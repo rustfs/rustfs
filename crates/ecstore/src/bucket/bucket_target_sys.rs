@@ -299,25 +299,15 @@ struct TargetClientBuildProbe {
     release: Arc<tokio::sync::Semaphore>,
 }
 
-/// Whether a replication target preserves the SSE-C passthrough transport
-/// headers (`X-Rustfs-Replication-*`) end to end.
-///
-/// A target that silently drops those headers (MinIO, generic S3) stores the
-/// forwarded ciphertext without its decryption material — an unreadable
-/// replica that used to report COMPLETED. The replication worker audits the
-/// first passthrough PUT per target (HEAD-back for SSE-C evidence) and caches
-/// the verdict here; a fresh `Unsupported` fails SSE-C replication closed
-/// before any PUT is sent. Entries follow the `arn_remotes_map` lifecycle
-/// (rebuilding or removing a target resets its capability to `Unknown`) and
-/// additionally expire after [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], after which
-/// the next attempt re-audits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SsecPassthroughCapability {
-    #[default]
-    Unknown,
-    Supported,
-    Unsupported,
-}
+/// SSE-C passthrough capability verdicts (see the enum's own docs in
+/// `rustfs-replication`) are cached here per target ARN: entries follow the
+/// `arn_remotes_map` lifecycle (rebuilding or removing a target resets its
+/// capability to `Unknown`) and additionally expire after
+/// [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], after which the next attempt
+/// re-audits. Re-exported so existing `bucket_target_sys` consumers keep
+/// their import path while the verdict vocabulary lives with the
+/// replication decision logic.
+pub use crate::bucket::replication::SsecPassthroughCapability;
 
 /// How long an audited SSE-C passthrough verdict stays authoritative.
 ///

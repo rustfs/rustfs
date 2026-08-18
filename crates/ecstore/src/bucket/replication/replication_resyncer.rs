@@ -18,10 +18,9 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    MrfReplicateEntry, NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
-    ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType,
-    ReplicationWorkerOperation, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
-    replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    REPLICATE_EXISTING, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
+    ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
+    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
@@ -30,9 +29,11 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
-    MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
+    MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
+    heal_uses_delete_replication_path, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
+    target_delete_version_id,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -40,21 +41,23 @@ use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::should_count_head_proxy_failure;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
-    resync_state_accepts_update, sanitize_resync_error_detail,
+    resync_state_accepts_update, resync_status_duration, sanitize_resync_error_detail,
 };
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
+#[cfg(test)]
+use super::replication_storage_boundary::ReplicationDeletedObject;
 use super::replication_storage_boundary::{
     AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
-    ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
+    ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
 };
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore,
-    SsecPassthroughCapability, SsecPassthroughGate, TargetClient, replication_action_for_target_head,
-    replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
-    replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
-    replication_put_object_options, replication_target_head_is_newer_null_version, resolve_read_api_version_id,
-    ssec_passthrough_evidence_present, ssec_passthrough_gate,
+    SsecPassthroughCapability, SsecPassthroughGate, TargetClient, is_replication_target_offline_error,
+    replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
+    replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
+    replication_put_object_header_size, replication_put_object_options, replication_target_head_is_newer_null_version,
+    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -110,21 +113,6 @@ const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
-const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
-    "dispatch failure",
-    "timeouterror",
-    "timed out",
-    "connection refused",
-    "connection reset",
-    "connection closed",
-    "connection aborted",
-    "broken pipe",
-    "dns error",
-    "failed to lookup address",
-    "name or service not known",
-    "deadline has elapsed",
-    "tcp connect error",
-];
 
 #[allow(
     dead_code,
@@ -194,27 +182,6 @@ const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_id
 /// after a restart is acceptable.
 static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
 
-/// Runtime half of the P1-19 version-identity contract (the explicit probe
-/// lives in replication-check's VersionFidelity phase): every replication PUT
-/// response reveals whether the target adopted the source version id. A
-/// target minting its own ids silently breaks version-addressed deletes and
-/// heal, so surface it — once per target — instead of letting the divergence
-/// accumulate unseen.
-/// Pure drift judgment: the contract only applies when the source addressed a
-/// real (non-nil) version uuid, and drift means the target answered with
-/// anything else — including nothing at all.
-fn version_identity_drifted(source_version_id: &str, assigned_version_id: Option<&str>) -> bool {
-    if source_version_id.is_empty() {
-        return false;
-    }
-    // A nil source uuid travels as the literal "null" (unversioned-source
-    // semantics); no identity contract applies to it.
-    if Uuid::parse_str(source_version_id).map(|uuid| uuid.is_nil()).unwrap_or(true) {
-        return false;
-    }
-    assigned_version_id != Some(source_version_id)
-}
-
 fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
     if !version_identity_drifted(source_version_id, assigned_version_id) {
         return;
@@ -255,13 +222,6 @@ fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
     let code = err.as_service_error().and_then(|se| se.code());
     let raw_status = err.raw_response().map(|r| r.status().as_u16());
     is_version_id_mismatch(code, raw_status)
-}
-
-fn is_replication_target_offline_error(err: &(impl Display + ?Sized)) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-    REPLICATION_TARGET_OFFLINE_ERROR_MARKERS
-        .iter()
-        .any(|marker| message.contains(marker))
 }
 
 async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetClient>, err: &(impl Display + ?Sized)) {
@@ -390,31 +350,6 @@ async fn audit_ssec_passthrough_replica(
 }
 
 static RESYNC_WORKER_COUNT: usize = 10;
-
-fn resync_status_duration(
-    status: ResyncStatusType,
-    start_time: Option<OffsetDateTime>,
-    now: OffsetDateTime,
-) -> Option<std::time::Duration> {
-    if !matches!(
-        status,
-        ResyncStatusType::ResyncCompleted | ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncCanceled
-    ) {
-        return None;
-    }
-
-    let millis = (now - start_time?).whole_milliseconds();
-    if millis < 0 {
-        return None;
-    }
-
-    let millis = if millis > i128::from(u64::MAX) {
-        u64::MAX
-    } else {
-        u64::try_from(millis).ok()?
-    };
-    Some(std::time::Duration::from_millis(millis))
-}
 
 type ResyncCancelKey = (String, String, String);
 
@@ -1213,33 +1148,6 @@ fn spawn_resync_walk_task<S: ReplicationStorage>(
     (rx, walk_failed, walk_task)
 }
 
-/// Build the delete-replication work item for an existing delete marker or
-/// version purge discovered during a resync scan.
-fn resync_existing_delete_replication_info(roi: &ReplicateObjectInfo, target_arn: &str) -> DeletedObjectReplicationInfo {
-    let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
-        (None, roi.version_id)
-    } else {
-        (roi.version_id, None)
-    };
-
-    DeletedObjectReplicationInfo {
-        delete_object: ReplicationDeletedObject {
-            object_name: roi.name.clone(),
-            delete_marker_version_id: dm_version_id,
-            version_id,
-            replication_state: roi.replication_state.clone(),
-            delete_marker: roi.delete_marker,
-            delete_marker_mtime: roi.mod_time,
-            ..Default::default()
-        },
-        bucket: roi.bucket.clone(),
-        event_type: REPLICATE_EXISTING_DELETE.to_string(),
-        op_type: ReplicationType::ExistingObject,
-        target_arn: target_arn.to_string(),
-        ..Default::default()
-    }
-}
-
 /// Classify the target HEAD verification result for one resynced object,
 /// updating the per-object status counters and returning the accounted size
 /// together with any verification error.
@@ -1956,29 +1864,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     )
 }
 
-/// Whether a delete replication fully succeeded — the MRF replay acknowledges
-/// (drops) an entry exactly when this returns true.
-///
-/// The delayed purge is deliberately NOT an input: holding the outcome hostage
-/// to it (`&& !requires_delayed_purge`) forced `false` for every delete-marker
-/// entry and retained them all in the durable MRF journal forever. Purge
-/// failures persist their own purge-intent entry instead
-/// (`watch_and_purge_source_delete_marker`), and replays of those entries
-/// report purge success through `purge_stale_delete_marker_targets`.
-fn replicate_delete_outcome(
-    expected_targets: usize,
-    replicated_targets: usize,
-    state_persisted: bool,
-    source_state_verified: bool,
-    replication_status: &ReplicationStatusType,
-) -> bool {
-    expected_targets > 0
-        && replicated_targets == expected_targets
-        && state_persisted
-        && source_state_verified
-        && *replication_status == ReplicationStatusType::Completed
-}
-
 async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
     storage: &S,
     bucket: &str,
@@ -2001,29 +1886,6 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
         Ok(info) => !info.delete_marker || info.version_id != Some(delete_marker_version_id),
         Err(err) => is_err_object_not_found(&err) || is_err_version_not_found(&err),
     }
-}
-
-/// Which version a delete-marker purge should address on one target.
-///
-/// `None` means do not purge at all: the recorded mapping disagreed across the
-/// dual internal prefixes, and guessing an id could destroy a live version on
-/// the target. `Some(id)` is the exact version the target reported when it
-/// accepted the marker; falling back to a source-derived id is only correct
-/// when the target mirrors source version ids, which a generic S3 target does
-/// not.
-fn delete_marker_purge_version_id(
-    state: Option<&ReplicationState>,
-    arn: &str,
-    delete_marker_version_id: Uuid,
-) -> Option<Option<String>> {
-    if state.is_some_and(|state| state.target_delete_marker_version_ids_corrupt) {
-        return None;
-    }
-    let recorded = state.and_then(|state| state.target_delete_marker_version_ids.get(arn).cloned());
-    Some(match recorded {
-        Some(version_id) => Some(version_id),
-        None => target_delete_version_id(delete_marker_version_id, true),
-    })
 }
 
 /// One purge pass over the eligible targets. Returns the ARNs that must be
@@ -2191,20 +2053,6 @@ async fn watch_and_purge_source_delete_marker<S: ReplicationStorage>(
     if let Some(failed_arns) = pending.filter(|failed_arns| !failed_arns.is_empty()) {
         enqueue_delete_marker_purge_mrf(&dobj, failed_arns).await;
     }
-}
-
-/// Shape an exhausted purge intent as a marker-creation delete entry. Replay
-/// reconstructs it with `delete_marker: true`, finds the source marker gone,
-/// and funnels into the stale-marker branch of `replicate_delete_with_outcome`
-/// — which re-runs the purge without touching source state and reports purge
-/// success as the replay outcome.
-fn delete_marker_purge_mrf_entry(dobj: &DeletedObjectReplicationInfo, failed_arns: Vec<String>) -> MrfReplicateEntry {
-    let mut entry = dobj.to_mrf_entry();
-    entry.delete_marker = true;
-    entry.version_id = None;
-    entry.retry_count = 0;
-    entry.target_arns = failed_arns;
-    entry
 }
 
 async fn enqueue_delete_marker_purge_mrf(dobj: &DeletedObjectReplicationInfo, failed_arns: Vec<String>) {
@@ -2564,14 +2412,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     }
 
     all_succeeded
-}
-
-fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<String> {
-    if version_id.is_nil() {
-        version_purge.then(|| NULL_VERSION_ID.to_string())
-    } else {
-        Some(version_id.to_string())
-    }
 }
 
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
@@ -4085,27 +3925,6 @@ mod tests {
         ReplicationTargetStore::register_test_target(target).await;
     }
 
-    /// P1-19 runtime spot-check exemption matrix: drift only applies when the
-    /// source addressed a real version uuid.
-    #[test]
-    fn test_version_identity_drift_judgment() {
-        let source = "6fa459ea-ee8a-3ca4-894e-db77e160355e";
-        for (sent, got, expected) in [
-            (source, Some(source), false),
-            (source, Some("0e304ce5-33e9-4b8a-9b12-9e40a53e6ded"), true),
-            (source, None, true),
-            ("", None, false),
-            ("null", Some("anything"), false),
-            ("00000000-0000-0000-0000-000000000000", Some("anything"), false),
-        ] {
-            assert_eq!(
-                version_identity_drifted(sent, got),
-                expected,
-                "sent {sent:?} got {got:?} must judge drift = {expected}"
-            );
-        }
-    }
-
     #[test]
     fn resync_admission_configuration_is_bounded() {
         assert_eq!(ENV_REPL_RESYNC_MAX_JOBS, "RUSTFS_REPL_RESYNC_MAX_JOBS");
@@ -4146,15 +3965,6 @@ mod tests {
         );
 
         drop((first, second));
-    }
-
-    #[test]
-    fn replication_target_offline_error_classifier_is_network_scoped() {
-        assert!(is_replication_target_offline_error(&"put_object dispatch failure: connector error"));
-        assert!(is_replication_target_offline_error(&"request TimeoutError after retry"));
-        assert!(is_replication_target_offline_error(&"tcp connect error: connection refused"));
-        assert!(!is_replication_target_offline_error(&"put_object failed: AccessDenied: denied"));
-        assert!(!is_replication_target_offline_error(&"put_object failed: NoSuchBucket"));
     }
 
     #[tokio::test]
@@ -4430,27 +4240,6 @@ mod tests {
         );
     }
 
-    /// P1-21 regression guard for the outcome formula. A fully successful
-    /// delete-marker replication must acknowledge its MRF entry: the formula
-    /// once carried `&& !requires_delayed_purge`, which pinned every
-    /// delete-marker entry to Missed and retained the whole backlog forever.
-    /// (Deterministically staging a marker-creation entry in the durable
-    /// journal from e2e would require saturating the worker queues, so the
-    /// formula is pinned here instead; the purge-intent replay half is pinned
-    /// by the delayed-purge e2e pair.)
-    #[test]
-    fn test_replicate_delete_outcome_is_not_held_hostage_by_the_delayed_purge() {
-        assert!(
-            replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Completed),
-            "a completed delete-marker replication must be acknowledgeable even though a delayed purge watch is pending"
-        );
-        assert!(!replicate_delete_outcome(0, 0, true, true, &ReplicationStatusType::Completed));
-        assert!(!replicate_delete_outcome(2, 1, true, true, &ReplicationStatusType::Completed));
-        assert!(!replicate_delete_outcome(1, 1, false, true, &ReplicationStatusType::Completed));
-        assert!(!replicate_delete_outcome(1, 1, true, false, &ReplicationStatusType::Completed));
-        assert!(!replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Failed));
-    }
-
     /// P1-21 review follow-up: a target whose recorded marker version is
     /// inconsistent must be reported as a per-target FAILURE. Treating the
     /// refusal as success let the watcher and the MRF replay drop the purge
@@ -4488,41 +4277,6 @@ mod tests {
             vec![arn],
             "a refused purge must stay in the failed set so the intent is never acknowledged"
         );
-    }
-
-    #[test]
-    fn test_delete_marker_purge_mrf_entry_replays_through_the_stale_marker_branch() {
-        let delete_marker_version_id = Uuid::new_v4();
-        let dobj = DeletedObjectReplicationInfo {
-            delete_object: ReplicationDeletedObject {
-                object_name: "doc.txt".to_string(),
-                // A version-purge flavored source event: the entry must still
-                // be reshaped as a marker-creation delete so replay funnels
-                // into the stale-marker branch instead of re-running the full
-                // delete replication (whose source-state stamping would fail
-                // against the already-purged version).
-                delete_marker: false,
-                version_id: Some(Uuid::new_v4()),
-                delete_marker_version_id: Some(delete_marker_version_id),
-                ..Default::default()
-            },
-            bucket: "bucket-a".to_string(),
-            ..Default::default()
-        };
-
-        let entry = delete_marker_purge_mrf_entry(&dobj, vec!["arn:a".to_string()]);
-
-        assert!(entry.delete_marker, "purge intents must replay as marker-creation deletes");
-        assert_eq!(entry.version_id, None, "the purged data version must not leak into the replay");
-        assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
-        assert_eq!(
-            entry.target_arns,
-            vec!["arn:a".to_string()],
-            "only the targets whose purge failed may be retried"
-        );
-        assert_eq!(entry.retry_count, 0);
-        assert_eq!(entry.bucket, "bucket-a");
-        assert_eq!(entry.object, "doc.txt");
     }
 
     #[test]
@@ -5031,61 +4785,5 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
-    }
-
-    #[test]
-    fn test_resync_status_duration_only_tracks_terminal_status() {
-        let start = match OffsetDateTime::from_unix_timestamp(1_700_000_000) {
-            Ok(start) => start,
-            Err(err) => panic!("valid test timestamp: {err}"),
-        };
-        let end = start + time::Duration::seconds(2);
-
-        assert_eq!(
-            resync_status_duration(ResyncStatusType::ResyncCompleted, Some(start), end),
-            Some(std::time::Duration::from_millis(2000))
-        );
-        assert_eq!(resync_status_duration(ResyncStatusType::ResyncStarted, Some(start), end), None);
-        assert_eq!(resync_status_duration(ResyncStatusType::ResyncFailed, None, end), None);
-    }
-
-    #[test]
-    fn target_delete_version_id_preserves_explicit_null_purges() {
-        let version_id = Uuid::new_v4();
-
-        assert_eq!(target_delete_version_id(version_id, true), Some(version_id.to_string()));
-        assert_eq!(target_delete_version_id(Uuid::nil(), true).as_deref(), Some(NULL_VERSION_ID));
-        assert_eq!(target_delete_version_id(Uuid::nil(), false), None);
-    }
-
-    #[test]
-    fn delete_marker_purge_prefers_the_recorded_target_version() {
-        let source = Uuid::new_v4();
-        let arn = "arn:rustfs:replication::target:bucket";
-
-        // No recorded mapping: fall back to deriving from the source uuid.
-        assert_eq!(delete_marker_purge_version_id(None, arn, source), Some(Some(source.to_string())));
-
-        // Recorded mapping wins — a generic S3 target assigns its own id, so the
-        // derived one would purge the wrong version or nothing at all.
-        let mut state = ReplicationState::default();
-        state
-            .target_delete_marker_version_ids
-            .insert(arn.to_string(), "target-assigned-id".to_string());
-        assert_eq!(
-            delete_marker_purge_version_id(Some(&state), arn, source),
-            Some(Some("target-assigned-id".to_string()))
-        );
-
-        // A mapping recorded for a different ARN must not be reused.
-        assert_eq!(
-            delete_marker_purge_version_id(Some(&state), "arn:rustfs:replication::other:bucket", source),
-            Some(Some(source.to_string()))
-        );
-
-        // Inconsistent persisted metadata: refuse to purge rather than guess.
-        let mut corrupt = state.clone();
-        corrupt.target_delete_marker_version_ids_corrupt = true;
-        assert_eq!(delete_marker_purge_version_id(Some(&corrupt), arn, source), None);
     }
 }
