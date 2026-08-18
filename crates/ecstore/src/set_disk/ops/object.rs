@@ -5845,6 +5845,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        // MRF journal intent: partial-write recovery must survive a restart
+        // (HS-01); the heal request below remains the in-memory fast path.
+        rustfs_common::mrf_channel::try_send_mrf_intent(
+            rustfs_common::mrf_channel::MrfKind::PartialWrite,
+            bucket,
+            object,
+            uuid::Uuid::try_parse(version_id).ok(),
+        );
         let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),
