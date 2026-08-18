@@ -55,6 +55,7 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    future::Future,
     io::Cursor,
     path::PathBuf,
     pin::Pin,
@@ -69,6 +70,7 @@ use tokio::time;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
+    task::{JoinError, JoinHandle},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -86,6 +88,7 @@ const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 const REMOTE_DISK_OPEN_READ_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_READ_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const REMOTE_READ_TIMEOUT_PARTS: u32 = 3;
 const NS_SCANNER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
 const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
@@ -254,7 +257,83 @@ fn resumed_read_request(request: &ReadStreamRequest, emitted: usize) -> io::Resu
     })
 }
 
-type ReadResumeFuture = tokio::task::JoinHandle<Result<FileReader>>;
+#[derive(Clone, Copy)]
+struct RemoteReadTimeouts {
+    body_stall: Option<Duration>,
+    initial_read: Option<Duration>,
+    recovery: Option<Duration>,
+}
+
+fn remote_read_timeouts(read_timeout: Duration) -> RemoteReadTimeouts {
+    let Some(recovery) = read_timeout
+        .checked_div(REMOTE_READ_TIMEOUT_PARTS)
+        .filter(|timeout| !timeout.is_zero())
+    else {
+        return RemoteReadTimeouts {
+            body_stall: None,
+            initial_read: None,
+            recovery: None,
+        };
+    };
+    RemoteReadTimeouts {
+        body_stall: Some(recovery),
+        initial_read: Some(read_timeout.saturating_sub(recovery)),
+        recovery: Some(recovery),
+    }
+}
+
+async fn with_remote_read_recovery_timeout<T, F>(recovery_timeout: Option<Duration>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match recovery_timeout {
+        Some(recovery_timeout) => match time::timeout(recovery_timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(DiskError::Timeout),
+        },
+        None => future.await,
+    }
+}
+
+struct AbortOnDropTask<T>(JoinHandle<T>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
+
+impl<T> Future for AbortOnDropTask<T>
+where
+    T: Send + 'static,
+{
+    type Output = std::result::Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn retry_cutoff_elapsed(
+    initial_read_timeout: &mut Option<Duration>,
+    cutoff: &mut Option<Pin<Box<time::Sleep>>>,
+    cx: &mut Context<'_>,
+) -> bool {
+    if cutoff.is_none()
+        && let Some(timeout) = initial_read_timeout.take()
+    {
+        *cutoff = Some(Box::pin(time::sleep(timeout)));
+    }
+    cutoff.as_mut().is_some_and(|cutoff| cutoff.as_mut().poll(cx).is_ready())
+}
+
+type ReadResumeFuture = AbortOnDropTask<Result<FileReader>>;
 
 struct RetryingRemoteReader {
     reader: Option<FileReader>,
@@ -262,17 +341,29 @@ struct RetryingRemoteReader {
     request: ReadStreamRequest,
     emitted: usize,
     retried: bool,
+    initial_read_timeout: Option<Duration>,
+    retry_cutoff: Option<Pin<Box<time::Sleep>>>,
+    recovery_timeout: Option<Duration>,
     resume: Option<ReadResumeFuture>,
 }
 
 impl RetryingRemoteReader {
-    fn new(reader: FileReader, transport: Arc<dyn InternodeDataTransport>, request: ReadStreamRequest) -> Self {
+    fn new_with_timeouts(
+        reader: FileReader,
+        transport: Arc<dyn InternodeDataTransport>,
+        request: ReadStreamRequest,
+        initial_read_timeout: Option<Duration>,
+        recovery_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             reader: Some(reader),
             transport,
             request,
             emitted: 0,
             retried: false,
+            initial_read_timeout,
+            retry_cutoff: None,
+            recovery_timeout,
             resume: None,
         }
     }
@@ -283,34 +374,62 @@ impl RetryingRemoteReader {
             return Ok(());
         }
         let request = resumed_read_request(&self.request, self.emitted)?;
+        let recovery_timeout = self.recovery_timeout;
         let transport = Arc::clone(&self.transport);
-        self.resume = Some(tokio::spawn(async move { transport.open_read_fresh(request).await }));
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
+            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_fresh(request)).await
+        })));
         Ok(())
+    }
+
+    fn retry_cutoff_elapsed(&mut self, cx: &mut Context<'_>) -> bool {
+        retry_cutoff_elapsed(&mut self.initial_read_timeout, &mut self.retry_cutoff, cx)
     }
 }
 
 impl AsyncRead for RetryingRemoteReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
-            if let Some(resume) = self.resume.as_mut() {
+            // After the absolute cutoff, let initial progress win over a stale fresh-open.
+            let resume_pending = if let Some(resume) = self.resume.as_mut() {
                 match Pin::new(resume).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => true,
                     Poll::Ready(Ok(Ok(reader))) => {
                         self.resume = None;
                         self.reader = Some(reader);
+                        false
                     }
                     Poll::Ready(Ok(Err(error))) => {
                         self.resume = None;
-                        return Poll::Ready(Err(io::Error::other(error)));
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
                     }
                     Poll::Ready(Err(error)) => {
                         self.resume = None;
-                        return Poll::Ready(Err(io::Error::other(error)));
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
                     }
                 }
+            } else {
+                false
+            };
+
+            if !self.retried && self.retry_cutoff_elapsed(cx) {
+                self.retried = true;
+                if let Err(resume_error) = self.start_resume() {
+                    return Poll::Ready(Err(resume_error));
+                }
+                continue;
             }
 
             let Some(reader) = self.reader.as_mut() else {
+                if resume_pending {
+                    return Poll::Pending;
+                }
                 return Poll::Ready(Ok(()));
             };
             let before = buf.filled().len();
@@ -322,13 +441,28 @@ impl AsyncRead for RetryingRemoteReader {
                         Some(emitted) => emitted,
                         None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
                     };
+                    if resume_pending {
+                        if produced == 0 && (self.request.length == 0 || self.emitted >= self.request.length) {
+                            self.resume = None;
+                        } else if produced == 0 {
+                            self.reader = None;
+                            continue;
+                        } else {
+                            self.resume = None;
+                        }
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
                     self.retried = true;
+                    self.reader = None;
                     if let Err(resume_error) = self.start_resume() {
                         return Poll::Ready(Err(resume_error));
                     }
+                    continue;
+                }
+                Poll::Ready(Err(error)) if resume_pending && is_retryable_remote_body_error(&error) => {
+                    self.reader = None;
                     continue;
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -337,7 +471,7 @@ impl AsyncRead for RetryingRemoteReader {
     }
 }
 
-type ChunkResumeFuture = tokio::task::JoinHandle<Result<Option<rustfs_rio::ChunkReaderBox>>>;
+type ChunkResumeFuture = AbortOnDropTask<Result<Option<rustfs_rio::ChunkReaderBox>>>;
 
 struct RetryingRemoteChunkReader {
     reader: Option<rustfs_rio::ChunkReaderBox>,
@@ -345,17 +479,29 @@ struct RetryingRemoteChunkReader {
     request: ReadStreamRequest,
     emitted: usize,
     retried: bool,
+    initial_read_timeout: Option<Duration>,
+    retry_cutoff: Option<Pin<Box<time::Sleep>>>,
+    recovery_timeout: Option<Duration>,
     resume: Option<ChunkResumeFuture>,
 }
 
 impl RetryingRemoteChunkReader {
-    fn new(reader: rustfs_rio::ChunkReaderBox, transport: Arc<dyn InternodeDataTransport>, request: ReadStreamRequest) -> Self {
+    fn new_with_timeouts(
+        reader: rustfs_rio::ChunkReaderBox,
+        transport: Arc<dyn InternodeDataTransport>,
+        request: ReadStreamRequest,
+        initial_read_timeout: Option<Duration>,
+        recovery_timeout: Option<Duration>,
+    ) -> Self {
         Self {
             reader: Some(reader),
             transport,
             request,
             emitted: 0,
             retried: false,
+            initial_read_timeout,
+            retry_cutoff: None,
+            recovery_timeout,
             resume: None,
         }
     }
@@ -366,9 +512,16 @@ impl RetryingRemoteChunkReader {
             return Ok(());
         }
         let request = resumed_read_request(&self.request, self.emitted)?;
+        let recovery_timeout = self.recovery_timeout;
         let transport = Arc::clone(&self.transport);
-        self.resume = Some(tokio::spawn(async move { transport.open_read_chunks_fresh(request).await }));
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
+            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_chunks_fresh(request)).await
+        })));
         Ok(())
+    }
+
+    fn retry_cutoff_elapsed(&mut self, cx: &mut Context<'_>) -> bool {
+        retry_cutoff_elapsed(&mut self.initial_read_timeout, &mut self.retry_cutoff, cx)
     }
 }
 
@@ -392,30 +545,52 @@ impl AsyncRead for RetryingRemoteChunkReader {
 impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
     fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
         loop {
-            if let Some(resume) = self.resume.as_mut() {
+            let resume_pending = if let Some(resume) = self.resume.as_mut() {
                 match Pin::new(resume).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => true,
                     Poll::Ready(Ok(Ok(Some(reader)))) => {
                         self.resume = None;
                         self.reader = Some(reader);
+                        false
                     }
                     Poll::Ready(Ok(Ok(None))) => {
                         self.resume = None;
-                        self.reader = None;
-                        return Poll::Ready(Err(io::Error::other("remote resume transport did not provide a chunk reader")));
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other("remote resume transport did not provide a chunk reader")));
+                        }
+                        continue;
                     }
                     Poll::Ready(Ok(Err(error))) => {
                         self.resume = None;
-                        return Poll::Ready(Err(io::Error::other(error)));
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
                     }
                     Poll::Ready(Err(error)) => {
                         self.resume = None;
-                        return Poll::Ready(Err(io::Error::other(error)));
+                        if self.reader.is_none() {
+                            return Poll::Ready(Err(io::Error::other(error)));
+                        }
+                        continue;
                     }
                 }
+            } else {
+                false
+            };
+
+            if !self.retried && self.retry_cutoff_elapsed(cx) {
+                self.retried = true;
+                if let Err(resume_error) = self.start_resume() {
+                    return Poll::Ready(Err(resume_error));
+                }
+                continue;
             }
 
             let Some(reader) = self.reader.as_mut() else {
+                if resume_pending {
+                    return Poll::Pending;
+                }
                 return Poll::Ready(Ok(None));
             };
             match rustfs_rio::ChunkReader::poll_read_chunk(Pin::new(reader.as_mut()), cx, max) {
@@ -425,14 +600,26 @@ impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
                         Some(emitted) => emitted,
                         None => return Poll::Ready(Err(io::Error::other("remote read emitted byte count overflow"))),
                     };
+                    if resume_pending {
+                        self.resume = None;
+                    }
                     return Poll::Ready(Ok(Some(chunk)));
+                }
+                Poll::Ready(Ok(None)) if resume_pending => {
+                    self.reader = None;
+                    continue;
                 }
                 Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
                 Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
                     self.retried = true;
+                    self.reader = None;
                     if let Err(resume_error) = self.start_resume() {
                         return Poll::Ready(Err(resume_error));
                     }
+                    continue;
+                }
+                Poll::Ready(Err(error)) if resume_pending && is_retryable_remote_body_error(&error) => {
+                    self.reader = None;
                     continue;
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -2710,7 +2897,7 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        let stall_timeout = get_object_disk_read_timeout();
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
         let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
@@ -2718,10 +2905,16 @@ impl DiskAPI for RemoteDisk {
             path: path.to_string(),
             offset,
             length,
-            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
+            stall_timeout: timeouts.body_stall,
         };
         let reader = self.open_read_with_retry(request.clone()).await?;
-        Ok(Box::new(RetryingRemoteReader::new(reader, Arc::clone(&self.data_transport), request)))
+        Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
+            reader,
+            Arc::clone(&self.data_transport),
+            request,
+            timeouts.initial_read,
+            timeouts.recovery,
+        )))
     }
 
     async fn read_file_stream_chunks(
@@ -2735,7 +2928,7 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
-        let stall_timeout = get_object_disk_read_timeout();
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
         let request = ReadStreamRequest {
             endpoint: self.endpoint.grid_host(),
             disk,
@@ -2743,12 +2936,17 @@ impl DiskAPI for RemoteDisk {
             path: path.to_string(),
             offset,
             length,
-            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
+            stall_timeout: timeouts.body_stall,
         };
         let reader = self.open_read_chunks_with_retry(request.clone()).await?;
         Ok(reader.map(|reader| {
-            Box::new(RetryingRemoteChunkReader::new(reader, Arc::clone(&self.data_transport), request))
-                as rustfs_rio::ChunkReaderBox
+            Box::new(RetryingRemoteChunkReader::new_with_timeouts(
+                reader,
+                Arc::clone(&self.data_transport),
+                request,
+                timeouts.initial_read,
+                timeouts.recovery,
+            )) as rustfs_rio::ChunkReaderBox
         }))
     }
 
@@ -3347,12 +3545,14 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
+    use crate::erasure::coding::{BitrotReader, Erasure, decode::ParallelReader};
+    use crate::io_support::bitrot::ShardReader;
     use crate::runtime::sources as runtime_sources;
     use serde_json::Value;
     use serial_test::serial;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
-    use std::sync::{Arc, Mutex, Mutex as StdMutex, Once};
+    use std::sync::{Arc, Mutex, Mutex as StdMutex, Once, atomic::AtomicUsize};
     use std::task::{Context, Poll};
     use tokio::io::{ReadBuf, duplex};
     use tokio::net::TcpListener;
@@ -4431,6 +4631,252 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BodyStallTestReader {
+        data: Option<Bytes>,
+        next_data: Option<(Bytes, Pin<Box<time::Sleep>>)>,
+        initial_delay: Option<Pin<Box<time::Sleep>>>,
+        timeout: Duration,
+        stall_timer: Option<Pin<Box<time::Sleep>>>,
+    }
+
+    impl BodyStallTestReader {
+        fn new(data: Bytes, initial_delay: Duration, timeout: Option<Duration>) -> Self {
+            let timeout = timeout.expect("parallel resume test requires a body stall timeout");
+            Self {
+                data: Some(data),
+                next_data: None,
+                initial_delay: Some(Box::pin(time::sleep(initial_delay))),
+                timeout,
+                stall_timer: None,
+            }
+        }
+
+        fn with_next_data(
+            data: Bytes,
+            initial_delay: Duration,
+            next_data: Bytes,
+            next_delay: Duration,
+            timeout: Option<Duration>,
+        ) -> Self {
+            let mut reader = Self::new(data, initial_delay, timeout);
+            reader.next_data = Some((next_data, Box::pin(time::sleep(next_delay))));
+            reader
+        }
+
+        fn poll_chunk(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            if let Some(delay) = self.initial_delay.as_mut() {
+                if delay.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.initial_delay = None;
+            }
+            if let Some(mut data) = self.data.take() {
+                let chunk = data.split_to(data.len().min(max));
+                if !data.is_empty() {
+                    self.data = Some(data);
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            if let Some((_, delay)) = self.next_data.as_mut()
+                && delay.as_mut().poll(cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+            if let Some((mut data, _)) = self.next_data.take() {
+                let chunk = data.split_to(data.len().min(max));
+                if !data.is_empty() {
+                    self.next_data = Some((data, Box::pin(time::sleep(Duration::ZERO))));
+                }
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+            let timer = self.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(self.timeout)));
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    std_io::ErrorKind::TimedOut,
+                    rustfs_rio::BodyStalled { timeout: self.timeout },
+                ))),
+            }
+        }
+    }
+
+    impl AsyncRead for BodyStallTestReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.poll_chunk(cx, buf.remaining()) {
+                Poll::Ready(Ok(Some(chunk))) => {
+                    buf.put_slice(&chunk);
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl rustfs_rio::ChunkReader for BodyStallTestReader {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+            self.poll_chunk(cx, max)
+        }
+    }
+
+    struct CountOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ParallelResumeTransport {
+        initial_data: Bytes,
+        resumed_data: Bytes,
+        initial_delay: Duration,
+        fresh_delay: Duration,
+        fresh_read_requests: Mutex<Vec<ReadStreamRequest>>,
+        fresh_chunk_requests: Mutex<Vec<ReadStreamRequest>>,
+        initial_next_data: Option<(Bytes, Duration)>,
+    }
+
+    impl ParallelResumeTransport {
+        fn new(initial_delay: Duration, fresh_delay: Duration) -> Self {
+            Self {
+                initial_data: Bytes::from_static(b"da"),
+                resumed_data: Bytes::from_static(b"ta"),
+                initial_delay,
+                fresh_delay,
+                fresh_read_requests: Mutex::new(Vec::new()),
+                fresh_chunk_requests: Mutex::new(Vec::new()),
+                initial_next_data: None,
+            }
+        }
+
+        fn with_initial_next_data(initial_delay: Duration, next_delay: Duration, fresh_delay: Duration) -> Self {
+            let mut transport = Self::new(initial_delay, fresh_delay);
+            transport.initial_next_data = Some((Bytes::from_static(b"ta"), next_delay));
+            transport
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for ParallelResumeTransport {
+        async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            let reader = match self.initial_next_data.as_ref() {
+                Some((next_data, next_delay)) => BodyStallTestReader::with_next_data(
+                    self.initial_data.clone(),
+                    self.initial_delay,
+                    next_data.clone(),
+                    *next_delay,
+                    request.stall_timeout,
+                ),
+                None => BodyStallTestReader::new(self.initial_data.clone(), self.initial_delay, request.stall_timeout),
+            };
+            Ok(Box::new(reader))
+        }
+
+        async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+            self.fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .push(request);
+            time::sleep(self.fresh_delay).await;
+            Ok(Box::new(Cursor::new(self.resumed_data.clone())))
+        }
+
+        async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            let reader = match self.initial_next_data.as_ref() {
+                Some((next_data, next_delay)) => BodyStallTestReader::with_next_data(
+                    self.initial_data.clone(),
+                    self.initial_delay,
+                    next_data.clone(),
+                    *next_delay,
+                    request.stall_timeout,
+                ),
+                None => BodyStallTestReader::new(self.initial_data.clone(), self.initial_delay, request.stall_timeout),
+            };
+            Ok(Some(Box::new(reader)))
+        }
+
+        async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .push(request);
+            time::sleep(self.fresh_delay).await;
+            Ok(Some(Box::new(ChunkPartialThenErrorReader {
+                data: Some(self.resumed_data.clone()),
+                error: None,
+            })))
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in parallel resume tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in parallel resume tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "parallel-resume-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingFreshOpenTransport {
+        fresh_read_drops: Arc<AtomicUsize>,
+        fresh_chunk_drops: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for PendingFreshOpenTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            Ok(Box::new(PartialThenErrorReader {
+                cursor: Cursor::new(Vec::new()),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }))
+        }
+
+        async fn open_read_fresh(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            let _drop = CountOnDrop(Arc::clone(&self.fresh_read_drops));
+            std::future::pending().await
+        }
+
+        async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            Ok(Some(Box::new(ChunkPartialThenErrorReader {
+                data: None,
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            })))
+        }
+
+        async fn open_read_chunks_fresh(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            let _drop = CountOnDrop(Arc::clone(&self.fresh_chunk_drops));
+            std::future::pending().await
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in fresh open cancellation tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in fresh open cancellation tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "pending-fresh-open-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
     fn resume_step_reader(step: ResumeReadStep) -> FileReader {
         match step {
             ResumeReadStep::PartialThenReset(data) => Box::new(PartialThenErrorReader {
@@ -4532,7 +4978,7 @@ mod tests {
         let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
         let request = resume_request(10);
         let reader = resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
-        let mut reader = RetryingRemoteReader::new(reader, transport.clone(), request);
+        let mut reader = RetryingRemoteReader::new_with_timeouts(reader, transport.clone(), request, None, None);
         let mut output = Vec::new();
         reader
             .read_to_end(&mut output)
@@ -4562,7 +5008,7 @@ mod tests {
         let transport = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::Data(b"456789".to_vec())]));
         let request = resume_request(10);
         let reader = resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
-        let mut reader = RetryingRemoteChunkReader::new(reader, transport.clone(), request);
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(reader, transport.clone(), request, None, None);
         let mut output = Vec::new();
         reader
             .read_to_end(&mut output)
@@ -4587,13 +5033,223 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy)]
+    enum ParallelResumePath {
+        Regular,
+        Chunk,
+    }
+
+    async fn assert_parallel_resume_case(
+        path: ParallelResumePath,
+        initial_delay: Duration,
+        initial_next_delay: Option<Duration>,
+        fresh_delay: Duration,
+        expect_success: bool,
+    ) {
+        const DATA: &[u8] = b"data";
+        let transport = Arc::new(match initial_next_delay {
+            Some(next_delay) => ParallelResumeTransport::with_initial_next_data(initial_delay, next_delay, fresh_delay),
+            None => ParallelResumeTransport::new(initial_delay, fresh_delay),
+        });
+        let remote_disk = new_remote_disk_with_transport(transport.clone()).await;
+        let erasure = Erasure::new(1, 1, DATA.len());
+        let (buffers, errors) = match path {
+            ParallelResumePath::Regular => {
+                let reader = remote_disk
+                    .read_file_stream("bucket", "object/part.1", 0, DATA.len())
+                    .await
+                    .expect("initial remote reader should open");
+                let readers = vec![
+                    Some(BitrotReader::new(reader, DATA.len(), rustfs_utils::HashAlgorithm::None, false)),
+                    None,
+                ];
+                ParallelReader::new_with_metrics_path_and_reconstruction_verification(readers, erasure, 0, DATA.len(), None)
+                    .read()
+                    .await
+            }
+            ParallelResumePath::Chunk => {
+                let reader = remote_disk
+                    .read_file_stream_chunks("bucket", "object/part.1", 0, DATA.len())
+                    .await
+                    .expect("initial remote chunk reader should open")
+                    .expect("chunk transport should return a reader");
+                let readers = vec![
+                    Some(BitrotReader::new(
+                        ShardReader::Chunked(reader),
+                        DATA.len(),
+                        rustfs_utils::HashAlgorithm::None,
+                        false,
+                    )),
+                    None,
+                ];
+                ParallelReader::new_with_metrics_path_and_reconstruction_verification(readers, erasure, 0, DATA.len(), None)
+                    .read()
+                    .await
+            }
+        };
+
+        if expect_success {
+            assert_eq!(buffers[0].as_deref(), Some(DATA));
+            assert!(errors[0].is_none());
+        } else {
+            assert!(buffers[0].is_none());
+            assert!(matches!(errors[0], Some(DiskError::Timeout)));
+        }
+        let requests = match path {
+            ParallelResumePath::Regular => transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned"),
+            ParallelResumePath::Chunk => transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned"),
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 2);
+        assert_eq!(requests[0].length, 2);
+    }
+
+    async fn assert_parallel_resume_path(path: ParallelResumePath) {
+        assert_parallel_resume_case(path, Duration::ZERO, None, Duration::from_millis(100), true).await;
+        assert_parallel_resume_case(path, Duration::from_millis(500), None, Duration::from_millis(100), true).await;
+        assert_parallel_resume_case(path, Duration::ZERO, None, Duration::from_millis(500), false).await;
+        assert_parallel_resume_case(
+            path,
+            Duration::from_millis(650),
+            Some(Duration::from_millis(700)),
+            Duration::from_millis(500),
+            true,
+        )
+        .await;
+    }
+
+    async fn assert_retry_drop_cancels_fresh_open(path: ParallelResumePath) {
+        let transport = Arc::new(PendingFreshOpenTransport::default());
+        let remote_disk = new_remote_disk_with_transport(transport.clone()).await;
+        let mut output = [0_u8; 1];
+        match path {
+            ParallelResumePath::Regular => {
+                let mut reader = remote_disk
+                    .read_file_stream("bucket", "object/part.1", 0, 1)
+                    .await
+                    .expect("initial remote reader should open");
+                assert!(
+                    time::timeout(Duration::from_millis(20), reader.read(&mut output))
+                        .await
+                        .is_err()
+                );
+                drop(reader);
+            }
+            ParallelResumePath::Chunk => {
+                let mut reader = remote_disk
+                    .read_file_stream_chunks("bucket", "object/part.1", 0, 1)
+                    .await
+                    .expect("initial remote chunk reader should open")
+                    .expect("chunk transport should return a reader");
+                assert!(
+                    time::timeout(Duration::from_millis(20), reader.read(&mut output))
+                        .await
+                        .is_err()
+                );
+                drop(reader);
+            }
+        }
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drops = match path {
+                    ParallelResumePath::Regular => transport.fresh_read_drops.load(Ordering::Relaxed),
+                    ParallelResumePath::Chunk => transport.fresh_chunk_drops.load(Ordering::Relaxed),
+                };
+                if drops == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the retrying reader should cancel the pending fresh open");
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_reader_recovers_body_stall_through_parallel_reader() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            assert_parallel_resume_path(ParallelResumePath::Regular).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_chunk_reader_recovers_body_stall_through_parallel_reader() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            assert_parallel_resume_path(ParallelResumePath::Chunk).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remote_reader_drop_cancels_pending_fresh_open() {
+        assert_retry_drop_cancels_fresh_open(ParallelResumePath::Regular).await;
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_drop_cancels_pending_fresh_open() {
+        assert_retry_drop_cancels_fresh_open(ParallelResumePath::Chunk).await;
+    }
+
+    #[tokio::test]
+    async fn remote_reader_treats_error_after_requested_length_as_eof() {
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteReader::new_with_timeouts(reader, transport.clone(), resume_request(4), None, None);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("error after the requested bytes should not trigger a redundant resume");
+        assert_eq!(output, b"0123");
+        assert!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_treats_error_after_requested_length_as_eof() {
+        let transport = Arc::new(ResumeTransport::default());
+        let reader = resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec()));
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(reader, transport.clone(), resume_request(4), None, None);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("error after the requested bytes should not trigger a redundant chunk resume");
+        assert_eq!(output, b"0123");
+        assert!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn remote_reader_retries_at_most_once_and_preserves_non_retryable_errors() {
         let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::PartialThenReset(b"456".to_vec())]));
-        let mut reader = RetryingRemoteReader::new(
+        let mut reader = RetryingRemoteReader::new_with_timeouts(
             resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec())),
             transport.clone(),
             resume_request(7),
+            None,
+            None,
         );
         let error = reader
             .read_to_end(&mut Vec::new())
@@ -4614,7 +5270,8 @@ mod tests {
             cursor: Cursor::new(b"data".to_vec()),
             error: Some(io::Error::new(std_io::ErrorKind::PermissionDenied, "permission denied")),
         };
-        let mut reader = RetryingRemoteReader::new(Box::new(reader), transport.clone(), resume_request(4));
+        let mut reader =
+            RetryingRemoteReader::new_with_timeouts(Box::new(reader), transport.clone(), resume_request(4), None, None);
         let error = reader
             .read_to_end(&mut Vec::new())
             .await
@@ -5013,7 +5670,7 @@ mod tests {
                     assert_eq!(request.path, "object/part.1");
                     assert_eq!(request.offset, 7);
                     assert_eq!(request.length, 11);
-                    assert_eq!(request.stall_timeout, Some(get_object_disk_read_timeout()));
+                    assert_eq!(request.stall_timeout, remote_read_timeouts(get_object_disk_read_timeout()).body_stall);
                 }
                 other => panic!("expected read transport call, got {other:?}"),
             }
