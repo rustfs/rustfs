@@ -60,7 +60,6 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use s3s::header::X_AMZ_REPLICATION_STATUS;
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -2506,7 +2505,6 @@ async fn build_replication_pair(
 /// metadata was inherited wholesale from the source, so the scanner heal pass
 /// skipped it too — no PENDING/FAILED marker meant nothing to re-drive).
 #[tokio::test]
-#[serial]
 async fn test_copy_object_replicates_to_target() -> TestResult {
     init_logging();
 
@@ -2555,7 +2553,6 @@ async fn test_copy_object_replicates_to_target() -> TestResult {
 /// independent object; every member must replicate to the remote target like a
 /// regular PUT (MinIO PutObjectExtract parity).
 #[tokio::test]
-#[serial]
 async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
     init_logging();
 
@@ -2601,7 +2598,6 @@ async fn test_snowball_extract_replicates_members_to_target() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2638,7 +2634,6 @@ async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_target_without_object_lock() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2692,7 +2687,6 @@ async fn test_replication_check_rejects_target_without_object_lock() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2731,7 +2725,6 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2755,7 +2748,6 @@ async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_missing_replication_config() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2779,7 +2771,6 @@ async fn test_replication_check_rejects_missing_replication_config() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2798,7 +2789,6 @@ async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2842,7 +2832,6 @@ async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2876,7 +2865,6 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2928,7 +2916,6 @@ async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Erro
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3017,7 +3004,6 @@ async fn fetch_single_target(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_partial_update_preserves_credentials() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3103,7 +3089,6 @@ async fn test_set_remote_target_partial_update_preserves_credentials() -> Result
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3145,7 +3130,6 @@ async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -3230,7 +3214,6 @@ async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tl
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_verify() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -3342,7 +3325,6 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -3427,7 +3409,6 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3518,7 +3499,6 @@ async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3538,7 +3518,6 @@ async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3557,7 +3536,6 @@ async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3598,7 +3576,6 @@ async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3623,7 +3600,6 @@ async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3647,7 +3623,6 @@ async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_remote_target_rejects_target_used_by_replication() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3687,7 +3662,6 @@ async fn test_remove_remote_target_rejects_target_used_by_replication() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3737,7 +3711,6 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -3779,7 +3752,6 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> TestResult {
     init_logging();
 
@@ -3878,7 +3850,6 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
     init_logging();
 
@@ -3965,7 +3936,6 @@ async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> 
 /// interoperability profile for a runner that provisions MinIO credentials
 /// and a reachable endpoint.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestResult {
     init_logging();
 
@@ -4293,7 +4263,6 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
 }
 
 #[tokio::test]
-#[serial]
 async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -4462,7 +4431,6 @@ async fn test_repl17_failure_observation_helpers() -> TestResult {
 /// the replica is decryptable only with the original customer key. The
 /// backlog#1291 property still holds: never a silent plaintext replica.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_c_contract() -> TestResult {
     init_logging();
 
@@ -4540,7 +4508,6 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
 /// part — part boundaries and the encrypted-multipart marker survive so the
 /// replica decrypts each part with its part-derived nonce.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     init_logging();
 
@@ -4657,7 +4624,6 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
 /// (independent KMS, so success proves target-owned envelopes), preserved
 /// source ETag, and a version that stays stable across scanner cycles.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_s3_contract() -> TestResult {
     init_logging();
     assert_managed_sse_replicates_and_reencrypts("sse-s3", false).await
@@ -4667,7 +4633,6 @@ async fn test_bucket_replication_sse_s3_contract() -> TestResult {
 /// fail closed — replication FAILED, and no plaintext (or any) replica ever
 /// materializes on the target.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_s3_fails_closed_without_target_kms() -> TestResult {
     init_logging();
 
@@ -4711,7 +4676,6 @@ async fn test_bucket_replication_sse_s3_fails_closed_without_target_kms() -> Tes
 /// the ETag comparison sees the preserved source ETag on the replica and does
 /// not rewrite it, so the replica's version stays stable through the resync.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_s3_resync_converges() -> TestResult {
     init_logging();
 
@@ -4768,7 +4732,6 @@ async fn test_bucket_replication_sse_s3_resync_converges() -> TestResult {
 /// re-encrypts under its own default key. The independent-KMS pair proves the
 /// replica's envelope is target-owned.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_kms_contract() -> TestResult {
     init_logging();
     assert_managed_sse_replicates_and_reencrypts("sse-kms", true).await
@@ -4779,7 +4742,6 @@ async fn test_bucket_replication_sse_kms_contract() -> TestResult {
 /// carries the full header set (SSE intent, content-type, user metadata) and
 /// the completed replica preserves the source's multipart ETag.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_s3_multipart_reencrypts() -> TestResult {
     init_logging();
 
@@ -4873,7 +4835,6 @@ async fn test_bucket_replication_sse_s3_multipart_reencrypts() -> TestResult {
 /// still-running source's data scanner (short cycle via [`FAST_SCANNER_ENV`])
 /// re-drives the failed objects once the target is reachable again.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
     init_logging();
 
@@ -4953,7 +4914,6 @@ async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
 /// must settle back to zero even though the historical failed counter remains
 /// non-zero.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -> TestResult {
     init_logging();
 
@@ -5087,7 +5047,6 @@ async fn test_bucket_replication_backlog_metrics_observe_outage_and_recovery() -
 /// must converge every persisted failure, including the replayed delete marker
 /// (whose replication decision is re-derived from the live config).
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replays_failed_entries_after_source_restart() -> TestResult {
     init_logging();
 
@@ -5179,7 +5138,6 @@ async fn test_bucket_replication_replays_failed_entries_after_source_restart() -
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_without_source_restart() -> TestResult {
     init_logging();
 
@@ -5249,7 +5207,6 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_w
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5293,7 +5250,6 @@ async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5337,7 +5293,6 @@ async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_real_dual_node() -> TestResult {
     init_logging();
 
@@ -5416,7 +5371,6 @@ async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_rea
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dual_node() -> TestResult {
     init_logging();
 
@@ -5495,7 +5449,6 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let resync_process_env = [
@@ -5715,7 +5668,6 @@ async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -5964,7 +5916,6 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6084,7 +6035,6 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6193,7 +6143,6 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_object_with_bucket_versioning_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6284,7 +6233,6 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
 /// receiver was dropped with only a debug line, while `replicate status` still reported
 /// "1/1 Buckets in sync" because both configs were byte-identical.
 #[tokio::test]
-#[serial]
 async fn test_site_replication_config_broadcast_keeps_reverse_direction_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6423,7 +6371,6 @@ async fn wait_for_site_replication_rule(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_active_active_converges_without_loops_real_dual_node() -> TestResult {
     init_logging();
 
@@ -6741,7 +6688,6 @@ async fn test_site_replication_active_active_converges_without_loops_real_dual_n
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_policy_backed_user_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -6829,7 +6775,6 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_group_policy_backed_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -6920,7 +6865,6 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
 }
 
 #[tokio::test]
-#[serial]
 async fn test_service_account_policy_from_accountinfo_round_trips_real_single_node() -> TestResult {
     init_logging();
 
@@ -6972,7 +6916,6 @@ async fn test_service_account_policy_from_accountinfo_round_trips_real_single_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_multiple_service_accounts_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -7073,7 +7016,6 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
 }
 
 #[tokio::test]
-#[serial]
 async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node() -> TestResult {
     init_logging();
 
@@ -7214,7 +7156,6 @@ async fn wait_for_target_request_version_id(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_resync_restart_revisits_objects_before_out_of_order_checkpoint() -> TestResult {
     init_logging();
 
@@ -7333,7 +7274,6 @@ async fn test_bucket_resync_restart_revisits_objects_before_out_of_order_checkpo
 /// CreateMultipartUpload (the version is decided at initiate time) must both
 /// carry the source version as `?versionId=`.
 #[tokio::test]
-#[serial]
 async fn test_replication_put_and_create_multipart_carry_source_version_id_query() -> TestResult {
     init_logging();
 
@@ -7448,7 +7388,6 @@ async fn test_replication_put_and_create_multipart_carry_source_version_id_query
 /// flow to the onward bucket, proving B's outbound replication and scanner
 /// are live.
 #[tokio::test]
-#[serial]
 async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
     init_logging();
 
@@ -7529,7 +7468,6 @@ async fn test_scanner_never_cascades_inbound_replicas() -> TestResult {
 /// version ids and still mint its own there — the check must not report OK
 /// while multipart deletes and heals would silently miss.
 #[tokio::test]
-#[serial]
 async fn test_replication_check_flags_multipart_only_version_minting_target() -> TestResult {
     init_logging();
 
@@ -7602,7 +7540,6 @@ async fn test_replication_check_flags_multipart_only_version_minting_target() ->
 }
 
 #[tokio::test]
-#[serial]
 async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
     init_logging();
 
@@ -7765,7 +7702,6 @@ async fn test_replication_check_aborts_failed_multipart_probes() -> TestResult {
 /// BucketRemoteTargetVersionMismatch — while still cleaning up the probe
 /// object via the version id the target actually assigned.
 #[tokio::test]
-#[serial]
 async fn test_replication_check_flags_version_minting_target() -> TestResult {
     init_logging();
 
@@ -8006,7 +7942,6 @@ async fn wait_for_target_marker_purged(
 /// the target forever. Contract under test: a failed purge attempt is retried
 /// within the watch window and converges once the fault clears.
 #[tokio::test]
-#[serial]
 async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure() -> TestResult {
     init_logging();
     let source_bucket = "delayed-purge-retry-src";
@@ -8066,7 +8001,6 @@ async fn test_delayed_delete_marker_purge_retries_after_transient_target_failure
 /// with an idempotent 204, which used to look like success and strand the
 /// real marker on the target forever.
 #[tokio::test]
-#[serial]
 async fn test_delayed_delete_marker_purge_uses_target_assigned_version() -> TestResult {
     init_logging();
     let source_bucket = "delayed-purge-mint-src";
@@ -8099,7 +8033,6 @@ async fn test_delayed_delete_marker_purge_uses_target_assigned_version() -> Test
 /// replayed purge succeeds, the entry must be acknowledged instead of being
 /// retained as Missed forever.
 #[tokio::test]
-#[serial]
 async fn test_delayed_delete_marker_purge_exhaustion_persists_to_mrf_and_replays_on_restart() -> TestResult {
     init_logging();
     let source_bucket = "delayed-purge-mrf-src";
@@ -8236,7 +8169,6 @@ async fn build_scanner_compensation_pair(
 /// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
 /// must NEVER be compensated.
 #[tokio::test]
-#[serial]
 async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
     init_logging();
     let source_bucket = "scanner-comp-src";
@@ -8352,7 +8284,6 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
 /// written after the rule replicate normally (the setting only gates the
 /// existing-object resync path).
 #[tokio::test]
-#[serial]
 async fn test_scanner_never_compensates_when_existing_object_replication_disabled() -> TestResult {
     init_logging();
     let source_bucket = "scanner-disabled-src";

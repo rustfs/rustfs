@@ -33,7 +33,6 @@ use aws_sdk_s3::types::{
     ObjectLockMode, ObjectLockRetentionMode,
 };
 use chrono::{DateTime, Duration, Utc};
-use serial_test::serial;
 use tracing::info;
 
 /// Initialize test logging
@@ -107,7 +106,6 @@ fn parse_s3_datetime(value: &aws_sdk_s3::primitives::DateTime) -> DateTime<Utc> 
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_blocked_by_compliance_retention() {
     init_logging();
     info!("🧪 Test: DeleteObject blocked by COMPLIANCE retention");
@@ -145,7 +143,6 @@ async fn test_delete_object_blocked_by_compliance_retention() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_blocked_by_governance_without_bypass() {
     init_logging();
     info!("🧪 Test: DeleteObject blocked by GOVERNANCE retention without bypass");
@@ -175,7 +172,6 @@ async fn test_delete_object_blocked_by_governance_without_bypass() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_allowed_by_governance_with_bypass() {
     init_logging();
     info!("🧪 Test: DeleteObject allowed by GOVERNANCE retention with bypass");
@@ -215,7 +211,6 @@ async fn test_delete_object_allowed_by_governance_with_bypass() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_creates_delete_marker_for_retained_current_version() {
     init_logging();
     info!("🧪 Test: DeleteObject creates delete marker for retained current version");
@@ -266,7 +261,6 @@ async fn test_delete_object_creates_delete_marker_for_retained_current_version()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_blocked_by_legal_hold() {
     init_logging();
     info!("🧪 Test: DeleteObject blocked by Legal Hold");
@@ -299,7 +293,6 @@ async fn test_delete_object_blocked_by_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_allowed_with_legal_hold_off() {
     init_logging();
     info!("🧪 Test: DeleteObject allowed with Legal Hold OFF");
@@ -335,7 +328,6 @@ async fn test_delete_object_allowed_with_legal_hold_off() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_after_legal_hold_removed() {
     init_logging();
     info!("🧪 Test: DeleteObject succeeds after Legal Hold is removed");
@@ -369,7 +361,6 @@ async fn test_delete_object_after_legal_hold_removed() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_legal_hold_returns_updated_status() {
     init_logging();
     info!("🧪 Test: GetObjectLegalHold returns updated status");
@@ -425,7 +416,6 @@ async fn test_get_object_legal_hold_returns_updated_status() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_retention_returns_configured_values() {
     init_logging();
     info!("🧪 Test: GetObjectRetention returns configured values");
@@ -476,7 +466,6 @@ async fn test_get_object_retention_returns_configured_values() {
 // creating a new current version. The lock protects the existing version
 // from deletion; it never blocks new versions.
 #[tokio::test]
-#[serial]
 async fn test_put_object_overwrite_creates_new_version_under_legal_hold() {
     init_logging();
     info!("🧪 Test: PutObject overwrite of a legal-hold version creates a new version");
@@ -561,7 +550,6 @@ async fn test_put_object_overwrite_creates_new_version_under_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_copy_object_applies_requested_legal_hold() {
     init_logging();
     info!("🧪 Test: CopyObject applies requested Legal Hold");
@@ -613,7 +601,6 @@ async fn test_copy_object_applies_requested_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_copy_object_does_not_inherit_source_legal_hold() {
     init_logging();
     info!("🧪 Test: CopyObject does not inherit source Legal Hold");
@@ -707,7 +694,6 @@ async fn test_copy_object_does_not_inherit_source_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_copy_object_overwrite_creates_new_version_under_legal_hold() {
     init_logging();
     info!("🧪 Test: CopyObject overwrite of a legal-hold destination creates a new version");
@@ -787,7 +773,6 @@ async fn test_copy_object_overwrite_creates_new_version_under_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_create_multipart_upload_applies_requested_legal_hold() {
     init_logging();
     info!("🧪 Test: CreateMultipartUpload applies requested Legal Hold");
@@ -853,7 +838,6 @@ async fn test_create_multipart_upload_applies_requested_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_create_multipart_upload_creates_new_version_under_compliance_retention() {
     init_logging();
     info!("🧪 Test: CreateMultipartUpload over a COMPLIANCE-retained key creates a new version");
@@ -933,7 +917,6 @@ async fn test_create_multipart_upload_creates_new_version_under_compliance_reten
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_completed_multipart_object_blocked_by_legal_hold() {
     init_logging();
     info!("🧪 Test: Delete completed multipart object blocked by Legal Hold");
@@ -993,7 +976,6 @@ async fn test_delete_completed_multipart_object_blocked_by_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_completed_multipart_object_blocked_by_retention() {
     init_logging();
     info!("🧪 Test: Delete completed multipart object blocked by retention");
@@ -1055,7 +1037,6 @@ async fn test_delete_completed_multipart_object_blocked_by_retention() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_complete_multipart_upload_creates_new_version_under_legal_hold() {
     init_logging();
     info!("🧪 Test: CompleteMultipartUpload creates a new version when the current version is under Legal Hold");
@@ -1135,7 +1116,6 @@ async fn test_complete_multipart_upload_creates_new_version_under_legal_hold() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_complete_multipart_upload_creates_new_version_under_compliance_retention() {
     init_logging();
     info!("🧪 Test: CompleteMultipartUpload creates a new version when the current version is under COMPLIANCE retention");
@@ -1209,7 +1189,6 @@ async fn test_complete_multipart_upload_creates_new_version_under_compliance_ret
 }
 
 #[tokio::test]
-#[serial]
 async fn test_write_paths_require_put_object_legal_hold_permission() {
     init_logging();
     info!("🧪 Test: write paths require PutObjectLegalHold permission");
@@ -1273,7 +1252,6 @@ async fn test_write_paths_require_put_object_legal_hold_permission() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_write_paths_require_put_object_retention_permission() {
     init_logging();
     info!("🧪 Test: write paths require PutObjectRetention permission");
@@ -1345,7 +1323,6 @@ async fn test_write_paths_require_put_object_retention_permission() {
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_delete_objects_mixed_locked_unlocked() {
     init_logging();
     info!("🧪 Test: DeleteObjects with mixed locked and unlocked objects");
@@ -1427,7 +1404,6 @@ async fn test_delete_objects_mixed_locked_unlocked() {
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_put_retention_compliance_cannot_shorten() {
     init_logging();
     info!("🧪 Test: PutObjectRetention cannot shorten COMPLIANCE retention");
@@ -1468,7 +1444,6 @@ async fn test_put_retention_compliance_cannot_shorten() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_put_retention_compliance_can_extend() {
     init_logging();
     info!("🧪 Test: PutObjectRetention can extend COMPLIANCE retention");
@@ -1509,7 +1484,6 @@ async fn test_put_retention_compliance_can_extend() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_put_retention_governance_extend_without_bypass() {
     init_logging();
     info!("🧪 Test: PutObjectRetention on GOVERNANCE can extend without bypass");
@@ -1553,7 +1527,6 @@ async fn test_put_retention_governance_extend_without_bypass() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_put_retention_governance_shorten_requires_bypass() {
     init_logging();
     info!("🧪 Test: PutObjectRetention on GOVERNANCE requires bypass to shorten");
@@ -1615,7 +1588,6 @@ async fn test_put_retention_governance_shorten_requires_bypass() {
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_default_retention_applied_to_new_objects() {
     init_logging();
     info!("🧪 Test: Default retention is applied to new objects");
@@ -1685,7 +1657,6 @@ async fn test_default_retention_applied_to_new_objects() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_delete_object_creates_delete_marker_for_default_retained_current_version() {
     init_logging();
     info!("🧪 Test: DeleteObject creates delete marker for default-retained current version");
@@ -1770,7 +1741,6 @@ async fn test_delete_object_creates_delete_marker_for_default_retained_current_v
 }
 
 #[tokio::test]
-#[serial]
 async fn test_put_copy_and_multipart_reject_incomplete_retention_headers() {
     init_logging();
     info!("🧪 Test: write paths reject incomplete Object Lock retention headers");
@@ -1869,7 +1839,6 @@ async fn test_put_copy_and_multipart_reject_incomplete_retention_headers() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_copy_object_retention_uses_destination_policy() {
     init_logging();
     info!("🧪 Test: CopyObject retention follows destination policy");
@@ -2051,7 +2020,6 @@ async fn test_copy_object_retention_uses_destination_policy() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_multipart_default_retention_fixed_at_create() {
     init_logging();
     info!("🧪 Test: multipart default retention is fixed at CreateMultipartUpload");
@@ -2122,7 +2090,6 @@ async fn test_multipart_default_retention_fixed_at_create() {
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_unretained_object_lock_object_delete_and_bucket_cleanup() {
     init_logging();
     info!("🧪 Test: Unretained Object Lock object delete and bucket cleanup (Issue #5339)");
@@ -2243,7 +2210,6 @@ async fn test_unretained_object_lock_object_delete_and_bucket_cleanup() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_versioning_auto_enabled_with_object_lock() {
     init_logging();
     info!("🧪 Test: Versioning is auto-enabled when Object Lock is configured");
@@ -2302,7 +2268,6 @@ async fn test_versioning_auto_enabled_with_object_lock() {
 // ============================================================================
 
 #[tokio::test]
-#[serial]
 async fn test_error_message_distinguishes_legal_hold_from_retention() {
     init_logging();
     info!("🧪 Test: Error messages distinguish Legal Hold from Retention");
