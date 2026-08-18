@@ -19,11 +19,12 @@ use crate::heal::{
     resume::{
         CheckpointManager, ReplacementPhase, ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match,
     },
-    storage::{HealStorageAPI, next_heal_listing_token},
+    storage::{HealBucketUsageBaseline, HealStorageAPI, next_heal_listing_token},
 };
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,17 @@ pub enum HealPriority {
     High = 2,
     /// Urgent priority
     Urgent = 3,
+}
+
+impl HealPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
 }
 
 /// Heal options
@@ -498,6 +510,61 @@ impl HealTask {
         }
     }
 
+    fn emit_trace_task_state(&self, state: &'static str, duration: Duration, error: Option<&Error>) {
+        trace_emit(|| {
+            let mut event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealTask)
+                .with_duration(duration)
+                .with_attr("task_id", self.id.as_str())
+                .with_attr("heal_type", self.heal_type.log_kind())
+                .with_attr("state", state)
+                .with_attr("source", self.source.as_str())
+                .with_attr("priority", self.priority.as_str())
+                .with_attr("retry_attempts", u64::from(self.retry_attempts))
+                .with_attr("dry_run", self.options.dry_run);
+
+            event = match &self.heal_type {
+                HealType::Cluster => event,
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::Bucket { bucket } => event.with_bucket(bucket.as_str()),
+                HealType::Prefix { bucket, prefix } => event.with_bucket(bucket.as_str()).with_object(prefix.as_str()),
+                HealType::ErasureSet { buckets, set_disk_id } => {
+                    let bucket_count = u64::try_from(buckets.len()).unwrap_or(u64::MAX);
+                    event
+                        .with_attr("set_disk_id", set_disk_id.as_str())
+                        .with_attr("bucket_count", bucket_count)
+                }
+                HealType::Metadata { bucket, object } => event.with_bucket(bucket.as_str()).with_object(object.as_str()),
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::MRF { meta_path } => event.with_object(meta_path.as_str()),
+            };
+
+            match error {
+                Some(error) => event.with_attr("error", error.to_string()),
+                None => event,
+            }
+        });
+    }
+
     async fn remaining_timeout(&self) -> Result<Option<Duration>> {
         if let Some(total) = self.options.timeout {
             let start_instant = { *self.task_start_instant.read().await };
@@ -717,6 +784,7 @@ impl HealTask {
             queue_delay = ?queue_delay,
             "Heal task started"
         });
+        self.emit_trace_task_state("started", Duration::ZERO, None);
 
         let result = match &self.heal_type {
             HealType::Cluster => self.heal_cluster().await,
@@ -804,6 +872,14 @@ impl HealTask {
                 });
             }
         }
+
+        let terminal_state = match &result {
+            Ok(_) => "completed",
+            Err(Error::TaskCancelled) => "cancelled",
+            Err(Error::TaskTimeout) => "timed_out",
+            Err(_) => "failed",
+        };
+        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), result.as_ref().err());
 
         result
     }
@@ -1535,7 +1611,7 @@ impl HealTask {
             let (objects, next_token, is_truncated) = self
                 .await_with_control(
                     self.storage
-                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref()),
+                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false),
                 )
                 .await?;
 
@@ -1694,6 +1770,23 @@ impl HealTask {
             result = "recursive_ok",
             "Heal bucket recursive pass completed"
         );
+        Ok(())
+    }
+
+    async fn apply_erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<()> {
+        let baseline = match self
+            .await_with_control(self.storage.erasure_set_usage_baseline(buckets))
+            .await
+        {
+            Ok(Some(baseline)) => baseline,
+            Ok(None) => return Ok(()),
+            Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+            Err(_) => return Ok(()),
+        };
+
+        let HealBucketUsageBaseline { objects_count, bytes } = baseline;
+        let mut progress = self.progress.write().await;
+        progress.set_total_baseline(objects_count, bytes);
         Ok(())
     }
 
@@ -2298,6 +2391,8 @@ impl HealTask {
             None
         };
 
+        self.apply_erasure_set_usage_baseline(&buckets).await?;
+
         let healing_marker = format!("{set_disk_id}:{}", self.id);
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
             let state = resume_manager.get_state().await;
@@ -2602,7 +2697,8 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(4, 4, 0, 0);
+            let bytes_processed = progress.bytes_processed;
+            progress.update_progress(4, 4, 0, bytes_processed);
         }
 
         match result {
@@ -2658,6 +2754,7 @@ mod tests {
     use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
     use super::*;
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
+    use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, TraceSubscription, TraceVal, subscribe_trace_events};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
@@ -3203,6 +3300,8 @@ mod tests {
         block_heal_object: Mutex<bool>,
         resume_disk: Mutex<Option<DiskStore>>,
         replacement_resume_disk: Mutex<Option<DiskStore>>,
+        usage_baseline: Mutex<Option<HealBucketUsageBaseline>>,
+        usage_baseline_error: Mutex<bool>,
     }
 
     #[test]
@@ -3265,11 +3364,69 @@ mod tests {
         assert_eq!(samples_logged, MAX_BUCKET_FAILURE_LOG_SAMPLES);
     }
 
+    #[tokio::test]
+    async fn execute_emits_heal_trace_task_state() {
+        let mut trace = subscribe_trace_events();
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(
+            HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+            storage,
+        );
+
+        task.execute().await.expect("mock object heal should complete");
+
+        let started = recv_trace_task_state(&mut trace, &task.id, "started").await;
+        assert_eq!(started.kind, TraceKind::Heal);
+        assert_eq!(started.func, TraceFunc::HealTask);
+        assert_eq!(started.bucket.as_deref(), Some("bucket-a"));
+        assert_eq!(started.object.as_deref(), Some("object-a"));
+        assert_eq!(trace_attr_string(&started, "heal_type").as_deref(), Some("object"));
+        assert_eq!(trace_attr_string(&started, "source").as_deref(), Some("internal"));
+        assert_eq!(trace_attr_string(&started, "version_id").as_deref(), Some("version-a"));
+
+        let completed = recv_trace_task_state(&mut trace, &task.id, "completed").await;
+        assert_eq!(completed.kind, TraceKind::Heal);
+        assert_eq!(completed.func, TraceFunc::HealTask);
+        assert_eq!(trace_attr_string(&completed, "state").as_deref(), Some("completed"));
+    }
+
+    async fn recv_trace_task_state(trace: &mut TraceSubscription, task_id: &str, state: &str) -> TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
+                .await
+                .expect("trace event should arrive")
+                .expect("trace bus should stay open");
+            if trace_attr_string(&event, "task_id").as_deref() == Some(task_id)
+                && trace_attr_string(&event, "state").as_deref() == Some(state)
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected trace state {state} for task {task_id}");
+    }
+
+    fn trace_attr_string(event: &TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                TraceVal::Bool(value) => value.to_string(),
+                TraceVal::U64(value) => value.to_string(),
+                TraceVal::I64(value) => value.to_string(),
+                TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
     /// Build a latest, non-delete-marker heal list item with no version id.
     fn heal_item(name: &str) -> HealListItem {
         HealListItem {
             name: name.to_string(),
             version_id: None,
+            mod_time_unix_nanos: None,
+            lifecycle_object_info: None,
             is_delete_marker: false,
         }
     }
@@ -3355,6 +3512,13 @@ mod tests {
                 name: bucket.to_string(),
                 ..Default::default()
             }))
+        }
+
+        async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+            if *self.usage_baseline_error.lock().unwrap() {
+                return Err(Error::Other("usage baseline unavailable".to_string()));
+            }
+            Ok(*self.usage_baseline.lock().unwrap())
         }
 
         async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
@@ -3540,6 +3704,7 @@ mod tests {
             bucket: &str,
             prefix: &str,
             continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
             self.listed_prefixes.lock().unwrap().push(prefix.to_string());
             if *self.truncate_without_token.lock().unwrap() {
@@ -4652,6 +4817,73 @@ mod tests {
         assert!(error.to_string().contains("injected bucket prepass failure"));
         assert_eq!(storage.bucket_heal_calls.lock().unwrap().as_slice(), ["bucket-a".to_string()]);
         assert!(storage.object_heal_opts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_applies_usage_baseline_to_progress() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
+                objects_count: 10,
+                bytes: 8,
+            })),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("erasure set heal should complete");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 10);
+        assert_eq!(progress.objects_total_size, 8);
+        assert_eq!(progress.bytes_processed, 2);
+        assert!((progress.progress_percentage - 25.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_ignores_usage_baseline_errors() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline_error: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("usage baseline failures should not fail erasure set heal");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 0);
+        assert_eq!(progress.objects_total_size, 0);
     }
 
     #[tokio::test]
