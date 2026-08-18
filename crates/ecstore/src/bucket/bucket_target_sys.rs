@@ -1549,8 +1549,8 @@ impl Default for PutObjectOptions {
     }
 }
 
-#[allow(dead_code)]
 impl PutObjectOptions {
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1561,6 +1561,7 @@ impl PutObjectOptions {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1696,6 +1697,7 @@ impl PutObjectOptions {
         header
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn validate(&self, _c: Arc<TargetClient>) -> Result<(), std::io::Error> {
         //if self.checksum.is_set() {
         /*if !self.trailing_header_support {

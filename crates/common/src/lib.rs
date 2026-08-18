@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod mrf_channel;
 mod readiness;
 pub mod table_catalog;
+pub mod trace_bus;
 
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};

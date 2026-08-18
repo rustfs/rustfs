@@ -39,7 +39,6 @@ use rustfs_config::{
 };
 use std::sync::LazyLock;
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
 pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
@@ -117,7 +116,6 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit MQTT settings.
 pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
@@ -375,7 +373,6 @@ pub static DEFAULT_AUDIT_NATS_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 pub static DEFAULT_AUDIT_PULSAR_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {

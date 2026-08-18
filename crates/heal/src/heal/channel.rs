@@ -768,6 +768,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> crate::Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
