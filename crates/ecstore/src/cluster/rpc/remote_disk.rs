@@ -3502,9 +3502,11 @@ mod tests {
                             Box::pin(async move {
                                 peer.verify_auth(&request, "/node_service.NodeService/ReadAll")?;
                                 let request = request.into_inner();
+                                let is_format_read = request.volume == crate::disk::RUSTFS_META_BUCKET
+                                    && request.path == crate::disk::FORMAT_CONFIG_FILE;
                                 let disk = request.disk;
                                 peer.read_all_calls.fetch_add(1, Ordering::AcqRel);
-                                let data = if request.path.ends_with("format.json") {
+                                let data = if is_format_read {
                                     peer.format_data.clone()
                                 } else {
                                     peer.object_read_all_disks
@@ -4832,7 +4834,7 @@ mod tests {
                     0,
                     0,
                     vec![endpoint.clone()],
-                    format.clone(),
+                    format,
                     Vec::new(),
                 )
                 .await;
