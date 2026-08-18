@@ -4848,7 +4848,10 @@ mod tests {
                 })
                 .await
                 .expect("teardown failure should re-arm recovery monitoring");
-                assert!(disk.recovery_monitor_is_active(), "re-armed monitor should retain single-flight ownership");
+                assert!(
+                    disk.recovery_monitor_is_active(),
+                    "re-armed monitor should retain single-flight ownership"
+                );
 
                 disk.cancel_token.cancel();
                 tokio::time::timeout(Duration::from_secs(2), async {
@@ -6553,7 +6556,10 @@ mod tests {
         )
         .await
         .expect("replacement remote disk should construct");
-        assert_ne!(remote_disk.handle_id, replacement.handle_id, "replacement handles need distinct log identities");
+        assert_ne!(
+            remote_disk.handle_id, replacement.handle_id,
+            "replacement handles need distinct log identities"
+        );
 
         let span = tracing::info_span!("request-span", request_id = "req-remote-disk");
         let _entered = span.enter();
