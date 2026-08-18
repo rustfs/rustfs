@@ -55,7 +55,7 @@ rustfs/                      # Workspace root (virtual manifest)
 ├── crates/                  # library crates (authoritative list: Cargo.toml [workspace].members)
 │   ├── ecstore/             # Erasure-coded storage engine
 │   ├── rio/                 # Reader I/O pipeline (encrypt, compress, hash)
-│   ├── io-core/             # Buffer pool, storage profiling, admission control
+│   ├── io-core/             # Buffer pool, storage profiling, backpressure/deadlock policy, lock optimizer, operation progress
 │   ├── io-metrics/          # I/O metrics collection
 │   ├── common/              # Shared runtime state, globals, data usage types
 │   ├── config/              # Configuration types and parsing
