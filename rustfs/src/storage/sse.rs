@@ -2719,6 +2719,7 @@ pub trait SseDekProvider: Send + Sync {
     /// Defaults to refusing: only a provider holding the MinIO master secret
     /// can serve these, and a provider that cannot must fail rather than fall
     /// back to a decoder that would misread the bytes.
+    #[cfg(feature = "rio-v2")]
     async fn decrypt_minio_sse_dek(
         &self,
         _encrypted_dek: &[u8],
