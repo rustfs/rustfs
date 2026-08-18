@@ -16,6 +16,7 @@ pub mod channel;
 pub mod erasure_healer;
 pub mod event;
 pub mod manager;
+pub mod mrf_queue;
 pub mod progress;
 pub(crate) mod replacement_readiness;
 pub mod resume;
