@@ -948,6 +948,10 @@ pub(crate) mod runtime {
 
     #[cfg(test)]
     pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+    /// Test-only: the process instance context, so a handler test can publish
+    /// the endpoint topology that server startup normally installs.
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_runtime::bootstrap_ctx;
 }
 
 pub(crate) mod s3 {
