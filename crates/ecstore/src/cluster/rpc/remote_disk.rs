@@ -231,6 +231,8 @@ pub struct RemoteDisk {
     recovery_monitor_active: Arc<AtomicBool>,
     #[cfg(test)]
     recovery_monitor_start_count: Arc<AtomicU32>,
+    #[cfg(test)]
+    recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     data_transport: Arc<dyn InternodeDataTransport>,
 }
 
@@ -242,6 +244,13 @@ impl Drop for RecoveryMonitorLease {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RecoveryMonitorTeardownHook {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 // ── Connection lifecycle (grpc-optimization P3) ──
@@ -438,6 +447,8 @@ impl RemoteDisk {
             recovery_monitor_active: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             recovery_monitor_start_count: Arc::new(AtomicU32::new(0)),
+            #[cfg(test)]
+            recovery_monitor_teardown_hook: Arc::new(tokio::sync::Mutex::new(None)),
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
@@ -612,6 +623,8 @@ impl RemoteDisk {
             Arc::clone(&self.recovery_monitor_active),
             #[cfg(test)]
             Arc::clone(&self.recovery_monitor_start_count),
+            #[cfg(test)]
+            Arc::clone(&self.recovery_monitor_teardown_hook),
         );
     }
 
@@ -623,6 +636,7 @@ impl RemoteDisk {
         cancel_token: CancellationToken,
         active: Arc<AtomicBool>,
         #[cfg(test)] start_count: Arc<AtomicU32>,
+        #[cfg(test)] teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     ) {
         if active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -638,6 +652,11 @@ impl RemoteDisk {
                 active: Arc::clone(&active),
             };
             Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
+            #[cfg(test)]
+            if let Some(hook) = teardown_hook.lock().await.take() {
+                hook.arrived.notify_one();
+                hook.release.notified().await;
+            }
             drop(lease);
             if !cancel_token.is_cancelled() && health.runtime_state() != RuntimeDriveHealthState::Online {
                 Self::schedule_recovery_monitor(
@@ -649,6 +668,8 @@ impl RemoteDisk {
                     active,
                     #[cfg(test)]
                     start_count,
+                    #[cfg(test)]
+                    teardown_hook,
                 );
             }
         });
@@ -692,9 +713,21 @@ impl RemoteDisk {
         let endpoint = self.endpoint.clone();
         let handle_id = self.handle_id;
         let recovery_monitor_active = Arc::clone(&self.recovery_monitor_active);
+        #[cfg(test)]
+        let recovery_monitor_teardown_hook = Arc::clone(&self.recovery_monitor_teardown_hook);
 
         tokio::spawn(async move {
-            Self::monitor_remote_disk_health(addr, endpoint, handle_id, health, cancel_token, recovery_monitor_active).await;
+            Self::monitor_remote_disk_health(
+                addr,
+                endpoint,
+                handle_id,
+                health,
+                cancel_token,
+                recovery_monitor_active,
+                #[cfg(test)]
+                recovery_monitor_teardown_hook,
+            )
+            .await;
         });
     }
 
@@ -706,6 +739,7 @@ impl RemoteDisk {
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
         recovery_monitor_active: Arc<AtomicBool>,
+        #[cfg(test)] recovery_monitor_teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
     ) {
         let mut interval = time::interval(get_drive_active_check_interval());
 
@@ -739,6 +773,8 @@ impl RemoteDisk {
                 Arc::clone(&recovery_monitor_active),
                 #[cfg(test)]
                 Arc::new(AtomicU32::new(0)),
+                #[cfg(test)]
+                Arc::clone(&recovery_monitor_teardown_hook),
             );
         }
 
@@ -807,6 +843,8 @@ impl RemoteDisk {
                             Arc::clone(&recovery_monitor_active),
                             #[cfg(test)]
                             Arc::new(AtomicU32::new(0)),
+                            #[cfg(test)]
+                            Arc::clone(&recovery_monitor_teardown_hook),
                         );
                     }
                 }
@@ -4757,6 +4795,78 @@ mod tests {
 
     #[tokio::test]
     #[serial(remote_disk_recovery_probe)]
+    async fn recovery_monitor_rearms_if_disk_fails_during_teardown() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some(peer) = TestGrpcPeer::spawn(Bytes::new(), Bytes::new()).await else {
+            return;
+        };
+        let endpoint = Endpoint {
+            url: url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("endpoint should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct");
+        if !disk.health_check {
+            peer.stop().await;
+            return;
+        }
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        let hook = Arc::new(RecoveryMonitorTeardownHook::default());
+        *disk.recovery_monitor_teardown_hook.lock().await = Some(Arc::clone(&hook));
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_RETURNING_PROBE_INTERVAL_SECS, Some("1")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("1")),
+                (rustfs_config::ENV_DRIVE_ACTIVE_CHECK_TIMEOUT_SECS, Some("1")),
+            ],
+            async {
+                disk.spawn_recovery_monitor_if_needed();
+                tokio::time::timeout(Duration::from_secs(5), hook.arrived.notified())
+                    .await
+                    .expect("first recovery monitor should reach teardown");
+                assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+
+                disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                hook.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while disk.recovery_monitor_start_count() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("teardown failure should re-arm recovery monitoring");
+                assert!(disk.recovery_monitor_is_active(), "re-armed monitor should retain single-flight ownership");
+
+                disk.cancel_token.cancel();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while disk.recovery_monitor_is_active() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("cancelled re-armed monitor should release single-flight state");
+            },
+        )
+        .await;
+
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
     async fn recovery_monitor_restores_online_then_real_reads_use_replacement_handle() {
         runtime_sources::ensure_test_rpc_secret();
         let mut format = crate::layout::format::FormatV3::new(1, 1);
@@ -6433,6 +6543,17 @@ mod tests {
         )
         .await
         .expect("remote disk should construct");
+        let replacement = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("replacement remote disk should construct");
+        assert_ne!(remote_disk.handle_id, replacement.handle_id, "replacement handles need distinct log identities");
 
         let span = tracing::info_span!("request-span", request_id = "req-remote-disk");
         let _entered = span.enter();
@@ -6448,11 +6569,24 @@ mod tests {
 
         assert_eq!(log["span"]["name"], Value::String("recovery-monitor".to_string()));
         assert_eq!(log["span"]["kind"], Value::String("remote_disk".to_string()));
+        assert_eq!(log["span"]["handle_id"], Value::String(remote_disk.handle_id.to_string()));
         let spans = log["spans"].as_array().expect("spans should be present");
         assert!(spans.iter().any(|span| {
             span.get("name").and_then(Value::as_str) == Some("request-span")
                 && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk")
         }));
+
+        remote_disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        remote_disk
+            .execute_with_timeout(|| async { Ok::<(), Error>(()) }, Duration::from_secs(1))
+            .await
+            .expect_err("faulty handle should short-circuit");
+        let faulty_log = logs
+            .lines()
+            .into_iter()
+            .find(|value| value.get("state").and_then(Value::as_str) == Some("faulty_short_circuit"))
+            .expect("expected faulty short-circuit log");
+        assert_eq!(faulty_log["handle_id"], Value::String(remote_disk.handle_id.to_string()));
     }
 
     #[tokio::test(flavor = "current_thread")]

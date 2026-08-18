@@ -2962,32 +2962,54 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn concurrent_failure_and_recovery_publish_one_health_snapshot() {
-        let endpoint = Endpoint::try_from("/tmp/concurrent-health-snapshot").expect("endpoint should parse");
-        let health = Arc::new(DiskHealthTracker::new());
-        let workers = (0..8)
-            .map(|_| {
-                let health = Arc::clone(&health);
-                let endpoint = endpoint.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..32 {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_SUSPECT_FAILURE_THRESHOLD, Some("2"), || {
+            let endpoint = Endpoint::try_from("/tmp/concurrent-health-snapshot").expect("endpoint should parse");
+            let health = Arc::new(DiskHealthTracker::new());
+            let transition_guard = health
+                .transition_lock
+                .lock()
+                .expect("health transition lock should not be poisoned");
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let workers = (0..2)
+                .map(|_| {
+                    let health = Arc::clone(&health);
+                    let endpoint = endpoint.clone();
+                    let start = Arc::clone(&start);
+                    let completed_tx = completed_tx.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
                         health.mark_failure(&endpoint, "concurrent_test");
-                        health.mark_recovery_success(&endpoint, "concurrent_test");
-                        let (runtime, faulty) = health.health_state_snapshot();
-                        assert!(matches!(
-                            (runtime, faulty),
-                            (RuntimeDriveHealthState::Online, false)
-                                | (RuntimeDriveHealthState::Suspect, false)
-                                | (RuntimeDriveHealthState::Offline, true)
-                                | (RuntimeDriveHealthState::Returning, true)
-                        ));
-                    }
+                        completed_tx.send(()).expect("completion receiver should remain available");
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        for worker in workers {
-            worker.join().expect("health transition worker should not panic");
-        }
+                .collect::<Vec<_>>();
+
+            start.wait();
+            assert!(
+                matches!(
+                    completed_rx.recv_timeout(Duration::from_millis(250)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "concurrent transitions must wait for the serialization lock"
+            );
+            drop(transition_guard);
+            completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first failure transition should complete after lock release");
+            completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second failure transition should complete after lock release");
+            for worker in workers {
+                worker.join().expect("health transition worker should not panic");
+            }
+
+            assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+            assert!(health.is_faulty());
+            assert_eq!(health.consecutive_failures.load(Ordering::Acquire), 2);
+        });
     }
 
     #[test]
