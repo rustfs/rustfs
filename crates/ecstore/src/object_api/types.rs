@@ -277,6 +277,20 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
+    /// True when the inbound request carried the
+    /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
+    /// value "true": the request was already proxied by a replication peer,
+    /// so this server must not proxy a local miss onward (anti-loop,
+    /// MinIO-compatible). The header only disables proxying — it grants no
+    /// capability — so no authorization gate is required to honor it.
+    pub proxy_request: bool,
+    /// True when the `source-proxy-request` header family was present at
+    /// all, regardless of value (MinIO's `ProxyHeaderSet`). A replication
+    /// peer sends `source-proxy-request: false` on its worker convergence
+    /// HEADs precisely so the receiver answers locally instead of proxying
+    /// back — otherwise a proxied 404->200 echo makes the worker believe the
+    /// object already converged and it never replicates it.
+    pub proxy_header_set: bool,
     /// Source-cluster LWW timestamps carried by an authorized replication
     /// request; None when the source never modified the category. Only the
     /// replication-authorized options builders may set these.

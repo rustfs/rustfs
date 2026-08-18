@@ -667,6 +667,368 @@ async fn acknowledge_mrf_recovery<S: ReplicationStorage>(
     Err(EcstoreError::PreconditionFailed)
 }
 
+/// Acquires the MRF recovery leader lock for the startup replay.
+/// Returns `None` (after logging) when the lock cannot be created or another
+/// node is already processing the backlog.
+async fn acquire_mrf_recovery_guard<S: ReplicationStorage>(storage: &Arc<S>) -> Option<rustfs_lock::NamespaceLockGuard> {
+    let recovery_lock = match storage
+        .new_ns_lock(
+            ReplicationMetadataStore::rustfs_meta_bucket(),
+            ReplicationMetadataStore::MRF_REPLICATION_RECOVERY_LOCK,
+        )
+        .await
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %error,
+                "Failed to create the MRF recovery leader lock"
+            );
+            return None;
+        }
+    };
+    match recovery_lock
+        .get_write_lock_quiet(ReplicationLockTiming::acquire_timeout())
+        .await
+    {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            debug!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                "Another node is already processing the MRF recovery backlog"
+            );
+            None
+        }
+    }
+}
+
+/// Reads and decodes the on-disk MRF recovery file.
+/// Returns `None` when there is nothing to replay: missing file (publishes an
+/// empty available summary), read failure, or corrupt data (quarantined).
+async fn load_mrf_recovery_entries<S: ReplicationStorage>(storage: &Arc<S>) -> Option<Vec<MrfReplicateEntry>> {
+    let data = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
+        Ok(d) => d,
+        Err(EcstoreError::ConfigNotFound) => {
+            set_durable_mrf_backlog_summary(DurableMrfBacklogSummary {
+                available: true,
+                buckets: Vec::new(),
+            });
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %e,
+                "Failed to load MRF recovery file"
+            );
+            return None;
+        }
+    };
+
+    match decode_mrf_file(&data) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %e,
+                "Failed to decode MRF recovery file — preserving corrupt data"
+            );
+            quarantine_mrf_file(storage, &data).await;
+            None
+        }
+    }
+}
+
+/// Replays one MRF recovery entry by operation kind.
+/// Returns `None` when the entry is skipped entirely (no admission outcome);
+/// entries that must be retried later are pushed onto `retry_entries`.
+async fn replay_mrf_entry<S: ReplicationStorage>(
+    entry: &MrfReplicateEntry,
+    storage: &Arc<S>,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicationQueueAdmission> {
+    match entry.op {
+        MrfOpKind::Delete => replay_mrf_delete_entry(entry, storage, retry_entries).await,
+        MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
+            replay_mrf_object_entry(entry, storage, retry_entries).await
+        }
+        MrfOpKind::Metadata => replay_mrf_metadata_entry(entry, storage, retry_entries).await,
+    }
+}
+
+/// Replays a delete-kind MRF entry: force-delete intents replay directly,
+/// stale force-delete generations are skipped, and plain deletes are
+/// reconstructed as heal deletes.
+async fn replay_mrf_delete_entry<S: ReplicationStorage>(
+    entry: &MrfReplicateEntry,
+    storage: &Arc<S>,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicationQueueAdmission> {
+    if should_replay_force_delete_intent(entry) {
+        let operation_id = entry.force_delete_id?;
+        let delete = force_delete_heal_replication_info(entry, operation_id);
+        if replicate_delete_with_outcome(delete, storage.clone()).await {
+            Some(ReplicationQueueAdmission::Queued)
+        } else {
+            Some(ReplicationQueueAdmission::Missed)
+        }
+    } else if entry.force_delete_id.is_some() {
+        Some(ReplicationQueueAdmission::Skipped)
+    } else {
+        replay_mrf_reconstructed_delete(entry, storage, retry_entries).await
+    }
+}
+
+/// Pure DTO construction: heal replication info for a replayed force-delete intent.
+fn force_delete_heal_replication_info(entry: &MrfReplicateEntry, operation_id: uuid::Uuid) -> DeletedObjectReplicationInfo {
+    DeletedObjectReplicationInfo {
+        delete_object: ReplicationDeletedObject {
+            object_name: entry.object.clone(),
+            force_delete: true,
+            force_delete_id: Some(operation_id),
+            force_delete_target_arns: entry.target_arns.clone(),
+            force_delete_generation: entry.force_delete_generation,
+            ..Default::default()
+        },
+        bucket: entry.bucket.clone(),
+        op_type: ReplicationType::Heal,
+        event_type: REPLICATE_HEAL_DELETE.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Reconstruct a heal delete and re-queue it.  We do NOT call
+/// get_object_info here because the delete-marker or version may
+/// already be absent from the local store — that is expected.
+async fn replay_mrf_reconstructed_delete<S: ReplicationStorage>(
+    entry: &MrfReplicateEntry,
+    storage: &Arc<S>,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicationQueueAdmission> {
+    let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
+    let oi = ObjectInfo {
+        bucket: entry.bucket.clone(),
+        name: entry.object.clone(),
+        version_id: entry.version_id,
+        delete_marker: entry.delete_marker,
+        ..Default::default()
+    };
+    let dsc = resolve_mrf_delete_replicate_decision(entry, &oi, versioned, retry_entries).await?;
+    let dv = reconstructed_heal_delete_info(entry, &oi, &dsc);
+    if replicate_delete_with_outcome(dv, storage.clone()).await {
+        Some(ReplicationQueueAdmission::Queued)
+    } else {
+        Some(ReplicationQueueAdmission::Missed)
+    }
+}
+
+/// The MRF entry does not persist the replication decision and the
+/// source object is gone, so re-derive the decision from the live
+/// bucket config (mirroring get_heal_replicate_object_info) and set
+/// it on the reconstructed delete. Without this the decision string
+/// is empty and the delete replicates to zero targets — a silent
+/// no-op that leaves replicas diverged (backlog#858 / #799 B9).
+async fn resolve_mrf_delete_replicate_decision(
+    entry: &MrfReplicateEntry,
+    oi: &ObjectInfo,
+    versioned: bool,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicateDecision> {
+    if entry.target_arns.is_empty() {
+        match ReplicationMetadataStore::optional_replication_config(&entry.bucket).await {
+            Ok(None) => None,
+            Err(_) => {
+                retry_entries.push(entry.clone());
+                None
+            }
+            Ok(Some(_)) => match check_replicate_delete_strict(
+                &entry.bucket,
+                &ObjectToDelete {
+                    object_name: entry.object.clone(),
+                    version_id: entry.version_id,
+                    ..Default::default()
+                },
+                oi,
+                &ObjectOptions {
+                    versioned,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            {
+                Ok(dsc) => Some(dsc),
+                Err(_) => {
+                    retry_entries.push(entry.clone());
+                    None
+                }
+            },
+        }
+    } else {
+        Some(replicate_decision_for_admitted_targets(&entry.target_arns))
+    }
+}
+
+/// Pure DTO construction: reconstructed heal delete carrying the re-derived
+/// replication decision.
+fn reconstructed_heal_delete_info(
+    entry: &MrfReplicateEntry,
+    oi: &ObjectInfo,
+    dsc: &ReplicateDecision,
+) -> DeletedObjectReplicationInfo {
+    let mut rstate = oi.replication_state();
+    rstate.replicate_decision_str = dsc.to_string();
+
+    let delete_marker_mtime = entry
+        .delete_marker_mtime
+        .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).ok());
+
+    DeletedObjectReplicationInfo {
+        delete_object: ReplicationDeletedObject {
+            object_name: entry.object.clone(),
+            version_id: entry.version_id,
+            delete_marker_version_id: entry.delete_marker_version_id,
+            delete_marker: entry.delete_marker,
+            delete_marker_mtime,
+            force_delete: entry.force_delete,
+            replication_state: Some(rstate),
+            ..Default::default()
+        },
+        bucket: entry.bucket.clone(),
+        op_type: ReplicationType::Heal,
+        event_type: REPLICATE_HEAL_DELETE.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Replays an Object/Heal/ExistingObject MRF entry against the live source object.
+async fn replay_mrf_object_entry<S: ReplicationStorage>(
+    entry: &MrfReplicateEntry,
+    storage: &Arc<S>,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicationQueueAdmission> {
+    let opts = ObjectOptions {
+        version_id: entry.version_id.map(|u| u.to_string()),
+        ..Default::default()
+    };
+    let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+        Ok(oi) => oi,
+        Err(e) => {
+            debug!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %entry.bucket,
+                object = %entry.object,
+                error = %e,
+                "MRF recovery: source object lookup failed"
+            );
+            if should_retry_mrf_source_lookup(&e) {
+                retry_entries.push(entry.clone());
+            }
+            return None;
+        }
+    };
+    if entry.target_arns.is_empty() {
+        // Legacy entries predate target admission persistence. They cannot
+        // be safely attributed, so retain the old live-config fallback.
+        Some(queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
+    } else {
+        let roi = admitted_mrf_replicate_object(oi, entry, entry.op.replication_type());
+        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+            Some(ReplicationQueueAdmission::Queued)
+        } else {
+            Some(ReplicationQueueAdmission::Missed)
+        }
+    }
+}
+
+/// Replays a metadata-kind MRF entry against the live source object.
+async fn replay_mrf_metadata_entry<S: ReplicationStorage>(
+    entry: &MrfReplicateEntry,
+    storage: &Arc<S>,
+    retry_entries: &mut Vec<MrfReplicateEntry>,
+) -> Option<ReplicationQueueAdmission> {
+    let opts = ObjectOptions {
+        version_id: entry.version_id.map(|u| u.to_string()),
+        ..Default::default()
+    };
+    let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
+        Ok(oi) => oi,
+        Err(e) => {
+            debug!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                bucket = %entry.bucket,
+                object = %entry.object,
+                error = %e,
+                "MRF metadata recovery: source object lookup failed"
+            );
+            if should_retry_mrf_source_lookup(&e) {
+                retry_entries.push(entry.clone());
+            }
+            return None;
+        }
+    };
+    if entry.target_arns.is_empty() {
+        Some(queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
+    } else {
+        let roi = admitted_mrf_replicate_object(oi, entry, ReplicationType::Metadata);
+        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+            Some(ReplicationQueueAdmission::Queued)
+        } else {
+            Some(ReplicationQueueAdmission::Missed)
+        }
+    }
+}
+
+/// Pure DTO construction: replicate-object info for an entry with persisted
+/// admitted targets, carrying over the entry's retry count.
+fn admitted_mrf_replicate_object(oi: ObjectInfo, entry: &MrfReplicateEntry, op_type: ReplicationType) -> ReplicateObjectInfo {
+    let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
+    let mut roi = replicate_object_info_from_object_info(oi, dsc, op_type);
+    roi.retry_count = entry.retry_count.max(0) as u32;
+    roi
+}
+
+/// Acknowledges the replayed MRF prefix and returns the retained backlog.
+/// On acknowledgement failure the backlog is preserved for the next startup and
+/// re-read (falling back to the replayed snapshot) so the published summary stays accurate.
+async fn resolve_retained_mrf_entries<S: ReplicationStorage>(
+    storage: &Arc<S>,
+    recovery_guard: &rustfs_lock::NamespaceLockGuard,
+    entries: &[MrfReplicateEntry],
+    retry_entries: &[MrfReplicateEntry],
+) -> Vec<MrfReplicateEntry> {
+    match acknowledge_mrf_recovery(storage.clone(), recovery_guard, entries, retry_entries).await {
+        Ok(retained) => retained,
+        Err(error) => {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
+                error = %error,
+                "Failed to acknowledge the MRF recovery prefix; preserving it for the next startup"
+            );
+            match read_mrf_entries(storage.clone()).await {
+                Ok(current) => current,
+                Err(read_error) => {
+                    warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                        error = %read_error,
+                        "Failed to refresh the MRF backlog after acknowledgement failure"
+                    );
+                    entries.to_vec()
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("replication resync {active_resync_id} is already active for {bucket}/{arn}")]
 struct ResyncActiveConflictError {
@@ -1221,71 +1583,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
-            let recovery_lock = match storage
-                .new_ns_lock(
-                    ReplicationMetadataStore::rustfs_meta_bucket(),
-                    ReplicationMetadataStore::MRF_REPLICATION_RECOVERY_LOCK,
-                )
-                .await
-            {
-                Ok(lock) => lock,
-                Err(error) => {
-                    warn!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                        error = %error,
-                        "Failed to create the MRF recovery leader lock"
-                    );
-                    return;
-                }
-            };
-            let recovery_guard = match recovery_lock
-                .get_write_lock_quiet(ReplicationLockTiming::acquire_timeout())
-                .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    debug!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                        "Another node is already processing the MRF recovery backlog"
-                    );
-                    return;
-                }
+            let Some(recovery_guard) = acquire_mrf_recovery_guard(&storage).await else {
+                return;
             };
 
-            let data = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
-                Ok(d) => d,
-                Err(EcstoreError::ConfigNotFound) => {
-                    set_durable_mrf_backlog_summary(DurableMrfBacklogSummary {
-                        available: true,
-                        buckets: Vec::new(),
-                    });
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                        error = %e,
-                        "Failed to load MRF recovery file"
-                    );
-                    return;
-                }
-            };
-
-            let entries = match decode_mrf_file(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                        error = %e,
-                        "Failed to decode MRF recovery file — preserving corrupt data"
-                    );
-                    quarantine_mrf_file(&storage, &data).await;
-                    return;
-                }
+            let Some(entries) = load_mrf_recovery_entries(&storage).await else {
+                return;
             };
             set_durable_mrf_backlog_snapshot(durable_mrf_backlog_summary_from_entries(&entries));
 
@@ -1294,187 +1597,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let mut retry_entries = Vec::new();
 
             for entry in entries.iter() {
-                let admission = match entry.op {
-                    MrfOpKind::Delete => {
-                        if should_replay_force_delete_intent(entry) {
-                            let Some(operation_id) = entry.force_delete_id else {
-                                continue;
-                            };
-                            let delete = DeletedObjectReplicationInfo {
-                                delete_object: ReplicationDeletedObject {
-                                    object_name: entry.object.clone(),
-                                    force_delete: true,
-                                    force_delete_id: Some(operation_id),
-                                    force_delete_target_arns: entry.target_arns.clone(),
-                                    force_delete_generation: entry.force_delete_generation,
-                                    ..Default::default()
-                                },
-                                bucket: entry.bucket.clone(),
-                                op_type: ReplicationType::Heal,
-                                event_type: REPLICATE_HEAL_DELETE.to_string(),
-                                ..Default::default()
-                            };
-                            if replicate_delete_with_outcome(delete, storage.clone()).await {
-                                ReplicationQueueAdmission::Queued
-                            } else {
-                                ReplicationQueueAdmission::Missed
-                            }
-                        } else if entry.force_delete_id.is_some() {
-                            ReplicationQueueAdmission::Skipped
-                        } else {
-                            // Reconstruct a heal delete and re-queue it.  We do NOT call
-                            // get_object_info here because the delete-marker or version may
-                            // already be absent from the local store — that is expected.
-                            //
-                            // The MRF entry does not persist the replication decision and the
-                            // source object is gone, so re-derive the decision from the live
-                            // bucket config (mirroring get_heal_replicate_object_info) and set
-                            // it on the reconstructed delete. Without this the decision string
-                            // is empty and the delete replicates to zero targets — a silent
-                            // no-op that leaves replicas diverged (backlog#858 / #799 B9).
-                            let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
-                            let oi = ObjectInfo {
-                                bucket: entry.bucket.clone(),
-                                name: entry.object.clone(),
-                                version_id: entry.version_id,
-                                delete_marker: entry.delete_marker,
-                                ..Default::default()
-                            };
-                            let dsc = if entry.target_arns.is_empty() {
-                                match ReplicationMetadataStore::optional_replication_config(&entry.bucket).await {
-                                    Ok(None) => continue,
-                                    Err(_) => {
-                                        retry_entries.push(entry.clone());
-                                        continue;
-                                    }
-                                    Ok(Some(_)) => match check_replicate_delete_strict(
-                                        &entry.bucket,
-                                        &ObjectToDelete {
-                                            object_name: entry.object.clone(),
-                                            version_id: entry.version_id,
-                                            ..Default::default()
-                                        },
-                                        &oi,
-                                        &ObjectOptions {
-                                            versioned,
-                                            ..Default::default()
-                                        },
-                                        None,
-                                    )
-                                    .await
-                                    {
-                                        Ok(dsc) => dsc,
-                                        Err(_) => {
-                                            retry_entries.push(entry.clone());
-                                            continue;
-                                        }
-                                    },
-                                }
-                            } else {
-                                replicate_decision_for_admitted_targets(&entry.target_arns)
-                            };
-                            let mut rstate = oi.replication_state();
-                            rstate.replicate_decision_str = dsc.to_string();
-
-                            let delete_marker_mtime = entry
-                                .delete_marker_mtime
-                                .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).ok());
-
-                            let dv = DeletedObjectReplicationInfo {
-                                delete_object: ReplicationDeletedObject {
-                                    object_name: entry.object.clone(),
-                                    version_id: entry.version_id,
-                                    delete_marker_version_id: entry.delete_marker_version_id,
-                                    delete_marker: entry.delete_marker,
-                                    delete_marker_mtime,
-                                    force_delete: entry.force_delete,
-                                    replication_state: Some(rstate),
-                                    ..Default::default()
-                                },
-                                bucket: entry.bucket.clone(),
-                                op_type: ReplicationType::Heal,
-                                event_type: REPLICATE_HEAL_DELETE.to_string(),
-                                ..Default::default()
-                            };
-                            if replicate_delete_with_outcome(dv, storage.clone()).await {
-                                ReplicationQueueAdmission::Queued
-                            } else {
-                                ReplicationQueueAdmission::Missed
-                            }
-                        }
-                    }
-                    MrfOpKind::Object | MrfOpKind::Heal | MrfOpKind::ExistingObject => {
-                        let opts = ObjectOptions {
-                            version_id: entry.version_id.map(|u| u.to_string()),
-                            ..Default::default()
-                        };
-                        let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
-                            Ok(oi) => oi,
-                            Err(e) => {
-                                debug!(
-                                    component = LOG_COMPONENT_ECSTORE,
-                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                                    bucket = %entry.bucket,
-                                    object = %entry.object,
-                                    error = %e,
-                                    "MRF recovery: source object lookup failed"
-                                );
-                                if should_retry_mrf_source_lookup(&e) {
-                                    retry_entries.push(entry.clone());
-                                }
-                                continue;
-                            }
-                        };
-                        if entry.target_arns.is_empty() {
-                            // Legacy entries predate target admission persistence. They cannot
-                            // be safely attributed, so retain the old live-config fallback.
-                            queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
-                        } else {
-                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
-                            let mut roi = replicate_object_info_from_object_info(oi, dsc, entry.op.replication_type());
-                            roi.retry_count = entry.retry_count.max(0) as u32;
-                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
-                                ReplicationQueueAdmission::Queued
-                            } else {
-                                ReplicationQueueAdmission::Missed
-                            }
-                        }
-                    }
-                    MrfOpKind::Metadata => {
-                        let opts = ObjectOptions {
-                            version_id: entry.version_id.map(|u| u.to_string()),
-                            ..Default::default()
-                        };
-                        let oi = match storage.get_object_info(&entry.bucket, &entry.object, &opts).await {
-                            Ok(oi) => oi,
-                            Err(e) => {
-                                debug!(
-                                    component = LOG_COMPONENT_ECSTORE,
-                                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                                    bucket = %entry.bucket,
-                                    object = %entry.object,
-                                    error = %e,
-                                    "MRF metadata recovery: source object lookup failed"
-                                );
-                                if should_retry_mrf_source_lookup(&e) {
-                                    retry_entries.push(entry.clone());
-                                }
-                                continue;
-                            }
-                        };
-                        if entry.target_arns.is_empty() {
-                            queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await
-                        } else {
-                            let dsc = replicate_decision_for_admitted_targets(&entry.target_arns);
-                            let mut roi = replicate_object_info_from_object_info(oi, dsc, ReplicationType::Metadata);
-                            roi.retry_count = entry.retry_count.max(0) as u32;
-                            if replicate_object_with_outcome(roi, storage.clone()).await.1 {
-                                ReplicationQueueAdmission::Queued
-                            } else {
-                                ReplicationQueueAdmission::Missed
-                            }
-                        }
-                    }
+                let Some(admission) = replay_mrf_entry(entry, &storage, &mut retry_entries).await else {
+                    continue;
                 };
 
                 if admission == ReplicationQueueAdmission::Missed {
@@ -1484,29 +1608,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 }
             }
 
-            let retained = match acknowledge_mrf_recovery(storage.clone(), &recovery_guard, &entries, &retry_entries).await {
-                Ok(retained) => retained,
-                Err(error) => {
-                    warn!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_REPLICATION,
-                        error = %error,
-                        "Failed to acknowledge the MRF recovery prefix; preserving it for the next startup"
-                    );
-                    match read_mrf_entries(storage.clone()).await {
-                        Ok(current) => current,
-                        Err(read_error) => {
-                            warn!(
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                                error = %read_error,
-                                "Failed to refresh the MRF backlog after acknowledgement failure"
-                            );
-                            entries.clone()
-                        }
-                    }
-                }
-            };
+            let retained = resolve_retained_mrf_entries(&storage, &recovery_guard, &entries, &retry_entries).await;
             let retained_count = retained.len();
             set_durable_mrf_backlog_snapshot(durable_mrf_backlog_summary_from_entries(&retained));
 

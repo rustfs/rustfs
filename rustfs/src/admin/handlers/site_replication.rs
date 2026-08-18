@@ -66,18 +66,20 @@ use rustfs_config::{
 };
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
+use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::store::{MappedPolicy, UserType, sr_wire_user_type, user_type_from_sr_wire};
 use rustfs_iam::sys::{
-    NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
+    IamSys, NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
 };
 use rustfs_madmin::{
     AddOrUpdateUserReq, BucketBandwidth, GroupAddRemove, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric,
     LDAPConfigSettings, LDAPSettings, OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus,
     ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC,
     SR_IAM_ITEM_STS_ACC_LEGACY, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem,
-    SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation,
-    SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRRetryStats, SRSessionPolicy, SRSiteSummary,
-    SRStateEditReq, SRStateInfo, SRStatusInfo, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    SRIAMPolicy, SRIAMUser, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq,
+    SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRRetryStats, SRSTSCredential,
+    SRSessionPolicy, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate,
+    SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -4584,7 +4586,10 @@ async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
             head_failed_total: non_negative_u64(node.proxy_head_failed),
             put_tag_total: non_negative_u64(node.proxy_put_tag_total),
             put_tag_failed_total: non_negative_u64(node.proxy_put_tag_failed),
-            ..Default::default()
+            get_tag_total: non_negative_u64(node.proxy_get_tag_total),
+            get_tag_failed_total: non_negative_u64(node.proxy_get_tag_failed),
+            remove_tag_total: non_negative_u64(node.proxy_delete_tag_total),
+            remove_tag_failed_total: non_negative_u64(node.proxy_delete_tag_failed),
         },
         metrics,
         uptime: node.uptime,
@@ -9358,253 +9363,268 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
     let incoming_updated_at = item.updated_at;
 
     match item.r#type.as_str() {
-        "policy" => {
-            if let Some(policy) = item.policy {
-                let policy: Policy =
-                    serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
-                iam_sys.set_policy(&item.name, policy).await.map_err(ApiError::from)?;
-            } else {
-                iam_sys.delete_policy(&item.name, true).await.map_err(ApiError::from)?;
-            }
-            Ok(())
-        }
-        "policy-mapping" => {
-            let Some(mapping) = item.policy_mapping else {
-                return Err(s3_error!(InvalidRequest, "policyMapping is required"));
-            };
-            let user_type =
-                user_type_from_sr_wire(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
-            iam_sys
-                .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
-                .await
-                .map_err(ApiError::from)?;
-            Ok(())
-        }
-        "group-info" => {
-            let Some(group_info) = item.group_info else {
-                return Err(s3_error!(InvalidRequest, "groupInfo is required"));
-            };
-            let update = group_info.update_req;
-            if !group_info_requires_upsert(&update) {
-                iam_sys
-                    .remove_users_from_group(&update.group, update.members)
-                    .await
-                    .map_err(ApiError::from)?;
-                return Ok(());
-            }
-
-            iam_sys
-                .add_users_to_group(&update.group, update.members)
-                .await
-                .map_err(ApiError::from)?;
-            iam_sys
-                .set_group_status(&update.group, matches!(update.status, GroupStatus::Enabled))
-                .await
-                .map_err(ApiError::from)?;
-            Ok(())
-        }
+        "policy" => apply_iam_policy_item(&iam_sys, &item.name, item.policy).await,
+        "policy-mapping" => apply_iam_policy_mapping_item(&iam_sys, item.policy_mapping).await,
+        "group-info" => apply_iam_group_info_item(&iam_sys, item.group_info).await,
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The legacy alias
         // `sts-credential` (emitted by older RustFS releases) stays accepted permanently
         // so mixed-version RustFS sites keep replicating STS credentials during rolling
         // upgrades; it is a compatibility layer, not temporary code.
-        SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => {
-            let Some(sts_credential) = item.sts_credential else {
-                return Err(s3_error!(InvalidRequest, "stsCredential is required"));
-            };
-            let Some(secret) = current_token_signing_key() else {
-                return Err(s3_error!(InvalidRequest, "token signing key not initialized"));
-            };
-            let claims = get_claims_from_token_with_secret(&sts_credential.session_token, &secret)
-                .map_err(|e| s3_error!(InvalidRequest, "invalid STS session token: {e}"))?;
-            let expiration = claims
-                .get("exp")
-                .and_then(claims_unix_timestamp)
-                .map(OffsetDateTime::from_unix_timestamp)
-                .transpose()
-                .map_err(|e| s3_error!(InvalidRequest, "invalid STS expiry: {e}"))?;
-            let groups = string_list_claim(&claims, "groups");
-            let compatibility_policy = sts_replication_compatibility_policy(&claims, &sts_credential.parent_policy_mapping);
-            let cred = rustfs_credentials::Credentials {
-                access_key: sts_credential.access_key.clone(),
-                secret_key: sts_credential.secret_key.clone(),
-                session_token: sts_credential.session_token.clone(),
-                expiration,
-                status: "on".to_string(),
-                parent_user: sts_credential.parent_user.clone(),
-                groups,
-                claims: Some(claims),
-                ..Default::default()
-            };
-            iam_sys
-                .set_temp_user(&sts_credential.access_key, &cred, compatibility_policy)
-                .await
-                .map_err(ApiError::from)?;
-            Ok(())
-        }
-        "iam-user" => {
-            let Some(user) = item.iam_user else {
-                return Err(s3_error!(InvalidRequest, "iamUser is required"));
-            };
-            if let Some(local) = iam_sys.get_user(&user.access_key).await
-                && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-            {
-                return Ok(());
-            }
-            if user.is_delete_req {
-                iam_sys.delete_user(&user.access_key, true).await.map_err(ApiError::from)?;
-            } else {
-                let Some(user_req) = user.user_req else {
-                    return Err(s3_error!(InvalidRequest, "userReq is required"));
-                };
-                let is_status_only_update = user_req.secret_key.is_empty() && user_req.policy.is_none();
-                if is_status_only_update {
-                    iam_sys
-                        .set_user_status(&user.access_key, user_req.status)
-                        .await
-                        .map_err(ApiError::from)?;
-                } else {
-                    iam_sys
-                        .create_user(&user.access_key, &user_req)
-                        .await
-                        .map_err(ApiError::from)?;
-                }
-            }
-            Ok(())
-        }
-        "service-account" => {
-            let Some(change) = item.svc_acc_change else {
-                return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
-            };
-            let envelope = change.oidc_service_account_envelope;
-            if let Some(create) = change.create {
-                let local_updated_at = iam_sys
-                    .get_user(&create.access_key)
-                    .await
-                    .map(|local| local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
-                let replicated_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
-                    if local_updated_at.is_some_and(|local_updated_at| is_stale_update(local_updated_at, incoming_updated_at)) {
-                        return Ok(());
-                    }
-                    ReplicatedServiceAccountPolicy {
-                        policy: Some(site_replicator_service_account_policy()?),
-                        is_envelope: false,
-                    }
-                } else {
-                    let Some(replicated_policy) = decode_service_account_replication_policy(
-                        &create,
-                        envelope.as_ref(),
-                        incoming_updated_at,
-                        local_updated_at,
-                    )?
-                    else {
-                        return Ok(());
-                    };
-                    replicated_policy
-                };
-                match iam_sys.get_service_account(&create.access_key).await {
-                    Ok((existing, _)) => {
-                        if existing.parent_user != create.parent {
-                            return Err(s3_error!(
-                                InvalidRequest,
-                                "service account {} already exists with a different parent user",
-                                create.access_key
-                            ));
-                        }
-                        iam_sys
-                            .update_service_account(
-                                &create.access_key,
-                                UpdateServiceAccountOpts {
-                                    name: replicated_policy.metadata_for_existing_account(create.name),
-                                    description: replicated_policy.metadata_for_existing_account(create.description),
-                                    session_policy: replicated_policy.for_existing_account(),
-                                    secret_key: Some(create.secret_key),
-                                    expiration: create.expiration,
-                                    status: (!create.status.is_empty()).then_some(create.status),
-                                    parent_user: None,
-                                    allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
-                                },
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                    Err(err) if is_err_no_such_service_account(&err) => {
-                        iam_sys
-                            .new_service_account(
-                                &create.parent,
-                                Some(create.groups),
-                                NewServiceAccountOpts {
-                                    session_policy: replicated_policy.policy,
-                                    access_key: create.access_key,
-                                    secret_key: create.secret_key,
-                                    name: (!create.name.is_empty()).then_some(create.name),
-                                    description: (!create.description.is_empty()).then_some(create.description),
-                                    expiration: create.expiration,
-                                    allow_site_replicator_account: true,
-                                    claims: Some(create.claims),
-                                },
-                            )
-                            .await
-                            .map_err(ApiError::from)?;
-                    }
-                    Err(err) => return Err(ApiError::from(err).into()),
-                }
-                return Ok(());
-            }
-
-            if let Some(update) = change.update {
-                if let Some(local) = iam_sys.get_user(&update.access_key).await
-                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-                {
-                    return Ok(());
-                }
-                let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
-                let session_policy = if allow_site_replicator_account {
-                    Some(site_replicator_service_account_policy()?)
-                } else {
-                    update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
-                };
-                iam_sys
-                    .update_service_account(
-                        &update.access_key,
-                        UpdateServiceAccountOpts {
-                            session_policy,
-                            secret_key: (!update.secret_key.is_empty()).then_some(update.secret_key),
-                            name: (!update.name.is_empty()).then_some(update.name),
-                            description: (!update.description.is_empty()).then_some(update.description),
-                            expiration: update.expiration,
-                            status: (!update.status.is_empty()).then_some(update.status),
-                            // Peers replicate credentials, never the local parent binding:
-                            // each site resolves its own parent from its own IAM.
-                            parent_user: None,
-                            allow_site_replicator_account,
-                        },
-                    )
-                    .await
-                    .map_err(ApiError::from)?;
-                return Ok(());
-            }
-
-            if let Some(delete) = change.delete {
-                if let Some(local) = iam_sys.get_user(&delete.access_key).await
-                    && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
-                {
-                    return Ok(());
-                }
-                iam_sys
-                    .delete_service_account(&delete.access_key, true)
-                    .await
-                    .map_err(ApiError::from)?;
-                return Ok(());
-            }
-
-            Err(s3_error!(InvalidRequest, "serviceAccountChange is empty"))
-        }
+        SR_IAM_ITEM_STS_ACC | SR_IAM_ITEM_STS_ACC_LEGACY => apply_iam_sts_account_item(&iam_sys, item.sts_credential).await,
+        "iam-user" => apply_iam_user_item(&iam_sys, item.iam_user, incoming_updated_at).await,
+        "service-account" => apply_iam_service_account_item(&iam_sys, item.svc_acc_change, incoming_updated_at).await,
         _ => Err(s3_error!(
             NotImplemented,
             "site replication IAM item type `{}` is not supported",
             item.r#type
         )),
     }
+}
+
+async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy: Option<Value>) -> S3Result<()> {
+    if let Some(policy) = policy {
+        let policy: Policy =
+            serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
+        iam_sys.set_policy(name, policy).await.map_err(ApiError::from)?;
+    } else {
+        iam_sys.delete_policy(name, true).await.map_err(ApiError::from)?;
+    }
+    Ok(())
+}
+
+async fn apply_iam_policy_mapping_item(iam_sys: &IamSys<ObjectStore>, policy_mapping: Option<SRPolicyMapping>) -> S3Result<()> {
+    let Some(mapping) = policy_mapping else {
+        return Err(s3_error!(InvalidRequest, "policyMapping is required"));
+    };
+    let user_type = user_type_from_sr_wire(mapping.user_type).ok_or_else(|| s3_error!(InvalidRequest, "invalid userType"))?;
+    iam_sys
+        .policy_db_set(&mapping.user_or_group, user_type, mapping.is_group, &mapping.policy)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn apply_iam_group_info_item(iam_sys: &IamSys<ObjectStore>, group_info: Option<SRGroupInfo>) -> S3Result<()> {
+    let Some(group_info) = group_info else {
+        return Err(s3_error!(InvalidRequest, "groupInfo is required"));
+    };
+    let update = group_info.update_req;
+    if !group_info_requires_upsert(&update) {
+        iam_sys
+            .remove_users_from_group(&update.group, update.members)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(());
+    }
+
+    iam_sys
+        .add_users_to_group(&update.group, update.members)
+        .await
+        .map_err(ApiError::from)?;
+    iam_sys
+        .set_group_status(&update.group, matches!(update.status, GroupStatus::Enabled))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn apply_iam_sts_account_item(iam_sys: &IamSys<ObjectStore>, sts_credential: Option<SRSTSCredential>) -> S3Result<()> {
+    let Some(sts_credential) = sts_credential else {
+        return Err(s3_error!(InvalidRequest, "stsCredential is required"));
+    };
+    let Some(secret) = current_token_signing_key() else {
+        return Err(s3_error!(InvalidRequest, "token signing key not initialized"));
+    };
+    let claims = get_claims_from_token_with_secret(&sts_credential.session_token, &secret)
+        .map_err(|e| s3_error!(InvalidRequest, "invalid STS session token: {e}"))?;
+    let expiration = claims
+        .get("exp")
+        .and_then(claims_unix_timestamp)
+        .map(OffsetDateTime::from_unix_timestamp)
+        .transpose()
+        .map_err(|e| s3_error!(InvalidRequest, "invalid STS expiry: {e}"))?;
+    let groups = string_list_claim(&claims, "groups");
+    let compatibility_policy = sts_replication_compatibility_policy(&claims, &sts_credential.parent_policy_mapping);
+    let cred = rustfs_credentials::Credentials {
+        access_key: sts_credential.access_key.clone(),
+        secret_key: sts_credential.secret_key.clone(),
+        session_token: sts_credential.session_token.clone(),
+        expiration,
+        status: "on".to_string(),
+        parent_user: sts_credential.parent_user.clone(),
+        groups,
+        claims: Some(claims),
+        ..Default::default()
+    };
+    iam_sys
+        .set_temp_user(&sts_credential.access_key, &cred, compatibility_policy)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(())
+}
+
+async fn apply_iam_user_item(
+    iam_sys: &IamSys<ObjectStore>,
+    iam_user: Option<SRIAMUser>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
+    let Some(user) = iam_user else {
+        return Err(s3_error!(InvalidRequest, "iamUser is required"));
+    };
+    if let Some(local) = iam_sys.get_user(&user.access_key).await
+        && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+    {
+        return Ok(());
+    }
+    if user.is_delete_req {
+        iam_sys.delete_user(&user.access_key, true).await.map_err(ApiError::from)?;
+    } else {
+        let Some(user_req) = user.user_req else {
+            return Err(s3_error!(InvalidRequest, "userReq is required"));
+        };
+        let is_status_only_update = user_req.secret_key.is_empty() && user_req.policy.is_none();
+        if is_status_only_update {
+            iam_sys
+                .set_user_status(&user.access_key, user_req.status)
+                .await
+                .map_err(ApiError::from)?;
+        } else {
+            iam_sys
+                .create_user(&user.access_key, &user_req)
+                .await
+                .map_err(ApiError::from)?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_iam_service_account_item(
+    iam_sys: &IamSys<ObjectStore>,
+    svc_acc_change: Option<SRSvcAccChange>,
+    incoming_updated_at: Option<OffsetDateTime>,
+) -> S3Result<()> {
+    let Some(change) = svc_acc_change else {
+        return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
+    };
+    let envelope = change.oidc_service_account_envelope;
+    if let Some(create) = change.create {
+        let local_updated_at = iam_sys
+            .get_user(&create.access_key)
+            .await
+            .map(|local| local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH));
+        let replicated_policy = if create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
+            if local_updated_at.is_some_and(|local_updated_at| is_stale_update(local_updated_at, incoming_updated_at)) {
+                return Ok(());
+            }
+            ReplicatedServiceAccountPolicy {
+                policy: Some(site_replicator_service_account_policy()?),
+                is_envelope: false,
+            }
+        } else {
+            let Some(replicated_policy) =
+                decode_service_account_replication_policy(&create, envelope.as_ref(), incoming_updated_at, local_updated_at)?
+            else {
+                return Ok(());
+            };
+            replicated_policy
+        };
+        match iam_sys.get_service_account(&create.access_key).await {
+            Ok((existing, _)) => {
+                if existing.parent_user != create.parent {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "service account {} already exists with a different parent user",
+                        create.access_key
+                    ));
+                }
+                iam_sys
+                    .update_service_account(
+                        &create.access_key,
+                        UpdateServiceAccountOpts {
+                            name: replicated_policy.metadata_for_existing_account(create.name),
+                            description: replicated_policy.metadata_for_existing_account(create.description),
+                            session_policy: replicated_policy.for_existing_account(),
+                            secret_key: Some(create.secret_key),
+                            expiration: create.expiration,
+                            status: (!create.status.is_empty()).then_some(create.status),
+                            parent_user: None,
+                            allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            Err(err) if is_err_no_such_service_account(&err) => {
+                iam_sys
+                    .new_service_account(
+                        &create.parent,
+                        Some(create.groups),
+                        NewServiceAccountOpts {
+                            session_policy: replicated_policy.policy,
+                            access_key: create.access_key,
+                            secret_key: create.secret_key,
+                            name: (!create.name.is_empty()).then_some(create.name),
+                            description: (!create.description.is_empty()).then_some(create.description),
+                            expiration: create.expiration,
+                            allow_site_replicator_account: true,
+                            claims: Some(create.claims),
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
+        return Ok(());
+    }
+
+    if let Some(update) = change.update {
+        if let Some(local) = iam_sys.get_user(&update.access_key).await
+            && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+        {
+            return Ok(());
+        }
+        let allow_site_replicator_account = update.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT;
+        let session_policy = if allow_site_replicator_account {
+            Some(site_replicator_service_account_policy()?)
+        } else {
+            update.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok())
+        };
+        iam_sys
+            .update_service_account(
+                &update.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy,
+                    secret_key: (!update.secret_key.is_empty()).then_some(update.secret_key),
+                    name: (!update.name.is_empty()).then_some(update.name),
+                    description: (!update.description.is_empty()).then_some(update.description),
+                    expiration: update.expiration,
+                    status: (!update.status.is_empty()).then_some(update.status),
+                    // Peers replicate credentials, never the local parent binding:
+                    // each site resolves its own parent from its own IAM.
+                    parent_user: None,
+                    allow_site_replicator_account,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(());
+    }
+
+    if let Some(delete) = change.delete {
+        if let Some(local) = iam_sys.get_user(&delete.access_key).await
+            && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+        {
+            return Ok(());
+        }
+        iam_sys
+            .delete_service_account(&delete.access_key, true)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(());
+    }
+
+    Err(s3_error!(InvalidRequest, "serviceAccountChange is empty"))
 }
 
 fn claims_unix_timestamp(value: &Value) -> Option<i64> {

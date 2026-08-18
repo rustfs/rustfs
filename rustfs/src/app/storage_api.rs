@@ -627,6 +627,24 @@ pub(crate) mod bucket {
         #[cfg(test)]
         pub(crate) use replication_contracts::replication_statuses_map;
 
+        /// Remote replication-target client used by the read-proxy path.
+        pub(crate) type ProxyTargetClient = crate::storage::storage_api::ecstore_bucket::bucket_target_sys::TargetClient;
+
+        /// Proxy-request metric recorder (get/head/tagging totals + failures).
+        pub(crate) use crate::storage::storage_api::record_replication_proxy;
+
+        /// Replication targets eligible to serve a proxied GET/HEAD/Tagging of
+        /// an object not present locally (MinIO `getProxyTargets`; empty when
+        /// the request was itself proxied, versioning is suspended, or no
+        /// replication rule matches). backlog#1675 P1-5.
+        pub(crate) async fn get_read_proxy_targets(
+            bucket: &str,
+            object: &str,
+            opts: &crate::storage::storage_api::StorageObjectOptions,
+        ) -> Vec<Arc<ProxyTargetClient>> {
+            replication_contracts::get_proxy_targets(bucket, object, opts).await
+        }
+
         pub(crate) async fn persist_force_delete_intent(
             store: Arc<crate::storage::storage_api::ECStore>,
             bucket: String,

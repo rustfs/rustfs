@@ -11,9 +11,9 @@ paths.
 | Module | Current role | Split blocker |
 |---|---|---|
 | `config.rs` | Replication config helpers, rule matching, and tag filtering. | Uses replication-local filemeta/tagging boundaries and S3 DTOs directly. |
-| `datatypes.rs` | ECStore compatibility re-export for resync status enums. | Re-exports `rustfs-replication` contracts while downstream facade consumers migrate. |
 | `replication_object_decision_boundary.rs` | Object replication option DTOs, resync target projection, delete replication decisions, and multipart planning helpers. | Keeps ECStore runtime modules from importing object decision contracts directly from `rustfs-replication`. |
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, metadata paths, queue contracts through the queue boundary, file metadata replication contracts through local boundaries, config storage, storage contracts through the replication storage boundary, runtime sources, and notification state. |
+| `replication_proxy.rs` | Proxy-target selection for GET/HEAD/Tagging reads of objects not yet replicated locally (MinIO `getProxyTargets` parity: anti-loop, version-suspended, and no-config empty branches). | Uses replication config lookup, rule matching, and target clients through local boundaries. |
 | `replication_queue_boundary.rs` | Queue/admission DTOs, heal queue DTOs, worker sizing, and backpressure helpers. | Keeps ECStore runtime modules from importing queue/backpressure contracts directly from `rustfs-replication`. |
 | `replication_resync_boundary.rs` | Resync DTOs, status classifiers, persisted resync/MRF codec wrappers, and ECStore error mapping. | Keeps ECStore runtime modules from importing resync contract helpers directly from `rustfs-replication`. |
 | `replication_resyncer.rs` | Object replication, delete replication, resync execution, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, object decisions and multipart planning through the object decision boundary, resync contracts through the resync boundary, queue DTOs through the queue boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
@@ -117,9 +117,12 @@ Target end state:
   their file names — so batch-merging them beforehand is explicitly rejected:
   it forces synchronized guard-script/mod/import churn with zero functional
   gain;
-- the only module that can retire early is `datatypes.rs`: delete it once its
-  facade consumers import the resync status enums through `rustfs-replication`
-  directly.
+- `datatypes.rs` retired early (its sanctioned exception): it was a pure
+  relay (`boundary -> datatypes -> mod.rs`), so the facade now re-exports
+  `ResyncStatusType` from the resync boundary directly and the relay file is
+  deleted. Note the original retirement wording ("consumers import through
+  `rustfs-replication` directly") conflicted with Migration Rule #15 —
+  consumers stay behind the ECStore facade; only the relay hop dissolves.
 
 ## Milestones
 
@@ -127,9 +130,9 @@ Target end state:
 |---|---|---|
 | M0 | Record the completion criteria and end state (this section). | Done |
 | M1 | Contract extraction: resync/queue/stats/object-decision/filemeta/storage wire contracts owned by `crates/replication`; ECStore imports concentrated in `*_boundary.rs`; event sink and runtime access behind local contracts. | Done — see Required Contracts |
-| M2 | Move resyncer pure decision logic (no IO) into `crates/replication`. | Pending; sequence after splitting the oversized resyncer/pool functions (`resync_bucket`, `replicate_all`, `start_mrf_processor`) so moves stay mechanical |
+| M2 | Move resyncer pure decision logic (no IO) into `crates/replication`. | Done — moved the pure decision helpers with their unit tests: `resync_status_duration` (resync), `resync_existing_delete_replication_info` / `replicate_delete_outcome` / `target_delete_version_id` / `delete_marker_purge_version_id` / `delete_marker_purge_mrf_entry` (delete), `version_identity_drifted` / `is_replication_target_offline_error` / the SSE-C passthrough gate family incl. `SsecPassthroughCapability` (object; `ssec_passthrough_evidence_present` was param-demoted to the echoed customer-algorithm string, ECStore keeps the `HeadObjectOutput` adapter). ECStore imports them through the resync/object-decision/target boundaries; `bucket_target_sys` keeps only the verdict cache + TTL and re-exports the capability enum. Not moved (signatures carry ECStore or aws-sdk types): `verify_resync_head_result`, `resync_target_error_detail`, the `SdkError` classifiers (`has_raw_status`, `is_version_id_format_mismatch`), the `replicate_all_*` option/info builders, and `bounded_resync_max_jobs` (itself a pure clamp, but it forms one local configuration unit with the env-reading `configured_resync_max_jobs` and its ECStore-local constants — moving the clamp alone has negative value). |
 | M3 | Move the worker runtime (`replication_pool.rs`, the IO paths of `replication_resyncer.rs`, `replication_state.rs`) once the contract traits are stable. Highest-risk step of the whole plan; do it last. | Pending |
-| M4 | Retire the boundary modules together with their guard-script entries; delete `datatypes.rs`. | Pending |
+| M4 | Retire the boundary modules together with their guard-script entries. | Pending (`datatypes.rs` already retired early alongside M2) |
 
 The original first code-bearing step (narrow `ReplicationEventSink` /
 `ReplicationRuntime` contracts) has landed — `replication_event_sink.rs`
