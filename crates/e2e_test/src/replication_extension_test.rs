@@ -60,6 +60,7 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use s3s::header::X_AMZ_REPLICATION_STATUS;
+use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
