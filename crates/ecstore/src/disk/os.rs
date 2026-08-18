@@ -435,11 +435,10 @@ impl OpenedDstDirFsyncGroup {
         }
         #[cfg(not(unix))]
         {
-            let key = DstDirFsyncGroupKey::from_metadata(canonical_path.clone(), std::fs::metadata(&canonical_path)?)?;
-            Ok(Self {
-                key,
-                dir: canonical_path,
-            })
+            let metadata = std::fs::metadata(&canonical_path)?;
+            let key = DstDirFsyncGroupKey::from_metadata(canonical_path, metadata)?;
+            let dir = key.canonical_path.clone();
+            Ok(Self { key, dir })
         }
     }
 }
