@@ -253,6 +253,13 @@ struct RecoveryMonitorTeardownHook {
     release: tokio::sync::Notify,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct RecoveryMonitorTestState {
+    start_count: Arc<AtomicU32>,
+    teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
+}
+
 // ── Connection lifecycle (grpc-optimization P3) ──
 
 /// Whether to prewarm the internode control channel in the background at construction (default off).
@@ -622,9 +629,10 @@ impl RemoteDisk {
             self.cancel_token.clone(),
             Arc::clone(&self.recovery_monitor_active),
             #[cfg(test)]
-            Arc::clone(&self.recovery_monitor_start_count),
-            #[cfg(test)]
-            Arc::clone(&self.recovery_monitor_teardown_hook),
+            RecoveryMonitorTestState {
+                start_count: Arc::clone(&self.recovery_monitor_start_count),
+                teardown_hook: Arc::clone(&self.recovery_monitor_teardown_hook),
+            },
         );
     }
 
@@ -635,8 +643,7 @@ impl RemoteDisk {
         health: Arc<DiskHealthTracker>,
         cancel_token: CancellationToken,
         active: Arc<AtomicBool>,
-        #[cfg(test)] start_count: Arc<AtomicU32>,
-        #[cfg(test)] teardown_hook: Arc<tokio::sync::Mutex<Option<Arc<RecoveryMonitorTeardownHook>>>>,
+        #[cfg(test)] test_state: RecoveryMonitorTestState,
     ) {
         if active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -647,13 +654,13 @@ impl RemoteDisk {
         let span = Self::recovery_monitor_span(&addr, &endpoint, handle_id);
         super::spawn_background_monitor(span, async move {
             #[cfg(test)]
-            start_count.fetch_add(1, Ordering::AcqRel);
+            test_state.start_count.fetch_add(1, Ordering::AcqRel);
             let lease = RecoveryMonitorLease {
                 active: Arc::clone(&active),
             };
             Self::monitor_remote_disk_recovery(addr.clone(), endpoint.clone(), Arc::clone(&health), cancel_token.clone()).await;
             #[cfg(test)]
-            if let Some(hook) = teardown_hook.lock().await.take() {
+            if let Some(hook) = test_state.teardown_hook.lock().await.take() {
                 hook.arrived.notify_one();
                 hook.release.notified().await;
             }
@@ -667,9 +674,7 @@ impl RemoteDisk {
                     cancel_token,
                     active,
                     #[cfg(test)]
-                    start_count,
-                    #[cfg(test)]
-                    teardown_hook,
+                    test_state,
                 );
             }
         });
@@ -772,9 +777,10 @@ impl RemoteDisk {
                 cancel_clone,
                 Arc::clone(&recovery_monitor_active),
                 #[cfg(test)]
-                Arc::new(AtomicU32::new(0)),
-                #[cfg(test)]
-                Arc::clone(&recovery_monitor_teardown_hook),
+                RecoveryMonitorTestState {
+                    start_count: Arc::new(AtomicU32::new(0)),
+                    teardown_hook: Arc::clone(&recovery_monitor_teardown_hook),
+                },
             );
         }
 
@@ -842,9 +848,10 @@ impl RemoteDisk {
                             cancel_clone,
                             Arc::clone(&recovery_monitor_active),
                             #[cfg(test)]
-                            Arc::new(AtomicU32::new(0)),
-                            #[cfg(test)]
-                            Arc::clone(&recovery_monitor_teardown_hook),
+                            RecoveryMonitorTestState {
+                                start_count: Arc::new(AtomicU32::new(0)),
+                                teardown_hook: Arc::clone(&recovery_monitor_teardown_hook),
+                            },
                         );
                     }
                 }
