@@ -9745,7 +9745,8 @@ impl DiskAPI for LocalDisk {
                 {
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
                     if let Err(err) =
-                        os::fsync_dir_with_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission).await
+                        os::fsync_dst_dir_group_commit_or_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission)
+                            .await
                     {
                         rustfs_io_metrics::record_put_object_stage_duration_from(
                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
@@ -13089,6 +13090,80 @@ mod test {
         assert!(
             !dst_meta_parent.join(new_data_dir.to_string()).exists(),
             "fresh PUT rollback must remove the committed data dir after grouped dst dir fsync failure"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn rename_data_inline_uses_dst_dir_fsync_group_commit_when_enabled() {
+        use tempfile::tempdir;
+
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "grouped-inline-dst-fsync-bucket";
+        let object = "dir/inline-object";
+        let tmp_object = "tmp-grouped-inline-dst-fsync";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let version_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("version id should parse");
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-payload")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("inline rename_data should commit");
+
+        let dst_meta_parent = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("dst meta path should resolve")
+            .parent()
+            .expect("dst meta should have a parent")
+            .to_path_buf();
+        assert_eq!(
+            os::fsync_dir_recorder::grouped_batch_sizes(&dst_meta_parent),
+            vec![1],
+            "enabled inline rename_data must route the dst parent fsync through the group commit coordinator"
+        );
+        assert!(
+            !os::fsync_dir_recorder::was_limited(&dst_meta_parent),
+            "enabled grouped dst parent fsync must not also run the direct file-sync limited path"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn rename_data_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
+        use tempfile::tempdir;
+
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "grouped-inline-dst-fsync-failure-bucket";
+        let object = "dir/inline-object";
+        let tmp_object = "tmp-grouped-inline-dst-fsync-failure";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let dst_meta_parent = dir.path().join(bucket).join(object);
+        os::fsync_dir_recorder::set_grouped_failure(&dst_meta_parent, io::ErrorKind::PermissionDenied);
+        let version_id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").expect("version id should parse");
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-payload")));
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect_err("grouped dst dir fsync failure must fail the fresh inline PUT");
+
+        assert!(
+            matches!(err, DiskError::Io(ref io_err) if io_err.kind() == io::ErrorKind::PermissionDenied),
+            "grouped dst dir fsync failure must propagate the injected permission error"
+        );
+        assert!(
+            !dst_meta_parent.join(STORAGE_FORMAT_FILE).exists(),
+            "fresh inline PUT rollback must remove the committed xl.meta after grouped dst dir fsync failure"
         );
     }
 
