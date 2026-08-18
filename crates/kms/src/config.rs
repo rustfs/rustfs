@@ -1729,30 +1729,10 @@ mod tests {
         assert!(config.validate().is_ok(), "deprecated mount_path must not be required");
     }
 
-    #[test]
-    fn test_vault_kv2_sources_do_not_claim_transit_wrapping() {
-        let sources = [
-            ("config.rs", include_str!("config.rs")),
-            ("api_types.rs", include_str!("api_types.rs")),
-            ("backends/vault.rs", include_str!("backends/vault.rs")),
-            ("lib.rs", include_str!("lib.rs")),
-        ];
-        // Assemble the needles at runtime so this guard does not match its own source.
-        let needles = [
-            format!("wrapping via {}", "Transit"),
-            format!("KV v2 + {}", "Transit"),
-            format!("KV2+{}", "Transit"),
-            format!("you would use Vault's {} engine", "transit"),
-        ];
-        for (name, source) in sources {
-            for needle in &needles {
-                assert!(
-                    !source.contains(needle.as_str()),
-                    "{name} still describes the Vault KV2 backend with `{needle}`"
-                );
-            }
-        }
-    }
+    // The "VaultKv2 must not claim Transit wrapping" documentation-claim
+    // invariant is enforced by scripts/check_fips_wording.sh, which scans every
+    // file in crates/kms rather than a fixed include_str! list
+    // (rustfs/backlog#1884).
 
     #[test]
     fn test_legacy_persisted_vault_transit_config_uses_metadata_defaults() {
