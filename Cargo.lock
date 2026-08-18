@@ -9538,6 +9538,8 @@ version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "crc-fast",
  "futures",
  "hotpath",
  "http 1.5.0",
