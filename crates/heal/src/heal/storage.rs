@@ -22,12 +22,44 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };
 use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealBucketUsageBaseline {
+    pub objects_count: u64,
+    pub bytes: u64,
+}
+
+pub struct HealLifecycleExpiryContext {
+    inner: HealLifecycleExpiryContextInner,
+}
+
+enum HealLifecycleExpiryContextInner {
+    Ecstore(EcstoreHealLifecycleExpiryContext),
+    #[allow(dead_code)]
+    Test,
+}
+
+impl HealLifecycleExpiryContext {
+    fn ecstore(inner: EcstoreHealLifecycleExpiryContext) -> Self {
+        Self {
+            inner: HealLifecycleExpiryContextInner::Ecstore(inner),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test() -> Self {
+        Self {
+            inner: HealLifecycleExpiryContextInner::Test,
+        }
+    }
+}
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
@@ -272,6 +304,10 @@ pub struct HealListItem {
     pub name: String,
     /// normalized version id (`None` when the version is nil/absent)
     pub version_id: Option<String>,
+    /// version modification time as Unix nanoseconds
+    pub mod_time_unix_nanos: Option<i128>,
+    /// object snapshot for lifecycle evaluation
+    pub lifecycle_object_info: Option<HealObjectInfo>,
     /// whether this version is a delete marker (observability only)
     pub is_delete_marker: bool,
 }
@@ -328,6 +364,28 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
+
+    /// Aggregate usage-cache baselines for the requested buckets.
+    async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+        Ok(None)
+    }
+
+    /// Load per-bucket lifecycle expiry context for heal skips.
+    async fn load_heal_lifecycle_expiry_context(&self, _bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        Ok(None)
+    }
+
+    /// Queue lifecycle expiry for a version that heal can skip.
+    async fn enqueue_heal_lifecycle_expiry(
+        &self,
+        _context: &HealLifecycleExpiryContext,
+        _bucket: &str,
+        _object: &str,
+        _version_id: Option<&str>,
+        _object_info: Option<&HealObjectInfo>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Fix bucket metadata
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()>;
@@ -409,6 +467,7 @@ pub trait HealStorageAPI: Send + Sync {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
 
     /// List versions for healing via a per-erasure-set DISK-WALK union enumerator
@@ -427,8 +486,10 @@ pub trait HealStorageAPI: Send + Sync {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
-        self.list_objects_for_heal_page(bucket, prefix, continuation_token).await
+        self.list_objects_for_heal_page(bucket, prefix, continuation_token, include_lifecycle_object_info)
+            .await
     }
 
     /// Get disk for resume functionality.
@@ -1021,6 +1082,85 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
+    async fn erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+        if buckets.is_empty() {
+            return Ok(None);
+        }
+
+        let info = match ecstore_load_admin_data_usage_from_backend_cached(self.ecstore.clone()).await {
+            Ok(info) if info.is_complete_bucket_usage_snapshot() => info,
+            Ok(_) | Err(_) => return Ok(None),
+        };
+
+        let mut baseline = HealBucketUsageBaseline::default();
+        for bucket in buckets {
+            if let Some(usage) = info.buckets_usage.get(bucket) {
+                baseline.objects_count = baseline.objects_count.saturating_add(usage.objects_count);
+                baseline.bytes = baseline.bytes.saturating_add(usage.size);
+            }
+        }
+
+        Ok(Some(baseline))
+    }
+
+    async fn load_heal_lifecycle_expiry_context(&self, bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        match self.ecstore.load_heal_lifecycle_expiry_context(bucket).await {
+            Ok(Some(context)) => Ok(Some(HealLifecycleExpiryContext::ecstore(context))),
+            Ok(None) => Ok(None),
+            Err(err) => {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "load_heal_lifecycle_expiry_context",
+                    bucket,
+                    result = "failed",
+                    error = %err,
+                    "Heal storage lifecycle expiry context load failed"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn enqueue_heal_lifecycle_expiry(
+        &self,
+        context: &HealLifecycleExpiryContext,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        object_info: Option<&HealObjectInfo>,
+    ) -> Result<bool> {
+        let context = match &context.inner {
+            HealLifecycleExpiryContextInner::Ecstore(context) => context,
+            HealLifecycleExpiryContextInner::Test => return Ok(false),
+        };
+        match self
+            .ecstore
+            .enqueue_heal_lifecycle_expiry(context, bucket, object, version_id, object_info)
+            .await
+        {
+            Ok(queued) => Ok(queued),
+            Err(err) => {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "enqueue_heal_lifecycle_expiry",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    result = "failed",
+                    error = %err,
+                    "Heal storage lifecycle expiry check failed"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1436,7 +1576,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         loop {
             let (page_objects, next_token, is_truncated) = self
-                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref())
+                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false)
                 .await?;
 
             all_objects.extend(page_objects);
@@ -1471,6 +1611,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1522,10 +1663,19 @@ impl HealStorageAPI for ECStoreHealStorage {
         let page_objects: Vec<HealListItem> = list_info
             .objects
             .into_iter()
-            .map(|obj| HealListItem {
-                name: obj.name,
-                version_id: obj.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string()),
-                is_delete_marker: obj.delete_marker,
+            .map(|mut obj| {
+                obj.version_id = obj.version_id.filter(|u| !u.is_nil());
+                let version_id = obj.version_id.map(|u| u.to_string());
+                let mod_time_unix_nanos = obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos());
+                let is_delete_marker = obj.delete_marker;
+                let lifecycle_object_info = include_lifecycle_object_info.then(|| obj.clone());
+                HealListItem {
+                    name: obj.name,
+                    version_id,
+                    mod_time_unix_nanos,
+                    lifecycle_object_info,
+                    is_delete_marker,
+                }
             })
             .collect();
         let page_count = page_objects.len();
@@ -1562,6 +1712,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         // Per-page bounds for the disk-walk union enumerator. Objects are atomic
         // (never split across pages), so version_budget only bounds how many
@@ -1590,7 +1741,16 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         let (versions, next_forward, is_truncated) = self
             .ecstore
-            .heal_walk_versions_page(pool_idx, set_idx, bucket, prefix, forward_to.as_deref(), BATCH_OBJECTS, VERSION_BUDGET)
+            .heal_walk_versions_page(
+                pool_idx,
+                set_idx,
+                bucket,
+                prefix,
+                forward_to.as_deref(),
+                BATCH_OBJECTS,
+                VERSION_BUDGET,
+                include_lifecycle_object_info,
+            )
             .await
             .map_err(|e| {
                 error!(
@@ -1614,6 +1774,8 @@ impl HealStorageAPI for ECStoreHealStorage {
             .map(|v| HealListItem {
                 name: v.name,
                 version_id: v.version_id,
+                mod_time_unix_nanos: v.mod_time_unix_nanos,
+                lifecycle_object_info: v.lifecycle_object_info,
                 is_delete_marker: v.is_delete_marker,
             })
             .collect();

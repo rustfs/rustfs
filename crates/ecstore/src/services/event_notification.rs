@@ -26,11 +26,26 @@ use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
 use tracing::warn;
 
+/// Dead ecstore-side notification skeleton.
+///
+/// The working notification stack is `rustfs-notify`, whose own `EventNotifier`
+/// is the one bucket configuration actually drives. Nothing calls the methods
+/// below; `init_bucket_targets` even logs that it is a no-op in this build.
+/// Removing it means also retiring the `InstanceContext` slot that holds it
+/// (backlog#939 Phase 5), so it is left explicit here rather than half-removed.
+#[allow(
+    dead_code,
+    reason = "ecstore-side notification skeleton superseded by rustfs-notify; see module note (backlog#1823)"
+)]
 pub struct EventNotifier {
     target_list: TargetList,
     //bucket_rules_map: HashMap<String , HashMap<EventName, Rules>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "ecstore-side notification skeleton superseded by rustfs-notify; see module note (backlog#1823)"
+)]
 impl EventNotifier {
     pub fn new() -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {

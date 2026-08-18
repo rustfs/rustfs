@@ -445,6 +445,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool), Error> {
             Ok((Vec::new(), None, false))
         }

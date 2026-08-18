@@ -102,7 +102,6 @@ impl MetricSubsystem {
     }
 
     /// Get the formatted metric name format string
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         format_path_to_metric_name(self.path())
     }
@@ -151,7 +150,6 @@ impl MetricSubsystem {
     }
 
     /// A convenient way to create custom subsystems directly
-    #[allow(dead_code)]
     pub fn new(path: impl Into<String>) -> Self {
         Self::Custom(path.into())
     }
@@ -176,7 +174,6 @@ impl std::fmt::Display for MetricSubsystem {
     }
 }
 
-#[allow(dead_code)]
 pub mod subsystems {
     use super::MetricSubsystem;
 

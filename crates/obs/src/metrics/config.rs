@@ -17,7 +17,6 @@ use std::time::Duration;
 /// Environment variable key for the global default metrics interval (seconds).
 pub const ENV_DEFAULT_METRICS_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL_SEC";
 /// Default interval for metrics collection if not specified otherwise.
-#[allow(dead_code)]
 pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Environment variable key for cluster metrics interval (seconds).

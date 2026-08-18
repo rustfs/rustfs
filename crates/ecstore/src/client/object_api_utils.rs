@@ -37,16 +37,17 @@ pub struct PutObjReader {
     //pub sealMD5Fn: SealMD5CurrFn,
 }
 
-#[allow(dead_code)]
 impl PutObjReader {
     pub fn new(reader: HashReader) -> Self {
         Self { reader }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn md5_current_hex_string(&self) -> String {
         self.reader.checksum().map(|v| v.encoded).unwrap_or_default()
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn with_encryption(&mut self, enc_reader: HashReader) -> Result<(), std::io::Error> {
         self.reader = enc_reader;
 
@@ -75,39 +76,6 @@ fn part_number_to_rangespec(oi: ObjectInfo, part_number: usize) -> Option<HTTPRa
         end,
         is_suffix_length: false,
     })
-}
-
-fn get_compressed_offsets(oi: ObjectInfo, offset: i64) -> (i64, i64, i64, i64, u64) {
-    let mut skip_length: i64 = 0;
-    let mut cumulative_actual_size: i64 = 0;
-    let mut first_part_idx: i64 = 0;
-    let mut compressed_offset: i64 = 0;
-    let mut part_skip: i64 = 0;
-    let mut decrypt_skip: i64 = 0;
-    let mut seq_num: u64 = 0;
-    for (i, part) in oi.parts.iter().enumerate() {
-        cumulative_actual_size += part.actual_size as i64;
-        if cumulative_actual_size <= offset {
-            compressed_offset += part.size as i64;
-        } else {
-            first_part_idx = i as i64;
-            skip_length = cumulative_actual_size - part.actual_size as i64;
-            break;
-        }
-    }
-    skip_length = offset - skip_length;
-
-    let parts: &[ObjectPartInfo] = &oi.parts;
-    if skip_length > 0
-        && parts.len() > first_part_idx as usize
-        && parts[first_part_idx as usize].index.as_ref().is_some_and(|idx| idx.len() > 0)
-    {
-        let _ = part_skip;
-        let _ = decrypt_skip;
-        let _ = seq_num;
-    }
-
-    (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
 }
 
 pub fn new_getobjectreader<'a>(

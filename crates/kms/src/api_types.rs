@@ -293,6 +293,15 @@ enum StrictVaultAuthMethod {
         #[serde(default)]
         refresh_safety_window_secs: Option<u64>,
     },
+    Kubernetes {
+        role: String,
+        #[serde(default)]
+        mount: Option<String>,
+        #[serde(default)]
+        jwt_path: Option<std::path::PathBuf>,
+        #[serde(default)]
+        refresh_safety_window_secs: Option<u64>,
+    },
     TokenFile {
         path: std::path::PathBuf,
         #[serde(default)]
@@ -317,6 +326,17 @@ impl From<StrictVaultAuthMethod> for VaultAuthMethod {
                 secret_id,
                 secret_id_file,
                 mount: mount.unwrap_or_else(|| crate::config::DEFAULT_VAULT_APPROLE_MOUNT.to_string()),
+                refresh_safety_window_secs,
+            },
+            StrictVaultAuthMethod::Kubernetes {
+                role,
+                mount,
+                jwt_path,
+                refresh_safety_window_secs,
+            } => Self::Kubernetes {
+                role,
+                mount: mount.unwrap_or_else(|| crate::config::DEFAULT_VAULT_KUBERNETES_MOUNT.to_string()),
+                jwt_path: jwt_path.unwrap_or_else(|| std::path::PathBuf::from(crate::config::DEFAULT_VAULT_KUBERNETES_JWT_PATH)),
                 refresh_safety_window_secs,
             },
             StrictVaultAuthMethod::TokenFile {
@@ -499,6 +519,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::Kubernetes { .. } => "kubernetes".to_string(),
                     VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
@@ -513,6 +534,7 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 auth_method_type: match &vault_config.auth_method {
                     VaultAuthMethod::Token { .. } => "token".to_string(),
                     VaultAuthMethod::AppRole { .. } => "approle".to_string(),
+                    VaultAuthMethod::Kubernetes { .. } => "kubernetes".to_string(),
                     VaultAuthMethod::TokenFile { .. } => "token_file".to_string(),
                 },
                 has_stored_credentials: true,
@@ -899,6 +921,42 @@ mod tests {
         });
         let request: ConfigureKmsRequest = serde_json::from_value(vault_opt_in_raw).expect("vault request should deserialize");
         assert!(request.to_kms_config().validate().is_ok());
+    }
+
+    /// The admin API reaches Kubernetes auth with the role alone; the mount and
+    /// the projected token path fall back to the cluster defaults, so a Tenant
+    /// manifest carries no credential and no cluster-specific paths.
+    #[test]
+    fn test_deserialize_vault_configure_request_accepts_kubernetes_auth() {
+        let raw = serde_json::json!({
+            "backend_type": "vault-transit",
+            "address": "https://vault.example.com:8200",
+            "mount_path": "rustfs",
+            "auth_method": { "Kubernetes": { "role": "rustfs" } }
+        });
+
+        let request: ConfigureKmsRequest = serde_json::from_value(raw).expect("kubernetes auth should deserialize");
+        let config = request.to_kms_config();
+        config.validate().expect("kubernetes auth must validate");
+
+        let vault = config.vault_transit_config().expect("vault transit backend config");
+        let VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } = &vault.auth_method
+        else {
+            panic!("expected Kubernetes auth, got {:?}", vault.auth_method);
+        };
+        assert_eq!(role, "rustfs");
+        assert_eq!(mount, crate::config::DEFAULT_VAULT_KUBERNETES_MOUNT);
+        assert_eq!(jwt_path, std::path::Path::new(crate::config::DEFAULT_VAULT_KUBERNETES_JWT_PATH));
+
+        let unknown_field = serde_json::json!({
+            "backend_type": "vault-transit",
+            "address": "https://vault.example.com:8200",
+            "auth_method": { "Kubernetes": { "role": "rustfs", "service_account": "rustfs" } }
+        });
+        serde_json::from_value::<ConfigureKmsRequest>(unknown_field)
+            .expect_err("an unknown auth field must be rejected rather than silently dropped");
     }
 
     #[test]

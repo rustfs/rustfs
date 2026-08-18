@@ -77,6 +77,10 @@ impl ReplicationObjectBridge {
         load_delete_request_config_in(ctx, bucket).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+    )]
     pub(crate) async fn delete_config_snapshot_in(
         ctx: &ReplicationInstanceContext,
         bucket: &str,

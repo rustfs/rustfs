@@ -46,15 +46,13 @@ use crate::bucket::lifecycle::transition_transaction::run_transition_transaction
 use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
-use crate::error::{
-    error_resp_to_object_err, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down,
-};
+use crate::error::{is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::object_api::{ObjectEncryptionResolver, ReadPlan};
 use crate::services::tier::{
     tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata},
     warm_backend::WarmBackendGetOpts,
@@ -128,11 +126,23 @@ const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
 const EVENT_LIFECYCLE_NOT_ENQUEUED: &str = "lifecycle_not_enqueued";
 const EVENT_LIFECYCLE_DELETE_DISPATCHED: &str = "lifecycle_delete_dispatched";
 const EVENT_LIFECYCLE_DELETE_COMPLETED: &str = "lifecycle_delete_completed";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
 const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
 const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TraceFn =
     Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
@@ -142,9 +152,21 @@ static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 pub const AMZ_ENCRYPTION_AES: &str = "AES256";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
@@ -282,6 +304,10 @@ impl LifecycleSys {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     pub fn trace(oi: &ObjectInfo) -> TraceFn {
         let bucket = oi.bucket.clone();
         let name = oi.name.clone();
@@ -430,16 +456,23 @@ impl<'a> LifecycleExpiryTrace<'a> {
     }
 }
 
-#[allow(dead_code)]
 impl ExpiryStats {
     pub fn missed_tasks(&self) -> i64 {
         self.missed_expiry_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_free_vers_tasks(&self) -> i64 {
         self.missed_freevers_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_tier_journal_tasks(&self) -> i64 {
         self.missed_tier_journal_tasks.load(Ordering::SeqCst)
     }
@@ -572,6 +605,10 @@ async fn delete_free_version_remote_object(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_free_version_remote_object_then<T, F, Fut>(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
@@ -2870,6 +2907,10 @@ fn stale_upload_default_due(initiated: OffsetDateTime, default_expiry: StdDurati
     initiated + time::Duration::seconds(default_expiry.as_secs() as i64)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<String, String>, upload_dir: &str) -> Option<usize> {
     stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
 }
@@ -3354,6 +3395,10 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
     if remote_delete_succeeded {
         opts.skip_decommissioned = true;
@@ -4341,6 +4386,10 @@ pub async fn expire_transitioned_object(
     Ok(dobj)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
@@ -4375,6 +4424,10 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     result
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     let tier = _tier.to_string();
     Arc::new(move || {
@@ -4393,6 +4446,10 @@ pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn get_transitioned_object_reader(
     bucket: &str,
     object: &str,
@@ -4400,9 +4457,10 @@ pub async fn get_transitioned_object_reader(
     h: &HeaderMap,
     oi: &ObjectInfo,
     opts: &ObjectOptions,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
+    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr, resolver).await
 }
 
 fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
@@ -4422,6 +4480,10 @@ fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::
     }
 }
 
+// The resolver joins the tier manager as the second injected port this read
+// needs; grouping the request half into a struct would churn every call site of
+// a bug fix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     bucket: &str,
     object: &str,
@@ -4430,6 +4492,7 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     oi: &ObjectInfo,
     opts: &ObjectOptions,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     validate_transition_remote_version(oi)?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
@@ -4447,11 +4510,16 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
 
     tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
 
-    let ret = new_getobjectreader(rs, oi, opts, h);
-    if let Err(err) = ret {
-        return Err(error_resp_to_object_err(err, vec![bucket, object]));
-    }
-    let (get_fn, off, length) = ret.expect("get_transitioned_object_reader should succeed after error check");
+    // The same read plan the local path uses, so the tier fetch is positioned in
+    // the object's *stored* coordinate system and the stream is handed the same
+    // decrypt/decompress transforms. Reading an encrypted object's ciphertext
+    // through a plaintext-coordinate range and skipping the transform is how a
+    // transitioned SSE object used to come back as silently corrupt bytes of the
+    // right length (rustfs/rustfs#6025).
+    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
+        .await
+        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
+    let (off, length) = (plan.storage_offset() as i64, plan.storage_length());
     let mut gopts = WarmBackendGetOpts::default();
 
     if off >= 0 && length >= 0 {
@@ -4488,7 +4556,10 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
             );
             e
         })?;
-    Ok(attach_tier_operation_lease(get_fn(reader, h.clone()), tgt_client))
+    let object_reader = plan
+        .into_object_reader(Box::new(reader), oi)
+        .map_err(|err| std::io::Error::other(format!("wrapping the tier stream for {bucket}/{object} failed: {err}")))?;
+    Ok(attach_tier_operation_lease(object_reader, tgt_client))
 }
 
 struct TierOperationLeaseReader {
@@ -5133,6 +5204,10 @@ async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Res
     ReplicationObjectBridge::delete_request_config(api, &oi.bucket).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
@@ -5776,6 +5851,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         .expect("transitioned reader should open");
@@ -5840,6 +5916,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -5880,6 +5957,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6117,6 +6195,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6140,6 +6219,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -7405,6 +7485,10 @@ mod tests {
     // process environment while `env::set_var`/`env::remove_var` is active.
     // SAFETY: keep this note adjacent to the allowance for the repository guard.
     #[allow(unsafe_code)]
+    #[allow(
+        dead_code,
+        reason = "transition-queue env fixture kept for tests that scope those vars; no test uses it today (backlog#1823)"
+    )]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
         F: FnOnce() -> Fut,

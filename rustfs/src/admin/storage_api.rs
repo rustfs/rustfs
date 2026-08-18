@@ -64,7 +64,9 @@ mod ecstore_metrics {
 }
 
 mod ecstore_notification {
-    pub(crate) use crate::storage::storage_api::ecstore_notification::NotificationSys;
+    pub(crate) use crate::storage::storage_api::ecstore_notification::{
+        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+    };
 }
 
 #[allow(unused_imports)]
@@ -111,6 +113,10 @@ pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 pub(crate) type TierCreds = ecstore_tier::tier_admin::TierCreds;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
 pub(crate) type TierConfigUpdateError = crate::storage::storage_api::TierConfigUpdateError;
+
+pub(crate) fn acquire_cross_pool_fence_fleet_proof() -> Option<ecstore_notification::CrossPoolFenceFleetProofToken> {
+    ecstore_notification::acquire_cross_pool_fence_fleet_proof()
+}
 
 pub(crate) mod runtime_sources {
     pub(crate) type DailyAllTierStats = super::DailyAllTierStats;
@@ -296,6 +302,15 @@ pub(crate) mod metadata_sys {
         super::ecstore_bucket::metadata_sys::update_if_incarnation(bucket, config_file, data, expected_incarnation_id).await
     }
 
+    pub(crate) async fn update_quota_if_incarnation(
+        bucket: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: uuid::Uuid,
+        proof: &super::ecstore_notification::CrossPoolFenceFleetProofToken,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_quota_if_incarnation(bucket, data, expected_incarnation_id, proof).await
+    }
+
     pub(crate) async fn capture_bucket_metadata_incarnation(bucket: &str) -> Result<uuid::Uuid> {
         super::ecstore_bucket::metadata_sys::capture_bucket_metadata_incarnation(bucket).await
     }
@@ -304,6 +319,34 @@ pub(crate) mod metadata_sys {
         bucket: &str,
     ) -> Result<super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
         crate::storage::storage_api::acquire_bucket_metadata_transaction_lock(bucket).await
+    }
+
+    pub(crate) async fn acquire_bucket_metadata_transaction_lock_for_incarnation(
+        bucket: &str,
+        expected_incarnation_id: uuid::Uuid,
+    ) -> Result<super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
+        super::ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(
+            bucket,
+            expected_incarnation_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn update_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::update_under_transaction_lock(guard, bucket, config_file, data).await
+    }
+
+    pub(crate) async fn delete_under_transaction_lock(
+        guard: &super::ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
+        bucket: &str,
+        config_file: &str,
+    ) -> Result<OffsetDateTime> {
+        super::ecstore_bucket::metadata_sys::delete_under_transaction_lock(guard, bucket, config_file).await
     }
 
     pub(crate) async fn update_bucket_targets_under_transaction_lock(
@@ -402,6 +445,10 @@ pub(crate) mod replication {
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
+    pub(crate) type BucketReplicationStats = super::ecstore_bucket::replication::BucketReplicationStats;
+    pub(crate) type BucketReplicationStat = super::ecstore_bucket::replication::BucketReplicationStat;
+    pub(crate) type InQueueMetric = super::ecstore_bucket::replication::InQueueMetric;
+    pub(crate) type XferStats = super::ecstore_bucket::replication::XferStats;
     pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;

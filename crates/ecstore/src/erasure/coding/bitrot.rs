@@ -820,10 +820,263 @@ impl BitrotWriterWrapper {
     }
 }
 
+// --- startup bitrot self-test (rustfs/backlog#1873, MinIO bitrotSelfTest parity) ---
+//
+// A broken hash implementation (bad SIMD feature combination, platform drift, a
+// key-handling regression) fails silently: every shard reads back "corrupt",
+// heal rewrites data that was fine, and cross-platform clusters disagree about
+// which copy is healthy. The self-test below pins the algorithms the moment a
+// process starts, so a drifted build announces itself instead of quietly
+// rewriting objects. See docs/rustfs-heal-scanner-vs-minio-comprehensive-
+// analysis-2026-08-16.md §6 HS-11.
+
+/// Length of the deterministic self-test payload.
+pub const BITROT_SELF_TEST_PAYLOAD_LEN: usize = 4096;
+
+/// Known-answer digest of [`bitrot_self_test_payload`] under `HighwayHash256S`
+/// (the production default). Pinned so any platform or build where the
+/// implementation drifts fails startup instead of miss-hashing shards.
+const BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S: [u8; 32] = [
+    0xb9, 0x32, 0xa2, 0xaa, 0x4a, 0xb7, 0x33, 0x6a, 0xa3, 0xca, 0x7e, 0x61, 0x9d, 0x86, 0x52, 0x14, 0x6e, 0x7f, 0xd8, 0x9e, 0xea,
+    0x08, 0xd9, 0x8c, 0x33, 0x85, 0x87, 0x19, 0x30, 0xd6, 0xed, 0x06,
+];
+
+/// Known-answer digest of the same payload under `HighwayHash256SLegacy`.
+const BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S_LEGACY: [u8; 32] = [
+    0x98, 0x24, 0x71, 0x4f, 0x16, 0xbb, 0x48, 0x39, 0xed, 0x68, 0xfa, 0x63, 0x5e, 0xd9, 0x07, 0x61, 0xdf, 0x0a, 0xff, 0xcf, 0x7d,
+    0x8c, 0xa8, 0xc7, 0xc0, 0xb6, 0x6f, 0x05, 0xdb, 0xda, 0x5a, 0x22,
+];
+
+/// FIPS 180-2 test vector: SHA-256 of the ASCII string "abc". Unlike the
+/// Highway digests above this one is externally verifiable, so it guards the
+/// whole `HashAlgorithm` plumbing even for readers who distrust pinned
+/// self-computed constants.
+const BITROT_SELF_TEST_KAT_SHA256_ABC: [u8; 32] = [
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96,
+    0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+];
+
+/// Deterministic self-test payload: xorshift64* from a fixed seed, so every
+/// platform and every run hashes the same 4096 bytes.
+fn bitrot_self_test_payload() -> [u8; BITROT_SELF_TEST_PAYLOAD_LEN] {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut payload = [0u8; BITROT_SELF_TEST_PAYLOAD_LEN];
+    for byte in payload.iter_mut() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        *byte = state.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8;
+    }
+    payload
+}
+
+/// Why a bitrot self-test failed.
+#[derive(Debug)]
+pub enum BitrotSelfTestError {
+    /// A known-answer digest mismatched the pinned constant.
+    KnownAnswerMismatch {
+        algorithm: &'static str,
+        got: String,
+        want: String,
+    },
+    /// A freshly encoded shard failed `bitrot_verify`.
+    RoundtripVerify { algorithm: &'static str, detail: String },
+    /// A verified roundtrip read back different bytes than were written.
+    RoundtripReadback { algorithm: &'static str },
+    /// A deliberately tampered shard was not rejected by `bitrot_verify`.
+    TamperNotRejected {
+        algorithm: &'static str,
+        tampered: &'static str,
+    },
+}
+
+impl std::fmt::Display for BitrotSelfTestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KnownAnswerMismatch { algorithm, got, want } => {
+                write!(f, "known-answer mismatch for {algorithm}: got {got}, want {want}")
+            }
+            Self::RoundtripVerify { algorithm, detail } => write!(f, "{algorithm} roundtrip shard failed verification: {detail}"),
+            Self::RoundtripReadback { algorithm } => write!(f, "{algorithm} roundtrip read back different bytes"),
+            Self::TamperNotRejected { algorithm, tampered } => {
+                write!(f, "{algorithm} tampered shard ({tampered}) was not rejected")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BitrotSelfTestError {}
+
+fn self_test_hex(bytes: &[u8]) -> String {
+    rustfs_utils::hex(bytes)
+}
+
+// (kept as a named one-liner so every KAT failure site reads the same; the
+// underlying formatter is the shared `rustfs_utils::hex`)
+
+/// Compare a digest against its pinned constant. Split out so a test can drive
+/// it with a wrong constant and prove the mismatch path fires.
+fn bitrot_kat_check(
+    algorithm: &'static str,
+    algo: &HashAlgorithm,
+    payload: &[u8],
+    expected: &[u8; 32],
+) -> Result<(), BitrotSelfTestError> {
+    let digest = algo.hash_encode(payload);
+    let digest = digest.as_ref();
+    if digest.len() != expected.len() || digest != expected.as_slice() {
+        return Err(BitrotSelfTestError::KnownAnswerMismatch {
+            algorithm,
+            got: self_test_hex(digest),
+            want: self_test_hex(expected),
+        });
+    }
+    Ok(())
+}
+
+/// Encode `payload` with `shard_size` blocks, verify it end to end, and read
+/// every block back through `BitrotReader` comparing bytes.
+async fn bitrot_roundtrip_check(
+    algorithm: &'static str,
+    algo: HashAlgorithm,
+    payload: &[u8],
+    shard_size: usize,
+) -> Result<(), BitrotSelfTestError> {
+    let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+    for chunk in payload.chunks(shard_size) {
+        writer
+            .write(chunk)
+            .await
+            .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+                algorithm,
+                detail: format!("encode failed: {err}"),
+            })?;
+    }
+    let encoded = writer.into_inner().into_inner();
+
+    let on_disk = bitrot_shard_file_size(payload.len(), shard_size, algo.clone());
+    if encoded.len() != on_disk {
+        return Err(BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: format!("encoded {} bytes, size formula says {on_disk}", encoded.len()),
+        });
+    }
+    bitrot_verify(std::io::Cursor::new(encoded.clone()), on_disk, payload.len(), algo.clone(), shard_size)
+        .await
+        .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: err.to_string(),
+        })?;
+
+    let mut reader = BitrotReader::new(std::io::Cursor::new(encoded), shard_size, algo, false);
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let want = shard_size.min(payload.len() - offset);
+        let mut buf = vec![0u8; want];
+        let read = reader
+            .read(&mut buf)
+            .await
+            .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+                algorithm,
+                detail: format!("read back failed at offset {offset}: {err}"),
+            })?;
+        if read != want || buf[..read] != payload[offset..offset + read] {
+            return Err(BitrotSelfTestError::RoundtripReadback { algorithm });
+        }
+        offset += read;
+    }
+    Ok(())
+}
+
+/// Flip one byte and require `bitrot_verify` to reject the result.
+async fn bitrot_tamper_check(
+    algorithm: &'static str,
+    algo: HashAlgorithm,
+    payload: &[u8],
+    shard_size: usize,
+    tampered: &'static str,
+    flip_at: usize,
+) -> Result<(), BitrotSelfTestError> {
+    let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+    for chunk in payload.chunks(shard_size) {
+        writer.write(chunk).await.expect("self-test encode should not fail");
+    }
+    let mut corrupt = writer.into_inner().into_inner();
+    let flip_index = flip_at % corrupt.len();
+    corrupt[flip_index] ^= 0x80;
+
+    let on_disk = bitrot_shard_file_size(payload.len(), shard_size, algo.clone());
+    match bitrot_verify(std::io::Cursor::new(corrupt), on_disk, payload.len(), algo, shard_size).await {
+        // The flipped byte must be rejected as a hash mismatch specifically, not
+        // by any incidental read error: an in-memory cursor cannot fail reads,
+        // so accepting any other failure here would mask a verify path that
+        // errors out before it ever compares hashes.
+        Err(err) if err.to_string().contains("hash mismatch") => Ok(()),
+        Ok(()) => Err(BitrotSelfTestError::TamperNotRejected { algorithm, tampered }),
+        Err(err) => Err(BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: format!("tampered shard rejected with an unexpected error: {err}"),
+        }),
+    }
+}
+
+/// Verify every bitrot algorithm this crate can write or verify in production:
+/// both streaming Highway variants roundtrip end to end (encode → size formula
+/// → `bitrot_verify` → read back) and reject a flipped byte in both the data
+/// and the leading hash, while all three hashed algorithms reproduce their
+/// pinned known-answer digests.
+///
+/// Runs in well under a millisecond on 4 KiB of data; callers may run it inline
+/// at startup. Pure CPU, no allocation beyond a few KiB of scratch.
+pub async fn bitrot_self_test() -> Result<(), BitrotSelfTestError> {
+    let payload = bitrot_self_test_payload();
+
+    // Externally verifiable vector first: it guards the HashAlgorithm plumbing
+    // itself, before any self-pinned constants are consulted.
+    let abc = HashAlgorithm::SHA256.hash_encode(b"abc");
+    if abc.as_ref() != BITROT_SELF_TEST_KAT_SHA256_ABC.as_slice() {
+        return Err(BitrotSelfTestError::KnownAnswerMismatch {
+            algorithm: "SHA256",
+            got: self_test_hex(abc.as_ref()),
+            want: self_test_hex(&BITROT_SELF_TEST_KAT_SHA256_ABC),
+        });
+    }
+
+    bitrot_kat_check(
+        "HighwayHash256S",
+        &HashAlgorithm::HighwayHash256S,
+        &payload,
+        &BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S,
+    )?;
+    bitrot_kat_check(
+        "HighwayHash256SLegacy",
+        &HashAlgorithm::HighwayHash256SLegacy,
+        &payload,
+        &BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S_LEGACY,
+    )?;
+
+    for (algorithm, algo) in [
+        ("HighwayHash256S", HashAlgorithm::HighwayHash256S),
+        ("HighwayHash256SLegacy", HashAlgorithm::HighwayHash256SLegacy),
+    ] {
+        // Full blocks plus a partial tail, exactly like a real part stripe.
+        let tail_len = 2 * 1024 + 333;
+        bitrot_roundtrip_check(algorithm, algo.clone(), &payload, 1024).await?;
+        bitrot_roundtrip_check(algorithm, algo.clone(), &payload[..tail_len], 1024).await?;
+        // One flipped byte in the final data block, one in the first leading
+        // hash: both must fail verification.
+        bitrot_tamper_check(algorithm, algo.clone(), &payload, 1024, "final data byte", payload.len() - 1).await?;
+        bitrot_tamper_check(algorithm, algo, &payload, 1024, "leading hash byte", 0).await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_kat_check, bitrot_self_test,
+        bitrot_self_test_payload, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
     };
     use super::{MAX_RETAINED_CHUNKS_PER_BLOCK, ShardChunkRead, ShardSource};
     use bytes::Bytes;
@@ -1090,6 +1343,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bitrot_self_test_payload_is_deterministic() {
+        // Two independent builds of the payload must agree byte for byte, or
+        // the pinned known-answer digests below would be meaningless.
+        assert_eq!(bitrot_self_test_payload(), bitrot_self_test_payload());
+    }
+
+    #[test]
+    fn bitrot_self_test_rejects_a_wrong_known_answer_digest() {
+        let payload = bitrot_self_test_payload();
+        let wrong = [0u8; 32];
+        let err = bitrot_kat_check("HighwayHash256S", &HashAlgorithm::HighwayHash256S, &payload, &wrong)
+            .expect_err("a zeroed digest must never match");
+        match err {
+            super::BitrotSelfTestError::KnownAnswerMismatch { algorithm, .. } => assert_eq!(algorithm, "HighwayHash256S"),
+            other => panic!("expected KnownAnswerMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bitrot_self_test_passes() {
+        bitrot_self_test()
+            .await
+            .expect("the pinned digests and roundtrip checks must all pass on this platform");
+    }
+
     #[tokio::test]
     async fn vectored_test_writers_cover_fallback_flush_and_shutdown_paths() {
         let mut counting = VectoredCountingWriter::default();
@@ -1189,7 +1468,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x80;
         let err = bitrot_verify(
-            Cursor::new(corrupt),
+            std::io::Cursor::new(corrupt),
             super::bitrot_shard_file_size(data.len(), shard_size, algo.clone()),
             data.len(),
             algo,
@@ -1282,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn bitrot_reader_rejects_output_buffers_larger_than_shard_size() {
-        let mut reader = BitrotReader::new(Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
+        let mut reader = BitrotReader::new(std::io::Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
         let mut out = [0u8; 5];
         let err = reader
             .read(&mut out)
@@ -1407,7 +1686,7 @@ mod tests {
             (HashAlgorithm::HighwayHash256, true),
         ] {
             let label = format!("{algo:?}");
-            let writer = Cursor::new(Vec::<u8>::new());
+            let writer = std::io::Cursor::new(Vec::<u8>::new());
             let mut w = BitrotWriter::new(writer, shard_size, algo.clone());
             w.write(&[7u8; 16]).await.unwrap();
             let written = w.into_inner().into_inner();
@@ -1492,7 +1771,7 @@ mod tests {
     }
 
     async fn encode_one_block(payload: &[u8], shard_size: usize, algo: HashAlgorithm) -> Vec<u8> {
-        let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo);
+        let mut w = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo);
         w.write(payload).await.unwrap();
         w.into_inner().into_inner()
     }
@@ -1600,7 +1879,7 @@ mod tests {
         for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::HighwayHash256SLegacy] {
             for &size in &[1usize, 16, 17, 32, 40, 48] {
                 let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
-                let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+                let mut w = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
                 for chunk in payload.chunks(shard_size) {
                     w.write(chunk).await.unwrap();
                 }
@@ -1674,14 +1953,14 @@ mod tests {
             w.write(&data).await.expect("write shard");
 
             let mut via_read = vec![0u8; SHARD];
-            let n1 = BitrotReader::new(Cursor::new(encoded.clone()), SHARD, algo.clone(), false)
+            let n1 = BitrotReader::new(std::io::Cursor::new(encoded.clone()), SHARD, algo.clone(), false)
                 .read(&mut via_read)
                 .await
                 .expect("read");
 
             // A buffer with only capacity — no initialized bytes at all.
             let mut via_append: Vec<u8> = Vec::with_capacity(SHARD);
-            let n2 = BitrotReader::new(Cursor::new(encoded), SHARD, algo.clone(), false)
+            let n2 = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo.clone(), false)
                 .read_appending(&mut via_append, SHARD)
                 .await
                 .expect("read_appending");
@@ -1706,7 +1985,7 @@ mod tests {
             encoded.truncate(encoded.len() - 1);
 
             let mut out: Vec<u8> = Vec::with_capacity(SHARD);
-            let err = BitrotReader::new(Cursor::new(encoded), SHARD, algo.clone(), false)
+            let err = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo.clone(), false)
                 .read_appending(&mut out, SHARD)
                 .await
                 .expect_err("a truncated shard must not succeed");
@@ -1732,7 +2011,7 @@ mod tests {
         encoded[last] ^= 0xff;
 
         let mut out: Vec<u8> = Vec::with_capacity(SHARD);
-        let err = BitrotReader::new(Cursor::new(encoded), SHARD, algo, false)
+        let err = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo, false)
             .read_appending(&mut out, SHARD)
             .await
             .expect_err("a corrupt shard must not verify");
@@ -1844,7 +2123,7 @@ mod tests {
             "Cursor<Bytes> must be able to hand out a block, otherwise the fast path is dead code"
         );
         assert_eq!(mem.position(), 8, "taking a block must advance like a read of the same length");
-        let mut streamed = Cursor::new(encoded.clone());
+        let mut streamed = std::io::Cursor::new(encoded.clone());
         assert!(
             ShardSource::try_take_block(&mut streamed, 8).is_none(),
             "a non-Bytes source must stay on the streaming path"
@@ -1872,7 +2151,7 @@ mod tests {
         );
 
         let mut via_stream: Vec<u8> = Vec::with_capacity(SHARD);
-        BitrotReader::new(Cursor::new(encoded), SHARD, algo, false)
+        BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo, false)
             .read_appending(&mut via_stream, SHARD)
             .await
             .expect("streaming read");

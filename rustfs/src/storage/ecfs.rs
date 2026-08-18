@@ -45,7 +45,7 @@ use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
-use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
+use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, insert_str};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -301,7 +301,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_copy_object(req)).await
+        usecase.execute_copy_object(req).await
     }
 
     #[instrument(
@@ -461,6 +461,11 @@ impl S3 for FS {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_TAGGING_TIMESTAMP,
+                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            );
             opts.eval_metadata = Some(eval_metadata);
         }
 
@@ -704,7 +709,7 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         crate::hp_guard!("S3::get_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_get_object(req)).await
+        usecase.execute_get_object(req).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -1261,7 +1266,7 @@ impl S3 for FS {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_put_object(self, req)).await
+        usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1645,6 +1650,11 @@ impl S3 for FS {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_TAGGING_TIMESTAMP,
+                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            );
             opts.eval_metadata = Some(eval_metadata);
         }
 

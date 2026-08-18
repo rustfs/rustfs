@@ -4033,7 +4033,7 @@ if [[ -s "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE" ]]; then
   report_failure "remote tier delete state access must stay behind ECStore tier sweeper owner helpers: $(paste -sd '; ' "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE")"
 fi
 
-RUSTFS_OWNER_LOCAL_STATIC_NAMES='(KEYSTONE_AUTH|KEYSTONE_MAPPER|KEYSTONE_CONFIG|LICENSE_STATE|LICENSE_VERIFIER|CPU_CONT_GUARD|PROFILING_CANCEL_TOKEN|MEMORY_SYSTEM|DIAL9_TELEMETRY_GUARD|DISPLAY_CONFIG_SNAPSHOT|GLOBAL_CONFIG_SNAPSHOT|BUFFER_CONFIG_SINGLETON|BUFFER_PROFILE_ENABLED|LEGACY_CREDENTIAL_WARNED_KEYS|CONSOLE_CONFIG|ACTIVE_HTTP_REQUESTS|USE_STARSHARD_CACHE|BUCKET_CACHE_SMALL|BUCKET_CACHE_LARGE|GLOBAL_SSE_DEK_PROVIDER|SSE_TEST_LOCK|AUTH_FS|LOCK_STATS|DEADLOCK_DETECTOR|GET_OBJECT_BUFFER_THRESHOLD_WARNED|GET_READER_STREAM_BUFFER_SIZE_OVERRIDE|OBJECT_SEEK_SUPPORT_THRESHOLD|OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS|SUPPORTED_HEADERS|SITE_REPLICATION_PEER_CLIENT|SITE_REPLICATION_STATE_LOCK|AUDIT_MODULE_ENABLED|NOTIFY_MODULE_ENABLED|PERSISTED_NOTIFY_MODULE_ENABLED|PERSISTED_AUDIT_MODULE_ENABLED|PERSISTED_MODULE_SWITCH_CONFIGURED|DELETE_TAIL_TOTAL|DELETE_CLEANUP_TOTAL|DELETE_REPLICATION_TOTAL|DELETE_NOTIFY_TOTAL|EMBEDDED_SERVER_STARTED|TEST_OUTBOUND_TLS_GENERATION|TEST_REMAINING_FAILURES|CAPACITY_DIRTY_SCOPE_ENV|CAPACITY_DIRTY_SCOPE_INIT|GLOBAL_ENV)'
+RUSTFS_OWNER_LOCAL_STATIC_NAMES='(KEYSTONE_AUTH|KEYSTONE_MAPPER|KEYSTONE_CONFIG|LICENSE_STATE|LICENSE_VERIFIER|CPU_CONT_GUARD|PROFILING_CANCEL_TOKEN|MEMORY_SYSTEM|DIAL9_TELEMETRY_GUARD|DISPLAY_CONFIG_SNAPSHOT|GLOBAL_CONFIG_SNAPSHOT|BUFFER_CONFIG_SINGLETON|BUFFER_PROFILE_ENABLED|LEGACY_CREDENTIAL_WARNED_KEYS|CONSOLE_CONFIG|ACTIVE_HTTP_REQUESTS|USE_STARSHARD_CACHE|BUCKET_CACHE_SMALL|BUCKET_CACHE_LARGE|GLOBAL_SSE_DEK_PROVIDER|SSE_TEST_LOCK|AUTH_FS|LOCK_STATS|DEADLOCK_DETECTOR|GET_OBJECT_BUFFER_THRESHOLD_WARNED|GET_READER_STREAM_BUFFER_SIZE_OVERRIDE|OBJECT_SEEK_SUPPORT_THRESHOLD|OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS|SUPPORTED_HEADERS|SITE_REPLICATION_PEER_CLIENT|AUDIT_MODULE_ENABLED|NOTIFY_MODULE_ENABLED|PERSISTED_NOTIFY_MODULE_ENABLED|PERSISTED_AUDIT_MODULE_ENABLED|PERSISTED_MODULE_SWITCH_CONFIGURED|DELETE_TAIL_TOTAL|DELETE_CLEANUP_TOTAL|DELETE_REPLICATION_TOTAL|DELETE_NOTIFY_TOTAL|EMBEDDED_SERVER_STARTED|TEST_OUTBOUND_TLS_GENERATION|TEST_REMAINING_FAILURES|CAPACITY_DIRTY_SCOPE_ENV|CAPACITY_DIRTY_SCOPE_INIT|GLOBAL_ENV)'
 
 (
   cd "$ROOT_DIR"
@@ -5448,6 +5448,57 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
   report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+fi
+
+# --- ecstore module-level lint blankets (backlog#1823 step 9) ---
+#
+# Two rules:
+#   1. ecstore carries zero `#![allow(dead_code)]` after the step 2 burn-down;
+#      the count may only stay at zero.
+#   2. Every other module-level blanket (unused_variables / unused_must_use /
+#      clippy::all) must match scripts/ecstore-module-lint-register.txt exactly.
+#      Exact match, not "no additions": a one-way rule lets the register rot
+#      into an amnesty list, which is what backlog#1834 found in the
+#      layer-dependency baseline.
+
+ECSTORE_LINT_REGISTER="${ROOT_DIR}/scripts/ecstore-module-lint-register.txt"
+ECSTORE_DEAD_CODE_HITS="${TMP_DIR}/ecstore_dead_code_blankets.txt"
+ECSTORE_LINT_ACTUAL="${TMP_DIR}/ecstore_lint_actual.txt"
+ECSTORE_LINT_EXPECTED="${TMP_DIR}/ecstore_lint_expected.txt"
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\(dead_code\)\]' crates/ecstore/src/ 2>/dev/null || true
+) >"$ECSTORE_DEAD_CODE_HITS"
+
+if [[ -s "$ECSTORE_DEAD_CODE_HITS" ]]; then
+  report_failure "ecstore must carry no module-level #![allow(dead_code)] (backlog#1823 step 2 cleared them; re-add an item-level allow with a reason instead): $(paste -sd '; ' "$ECSTORE_DEAD_CODE_HITS")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\((unused_variables|unused_must_use|clippy::all)\)\]' crates/ecstore/src/ 2>/dev/null |
+    sed -E 's#^([^:]+):[0-9]+:\#!\[allow\(([^)]+)\)\]#\1|\2#' | sort -u
+) >"$ECSTORE_LINT_ACTUAL"
+
+if [[ ! -f "$ECSTORE_LINT_REGISTER" ]]; then
+  report_failure "missing scripts/ecstore-module-lint-register.txt (backlog#1823 step 9)"
+else
+  rg -v '^\s*(#|$)' "$ECSTORE_LINT_REGISTER" | sort -u >"$ECSTORE_LINT_EXPECTED"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_EXPECTED"; then
+      report_failure "new ecstore module-level lint blanket '${entry}' is not in scripts/ecstore-module-lint-register.txt; prefer an item-level allow with a reason, or add the line with a rationale in the PR description (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_ACTUAL"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_ACTUAL"; then
+      report_failure "scripts/ecstore-module-lint-register.txt lists '${entry}' but the blanket is gone; delete the line in the same PR so the register can only shrink (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_EXPECTED"
 fi
 
 if (( FAILURES > 0 )); then

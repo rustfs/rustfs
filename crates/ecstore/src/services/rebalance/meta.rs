@@ -864,6 +864,10 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
     RebalanceMetaMergeOutcome::Merged
 }
 
+#[allow(
+    dead_code,
+    reason = "stop-transition helper retained beside stop_rebalance_meta_snapshot; no caller yet (backlog#1823)"
+)]
 pub(super) fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
@@ -964,6 +968,7 @@ pub(super) fn rollback_rebalance_start_meta_snapshot_for_id(
     })
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(super) fn stop_rebalance_meta_snapshot(meta: Option<&mut RebalanceMeta>, now: OffsetDateTime) -> Option<RebalanceMeta> {
     let meta = meta?;
     stop_rebalance_state(meta, now);

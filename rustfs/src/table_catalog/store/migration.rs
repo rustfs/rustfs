@@ -216,7 +216,7 @@ where
         Ok(fence)
     }
 
-    pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<Box<dyn Send>> {
+    pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let fence_path = self.paths.backing_migration_global_fence_path();
         let lock_path = self.paths.backing_migration_global_fence_lock_path();
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
@@ -235,7 +235,7 @@ where
     pub(super) async fn acquire_object_backed_catalog_write_permit(
         &self,
         table_bucket: &str,
-    ) -> TableCatalogStoreResult<Box<dyn Send>> {
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
         if self.read_backing_migration_fence(table_bucket).await?.is_some() {
@@ -290,7 +290,7 @@ where
     async fn collect_bucket_snapshot_with_locks(
         &self,
         table_bucket: &str,
-        guards: &mut Vec<Box<dyn Send>>,
+        guards: &mut Vec<TableCatalogLockGuard>,
     ) -> TableCatalogStoreResult<StrongTableCatalogBucketSnapshot> {
         let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
         guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?);

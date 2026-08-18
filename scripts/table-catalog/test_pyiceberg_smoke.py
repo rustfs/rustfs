@@ -749,6 +749,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(request["name"], "orders_view")
         self.assertEqual(request["schema"]["type"], "struct")
         self.assertEqual(request["view-version"]["version-id"], 7)
+        self.assertEqual(request["view-version"]["default-namespace"], ["sales"])
         self.assertEqual(request["view-version"]["representations"][0]["dialect"], "spark")
         self.assertEqual(request["properties"]["rustfs.smoke.table"], "orders")
 

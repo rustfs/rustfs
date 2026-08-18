@@ -326,7 +326,11 @@ impl From<StorageError> for ApiError {
             _ => S3ErrorCode::InternalError,
         };
 
-        let message = if matches!(&err, StorageError::QuotaExceeded { .. }) || code == S3ErrorCode::InternalError {
+        let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
+            err.to_string()
+        } else if code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)) {
+            ApiError::error_code_to_message(&code)
+        } else if code == S3ErrorCode::InternalError {
             err.to_string()
         } else if let StorageError::InvalidArgument(_, _, reason) = &err
             && !reason.is_empty()
@@ -526,6 +530,25 @@ mod tests {
     }
 
     #[test]
+    fn storage_io_internal_error_redacts_public_message_and_retains_source() {
+        let sensitive_path = "/sensitive/storage/path";
+        let api_error = ApiError::from(StorageError::Io(IoError::new(
+            ErrorKind::PermissionDenied,
+            format!("permission denied: {sensitive_path}"),
+        )));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        assert!(!api_error.message.contains(sensitive_path));
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains(sensitive_path)));
+    }
+
+    #[test]
     fn test_kms_service_unavailable_maps_to_retryable_error() {
         let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
 
@@ -691,9 +714,14 @@ mod tests {
         let iam_error = rustfs_iam::error::Error::other("IAM test error");
         let api_error: ApiError = iam_error.into();
 
-        // IAM error is first converted to StorageError, then to ApiError
-        assert!(api_error.source.is_some());
-        assert!(api_error.message.contains("test error"));
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains("IAM test error")));
     }
 
     #[test]

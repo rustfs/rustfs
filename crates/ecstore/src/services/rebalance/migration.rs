@@ -171,6 +171,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, D, DFut, W, WFut>(
     set: &Backend,
     bucket: String,

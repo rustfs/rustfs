@@ -365,11 +365,15 @@ mod tests {
 pub struct Checksum {
     checksum_type: ChecksumMode,
     r: Vec<u8>,
+    #[allow(
+        dead_code,
+        reason = "checksum bookkeeping field kept beside the value it guards (backlog#1823)"
+    )]
     computed: bool,
 }
 
-#[allow(dead_code)]
 impl Checksum {
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn new(t: ChecksumMode, b: &[u8]) -> Checksum {
         if t.is_set() && b.len() == t.raw_byte_len() {
             return Checksum {
@@ -381,7 +385,7 @@ impl Checksum {
         Checksum::default()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn new_checksum_string(t: ChecksumMode, s: &str) -> Result<Checksum, std::io::Error> {
         let b = match base64_decode(s.as_bytes()) {
             Ok(b) => b,
@@ -408,7 +412,7 @@ impl Checksum {
         base64_encode(&self.r)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn raw(&self) -> Option<Vec<u8>> {
         if !self.is_set() {
             return None;

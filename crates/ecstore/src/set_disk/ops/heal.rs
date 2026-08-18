@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use super::super::*;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -452,7 +454,9 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let write_lock_guard = if !opts.no_lock {
+        // Bound, not `_`: this guard must live to the end of the scope. A bare
+        // `_` would drop it here and release the namespace write lock.
+        let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             Some(
                 ns_lock
@@ -995,7 +999,7 @@ impl SetDisks {
                                                 readers.push(None);
                                                 continue;
                                             }
-                                            Err(e) => {
+                                            Err(_e) => {
                                                 readers.push(None);
                                                 continue;
                                             }
@@ -1164,10 +1168,10 @@ impl SetDisks {
                                 let rename_result = if should_fail_heal_rename(bucket, object, index) {
                                     Err(DiskError::Unexpected)
                                 } else {
-                                    disk.rename_data(
+                                    disk.rename_data_borrowed(
                                         RUSTFS_META_TMP_BUCKET,
                                         &tmp_id,
-                                        parts_metadata[index].clone(),
+                                        &parts_metadata[index],
                                         bucket,
                                         object,
                                     )
@@ -1544,6 +1548,9 @@ impl SetDisks {
 
         for candidate in candidates.iter_mut().filter(|candidate| candidate.local_payload) {
             for (disk_index, disk) in disks.iter().enumerate() {
+                // Only the #[cfg(test)] fault-injection branch below reads this.
+                #[cfg(not(test))]
+                let _ = disk_index;
                 let Some(disk) = disk else {
                     return Ok(DanglingDeleteSafety::UnsafeToDelete);
                 };
@@ -1715,6 +1722,10 @@ impl SetDisks {
         Ok((result, None))
     }
 
+    #[allow(
+        dead_code,
+        reason = "lock-taking wrapper over the live heal_object_dir_locked; only comments reference it (backlog#1823)"
+    )]
     #[tracing::instrument(level = "trace", skip(self), fields(bucket = %bucket, object = %object))]
     pub(in crate::set_disk) async fn heal_object_dir(
         &self,
@@ -2047,11 +2058,61 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         Err(Error::DiskNotFound)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the set layer
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
+    #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        let started_at = std::time::Instant::now();
+        let _write_lock_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
+        } else {
+            None
+        };
+
+        let removed = if opts.dry_run {
+            self.dry_run_reclaim_orphan_data_dirs(bucket, object).await?
+        } else {
+            self.reclaim_orphan_data_dirs(bucket, object).await?
+        };
+        let state = if opts.dry_run && removed > 0 {
+            "dry_run_matched"
+        } else if removed > 0 {
+            "reclaimed"
+        } else {
+            "checked"
+        };
+        let data_dirs = u64::try_from(removed).unwrap_or(u64::MAX);
+
+        trace_emit(|| {
+            TraceEvent::new(TraceKind::Heal, TraceFunc::HealCheckAbandonedParts)
+                .with_bucket(bucket)
+                .with_object(object)
+                .with_duration(started_at.elapsed())
+                .with_attr("state", state)
+                .with_attr("dry_run", opts.dry_run)
+                .with_attr("data_dirs", data_dirs)
+        });
+
+        if removed > 0 {
+            trace!(
+                event = "heal_abandoned_parts",
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                state = if opts.dry_run { "dry_run_matched" } else { "reclaimed" },
+                result = "ok",
+                bucket,
+                object,
+                dry_run = opts.dry_run,
+                data_dirs = removed,
+                "Heal abandoned parts checked object data directories"
+            );
+        }
+
+        Ok(())
     }
 }
 

@@ -1586,6 +1586,71 @@ fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
     file_info.validate_for_metadata_read().map_err(Into::into)
 }
 
+impl RemoteDisk {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        trace!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            src_volume,
+            src_path,
+            dst_volume,
+            dst_path,
+            op = "rename_data",
+            state = "started",
+            "Remote disk RPC started"
+        );
+
+        self.execute_with_timeout_for_op(
+            "rename_data",
+            || async {
+                let file_info = compat_json(fi)?;
+                let file_info_bin = encode_file_info_msgpack(fi)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(RenameDataRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    file_info,
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                    file_info_bin: file_info_bin.into(),
+                });
+                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+
+                let response = client.rename_data(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
+                    &response.rename_data_resp_bin,
+                    &response.rename_data_resp,
+                    "RenameDataResp",
+                )?;
+
+                Ok(rename_data_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "trace", skip_all)]
@@ -2511,58 +2576,8 @@ impl DiskAPI for RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        trace!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            src_volume,
-            src_path,
-            dst_volume,
-            dst_path,
-            op = "rename_data",
-            state = "started",
-            "Remote disk RPC started"
-        );
-
-        self.execute_with_timeout_for_op(
-            "rename_data",
-            || async {
-                let file_info = compat_json(&fi)?;
-                let file_info_bin = encode_file_info_msgpack(&fi)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let mut request = Request::new(RenameDataRequest {
-                    disk: self.endpoint.to_string(),
-                    src_volume: src_volume.to_string(),
-                    src_path: src_path.to_string(),
-                    file_info,
-                    dst_volume: dst_volume.to_string(),
-                    dst_path: dst_path.to_string(),
-                    file_info_bin: file_info_bin.into(),
-                });
-                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
-
-                let response = client.rename_data(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
-                    &response.rename_data_resp_bin,
-                    &response.rename_data_resp,
-                    "RenameDataResp",
-                )?;
-
-                Ok(rename_data_resp)
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

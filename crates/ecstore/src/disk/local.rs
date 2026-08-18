@@ -27,17 +27,18 @@ use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
     DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
-    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
-    RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    conv_part_err_to_int,
+    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
+    QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
-    os,
+    is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
+    quota_mutation_fence_path,
 };
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
@@ -60,9 +61,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Error as IoError, SeekFrom};
-#[cfg(target_os = "linux")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{
@@ -666,6 +665,7 @@ async fn remove_empty_directory_tree_under_mount_lease(
 }
 
 #[cfg(unix)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn remove_empty_directory_tree_with(
     root: &Path,
     before_descend: impl FnMut(&Path) -> std::io::Result<()>,
@@ -1017,13 +1017,29 @@ fn record_direct_read_page_fault_delta(path: &'static str, stage: &'static str, 
 /// When enabled, shard reads bypass the page cache using O_DIRECT flag.
 /// Requires aligned buffers (typically 512 bytes or 4096 bytes).
 /// Default: false (uses page cache via mmap/pread).
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: bool = false;
 
 /// Minimum shard size threshold for O_DIRECT reads.
 /// Only shards larger than this threshold will use O_DIRECT.
 /// Default: 4MB.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Enable O_DIRECT for erasure shard / multipart part data writes (Linux only).
@@ -1037,7 +1053,15 @@ const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
 /// EINVAL/EOPNOTSUPP (tmpfs, overlayfs, 9p, ...) latch the path off and fall
 /// back to buffered writes for the whole disk. Non-Linux always falls back.
 /// Default: false (buffered writes via the page cache, as before).
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE";
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: bool = false;
 const ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: &str = "RUSTFS_OBJECT_MMAP_POPULATE_ENABLE";
 const DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: bool = false;
@@ -1096,12 +1120,14 @@ macro_rules! cached_read_env {
 
 cached_read_env! {
     /// Check if O_DIRECT reads are enabled.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn is_direct_io_read_enabled() -> bool =
         rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE);
 }
 
 cached_read_env! {
     /// Check if O_DIRECT shard/part data writes are enabled.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn is_direct_io_write_enabled() -> bool =
         rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE);
 }
@@ -1457,6 +1483,7 @@ pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
 
 cached_read_env! {
     /// Get the O_DIRECT read threshold size.
+    #[allow(dead_code, reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)")]
     fn get_direct_io_read_threshold() -> usize =
         rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
 }
@@ -1674,12 +1701,20 @@ impl DirectIoWriteState {
 /// Target staging size for O_DIRECT writes, rounded up to the DIO alignment.
 /// Bounds the per-writer aligned bounce buffer and batches many shard blocks
 /// into one positioned write to keep the syscall count low.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 const DIRECT_WRITE_STAGING_BYTES: usize = 1024 * 1024;
 
 /// Aligned bounce-buffer capacity for a given DIO alignment: the target staging
 /// size rounded up to a whole multiple of `align` so the buffer address, every
 /// flushed batch length, and every write offset stay alignment-correct.
 /// Platform-independent (no O_DIRECT), so it is unit-tested on any host.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 fn direct_write_staging_capacity(align: usize) -> usize {
     debug_assert!(align.is_power_of_two() && align >= 512);
     DIRECT_WRITE_STAGING_BYTES.div_ceil(align) * align
@@ -1688,6 +1723,10 @@ fn direct_write_staging_capacity(align: usize) -> usize {
 /// Split `filled` staged bytes into the alignment-sized prefix written with
 /// O_DIRECT and the sub-alignment tail written buffered. Platform-independent,
 /// so the tail-boundary math is unit-tested on any host.
+#[allow(
+    dead_code,
+    reason = "platform-conditional: production callers are inside #[cfg(target_os = \"linux\")] blocks, so this reads as dead on non-Linux hosts (backlog#1823)"
+)]
 fn direct_write_tail_split(filled: usize, align: usize) -> (usize, usize) {
     let aligned = filled - (filled % align);
     (aligned, filled - aligned)
@@ -2029,14 +2068,17 @@ static RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT: std::sync::Mutex<Option<(Strin
 #[cfg(test)]
 type InlinePreparationHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
+type RenameDataPublicationHookKey = (PathBuf, String, String);
+#[cfg(test)]
 static INLINE_PREPARATION_BEFORE_BACKUP: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
 static INLINE_BEFORE_FILE_SYNC_ADMISSION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
-static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<std::sync::Mutex<HashMap<String, InlinePreparationHook>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<RenameDataPublicationHookKey, InlinePreparationHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(test)]
 static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -2108,11 +2150,11 @@ fn set_inline_before_file_sync_admission(dst_path: &str, hook: impl FnOnce() + S
 }
 
 #[cfg(test)]
-fn set_rename_data_after_first_publication(dst_path: &str, hook: impl FnOnce() + Send + 'static) {
+fn set_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_path: &str, hook: impl FnOnce() + Send + 'static) {
     RENAME_DATA_AFTER_FIRST_PUBLICATION
         .lock()
         .expect("test publication hook lock should not be poisoned")
-        .insert(dst_path.to_string(), Box::new(hook));
+        .insert((root.to_path_buf(), dst_volume.to_string(), dst_path.to_string()), Box::new(hook));
 }
 
 #[cfg(test)]
@@ -2140,6 +2182,7 @@ fn set_delete_version_fail_after_data_staged(path: &str) {
 }
 
 #[cfg(test)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(crate) fn set_delete_version_fail_after_commit(root: &Path, path: &str) {
     DELETE_VERSION_FAIL_AFTER_COMMIT
         .lock()
@@ -2264,11 +2307,11 @@ fn run_inline_before_file_sync_admission(dst_path: &str) {
 }
 
 #[cfg(test)]
-fn run_rename_data_after_first_publication(dst_path: &str) {
+fn run_rename_data_after_first_publication(root: &Path, dst_volume: &str, dst_path: &str) {
     let hook = RENAME_DATA_AFTER_FIRST_PUBLICATION
         .lock()
         .expect("test publication hook lock should not be poisoned")
-        .remove(dst_path);
+        .remove(&(root.to_path_buf(), dst_volume.to_string(), dst_path.to_string()));
     if let Some(hook) = hook {
         hook();
     }
@@ -2367,9 +2410,6 @@ async fn remove_dst_base_before_commit(
 fn run_inline_preparation_before_backup(_dst_path: &str) {}
 
 #[cfg(not(test))]
-fn run_rename_data_after_first_publication(_dst_path: &str) {}
-
-#[cfg(not(test))]
 fn should_fail_after_delete_data_staged(_path: &str) -> bool {
     false
 }
@@ -2448,6 +2488,10 @@ enum SyncMode {
     FileOnly,
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
+)]
 struct FileCacheReclaimWriter {
     inner: File,
     reclaim_len: usize,
@@ -2455,6 +2499,10 @@ struct FileCacheReclaimWriter {
     reclaimed: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim bookkeeping fields written by Drop but never read back (backlog#1823)"
+)]
 struct FileCacheReclaimReader {
     inner: File,
     reclaim_offset: u64,
@@ -2520,6 +2568,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "reclaim metrics emitter reached only from the Linux-gated reclaim paths (backlog#1823)"
+)]
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
     // Runs per read-stream page-cache reclaim window; skip the whole emission
     // (three metric-key constructions) when general metrics are disabled.
@@ -3072,6 +3124,7 @@ impl LocalIoBackend for StdBackend {
             use memmap2::MmapOptions;
             use std::time::{Duration as StdDuration, Instant as StdInstant};
 
+            #[allow(dead_code, reason = "mmap copy result slot kept beside the mapping it owns (backlog#1823)")]
             struct MmapCopyReadResult {
                 bytes: Bytes,
                 access_check_duration: StdDuration,
@@ -4705,6 +4758,10 @@ fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     Arc::new(StdBackend::new(root))
 }
 
+#[allow(
+    dead_code,
+    reason = "path cache and cwd slots retained beside the disk root they derive from (backlog#1823)"
+)]
 pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
@@ -4756,6 +4813,25 @@ struct SnapshotLeaseEntry {
     tokens: HashSet<SnapshotLeaseToken>,
     pending_delete: Option<DeleteOptions>,
     deleting: bool,
+    mutation_fence: Option<Arc<QuotaMutationFenceState>>,
+}
+
+#[derive(Default)]
+struct QuotaMutationFenceState {
+    revoked: AtomicBool,
+    running: AtomicUsize,
+    notify: Notify,
+}
+
+struct QuotaMutationFenceClaim {
+    state: Arc<QuotaMutationFenceState>,
+}
+
+impl Drop for QuotaMutationFenceClaim {
+    fn drop(&mut self) {
+        self.state.running.fetch_sub(1, Ordering::AcqRel);
+        self.state.notify.notify_waiters();
+    }
 }
 
 #[derive(Default)]
@@ -5472,6 +5548,7 @@ impl LocalDisk {
         Ok(Self::resolve_abs_path_from(&self.root, path.as_ref()))
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn io_resolve_abs_path(&self, path: impl AsRef<Path>) -> PathBuf {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy();
@@ -5549,15 +5626,24 @@ impl LocalDisk {
     }
 
     // Check if a path is valid
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function check_local_disk_valid_path; no caller in this port (backlog#1823)"
+    )]
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         check_local_disk_valid_path(self.io_root(), path)
     }
 
+    #[allow(
+        dead_code,
+        reason = "method wrapper over the live free function reject_local_disk_symlink_components; no caller in this port (backlog#1823)"
+    )]
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(self.io_root(), path)
     }
 
     // Batch path generation with single lock acquisition
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn get_object_paths_batch(&self, requests: &[(String, String)]) -> Result<Vec<PathBuf>> {
         let mut results = Vec::with_capacity(requests.len());
         let mut cache_misses = Vec::new();
@@ -6470,12 +6556,13 @@ impl LocalDisk {
         Ok(f)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
         let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
         Ok(f)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn get_metrics(&self) -> DiskMetrics {
         DiskMetrics::default()
     }
@@ -7320,6 +7407,34 @@ fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
 }
 
 impl LocalDisk {
+    async fn claim_quota_mutation_fence(
+        &self,
+        volume: &str,
+        path: &str,
+        token: SnapshotLeaseToken,
+    ) -> Result<Arc<QuotaMutationFenceClaim>> {
+        let key = SnapshotLeaseKey {
+            volume: RUSTFS_META_BUCKET.to_string(),
+            path: quota_mutation_fence_path(volume, path),
+        };
+        let state = {
+            let registry = self.snapshot_leases.lock().await;
+            let entry = registry.entries.get(&key).ok_or(DiskError::FileNotFound)?;
+            let state = entry.mutation_fence.as_ref().ok_or(DiskError::FileNotFound)?;
+            if !entry.tokens.contains(&token) || state.revoked.load(Ordering::Acquire) {
+                return Err(DiskError::FileNotFound);
+            }
+            state.running.fetch_add(1, Ordering::AcqRel);
+            Arc::clone(state)
+        };
+        if state.revoked.load(Ordering::Acquire) {
+            state.running.fetch_sub(1, Ordering::AcqRel);
+            state.notify.notify_waiters();
+            return Err(DiskError::FileNotFound);
+        }
+        Ok(Arc::new(QuotaMutationFenceClaim { state }))
+    }
+
     async fn reserve_version_delete(&self, volume: &str, object: &str, data_dir: Uuid, rollback_dir: Uuid) -> Result<bool> {
         let path = format!("{object}/{data_dir}");
         let data_path = self.io_get_object_path(volume, &path)?;
@@ -8643,17 +8758,41 @@ impl DiskAPI for LocalDisk {
         &self,
         src_volume: &str,
         src_path: &str,
-        mut fi: FileInfo,
+        fi: FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
+        let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
         // optimistic; this lease establishes the local commit/delete order and
         // remains owned by any blocking syscall that outlives async cancellation.
         let destination_object_path = self.io_get_object_path(dst_volume, dst_path)?;
+        let quota_fence_token =
+            match rustfs_utils::http::metadata_compat::get_consistent_str(&fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX) {
+                Some(value) => {
+                    let token = Uuid::parse_str(value).map_err(|_| DiskError::FileCorrupt)?;
+                    Some(SnapshotLeaseToken::from_slice(token.as_bytes())?)
+                }
+                None if rustfs_utils::http::metadata_compat::contains_key_str(
+                    &fi.metadata,
+                    QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                ) =>
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                None => None,
+            };
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX);
+        let quota_fence_claim = match quota_fence_token {
+            Some(token) => Some(self.claim_quota_mutation_fence(dst_volume, dst_path, token).await?),
+            None => None,
+        };
         let mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, dst_volume, &destination_object_path).await;
+        if let Some(claim) = quota_fence_claim {
+            mutation_lease.attach_external_guard(claim);
+        }
         if fi.is_legacy_indexed_delete_marker() {
             fi.erasure.index = 0;
         }
@@ -8946,8 +9085,9 @@ impl DiskAPI for LocalDisk {
                 .await?;
                 return Err(err);
             }
+            #[cfg(test)]
             if has_data_dir_path.is_some() {
-                run_rename_data_after_first_publication(dst_path);
+                run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
             }
 
             // Crash-consistency injection: hard power loss after the data dir
@@ -9380,7 +9520,8 @@ impl DiskAPI for LocalDisk {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
                 }
-                run_rename_data_after_first_publication(dst_path);
+                #[cfg(test)]
+                run_rename_data_after_first_publication(&self.root, dst_volume, dst_path);
                 if sync {
                     file_sync_admission = Some(
                         os::acquire_file_sync_admission(self.file_sync_permits.clone())
@@ -9643,11 +9784,26 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
-        let file_path = self.io_get_object_path(volume, path)?;
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
             path: path.to_string(),
         };
+        if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
+            let mut registry = self.snapshot_leases.lock().await;
+            let entry = registry.entries.entry(key).or_default();
+            let state = entry
+                .mutation_fence
+                .get_or_insert_with(|| Arc::new(QuotaMutationFenceState::default()));
+            if state.revoked.load(Ordering::Acquire) {
+                return Err(DiskError::FileNotFound);
+            }
+            let token = SnapshotLeaseToken::new();
+            entry.tokens.insert(token);
+            return Ok(token);
+        }
+
+        let file_path = self.io_get_object_path(volume, path)?;
+        let _mutation_lease = os::acquire_rename_data_mutation_lease(&self.root, volume, &file_path).await;
         let token = {
             let mut registry = self.snapshot_leases.lock().await;
             if registry.entries.get(&key).is_some_and(|entry| entry.deleting) {
@@ -9675,6 +9831,48 @@ impl DiskAPI for LocalDisk {
             volume: volume.to_string(),
             path: path.to_string(),
         };
+        if volume == RUSTFS_META_BUCKET && is_quota_mutation_fence_path(path) {
+            if !token.is_revoke_all() {
+                let mut registry = self.snapshot_leases.lock().await;
+                let Some(entry) = registry.entries.get_mut(&key) else {
+                    return Ok(());
+                };
+                entry.tokens.remove(&token);
+                let removable = entry.tokens.is_empty()
+                    && entry
+                        .mutation_fence
+                        .as_ref()
+                        .is_none_or(|state| state.running.load(Ordering::Acquire) == 0);
+                if removable {
+                    registry.entries.remove(&key);
+                }
+                return Ok(());
+            }
+            let state = {
+                let mut registry = self.snapshot_leases.lock().await;
+                let Some(entry) = registry.entries.get_mut(&key) else {
+                    return Ok(());
+                };
+                let Some(state) = entry.mutation_fence.as_ref().cloned() else {
+                    registry.entries.remove(&key);
+                    return Ok(());
+                };
+                state.revoked.store(true, Ordering::Release);
+                entry.tokens.clear();
+                state
+            };
+            loop {
+                let notified = state.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if state.running.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+            self.snapshot_leases.lock().await.entries.remove(&key);
+            return Ok(());
+        }
         let opts = {
             let mut registry = self.snapshot_leases.lock().await;
             let Some(entry) = registry.entries.get_mut(&key) else {
@@ -10450,6 +10648,19 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data.into())
+    }
+}
+
+impl LocalDisk {
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        <Self as DiskAPI>::rename_data(self, src_volume, src_path, fi.clone(), dst_volume, dst_path).await
     }
 }
 
@@ -13007,7 +13218,7 @@ mod test {
         let replacement_staging_parent_for_hook = replacement_staging_parent.clone();
         let staged_metadata_for_hook = staged_metadata.clone();
         let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned until xl.meta commits");
             std::fs::rename(&staging_parent_for_hook, &replacement_staging_parent_for_hook)
@@ -13274,7 +13485,7 @@ mod test {
         let replacement_dir_for_hook = replacement_dir.clone();
         let staged_metadata_for_hook = staged_metadata.clone();
         let replacement_staged_metadata_for_hook = replacement_staged_metadata.clone();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             std::fs::rename(&object_dir_for_hook, &replacement_dir_for_hook)
                 .expect_err("the destination object identity must remain pinned after publishing its rollback backup");
             std::fs::rename(&staged_metadata_for_hook, &replacement_staged_metadata_for_hook)
@@ -13640,7 +13851,7 @@ mod test {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             entered_tx.send(()).expect("signal first publication");
             release_rx.recv().expect("wait while delete_volume is blocked");
         });
@@ -14234,7 +14445,7 @@ mod test {
 
         let (published_tx, published_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        set_rename_data_after_first_publication(object, move || {
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
             published_tx.send(()).expect("signal backup publication");
             release_rx.recv().expect("wait for lock-order assertion");
         });
@@ -18887,6 +19098,48 @@ mod test {
             .await
             .expect("releasing an already released token should be idempotent");
         assert!(matches!(disk.read_all(volume, &first_part).await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn quota_mutation_fence_revoke_waits_for_active_claim_and_rejects_late_claims() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "quota-fence-volume";
+        let object = "object";
+        let fence_path = quota_mutation_fence_path(bucket, object);
+        let token = disk
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("quota mutation token should be prepared");
+        let claim = disk
+            .claim_quota_mutation_fence(bucket, object, token)
+            .await
+            .expect("prepared token should be claimable");
+
+        let release_disk = Arc::clone(&disk);
+        let mut release = tokio::spawn(async move {
+            release_disk
+                .release_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, SnapshotLeaseToken::revoke_all())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut release).await.is_err(),
+            "revoke must wait until an already claimed mutation has finished"
+        );
+
+        drop(claim);
+        tokio::time::timeout(Duration::from_secs(1), release)
+            .await
+            .expect("revoke should wake after the final claim drops")
+            .expect("revoke task should not panic")
+            .expect("revoke should succeed");
+        assert!(matches!(
+            disk.claim_quota_mutation_fence(bucket, object, token).await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[tokio::test]

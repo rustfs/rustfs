@@ -55,7 +55,6 @@ pub struct RemoveBucketOptions {
 const DELETE_RESPONSE_PREVIEW_LEN: usize = 1024;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct AdvancedRemoveOptions {
     pub replication_delete_marker: bool,
     pub replication_status: ReplicationStatus,
@@ -465,10 +464,10 @@ impl TransitionClient {
 }
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct RemoveObjectError {
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     object_name: String,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     version_id: String,
     err: Option<std::io::Error>,
 }

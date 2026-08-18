@@ -48,10 +48,6 @@ lazy_static! {
     };
 }
 
-pub fn is_standard_query_value(qs_key: &str) -> bool {
-    SUPPORTED_QUERY_VALUES[qs_key]
-}
-
 pub fn is_storageclass_header(header_key: &str) -> bool {
     header_key.to_lowercase() == X_AMZ_STORAGE_CLASS.as_str().to_lowercase()
 }

@@ -1828,33 +1828,36 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
     Ok(())
 }
 
+/// Multipart disk compression is live again, so a compression-enabled cluster classifies multipart objects as compressed and the roundtrip (full GET plus partNumber GET) must still return the original bytes.
+/// Reverting the multipart compression fix must fail this test.
 #[tokio::test]
 #[serial]
-async fn four_node_multipart_ignores_disk_compression_fallback() -> TestResult {
+async fn four_node_multipart_disk_compression_roundtrip() -> TestResult {
     init_logging();
 
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     cluster.start().await?;
 
-    let bucket = "inline-multipart-compression-fallback";
+    let bucket = "inline-multipart-compression-roundtrip";
     cluster.create_test_bucket(bucket).await?;
     let client = cluster.create_s3_client(0)?;
-    let key = "multipart/compression-disabled.txt";
+    let key = "multipart/compressed.txt";
     let (body, second_part, etag) = put_two_part_multipart(&client, bucket, key).await?;
 
     assert_reader_path(
         &collector,
         &client,
-        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, MULTIPART),
+        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, COMPRESSED),
     )
     .await?;
     assert_part_number_reader_path(
         &collector,
         &client,
-        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), MULTIPART, LEGACY_DUPLEX),
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), COMPRESSED, LEGACY_DUPLEX),
     )
     .await?;
 
@@ -1871,6 +1874,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
     cluster.start().await?;
 
@@ -1890,14 +1894,21 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
         ReaderPathExpectation::for_class(
             ReaderObject::new(bucket, multipart_key, &multipart_body, multipart_etag.as_deref(), None),
             LEGACY_DUPLEX,
-            MULTIPART,
+            COMPRESSED,
         ),
     )
     .await?;
     assert_part_number_reader_path(
         &collector,
         &client,
-        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
+        PartNumberReaderPathExpectation::new(
+            bucket,
+            multipart_key,
+            &second_part,
+            multipart_body.len(),
+            COMPRESSED,
+            LEGACY_DUPLEX,
+        ),
     )
     .await?;
     assert_msgpack_decode_observed(&collector, &decode_before).await?;
@@ -2353,7 +2364,11 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     hot_client.create_bucket().bucket(bucket).send().await?;
     put_lifecycle_with_transition_retry(&hot_client, bucket, &tier_name).await?;
 
-    let key = "transition/mixed-multipart.bin";
+    // `.zip` sits on the disk-compression exclusion list: this test pins
+    // msgpack compat controls across ILM transition, and a compressed object
+    // would classify as `compressed` instead of `remote` (and the warm-tier
+    // read path does not decode compression — tracked separately).
+    let key = "transition/mixed-multipart.zip";
     let (body, second_part, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
     wait_for_transition(&hot_client, bucket, key, &tier_name).await?;
     assert!(

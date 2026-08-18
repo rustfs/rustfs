@@ -32,6 +32,7 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use std::ffi::OsStr;
 use std::fs as stdfs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -51,6 +52,11 @@ pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
     &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
+const TEST_PORT_MIN: u16 = 20_000;
+const TEST_PORT_RANGE: u16 = 40_000;
+const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
+const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
+const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -67,7 +73,68 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
 }
 
-fn capture_command_logs(command: &mut Command, log_path: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+struct PortAllocatorGuard;
+
+impl PortAllocatorGuard {
+    async fn acquire() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match stdfs::create_dir(TEST_PORT_LOCK_DIR) {
+                Ok(()) => return Ok(Self),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    remove_stale_port_allocator_lock();
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+}
+
+impl Drop for PortAllocatorGuard {
+    fn drop(&mut self) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn advance_test_port(port: u16) -> u16 {
+    let offset = (port - TEST_PORT_MIN + 1) % TEST_PORT_RANGE;
+    TEST_PORT_MIN + offset
+}
+
+fn seeded_test_port() -> u16 {
+    let offset = (Uuid::new_v4().as_u128() % u128::from(TEST_PORT_RANGE)) as u16;
+    TEST_PORT_MIN + offset
+}
+
+fn read_next_test_port() -> u16 {
+    stdfs::read_to_string(TEST_PORT_COUNTER_PATH)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| (TEST_PORT_MIN..TEST_PORT_MIN + TEST_PORT_RANGE).contains(port))
+        .unwrap_or_else(seeded_test_port)
+}
+
+fn remove_stale_port_allocator_lock() {
+    let Ok(metadata) = stdfs::metadata(TEST_PORT_LOCK_DIR) else {
+        return;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return;
+    };
+    if modified.elapsed().is_ok_and(|elapsed| elapsed > TEST_PORT_LOCK_STALE_AFTER) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn write_next_test_port(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stdfs::write(TEST_PORT_COUNTER_PATH, port.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn capture_command_logs(
+    command: &mut Command,
+    log_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(log_path) = log_path else {
         return Ok(());
     };
@@ -505,10 +572,21 @@ impl RustFSTestEnvironment {
     /// Find an available port for the test
     pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        Ok(port)
+        let _guard = PortAllocatorGuard::acquire().await?;
+        let mut next_port = read_next_test_port();
+
+        for _ in 0..TEST_PORT_RANGE {
+            let port = next_port;
+            next_port = advance_test_port(next_port);
+            write_next_test_port(next_port)?;
+
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+                drop(listener);
+                return Ok(port);
+            }
+        }
+
+        Err("no available E2E test port found".into())
     }
 
     /// Kill any existing RustFS processes

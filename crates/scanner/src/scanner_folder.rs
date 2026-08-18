@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
@@ -32,6 +32,7 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
+use crate::storage_api::owner::{EcstoreEventArgs, ecstore_send_event};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
@@ -41,6 +42,7 @@ use rustfs_common::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
@@ -65,6 +67,7 @@ const LOG_SUBSYSTEM_FOLDER: &str = "folder";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_SCANNER_FOLDER_STATE: &str = "scanner_folder_state";
+const EVENT_SCANNER_METADATA_CORRUPT: &str = "scanner_metadata_corrupt";
 const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
 const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
@@ -96,6 +99,101 @@ const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders
 const METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL: &str = "rustfs_scanner_pending_heal_prune_total";
 const METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL: &str = "rustfs_scanner_pending_heal_malformed_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
+
+// --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
+//
+// The excess-versions / excess-version-size / excess-folders alerts were
+// metrics-and-logs only; subscribers (consoles, external auditors) had no way
+// to hear them. MinIO emits s3:ObjectManyVersions / s3:ObjectLargeVersions /
+// s3:PrefixManyFolders for the same conditions — RustFS carries those as
+// EventName::Scanner* with the wire names below. Without a cooldown a single
+// over-threshold object would re-emit on every scan cycle (~a minute), so
+// emissions are edge-held per (kind, bucket, object) for 24h.
+
+/// `s3:Scanner:ManyVersions` (MinIO `s3:ObjectManyVersions`).
+pub const EVENT_SCANNER_MANY_VERSIONS: &str = "s3:Scanner:ManyVersions";
+/// `s3:Scanner:LargeVersions` (MinIO `s3:ObjectLargeVersions`).
+pub const EVENT_SCANNER_LARGE_VERSIONS: &str = "s3:Scanner:LargeVersions";
+/// `s3:Scanner:BigPrefix` (MinIO `s3:PrefixManyFolders`).
+pub const EVENT_SCANNER_BIG_PREFIX: &str = "s3:Scanner:BigPrefix";
+const ENV_SCANNER_ALERT_COOLDOWN_SECS: &str = "RUSTFS_SCANNER_ALERT_COOLDOWN_SECS";
+const DEFAULT_SCANNER_ALERT_COOLDOWN_SECS: u64 = 86_400;
+/// Hard cap on distinct cooldown keys; a pathological number of over-threshold
+/// objects clears the map wholesale instead of growing without bound (the
+/// worst case is one re-emission per still-hot key per scan cycle).
+const MAX_SCANNER_ALERT_COOLDOWN_KEYS: usize = 4096;
+
+/// Distinct alert kinds sharing one cooldown map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScannerAlertKind {
+    ManyVersions,
+    LargeVersions,
+    BigPrefix,
+}
+
+type ScannerAlertCooldownKey = (ScannerAlertKind, String, String);
+type ScannerAlertCooldownMap = HashMap<ScannerAlertCooldownKey, Instant>;
+
+static SCANNER_ALERT_EMISSION_COOLDOWN: Mutex<Option<ScannerAlertCooldownMap>> = Mutex::new(None);
+
+fn scanner_alert_cooldown() -> Duration {
+    let raw = std::env::var(ENV_SCANNER_ALERT_COOLDOWN_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    Duration::from_secs(raw.unwrap_or(DEFAULT_SCANNER_ALERT_COOLDOWN_SECS))
+}
+
+/// Edge-held emission gate: returns `true` (and records the cooldown) only
+/// when this (kind, bucket, object) last fired longer than the cooldown ago —
+/// or never. Metrics and logs stay level-triggered every cycle; only the
+/// notification events are held back.
+fn scanner_alert_emission_allows(kind: ScannerAlertKind, bucket: &str, object: &str, cooldown: Duration) -> bool {
+    let key = (kind, bucket.to_string(), object.to_string());
+    let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let guard = guard.get_or_insert_with(ScannerAlertCooldownMap::new);
+    let now = Instant::now();
+    // Expired entries leave first; the cap is still exceeded only when live
+    // keys alone overflow it, in which case a wholesale clear trades one
+    // extra emission per hot key for a hard memory bound.
+    if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+        guard.retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+            guard.clear();
+        }
+    }
+    match guard.get(&key) {
+        Some(fired_at) if now.duration_since(*fired_at) < cooldown => false,
+        _ => {
+            guard.insert(key, now);
+            true
+        }
+    }
+}
+
+/// Emit a scanner alert as an S3 notification event through the standard
+/// dispatch pipeline. Fire-and-forget: the notify layer owns delivery,
+/// retry, and target filtering; the scanner never waits on it.
+fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: i64, details: &[(&str, String)]) {
+    let mut req_params = HashMap::with_capacity(details.len());
+    for (key, value) in details {
+        req_params.insert((*key).to_string(), value.clone());
+    }
+    ecstore_send_event(EcstoreEventArgs {
+        event_name: event_name.to_string(),
+        bucket_name: bucket.to_string(),
+        object: crate::ScannerObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size,
+            ..Default::default()
+        },
+        req_params,
+        user_agent: "Scanner".to_string(),
+        ..Default::default()
+    });
+}
 const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 
 static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
@@ -429,6 +527,113 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+fn trace_start_instant() -> Option<Instant> {
+    (trace_subscriber_count() > 0).then(Instant::now)
+}
+
+fn emit_scanner_folder_trace(root: &str, folder: &str, objects: u64, started_at: Option<Instant>, state: &'static str) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    trace_emit(|| {
+        let (bucket, prefix) = path2_bucket_object_with_base_path(root, folder);
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerFolder)
+            .with_bucket(bucket)
+            .with_object(prefix)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("objects", objects)
+    });
+}
+
+fn emit_scanner_ilm_action_trace(
+    bucket: &str,
+    object: &str,
+    action: IlmAction,
+    count: u64,
+    queued: bool,
+    started_at: Option<Instant>,
+) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    let state = if queued { "queued" } else { "not_queued" };
+    trace_emit(|| {
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+            .with_bucket(bucket)
+            .with_object(object)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("action", action.as_str())
+            .with_attr("count", count)
+            .with_attr("queued", queued)
+    });
+}
+
+struct ScannerHealCandidateTraceContext {
+    bucket: String,
+    object: Option<String>,
+    version_id: Option<String>,
+    scan_mode: Option<HealScanMode>,
+    started_at: Instant,
+}
+
+fn scanner_heal_candidate_trace_context(request: &HealChannelRequest) -> Option<ScannerHealCandidateTraceContext> {
+    let started_at = trace_start_instant()?;
+    Some(ScannerHealCandidateTraceContext {
+        bucket: request.bucket.clone(),
+        object: request.object_prefix.clone(),
+        version_id: request.object_version_id.clone(),
+        scan_mode: request.scan_mode,
+        started_at,
+    })
+}
+
+struct ScannerHealCandidateTrace<'a> {
+    candidate_type: &'static str,
+    bucket: &'a str,
+    object: Option<&'a str>,
+    version_id: Option<&'a str>,
+    priority: HealChannelPriority,
+    scan_mode: Option<HealScanMode>,
+    result: Result<HealAdmissionResult, &'a str>,
+    started_at: Instant,
+}
+
+fn emit_scanner_heal_candidate_trace(trace: ScannerHealCandidateTrace<'_>) {
+    trace_emit(|| {
+        let (state, admission, error) = match trace.result {
+            Ok(result) if result.is_admitted() => ("admitted", describe_heal_admission(result), None),
+            Ok(result) => ("not_admitted", describe_heal_admission(result), None),
+            Err(error) => ("submit_failed", "channel_error".to_string(), Some(error)),
+        };
+        let mut event = TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
+            .with_bucket(trace.bucket)
+            .with_duration(trace.started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("candidate_type", trace.candidate_type)
+            .with_attr("priority", heal_priority_label(trace.priority))
+            .with_attr("admission", admission);
+
+        if let Some(object) = trace.object {
+            event = event.with_object(object);
+        }
+        if let Some(version_id) = trace.version_id {
+            event = event.with_attr("version_id", version_id);
+        }
+        if let Some(scan_mode) = trace.scan_mode {
+            event = event.with_attr("scan_mode", scan_mode.as_str());
+        }
+        if let Some(error) = error {
+            event = event.with_attr("error", error);
+        }
+
+        event
+    });
+}
+
 fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
     into.size = into.size.saturating_add(summary.total_size);
     into.versions = into.versions.saturating_add(summary.versions);
@@ -676,9 +881,22 @@ async fn send_scanner_heal_request(
     request: HealChannelRequest,
 ) -> Result<HealAdmissionResult, ScannerError> {
     let priority = request.priority;
+    let trace_context = scanner_heal_candidate_trace_context(&request);
     match send_heal_request_with_admission(request).await {
         Ok(result) => {
             record_heal_candidate_admission(candidate_type, priority, result);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Ok(result),
+                    started_at: trace_context.started_at,
+                });
+            }
             Ok(result)
         }
         Err(err) => {
@@ -689,6 +907,18 @@ async fn send_scanner_heal_request(
                 "result" => "channel_error".to_string()
             )
             .increment(1);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Err(err.as_str()),
+                    started_at: trace_context.started_at,
+                });
+            }
             Err(ScannerError::Other(err))
         }
     }
@@ -904,7 +1134,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             remaining_versions = 0;
@@ -956,7 +1188,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
@@ -994,7 +1228,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                         }
@@ -1018,7 +1254,21 @@ impl ScannerItem {
             let action = event.action;
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
+            let trace_started_at = trace_start_instant();
             let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
+            if let Some(trace_started_at) = trace_started_at {
+                let state = if queued { "queued" } else { "not_queued" };
+                trace_emit(|| {
+                    TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+                        .with_bucket(self.bucket.as_str())
+                        .with_object(self.object_path())
+                        .with_duration(trace_started_at.elapsed())
+                        .with_attr("state", state)
+                        .with_attr("action", action.as_str())
+                        .with_attr("count", count)
+                        .with_attr("queued", queued)
+                });
+            }
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
@@ -1196,6 +1446,7 @@ impl ScannerItem {
     fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
+        let object_path = self.object_path();
         if too_many_versions {
             global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
             counter!(
@@ -1203,13 +1454,26 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, &self.bucket, &object_path, scanner_alert_cooldown())
+            {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_MANY_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("threshold", scanner_excess_versions_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 threshold = scanner_excess_versions_threshold(),
                 state = "excess_versions",
@@ -1223,13 +1487,31 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(
+                ScannerAlertKind::LargeVersions,
+                &self.bucket,
+                &object_path,
+                scanner_alert_cooldown(),
+            ) {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_LARGE_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("cumulativeSize", cumulative_size.to_string()),
+                        ("threshold", scanner_excess_version_size_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 cumulative_size,
                 threshold = scanner_excess_version_size_threshold(),
@@ -1610,6 +1892,15 @@ impl FolderScanner {
             "root" => self.root.clone()
         )
         .increment(1);
+        if scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, &self.root, folder, scanner_alert_cooldown()) {
+            emit_scanner_alert_event(
+                EVENT_SCANNER_BIG_PREFIX,
+                &self.root,
+                folder,
+                0,
+                &[("folders", total_folders.to_string()), ("threshold", threshold.to_string())],
+            );
+        }
         warn!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_ALERT_STATE,
@@ -1829,6 +2120,7 @@ impl FolderScanner {
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
+        let trace_started_at = trace_start_instant();
 
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2154,17 +2446,34 @@ impl FolderScanner {
                             self.record_failed(&item.path);
 
                             if should_log_failed_object(into.failed_objects) {
-                                warn!(
-                                    target: "rustfs::scanner::folder",
-                                    event = EVENT_SCANNER_FOLDER_STATE,
-                                    component = LOG_COMPONENT_SCANNER,
-                                    subsystem = LOG_SUBSYSTEM_FOLDER,
-                                    path = %item.path,
-                                    failed_objects = into.failed_objects,
-                                    state = "get_size_failed",
-                                    error = %e,
-                                    "Scanner folder failed to get object size"
-                                );
+                                if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_METADATA_CORRUPT,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        drive = %self.local_disk.path().display(),
+                                        bucket = %item.bucket,
+                                        object = %object,
+                                        metadata_path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "metadata_corrupt",
+                                        error = %e,
+                                        "Scanner detected corrupt object metadata"
+                                    );
+                                } else {
+                                    warn!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        path = %item.path,
+                                        failed_objects = into.failed_objects,
+                                        state = "get_size_failed",
+                                        error = %e,
+                                        "Scanner folder failed to get object size"
+                                    );
+                                }
                             }
                         }
 
@@ -2877,6 +3186,8 @@ impl FolderScanner {
         }
 
         done_folder();
+        let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
+        emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
         Ok(())
     }
@@ -3054,11 +3365,142 @@ mod tests {
     use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
     use rustfs_filemeta::{FileInfo, FileMeta};
     use serial_test::serial;
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Mutex;
+
+    /// Reset the process-global alert cooldown map; test-only.
+    fn reset_alert_cooldowns() {
+        *SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(ScannerAlertCooldownMap::new());
+    }
+
+    /// The emitted event-name strings must be exactly what `EventName`
+    /// serializes, or a bucket notification subscribed to the documented name
+    /// would silently never match (rustfs/backlog#1868).
+    #[test]
+    fn scanner_alert_wire_names_match_canonical_event_names() {
+        use rustfs_s3_types::EventName;
+        assert_eq!(EVENT_SCANNER_MANY_VERSIONS, EventName::ScannerManyVersions.to_string());
+        assert_eq!(EVENT_SCANNER_LARGE_VERSIONS, EventName::ScannerLargeVersions.to_string());
+        assert_eq!(EVENT_SCANNER_BIG_PREFIX, EventName::ScannerBigPrefix.to_string());
+    }
+
+    fn cooldown_map_len() -> usize {
+        SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Backdate every recorded cooldown so the next check fires again.
+    fn expire_all_alert_cooldowns(cooldown: Duration) {
+        let now = Instant::now();
+        let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(map) = guard.as_mut() {
+            for fired_at in map.values_mut() {
+                if let Some(expired) = now.checked_sub(cooldown + Duration::from_secs(1)) {
+                    *fired_at = expired;
+                }
+            }
+        }
+    }
+
+    /// The emission gate is the only thing standing between an over-threshold
+    /// object and one S3 event per scan cycle, so its edge semantics get
+    /// pinned directly. All scenarios share one #[test] because the cooldown
+    /// map is process-global and parallel tests would read each other's
+    /// firings.
+    #[test]
+    fn scanner_alert_emission_is_edge_held_per_key_and_bounded() {
+        reset_alert_cooldowns();
+        let cooldown = Duration::from_secs(3600);
+
+        // First firing allows, an immediate re-check is held.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+        assert!(!scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // Different kind, object, and bucket are independent keys.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::LargeVersions, "bkt", "obj", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "other", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "other", "obj", cooldown));
+        assert_eq!(cooldown_map_len(), 4);
+
+        // After the cooldown elapses the same key fires again.
+        expire_all_alert_cooldowns(cooldown);
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // A zero cooldown degenerates to always-emit (operators may want that).
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+
+        // Hard bound: overflow the cap with zero-cooldown keys and confirm the
+        // map clears rather than growing past it.
+        reset_alert_cooldowns();
+        for index in 0..=(MAX_SCANNER_ALERT_COOLDOWN_KEYS + 8) {
+            let _ = scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", &format!("dir-{index}"), Duration::ZERO);
+        }
+        assert!(
+            cooldown_map_len() <= MAX_SCANNER_ALERT_COOLDOWN_KEYS,
+            "cooldown map must stay bounded, got {}",
+            cooldown_map_len()
+        );
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
+    use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     #[test]
     fn scanner_size_summary_application_saturates_usage_counters() {
@@ -4335,6 +4777,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn scanner_trace_helpers_emit_expected_events() {
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+
+        emit_scanner_folder_trace(
+            "/tmp/rustfs-scanner-trace",
+            "/tmp/rustfs-scanner-trace/bucket-a/folder-a",
+            7,
+            Some(Instant::now()),
+            "completed",
+        );
+        let folder = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerFolder,
+            Some("bucket-a"),
+            Some("folder-a"),
+            Some("completed"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&folder, "objects").as_deref(), Some("7"));
+
+        emit_scanner_ilm_action_trace("bucket-a", "object-a", IlmAction::DeleteAction, 2, true, Some(Instant::now()));
+        let ilm = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerIlmAction,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("queued"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&ilm, "action").as_deref(), Some("delete"));
+        assert_eq!(trace_attr_string(&ilm, "count").as_deref(), Some("2"));
+        assert_eq!(trace_attr_string(&ilm, "queued").as_deref(), Some("true"));
+
+        emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+            candidate_type: "object",
+            bucket: "bucket-a",
+            object: Some("object-a"),
+            version_id: Some("version-a"),
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Deep),
+            result: Ok(HealAdmissionResult::Merged),
+            started_at: Instant::now(),
+        });
+        let heal_candidate = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerHealCandidate,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("admitted"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&heal_candidate, "candidate_type").as_deref(), Some("object"));
+        assert_eq!(trace_attr_string(&heal_candidate, "priority").as_deref(), Some("high"));
+        assert_eq!(trace_attr_string(&heal_candidate, "scan_mode").as_deref(), Some("deep"));
+        assert_eq!(trace_attr_string(&heal_candidate, "version_id").as_deref(), Some("version-a"));
+        assert_eq!(trace_attr_string(&heal_candidate, "admission").as_deref(), Some("merged"));
+    }
+
+    async fn recv_scanner_trace_event(
+        trace: &mut rustfs_common::trace_bus::TraceSubscription,
+        func: TraceFunc,
+        bucket: Option<&str>,
+        object: Option<&str>,
+        state: Option<&str>,
+    ) -> TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
+                .await
+                .expect("scanner trace event should arrive")
+                .expect("trace bus should stay open");
+            if event.kind == TraceKind::Scanner
+                && event.func == func
+                && event.bucket.as_deref() == bucket
+                && event.object.as_deref() == object
+                && state.is_none_or(|state| trace_attr_string(&event, "state").as_deref() == Some(state))
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected scanner trace event {func:?} for bucket {bucket:?} object {object:?}");
+    }
+
+    fn trace_attr_string(event: &TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                rustfs_common::trace_bus::TraceVal::Bool(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::U64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::I64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
     #[test]
     fn test_build_high_priority_heal_admission_error_contains_context() {
         let err = build_high_priority_heal_admission_error(
@@ -4542,10 +5082,22 @@ mod tests {
         assert!(budget.entries_visited() >= 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
+        let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
 
         let object_dir = temp_dir.join("bucket").join("object");
@@ -4595,6 +5147,30 @@ mod tests {
         );
         assert!(!budget.budget_elapsed());
         assert_eq!(budget.reason(), None);
+
+        let captured = logs.contents();
+        assert!(
+            !captured.contains("failed to check XL2 v1 format"),
+            "the context-free filemeta parser error must not be emitted"
+        );
+        let events = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("captured scanner log should be valid JSON"))
+            .filter(|line| line["fields"]["event"] == EVENT_SCANNER_METADATA_CORRUPT)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "one corrupt metadata observation must emit one scanner-owned diagnostic event"
+        );
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["component"], LOG_COMPONENT_SCANNER);
+        assert_eq!(fields["subsystem"], LOG_SUBSYSTEM_FOLDER);
+        assert_eq!(fields["drive"], canonical_temp_dir.to_string_lossy().as_ref());
+        assert_eq!(fields["bucket"], "bucket");
+        assert_eq!(fields["object"], "object");
+        assert_eq!(fields["metadata_path"], metadata_path.to_string_lossy().as_ref());
+        assert_eq!(fields["state"], "metadata_corrupt");
 
         let retry_budget = ScannerCycleBudget::new_with_progress_tracking(
             &parent,
