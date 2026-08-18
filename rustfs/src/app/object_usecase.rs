@@ -2998,6 +2998,10 @@ pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs:
     }
 }
 
+fn inject_accept_ranges_header(headers: &mut HeaderMap) {
+    headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
+}
+
 /// Derive the response-header echo pairs for an additional-checksum algorithm
 /// (XXHash3/64/128, SHA-512) from the server-computed content checksum, for
 /// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms
@@ -6500,6 +6504,7 @@ impl DefaultObjectUsecase {
         };
         let helper = helper.version_id(version_id_for_event);
         let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
@@ -6633,7 +6638,6 @@ impl DefaultObjectUsecase {
             content_encoding: info.content_encoding.clone(),
             cache_control,
             content_disposition,
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
@@ -6811,7 +6815,6 @@ impl DefaultObjectUsecase {
             content_disposition: remote.content_disposition,
             content_language: remote.content_language,
             cache_control: remote.cache_control,
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
             last_modified: remote
                 .last_modified
@@ -7016,7 +7019,8 @@ impl DefaultObjectUsecase {
                     && let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await
                 {
                     lifecycle.finish_ok();
-                    let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    inject_accept_ranges_header(&mut response.headers);
                     let result = Ok(response);
                     let _ = helper.version_id(version_id_for_event).complete(&result);
                     return result;
@@ -10288,6 +10292,34 @@ mod tests {
         let mut empty = HeaderMap::new();
         inject_additional_checksum_headers(&mut empty, &[]);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn inject_accept_ranges_header_writes_static_bytes_value() {
+        let mut headers = HeaderMap::new();
+        inject_accept_ranges_header(&mut headers);
+
+        assert_eq!(headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+    }
+
+    #[tokio::test]
+    async fn finalize_get_object_response_injects_accept_ranges_header() {
+        let req = build_request(GetObjectInput::default(), Method::GET);
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let response = DefaultObjectUsecase::finalize_get_object_response(
+            helper,
+            "bucket",
+            &req.method,
+            &req.headers,
+            None,
+            String::new(),
+            GetObjectOutput::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("finalize response");
+
+        assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
     }
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
