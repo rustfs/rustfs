@@ -159,15 +159,17 @@ impl LocalClient {
         expired_entries
     }
 
-    fn release_reclaimed_guards(mut entries: Vec<LocalGuardEntry>, resource: Option<&crate::ObjectKey>) -> usize {
-        let reclaimed = entries.len();
-        for entry in &mut entries {
+    fn release_reclaimed_guards(
+        entries: impl IntoIterator<Item = LocalGuardEntry>,
+        resource: Option<&crate::ObjectKey>,
+    ) -> usize {
+        let mut reclaimed = 0;
+        for mut entry in entries {
             let _ = entry.guard.release();
+            rustfs_io_metrics::record_lock_reclaimed();
+            reclaimed += 1;
         }
         if reclaimed > 0 {
-            for _ in 0..reclaimed {
-                rustfs_io_metrics::record_lock_reclaimed();
-            }
             if let Some(resource) = resource {
                 tracing::debug!(event = "lock_guard_reclaimed", resource = %resource, count = reclaimed, "expired lock guards reclaimed");
             } else {
@@ -297,18 +299,19 @@ impl LockClient for LocalClient {
         let shard = self.get_shard(lock_id);
         let expired_entry = {
             let mut guards = shard.write().await;
-            if guards.get(lock_id).is_some_and(LocalGuardEntry::is_expired) {
+            let Some(entry) = guards.get_mut(lock_id) else {
+                return Ok(false);
+            };
+            if entry.is_expired() {
                 guards.remove(lock_id)
-            } else if let Some(entry) = guards.get_mut(lock_id) {
+            } else {
                 entry.refresh();
                 None
-            } else {
-                return Ok(false);
             }
         };
 
         if let Some(entry) = expired_entry {
-            Self::release_reclaimed_guards(vec![entry], Some(&lock_id.resource));
+            Self::release_reclaimed_guards([entry], Some(&lock_id.resource));
             Ok(false)
         } else {
             Ok(true)
@@ -443,6 +446,7 @@ mod tests {
     async fn refresh_after_expiry_releases_guard_without_reviving_it() {
         let manager = Arc::new(GlobalLockManager::new());
         let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
         let lock_request = request(
             crate::ObjectKey::new("bucket", "refresh-after-expiry"),
             "owner-a",
@@ -450,12 +454,25 @@ mod tests {
         );
         let lock_id = lock_request.lock_id.clone();
 
-        assert!(client.acquire_lock(&lock_request).await.unwrap().success);
+        assert!(
+            client
+                .acquire_lock(&lock_request)
+                .await
+                .expect("initial owner should acquire the lock")
+                .success
+        );
         tokio::time::advance(Duration::from_secs(11)).await;
 
-        assert!(!client.refresh(&lock_id).await.unwrap(), "an expired guard must not be refreshed");
         assert!(
-            client.check_status(&lock_id).await.unwrap().is_none(),
+            !client.refresh(&lock_id).await.expect("expired refresh should return a result"),
+            "an expired guard must not be refreshed"
+        );
+        assert!(
+            client
+                .check_status(&lock_id)
+                .await
+                .expect("expired guard status should be readable")
+                .is_none(),
             "expired guard should be removed after refresh"
         );
 
@@ -465,7 +482,11 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(
-            client.acquire_lock(&contender).await.unwrap().success,
+            client
+                .acquire_lock(&contender)
+                .await
+                .expect("contender should receive an acquisition result")
+                .success,
             "released guard must be acquirable by a new owner"
         );
     }
