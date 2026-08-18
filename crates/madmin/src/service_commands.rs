@@ -43,7 +43,7 @@ pub struct ServiceTraceOpts {
 
 #[allow(dead_code)]
 impl ServiceTraceOpts {
-    fn trace_types(&self) -> TraceType {
+    pub fn trace_types(&self) -> TraceType {
         let mut tt = TraceType::default();
         tt.set_if(self.s3, &TraceType::S3);
         tt.set_if(self.internal, &TraceType::INTERNAL);
@@ -70,6 +70,14 @@ impl ServiceTraceOpts {
         tt.set_if(self.ilm, &TraceType::ILM);
 
         tt
+    }
+
+    pub fn only_errors(&self) -> bool {
+        self.only_errors
+    }
+
+    pub fn threshold(&self) -> Duration {
+        self.threshold
     }
 
     pub fn parse_params(&mut self, uri: &Uri) -> Result<(), String> {

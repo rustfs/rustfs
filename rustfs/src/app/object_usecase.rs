@@ -56,8 +56,8 @@ use super::storage_api::object_usecase::bucket::{
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size,
-    get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectAdmission, PutObjectGuard,
+    get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
@@ -1074,7 +1074,7 @@ where
 }
 
 impl futures::Stream for MemoryTrackedBytesStream {
-    type Item = std::io::Result<Bytes>;
+    type Item = Result<Bytes, S3StdError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -1105,7 +1105,8 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
-            ))));
+            )
+            .into())));
         }
 
         let Some(bytes) = this.bytes.take() else {
@@ -1129,6 +1130,16 @@ impl futures::Stream for MemoryTrackedBytesStream {
             );
         }
         Poll::Ready(Some(Ok(bytes)))
+    }
+}
+
+impl ByteStream for MemoryTrackedBytesStream {
+    fn remaining_length(&self) -> RemainingLength {
+        if self.emitted || self.bytes.is_none() {
+            RemainingLength::new_exact(0)
+        } else {
+            RemainingLength::new_exact(self.expected)
+        }
     }
 }
 
@@ -4149,7 +4160,7 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -5670,6 +5681,35 @@ impl DefaultObjectUsecase {
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
+        // Resolve the store through the request-bound server context
+        // (backlog#1052 S6), not the process-global handle, so an embedded
+        // second server never writes into the first server's store.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
+
+        let put_admission = match get_concurrency_manager()
+            .admit_put_object()
+            .await
+            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+        {
+            PutObjectAdmission::Disabled => None,
+            PutObjectAdmission::Admitted(permit) => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            PutObjectAdmission::Rejected => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(s3_error!(
+                    SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate"
+                ));
+            }
+        };
+
         let mut put_request_guard = PutObjectGuard::new();
         let concurrent_put_requests = PutObjectGuard::concurrent_requests();
 
@@ -5721,16 +5761,6 @@ impl DefaultObjectUsecase {
             buffer_size,
             use_large_put_concurrency_tuning,
         );
-
-        // Resolve the store through the request-bound server context
-        // (backlog#1052 S6), not the process-global handle, so an embedded
-        // second server never writes into the first server's store.
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        validate_bucket_exists(&store, &bucket).await?;
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
 
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
@@ -6121,7 +6151,9 @@ impl DefaultObjectUsecase {
             let cache_adapter = cache_adapter.clone();
             let request_id = request_id.clone();
             let put_path = put_path.to_string();
+            let put_admission = put_admission;
             async move {
+                let _put_admission = put_admission;
                 let object_traffic_progress = object_traffic_health
                     .as_deref()
                     .and_then(ObjectTrafficHealth::track_write_storage);
@@ -6172,6 +6204,7 @@ impl DefaultObjectUsecase {
                     }
                 };
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                drop(_put_admission);
                 drop(object_traffic_progress);
                 #[cfg(test)]
                 wait_for_put_post_store_test_hook(&bucket).await;
@@ -12882,7 +12915,10 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("a short memory body must fail the stream instead of serving a truncated body");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
         assert!(stream.next().await.is_none(), "stream must terminate after the error");
     }
 
@@ -12901,7 +12937,22 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn memory_blob_preserves_exact_remaining_length() {
+        let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            GetObjectBodyLifecycle::disabled(),
+        );
+
+        assert_eq!(blob.remaining_length().exact(), Some(5));
     }
 
     #[tokio::test]

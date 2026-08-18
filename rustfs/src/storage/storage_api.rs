@@ -117,7 +117,7 @@ pub(crate) mod access_consumer {
 
 pub(crate) mod concurrency_consumer {
     pub(crate) use super::super::concurrency::{
-        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard,
+        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectAdmission, PutObjectGuard,
         get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
@@ -568,6 +568,10 @@ pub(crate) mod ecstore_set_disk {
 pub(crate) mod ecstore_erasure {
     pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
 }
+
+/// Startup bitrot algorithm self-test (rustfs/backlog#1873), re-exported for
+/// the root facade's background-startup section.
+pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
 pub(crate) mod ecstore_storage {
     #[cfg(test)]

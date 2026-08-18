@@ -258,7 +258,7 @@ pub struct SRLDAPUser {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRIAMUser {
     #[serde(rename = "accessKey", default)]
     pub access_key: String,
@@ -270,7 +270,7 @@ pub struct SRIAMUser {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRGroupInfo {
     #[serde(rename = "updateReq", default)]
     pub update_req: GroupAddRemove,
@@ -346,7 +346,7 @@ pub struct SRCredInfo {
     pub api_version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRIAMItem {
     #[serde(default)]
     pub r#type: String,

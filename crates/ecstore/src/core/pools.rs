@@ -16,6 +16,7 @@ use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
+        LifecycleExpiryConfigs,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
@@ -1996,11 +1997,11 @@ impl PoolMeta {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self, pools: Vec<Arc<Sets>>) -> Result<bool> {
         struct PoolInfo {
             position: usize,
             completed: bool,
+            #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
             decom_started: bool,
         }
 
@@ -2335,6 +2336,10 @@ fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
     )
 }
 
+fn lifecycle_action_skips_heal_version(action: IlmAction) -> bool {
+    action.delete()
+}
+
 fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
     if !apply_actions || applied {
         return Ok(true);
@@ -2385,7 +2390,80 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     }
 }
 
+pub struct HealLifecycleExpiryContext {
+    configs: LifecycleExpiryConfigs,
+}
+
 impl ECStore {
+    pub async fn load_heal_lifecycle_expiry_context(&self, bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        if bucket == RUSTFS_META_BUCKET {
+            return Ok(None);
+        }
+
+        let configs = get_expiry_configs(self, bucket).await?;
+        if configs.lifecycle.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(HealLifecycleExpiryContext { configs }))
+    }
+
+    pub async fn enqueue_heal_lifecycle_expiry(
+        self: &Arc<Self>,
+        context: &HealLifecycleExpiryContext,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        object_info: Option<&crate::object_api::ObjectInfo>,
+    ) -> Result<bool> {
+        let Some(lifecycle_config) = context.configs.lifecycle.as_ref() else {
+            return Ok(false);
+        };
+
+        let object_info = if let Some(object_info) = object_info {
+            if object_info.bucket != bucket || object_info.name != object {
+                return Ok(false);
+            }
+            let snapshot_version_id = object_info
+                .version_id
+                .filter(|version_id| !version_id.is_nil())
+                .map(|version_id| version_id.to_string());
+            if snapshot_version_id.as_deref() != version_id {
+                return Ok(false);
+            }
+            object_info.clone()
+        } else {
+            match self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: version_id.map(str::to_string),
+                        versioned: version_id.is_some(),
+                        expected_bucket_incarnation_id: Some(context.configs.bucket_incarnation_id),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(object_info) => object_info,
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        };
+
+        let event = eval_action_from_lifecycle(lifecycle_config, context.configs.object_lock.as_deref(), &object_info).await;
+        if !lifecycle_action_skips_heal_version(event.action) {
+            return Ok(false);
+        }
+
+        if lifecycle_delete_all_versions_blocked_by_replication(self.clone(), bucket, &object_info.name, event.action).await? {
+            return Ok(false);
+        }
+
+        Ok(apply_expiry_rule_in(self.clone(), &event, &LcEventSrc::Scanner, &object_info).await)
+    }
+
     async fn save_current_pool_meta(&self) -> Result<()> {
         let _save_guard = self.pool_meta_save_gate.lock().await;
         let snapshot = {
@@ -4288,6 +4366,19 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_action_skips_heal_version_for_every_delete_action() {
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAllVersionsAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DelMarkerDeleteAllVersionsAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionVersionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::NoneAction));
+    }
+
+    #[test]
     fn resolve_data_movement_lifecycle_expiry_result_allows_dry_run_skip() {
         let skip = resolve_data_movement_lifecycle_expiry_result(IlmAction::DeleteVersionAction, false, false)
             .expect("dry-run lifecycle evaluation should not require expiry enqueue");
@@ -4958,13 +5049,19 @@ fn is_disk_online_state(state: &str) -> bool {
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_total_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_total_capacity_dedup(disks)
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_free_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_free_capacity_dedup(disks)
 }

@@ -273,6 +273,10 @@ uer. `ClusterIssuer` or `Issuer`. |
 | gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
 | gatewayApi.listeners.https.name | string | `websecure` | Gateway API https listener name. |
 | gatewayApi.listeners.https.port| int | `8443` | Gateway API https listener port. |
+| gatewayApi.listeners.tls.enabled | bool | `false` | Enable a TLS passthrough listener and generate a TLSRoute. |
+| gatewayApi.listeners.tls.name | string | `tls` | Gateway API TLS passthrough listener name. |
+| gatewayApi.listeners.tls.port | int | `443` | Gateway API TLS passthrough listener port. |
+| gatewayApi.listeners.tls.backendPort | int | `null` | Backend service port that terminates TLS; defaults to the console port. |
 | gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
@@ -446,6 +450,8 @@ rustfs-route   ["example.rustfs.com"]   172m
 ```
 
 Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
+
+For end-to-end encryption, set `gatewayApi.listeners.tls.enabled` to `true`. The chart then adds a `TLS` listener with `tls.mode: Passthrough` to the `Gateway` and generates a `TLSRoute` that forwards the encrypted stream to the RustFS service, where TLS is terminated on the backend side. Note that backend TLS termination must be configured on RustFS itself (for example `RUSTFS_TLS_PATH` pointing to server certificates), and the installed Gateway API CRDs must include `TLSRoute`.
 
 # Uninstall
 

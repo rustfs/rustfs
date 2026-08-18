@@ -2420,6 +2420,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }

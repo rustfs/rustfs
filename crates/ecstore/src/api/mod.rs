@@ -373,14 +373,14 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
-        calc_shard_size, calc_shard_size_legacy,
+        BitrotReader, BitrotSelfTestError, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError,
+        ReedSolomonEncoder, bitrot_self_test, calc_shard_size, calc_shard_size_legacy,
     };
 }
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook, send_event};
 }
 
 pub mod global {
@@ -483,6 +483,7 @@ pub mod store_list {
 }
 
 pub mod storage {
+    pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,

@@ -312,9 +312,7 @@ mod tests {
         }
         #[derive(Deserialize)]
         struct LegacyBucketQuota {
-            #[allow(dead_code)]
             quota: Option<u64>,
-            #[allow(dead_code)]
             quota_type: LegacyQuotaType,
         }
         let legacy = serde_json::from_slice::<LegacyBucketQuota>(&json)

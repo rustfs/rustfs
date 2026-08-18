@@ -206,7 +206,6 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
 }
 
 /// Test helper: Create a test bucket
-#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -251,7 +250,6 @@ async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOpti
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -274,7 +272,6 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create lifecycle rule that targets delete-marker cleanup only.
     // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
@@ -297,7 +294,6 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -320,7 +316,6 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -368,7 +363,6 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 }
 
 /// Test helper: Check if object exists
-#[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
         println!("oi: {oi:?}");
@@ -379,7 +373,6 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
-#[allow(dead_code)]
 async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
 

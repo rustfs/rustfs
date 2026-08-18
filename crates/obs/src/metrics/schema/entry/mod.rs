@@ -56,7 +56,6 @@ pub fn new_gauge_md(
 }
 
 /// create a new histogram indicator descriptor
-#[allow(dead_code)]
 pub fn new_histogram_md(
     name: impl Into<MetricName>,
     help: impl Into<String>,

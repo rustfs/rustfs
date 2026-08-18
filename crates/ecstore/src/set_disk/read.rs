@@ -1077,6 +1077,15 @@ impl SetDisks {
                             "Recoverable decode error triggered read repair"
                         );
                         let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                        // MRF journal intent: keeps a durable Urgent ECDecode
+                        // request alive across restarts even when the in-memory
+                        // read-repair request is dropped or lost (HS-01).
+                        rustfs_common::mrf_channel::try_send_mrf_intent(
+                            rustfs_common::mrf_channel::MrfKind::DecodeFailure,
+                            bucket,
+                            object,
+                            fi.version_id,
+                        );
                         submit_read_repair_heal(
                             bucket,
                             object,

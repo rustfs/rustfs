@@ -70,7 +70,6 @@ pub fn is_dir_object(object: &str) -> bool {
 ///
 /// If the object name ends with `GLOBAL_DIR_SUFFIX`, it is replaced with a slash.
 /// Otherwise, the name is returned as is.
-#[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
         format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
