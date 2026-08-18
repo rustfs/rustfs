@@ -9264,17 +9264,27 @@ impl DiskAPI for LocalDisk {
             // accept that window (documented in docs/operations/durability-modes.md).
             if durability.syncs_commit_metadata()
                 && let Some(parent) = dst_file_path.parent()
-                && let Err(err) = os::fsync_dir(parent).await
             {
-                rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
-                    .map_err(to_file_error)?;
-                // The commit rename changed the dst part inodes before this fsync
-                // failed and rolled them back; drop any fd cached during that
-                // window so readers re-open the restored inode (rustfs/backlog#1177).
-                for part_path in &invalidate_part_paths {
-                    self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                let fsync_started = rustfs_io_metrics::put_stage_timer();
+                if let Err(err) = os::fsync_dir(parent).await {
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                        fsync_started,
+                    );
+                    rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
+                        .map_err(to_file_error)?;
+                    // The commit rename changed the dst part inodes before this fsync
+                    // failed and rolled them back; drop any fd cached during that
+                    // window so readers re-open the restored inode (rustfs/backlog#1177).
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(to_file_error(err).into());
                 }
-                return Err(to_file_error(err).into());
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                    fsync_started,
+                );
             }
 
             // First PUT of an object creates its directory (and any missing prefix
@@ -9293,7 +9303,12 @@ impl DiskAPI for LocalDisk {
                     if !dir.starts_with(&dst_volume_dir) {
                         break;
                     }
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
                     if let Err(err) = os::fsync_dir(dir).await {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                            fsync_started,
+                        );
                         rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                             .map_err(to_file_error)?;
                         // Same post-commit rollback window as above — drop cached
@@ -9304,6 +9319,10 @@ impl DiskAPI for LocalDisk {
                         }
                         return Err(to_file_error(err).into());
                     }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                        fsync_started,
+                    );
                     if dir == dst_volume_dir.as_path() {
                         break;
                     }
@@ -9532,10 +9551,21 @@ impl DiskAPI for LocalDisk {
                 }
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(backup_parent) = backup_path.parent()
-                    && let Err(err) =
-                        os::fsync_dir_with_namespace_file_sync_limit(backup_parent, mutation_lease.clone(), admission).await
                 {
-                    return Err(DiskError::from(to_file_error(err)));
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
+                    if let Err(err) =
+                        os::fsync_dir_with_namespace_file_sync_limit(backup_parent, mutation_lease.clone(), admission).await
+                    {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+                            fsync_started,
+                        );
+                        return Err(DiskError::from(to_file_error(err)));
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+                        fsync_started,
+                    );
                 }
                 local_rollback_path = None;
             }
@@ -9573,11 +9603,22 @@ impl DiskAPI for LocalDisk {
                 // Persist the commit rename's directory entry across power loss.
                 if let Some(admission) = file_sync_admission.as_ref()
                     && let Some(dst_parent) = dst_file_path.parent()
-                    && let Err(err) =
-                        os::fsync_dir_with_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission).await
                 {
-                    rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
-                    return Err(err);
+                    let fsync_started = rustfs_io_metrics::put_stage_timer();
+                    if let Err(err) =
+                        os::fsync_dir_with_namespace_file_sync_limit(dst_parent, mutation_lease.clone(), admission).await
+                    {
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                            fsync_started,
+                        );
+                        rollback_inline_metadata_commit_std(&dst_file_path, rollback_data_dir, local_rollback_path.as_deref())?;
+                        return Err(err);
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+                        fsync_started,
+                    );
                 }
 
                 // Same power-loss gap as the non-inline path (rustfs/backlog#922
@@ -9595,9 +9636,14 @@ impl DiskAPI for LocalDisk {
                         if !ancestor_dir.starts_with(&dst_volume_dir) {
                             break;
                         }
+                        let fsync_started = rustfs_io_metrics::put_stage_timer();
                         if let Err(err) =
                             os::fsync_dir_with_namespace_file_sync_limit(ancestor_dir, mutation_lease.clone(), admission).await
                         {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                                fsync_started,
+                            );
                             rollback_inline_metadata_commit_std(
                                 &dst_file_path,
                                 rollback_data_dir,
@@ -9605,6 +9651,10 @@ impl DiskAPI for LocalDisk {
                             )?;
                             return Err(err);
                         }
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+                            fsync_started,
+                        );
                         if ancestor_dir == dst_volume_dir.as_path() {
                             break;
                         }
