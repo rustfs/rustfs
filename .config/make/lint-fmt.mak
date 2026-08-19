@@ -70,6 +70,11 @@ fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabi
 	@echo "📣 Checking cryptographic capability wording guard..."
 	./scripts/check_fips_wording.sh
 
+.PHONY: embedded-secrets-check
+embedded-secrets-check: ## Check no private key material or credential literal is committed
+	@echo "🔑 Checking embedded secret material guard..."
+	./scripts/check_embedded_secrets.sh
+
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source
 	@echo "🩺 Checking log-analyzer rule anchors..."

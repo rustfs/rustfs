@@ -1425,10 +1425,6 @@ fn maintenance_inspection_decision(generation: u64, current_generation: u64, att
     }
 }
 
-fn single_disk_default_cycle_secs(_features: ScannerMaintenanceFeatures) -> Option<u64> {
-    None
-}
-
 fn single_disk_default_speed() -> ScannerSpeed {
     ScannerSpeed::Default
 }
@@ -1592,9 +1588,12 @@ async fn configure_scanner_defaults(
                     scanner_maintenance_generation(),
                 )
             });
-        let default_cycle_secs = single_disk_default_cycle_secs(features);
+        // Single-disk keeps the speed-preset-derived default cycle (60s at the
+        // `default` preset) instead of a special shorter cycle: no measured
+        // cold-start ILM latency basis for an override, and clean-idle backoff
+        // already stretches idle cadence. Decision record: backlog#1878 (HS-16).
         set_scanner_default_speed(single_disk_default_speed());
-        set_scanner_default_cycle_secs(default_cycle_secs);
+        set_scanner_default_cycle_secs(None);
         info!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_RUNTIME_CONFIG,
@@ -1603,7 +1602,6 @@ async fn configure_scanner_defaults(
             env_speed = ENV_SCANNER_SPEED,
             env_cycle = ENV_SCANNER_CYCLE,
             env_start_delay = ENV_SCANNER_START_DELAY_SECS,
-            ?default_cycle_secs,
             lifecycle_active = features.lifecycle,
             replication_active = features.replication,
             feature_inspection_failed = features.inspection_failed,
@@ -6951,11 +6949,6 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_default_cycle_uses_speed_based_interval_without_maintenance_features() {
-        assert_eq!(single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()), None);
-    }
-
-    #[test]
     fn test_single_disk_default_speed_uses_regular_scanner_default() {
         assert_eq!(single_disk_default_speed(), ScannerSpeed::Default);
     }
@@ -7413,39 +7406,6 @@ mod tests {
         with_var("RUSTFS_HEAL_OBJECT_SELECT_PROB", Some("1024"), || {
             assert_eq!(scanner_clean_idle_max_interval(Duration::from_secs(60), &config), Duration::from_secs(60));
         });
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_for_lifecycle() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                lifecycle: true,
-                ..Default::default()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_for_replication() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                replication: true,
-                ..Default::default()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_on_inspection_failure() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                inspection_failed: true,
-                ..Default::default()
-            }),
-            None
-        );
     }
 
     #[test]

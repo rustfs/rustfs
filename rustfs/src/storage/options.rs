@@ -1018,12 +1018,6 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
         Err(s3_error!(InvalidArgument, "Invalid range format"))
     }
 }
-
-#[allow(dead_code)]
-pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    get_content_sha256_with_query(headers, None)
-}
-
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
         AuthType::Presigned | AuthType::Signed => {
@@ -1036,14 +1030,6 @@ pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, qu
         _ => None,
     }
 }
-
-/// skip_content_sha256_cksum returns true if caller needs to skip
-/// payload checksum, false if not.
-#[allow(dead_code)]
-fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
-    skip_content_sha256_cksum_with_query(headers, None)
-}
-
 fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
     let include_query_values = matches!(get_request_auth_type_with_query(headers, query), AuthType::Presigned);
     let content_sha256 = get_content_sha256_value(headers, query, include_query_values);
@@ -1138,12 +1124,6 @@ fn get_content_sha256_value(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
 }
-
-#[allow(dead_code)]
-fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
-    get_content_sha256_cksum_with_query(headers, None, service_type)
-}
-
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {

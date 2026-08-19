@@ -42,7 +42,6 @@ fn map_data_usage_result<E>(result: Result<DataUsageInfo, E>) -> S3Result<DataUs
     result.map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, DATA_USAGE_LOAD_ERROR_MESSAGE))
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {

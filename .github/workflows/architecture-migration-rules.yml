@@ -53,9 +53,9 @@ jobs:
           persist-credentials: false
 
       - name: Install ripgrep
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: ripgrep@15.2.0
 
       - name: Check architecture migration rules
         run: ./scripts/check_architecture_migration_rules.sh

@@ -94,7 +94,7 @@ aws-smithy-types = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 # Debugging recorder for asserting emitted metrics in tests.
-metrics-util = { version = "0.20", features = ["debugging"] }
+metrics-util = { workspace = true, features = ["debugging"] }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

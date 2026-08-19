@@ -15,7 +15,6 @@
 use crate::common::{RustFSTestEnvironment, admin_ok, build_test_s3_config, build_test_sts_client, init_logging};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use serial_test::serial;
 use tokio::time::{Duration, Instant};
 
 fn user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str, session_token: Option<&str>) -> Client {
@@ -76,7 +75,6 @@ async fn create_service_account(
 }
 
 #[tokio::test]
-#[serial]
 async fn list_buckets_filters_with_iam_bucket_resources() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;

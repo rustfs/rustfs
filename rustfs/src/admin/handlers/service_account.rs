@@ -359,6 +359,13 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
+        // This family deliberately calls `is_allowed` directly instead of going
+        // through `validate_admin_request`, and must keep doing so
+        // (backlog#1886). The shared helper returns as soon as *any* candidate
+        // action is allowed — an OR. The checks here are an AND: each one must
+        // pass, and a later stage additionally needs `owner` for the GHSA-5354
+        // parent-scope guard and drives `deny_only` dynamically. Replacing these
+        // with the shared gate would widen authorization.
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,

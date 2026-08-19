@@ -32,11 +32,9 @@ use aws_sdk_s3::types::{
     MetadataDirective, ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
     ServerSideEncryptionRule,
 };
-use serial_test::serial;
 use tracing::info;
 
 #[tokio::test]
-#[serial]
 async fn test_metadata_replace_self_copy_of_sse_object_stays_decryptable() {
     init_logging();
     info!("same-key CopyObject with REPLACE metadata must not re-key an SSE-S3 object");
@@ -136,7 +134,6 @@ async fn test_metadata_replace_self_copy_of_sse_object_stays_decryptable() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_metadata_replace_self_copy_dropping_sse_rewrites_plaintext() {
     init_logging();
     info!("same-key CopyObject that drops SSE must rewrite the data, not orphan the ciphertext");
@@ -233,7 +230,6 @@ async fn test_metadata_replace_self_copy_dropping_sse_rewrites_plaintext() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_metadata_replace_self_copy_under_bucket_default_sse_stays_decryptable() {
     init_logging();
     info!("bucket default encryption must also keep a same-key copy off the metadata-only path");

@@ -36,7 +36,6 @@ use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
 pub trait IamInterface: Send + Sync {
-    #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
     fn token_signing_key(&self) -> Option<String> {
@@ -53,7 +52,6 @@ pub trait FederatedIdentityInterface: Send + Sync {
 }
 
 /// KMS interface for application-layer use-cases.
-#[allow(dead_code)]
 pub trait KmsInterface: Send + Sync {
     fn handle(&self) -> Arc<KmsServiceManager>;
 }

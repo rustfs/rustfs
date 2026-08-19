@@ -1032,8 +1032,9 @@ pub(crate) mod sse {
         validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::sse_consumer::{
-        EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
-        extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        EncryptionKeyKind, SSEType, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
+        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, map_get_object_reader_error,
+        mark_encrypted_multipart_metadata,
     };
 }
 

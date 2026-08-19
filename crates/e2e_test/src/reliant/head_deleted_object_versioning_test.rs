@@ -25,7 +25,6 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use bytes::Bytes;
-use serial_test::serial;
 use std::error::Error;
 use tracing::info;
 
@@ -85,7 +84,6 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
 
 /// Test that HeadObject on a deleted object returns NoSuchKey when versioning is enabled
 #[tokio::test]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_head_deleted_object_versioning_returns_nosuchkey() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()

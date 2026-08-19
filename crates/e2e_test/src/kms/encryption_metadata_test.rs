@@ -22,7 +22,6 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, ServerSideEncryption, ServerSideEncryptionByDefault,
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use serial_test::serial;
 use std::collections::{HashMap, VecDeque};
 use tracing::info;
 
@@ -82,7 +81,6 @@ pub(super) fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &
 }
 
 #[tokio::test]
-#[serial]
 async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating SSE-S3 managed encryption metadata exposure");
@@ -143,7 +141,6 @@ async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-#[serial]
 async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating SSE-KMS managed encryption metadata (including copy)");
@@ -247,7 +244,6 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_multipart_upload_writes_encrypted_data() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Validating ciphertext persistence for multipart SSE-KMS uploads");

@@ -30,7 +30,6 @@ use reqwest::{Certificate, Client, Response, StatusCode};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
 use std::error::Error;
 use std::path::Path;
 use std::process::Command;
@@ -157,7 +156,6 @@ async fn start_tls_rustfs_server(env: &mut RustFSTestEnvironment, tls_dir: &Path
 }
 
 #[tokio::test]
-#[serial]
 async fn test_head_missing_object_over_tls_http2_is_bodyless() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 

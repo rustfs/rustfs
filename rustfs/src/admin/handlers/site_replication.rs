@@ -126,6 +126,10 @@ const SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH: &str = "config/site-replication
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
 const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from cluster replication successfully.";
+/// Local removal committed, but at least one peer could not be told. The
+/// cluster is diverged until the removal finishes — the reconcile tick keeps
+/// retrying it, and `replicate info` reports the pending operation meanwhile.
+const SITE_REPL_REMOVE_PARTIAL: &str = "Partial";
 const SITE_REPL_RESYNC_START: &str = "start";
 const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_RESYNC_STATUS: &str = "status";
@@ -713,6 +717,16 @@ struct SRPeerJoinResponse {
     peer: PeerInfo,
     #[serde(rename = "initialSyncErrorMessage", default, skip_serializing_if = "String::is_empty")]
     initial_sync_error_message: String,
+    /// Whether the receiving site actually applied this join.
+    ///
+    /// Three-valued on purpose. `None` means the peer did not report — MinIO
+    /// answers a successful `SRPeerJoin` with an empty body, and RustFS peers
+    /// older than this field say nothing either — so the initiator must NOT
+    /// read it as a failure. `Some(false)` is an explicit no-op: the peer had
+    /// already moved past the snapshot it was sent and wrote nothing, which
+    /// used to be indistinguishable from success (rustfs/rustfs#5963).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2568,6 +2582,21 @@ fn apply_peer_join(
     state.peers = normalize_join_peers_for_local(local_peer, join_req.peers);
     initialize_join_peer_sync_state(&mut state.peers, defer_sync_state_enable);
     state.sync_state_initialized = true;
+    // An accepted join supersedes a half-finished removal this site started:
+    // the sender's snapshot IS the new topology, while the pending record only
+    // exists to keep notifying peers about the OLD one. Leaving it set is what
+    // kept a recovered site rejecting every peer bucket-op forever —
+    // `SRPeerBucketOpsHandler` short-circuits on `pending_remove` BEFORE it
+    // consults `enabled()`, so a successful re-add restored the topology on
+    // both sides while replication stayed dead (rustfs/rustfs#5963).
+    //
+    // Safe against a concurrent removal: `SiteReplicationRemoveHandler` and
+    // the join admission both hold the lifecycle guard, so a join is only ever
+    // admitted before that handler starts or after it has returned.
+    //
+    // Deliberately NOT cleared here: the peer-edit high-water marks (see this
+    // function's doc comment) — those fence edit ordering, not lifecycle.
+    state.pending_remove = None;
     state.name = state
         .peers
         .get(&local_peer.deployment_id)
@@ -3002,8 +3031,17 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
 
         match load_site_replication_state().await {
             Ok(state) => {
-                if state.pending_endpoint_refresh.is_some() || state.pending_remove.is_some() || state.pending_rotation.is_some()
-                {
+                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() {
+                    return;
+                }
+                // A removal whose peers were unreachable is the one pending
+                // marker that nothing else re-drives, and it wedges the site
+                // while it sits there. Push it forward here rather than giving
+                // up the round (rustfs/rustfs#5963). The reconcilers below
+                // still skip this round either way: the topology is only
+                // settled once the removal clears, and the next tick sees it.
+                if let Some(pending_remove) = state.pending_remove.clone() {
+                    resume_pending_remove(&state, &pending_remove).await;
                     return;
                 }
             }
@@ -7041,15 +7079,31 @@ async fn dequeue_site_replication_retry_event_for_generation(peer: &PeerInfo, pa
     }
 }
 
+/// The removal's client-facing verdict.
+///
+/// A fully-notified removal keeps answering with the historical success string,
+/// byte for byte, so healthy runs stay wire-identical for every existing
+/// client. Only the path that used to LIE — peers that could not be notified,
+/// reported as unqualified success while the cluster silently diverged
+/// (rustfs/rustfs#5963) — now says `Partial`, matching the vocabulary
+/// `SRRotateServiceAccountHandler` already uses for the same situation.
 fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStatus {
+    if peer_errors.is_empty() {
+        return ReplicateRemoveStatus {
+            status: SITE_REPL_REMOVE_SUCCESS.to_string(),
+            err_detail: String::new(),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        };
+    }
+
+    let summaries: Vec<String> = peer_errors.iter().map(|error| summarize_peer_error_detail(error)).collect();
     ReplicateRemoveStatus {
-        status: SITE_REPL_REMOVE_SUCCESS.to_string(),
-        err_detail: if peer_errors.is_empty() {
-            String::new()
-        } else {
-            let summaries: Vec<String> = peer_errors.iter().map(|error| summarize_peer_error_detail(error)).collect();
-            summarize_peer_error_detail(&format!("failed to notify {} peer(s): {}", summaries.len(), summaries.join("; ")))
-        },
+        status: SITE_REPL_REMOVE_PARTIAL.to_string(),
+        err_detail: summarize_peer_error_detail(&format!(
+            "failed to notify {} peer(s): {}",
+            summaries.len(),
+            summaries.join("; ")
+        )),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
 }
@@ -7224,6 +7278,137 @@ async fn clear_pending_remove(remove_id: &str) -> S3Result<()> {
         Ok(StateCommit::Changed(()))
     })
     .await
+}
+
+/// Push a half-finished removal one step forward: notify every peer that has
+/// not acked yet, then finalize locally if that completed the set. Returns the
+/// per-peer failures and whether the removal is now finished.
+///
+/// Shared by the operator-driven `SiteReplicationRemoveHandler` and the
+/// reconcile tick. The tick is what makes this self-healing: a removal whose
+/// peers were unreachable used to sit in `pending_remove` forever, and that one
+/// field gates every peer bucket-op (`SRPeerBucketOpsHandler` checks it first)
+/// plus every reconciler — so the site stayed wedged until an operator happened
+/// to re-run `replicate remove` (rustfs/rustfs#5963).
+///
+/// Callers must hold the lifecycle guard: this both notifies peers and, on the
+/// final step, takes the bucket-op write lock to clean up local rules.
+async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerInfo) -> S3Result<(Vec<String>, bool)> {
+    let mut peer_errors = Vec::new();
+    let mut secret_candidates = pending_remove.secret_candidates.clone();
+    if pending_remove.service_account_access_key.is_empty() {
+        peer_errors.push("site replication service account unavailable".to_string());
+    } else if let Ok(service_account_secret_key) =
+        site_replicator_service_account_secret(&pending_remove.service_account_access_key).await
+    {
+        record_pending_remove_secret_candidate(&pending_remove.id, service_account_secret_key.clone()).await?;
+        push_unique_secret_candidate(&mut secret_candidates, service_account_secret_key);
+    }
+
+    if secret_candidates.is_empty() {
+        peer_errors.push("site replication service account secret unavailable".to_string());
+    } else {
+        for peer in pending_remove.original_peers.values() {
+            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+                || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
+            {
+                continue;
+            }
+            if let Err(err) = send_peer_admin_request_with_secret_candidates(
+                &runtime_peer_connection(peer)?,
+                SITE_REPLICATION_PEER_REMOVE_PATH,
+                &pending_remove.service_account_access_key,
+                &secret_candidates,
+                &pending_remove.req,
+            )
+            .await
+            {
+                let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    peer = %peer.endpoint,
+                    result = "peer_remove_notification_failed",
+                    error = %err_detail,
+                    "admin site replication state"
+                );
+                peer_errors.push(err_detail);
+            } else {
+                mark_pending_remove_peer_acked(&pending_remove.id, &peer.deployment_id).await?;
+            }
+        }
+    }
+
+    let finalize_candidate = pending_remove_ready_to_finalize(&pending_remove.id, local_peer).await?;
+    let complete = if let Some(finalized_remove) = finalize_candidate {
+        let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
+        let removed_deployment_ids = removed_deployment_ids_for_pending_remove(&finalized_remove, local_peer);
+        match cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
+            Ok(removed) => {
+                if removed > 0 {
+                    info!(
+                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                        removed,
+                        result = "remove_cleanup_completed",
+                        "admin site replication state"
+                    );
+                }
+                clear_pending_remove(&pending_remove.id).await?;
+                true
+            }
+            Err(err) => {
+                peer_errors.push(summarize_peer_error_detail(&format!("local remove cleanup failed: {err}")));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok((peer_errors, complete))
+}
+
+/// The reconcile tick's half of [`drive_pending_remove`]: resume the removal
+/// this site could not finish, and report the outcome. Runs under the tick's
+/// lifecycle guard, which is what keeps it from racing an operator re-running
+/// `replicate remove` (that handler takes the same guard).
+async fn resume_pending_remove(state: &SiteReplicationState, pending_remove: &PendingRemove) {
+    let local_peer = current_local_runtime_peer(state);
+    match drive_pending_remove(pending_remove, &local_peer).await {
+        Ok((peer_errors, complete)) => {
+            if complete && peer_errors.is_empty() {
+                info!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_remove_resumed",
+                    "admin site replication state"
+                );
+            } else {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_remove_still_pending",
+                    error_count = peer_errors.len(),
+                    "admin site replication state"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_remove_resume_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
 }
 
 fn removed_deployment_ids_for_pending_remove(pending: &PendingRemove, local_peer: &PeerInfo) -> HashSet<String> {
@@ -9656,9 +9841,12 @@ pub struct SiteReplicationAddHandler {}
 /// peer identity from the add preflight metainfo in that case.
 fn parse_peer_join_response(body: &[u8], fallback_peer: PeerInfo) -> Result<SRPeerJoinResponse, serde_json::Error> {
     if body.iter().all(u8::is_ascii_whitespace) {
+        // MinIO's empty-body success. `applied` stays `None`: the peer told us
+        // nothing, which must not be reported as a no-op join.
         return Ok(SRPeerJoinResponse {
             peer: fallback_peer,
             initial_sync_error_message: String::new(),
+            applied: None,
         });
     }
     serde_json::from_slice(body)
@@ -9760,6 +9948,19 @@ impl Operation for SiteReplicationAddHandler {
             })?;
             if !join_response.initial_sync_error_message.is_empty() {
                 initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+            }
+            // An explicit no-op join. The peer answered 200 but wrote nothing —
+            // its persisted state is already newer than the snapshot it was
+            // sent — so the add is only PARTIALLY configured and saying
+            // "configured successfully" would be a lie (rustfs/rustfs#5963).
+            // `None` (a MinIO peer, or one older than the field) is not a
+            // no-op signal and is deliberately not reported.
+            if join_response.applied == Some(false) {
+                initial_sync_errors.push(format!(
+                    "{}: peer did not apply the join (its site replication state is newer than the snapshot it was sent); \
+                     the site is not configured against this peer",
+                    site.endpoint
+                ));
             }
             state = reconcile_peer_with_actual_identity(state, join_response.peer);
             let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
@@ -9933,79 +10134,7 @@ impl Operation for SiteReplicationRemoveHandler {
             .await?
         };
 
-        let mut peer_errors = Vec::new();
-        let mut secret_candidates = pending_remove.secret_candidates.clone();
-        if pending_remove.service_account_access_key.is_empty() {
-            peer_errors.push("site replication service account unavailable".to_string());
-        } else if let Ok(service_account_secret_key) =
-            site_replicator_service_account_secret(&pending_remove.service_account_access_key).await
-        {
-            record_pending_remove_secret_candidate(&pending_remove.id, service_account_secret_key.clone()).await?;
-            push_unique_secret_candidate(&mut secret_candidates, service_account_secret_key);
-        }
-
-        if secret_candidates.is_empty() {
-            peer_errors.push("site replication service account secret unavailable".to_string());
-        } else {
-            for peer in pending_remove.original_peers.values() {
-                if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                    || pending_remove.acked_deployment_ids.contains(&peer.deployment_id)
-                {
-                    continue;
-                }
-                if let Err(err) = send_peer_admin_request_with_secret_candidates(
-                    &runtime_peer_connection(peer)?,
-                    SITE_REPLICATION_PEER_REMOVE_PATH,
-                    &pending_remove.service_account_access_key,
-                    &secret_candidates,
-                    &pending_remove.req,
-                )
-                .await
-                {
-                    let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
-                    warn!(
-                        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                        peer = %peer.endpoint,
-                        result = "peer_remove_notification_failed",
-                        error = %err_detail,
-                        "admin site replication state"
-                    );
-                    peer_errors.push(err_detail);
-                } else {
-                    mark_pending_remove_peer_acked(&pending_remove.id, &peer.deployment_id).await?;
-                }
-            }
-        }
-
-        let finalize_candidate = pending_remove_ready_to_finalize(&pending_remove.id, &local_peer).await?;
-        let complete = if let Some(finalized_remove) = finalize_candidate {
-            let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            let removed_deployment_ids = removed_deployment_ids_for_pending_remove(&finalized_remove, &local_peer);
-            match cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
-                Ok(removed) => {
-                    if removed > 0 {
-                        info!(
-                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                            removed,
-                            result = "remove_cleanup_completed",
-                            "admin site replication state"
-                        );
-                    }
-                    clear_pending_remove(&pending_remove.id).await?;
-                    true
-                }
-                Err(err) => {
-                    peer_errors.push(summarize_peer_error_detail(&format!("local remove cleanup failed: {err}")));
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        let (mut peer_errors, complete) = drive_pending_remove(&pending_remove, &local_peer).await?;
         if !complete && peer_errors.is_empty() {
             peer_errors.push("site replication remove is still pending".to_string());
         }
@@ -10019,6 +10148,25 @@ impl Operation for SiteReplicationRemoveHandler {
     }
 }
 
+/// The `replicate info` projection.
+///
+/// Carries the peer-facing health this endpoint used to omit entirely: a peer
+/// rejecting every operation, or a removal stuck mid-flight, left `info`
+/// reporting a perfectly healthy cluster while replication was dead — both were
+/// only visible through `replicate status --json` (rustfs/rustfs#5963). Split
+/// out so that omission is a test failure rather than an invisible regression.
+fn site_replication_info_for(state: &SiteReplicationState, local_peer: &PeerInfo) -> SiteReplicationInfo {
+    SiteReplicationInfo {
+        enabled: state.enabled(),
+        name: local_peer.name.clone(),
+        sites: state.peers.values().cloned().collect(),
+        service_account_access_key: state.service_account_access_key.clone(),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        retry_stats: retry_stats_for_state(state),
+        pending_operation: pending_operation_for_state(state, local_peer),
+    }
+}
+
 pub struct SiteReplicationInfoHandler {}
 
 #[async_trait::async_trait]
@@ -10027,14 +10175,7 @@ impl Operation for SiteReplicationInfoHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let info = SiteReplicationInfo {
-            enabled: state.enabled(),
-            name: local_peer.name,
-            sites: state.peers.values().cloned().collect(),
-            service_account_access_key: state.service_account_access_key,
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        };
-        json_response(&info)
+        json_response(&site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -10253,6 +10394,28 @@ async fn apply_peer_join_service_account(join_req: SRPeerJoinReq) -> S3Result<()
     Ok(())
 }
 
+/// The answer to a join this site refused to apply because it had already
+/// moved past the sender's snapshot. Split out so the verdict itself is
+/// testable: answering `applied: Some(true)` here (or omitting the field) is
+/// exactly the silent no-op that made `replicate add` report success against a
+/// peer that wrote nothing (rustfs/rustfs#5963).
+fn superseded_join_response(peer: PeerInfo) -> SRPeerJoinResponse {
+    SRPeerJoinResponse {
+        peer,
+        initial_sync_error_message: String::new(),
+        applied: Some(false),
+    }
+}
+
+/// The answer to a join this site committed.
+fn applied_join_response(peer: PeerInfo, initial_sync_error_message: String) -> SRPeerJoinResponse {
+    SRPeerJoinResponse {
+        peer,
+        initial_sync_error_message,
+        applied: Some(true),
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -10275,10 +10438,14 @@ impl Operation for SRPeerJoinHandler {
         let (state, local_peer) = match committed {
             PeerJoinOutcome::Applied(state, local_peer) => (*state, local_peer),
             PeerJoinOutcome::Superseded(peer) => {
-                return json_response(&SRPeerJoinResponse {
-                    peer,
-                    ..Default::default()
-                });
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "join_superseded",
+                    "admin site replication state"
+                );
+                return json_response(&superseded_join_response(peer));
             }
         };
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
@@ -10297,10 +10464,10 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(&SRPeerJoinResponse {
-            peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
-            initial_sync_error_message: backfill_errors.render(),
-        })
+        json_response(&applied_join_response(
+            state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+            backfill_errors.render(),
+        ))
     }
 }
 
@@ -11344,7 +11511,11 @@ impl Operation for SRRotateServiceAccountHandler {
             {
                 continue;
             }
-            if let Err(err) = send_peer_admin_request_with_secret_candidates(
+            // A superseded join returns BEFORE `apply_iam`, so a no-op answer
+            // means the peer never installed the new secret. Acking it would
+            // finalize a rotation half the mesh cannot authenticate against
+            // (rustfs/rustfs#5963).
+            let rotation_error = match send_peer_admin_request_with_secret_candidates(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_JOIN_PATH,
                 &pending_rotation.access_key,
@@ -11353,7 +11524,20 @@ impl Operation for SRRotateServiceAccountHandler {
             )
             .await
             {
-                let detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
+                Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
+                Ok(body) => match parse_peer_join_response(&body, peer.clone()) {
+                    Ok(response) if response.applied == Some(false) => Some(summarize_peer_error_detail(&format!(
+                        "{}: peer did not apply the rotation join (its site replication state is newer than the snapshot it \
+                         was sent); the new service account secret was not installed",
+                        peer.endpoint
+                    ))),
+                    // Unparseable bodies keep the pre-existing behaviour: the
+                    // transport succeeded, and MinIO peers answer with an empty
+                    // body this helper already tolerates.
+                    Ok(_) | Err(_) => None,
+                },
+            };
+            if let Some(detail) = rotation_error {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -15639,9 +15823,17 @@ mod tests {
             site_replication_remove_status(&["peer request to https://remote.example.com failed with 403 Forbidden".to_string()]);
 
         assert!(state.peers.is_empty());
-        assert_eq!(status.status, SITE_REPL_REMOVE_SUCCESS);
+        assert_eq!(
+            status.status, SITE_REPL_REMOVE_PARTIAL,
+            "a removal whose peer could not be notified must not report unqualified success"
+        );
         assert!(status.err_detail.contains("failed to notify 1 peer"));
         assert!(status.err_detail.contains("403 Forbidden"));
+
+        // The fully-notified path stays byte-identical for existing clients.
+        let clean = site_replication_remove_status(&[]);
+        assert_eq!(clean.status, SITE_REPL_REMOVE_SUCCESS);
+        assert!(clean.err_detail.is_empty());
     }
 
     #[test]
@@ -16982,16 +17174,22 @@ mod tests {
             assert_eq!(response.peer.deployment_id, "remote-deployment");
             assert_eq!(response.peer.endpoint, "https://remote.example.com");
             assert!(response.initial_sync_error_message.is_empty());
+            assert_eq!(
+                response.applied, None,
+                "a MinIO empty-body success reports nothing; it must not read as a no-op join"
+            );
         }
 
         let json = serde_json::to_vec(&SRPeerJoinResponse {
             peer: peer("actual", "https://actual.example.com"),
             initial_sync_error_message: "sync failed".to_string(),
+            applied: Some(true),
         })
         .expect("serialize join response");
         let response = parse_peer_join_response(&json, fallback.clone()).expect("parse join response body");
         assert_eq!(response.peer.endpoint, "https://actual.example.com");
         assert_eq!(response.initial_sync_error_message, "sync failed");
+        assert_eq!(response.applied, Some(true));
 
         assert!(parse_peer_join_response(b"not-json", fallback).is_err());
     }
@@ -17712,13 +17910,319 @@ mod tests {
         .expect("parse legacy peer join response");
 
         assert!(response.initial_sync_error_message.is_empty());
+        assert_eq!(
+            response.applied, None,
+            "a peer older than the field says nothing about whether it applied the join"
+        );
 
         let value = serde_json::to_value(SRPeerJoinResponse {
             peer: peer("remote", "https://remote.example.com"),
             initial_sync_error_message: "bucket setup failed".to_string(),
+            applied: Some(true),
         })
         .expect("serialize peer join response");
         assert_eq!(value.get("initialSyncErrorMessage").and_then(Value::as_str), Some("bucket setup failed"));
+        assert_eq!(value.get("applied").and_then(Value::as_bool), Some(true));
+
+        // An unset verdict must not appear on the wire, so a peer that never
+        // learned the field keeps deserializing byte-identical payloads.
+        let value = serde_json::to_value(SRPeerJoinResponse {
+            peer: peer("remote", "https://remote.example.com"),
+            initial_sync_error_message: String::new(),
+            applied: None,
+        })
+        .expect("serialize peer join response");
+        assert!(value.get("applied").is_none(), "an unset verdict must be omitted: {value}");
+    }
+
+    /// rustfs/rustfs#5963: a removal that could not notify its peers leaves
+    /// `pending_remove` set, and that field alone makes `SRPeerBucketOpsHandler`
+    /// reject every peer operation — before it ever consults `enabled()`. A
+    /// later join restored the topology but left the marker, so a "successful"
+    /// re-add produced a cluster that reported Enabled/2-sites on both sides
+    /// while replication stayed dead. The join must clear it.
+    #[test]
+    fn peer_join_clears_a_stuck_pending_remove() {
+        let local = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "https://site-b.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([(local.deployment_id.clone(), local.clone())]),
+            pending_remove: Some(PendingRemove {
+                id: "stuck-remove".to_string(),
+                req: SRRemoveReq {
+                    remove_all: true,
+                    ..Default::default()
+                },
+                service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                secret_candidates: Vec::new(),
+                original_peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote.clone()),
+                ]),
+                acked_deployment_ids: BTreeSet::new(),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            }),
+            ..Default::default()
+        };
+
+        apply_peer_join(
+            &mut state,
+            &local,
+            SRPeerJoinReq {
+                svc_acct_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                svc_acct_secret_key: "svc-secret".to_string(),
+                svc_acct_parent: "root".to_string(),
+                peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote),
+                ]),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            },
+            false,
+        );
+
+        assert!(
+            state.pending_remove.is_none(),
+            "an accepted join supersedes the half-finished removal it lands on"
+        );
+        assert!(state.enabled(), "the join restores the two-site topology");
+        // The guard `SRPeerBucketOpsHandler` evaluates, asserted directly: with
+        // the marker cleared and the topology back, peer bucket-ops are
+        // admitted again.
+        assert!(
+            state.pending_remove.is_none() && state.enabled(),
+            "the bucket-ops admission predicate must now pass"
+        );
+    }
+
+    /// The fence marks are lifecycle-independent and must survive the clearing
+    /// above — wiping them would reopen the rollback window the fence closes.
+    #[test]
+    fn peer_join_clearing_pending_remove_keeps_edit_generation_marks() {
+        let local = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "https://site-b.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let mut state = SiteReplicationState {
+            peers: BTreeMap::from([(local.deployment_id.clone(), local.clone())]),
+            applied_edit_generations: BTreeMap::from([(remote.deployment_id.clone(), 7)]),
+            pending_remove: Some(PendingRemove {
+                id: "stuck-remove".to_string(),
+                req: SRRemoveReq {
+                    remove_all: true,
+                    ..Default::default()
+                },
+                service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                secret_candidates: Vec::new(),
+                original_peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote.clone()),
+                ]),
+                acked_deployment_ids: BTreeSet::new(),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            }),
+            ..Default::default()
+        };
+
+        apply_peer_join(
+            &mut state,
+            &local,
+            SRPeerJoinReq {
+                svc_acct_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                svc_acct_secret_key: "svc-secret".to_string(),
+                svc_acct_parent: "root".to_string(),
+                peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote.clone()),
+                ]),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            },
+            false,
+        );
+
+        assert!(state.pending_remove.is_none());
+        assert_eq!(
+            state.applied_edit_generations.get(&remote.deployment_id),
+            Some(&7),
+            "clearing the lifecycle marker must not touch the ordering fence"
+        );
+    }
+
+    /// rustfs/rustfs#5963: the two join verdicts must be distinguishable on the
+    /// wire. `Some(true)`/`Some(false)` is what lets the initiator tell a real
+    /// configuration from a 200 that wrote nothing; flipping either one back to
+    /// an unset verdict re-hides the no-op.
+    #[test]
+    fn join_verdicts_are_distinguishable_on_the_wire() {
+        let remote = peer("remote", "https://remote.example.com");
+
+        let superseded = superseded_join_response(remote.clone());
+        assert_eq!(
+            superseded.applied,
+            Some(false),
+            "a join this site refused to apply must say so explicitly"
+        );
+        assert!(superseded.initial_sync_error_message.is_empty());
+
+        let applied = applied_join_response(remote, "bucket setup failed".to_string());
+        assert_eq!(applied.applied, Some(true));
+        assert_eq!(applied.initial_sync_error_message, "bucket setup failed");
+
+        // Round-tripping through the wire keeps the two apart — the initiator
+        // only ever sees the serialized form.
+        let decoded: SRPeerJoinResponse =
+            serde_json::from_slice(&serde_json::to_vec(&superseded_join_response(peer("r", "https://r.example.com"))).unwrap())
+                .expect("round-trip superseded verdict");
+        assert_eq!(decoded.applied, Some(false));
+    }
+
+    /// rustfs/rustfs#5963: a stuck removal must be visible on the endpoint
+    /// operators actually run. `replicate info` used to report only
+    /// `enabled: false`, which reads as "never configured" rather than "a
+    /// removal is wedged here and this site rejects every peer operation".
+    #[test]
+    fn site_replication_info_reports_a_wedged_removal() {
+        let local = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "https://site-b.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let state = SiteReplicationState {
+            name: "site-b".to_string(),
+            peers: BTreeMap::from([(local.deployment_id.clone(), local.clone())]),
+            pending_remove: Some(PendingRemove {
+                id: "stuck-remove".to_string(),
+                req: SRRemoveReq {
+                    remove_all: true,
+                    ..Default::default()
+                },
+                service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                secret_candidates: Vec::new(),
+                original_peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote.deployment_id.clone(), remote.clone()),
+                ]),
+                acked_deployment_ids: BTreeSet::new(),
+                updated_at: Some(OffsetDateTime::now_utc()),
+            }),
+            ..Default::default()
+        };
+
+        let info = site_replication_info_for(&state, &local);
+        assert!(!info.enabled, "the peer set is already torn down");
+        let pending = info
+            .pending_operation
+            .as_ref()
+            .expect("a wedged removal must surface as a pending operation");
+        assert_eq!(pending.operation, "remove");
+        assert!(
+            pending.pending_peers.contains(&remote.deployment_id),
+            "the peer that was never notified must be named: {pending:?}"
+        );
+    }
+
+    /// The source side of the same failure: peer operations are being rejected,
+    /// the topology still looks like a healthy two-site cluster, and `info` has
+    /// to say the deliveries are failing.
+    #[test]
+    fn site_replication_info_reports_failing_peer_deliveries() {
+        let local = PeerInfo {
+            deployment_id: "site-a".to_string(),
+            ..peer("site-a", "https://site-a.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "site-b".to_string(),
+            ..peer("site-b", "https://site-b.example.com")
+        };
+        let state = SiteReplicationState {
+            name: "site-a".to_string(),
+            peers: BTreeMap::from([
+                (local.deployment_id.clone(), local.clone()),
+                (remote.deployment_id.clone(), remote.clone()),
+            ]),
+            retry_queue: vec![SiteReplicationRetryEvent {
+                id: "evt".to_string(),
+                peer_deployment_id: remote.deployment_id.clone(),
+                peer_endpoint: remote.endpoint,
+                path: "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=demo&operation=make-with-versioning".to_string(),
+                retry_count: 9,
+                failed: true,
+                last_error: "site replication is not enabled".to_string(),
+                updated_at: Some(OffsetDateTime::now_utc()),
+                edit_generation: None,
+            }],
+            ..Default::default()
+        };
+
+        let info = site_replication_info_for(&state, &local);
+        assert!(info.enabled, "the topology still reports two sites — that was the trap");
+        let stats = info
+            .retry_stats
+            .as_ref()
+            .expect("a peer rejecting every delivery must be visible in `info`");
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.last_error, "site replication is not enabled");
+
+        // A healthy site must stay wire-identical to before the field existed.
+        let healthy = SiteReplicationState {
+            retry_queue: Vec::new(),
+            ..state
+        };
+        let info = site_replication_info_for(&healthy, &local);
+        assert!(info.retry_stats.is_none());
+        assert!(info.pending_operation.is_none());
+    }
+
+    /// rustfs/rustfs#5963: `replicate info` reported a healthy cluster while
+    /// every peer operation was failing. The health it used to omit now rides
+    /// along, and a healthy site still serializes without the new fields.
+    #[test]
+    fn site_replication_info_health_fields_are_absent_when_healthy() {
+        let healthy = SiteReplicationInfo {
+            enabled: true,
+            name: "site-a".to_string(),
+            sites: vec![peer("site-a", "https://site-a.example.com")],
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            retry_stats: None,
+            pending_operation: None,
+        };
+        let value = serde_json::to_value(&healthy).expect("serialize info");
+        assert!(value.get("retryStats").is_none(), "a healthy site must not grow fields: {value}");
+        assert!(value.get("pendingOperation").is_none(), "a healthy site must not grow fields: {value}");
+
+        let degraded = SiteReplicationInfo {
+            retry_stats: Some(SRRetryStats {
+                pending: 1,
+                failed: 4,
+                last_error: "site replication is not enabled".to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            ..healthy
+        };
+        let value = serde_json::to_value(&degraded).expect("serialize info");
+        assert_eq!(
+            value.pointer("/retryStats/failed").and_then(Value::as_u64),
+            Some(4),
+            "a source site whose peer rejects everything must say so in `info`"
+        );
+        assert_eq!(
+            value.pointer("/retryStats/lastError").and_then(Value::as_str),
+            Some("site replication is not enabled")
+        );
     }
 
     // Fix 5: remove --all must purge local state unconditionally even when peer errors occur
@@ -17766,12 +18270,14 @@ mod tests {
         assert!(state.peers.is_empty(), "peers must be cleared on remove --all");
         assert!(state.resync_status.is_empty(), "resync_status must be cleared on remove --all");
 
-        // Even if peers returned 403 (desynced account), status still reports success
+        // The local side is torn down either way, but a peer that returned 403
+        // (desynced account) leaves the cluster diverged — the response must
+        // say so instead of reporting unqualified success (rustfs/rustfs#5963).
         let status =
             site_replication_remove_status(&["https://remote.example.com: peer/remove returned 403 Forbidden".to_string()]);
         assert_eq!(
-            status.status, SITE_REPL_REMOVE_SUCCESS,
-            "local remove reports success even when peer notifications fail"
+            status.status, SITE_REPL_REMOVE_PARTIAL,
+            "local remove must report a partial result when peer notifications fail"
         );
         assert!(
             status.err_detail.contains("403 Forbidden"),

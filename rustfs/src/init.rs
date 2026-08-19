@@ -765,7 +765,6 @@ fn resolve_buffer_profile_config(
 
 /// Parse and normalize server address for FTP/FTPS
 /// Forces IPv4 binding to avoid libunftp IPv6 compatibility issues
-#[allow(dead_code)]
 async fn parse_and_normalize_server_address(
     address_str: &str,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -781,45 +780,6 @@ async fn parse_and_normalize_server_address(
 
     Ok(normalized_addr)
 }
-
-/// Start FTP/FTPS server in background with shutdown support
-/// # Arguments
-/// * `server` - The FTP/FTPS server instance
-/// * `protocol_name` - Name of the protocol (e.g., "FTP", "FTPS")
-#[allow(dead_code)]
-fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
-where
-    S: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
-{
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-
-    tokio::spawn(async move {
-        if let Err(e) = server.await {
-            error!(
-                target: "rustfs::init",
-                event = "protocol_server_state",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_PROTOCOL,
-                protocol = protocol_name,
-                state = "runtime_failed",
-                error = %e,
-                "Protocol server failed"
-            );
-        }
-        info!(
-            target: "rustfs::init",
-            event = "protocol_server_state",
-            component = LOG_COMPONENT_INIT,
-            subsystem = LOG_SUBSYSTEM_PROTOCOL,
-            protocol = protocol_name,
-            state = "stopped",
-            "Protocol server stopped"
-        );
-    });
-
-    shutdown_tx
-}
-
 /// Starts the auto-tuner for performance optimization if enabled via environment variable.
 ///
 /// The auto-tuner reads `RUSTFS_AUTOTUNER_ENABLED` to decide whether to run.

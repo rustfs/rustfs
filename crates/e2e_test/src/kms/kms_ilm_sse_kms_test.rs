@@ -51,7 +51,6 @@ use aws_sdk_s3::types::{
     TransitionStorageClass,
 };
 use serde::Deserialize;
-use serial_test::serial;
 use std::time::{Duration as StdDuration, Instant};
 use tracing::info;
 
@@ -424,7 +423,6 @@ async fn wait_for_restore_complete(client: &Client, bucket: &str, key: &str, dea
 /// filter as the cause of the deletion and proves the encrypted bucket stays
 /// readable end to end after the scanner has run.
 #[tokio::test]
-#[serial]
 async fn ilm_expiration_on_sse_kms_bucket_under_enforcement() -> TestResult {
     init_logging();
 
@@ -485,7 +483,6 @@ async fn ilm_expiration_on_sse_kms_bucket_under_enforcement() -> TestResult {
 /// (the mechanism `reliant/tiering.rs` established), so the test does not
 /// depend on scanner scheduling; the 1s scanner cycle stays on as a backstop.
 #[tokio::test]
-#[serial]
 async fn ilm_transition_on_sse_kms_bucket_under_enforcement_reads_back() -> TestResult {
     init_logging();
 

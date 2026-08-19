@@ -33,7 +33,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -51,7 +50,6 @@ mod tests {
     /// 4. Verify the object is NOT in LIST
     /// 5. Verify HEAD returns 404
     #[tokio::test]
-    #[serial]
     async fn test_delete_removes_object_from_list() -> TestResult {
         init_logging();
         info!("RT-05: delete removes object from list");
@@ -132,7 +130,6 @@ mod tests {
     /// Regression pattern: batch delete returns success but some objects
     /// remain in LIST.
     #[tokio::test]
-    #[serial]
     async fn test_batch_delete_removes_all_objects() -> TestResult {
         init_logging();
         info!("RT-05c: batch delete removes all objects");
@@ -212,7 +209,6 @@ mod tests {
     /// Covers the pattern where permanent deletion of a specific version
     /// fails with FileAccessDenied (rustfs#4978).
     #[tokio::test]
-    #[serial]
     async fn test_versioned_permanent_delete() -> TestResult {
         init_logging();
         info!("RT-05d: versioned permanent delete");
@@ -283,7 +279,6 @@ mod tests {
     /// Covers the pattern where creating a delete marker and then listing
     /// versions shows incorrect state (rustfs#760).
     #[tokio::test]
-    #[serial]
     async fn test_versioned_delete_marker_and_list_consistency() -> TestResult {
         init_logging();
         info!("RT-05e: versioned delete marker and list consistency");
@@ -379,7 +374,6 @@ mod tests {
     /// Regression pattern: after delete, the object data files remain on disk
     /// (rustfs#5029: Node Does Not Remove Files After Reconnect).
     #[tokio::test]
-    #[serial]
     async fn test_delete_removes_object_head_returns_404() -> TestResult {
         init_logging();
         info!("RT-05f: delete → HEAD 404 consistency");

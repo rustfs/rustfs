@@ -29,7 +29,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
-    use serial_test::serial;
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -42,7 +41,6 @@ mod tests {
     /// a versioned bucket, calling `list_object_versions` **immediately** (with
     /// no sleep) returns the newly-created DeleteMarker with `is_latest = true`.
     #[tokio::test]
-    #[serial]
     async fn test_delete_objects_delete_marker_immediately_visible() {
         init_logging();
         info!("🧪 TEST: DeleteMarker from delete_objects is immediately visible via list_object_versions");
@@ -190,7 +188,6 @@ mod tests {
     /// a single `delete_objects` call all have their delete markers visible
     /// immediately afterwards.
     #[tokio::test]
-    #[serial]
     async fn test_delete_objects_multiple_keys_delete_markers_immediately_visible() {
         init_logging();
         info!("🧪 TEST: Multiple delete markers from delete_objects are immediately visible");

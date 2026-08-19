@@ -16,7 +16,6 @@ use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use serial_test::serial;
 use std::time::Duration;
 use tracing::info;
 
@@ -29,7 +28,6 @@ fn list_contains_key(output: &aws_sdk_s3::operation::list_objects_v2::ListObject
 }
 
 #[tokio::test]
-#[serial]
 async fn head_object_consistency_after_write_and_multipart_and_presigned_head()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();

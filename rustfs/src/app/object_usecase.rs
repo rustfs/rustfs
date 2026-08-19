@@ -97,7 +97,7 @@ use super::storage_api::object_usecase::set_disk::{
 };
 use super::storage_api::object_usecase::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
-    authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    authorize_sse_kms_object_read, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_decryption, sse_encryption,
     validate_bucket_object_lock_enabled_state,
@@ -169,7 +169,7 @@ use s3s::dto::{
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
     SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
-    ServerSideEncryptionByDefault, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
     WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
@@ -738,7 +738,7 @@ struct GetObjectPreparedRead {
 }
 
 struct GetObjectStrategyContext {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
     enable_readahead: bool,
@@ -2676,23 +2676,37 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
 }
 
-/// Managed SSE resolved from a bucket default encryption rule on the copy path.
+/// Resolve the effective server-side encryption for a write against the bucket's
+/// default encryption configuration.
 ///
-/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
-/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
-/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
-/// instead lets a same-name copy under a malformed bucket default pass the
-/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
-/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
-/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
-/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
-/// (backlog#1826).
-fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
-    match sse.sse_algorithm.as_str() {
-        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-    }
+/// A request-level value always wins; the bucket default only fills a gap, and
+/// the unknown-algorithm fallback lives once in [`bucket_default_write_sse`].
+///
+/// `has_explicit_ssec` suppresses the default entirely. Only COPY passes `true`
+/// today: its destination may carry SSE-C, which must not also be given managed
+/// encryption. PUT and extract pass `false`, matching their current behaviour —
+/// see backlog#1826 for the divergence that leaves.
+///
+/// Callers layering further overrides (PUT's `ciphertext_passthrough`) apply
+/// them to the returned pair.
+fn resolve_bucket_default_sse(
+    bucket_sse_config: Option<&ServerSideEncryptionConfiguration>,
+    requested_sse: Option<ServerSideEncryption>,
+    requested_kms_key_id: Option<SSEKMSKeyId>,
+    has_explicit_ssec: bool,
+) -> (Option<ServerSideEncryption>, Option<SSEKMSKeyId>) {
+    let bucket_default = || {
+        if has_explicit_ssec {
+            return None;
+        }
+        bucket_sse_config
+            .and_then(|config| config.rules.first())
+            .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+    };
+
+    let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
+    let effective_kms_key_id = requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()));
+    (effective_sse, effective_kms_key_id)
 }
 
 fn should_use_small_eager_put_path(
@@ -5823,19 +5837,12 @@ impl DefaultObjectUsecase {
         );
 
         let original_sse = server_side_encryption.clone();
-        let mut effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
+            server_side_encryption,
+            ssekms_key_id,
+            false,
+        );
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -5846,16 +5853,6 @@ impl DefaultObjectUsecase {
             effective = ?effective_sse,
             "Resolved effective SSE configuration"
         );
-
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
 
         if ciphertext_passthrough {
             // The replica keeps the source's SSE-C metadata; the bucket
@@ -7658,30 +7655,12 @@ impl DefaultObjectUsecase {
             }
         };
 
-        let mut effective_sse = requested_sse.or_else(|| {
-            if has_explicit_ssec {
-                return None;
-            }
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(bucket_default_write_sse)
-                })
-            })
-        });
-        let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
-            if has_explicit_ssec {
-                return None;
-            }
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _)| config),
+            requested_sse,
+            requested_kms_key_id,
+            has_explicit_ssec,
+        );
 
         let h = build_ssec_read_headers(
             copy_source_sse_customer_algorithm.as_ref(),
@@ -9587,28 +9566,12 @@ impl DefaultObjectUsecase {
 
         let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        let mut effective_sse = original_sse.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        })
-                })
-            })
-        });
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
+            original_sse,
+            ssekms_key_id,
+            false,
+        );
         if effective_sse
             .as_ref()
             .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
@@ -10133,8 +10096,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -10395,6 +10358,74 @@ mod tests {
             };
             assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
         }
+    }
+
+    fn bucket_sse_config_with(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionConfiguration {
+        ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from(String::from(algorithm)),
+                    kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                }),
+                bucket_key_enabled: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_prefers_the_request_over_the_bucket_default() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(
+            Some(&config),
+            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            Some(SSEKMSKeyId::from("request-key".to_string())),
+            false,
+        );
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(kms_key_id.as_deref(), Some("request-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_fills_gaps_from_the_bucket_default() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_falls_back_to_aes256_for_an_unknown_algorithm() {
+        // Reachable only through corrupt or hand-edited bucket metadata;
+        // PutBucketEncryption rejects unknown algorithms. All three call sites
+        // now share this single decision (backlog#1826).
+        let config = bucket_sse_config_with("garbage", None);
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert!(kms_key_id.is_none());
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_suppresses_the_default_for_explicit_ssec() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AES256, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, true);
+
+        assert!(sse.is_none(), "an SSE-C destination must not also get managed encryption");
+        assert!(kms_key_id.is_none());
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_returns_nothing_without_a_bucket_default() {
+        let (sse, kms_key_id) = resolve_bucket_default_sse(None, None, None, false);
+
+        assert!(sse.is_none());
+        assert!(kms_key_id.is_none());
     }
 
     #[test]

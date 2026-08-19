@@ -51,8 +51,8 @@ pub use crate::{
     namespace::{NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper},
     // Core types
     types::{
-        HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,
-        LockType,
+        HealthInfo, HealthStatus, LockId, LockInfo, LockLeaseInfo, LockMetadata, LockPriority, LockRequest, LockResponse,
+        LockStats, LockStatus, LockType,
     },
 };
 

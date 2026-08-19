@@ -24,11 +24,9 @@ use super::common::{
     test_kms_key_management, test_sse_c_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tracing::{error, info};
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_local_kms_end_to_end") {
@@ -114,7 +112,6 @@ async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_key_isolation() {
     init_logging();
     info!("Starting Local KMS Key Isolation Test");
@@ -215,7 +212,6 @@ async fn test_local_kms_key_isolation() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_large_file() {
     init_logging();
     info!("Starting Local KMS Large File Test");
@@ -298,7 +294,6 @@ async fn test_local_kms_large_file() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_local_kms_multipart_upload() {
     init_logging();
     info!("Starting Local KMS Multipart Upload Test");

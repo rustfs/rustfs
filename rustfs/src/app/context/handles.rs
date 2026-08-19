@@ -49,7 +49,6 @@ use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
 pub struct IamHandle {
-    #[allow(dead_code)]
     iam: Arc<IamSys<ObjectStore>>,
 }
 
@@ -110,7 +109,6 @@ impl FederatedIdentityInterface for FederatedIdentityHandle {
 }
 
 /// Default KMS interface adapter.
-#[allow(dead_code)]
 pub struct KmsHandle {
     kms: Arc<KmsServiceManager>,
 }

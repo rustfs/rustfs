@@ -34,7 +34,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
     use tracing::{debug, info};
 
@@ -93,7 +92,6 @@ mod tests {
     /// mc cp README.md "local/dummy/a%20f+/b/c/3/README.md"
     /// ```
     #[tokio::test]
-    #[serial]
     async fn test_object_with_space_in_path() {
         init_logging();
         info!("Starting test: object with space in path");
@@ -175,7 +173,6 @@ mod tests {
     /// /test/data/org_main-org/dashboards/ES+net/LHC+Data+Challenge/firefly-details.json
     /// ```
     #[tokio::test]
-    #[serial]
     async fn test_object_with_plus_in_path() {
         init_logging();
         info!("Starting test: object with plus sign in path");
@@ -245,7 +242,6 @@ mod tests {
 
     /// Test with mixed special characters
     #[tokio::test]
-    #[serial]
     async fn test_object_with_mixed_special_chars() {
         init_logging();
         info!("Starting test: object with mixed special characters");
@@ -305,7 +301,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_signed_get_missing_object_with_trailing_equals_returns_no_such_key() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         init_logging();
@@ -334,7 +329,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_signed_get_existing_object_with_trailing_equals_returns_content() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -373,7 +367,6 @@ mod tests {
 
     /// Test DELETE operation with special characters
     #[tokio::test]
-    #[serial]
     async fn test_delete_object_with_special_chars() {
         init_logging();
         info!("Starting test: DELETE object with special characters");
@@ -421,7 +414,6 @@ mod tests {
 
     /// Test exact scenario from the issue
     #[tokio::test]
-    #[serial]
     async fn test_issue_scenario_exact() {
         init_logging();
         info!("Starting test: Exact scenario from GitHub issue");
@@ -494,7 +486,6 @@ mod tests {
 
     /// Test HEAD object with special characters
     #[tokio::test]
-    #[serial]
     async fn test_head_object_with_special_chars() {
         init_logging();
         info!("Starting test: HEAD object with special characters");
@@ -538,7 +529,6 @@ mod tests {
 
     /// Test COPY object with special characters in both source and destination
     #[tokio::test]
-    #[serial]
     async fn test_copy_object_with_special_chars() {
         init_logging();
         info!("Starting test: COPY object with special characters");
@@ -597,7 +587,6 @@ mod tests {
 
     /// Test Unicode characters in object keys
     #[tokio::test]
-    #[serial]
     async fn test_unicode_characters_in_path() {
         init_logging();
         info!("Starting test: Unicode characters in object paths");
@@ -661,7 +650,6 @@ mod tests {
 
     /// Test special characters in different parts of the path
     #[tokio::test]
-    #[serial]
     async fn test_special_chars_in_different_path_positions() {
         init_logging();
         info!("Starting test: Special characters in different path positions");
@@ -719,7 +707,6 @@ mod tests {
 
     /// Test that control characters are properly rejected
     #[tokio::test]
-    #[serial]
     async fn test_control_characters_rejected() {
         init_logging();
         info!("Starting test: Control characters should be rejected");
@@ -769,7 +756,6 @@ mod tests {
 
     /// Test LIST with various special character prefixes
     #[tokio::test]
-    #[serial]
     async fn test_list_with_special_char_prefixes() {
         init_logging();
         info!("Starting test: LIST with special character prefixes");
@@ -838,7 +824,6 @@ mod tests {
 
     /// Test delimiter-based listing with special characters
     #[tokio::test]
-    #[serial]
     async fn test_list_with_delimiter_and_special_chars() {
         init_logging();
         info!("Starting test: LIST with delimiter and special characters");

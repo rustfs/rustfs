@@ -3417,6 +3417,25 @@ impl SetDisks {
             quorum_wait_started,
         );
         let (results, mut file_infos) = fanout_result.map_err(|_| DiskError::Unexpected)?;
+        if rustfs_io_metrics::put_stage_metrics_enabled() {
+            let mut fanout_success = 0;
+            let mut fanout_error = 0;
+            let mut fanout_panic = 0;
+            for result in &results {
+                match result {
+                    Ok(Ok(_)) => fanout_success += 1,
+                    Ok(Err(_)) => fanout_error += 1,
+                    Err(_) => fanout_panic += 1,
+                }
+            }
+            rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
+                results.len(),
+                write_quorum,
+                fanout_success,
+                fanout_error,
+                fanout_panic,
+            );
+        }
 
         for (idx, result) in results.iter().enumerate() {
             match result {

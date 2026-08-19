@@ -24,7 +24,20 @@ use crate::fast_lock::{
     state::ObjectLockState,
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
-use std::collections::HashSet;
+
+#[derive(Debug)]
+struct ActiveGuardInfo {
+    key: ObjectKey,
+    mode: LockMode,
+    owner: Arc<str>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct GuardHolderKey {
+    key: ObjectKey,
+    mode: LockMode,
+    owner: Arc<str>,
+}
 
 /// Lock shard to reduce global contention
 #[derive(Debug)]
@@ -38,7 +51,7 @@ pub struct LockShard {
     /// Shard ID for debugging
     _shard_id: usize,
     /// Active guard IDs to prevent cleanup of locks with live guards
-    active_guards: parking_lot::Mutex<HashSet<u64>>,
+    active_guards: parking_lot::Mutex<HashMap<u64, Option<ActiveGuardInfo>>>,
 }
 
 /// Cancellation-safe waiter counter ticket.
@@ -84,7 +97,7 @@ impl LockShard {
             object_pool: ObjectStatePool::new(),
             metrics: ShardMetrics::new(),
             _shard_id: shard_id,
-            active_guards: parking_lot::Mutex::new(HashSet::new()),
+            active_guards: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -327,7 +340,7 @@ impl LockShard {
         // First, try to remove the guard from active set
         let guard_was_active = {
             let mut guards = self.active_guards.lock();
-            guards.remove(&guard_id)
+            guards.remove(&guard_id).is_some()
         };
 
         // If guard was not active, this is a double-release attempt
@@ -375,8 +388,19 @@ impl LockShard {
 
     /// Register a guard to prevent premature cleanup
     pub fn register_guard(&self, guard_id: u64) {
+        self.active_guards.lock().insert(guard_id, None);
+    }
+
+    pub(crate) fn register_guard_with_info(&self, guard_id: u64, key: &ObjectKey, mode: LockMode, owner: &Arc<str>) {
         let mut guards = self.active_guards.lock();
-        guards.insert(guard_id);
+        guards.insert(
+            guard_id,
+            Some(ActiveGuardInfo {
+                key: key.clone(),
+                mode,
+                owner: owner.clone(),
+            }),
+        );
     }
 
     /// Unregister a guard (called when guard is dropped)
@@ -396,7 +420,7 @@ impl LockShard {
     #[cfg(test)]
     pub fn is_guard_active(&self, guard_id: u64) -> bool {
         let guards = self.active_guards.lock();
-        guards.contains(&guard_id)
+        guards.contains_key(&guard_id)
     }
 
     /// Calculate adaptive timeout based on current system load and request priority
@@ -544,6 +568,13 @@ impl LockShard {
     /// holder. Entries for objects that are tracked but not currently locked
     /// (e.g. pooled-but-idle state) are skipped.
     pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        self.list_locks_with_holder_counts()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    pub(crate) fn list_locks_with_holder_counts(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32)> {
         let objects = self.objects.read();
         let mut infos = Vec::new();
         for (key, state) in objects.iter() {
@@ -558,14 +589,17 @@ impl LockShard {
                             .acquired_at
                             .checked_add(info.lock_timeout)
                             .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: info.owner,
-                            acquired_at: info.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: info.owner,
+                                acquired_at: info.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            1,
+                        ));
                     }
                 }
                 LockMode::Shared => {
@@ -574,19 +608,66 @@ impl LockShard {
                             .acquired_at
                             .checked_add(entry.lock_timeout)
                             .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
-                        infos.push(crate::fast_lock::types::ObjectLockInfo {
-                            key: key.clone(),
-                            mode,
-                            owner: entry.owner.clone(),
-                            acquired_at: entry.acquired_at,
-                            expires_at,
-                            priority,
-                        });
+                        infos.push((
+                            crate::fast_lock::types::ObjectLockInfo {
+                                key: key.clone(),
+                                mode,
+                                owner: entry.owner.clone(),
+                                acquired_at: entry.acquired_at,
+                                expires_at,
+                                priority,
+                            },
+                            entry.count,
+                        ));
                     }
                 }
             }
         }
         infos
+    }
+
+    pub(crate) fn list_locks_with_holder_generations(
+        &self,
+    ) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
+        // Snapshot lock state before guard registrations. Acquires register after
+        // mutating state, while releases unregister before mutating state, so a
+        // concurrent transition can only make the cohort mismatch and fall back.
+        let infos = self.list_locks_with_holder_counts();
+        let guards = self.active_guards.lock();
+        let mut guard_ids_by_holder: HashMap<GuardHolderKey, Vec<u64>> = HashMap::with_capacity(guards.len());
+        for (&guard_id, guard) in guards
+            .iter()
+            .filter_map(|(guard_id, guard)| guard.as_ref().map(|guard| (guard_id, guard)))
+        {
+            let key = GuardHolderKey {
+                key: guard.key.clone(),
+                mode: guard.mode,
+                owner: guard.owner.clone(),
+            };
+            guard_ids_by_holder
+                .entry(key)
+                .and_modify(|guard_ids| guard_ids.push(guard_id))
+                .or_insert_with(|| vec![guard_id]);
+        }
+        drop(guards);
+        for guard_ids in guard_ids_by_holder.values_mut() {
+            guard_ids.sort_unstable();
+        }
+
+        infos
+            .into_iter()
+            .map(|(info, holder_count)| {
+                let key = GuardHolderKey {
+                    key: info.key.clone(),
+                    mode: info.mode,
+                    owner: info.owner.clone(),
+                };
+                let generation = guard_ids_by_holder
+                    .remove(&key)
+                    .filter(|guard_ids| u32::try_from(guard_ids.len()).ok() == Some(holder_count));
+                (info, holder_count, generation)
+            })
+            .collect()
     }
 
     /// Force-release every holder of a lock on `key`, regardless of owner.

@@ -455,12 +455,6 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
 async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
     authorize_admin_request(req, vec![Action::AdminAction(action)]).await
 }
-
-#[allow(dead_code)]
-fn is_local_host(_host: String) -> bool {
-    false
-}
-
 pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<AppContext>>) -> BucketStats {
     let Some(stats) = current_replication_stats_handle_for_context(context.clone()) else {
         return BucketStats::default();

@@ -38,7 +38,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -162,7 +161,6 @@ mod tests {
     /// A fully authenticated but non-admin credential must be rejected with
     /// `403 AccessDenied` on an admin API, while the root credential succeeds.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn non_admin_credential_denied_on_admin_api() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -198,7 +196,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn non_admin_credential_denied_on_manual_transition_run() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -326,7 +323,6 @@ mod tests {
     /// credential is accepted and the old one is rejected, on both the S3 data
     /// plane and the admin plane.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn root_credential_rotation_takes_effect() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -389,7 +385,6 @@ mod tests {
     /// runtime. We capture the child's stdout/stderr directly (the shared
     /// harness inherits stdio) and poll for the warning until it appears.
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn default_credentials_emit_startup_warning() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 

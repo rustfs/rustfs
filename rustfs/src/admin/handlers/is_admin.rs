@@ -46,6 +46,12 @@ impl Operation for IsAdminHandler {
 
         let access_key_to_check = input_cred.access_key.clone();
 
+        // This endpoint reports a capability; it does not gate on one. The
+        // `is_allowed` result below becomes the `is_admin` field of a 200
+        // response — a caller without admin rights gets `{"is_admin": false}`,
+        // not a 403. Turning this into a rejection would change the API
+        // contract, so it must stay out of any shared-gate normalisation
+        // (backlog#1886).
         // Check if the user is admin: root user check, then evaluate through the policy engine
         let is_admin = if let Some(sys_cred) = current_action_credentials() {
             constant_time_eq(&access_key_to_check, &sys_cred.access_key)

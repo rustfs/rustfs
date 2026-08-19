@@ -267,7 +267,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | topologySpreadConstraints.enabled | bool | `false` | Enable custom topology spread constraints on distributed-mode StatefulSet pods. |
 | topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
-| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation (traefik, contour, istio). |
 | gatewayApi.httpToHttpsRedirect | bool | `true` | To enable/disable the redirect httproute. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
 | gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
@@ -437,7 +437,7 @@ helm install rustfs rustfs/rustfs -n rustfs --set tls.enabled=true,--set-file tl
 
 # Gateway API support (alpha)
 
-Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS only supports traefik as gateway class, more and more gateway class support will be added in the future after those classes are tested. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
+Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS supports traefik, contour, and istio as gateway classes. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
 
 ```
 $ kubectl -n rustfs get gateway

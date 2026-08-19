@@ -18,7 +18,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-    use serial_test::serial;
 
     async fn create_versioned_bucket(client: &Client, bucket: &str) {
         client
@@ -72,7 +71,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_versioning_only_delete_marker_has_minio_compatible_visibility_for_migration_proof() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
@@ -113,7 +111,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_versioning_delete_marker_plus_history_remains_visible_for_migration_proof() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("create test environment");

@@ -60,7 +60,6 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use s3s::header::X_AMZ_REPLICATION_STATUS;
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -4630,7 +4629,6 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
 /// fails without any PUT reaching the target (capability cache, proven from
 /// the target journal); plaintext objects still replicate COMPLETED.
 #[tokio::test]
-#[serial]
 async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_headers() -> TestResult {
     init_logging();
 
@@ -4740,7 +4738,6 @@ async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_header
 /// a capability limit, and a plaintext-only deployment against a MinIO-like
 /// target must not turn red.
 #[tokio::test]
-#[serial]
 async fn test_replication_check_flags_ssec_passthrough_dropping_target() -> TestResult {
     init_logging();
 
@@ -4831,7 +4828,6 @@ async fn test_replication_check_flags_ssec_passthrough_dropping_target() -> Test
 /// HEAD-back audit against the recovered RustFS target — and the replica must
 /// be readable with the customer key.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult {
     init_logging();
 
@@ -4924,7 +4920,6 @@ async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult
 /// the existing-object resync (`replicate_all` transport, N2-audited), land as
 /// a REPLICA, and read back with the customer key.
 #[tokio::test]
-#[serial]
 async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
     init_logging();
 
@@ -8819,7 +8814,6 @@ async fn start_read_proxy_lab(
 /// headers are forwarded verbatim, and an inbound request that was itself
 /// proxied is answered locally (404) without touching the target.
 #[tokio::test]
-#[serial]
 async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> TestResult {
     init_logging();
 
@@ -9002,7 +8996,6 @@ async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> 
 /// proxied to the replication target with the anti-loop marker, mirroring
 /// MinIO `proxyGetTaggingToRepTarget`.
 #[tokio::test]
-#[serial]
 async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_target() -> TestResult {
     init_logging();
 

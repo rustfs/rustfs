@@ -1,6 +1,5 @@
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::primitives::ByteStream;
-use serial_test::serial;
 use tracing::info;
 
 const RANGE_HEAD_BUCKET: &str = "range-head-test-bucket";
@@ -8,7 +7,6 @@ const RANGE_HEAD_KEY: &str = "range-head-object.bin";
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 
 #[tokio::test]
-#[serial]
 async fn head_object_advertises_accept_ranges() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting HeadObject Accept-Ranges regression test");

@@ -71,7 +71,6 @@ const EVENT_SCANNER_METADATA_CORRUPT: &str = "scanner_metadata_corrupt";
 const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
 const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
-const EVENT_SCANNER_COMPAT_STATE: &str = "scanner_compat_state";
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
@@ -92,7 +91,6 @@ const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
 const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
 const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
 const DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS: u64 = 60;
-const METRIC_SCANNER_INLINE_HEAL_TOTAL: &str = "rustfs_scanner_inline_heal_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL: &str = "rustfs_scanner_excess_object_versions_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_excess_object_version_size_total";
 const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders_total";
@@ -196,8 +194,6 @@ fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: 
 }
 const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 
-static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
-static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
 
 #[cfg(test)]
@@ -249,27 +245,6 @@ fn effective_object_heal_scan_mode(heal_bitrot: bool, mod_time: Option<OffsetDat
     } else {
         HealScanMode::Deep
     }
-}
-
-fn scanner_inline_heal_enabled() -> bool {
-    scanner_inline_heal_enabled_from_value(std::env::var(rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE).ok().as_deref())
-}
-
-fn scanner_inline_heal_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
-        None => rustfs_config::DEFAULT_SCANNER_INLINE_HEAL_ENABLE,
-    }
-}
-
-fn ensure_scanner_inline_heal_metric_registered() {
-    SCANNER_INLINE_HEAL_METRICS_ONCE.call_once(|| {
-        describe_counter!(
-            METRIC_SCANNER_INLINE_HEAL_TOTAL,
-            "Total number of inline heal operations executed directly by scanner."
-        );
-        counter!(METRIC_SCANNER_INLINE_HEAL_TOTAL).increment(0);
-    });
 }
 
 fn ensure_scanner_alert_metrics_registered() {
@@ -503,24 +478,6 @@ fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i
     let too_many_versions = remaining_versions as u64 >= scanner_excess_versions_threshold();
     let too_large_versions = cumulative_size > 0 && cumulative_size as u64 >= scanner_excess_version_size_threshold();
     (too_many_versions, too_large_versions)
-}
-
-fn warn_inline_heal_compat_requested() {
-    if !scanner_inline_heal_enabled() {
-        return;
-    }
-
-    SCANNER_INLINE_HEAL_WARN_ONCE.call_once(|| {
-        warn!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_COMPAT_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_HEAL,
-            env = rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE,
-            state = "inline_heal_rollback_unsupported",
-            "Scanner inline-heal rollback is unsupported; using async heal admission"
-        );
-    });
 }
 
 fn non_negative_i64_to_u64(value: i64) -> u64 {
@@ -1282,7 +1239,6 @@ impl ScannerItem {
 
     async fn heal_actions(&mut self, oi: &ObjectInfo, actual_size: i64, size_summary: &mut SizeSummary) -> i64 {
         if self.heal_enabled {
-            warn_inline_heal_compat_requested();
             self.enqueue_heal(oi).await;
         }
 
@@ -3231,8 +3187,6 @@ pub async fn scan_data_folder(
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
-    ensure_scanner_inline_heal_metric_registered();
-
     // Check that we're not trying to scan the root
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
         return Err(ScannerError::Other("internal error: root scan attempted".to_string()));
@@ -4323,19 +4277,6 @@ mod tests {
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh1"));
         assert!(scanner.new_cache.info.failed_objects.contains_key("fresh2"));
         assert!(!scanner.new_cache.info.failed_objects.contains_key("expired"));
-    }
-
-    #[test]
-    fn test_scanner_inline_heal_enabled_defaults_to_false() {
-        assert!(!scanner_inline_heal_enabled_from_value(None));
-    }
-
-    #[test]
-    fn test_scanner_inline_heal_enabled_reads_env_override() {
-        assert!(scanner_inline_heal_enabled_from_value(Some("true")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("YES")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("1")));
-        assert!(!scanner_inline_heal_enabled_from_value(Some("false")));
     }
 
     #[test]

@@ -14,10 +14,9 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{app_context_from_req, object_store_from_extensions};
+use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
-use crate::admin::storage_api::contract::heal::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
@@ -1219,41 +1218,6 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     Ok(())
 }
 
-fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
-    false
-}
-
-fn map_root_heal_status(heal_err: Option<crate::admin::storage_api::error::Error>) -> S3Result<()> {
-    match heal_err {
-        None => Ok(()),
-        Some(crate::admin::storage_api::error::StorageError::NoHealRequired) => {
-            info!(
-                event = EVENT_ADMIN_RESPONSE_EMITTED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "success",
-                state = "no_heal_required",
-                "admin response emitted"
-            );
-            Ok(())
-        }
-        Some(err) => {
-            warn!(
-                event = EVENT_ADMIN_REQUEST_FAILED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "failed",
-                reason = "root_heal_failed",
-                error = %err,
-                "admin request failed"
-            );
-            Err(s3_error!(InternalError, "root heal failed: {err}"))
-        }
-    }
-}
-
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1358,50 +1322,6 @@ impl Operation for HealHandler {
             }
         };
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
-        // The heal channel currently models bucket/object work. Root heal reuses the
-        // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
-        if should_handle_root_heal_directly(&hip) {
-            let Some(store) = object_store_from_extensions(&req.extensions) else {
-                warn!(
-                    event = EVENT_ADMIN_REQUEST_FAILED,
-                    component = LOG_COMPONENT_ADMIN_API,
-                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                    operation = "root_heal",
-                    result = "failed",
-                    reason = "server_not_initialized",
-                    "admin request failed"
-                );
-                return Err(s3_error!(InternalError, "server not initialized"));
-            };
-
-            let (_, heal_err) = store.heal_format(hip.hs.dry_run).await.map_err(|e| {
-                warn!(
-                    event = EVENT_ADMIN_REQUEST_FAILED,
-                    component = LOG_COMPONENT_ADMIN_API,
-                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                    operation = "root_heal",
-                    result = "failed",
-                    reason = "heal_format_failed",
-                    error = %e,
-                    "admin request failed"
-                );
-                s3_error!(InternalError, "root heal failed: {e}")
-            })?;
-
-            map_root_heal_status(heal_err)?;
-            let body = encode_heal_start_success("root-heal".to_string(), client_address)?;
-            info!(
-                event = EVENT_ADMIN_RESPONSE_EMITTED,
-                component = LOG_COMPONENT_ADMIN_API,
-                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-                operation = "root_heal",
-                result = "success",
-                state = "started",
-                "admin response emitted"
-            );
-
-            return Ok(json_response(StatusCode::OK, body));
-        }
         validate_heal_request_mode(&hip)?;
         let response_operation = if hip.force_stop {
             "cancel_heal"
@@ -1614,11 +1534,9 @@ mod tests {
         build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
         encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
         heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
-        map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
-        query_peer_replacement_recovery_status, reject_heal_admission, should_handle_root_heal_directly,
-        validate_heal_request_mode, validate_heal_target,
+        map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        query_peer_replacement_recovery_status, reject_heal_admission, validate_heal_request_mode, validate_heal_target,
     };
-    use crate::admin::storage_api::error::StorageError;
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
     };
@@ -2086,48 +2004,63 @@ mod tests {
     }
 
     #[test]
-    fn test_should_handle_root_heal_directly_is_disabled_for_root_start_modes() {
-        assert!(!should_handle_root_heal_directly(&HealInitParams::default()));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            force_start: true,
-            ..Default::default()
-        }));
-    }
-
-    #[test]
-    fn test_should_handle_root_heal_directly_skips_query_cancel_and_bucket_targets() {
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            client_token: "heal-token".to_string(),
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            force_stop: true,
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            bucket: "bucket".to_string(),
-            ..Default::default()
-        }));
-        assert!(!should_handle_root_heal_directly(&HealInitParams {
-            hs: HealOpts {
-                pool: Some(1),
-                set: Some(2),
+    fn test_root_heal_shapes_route_through_cluster_coordination() {
+        // Root heal has no direct local store path: every start shape is either
+        // rejected by validate_heal_request_mode or submitted to the cluster
+        // heal channel as an Admin-sourced request (see HealHandler::call).
+        let accepted_root_starts = [
+            HealInitParams {
+                hs: HealOpts {
+                    recursive: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        }));
-    }
+            HealInitParams {
+                force_start: true,
+                hs: HealOpts {
+                    recursive: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            HealInitParams {
+                hs: HealOpts {
+                    pool: Some(1),
+                    set: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+        for hip in accepted_root_starts {
+            validate_heal_request_mode(&hip).expect("accepted root heal start must reach cluster coordination");
+            let request = build_heal_channel_request(&hip);
+            assert_eq!(request.bucket, "", "root heal must stay cluster-scoped");
+            assert_eq!(request.source, HealRequestSource::Admin);
+            assert!(!request.id.is_empty(), "cluster heal requests carry a dedup id");
+        }
 
-    #[test]
-    fn test_map_root_heal_status_allows_no_heal_required() {
-        map_root_heal_status(Some(StorageError::NoHealRequired)).expect("NoHealRequired should stay non-fatal");
-    }
-
-    #[test]
-    fn test_map_root_heal_status_rejects_fatal_errors() {
-        let err = map_root_heal_status(Some(StorageError::Unexpected)).expect_err("fatal status must fail");
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.to_string().contains("root heal failed: Unexpected error"));
+        // Shapes that cannot start a tracked heal (plain start, bare force_start
+        // without recursive, bare pool) are rejected instead of falling back to
+        // a direct local path.
+        for hip in [
+            HealInitParams::default(),
+            HealInitParams {
+                force_start: true,
+                ..Default::default()
+            },
+            HealInitParams {
+                hs: HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ] {
+            let err = validate_heal_request_mode(&hip).expect_err("unscoped root heal start must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]

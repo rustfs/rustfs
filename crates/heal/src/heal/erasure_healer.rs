@@ -1267,7 +1267,7 @@ mod resume_loop_tests {
         CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
         compose_key,
     };
-    use crate::heal::storage::{DiskStatus, HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
+    use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
         BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, RUSTFS_META_BUCKET, new_disk,
@@ -1448,26 +1448,8 @@ mod resume_loop_tests {
         async fn get_object_meta(&self, _b: &str, _o: &str) -> Result<Option<HealObjectInfo>> {
             Ok(None)
         }
-        async fn get_object_data(&self, _b: &str, _o: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn put_object_data(&self, _b: &str, _o: &str, _d: &[u8]) -> Result<()> {
-            Ok(())
-        }
-        async fn delete_object(&self, _b: &str, _o: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn verify_object_integrity(&self, _b: &str, _o: &str) -> Result<bool> {
-            Ok(true)
-        }
         async fn ec_decode_rebuild(&self, _b: &str, _o: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
-        }
-        async fn get_disk_status(&self, _e: &Endpoint) -> Result<DiskStatus> {
-            Ok(DiskStatus::Ok)
-        }
-        async fn format_disk(&self, _e: &Endpoint) -> Result<()> {
-            Ok(())
         }
         async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {
             Ok(Some(BucketInfo {
@@ -1475,21 +1457,12 @@ mod resume_loop_tests {
                 ..Default::default()
             }))
         }
-        async fn heal_bucket_metadata(&self, _b: &str) -> Result<()> {
-            Ok(())
-        }
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
             Ok(Vec::new())
         }
         async fn object_exists(&self, _b: &str, _o: &str) -> Result<bool> {
             // Must never be consulted: the resume loop always goes through heal_object.
             panic!("object_exists must not be called by the resume heal loop");
-        }
-        async fn get_object_size(&self, _b: &str, _o: &str) -> Result<Option<u64>> {
-            Ok(None)
-        }
-        async fn get_object_checksum(&self, _b: &str, _o: &str) -> Result<Option<String>> {
-            Ok(None)
         }
         async fn load_heal_lifecycle_expiry_context(&self, _bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
             Ok((!self.lifecycle_expired.lock().unwrap().is_empty()).then(HealLifecycleExpiryContext::test))
@@ -1555,9 +1528,6 @@ mod resume_loop_tests {
                 ReplacementCommitEvidence::Confirmed(committed) => Ok(committed),
                 ReplacementCommitEvidence::Error(message) => Err(Error::other(message)),
             }
-        }
-        async fn list_objects_for_heal(&self, _b: &str, _p: &str) -> Result<Vec<HealListItem>> {
-            Ok(Vec::new())
         }
         async fn list_objects_for_heal_page(
             &self,

@@ -873,9 +873,16 @@ mod tests {
     /// now return a finite, non-panicking mask.
     #[test]
     fn test_mask_never_recurses_for_any_variant() {
-        for ev in ALL_EVENT_NAMES {
-            // Must terminate (no infinite recursion / stack overflow).
-            let _ = ev.mask();
+        // Terminating is the point — a regression here overflows the stack rather
+        // than failing an assertion — but the masks are collected and checked so
+        // the loop cannot be optimised into nothing and so a variant that starts
+        // returning an empty mask is caught too (rustfs/backlog#1836).
+        let masks: Vec<u64> = ALL_EVENT_NAMES.iter().map(|ev| ev.mask()).collect();
+
+        assert_eq!(masks.len(), ALL_EVENT_NAMES.len());
+        for (ev, mask) in ALL_EVENT_NAMES.iter().zip(&masks) {
+            assert_ne!(*mask, 0, "{ev:?} must carry at least one bit");
+            assert_eq!(ev.mask(), *mask, "{ev:?} must return the same mask every call");
         }
     }
 

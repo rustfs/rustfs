@@ -1098,6 +1098,10 @@ pub(crate) async fn sync_dir_files_with_limiter(dir: impl AsRef<Path>, disk_perm
     let files = run_file_sync_blocking(disk_permits.clone(), move || {
         let files = regular_files(&scan_dir)?;
         if files.len() < PARALLEL_FILE_SYNC_THRESHOLD {
+            rustfs_io_metrics::record_put_rename_fdatasync_batch(
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL,
+                files.len(),
+            );
             sync_files(&files)?;
             let fsync_started = rustfs_io_metrics::put_stage_timer();
             let result = fsync_dir_std(scan_dir);
@@ -1115,6 +1119,10 @@ pub(crate) async fn sync_dir_files_with_limiter(dir: impl AsRef<Path>, disk_perm
     let Some(files) = files else {
         return Ok(());
     };
+    rustfs_io_metrics::record_put_rename_fdatasync_batch(
+        rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL,
+        files.len(),
+    );
     futures::stream::iter(files.into_iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(MAX_PARALLEL_FILE_SYNCS, |path| {
             let disk_permits = disk_permits.clone();

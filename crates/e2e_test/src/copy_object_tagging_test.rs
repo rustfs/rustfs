@@ -21,7 +21,6 @@ mod tests {
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, MetadataDirective, TaggingDirective, VersioningConfiguration};
-    use serial_test::serial;
     use std::collections::BTreeMap;
 
     async fn object_tags(client: &Client, bucket: &str, key: &str) -> BTreeMap<String, String> {
@@ -39,7 +38,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn copy_object_applies_copy_replace_and_empty_tagging_directives() {
         init_logging();
         let mut env = RustFSTestEnvironment::new()
@@ -305,7 +303,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn copy_object_tag_replacement_honors_request_tag_policy_denial() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     {
         init_logging();

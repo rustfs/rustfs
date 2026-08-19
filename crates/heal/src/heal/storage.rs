@@ -27,7 +27,7 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
+use super::{DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,7 +65,6 @@ const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_STORAGE: &str = "storage";
 const EVENT_HEAL_STORAGE_OBJECT_IO: &str = "heal_storage_object_io";
 const EVENT_HEAL_STORAGE_OBJECT_READ_LIMIT: &str = "heal_storage_object_read_limit";
-const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
 
@@ -312,55 +311,22 @@ pub struct HealListItem {
     pub is_delete_marker: bool,
 }
 
-/// Disk status for heal operations
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiskStatus {
-    /// Ok
-    Ok,
-    /// Offline
-    Offline,
-    /// Corrupt
-    Corrupt,
-    /// Missing
-    Missing,
-    /// Permission denied
-    PermissionDenied,
-    /// Faulty
-    Faulty,
-    /// Root mount
-    RootMount,
-    /// Unknown
-    Unknown,
-    /// Unformatted
-    Unformatted,
-}
-
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
     /// Get object meta
+    ///
+    /// Reserved for HS-01 MRF wiring (rustfs/backlog#1865): MRF intents
+    /// currently execute through `heal_object`; keep this entry point for the
+    /// metadata-corruption variant that must inspect metadata first.
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>>;
 
-    /// Get object data
-    async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>>;
-
-    /// Put object data
-    async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()>;
-
-    /// Delete object
-    async fn delete_object(&self, bucket: &str, object: &str) -> Result<()>;
-
-    /// Check object integrity
-    async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<bool>;
-
     /// EC decode rebuild
+    ///
+    /// Reserved for HS-01 MRF wiring (rustfs/backlog#1865): urgent ECDecode
+    /// requests currently execute through `heal_object`; keep the explicit
+    /// rebuild-and-read path for the decode-failure fast variant.
     async fn ec_decode_rebuild(&self, bucket: &str, object: &str) -> Result<Vec<u8>>;
-
-    /// Get disk status
-    async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus>;
-
-    /// Format disk
-    async fn format_disk(&self, endpoint: &Endpoint) -> Result<()>;
 
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
@@ -387,20 +353,11 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(false)
     }
 
-    /// Fix bucket metadata
-    async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()>;
-
     /// Get all buckets
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>>;
 
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
-
-    /// Get object size
-    async fn get_object_size(&self, bucket: &str, object: &str) -> Result<Option<u64>>;
-
-    /// Get object checksum
-    async fn get_object_checksum(&self, bucket: &str, object: &str) -> Result<Option<String>>;
 
     /// Heal object using ecstore
     async fn heal_object(
@@ -452,12 +409,6 @@ pub trait HealStorageAPI: Send + Sync {
     ) -> Result<bool> {
         Ok(false)
     }
-
-    /// List object versions for healing (returns all versions, may use significant memory for large buckets)
-    ///
-    /// WARNING: This method loads all object versions into memory at once. For buckets with many
-    /// objects/versions, consider using `list_objects_for_heal_page` instead to process versions in pages.
-    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>>;
 
     /// List object versions for healing with pagination (returns one page and continuation token)
     /// Returns (versions, next_continuation_token, is_truncated). The continuation token is an
@@ -527,89 +478,11 @@ impl ECStoreHealStorage {
     pub fn new(ecstore: Arc<ECStore>) -> Self {
         Self { ecstore }
     }
-}
 
-fn is_transient_object_exists_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-
-    [
-        "failed to acquire read lock",
-        "lock acquisition failed",
-        "lock acquisition timeout",
-        "quorum not reached",
-        "deadline has elapsed",
-        "timed out",
-        "network error",
-        "transport error",
-        "connection refused",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
-}
-
-fn is_transient_object_exists_error(err: &StorageError) -> bool {
-    if err.is_quorum_error() {
-        return true;
-    }
-
-    match err {
-        StorageError::Lock(lock_err) => lock_err.is_retryable() || is_transient_object_exists_message(&lock_err.to_string()),
-        StorageError::Io(io_err) => is_transient_object_exists_message(&io_err.to_string()),
-        StorageError::SlowDown | StorageError::OperationCanceled => true,
-        _ => false,
-    }
-}
-
-#[async_trait]
-impl HealStorageAPI for ECStoreHealStorage {
-    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_OBJECT_IO,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_object_meta",
-            bucket,
-            object,
-            "Heal storage request started"
-        );
-
-        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
-            Ok(info) => Ok(Some(info)),
-            Err(e) => {
-                // Map ObjectNotFound to None to align with Option return type
-                if matches!(e, StorageError::ObjectNotFound(_, _)) {
-                    debug!(
-                        target: "rustfs::heal::storage",
-                        event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_STORAGE,
-                        operation = "get_object_meta",
-                        bucket,
-                        object,
-                        result = "not_found",
-                        "Heal storage object metadata missing"
-                    );
-                    Ok(None)
-                } else {
-                    error!(
-                        target: "rustfs::heal::storage",
-                        event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_STORAGE,
-                        operation = "get_object_meta",
-                        bucket,
-                        object,
-                        result = "failed",
-                        error = %e,
-                        "Heal storage request failed"
-                    );
-                    Err(Error::other(e))
-                }
-            }
-        }
-    }
-
+    /// Read back an object's bytes, capped to bound memory.
+    ///
+    /// Private support for the reserved `ec_decode_rebuild` (HS-01); not part
+    /// of the storage trait surface.
     async fn get_object_data(&self, bucket: &str, object: &str) -> Result<Option<Vec<u8>>> {
         debug!(
             target: "rustfs::heal::storage",
@@ -695,196 +568,85 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
         Ok(Some(buf))
     }
+}
 
-    async fn put_object_data(&self, bucket: &str, object: &str, data: &[u8]) -> Result<()> {
+fn is_transient_object_exists_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "failed to acquire read lock",
+        "lock acquisition failed",
+        "lock acquisition timeout",
+        "quorum not reached",
+        "deadline has elapsed",
+        "timed out",
+        "network error",
+        "transport error",
+        "connection refused",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+fn is_transient_object_exists_error(err: &StorageError) -> bool {
+    if err.is_quorum_error() {
+        return true;
+    }
+
+    match err {
+        StorageError::Lock(lock_err) => lock_err.is_retryable() || is_transient_object_exists_message(&lock_err.to_string()),
+        StorageError::Io(io_err) => is_transient_object_exists_message(&io_err.to_string()),
+        StorageError::SlowDown | StorageError::OperationCanceled => true,
+        _ => false,
+    }
+}
+
+#[async_trait]
+impl HealStorageAPI for ECStoreHealStorage {
+    async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_OBJECT_IO,
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "put_object_data",
-            bucket,
-            object,
-            bytes = data.len(),
-            "Heal storage request started"
-        );
-
-        let mut reader = HealPutObjReader::from_vec(data.to_vec());
-        match (*self.ecstore)
-            .put_object(bucket, object, &mut reader, &Default::default())
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "put_object_data",
-                    bucket,
-                    object,
-                    result = "ok",
-                    "Heal storage object write completed"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "put_object_data",
-                    bucket,
-                    object,
-                    result = "failed",
-                    error = %e,
-                    "Heal storage request failed"
-                );
-                Err(Error::other(e))
-            }
-        }
-    }
-
-    async fn delete_object(&self, bucket: &str, object: &str) -> Result<()> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_OBJECT_IO,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "delete_object",
+            operation = "get_object_meta",
             bucket,
             object,
             "Heal storage request started"
         );
 
-        match self.ecstore.delete_object(bucket, object, Default::default()).await {
-            Ok(_) => {
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "delete_object",
-                    bucket,
-                    object,
-                    result = "ok",
-                    "Heal storage object delete completed"
-                );
-                Ok(())
-            }
+        match self.ecstore.get_object_info(bucket, object, &Default::default()).await {
+            Ok(info) => Ok(Some(info)),
             Err(e) => {
-                error!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_OBJECT_IO,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "delete_object",
-                    bucket,
-                    object,
-                    result = "failed",
-                    error = %e,
-                    "Heal storage request failed"
-                );
-                Err(Error::other(e))
-            }
-        }
-    }
-
-    async fn verify_object_integrity(&self, bucket: &str, object: &str) -> Result<bool> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            bucket,
-            object,
-            state = "started",
-            "Heal storage object verification started"
-        );
-
-        // Check object metadata first
-        match self.get_object_meta(bucket, object).await? {
-            Some(obj_info) => {
-                if obj_info.size < 0 {
-                    warn!(
+                // Map ObjectNotFound to None to align with Option return type
+                if matches!(e, StorageError::ObjectNotFound(_, _)) {
+                    debug!(
                         target: "rustfs::heal::storage",
-                        event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
+                        event = EVENT_HEAL_STORAGE_OBJECT_IO,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_STORAGE,
+                        operation = "get_object_meta",
                         bucket,
                         object,
-                        state = "invalid_size",
-                        "Heal storage object verification failed"
+                        result = "not_found",
+                        "Heal storage object metadata missing"
                     );
-                    return Ok(false);
+                    Ok(None)
+                } else {
+                    error!(
+                        target: "rustfs::heal::storage",
+                        event = EVENT_HEAL_STORAGE_OBJECT_IO,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_STORAGE,
+                        operation = "get_object_meta",
+                        bucket,
+                        object,
+                        result = "failed",
+                        error = %e,
+                        "Heal storage request failed"
+                    );
+                    Err(Error::other(e))
                 }
-
-                // Stream-read the object to a sink to avoid loading into memory
-                match (*self.ecstore)
-                    .get_object_reader(bucket, object, None, Default::default(), &Default::default())
-                    .await
-                {
-                    Ok(reader) => {
-                        let mut stream = reader.stream;
-                        match tokio::io::copy(&mut stream, &mut tokio::io::sink()).await {
-                            Ok(_) => {
-                                debug!(
-                                    target: "rustfs::heal::storage",
-                                    event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                                    bucket,
-                                    object,
-                                    state = "ok",
-                                    "Heal storage object verified"
-                                );
-                                Ok(true)
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "rustfs::heal::storage",
-                                    event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                                    bucket,
-                                    object,
-                                    state = "stream_read_failed",
-                                    error = %e,
-                                    "Heal storage object verification failed"
-                                );
-                                Ok(false)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "rustfs::heal::storage",
-                            event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_STORAGE,
-                            bucket,
-                            object,
-                            state = "reader_open_failed",
-                            error = %e,
-                            "Heal storage object verification failed"
-                        );
-                        Ok(false)
-                    }
-                }
-            }
-            None => {
-                warn!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_OBJECT_VERIFY,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    bucket,
-                    object,
-                    state = "metadata_missing",
-                    "Heal storage object verification failed"
-                );
-                Ok(false)
             }
         }
     }
@@ -970,81 +732,6 @@ impl HealStorageAPI for ECStoreHealStorage {
                     state = "failed",
                     error = %e,
                     "Heal storage repair failed"
-                );
-                Err(e)
-            }
-        }
-    }
-
-    async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_disk_status",
-            endpoint = ?endpoint,
-            state = "started",
-            "Heal storage admin operation started"
-        );
-
-        // TODO: implement disk status check using ecstore
-        // For now, return Ok status
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_disk_status",
-            endpoint = ?endpoint,
-            result = "ok",
-            disk_status = "ok",
-            "Heal storage disk status resolved"
-        );
-        Ok(DiskStatus::Ok)
-    }
-
-    async fn format_disk(&self, endpoint: &Endpoint) -> Result<()> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "format_disk",
-            endpoint = ?endpoint,
-            state = "started",
-            "Heal storage admin operation started"
-        );
-
-        // Use ecstore's heal_format
-        match self.heal_format(false).await {
-            Ok((_, error)) => {
-                if error.is_some() {
-                    return Err(Error::other(format!("Format failed: {error:?}")));
-                }
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "format_disk",
-                    endpoint = ?endpoint,
-                    result = "ok",
-                    "Heal storage disk format completed"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "format_disk",
-                    endpoint = ?endpoint,
-                    result = "failed",
-                    error = %e,
-                    "Heal storage admin operation failed"
                 );
                 Err(e)
             }
@@ -1161,61 +848,6 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
-    async fn heal_bucket_metadata(&self, bucket: &str) -> Result<()> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_REPAIR_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "heal_bucket_metadata",
-            bucket,
-            state = "started",
-            "Heal storage repair started"
-        );
-
-        let heal_opts = HealOpts {
-            recursive: true,
-            dry_run: false,
-            remove: false,
-            recreate: false,
-            scan_mode: HealScanMode::Normal,
-            update_parity: false,
-            no_lock: false,
-            pool: None,
-            set: None,
-        };
-
-        match self.heal_bucket(bucket, &heal_opts).await {
-            Ok(_) => {
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "heal_bucket_metadata",
-                    bucket,
-                    result = "ok",
-                    "Heal storage bucket metadata repaired"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "heal_bucket_metadata",
-                    bucket,
-                    result = "failed",
-                    error = %e,
-                    "Heal storage repair failed"
-                );
-                Err(e)
-            }
-        }
-    }
-
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1312,48 +944,6 @@ impl HealStorageAPI for ECStoreHealStorage {
                     Err(Error::other(e))
                 }
             }
-        }
-    }
-
-    async fn get_object_size(&self, bucket: &str, object: &str) -> Result<Option<u64>> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_OBJECT_IO,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_object_size",
-            bucket,
-            object,
-            "Heal storage request started"
-        );
-
-        match self.get_object_meta(bucket, object).await {
-            Ok(Some(obj_info)) => Ok(Some(obj_info.size as u64)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn get_object_checksum(&self, bucket: &str, object: &str) -> Result<Option<String>> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_OBJECT_IO,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_object_checksum",
-            bucket,
-            object,
-            "Heal storage request started"
-        );
-
-        match self.get_object_meta(bucket, object).await {
-            Ok(Some(obj_info)) => {
-                // Convert checksum bytes to hex string
-                let checksum = obj_info.checksum.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                Ok(Some(checksum))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
         }
     }
 
@@ -1545,65 +1135,6 @@ impl HealStorageAPI for ECStoreHealStorage {
             .replacement_targets_have_version(bucket, object, version_id.unwrap_or(""), pool_index, set_index, targets)
             .await
             .map_err(Error::Storage)
-    }
-
-    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "list_objects_for_heal",
-            bucket,
-            prefix,
-            state = "started",
-            "Heal storage admin operation started"
-        );
-        warn!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "list_objects_for_heal",
-            bucket,
-            prefix,
-            state = "memory_heavy",
-            "Heal storage version listing loads all versions into memory (footprint is per-version, not per-object)"
-        );
-
-        let mut all_objects: Vec<HealListItem> = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let (page_objects, next_token, is_truncated) = self
-                .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false)
-                .await?;
-
-            all_objects.extend(page_objects);
-
-            if !is_truncated {
-                break;
-            }
-
-            continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "list_objects_for_heal",
-            bucket,
-            prefix,
-            object_count = all_objects.len(),
-            result = "ok",
-            "Heal storage object listing completed"
-        );
-        Ok(all_objects)
     }
 
     async fn list_objects_for_heal_page(

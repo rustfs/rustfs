@@ -22,11 +22,9 @@ mod tests {
     use aws_sdk_s3::types::{
         BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective, StorageClass, VersioningConfiguration,
     };
-    use serial_test::serial;
     use tracing::info;
 
     #[tokio::test]
-    #[serial]
     async fn copy_object_standard_metadata_copy_replace_and_clear() {
         init_logging();
         info!("Issue #2789: self-copy metadata replacement must preserve object data");
@@ -300,7 +298,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn copy_object_replace_accepts_each_standard_field_independently() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
@@ -416,7 +413,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn copy_object_replace_handles_versioned_multipart_source() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
@@ -530,7 +526,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn invalid_replacement_metadata_does_not_mutate_destination() {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");

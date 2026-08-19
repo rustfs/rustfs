@@ -21,7 +21,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-    use serial_test::serial;
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -29,7 +28,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_list_object_versions_immediately_returns_latest_put_after_delete_marker() {
         init_logging();
         info!("🧪 TEST: ListObjectVersions returns the newest version immediately after put -> delete -> put");
@@ -182,7 +180,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_list_object_versions_prefix_with_marker_object_returns_children() {
         init_logging();
         info!("🧪 TEST: ListObjectVersions returns prefix children when a marker object also exists");

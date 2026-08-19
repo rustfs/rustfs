@@ -34,6 +34,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
+	./scripts/check_embedded_secrets.sh --self-test
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
 	./scripts/validate_object_data_cache_cold_stampede.sh --self-test

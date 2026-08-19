@@ -83,6 +83,16 @@ pub struct SiteReplicationInfo {
     pub service_account_access_key: String,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Outstanding peer deliveries. Absent when the retry queue is empty, so a
+    /// healthy site serializes exactly as it did before this field existed.
+    /// Present means peer operations are failing even if `enabled` is true.
+    #[serde(rename = "retryStats", default, skip_serializing_if = "Option::is_none")]
+    pub retry_stats: Option<SRRetryStats>,
+    /// A multi-step lifecycle operation this site has not finished — most
+    /// importantly a removal that could not reach its peers, which makes the
+    /// site reject peer operations while `enabled` may still read true.
+    #[serde(rename = "pendingOperation", default, skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<SRPendingOperation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

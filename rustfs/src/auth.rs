@@ -812,12 +812,10 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
 /// # Returns
 /// * `AuthType` - The determined authentication type
 ///
-#[allow(dead_code)]
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     get_request_auth_type_with_query(header, None)
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
@@ -846,20 +844,6 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
     }
 }
 
-/// Helper function to determine auth type and signature version
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `(String, String)` - Tuple of auth type and signature version
-///
-#[allow(dead_code)]
-fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
-    determine_auth_type_and_version_with_query(header, None)
-}
-
-#[allow(dead_code)]
 fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
     match get_request_auth_type_with_query(header, query) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
@@ -923,18 +907,6 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
         return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
     }
     false
-}
-
-/// Verify if request has AWS PreSign Version '4'
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `bool` - True if request has AWS PreSign Version '4', false otherwise
-#[allow(dead_code)]
-pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
-    is_request_presigned_signature_v4_with_query(header, None)
 }
 
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {

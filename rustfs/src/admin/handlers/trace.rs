@@ -21,7 +21,6 @@ use matchit::Params;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 
-#[allow(dead_code)]
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     let mut st_opts = ServiceTraceOpts::default();
     st_opts
@@ -31,7 +30,6 @@ fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     Ok(st_opts)
 }
 
-#[allow(dead_code)]
 pub struct Trace {}
 
 #[async_trait::async_trait]

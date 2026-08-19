@@ -24,11 +24,9 @@ mod tests {
     };
     use http::Method;
     use http::header::CONTENT_TYPE;
-    use serial_test::serial;
     use tracing::info;
 
     #[tokio::test]
-    #[serial]
     async fn test_dummy_bucket_compatibility_endpoints() {
         init_logging();
         info!("Starting test: dummy-compat bucket APIs should match S3-compatible behavior");
@@ -236,7 +234,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_dummy_bucket_compatibility_endpoints_no_such_bucket() {
         init_logging();
         info!("Starting test: dummy-compat bucket APIs should return NoSuchBucket for missing bucket");
@@ -392,7 +389,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_dummy_bucket_endpoints_http_contracts() {
         init_logging();
         info!("Starting test: dummy-compat bucket API HTTP contracts");

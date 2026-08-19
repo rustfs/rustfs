@@ -1598,6 +1598,10 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     ),
 ];
 
+#[allow(
+    dead_code,
+    reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub fn validate_admin_route_policy_specs() -> Result<(), AdminRouteMatrixError> {
     validate_admin_route_specs(ADMIN_ROUTE_POLICY_SPECS)
 }

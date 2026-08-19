@@ -47,7 +47,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
 
     /// Signed raw `PUT` copy request with an explicit copy-source conditional
@@ -84,7 +83,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_copy_source_if_unmodified_since_valid_and_invalid() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
