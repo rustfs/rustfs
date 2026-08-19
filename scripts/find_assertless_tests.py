@@ -81,6 +81,78 @@ FN_LINE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)")
 
 
 
+# A char literal is 'x' or '\n'; a lone `'` is a lifetime (`&'a str`), and
+# consuming to the next quote on one would swallow the rest of the line.
+CHAR_LITERAL = re.compile(r"'(?:[^'\\]|\\.)'")
+RAW_STRING_OPEN = re.compile(r'r(#*)"')
+
+
+class LiteralStripper:
+    """Blanks out literals and comments so brace matching sees only code.
+
+    Carries state across lines: Rust string literals — the JSON and `r#"..."#`
+    fixtures these tests are full of — routinely span lines, and a per-line
+    scanner falls out of phase on the first one. A `{` inside a string would
+    otherwise unbalance the count and truncate a test body before its
+    assertions.
+    """
+
+    def __init__(self) -> None:
+        self.in_string = False
+        self.raw_hashes = None  # None when the open string is not raw
+
+    def feed(self, line: str) -> str:
+        out = []
+        i = 0
+        n = len(line)
+        while i < n:
+            if self.in_string:
+                if self.raw_hashes is not None:
+                    close = '"' + "#" * self.raw_hashes
+                    idx = line.find(close, i)
+                    if idx == -1:
+                        return "".join(out)
+                    i = idx + len(close)
+                    self.in_string = False
+                    self.raw_hashes = None
+                    continue
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    self.in_string = False
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            ch = line[i]
+            if ch == "/" and i + 1 < n and line[i + 1] == "/":
+                break
+            m = RAW_STRING_OPEN.match(line, i)
+            if m:
+                self.in_string = True
+                self.raw_hashes = len(m.group(1))
+                i = m.end()
+                continue
+            if ch == '"':
+                self.in_string = True
+                self.raw_hashes = None
+                i += 1
+                continue
+            if ch == "'":
+                cm = CHAR_LITERAL.match(line, i)
+                if cm:
+                    i = cm.end()
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+
 def extract_body(text: str) -> str:
     """Return what is between the outermost braces of a scanned function."""
     start = text.find("{")
@@ -121,8 +193,9 @@ def scan_file(path: Path):
         begun = False
         body = []
         k = j
+        stripper = LiteralStripper()
         while k < len(lines):
-            for ch in lines[k]:
+            for ch in stripper.feed(lines[k]):
                 if ch == "{":
                     depth += 1
                     begun = True
