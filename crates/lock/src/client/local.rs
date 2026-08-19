@@ -47,6 +47,7 @@ pub struct LocalClient {
 #[derive(Debug)]
 struct LocalGuardEntry {
     guard: FastLockGuard,
+    acquired_at: SystemTime,
     expires_at: SystemTime,
     deadline: Instant,
     ttl: Duration,
@@ -54,11 +55,12 @@ struct LocalGuardEntry {
 
 impl LocalGuardEntry {
     fn new(guard: FastLockGuard, ttl: Duration) -> Self {
-        let now = SystemTime::now();
+        let acquired_at = SystemTime::now();
         let monotonic_now = Instant::now();
         Self {
             guard,
-            expires_at: now.checked_add(ttl).unwrap_or(now),
+            acquired_at,
+            expires_at: acquired_at.checked_add(ttl).unwrap_or(acquired_at),
             deadline: monotonic_now.checked_add(ttl).unwrap_or(monotonic_now),
             ttl,
         }
@@ -231,13 +233,14 @@ impl LockClient for LocalClient {
             match lock_manager.acquire_lock(build_lock_request(remaining)).await {
                 Ok(guard) => {
                     let lock_id = request.lock_id.clone();
-                    let acquired_at = SystemTime::now();
-                    let expires_at = acquired_at.checked_add(request.ttl).unwrap_or(acquired_at);
+                    let entry = LocalGuardEntry::new(guard, request.ttl);
+                    let acquired_at = entry.acquired_at;
+                    let expires_at = entry.expires_at;
 
                     {
                         let shard = self.get_shard(&lock_id);
                         let mut guards = shard.write().await;
-                        guards.insert(lock_id.clone(), LocalGuardEntry::new(guard, request.ttl));
+                        guards.insert(lock_id.clone(), entry);
                     }
 
                     let lock_info = LockInfo {
@@ -342,7 +345,7 @@ impl LockClient for LocalClient {
                 lock_type,
                 status,
                 owner: entry.guard.owner().to_string(),
-                acquired_at: SystemTime::now(),
+                acquired_at: entry.acquired_at,
                 expires_at: entry.expires_at,
                 last_refreshed: SystemTime::now(),
                 metadata: LockMetadata::default(),
@@ -352,6 +355,25 @@ impl LockClient for LocalClient {
         } else {
             Ok(None)
         }
+    }
+
+    async fn list_lock_leases(&self) -> Vec<crate::LockLeaseInfo> {
+        let mut leases = Vec::new();
+        for shard in self.guard_storage.iter() {
+            let guards = shard.read().await;
+            leases.reserve(guards.len());
+            leases.extend(guards.iter().map(|(lock_id, entry)| crate::LockLeaseInfo {
+                resource: lock_id.resource.clone(),
+                lock_type: match entry.guard.mode() {
+                    crate::LockMode::Shared => LockType::Shared,
+                    crate::LockMode::Exclusive => LockType::Exclusive,
+                },
+                owner: entry.guard.owner().to_string(),
+                acquired_at: entry.acquired_at,
+                remaining_ttl: entry.deadline.saturating_duration_since(Instant::now()),
+            }));
+        }
+        leases
     }
 
     async fn get_stats(&self) -> Result<LockStats> {
@@ -403,6 +425,10 @@ mod tests {
         assert!(client.check_status(&lock_id).await.unwrap().is_some());
         tokio::time::sleep(Duration::from_millis(15)).await;
         wait_until_reaped(&client, &lock_id).await;
+        assert!(
+            client.list_lock_leases().await.is_empty(),
+            "reaped guards must disappear from lease diagnostics"
+        );
 
         let direct = manager
             .acquire_lock(crate::ObjectLockRequest::new_write(request.resource.clone(), "owner-b"))
@@ -440,6 +466,56 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
         assert!(client.check_status(&lock_id).await.unwrap().is_some());
         wait_until_reaped(&client, &lock_id).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_snapshot_tracks_refresh_without_resetting_acquisition_time() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager_and_reaper_interval(manager, Duration::from_secs(60));
+        client.reaper_started.store(true, Ordering::Release);
+        let lock_request = request(crate::ObjectKey::new("bucket", "lease-snapshot"), "owner-a", Duration::from_secs(30));
+        let lock_id = lock_request.lock_id.clone();
+
+        assert!(
+            client
+                .acquire_lock(&lock_request)
+                .await
+                .expect("lease-backed lock should acquire")
+                .success
+        );
+        let initial = client.list_lock_leases().await.pop().expect("acquired lock should be listed");
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let aging = client
+            .list_lock_leases()
+            .await
+            .pop()
+            .expect("held lock should remain listed before refresh");
+        assert_eq!(aging.remaining_ttl, Duration::from_secs(10));
+        assert!(client.refresh(&lock_id).await.expect("refresh should return a result"));
+
+        let refreshed = client
+            .list_lock_leases()
+            .await
+            .pop()
+            .expect("refreshed lock should be listed");
+        let status = client
+            .check_status(&lock_id)
+            .await
+            .expect("lock status should be readable")
+            .expect("refreshed lock should remain held");
+
+        assert_eq!(refreshed.acquired_at, initial.acquired_at);
+        assert_eq!(status.acquired_at, initial.acquired_at);
+        assert_eq!(refreshed.remaining_ttl, Duration::from_secs(30));
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let expired = client
+            .list_lock_leases()
+            .await
+            .pop()
+            .expect("unreaped lease should remain listed");
+        assert_eq!(expired.remaining_ttl, Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]

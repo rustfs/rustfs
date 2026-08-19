@@ -295,9 +295,17 @@ impl FastObjectLockManager {
     /// Powers the admin "top locks" view. Order is shard-then-insertion and is
     /// not otherwise stable across calls.
     pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        self.list_locks_with_holder_counts()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    /// Enumerate held locks with the number of guards represented by each owner.
+    pub fn list_locks_with_holder_counts(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32)> {
         let mut infos = Vec::new();
         for shard in &self.shards {
-            infos.extend(shard.list_locks());
+            infos.extend(shard.list_locks_with_holder_counts());
         }
         infos
     }
@@ -556,6 +564,10 @@ mod tests {
             .acquire_read_lock(read_key.clone(), "reader")
             .await
             .expect("read lock should acquire");
+        let _second_read_guard = manager
+            .acquire_read_lock(read_key.clone(), "reader")
+            .await
+            .expect("second read lock should acquire");
 
         let mut locks = manager.list_locks();
         locks.sort_by(|a, b| a.key.object.cmp(&b.key.object));
@@ -568,6 +580,18 @@ mod tests {
         let write = locks.iter().find(|l| l.key == write_key).expect("write lock listed");
         assert_eq!(write.mode, LockMode::Exclusive);
         assert_eq!(write.owner.as_ref(), "writer");
+
+        let counts = manager.list_locks_with_holder_counts();
+        let (_, read_holder_count) = counts
+            .iter()
+            .find(|(info, _)| info.key == read_key)
+            .expect("read holder count listed");
+        assert_eq!(*read_holder_count, 2);
+        let (_, write_holder_count) = counts
+            .iter()
+            .find(|(info, _)| info.key == write_key)
+            .expect("write holder count listed");
+        assert_eq!(*write_holder_count, 1);
 
         manager.shutdown().await;
     }
