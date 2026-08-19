@@ -24,7 +24,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -36,7 +35,6 @@ mod tests {
     /// PUT with a leading-slash key must succeed and the object must be
     /// readable under the normalized key (leading slash stripped).
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_leading_slash_key() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("Starting test: PUT object with leading slash in key (Issue #2427)");
@@ -94,7 +92,6 @@ mod tests {
 
     /// Duplicate and repeated slashes after a leading slash collapse MinIO-style.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_duplicate_slashes_normalized() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("Starting test: duplicate slash normalization (Issue #2427)");

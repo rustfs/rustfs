@@ -31,7 +31,6 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::collections::HashSet;
     use std::error::Error;
     use tracing::info;
@@ -49,7 +48,6 @@ mod tests {
     /// 3. Verify all 100 keys are returned exactly once
     /// 4. Verify no duplicates or skipped keys
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_completeness_100_objects() -> TestResult {
         init_logging();
         info!("RT-06: listing completeness with 100 objects");
@@ -133,7 +131,6 @@ mod tests {
     /// Regression pattern: prefix filter returns empty or includes wrong keys
     /// (rustfs#5051: empty results for shallow prefixes).
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_prefix_filter_correctness() -> TestResult {
         init_logging();
         info!("RT-06b: prefix filter correctness");
@@ -233,7 +230,6 @@ mod tests {
     /// Regression pattern: delimiter handling produces incorrect CommonPrefixes
     /// or misses objects at the delimiter boundary.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_delimiter_common_prefixes() -> TestResult {
         init_logging();
         info!("RT-06c: delimiter and CommonPrefixes");
@@ -290,7 +286,6 @@ mod tests {
     /// Regression pattern: IsTruncated=false when there are more objects
     /// (rustfs#4810: walk_dir timeout truncation with false IsTruncated).
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_is_truncated_correctness() -> TestResult {
         init_logging();
         info!("RT-06d: IsTruncated correctness");

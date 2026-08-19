@@ -16,7 +16,6 @@ use crate::common::{RustFSTestClusterEnvironment, init_logging};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
-use serial_test::serial;
 use tokio::time::{Duration, sleep};
 use tracing::info;
 use uuid::Uuid;
@@ -101,7 +100,6 @@ async fn wait_for_cleanup_on_all_nodes(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_stale_multipart_cleanup_removes_incomplete_upload_across_cluster()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
