@@ -97,7 +97,7 @@ use super::storage_api::object_usecase::set_disk::{
 };
 use super::storage_api::object_usecase::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
-    authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    authorize_sse_kms_object_read, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_decryption, sse_encryption,
     validate_bucket_object_lock_enabled_state,
@@ -169,8 +169,8 @@ use s3s::dto::{
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
     SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective,
-    TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
@@ -738,7 +738,7 @@ struct GetObjectPreparedRead {
 }
 
 struct GetObjectStrategyContext {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
     enable_readahead: bool,
@@ -2674,25 +2674,6 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
     headers.get(AMZ_SERVER_SIDE_ENCRYPTION).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM).is_some()
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
-}
-
-/// Managed SSE resolved from a bucket default encryption rule on the copy path.
-///
-/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
-/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
-/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
-/// instead lets a same-name copy under a malformed bucket default pass the
-/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
-/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
-/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
-/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
-/// (backlog#1826).
-fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
-    match sse.sse_algorithm.as_str() {
-        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-    }
 }
 
 /// Resolve the effective server-side encryption for a write against the bucket's
@@ -10115,8 +10096,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;

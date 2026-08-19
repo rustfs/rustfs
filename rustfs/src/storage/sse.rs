@@ -164,7 +164,7 @@ use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
 };
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
+use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId, ServerSideEncryptionByDefault};
 use std::borrow::Cow;
 
 // ============================================================================
@@ -202,6 +202,24 @@ pub struct SseConfiguration {
     pub effective_sse: ServerSideEncryption,
     /// Effective KMS key ID (after considering bucket defaults)
     pub effective_kms_key_id: Option<SSEKMSKeyId>,
+}
+/// Managed SSE resolved from a bucket default encryption rule on a write path.
+///
+/// The single mapping shared by every writer: this resolver, and the PUT, COPY
+/// and extract paths in `app::object_usecase`, which reach it through
+/// `resolve_bucket_default_sse`. Unknown algorithms fall back to AES256 rather
+/// than to `None`. Resolving `None` instead lets a same-name copy under a
+/// malformed bucket default pass the `copy_changes_encryption` guard and take
+/// the metadata-only shortcut while this layer still encrypts: fresh DEK
+/// metadata is committed beside the untouched plaintext blocks and the object
+/// becomes unreadable. Reachable only via corrupt or hand-edited bucket
+/// metadata — PutBucketEncryption rejects unknown algorithms (backlog#1826).
+pub(crate) fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
+    match sse.sse_algorithm.as_str() {
+        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    }
 }
 
 /// Prepare SSE configuration by resolving request parameters with bucket defaults
@@ -266,11 +284,7 @@ async fn prepare_sse_configuration(
                         has_kms_key_id = sse.kms_master_key_id.is_some(),
                         "Bucket SSE default resolved"
                     );
-                    match sse.sse_algorithm.as_str() {
-                        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback
-                    }
+                    bucket_default_write_sse(sse)
                 })
             })
         });
@@ -3354,7 +3368,6 @@ async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiErro
 /// Clears GLOBAL_SSE_DEK_PROVIDER (local/test providers) and
 /// GLOBAL_KMS_DEK_PROVIDER (test-injected KMS providers).
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn reset_sse_dek_provider() {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = None;
@@ -3365,7 +3378,6 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = Some(provider.clone());

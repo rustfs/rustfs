@@ -1401,24 +1401,10 @@ impl CurrentCycle {
 }
 
 /// OTEL metric name constants for scanner metrics
-const OTEL_SCANNER_OBJECTS_SCANNED: &str = "rustfs_scanner_objects_scanned_total";
-const OTEL_SCANNER_DIRECTORIES_SCANNED: &str = "rustfs_scanner_directories_scanned_total";
 const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs_scanner_buckets_scanned_total";
 const OTEL_SCANNER_CYCLES: &str = "rustfs_scanner_cycles_total";
 const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs_scanner_cycle_duration_seconds";
 const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs_scanner_bucket_drive_duration_seconds";
-
-fn emit_otel_counter(metric: usize, count: u64) {
-    match Metric::from_index(metric) {
-        Some(Metric::ScanObject) => {
-            metrics::counter!(OTEL_SCANNER_OBJECTS_SCANNED).increment(count);
-        }
-        Some(Metric::ScanFolder) => {
-            metrics::counter!(OTEL_SCANNER_DIRECTORIES_SCANNED).increment(count);
-        }
-        _ => {}
-    }
-}
 
 fn scan_cycle_result_label(result: u8) -> &'static str {
     match result {
@@ -1960,7 +1946,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add(duration);
             }
@@ -1976,7 +1961,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add_size(duration, size);
             }
@@ -1992,7 +1976,6 @@ impl Metrics {
             let duration = SystemTime::now().duration_since(start).unwrap_or_default();
             global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
             global_metrics().record_source_work_for_metric(metric, 1);
-            emit_otel_counter(metric_idx, 1);
             if metric_idx < Metric::LastRealtime as usize {
                 global_metrics().latency[metric_idx].add(duration);
             }
@@ -2010,7 +1993,6 @@ impl Metrics {
                 let count = usize_to_u64_saturated(count);
                 global_metrics().operations[metric_idx].fetch_add(count, Ordering::Relaxed);
                 global_metrics().record_source_work_for_metric(metric, count);
-                emit_otel_counter(metric_idx, count);
                 if metric_idx < Metric::LastRealtime as usize {
                     global_metrics().latency[metric_idx].add(duration);
                 }
@@ -2031,7 +2013,6 @@ impl Metrics {
                 let duration = SystemTime::now().duration_since(start).unwrap_or_default();
                 let metric_idx = Metric::Ilm as usize;
                 global_metrics().operations[metric_idx].fetch_add(versions, Ordering::Relaxed);
-                emit_otel_counter(metric_idx, versions);
                 global_metrics().actions[a_idx].fetch_add(versions, Ordering::Relaxed);
                 global_metrics().actions_latency[a_idx].add(duration);
             })
@@ -2044,7 +2025,6 @@ impl Metrics {
         let metric_idx = metric as usize;
         global_metrics().operations[metric_idx].fetch_add(1, Ordering::Relaxed);
         global_metrics().record_source_work_for_metric(metric, 1);
-        emit_otel_counter(metric_idx, 1);
         if metric_idx < Metric::LastRealtime as usize {
             global_metrics().latency[metric_idx].add(duration);
         }

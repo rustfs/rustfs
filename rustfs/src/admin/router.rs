@@ -5800,7 +5800,6 @@ mod tests {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Extra {
     pub credentials: Option<s3s::auth::Credentials>,

@@ -64,7 +64,6 @@ impl GetObjectGuard {
     }
 
     /// Get the elapsed time since this guard was created.
-    #[allow(dead_code)]
     // This helper is primarily used by unit tests to assert timing.
     // It's intentionally kept public for callers that may want to inspect
     // a guard's duration without dropping it.

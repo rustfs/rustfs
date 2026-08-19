@@ -14,10 +14,11 @@
 
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_RESPONSE,
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
+use std::time::Duration;
 
 #[cfg(test)]
 use rustfs_io_metrics::internode_metrics::InternodeMetricsSnapshot;
@@ -80,6 +81,59 @@ pub(crate) fn record_remote_disk_grpc_read_all_error() {
 pub(crate) fn record_remote_disk_grpc_read_all_request() {
     global_internode_metrics()
         .record_outgoing_request_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_request() {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics().record_outgoing_request_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_error() {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics()
+        .record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_TRANSPORT_BACKEND_GRPC);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_sent_bytes(bytes: usize) {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics().record_sent_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        bytes,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_recv_bytes(bytes: usize) {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        bytes,
+    );
+    record_grpc_payload_size(INTERNODE_OPERATION_GRPC_READ_VERSION, bytes);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_version_stage(stage: &'static str, duration: Duration) {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics().record_stage_duration_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        stage,
+        duration,
+    );
 }
 
 pub(crate) fn record_remote_disk_grpc_read_all_recv_bytes(bytes: usize) {

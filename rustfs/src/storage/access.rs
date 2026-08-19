@@ -61,7 +61,7 @@ pub(crate) struct ReqInfo {
     pub object: Option<String>,
     pub version_id: Option<String>,
     pub replication_request_authorized: bool,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     pub region: Option<s3s::region::Region>,
     pub request_context: Option<RequestContext>,
     /// Set by probe-style callers that treat AccessDenied as an expected filter
