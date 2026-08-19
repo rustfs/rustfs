@@ -45,7 +45,6 @@ pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
     federated_identity: Arc<dyn FederatedIdentityInterface>,
-    #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
     outbound_tls_runtime: Arc<dyn OutboundTlsRuntimeInterface>,
@@ -162,7 +161,6 @@ impl AppContext {
         self.federated_identity.publish_handle(service)
     }
 
-    #[allow(dead_code)]
     pub fn kms(&self) -> Arc<dyn KmsInterface> {
         self.kms.clone()
     }

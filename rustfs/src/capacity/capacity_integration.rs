@@ -31,7 +31,6 @@ pub async fn init_capacity_management_managed() -> Option<CapacityBackgroundTask
 }
 
 /// Get capacity statistics with metrics
-#[allow(dead_code)]
 pub async fn get_capacity_with_metrics() -> Option<(u64, String)> {
     get_cached_capacity_with_metrics()
         .await
