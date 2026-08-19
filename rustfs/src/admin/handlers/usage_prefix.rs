@@ -19,11 +19,10 @@
 //! usage caches, with a one-level sub-prefix breakdown — the data console
 //! buckets view MinIO serves from `loadPrefixUsageFromBackend`.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::system::data_usage_info_gate_actions;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -70,15 +69,10 @@ fn parse_usage_prefix_query(query: Option<&str>) -> S3Result<(String, usize)> {
 #[async_trait::async_trait]
 impl Operation for BucketPrefixUsageHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(&req.headers, &cred, owner, false, data_usage_info_gate_actions(), remote_addr).await?;
+        // The shared gate reports the same `InvalidRequest` "get cred failed" this
+        // handler has always returned for a credential-less request, so it needs no
+        // message-preserving pre-check.
+        authorize_admin_request(&req, data_usage_info_gate_actions()).await?;
 
         let bucket = params.get("bucket").unwrap_or_default().to_string();
         if bucket.is_empty() {
@@ -104,11 +98,38 @@ impl Operation for BucketPrefixUsageHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_ENTRIES, MAX_ENTRIES_LIMIT, parse_usage_prefix_query};
+    use super::{BucketPrefixUsageHandler, DEFAULT_MAX_ENTRIES, MAX_ENTRIES_LIMIT, parse_usage_prefix_query};
+    use crate::admin::router::Operation;
     use s3s::S3Error;
 
     fn query(raw: &str) -> Result<(String, usize), S3Error> {
         parse_usage_prefix_query(Some(raw))
+    }
+
+    /// This endpoint authorizes through the shared admin gate, whose
+    /// credential-less rejection is the same `InvalidRequest` "get cred failed"
+    /// the handler returned inline before (rustfs/backlog#1829), so no
+    /// message-preserving pre-check is needed here.
+    #[tokio::test]
+    async fn prefix_usage_handler_keeps_its_missing_credentials_message() {
+        let req = s3s::S3Request {
+            input: s3s::Body::from(String::new()),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v3/usage/bucket"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = BucketPrefixUsageHandler {}
+            .call(req, matchit::Params::new())
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("get cred failed"));
     }
 
     #[test]

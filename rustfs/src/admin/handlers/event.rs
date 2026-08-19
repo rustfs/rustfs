@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
@@ -26,10 +26,8 @@ use crate::admin::{
     runtime_sources::{AppContext, app_context_from_req},
     service::config::{preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context},
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
-    ADMIN_PREFIX, RemoteAddr, is_notify_module_enabled, refresh_notify_module_enabled,
-    refresh_persisted_module_switches_from_store,
+    ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
 };
 use http::StatusCode;
 use hyper::Method;
@@ -264,14 +262,14 @@ fn notification_target_specs() -> &'static [AdminTargetSpec] {
 
 // --- Helper Functions ---
 
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_notification_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
-    };
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 fn target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> S3Result<Option<String>> {
@@ -985,6 +983,30 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn notification_target_gate_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::PUT,
+            uri: http::Uri::from_static("/rustfs/admin/v3/notification/target"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize_notification_admin_request(&req, AdminAction::SetBucketTargetAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("credentials not found"));
     }
 
     #[test]
