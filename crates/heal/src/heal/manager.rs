@@ -3886,10 +3886,6 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<crate::heal::storage::DiskStatus> {
-            Ok(crate::heal::storage::DiskStatus::Ok)
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
             Ok(None)
         }

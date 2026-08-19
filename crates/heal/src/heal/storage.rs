@@ -27,7 +27,7 @@ use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };
-use super::{DiskStore, ECStore, Endpoint, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
+use super::{DiskStore, ECStore, HealDiskExt as _, StorageError, resume::ReplacementTargetIdentity};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -311,29 +311,6 @@ pub struct HealListItem {
     pub is_delete_marker: bool,
 }
 
-/// Disk status for heal operations
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiskStatus {
-    /// Ok
-    Ok,
-    /// Offline
-    Offline,
-    /// Corrupt
-    Corrupt,
-    /// Missing
-    Missing,
-    /// Permission denied
-    PermissionDenied,
-    /// Faulty
-    Faulty,
-    /// Root mount
-    RootMount,
-    /// Unknown
-    Unknown,
-    /// Unformatted
-    Unformatted,
-}
-
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
@@ -350,9 +327,6 @@ pub trait HealStorageAPI: Send + Sync {
     /// requests currently execute through `heal_object`; keep the explicit
     /// rebuild-and-read path for the decode-failure fast variant.
     async fn ec_decode_rebuild(&self, bucket: &str, object: &str) -> Result<Vec<u8>>;
-
-    /// Get disk status
-    async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus>;
 
     /// Get bucket info
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>>;
@@ -762,34 +736,6 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Err(e)
             }
         }
-    }
-
-    async fn get_disk_status(&self, endpoint: &Endpoint) -> Result<DiskStatus> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_disk_status",
-            endpoint = ?endpoint,
-            state = "started",
-            "Heal storage admin operation started"
-        );
-
-        // TODO: implement disk status check using ecstore
-        // For now, return Ok status
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_ADMIN_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "get_disk_status",
-            endpoint = ?endpoint,
-            result = "ok",
-            disk_status = "ok",
-            "Heal storage disk status resolved"
-        );
-        Ok(DiskStatus::Ok)
     }
 
     async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {

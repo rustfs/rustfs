@@ -2206,7 +2206,7 @@ mod tests {
         previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
+    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,
@@ -2336,10 +2336,6 @@ mod tests {
 
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(Vec::new())
-        }
-
-        async fn get_disk_status(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
-            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
         }
 
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<HealBucketInfo>> {

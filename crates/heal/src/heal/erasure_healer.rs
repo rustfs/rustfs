@@ -1267,7 +1267,7 @@ mod resume_loop_tests {
         CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
         compose_key,
     };
-    use crate::heal::storage::{DiskStatus, HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
+    use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
     use crate::heal::{
         BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, RUSTFS_META_BUCKET, new_disk,
@@ -1450,9 +1450,6 @@ mod resume_loop_tests {
         }
         async fn ec_decode_rebuild(&self, _b: &str, _o: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
-        }
-        async fn get_disk_status(&self, _e: &Endpoint) -> Result<DiskStatus> {
-            Ok(DiskStatus::Ok)
         }
         async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {
             Ok(Some(BucketInfo {

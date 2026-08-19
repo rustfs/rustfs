@@ -759,7 +759,7 @@ impl HealChannelProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DiskStore, Endpoint};
+    use super::super::DiskStore;
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
@@ -778,9 +778,6 @@ mod tests {
         }
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> crate::Result<Vec<u8>> {
             Ok(vec![])
-        }
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> crate::Result<crate::heal::storage::DiskStatus> {
-            Ok(crate::heal::storage::DiskStatus::Ok)
         }
         async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<crate::heal::storage_api::status::BucketInfo>> {
             Ok(None)

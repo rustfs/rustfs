@@ -352,8 +352,8 @@ pub(crate) fn set_heal_queue_length(count: usize) {
 mod tests {
     use super::{
         Error, HEAL_RUNTIME_INIT_TEST_HOOK, HealRuntimeInitTestHook, get_heal_channel_processor, get_heal_manager,
-        heal::DiskStore, heal::Endpoint, heal::manager::HealConfig, heal::storage::DiskStatus, heal::storage::HealListItem,
-        heal::storage::HealObjectInfo, heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
+        heal::DiskStore, heal::manager::HealConfig, heal::storage::HealListItem, heal::storage::HealObjectInfo,
+        heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
     use crate::heal::storage_api::status::BucketInfo;
     use rustfs_common::heal_channel::HealOpts;
@@ -372,10 +372,6 @@ mod tests {
 
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>, Error> {
             Ok(Vec::new())
-        }
-
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<DiskStatus, Error> {
-            Ok(DiskStatus::Ok)
         }
 
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>, Error> {

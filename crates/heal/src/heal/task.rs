@@ -2822,7 +2822,7 @@ impl std::fmt::Debug for HealTask {
 mod tests {
     use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
     use super::*;
-    use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
+    use crate::heal::storage::{HealListItem, HealObjectInfo};
     use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, TraceSubscription, TraceVal, subscribe_trace_events};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, VecDeque};
@@ -3548,10 +3548,6 @@ mod tests {
 
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
-        }
-
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<DiskStatus> {
-            Ok(DiskStatus::Ok)
         }
 
         async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {

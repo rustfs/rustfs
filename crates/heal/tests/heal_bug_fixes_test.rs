@@ -187,9 +187,6 @@ fn test_heal_task_status_atomic_update() {
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
-            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
-        }
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
@@ -262,7 +259,7 @@ fn test_heal_task_status_atomic_update() {
 
 #[tokio::test]
 async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
-    use rustfs_heal::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
+    use rustfs_heal::heal::storage::{HealListItem, HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType};
     use std::sync::{
         Arc,
@@ -282,10 +279,6 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
 
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(Vec::new())
-        }
-
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<DiskStatus> {
-            Ok(DiskStatus::Ok)
         }
 
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
