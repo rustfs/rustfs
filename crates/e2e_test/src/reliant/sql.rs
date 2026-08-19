@@ -20,7 +20,6 @@ use aws_sdk_s3::types::{
     CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType, OutputSerialization,
 };
 use bytes::Bytes;
-use serial_test::serial;
 use std::error::Error;
 
 const ENDPOINT: &str = "http://localhost:9000";
@@ -118,7 +117,6 @@ async fn process_select_response(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -160,7 +158,6 @@ async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -206,7 +203,6 @@ async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Erro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -248,7 +244,6 @@ async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -291,7 +286,6 @@ async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -337,7 +331,6 @@ async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;
@@ -373,7 +366,6 @@ async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_select_object_content_nonexistent_object() -> Result<(), Box<dyn Error>> {
     let client = create_aws_s3_client().await?;

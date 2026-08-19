@@ -17,7 +17,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use tracing::info;
 
     /// Helper function to create an S3 client for testing
@@ -60,7 +59,6 @@ mod tests {
     /// The bug was that "folder/" (the object) and "folder/" (derived prefix) were both added to CommonPrefixes
     /// when delimiter was "/" because the deduplication check was explicitly skipped for "/" delimiter.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_unique_common_prefixes() {
         init_logging();
         info!("Starting test: ListObjectsV2 should return unique CommonPrefixes");
@@ -140,7 +138,6 @@ mod tests {
     /// When both "marker/subdir/" and "marker/subdir/file.txt" exist, listing with
     /// Prefix="marker/" must not duplicate "marker/subdir/file.txt" in Contents.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_unique_contents_with_explicit_directory_markers() {
         init_logging();
         info!("Starting test: ListObjectsV2 should return unique keys with explicit directory markers");
@@ -208,7 +205,6 @@ mod tests {
     /// and never produce the prefix entry `a/`. Delimiter="/" listings then
     /// returned Contents `a` but silently dropped CommonPrefix `a/`.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_object_and_same_named_prefix_coexist() {
         init_logging();
         info!("Starting test: ListObjectsV2 should return both object `a` and CommonPrefix `a/`");

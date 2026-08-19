@@ -19,7 +19,6 @@ mod tests {
     use crate::chaos::signed_admin_post;
     use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::collections::HashSet;
     use std::error::Error;
     use std::path::{Path, PathBuf};
@@ -63,7 +62,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_auto_heal_rebuilds_runtime_wiped_disk_without_restart() {
         init_logging();
         info!("Issue #1533: auto heal should rebuild a runtime-wiped disk in a 4-disk single-node erasure set without restart");
@@ -182,7 +180,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_admin_deep_heal_rebuilds_cleared_disk_in_single_node_erasure_set() {
         init_logging();
         info!("Discussion #2964: admin deep heal should rebuild a wiped disk in a 4-disk single-node erasure set");
@@ -332,7 +329,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[serial]
     async fn test_cluster_root_heal_rebuilds_replaced_remote_disk() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("Root recursive heal should rebuild data on a remote node after its disk is replaced and the node rejoins");
@@ -444,7 +440,6 @@ mod tests {
     /// topology early-return or the merge hard-fail) turns the down-window
     /// response into a 500 and fails this test.
     #[tokio::test]
-    #[serial]
     async fn test_background_heal_status_degrades_while_peer_down_and_recovers_after_rejoin()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();

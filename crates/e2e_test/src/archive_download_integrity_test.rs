@@ -24,7 +24,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::{pre_sign_v4, sign_v4};
     use s3s::Body;
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::error::Error;
     use std::io::{Cursor, Write};
@@ -339,7 +338,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_allows_content_encoding_by_default() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -367,7 +365,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_rejects_content_encoding_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -391,7 +388,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_with_aws_chunked_does_not_persist_content_encoding_by_default()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -427,7 +423,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_with_aws_chunked_and_effective_encoding_roundtrips_by_default()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -463,7 +458,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_with_aws_chunked_allowed_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -498,7 +492,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_put_with_aws_chunked_and_effective_encoding_rejects_when_strict_mode_enabled()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -529,7 +522,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_download_roundtrip_with_http_compression_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -591,7 +583,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_multipart_roundtrip_preserves_bytes() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -687,7 +678,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_multipart_get_ignores_empty_conditional_etag_headers() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -723,7 +713,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_multipart_with_aws_chunked_and_effective_encoding_roundtrips_by_default()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -753,7 +742,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_multipart_with_aws_chunked_allowed_when_strict_mode_enabled() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         init_logging();
@@ -783,7 +771,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_archive_multipart_with_aws_chunked_and_effective_encoding_rejects_when_strict_mode_enabled()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -816,7 +803,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_presigned_get_and_reverse_proxy_preserve_multipart_bytes() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;

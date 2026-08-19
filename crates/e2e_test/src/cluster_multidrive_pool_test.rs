@@ -31,7 +31,6 @@
 //! (toxiproxy / socket proxy) and 5GiB large-object budgets.
 
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
-use serial_test::serial;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -58,7 +57,6 @@ async fn put_get_roundtrip(cluster: &RustFSTestClusterEnvironment, key: &str, pa
 
 /// 4 nodes x 2 drives, single pool: the multi-drive layout boots and round-trips.
 #[tokio::test]
-#[serial]
 async fn cluster_multidrive_single_pool_smoke() -> TestResult {
     crate::common::init_logging();
 
@@ -81,7 +79,6 @@ async fn cluster_multidrive_single_pool_smoke() -> TestResult {
 /// Two single-node pools, 2 drives each: the multi-pool layout boots and
 /// round-trips. Every pool is a distinct erasure pool (`pool_idx` 0 and 1).
 #[tokio::test]
-#[serial]
 async fn cluster_two_pool_smoke() -> TestResult {
     crate::common::init_logging();
 

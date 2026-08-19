@@ -22,7 +22,6 @@ use crate::protocols::sftp_compliance::{
 };
 use crate::protocols::sftp_core::{test_sftp_core_operations, test_sftp_idle_timeout_disconnects};
 use crate::protocols::webdav_core::test_webdav_core_operations;
-use serial_test::serial;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
@@ -229,7 +228,6 @@ fn all_protocol_tests() -> Vec<TestDefinition> {
 
 /// Test suite
 #[tokio::test]
-#[serial]
 async fn test_protocol_core_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let suite = ProtocolTestSuite::new();
     let results = suite.run_test_suite().await;

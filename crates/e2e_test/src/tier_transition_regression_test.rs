@@ -30,7 +30,6 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, admin_ok, init_logging};
     use serde_json::Value;
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -42,7 +41,6 @@ mod tests {
     /// validates that an expiration-only rule (the persistence path) survives
     /// a server restart.
     #[tokio::test]
-    #[serial]
     async fn test_lifecycle_rule_persists_after_restart() -> TestResult {
         init_logging();
         info!("RT-13: lifecycle rule persists after restart");
@@ -105,7 +103,6 @@ mod tests {
     /// Regression pattern: tier add/verify/delete API fails or the tier
     /// configuration is not persisted (rustfs#5218).
     #[tokio::test]
-    #[serial]
     async fn test_admin_tier_list_endpoint_returns_json() -> TestResult {
         init_logging();
         info!("RT-13b: admin tier list endpoint returns JSON");
@@ -135,7 +132,6 @@ mod tests {
     /// is not persisted (rustfs#5013), causing the scanner to not run or
     /// use stale settings.
     #[tokio::test]
-    #[serial]
     async fn test_scanner_config_persists_after_restart() -> TestResult {
         init_logging();
         info!("RT-13c: scanner config persists after restart");

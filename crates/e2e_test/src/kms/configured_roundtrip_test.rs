@@ -20,7 +20,6 @@ use super::common::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, ServerSideEncryption, VersioningConfiguration};
-use serial_test::serial;
 use std::error::Error;
 use uuid::Uuid;
 
@@ -386,7 +385,6 @@ async fn assert_versioned_sse_kms_roundtrip_and_cleanup(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_configured_local_kms_admin_and_versioned_cleanup() -> TestResult {
     let mut env = LocalKMSTestEnvironment::new().await?;
     env.base_env.start_rustfs_server(Vec::new()).await?;
@@ -434,7 +432,6 @@ async fn test_configured_local_kms_admin_and_versioned_cleanup() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 #[ignore = "requires a Vault binary"]
 async fn test_configured_vault_kms_admin_and_versioned_cleanup() -> TestResult {
     let mut env = VaultTestEnvironment::new().await?;
