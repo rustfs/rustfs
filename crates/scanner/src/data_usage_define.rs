@@ -29,7 +29,7 @@ use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
-    PrefixUsageQuery, PrefixUsageSummary, TierStats, hash_path, prefix_usage_in_cache,
+    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, hash_path, prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -188,38 +188,18 @@ pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
 
 const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
 
-/// Size summary for a single object or group of objects
-#[derive(Debug, Default, Clone)]
-pub struct SizeSummary {
-    /// Total size
-    pub total_size: usize,
-    /// Number of versions
-    pub versions: usize,
-    /// Number of delete markers
-    pub delete_markers: usize,
-    /// Replicated size
-    pub replicated_size: i64,
-    /// Replicated count
-    pub replicated_count: usize,
-    /// Pending size
-    pub pending_size: i64,
-    /// Failed size
-    pub failed_size: i64,
-    /// Replica size
-    pub replica_size: i64,
-    /// Replica count
-    pub replica_count: usize,
-    /// Pending count
-    pub pending_count: usize,
-    /// Failed count
-    pub failed_count: usize,
-    /// Replication target stats
-    pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
-    pub tier_stats: HashMap<String, TierStats>,
+/// Scanner-side accounting on the shared [`SizeSummary`].
+///
+/// The type itself lives in `rustfs-data-usage`, which sits below the storage
+/// layer and cannot see `ObjectInfo`, so this stays an extension trait rather
+/// than an inherent method (backlog#1828).
+pub trait ScannerSizeSummaryExt {
+    /// Fold one object's contribution into the summary, including its tier.
+    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64);
 }
 
-impl SizeSummary {
-    pub fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
+impl ScannerSizeSummaryExt for SizeSummary {
+    fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
         if oi.delete_marker {
             self.delete_markers = self.delete_markers.saturating_add(1);
             return;
@@ -249,23 +229,6 @@ impl SizeSummary {
             });
         }
     }
-}
-
-/// Replication target size summary
-#[derive(Debug, Default, Clone)]
-pub struct ReplTargetSizeSummary {
-    /// Replicated size
-    pub replicated_size: i64,
-    /// Replicated count
-    pub replicated_count: usize,
-    /// Pending size
-    pub pending_size: i64,
-    /// Failed size
-    pub failed_size: i64,
-    /// Pending count
-    pub pending_count: usize,
-    /// Failed count
-    pub failed_count: usize,
 }
 
 // ===== Cache-related data structures =====
@@ -1542,39 +1505,6 @@ pub trait DataUsageCacheStorage {
 
     /// Save data usage cache to backend storage
     async fn save(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-impl SizeSummary {
-    /// Create a new SizeSummary
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add another SizeSummary to this one
-    pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size = self.total_size.saturating_add(other.total_size);
-        self.versions = self.versions.saturating_add(other.versions);
-        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
-        self.replicated_size = self.replicated_size.saturating_add(other.replicated_size);
-        self.replicated_count = self.replicated_count.saturating_add(other.replicated_count);
-        self.pending_size = self.pending_size.saturating_add(other.pending_size);
-        self.failed_size = self.failed_size.saturating_add(other.failed_size);
-        self.replica_size = self.replica_size.saturating_add(other.replica_size);
-        self.replica_count = self.replica_count.saturating_add(other.replica_count);
-        self.pending_count = self.pending_count.saturating_add(other.pending_count);
-        self.failed_count = self.failed_count.saturating_add(other.failed_count);
-
-        // Merge replication target stats
-        for (target, stats) in &other.repl_target_stats {
-            let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size = entry.replicated_size.saturating_add(stats.replicated_size);
-            entry.replicated_count = entry.replicated_count.saturating_add(stats.replicated_count);
-            entry.pending_size = entry.pending_size.saturating_add(stats.pending_size);
-            entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
-            entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
-            entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
-        }
-    }
 }
 
 #[cfg(test)]

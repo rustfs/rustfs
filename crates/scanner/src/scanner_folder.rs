@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
     DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
-    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, SizeSummary, hash_path,
+    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
