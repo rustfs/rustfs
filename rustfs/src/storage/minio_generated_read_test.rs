@@ -260,6 +260,20 @@ async fn reads_minio_generated_sse_kms_multipart_fixture() {
     assert_fixture_round_trip("sse-kms-multipart-8m", 8 * 1024 * 1024).await;
 }
 
+/// The interop claim must hold on the production key entry point, not only on
+/// the test-only injection channel every other case here uses.
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn reads_minio_generated_sse_s3_fixture_through_production_master_key_env() {
+    let (object_info, encrypted, expected_sha256) = load_fixture_reader_input("sse-s3-multipart-8m").await;
+
+    let plaintext = read_fixture_plaintext_via_production_env(encrypted, object_info, minio_static_kms_key_b64())
+        .await
+        .expect("fixture must restore through RUSTFS_SSE_S3_MASTER_KEY");
+
+    assert_eq!(sha256_hex(&plaintext), expected_sha256);
+}
+
 #[tokio::test]
 #[ignore = "requires generated MinIO fixture data and a local static KMS key"]
 async fn rejects_minio_generated_sse_s3_fixture_with_wrong_kms_key() {
@@ -286,6 +300,55 @@ async fn rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext() {
             "truncated ciphertext must not restore the original plaintext"
         );
     }
+}
+
+/// Read a fixture through the **production** provider selection.
+///
+/// [`read_fixture_plaintext`] injects the master key through
+/// `__RUSTFS_SSE_SIMPLE_CMK`, which is `#[cfg(test)]`-only, so on its own it
+/// proves nothing about a deployment: it never reaches
+/// `LocalSseDekProvider::new_from_env`. This variant sets only
+/// `RUSTFS_SSE_S3_MASTER_KEY` — the sole production entry point — so the
+/// interop claim rests on the path operators actually run (backlog#1638).
+async fn read_fixture_plaintext_via_production_env(
+    encrypted: Vec<u8>,
+    object_info: ObjectInfo,
+    master_key_b64: String,
+) -> Result<Vec<u8>, String> {
+    let object_size = object_info.size;
+    reset_sse_dek_provider();
+
+    async_with_vars(
+        [
+            ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
+            ("RUSTFS_SSE_S3_MASTER_KEY", Some(master_key_b64)),
+        ],
+        async move {
+            let resolver = SseObjectEncryptionResolver;
+            let (mut reader, offset, length) = GetObjectReader::new_with_resolver(
+                Box::new(Cursor::new(encrypted)),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &http::HeaderMap::new(),
+                Some(&resolver),
+            )
+            .await
+            .map_err(|err| format!("construct GetObjectReader from MinIO raw fixture: {err:?}"))?;
+
+            if offset != 0 || length != object_size {
+                return Err(format!("unexpected fixture range offset={offset} length={length} size={object_size}"));
+            }
+
+            let mut plaintext = Vec::new();
+            reader
+                .read_to_end(&mut plaintext)
+                .await
+                .map_err(|err| format!("read plaintext from MinIO raw fixture: {err}"))?;
+            Ok(plaintext)
+        },
+    )
+    .await
 }
 
 async fn assert_fixture_round_trip(case_id: &str, expected_size: i64) {

@@ -324,11 +324,18 @@ impl Default for LocalConfig {
 /// wraps data encryption keys — there is no HMAC-SHA256 derivation step — and
 /// each wrapped DEK is serialized as a RustFS `DataKeyEnvelope` JSON blob.
 ///
-/// This mirrors the *concept* of MinIO's builtin/static single-key KMS, but is
-/// not wire-compatible with it: MinIO wraps DEKs in a different (`{"aead": ...}`)
-/// blob that this backend neither produces nor accepts, so KMS ciphertext
-/// written by MinIO cannot be opened here. Reading MinIO-written SSE objects is
-/// tracked separately in rustfs/backlog#1638.
+/// This mirrors the *concept* of MinIO's builtin/static single-key KMS but is
+/// not wire-compatible with it. MinIO seals a DEK as `sealed || iv[16] ||
+/// nonce[12]` under a per-ciphertext key derived from the master secret, with
+/// a legacy JSON encoding of the same layout; this backend neither produces
+/// nor accepts either, so pointing it at MinIO's master key does **not** make
+/// MinIO-written objects readable through it.
+///
+/// Reading MinIO-written SSE objects is a property of the object read path, not
+/// of this backend: that path decodes MinIO's format directly, keyed by
+/// `RUSTFS_SSE_S3_MASTER_KEY`. See the migration section of
+/// `docs/operations/kms-backend-security.md` for which object shapes are
+/// covered, and rustfs/backlog#1638 for the remainder.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct StaticConfig {
     /// Key identifier (name) for the single configured key

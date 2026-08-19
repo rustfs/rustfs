@@ -14,23 +14,38 @@ For how the Vault backends authenticate (static token, AppRole, Kubernetes, Vaul
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 | AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments already rooted in AWS IAM that want AWS as the cryptographic root — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
 
-## Migrating from MinIO: encrypted objects do not carry over
+## Migrating from MinIO: what carries over, and what does not
 
-> **Warning: RustFS does not currently support reading objects that MinIO encrypted.**
-> This applies to SSE-S3, SSE-KMS, and SSE-C, in every released binary and container image, and it holds regardless of which KMS backend you configure. Configuring the `Static` backend with the same key material MinIO used does **not** make those objects readable — MinIO wraps data keys in a different envelope format that no RustFS backend produces or accepts (`crates/kms/src/config.rs:304-308`). Plan for this **before** moving data. Tracked in rustfs/backlog#1638.
+> **Read this before moving data.** Some MinIO-encrypted objects are readable by RustFS and some are not, and the boundary is not where you would guess. Verify against a sample of your own objects rather than assuming either answer. Tracked in rustfs/backlog#1638.
 
-The read does fail closed — ciphertext is never served as plaintext. MinIO's internal encryption headers mark the object as encrypted (`crates/utils/src/http/header_compat.rs:50-67`), so the read path demands encryption material and refuses when none resolves (`crates/ecstore/src/object_api/readers.rs:559-568`). Two properties still make the problem easy to discover late:
+Support is stated per shape below because that is how far it has been *measured* — against fixtures captured from a real MinIO server (`minio/minio:RELEASE.2025-09-07T16-13-09Z`), not inferred from the code:
+
+| MinIO object | RustFS read | Evidence |
+| --- | --- | --- |
+| SSE-S3, multipart | **Yes** | `reads_minio_generated_sse_s3_multipart_fixture` |
+| SSE-KMS, multipart | **Yes** | `reads_minio_generated_sse_kms_multipart_fixture` |
+| SSE-S3 / SSE-KMS, single-part | **Unverified** | No fixture coverage — see below |
+| SSE-C | **Unverified** | No fixture coverage |
+| Sealed by KES, a KMS plugin, or MinKMS | **No**, and not planned | Re-encrypt at the source before migrating |
+
+Reading a supported object requires RustFS to hold the same master key MinIO used, supplied through `RUSTFS_SSE_S3_MASTER_KEY` (the production entry point, exercised by `reads_minio_generated_sse_s3_fixture_through_production_master_key_env`). MinIO's builtin KMS derives a per-ciphertext sealing key from that master secret, so the *same* secret is required — not merely an equivalently configured backend.
+
+**"Unverified" means unknown, not broken.** Single-part objects below MinIO's small-file threshold carry their data inline in `xl.meta`, sharded across disks, and the interop fixture harness cannot yet load that shape — so those objects have never been read in a test either way. Do not read the table's "Yes" rows as covering them.
+
+Whatever the table says, verify before you commit: **read a sample of encrypted objects, not just their listings.** A read that is not supported fails closed — ciphertext is never served as plaintext — but two properties still make it easy to discover late:
 
 - **The error does not say what happened.** It surfaces as a 500 `InternalError`, which reads as a RustFS fault rather than "another implementation encrypted this object".
 - **Surrounding metadata migrates fine.** The object's `xl.meta` parses, so encrypted objects list and HEAD normally and report plausible sizes. The failure appears only when something reads the payload.
 
-Read a sample of encrypted objects, not just their listings, before decommissioning the MinIO deployment.
-
-Current options for a migration whose source contains encrypted objects:
+For any shape that does not read, the options are unchanged:
 
 - Decrypt on the MinIO side first, migrate plaintext, then let RustFS re-encrypt with its own KMS.
 - Copy through the S3 API rather than moving drives — MinIO decrypts on read, and RustFS encrypts on write. This re-encrypts rather than preserving ciphertext and costs a full data transfer.
 - Leave encrypted objects on MinIO and migrate only unencrypted data.
+
+### The reverse direction does not work
+
+MinIO cannot read objects RustFS encrypted, and that is a deliberate, documented position rather than a gap awaiting a fix. RustFS fills MinIO's metadata slots — the sealed-key and IV headers are MinIO-shaped — but the data key in `X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key` is a RustFS envelope, which MinIO's KMS cannot open. **Treat the MinIO-branded headers on a RustFS-written object as RustFS-internal.** Their presence is not a statement that MinIO can read the object, and no coexistence plan should assume two-way reads.
 
 Inventory the source before choosing: bucket default-encryption settings mean objects can be encrypted without any client having sent SSE headers.
 
