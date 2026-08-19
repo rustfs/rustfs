@@ -527,9 +527,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_facade_stops_empty_replay_workers() {
+    async fn stopping_replay_workers_is_a_no_op_when_there_are_none() {
         let (facade, _, _) = build_facade();
+
         facade.stop_replay_workers().await;
+
+        // The stop path takes the worker list and hands it to the adapter, so an
+        // empty facade must come back with the list still empty and dispatch
+        // released rather than left paused (rustfs/backlog#1836).
+        assert!(facade.replay_workers.read().await.is_empty());
+
+        // Calling it twice must stay harmless: shutdown paths do exactly that.
+        facade.stop_replay_workers().await;
+        assert!(facade.replay_workers.read().await.is_empty());
     }
 
     #[tokio::test]
