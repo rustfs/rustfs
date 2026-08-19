@@ -236,12 +236,19 @@ async fn audit_pipeline_reports_empty_runtime_snapshots() {
 }
 
 #[tokio::test]
-async fn audit_runtime_facade_stops_empty_replay_workers() {
+async fn stopping_audit_replay_workers_is_a_no_op_when_there_are_none() {
     let registry = Arc::new(Mutex::new(AuditRegistry::new()));
     let replay_workers = Arc::new(RwLock::new(rustfs_targets::ReplayWorkerManager::new()));
-    let facade = AuditRuntimeFacade::new(registry, replay_workers);
+    let facade = AuditRuntimeFacade::new(registry, Arc::clone(&replay_workers));
 
     facade.stop_replay_workers().await;
+
+    // The stop path takes the manager's workers and hands them to the adapter,
+    // so an empty facade must leave it empty rather than wedge it, and a second
+    // call — which shutdown paths make — must stay harmless (rustfs/backlog#1836).
+    assert!(replay_workers.read().await.is_empty());
+    facade.stop_replay_workers().await;
+    assert!(replay_workers.read().await.is_empty());
 }
 
 #[tokio::test]
