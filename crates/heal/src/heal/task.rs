@@ -54,7 +54,7 @@ const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
 const MAX_BUCKET_FAILURE_LOG_SAMPLES: u64 = 5;
 
 /// Emits at `$level`, demoted to `debug!` when `$demote` is true. Keeps
-/// per-object heal work — Object/Metadata/MRF/ECDecode tasks queued per
+/// per-object heal work — Object/Metadata/ECDecode tasks queued per
 /// object by MRF/autoheal/scanner loops, and per-object sweep failures past
 /// a sample cap — from amplifying into one info!/warn!/error! line per
 /// object during mass recovery (rustfs/rustfs#5716). Aggregate task kinds
@@ -75,8 +75,6 @@ const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
 const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
 const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
 const EVENT_HEAL_METADATA_RESULT: &str = "heal_metadata_result";
-const EVENT_HEAL_MRF_STAGE: &str = "heal_mrf_stage";
-const EVENT_HEAL_MRF_RESULT: &str = "heal_mrf_result";
 const EVENT_HEAL_EC_DECODE_STAGE: &str = "heal_ec_decode_stage";
 const EVENT_HEAL_EC_DECODE_RESULT: &str = "heal_ec_decode_result";
 const EVENT_HEAL_ERASURE_SET_STAGE: &str = "heal_erasure_set_stage";
@@ -101,8 +99,6 @@ pub enum HealType {
     ErasureSet { buckets: Vec<String>, set_disk_id: String },
     /// Metadata heal
     Metadata { bucket: String, object: String },
-    /// MRF heal
-    MRF { meta_path: String },
     /// EC decode heal
     ECDecode {
         bucket: String,
@@ -120,21 +116,18 @@ impl HealType {
             Self::Prefix { .. } => "prefix",
             Self::ErasureSet { .. } => "erasure_set",
             Self::Metadata { .. } => "metadata",
-            Self::MRF { .. } => "mrf",
             Self::ECDecode { .. } => "ec_decode",
         }
     }
 
     /// Task kinds enqueued at per-object granularity (MRF, autoheal, scanner,
-    /// read-repair loops). Their lifecycle and admission logs stay at `debug!`
+    /// read-repair loops; the MRF loop queues Object/ECDecode/Metadata
+    /// tasks). Their lifecycle and admission logs stay at `debug!`
     /// so a recovery loop queuing hundreds of thousands of object heal tasks
     /// cannot amplify into per-object `info!`/`warn!` lines; aggregate kinds
     /// (cluster/bucket/prefix/erasure-set) keep operator-visible levels.
     pub(crate) fn is_per_object(&self) -> bool {
-        matches!(
-            self,
-            Self::Object { .. } | Self::Metadata { .. } | Self::MRF { .. } | Self::ECDecode { .. }
-        )
+        matches!(self, Self::Object { .. } | Self::Metadata { .. } | Self::ECDecode { .. })
     }
 }
 
@@ -504,7 +497,6 @@ impl HealTask {
             HealType::Prefix { .. } => "prefix",
             HealType::ErasureSet { .. } => "erasure_set",
             HealType::Metadata { .. } => "metadata",
-            HealType::MRF { .. } => "mrf",
             HealType::ECDecode { .. } => "ec_decode",
         }
     }
@@ -579,7 +571,6 @@ impl HealTask {
                         None => event,
                     }
                 }
-                HealType::MRF { meta_path } => event.with_object(meta_path.as_str()),
             };
 
             match error {
@@ -821,7 +812,6 @@ impl HealTask {
             HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
 
             HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
-            HealType::MRF { meta_path } => self.heal_mrf(meta_path).await,
             HealType::ECDecode {
                 bucket,
                 object,
@@ -2015,139 +2005,6 @@ impl HealTask {
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn heal_mrf(&self, meta_path: &str) -> Result<()> {
-        debug!(
-            target: "rustfs::heal::task",
-            event = EVENT_HEAL_MRF_STAGE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_TASK,
-            task_id = %self.id,
-            meta_path,
-            stage = "start",
-            "Heal MRF started"
-        );
-
-        // update progress
-        {
-            let mut progress = self.progress.write().await;
-            progress.set_current_object(Some(format!("mrf: {meta_path}")));
-            progress.update_progress(0, 2, 0, 0);
-        }
-
-        // Parse meta_path to extract bucket and object
-        let parts: Vec<&str> = meta_path.split('/').collect();
-        if parts.len() < 2 {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Invalid meta path format: {meta_path}"),
-            });
-        }
-
-        let bucket = parts[0];
-        let object = parts[1..].join("/");
-
-        // Step 1: Perform MRF heal using ecstore
-        debug!(
-            target: "rustfs::heal::task",
-            event = EVENT_HEAL_MRF_STAGE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_TASK,
-            task_id = %self.id,
-            meta_path,
-            bucket,
-            object = %object,
-            stage = "heal_with_ecstore",
-            "Heal MRF stage entered"
-        );
-        let heal_opts = HealOpts {
-            recursive: true,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: HealScanMode::Deep,
-            update_parity: true,
-            no_lock: self.options.no_lock,
-            pool: None,
-            set: None,
-        };
-
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, &object, None, &heal_opts))
-            .await;
-
-        match heal_result {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    error!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_MRF_RESULT,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_TASK,
-                        task_id = %self.id,
-                        meta_path,
-                        bucket,
-                        object = %object,
-                        result = "failed",
-                        error = %e,
-                        "Heal MRF failed"
-                    );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(2, 2, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal MRF {meta_path}: {e}"),
-                    });
-                }
-
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_MRF_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    meta_path,
-                    bucket,
-                    object = %object,
-                    drives_healed = result.drives_healed(),
-                    drives_total = result.drives_reported(),
-                    result = "ok",
-                    "Heal MRF repaired"
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(2, 2, 0, 0);
-                }
-                self.record_result_item(result).await;
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                error!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_MRF_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    meta_path,
-                    bucket,
-                    object = %object,
-                    result = "failed",
-                    error = %e,
-                    "Heal MRF failed"
-                );
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_progress(2, 2, 0, 0);
-                }
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal MRF {meta_path}: {e}"),
                 })
             }
         }
@@ -3386,12 +3243,6 @@ mod tests {
             HealType::Metadata {
                 bucket: "b".to_string(),
                 object: "o".to_string(),
-            }
-            .is_per_object()
-        );
-        assert!(
-            HealType::MRF {
-                meta_path: "p".to_string(),
             }
             .is_per_object()
         );
