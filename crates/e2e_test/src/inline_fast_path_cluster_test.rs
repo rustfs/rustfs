@@ -67,6 +67,9 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
+/// Physical bytes the erasure layer pulled from disk, emitted per shard read by
+/// `crates/ecstore/src/erasure/coding/decode.rs`.
+const SHARD_READ_BYTES_COUNTER: &str = "rustfs_io_get_object_shard_read_observed_bytes_total";
 const MSGPACK_JSON_DECODE_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
 const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const MSGPACK_JSON_DECODE_ERROR_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
@@ -146,6 +149,7 @@ struct OtlpMetricCollector {
     decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
+    shard_read_values: MetricValues,
     task: JoinHandle<()>,
 }
 
@@ -157,10 +161,12 @@ impl OtlpMetricCollector {
         let decode_values = Arc::new(Mutex::new(BTreeMap::new()));
         let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
         let decode_error_values = Arc::new(Mutex::new(BTreeMap::new()));
+        let shard_read_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
         let task_decode_values = decode_values.clone();
         let task_fallback_values = fallback_values.clone();
         let task_decode_error_values = decode_error_values.clone();
+        let task_shard_read_values = shard_read_values.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -170,6 +176,7 @@ impl OtlpMetricCollector {
                 let decode_values = task_decode_values.clone();
                 let fallback_values = task_fallback_values.clone();
                 let decode_error_values = task_decode_error_values.clone();
+                let shard_read_values = task_shard_read_values.clone();
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(
@@ -181,6 +188,7 @@ impl OtlpMetricCollector {
                                     decode_values.clone(),
                                     fallback_values.clone(),
                                     decode_error_values.clone(),
+                                    shard_read_values.clone(),
                                 )
                             }),
                         )
@@ -194,8 +202,46 @@ impl OtlpMetricCollector {
             decode_values,
             fallback_values,
             decode_error_values,
+            shard_read_values,
             task,
         })
+    }
+
+    /// Total physical bytes read from disk across every shard-read label set.
+    async fn shard_read_bytes_total(&self) -> u64 {
+        self.shard_read_values
+            .lock()
+            .await
+            .values()
+            .map(|versions| versions.values().map(|(_, value)| *value).sum::<u64>())
+            .sum()
+    }
+
+    /// Waits until the shard-read counter stops advancing so a measurement window
+    /// is not polluted by exports still in flight.
+    ///
+    /// Requires several consecutive equal samples spanning more than one export
+    /// interval (`RUSTFS_OBS_METER_INTERVAL=1`): a single unchanged sample only
+    /// proves the latest export has not landed yet, which silently reads as "no
+    /// disk reads happened" and makes any upper-bound assertion vacuous.
+    async fn wait_for_shard_read_bytes_to_settle(&self) -> TestResult<u64> {
+        const REQUIRED_STABLE_SAMPLES: usize = 5;
+        let mut last = self.shard_read_bytes_total().await;
+        let mut stable = 0;
+        for _ in 0..60 {
+            sleep(Duration::from_millis(500)).await;
+            let current = self.shard_read_bytes_total().await;
+            if current == last {
+                stable += 1;
+                if stable >= REQUIRED_STABLE_SAMPLES {
+                    return Ok(current);
+                }
+            } else {
+                stable = 0;
+                last = current;
+            }
+        }
+        Err("timed out waiting for shard-read byte counter to settle".into())
     }
 
     async fn reader_path_total(&self, path: &str, object_class: &str, size_bucket: &str) -> u64 {
@@ -321,6 +367,7 @@ async fn handle_metric_export(
     decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
+    shard_read_values: MetricValues,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != "/v1/metrics" {
         return Ok(response(StatusCode::NOT_FOUND));
@@ -354,7 +401,9 @@ async fn handle_metric_export(
             let mut decode_values = decode_values.lock().await;
             let mut fallback_values = fallback_values.lock().await;
             let mut decode_error_values = decode_error_values.lock().await;
+            let mut shard_read_values = shard_read_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
+            record_shard_read_bytes_metrics(&export, &mut shard_read_values);
             record_msgpack_decode_metrics(&export, &mut decode_values);
             record_msgpack_fallback_metrics(&export, &mut fallback_values);
             record_msgpack_decode_error_metrics(&export, &mut decode_error_values);
@@ -373,6 +422,50 @@ fn response(status: StatusCode) -> Response<Full<Bytes>> {
 
 fn reader_path_metric_key(path: &str, object_class: &str, size_bucket: &str) -> String {
     format!("{path}\u{1f}{object_class}\u{1f}{size_bucket}")
+}
+
+/// Accumulates `SHARD_READ_BYTES_COUNTER` across all label sets. Only the total
+/// matters: it is the number of physical bytes the erasure layer actually pulled
+/// from disk, which is what separates a bounded per-part read from a decode of
+/// the whole object.
+fn record_shard_read_bytes_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    for resource_metrics in &export.resource_metrics {
+        for scope_metrics in &resource_metrics.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                if metric.name != SHARD_READ_BYTES_COUNTER {
+                    continue;
+                }
+                let Some(metric::Data::Sum(sum)) = &metric.data else {
+                    continue;
+                };
+                for point in &sum.data_points {
+                    let Some(number_data_point::Value::AsInt(value)) = point.value.as_ref() else {
+                        continue;
+                    };
+                    let value = u64::try_from(*value).unwrap_or_default();
+                    // Keyed by labels, not by position: point order within an export
+                    // is not guaranteed stable, so an index key would alias distinct
+                    // series across batches.
+                    let key = format!(
+                        "{}\u{1f}{}\u{1f}{}",
+                        attribute_string(&point.attributes, "path").unwrap_or_default(),
+                        attribute_string(&point.attributes, "role").unwrap_or_default(),
+                        attribute_string(&point.attributes, "outcome").unwrap_or_default(),
+                    );
+                    values
+                        .entry(key)
+                        .or_default()
+                        .entry(point.start_time_unix_nano)
+                        .and_modify(|current| {
+                            if point.time_unix_nano >= current.0 {
+                                *current = (point.time_unix_nano, value);
+                            }
+                        })
+                        .or_insert((point.time_unix_nano, value));
+                }
+            }
+        }
+    }
 }
 
 fn record_reader_path_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
@@ -1828,35 +1921,118 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
     Ok(())
 }
 
+/// Multipart disk compression is live again, so a compression-enabled cluster classifies multipart objects as compressed and the roundtrip (full GET plus partNumber GET) must still return the original bytes.
+/// Reverting the multipart compression fix must fail this test.
 #[tokio::test]
 #[serial]
-async fn four_node_multipart_ignores_disk_compression_fallback() -> TestResult {
+async fn four_node_multipart_disk_compression_roundtrip() -> TestResult {
     init_logging();
 
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     cluster.start().await?;
 
-    let bucket = "inline-multipart-compression-fallback";
+    let bucket = "inline-multipart-compression-roundtrip";
     cluster.create_test_bucket(bucket).await?;
     let client = cluster.create_s3_client(0)?;
-    let key = "multipart/compression-disabled.txt";
+    let key = "multipart/compressed.txt";
     let (body, second_part, etag) = put_two_part_multipart(&client, bucket, key).await?;
 
     assert_reader_path(
         &collector,
         &client,
-        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, MULTIPART),
+        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, COMPRESSED),
     )
     .await?;
     assert_part_number_reader_path(
         &collector,
         &client,
-        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), MULTIPART, LEGACY_DUPLEX),
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), COMPRESSED, LEGACY_DUPLEX),
     )
     .await?;
+
+    Ok(())
+}
+
+/// A tail range over a compressed multipart object must read only the physical
+/// data it needs, not decode the object from byte zero.
+///
+/// The byte-exactness tests around this one stay green even if the seek path
+/// regresses into decoding from the start of the object: the bytes returned are
+/// still correct, only the read amplification explodes. This asserts the cost
+/// side, using `SHARD_READ_BYTES_COUNTER` — already emitted per shard read by the
+/// erasure layer, so no production code is instrumented for the test.
+///
+/// `get_compressed_offsets` skips whole preceding parts by their stored size and
+/// then seeks inside the covering part via its compression index, so a bounded
+/// read costs on the order of the covering part's block size against a ~5 MiB
+/// object.
+#[tokio::test]
+#[serial]
+async fn four_node_compressed_multipart_tail_range_reads_are_bounded() -> TestResult {
+    init_logging();
+
+    let collector = OtlpMetricCollector::start().await?;
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    configure_reader_metric_cluster(&mut cluster, &collector);
+    cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
+    cluster.start().await?;
+
+    let bucket = "inline-multipart-compression-tail-range";
+    cluster.create_test_bucket(bucket).await?;
+    let client = cluster.create_s3_client(0)?;
+    let key = "multipart/tail-range.txt";
+    let (body, _second_part, etag) = put_two_part_multipart(&client, bucket, key).await?;
+
+    // Establish that the object really took the compressed read path; otherwise a
+    // small delta below would only prove compression never happened.
+    assert_reader_path(
+        &collector,
+        &client,
+        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, COMPRESSED),
+    )
+    .await?;
+
+    let baseline = collector.wait_for_shard_read_bytes_to_settle().await?;
+
+    let tail_len = 4 * KIB;
+    let start = body.len() - tail_len;
+    let end = body.len() - 1;
+    let range = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(format!("bytes={start}-{end}"))
+        .send()
+        .await?;
+    let tail = range.body.collect().await?.into_bytes();
+    assert_eq!(tail.as_ref(), &body[start..], "tail range returned wrong bytes");
+
+    let after = collector.wait_for_shard_read_bytes_to_settle().await?;
+    let read_bytes = after.saturating_sub(baseline);
+
+    // A zero delta means the window caught nothing — an unexported counter, or a
+    // read served without touching the erasure layer — which would make the upper
+    // bound vacuously true. Fail instead of passing blind.
+    assert!(
+        read_bytes > 0,
+        "no shard reads observed for the tail range; the budget assertion below would be vacuous"
+    );
+
+    // Part 1 alone is MPU_PART_1_SIZE, so a whole-object decode cannot come in
+    // under it. Half the logical size leaves generous headroom for erasure padding
+    // and unrelated background reads while still failing loudly on a full decode.
+    let budget = (body.len() / 2) as u64;
+    assert!(
+        read_bytes < budget,
+        "tail range read {read_bytes} physical bytes for a {tail_len}-byte range (budget {budget}, object {} bytes): \
+         the read is not bounded to the covering part",
+        body.len()
+    );
 
     Ok(())
 }
@@ -1871,6 +2047,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
     configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
     cluster.start().await?;
 
@@ -1890,14 +2067,21 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
         ReaderPathExpectation::for_class(
             ReaderObject::new(bucket, multipart_key, &multipart_body, multipart_etag.as_deref(), None),
             LEGACY_DUPLEX,
-            MULTIPART,
+            COMPRESSED,
         ),
     )
     .await?;
     assert_part_number_reader_path(
         &collector,
         &client,
-        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
+        PartNumberReaderPathExpectation::new(
+            bucket,
+            multipart_key,
+            &second_part,
+            multipart_body.len(),
+            COMPRESSED,
+            LEGACY_DUPLEX,
+        ),
     )
     .await?;
     assert_msgpack_decode_observed(&collector, &decode_before).await?;
@@ -2353,7 +2537,11 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     hot_client.create_bucket().bucket(bucket).send().await?;
     put_lifecycle_with_transition_retry(&hot_client, bucket, &tier_name).await?;
 
-    let key = "transition/mixed-multipart.bin";
+    // `.zip` sits on the disk-compression exclusion list: this test pins
+    // msgpack compat controls across ILM transition, and a compressed object
+    // would classify as `compressed` instead of `remote` (and the warm-tier
+    // read path does not decode compression — tracked separately).
+    let key = "transition/mixed-multipart.zip";
     let (body, second_part, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
     wait_for_transition(&hot_client, bucket, key, &tier_name).await?;
     assert!(

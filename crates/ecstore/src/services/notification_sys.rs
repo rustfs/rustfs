@@ -44,12 +44,14 @@ const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
+const EVENT_NOTIFICATION_CAPABILITY_PROBE: &str = "notification_capability_probe";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
 const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -95,15 +97,15 @@ lazy_static! {
 }
 
 #[derive(Clone)]
-struct RemoteVersionStateFleetProof {
+struct FleetCapabilityProof {
     topology_fingerprint: String,
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
     expires_at: Instant,
 }
 
-impl RemoteVersionStateFleetProof {
-    fn token(&self) -> RemoteVersionStateFleetProofToken {
-        RemoteVersionStateFleetProofToken {
+impl FleetCapabilityProof {
+    fn token(&self) -> FleetCapabilityProofToken {
+        FleetCapabilityProofToken {
             topology_fingerprint: self.topology_fingerprint.clone(),
             peer_epochs: self.peer_epochs.clone(),
         }
@@ -111,37 +113,41 @@ impl RemoteVersionStateFleetProof {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct RemoteVersionStateFleetProofToken {
+struct FleetCapabilityProofToken {
     topology_fingerprint: String,
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
 }
 
 #[derive(Default)]
-struct RemoteVersionStateFleetProofState {
-    proof: Option<RemoteVersionStateFleetProof>,
+struct FleetCapabilityProofState {
+    proof: Option<FleetCapabilityProof>,
     topology_conflict: bool,
 }
 
-static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<RemoteVersionStateFleetProofState>> = OnceLock::new();
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RemoteVersionStateFleetProofToken(FleetCapabilityProofToken);
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrossPoolFenceFleetProofToken(FleetCapabilityProofToken);
+
+static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
 
-fn remote_version_state_fleet_proof_slot() -> &'static std::sync::RwLock<RemoteVersionStateFleetProofState> {
-    REMOTE_VERSION_STATE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(RemoteVersionStateFleetProofState::default()))
+fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    CROSS_POOL_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
-fn replace_remote_version_state_fleet_proof(proof: Option<RemoteVersionStateFleetProof>) {
-    replace_remote_version_state_fleet_proof_in(remote_version_state_fleet_proof_slot(), proof);
+fn remote_version_state_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    REMOTE_VERSION_STATE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
-fn replace_remote_version_state_fleet_proof_in(
-    slot: &std::sync::RwLock<RemoteVersionStateFleetProofState>,
-    proof: Option<RemoteVersionStateFleetProof>,
-) {
+fn replace_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>, proof: Option<FleetCapabilityProof>) {
     slot.write().unwrap_or_else(std::sync::PoisonError::into_inner).proof = proof;
 }
 
-fn publish_remote_version_state_probe_result(
-    slot: &std::sync::RwLock<RemoteVersionStateFleetProofState>,
+fn publish_fleet_capability_probe_result(
+    slot: &std::sync::RwLock<FleetCapabilityProofState>,
     topology_fingerprint: &str,
     result: Result<BTreeMap<String, Uuid>>,
     observed_at: Instant,
@@ -155,7 +161,7 @@ fn publish_remote_version_state_probe_result(
                 .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
                 .map(|proof| Arc::clone(&proof.peer_epochs))
                 .unwrap_or_else(|| Arc::new(peer_epochs));
-            state.proof = Some(RemoteVersionStateFleetProof {
+            state.proof = Some(FleetCapabilityProof {
                 topology_fingerprint: topology_fingerprint.to_string(),
                 peer_epochs,
                 expires_at: observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
@@ -163,7 +169,7 @@ fn publish_remote_version_state_probe_result(
             None
         }
         Err(err) => {
-            replace_remote_version_state_fleet_proof_in(slot, None);
+            replace_fleet_capability_proof(slot, None);
             Some(err)
         }
     }
@@ -174,27 +180,60 @@ pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersion
     let state = remote_version_state_fleet_proof_slot()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    acquire_remote_version_state_fleet_proof_from(&state, expected_topology, Instant::now())
+    acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(RemoteVersionStateFleetProofToken)
 }
 
-fn acquire_remote_version_state_fleet_proof_from(
-    state: &RemoteVersionStateFleetProofState,
+fn acquire_fleet_capability_proof_from(
+    state: &FleetCapabilityProofState,
     expected_topology: &str,
     now: Instant,
-) -> Option<RemoteVersionStateFleetProofToken> {
-    if state.topology_conflict || !remote_version_state_fleet_proof_valid_at(state.proof.as_ref(), expected_topology, now) {
+) -> Option<FleetCapabilityProofToken> {
+    if state.topology_conflict || !fleet_capability_proof_valid_at(state.proof.as_ref(), expected_topology, now) {
         return None;
     }
-    state.proof.as_ref().map(RemoteVersionStateFleetProof::token)
+    state.proof.as_ref().map(FleetCapabilityProof::token)
 }
 
 pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStateFleetProofToken) -> bool {
+    fleet_capability_proof_matches(remote_version_state_fleet_proof_slot(), &proof.0)
+}
+
+pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = cross_pool_fence_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(CrossPoolFenceFleetProofToken)
+}
+
+pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToken) -> bool {
+    fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(current) = state.proof.as_ref() else {
+        return false;
+    };
+    state.proof = Some(FleetCapabilityProof {
+        topology_fingerprint: current.topology_fingerprint.clone(),
+        peer_epochs: Arc::new(current.peer_epochs.as_ref().clone()),
+        expires_at: current.expires_at,
+    });
+    true
+}
+
+fn fleet_capability_proof_matches(
+    slot: &std::sync::RwLock<FleetCapabilityProofState>,
+    proof: &FleetCapabilityProofToken,
+) -> bool {
     let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
         return false;
     };
-    let state = remote_version_state_fleet_proof_slot()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = slot.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     if state.topology_conflict {
         return false;
     }
@@ -206,12 +245,40 @@ pub(crate) fn remote_version_state_fleet_proof_matches(proof: &RemoteVersionStat
     })
 }
 
-fn remote_version_state_fleet_proof_valid_at(
-    proof: Option<&RemoteVersionStateFleetProof>,
-    expected_topology: &str,
-    now: Instant,
-) -> bool {
+fn fleet_capability_proof_valid_at(proof: Option<&FleetCapabilityProof>, expected_topology: &str, now: Instant) -> bool {
     proof.is_some_and(|proof| proof.topology_fingerprint == expected_topology && now < proof.expires_at)
+}
+
+#[cfg(test)]
+pub(crate) struct RemoteVersionStateFleetProofGuard;
+
+#[cfg(test)]
+impl Drop for RemoteVersionStateFleetProofGuard {
+    fn drop(&mut self) {
+        replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_remote_version_state_fleet_proof_for_test(topology_fingerprint: &str) -> RemoteVersionStateFleetProofGuard {
+    match REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.to_string()) {
+        Ok(()) => {}
+        Err(_)
+            if REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+                .get()
+                .is_some_and(|current| current == topology_fingerprint) => {}
+        Err(_) => panic!("remote version state test topology is already bound to another fingerprint"),
+    }
+    let peer_epochs = BTreeMap::new();
+    if let Some(err) = publish_fleet_capability_probe_result(
+        remote_version_state_fleet_proof_slot(),
+        topology_fingerprint,
+        Ok(peer_epochs),
+        Instant::now(),
+    ) {
+        panic!("test proof installation must not fail: {err}");
+    }
+    RemoteVersionStateFleetProofGuard
 }
 
 fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, peer: String, epoch: Uuid) -> Result<()> {
@@ -224,11 +291,11 @@ fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, pe
 pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.clone()).is_err() {
         if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() != Some(&topology_fingerprint) {
-            let mut state = remote_version_state_fleet_proof_slot()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.topology_conflict = true;
-            state.proof = None;
+            for slot in [remote_version_state_fleet_proof_slot(), cross_pool_fence_fleet_proof_slot()] {
+                let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.topology_conflict = true;
+                state.proof = None;
+            }
         }
         return;
     }
@@ -249,19 +316,47 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 }
                 None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
             };
+            let fence_result = match get_global_notification_sys() {
+                Some(notification_sys) => timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
+                None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
+            };
             let topology_conflict = remote_version_state_fleet_proof_slot()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .topology_conflict;
             if topology_conflict {
-                replace_remote_version_state_fleet_proof(None);
-            } else if let Some(err) = publish_remote_version_state_probe_result(
+                replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
+                replace_fleet_capability_proof(cross_pool_fence_fleet_proof_slot(), None);
+            } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
                 result,
                 Instant::now(),
             ) {
                 debug!(error = %err, "remote version state fleet capability probe failed closed");
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    cross_pool_fence_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    fence_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "cross_pool_fence_v1",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
             }
             sleep(REMOTE_VERSION_STATE_PROBE_INTERVAL).await;
         }
@@ -326,6 +421,27 @@ impl NotificationSys {
         let mut peer_epochs = BTreeMap::new();
         for result in join_all(probes).await {
             let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
+    }
+
+    async fn probe_cross_pool_fence_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("cross-pool fence capability fleet membership is incomplete"));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("cross-pool fence capability peer is unreachable"))?;
+            client.probe_cross_pool_fence(topology_fingerprint.to_string()).await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, version, epoch) = result?;
+            if version < CROSS_POOL_FENCE_SUPPORTED_VERSION {
+                return Err(Error::other("cross-pool fence capability version is unsupported"));
+            }
             insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
         }
         Ok(peer_epochs)
@@ -1507,6 +1623,7 @@ impl NotificationSys {
         workers.peers.remove(host);
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn tier_config_reload_worker_active(&self, host: &str) -> bool {
         self.tier_config_reload_workers
             .lock()
@@ -1680,6 +1797,7 @@ where
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn call_peer_with_timeout<F, Fut>(
     timeout_dur: Duration,
     host_label: &str,
@@ -2145,16 +2263,16 @@ mod tests {
         let now = Instant::now();
         let mut peer_epochs = BTreeMap::new();
         peer_epochs.insert("peer-a".to_string(), Uuid::new_v4());
-        let proof = RemoteVersionStateFleetProof {
+        let proof = FleetCapabilityProof {
             topology_fingerprint: "topology-a".to_string(),
             peer_epochs: Arc::new(peer_epochs),
             expires_at: now + Duration::from_secs(1),
         };
 
-        assert!(remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", now));
-        assert!(!remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-b", now));
-        assert!(!remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", proof.expires_at));
-        assert!(!remote_version_state_fleet_proof_valid_at(None, "topology-a", now));
+        assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
+        assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-b", now));
+        assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-a", proof.expires_at));
+        assert!(!fleet_capability_proof_valid_at(None, "topology-a", now));
     }
 
     #[test]
@@ -2168,25 +2286,25 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_accepts_single_node_membership() {
         let now = Instant::now();
-        let proof = RemoteVersionStateFleetProof {
+        let proof = FleetCapabilityProof {
             topology_fingerprint: "topology-a".to_string(),
             peer_epochs: Arc::new(BTreeMap::new()),
             expires_at: now + Duration::from_secs(1),
         };
 
-        assert!(remote_version_state_fleet_proof_valid_at(Some(&proof), "topology-a", now));
+        assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
     }
 
     #[test]
     fn remote_version_state_fleet_proof_token_changes_with_process_epoch() {
         let now = Instant::now();
-        let proof = RemoteVersionStateFleetProof {
+        let proof = FleetCapabilityProof {
             topology_fingerprint: "topology-a".to_string(),
             peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
             expires_at: now + Duration::from_secs(1),
         };
         let captured = proof.token();
-        let restarted = RemoteVersionStateFleetProof {
+        let restarted = FleetCapabilityProof {
             topology_fingerprint: proof.topology_fingerprint.clone(),
             peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
             expires_at: proof.expires_at,
@@ -2197,11 +2315,11 @@ mod tests {
 
     #[test]
     fn remote_version_state_fleet_proof_renewal_preserves_only_same_epoch_token() {
-        let slot = std::sync::RwLock::new(RemoteVersionStateFleetProofState::default());
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
         let now = Instant::now();
         let epoch = Uuid::new_v4();
         let peers = BTreeMap::from([("peer-a".to_string(), epoch)]);
-        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peers.clone()), now).is_none());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers.clone()), now).is_none());
         let original = slot
             .read()
             .expect("proof slot should not poison")
@@ -2210,9 +2328,7 @@ mod tests {
             .expect("successful probe should publish proof")
             .token();
 
-        assert!(
-            publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peers), now + Duration::from_millis(1)).is_none()
-        );
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now + Duration::from_millis(1)).is_none());
         let renewed = slot
             .read()
             .expect("proof slot should not poison")
@@ -2224,8 +2340,7 @@ mod tests {
 
         let restarted = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
         assert!(
-            publish_remote_version_state_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(2))
-                .is_none()
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted), now + Duration::from_millis(2)).is_none()
         );
         let replaced = slot
             .read()
@@ -2240,18 +2355,18 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_conflict_revokes_atomic_snapshot() {
         let now = Instant::now();
-        let mut state = RemoteVersionStateFleetProofState {
-            proof: Some(RemoteVersionStateFleetProof {
+        let mut state = FleetCapabilityProofState {
+            proof: Some(FleetCapabilityProof {
                 topology_fingerprint: "topology-a".to_string(),
                 peer_epochs: Arc::new(BTreeMap::new()),
                 expires_at: now + Duration::from_secs(1),
             }),
             topology_conflict: false,
         };
-        assert!(acquire_remote_version_state_fleet_proof_from(&state, "topology-a", now).is_some());
+        assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_some());
 
         state.topology_conflict = true;
-        assert!(acquire_remote_version_state_fleet_proof_from(&state, "topology-a", now).is_none());
+        assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_none());
     }
 
     #[test]
@@ -2267,19 +2382,19 @@ mod tests {
 
     #[test]
     fn remote_version_state_fleet_probe_failure_revokes_previous_proof() {
-        let slot = std::sync::RwLock::new(RemoteVersionStateFleetProofState::default());
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
         let now = Instant::now();
         let peer_epochs = BTreeMap::from([("node-a:9000".to_string(), Uuid::new_v4())]);
-        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
         assert!(slot.read().expect("proof slot should not poison").proof.is_some());
 
         assert!(
-            publish_remote_version_state_probe_result(&slot, "topology-a", Err(Error::other("peer unavailable")), now,).is_some()
+            publish_fleet_capability_probe_result(&slot, "topology-a", Err(Error::other("peer unavailable")), now,).is_some()
         );
         assert!(slot.read().expect("proof slot should not poison").proof.is_none());
 
         let peer_epochs = BTreeMap::from([("node-a:9000".to_string(), Uuid::new_v4())]);
-        assert!(publish_remote_version_state_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peer_epochs), now).is_none());
         assert!(slot.read().expect("proof slot should not poison").proof.is_some());
     }
 

@@ -635,6 +635,38 @@ mod tests {
         assert!(!should_use_existing_delete_replication_info(false, false));
     }
 
+    /// P1-20 truth-table pin (rustfs/backlog#1675): without any reset in play
+    /// (no per-target reset header on the object, empty reset id on the
+    /// target) the existing-object resync decision compensates exactly the
+    /// never-replicated objects — Empty replicates, any recorded status does
+    /// not.
+    #[test]
+    fn resync_target_without_reset_replicates_only_empty_status() {
+        let user_defined = HashMap::new();
+        let object = ReplicationResyncTargetObject {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: &user_defined,
+        };
+
+        for (status, expected) in [
+            (ReplicationStatusType::Empty, true),
+            (ReplicationStatusType::Completed, false),
+            // "COMPLETE" on disk parses to this legacy variant, so objects
+            // written by older versions reach the decision through it.
+            (ReplicationStatusType::CompletedLegacy, false),
+            (ReplicationStatusType::Pending, false),
+            (ReplicationStatusType::Failed, false),
+            (ReplicationStatusType::Replica, false),
+        ] {
+            let label = format!("{status:?}");
+            let decision = resync_target_for_object(&object, "arn:target", "", None, status);
+            assert_eq!(
+                decision.replicate, expected,
+                "existing-object resync without a reset must replicate only never-replicated objects (status {label})"
+            );
+        }
+    }
+
     #[test]
     fn resync_target_includes_object_at_reset_before_boundary() {
         let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);

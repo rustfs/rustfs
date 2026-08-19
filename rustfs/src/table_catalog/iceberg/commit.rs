@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::super::*;
 
 pub(crate) fn commit_log_matches_request(commit_log: &CommitLogEntry, request: &TableCommitRequest, table_id: &str) -> bool {
@@ -37,6 +39,64 @@ pub(crate) fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitL
     table.table_id == commit_log.table_id
         && table.metadata_location == commit_log.previous_metadata_location
         && table.version_token == commit_log.expected_version_token
+}
+
+pub(crate) struct TableCommitHistoryIndex<'a> {
+    table_id: &'a str,
+    reachable_states: BTreeSet<(&'a str, &'a str)>,
+    ambiguous_states: BTreeSet<(&'a str, &'a str)>,
+    cycle_detected: bool,
+}
+
+impl<'a> TableCommitHistoryIndex<'a> {
+    pub(crate) fn new(table: &'a TableEntry, commits: impl IntoIterator<Item = &'a CommitLogEntry>) -> Self {
+        let mut by_new_state = BTreeMap::<(&str, &str), Option<(&str, &str)>>::new();
+        let mut ambiguous_states = BTreeSet::new();
+        for commit in commits
+            .into_iter()
+            .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
+        {
+            let key = (commit.new_metadata_location.as_str(), commit.new_version_token.as_str());
+            let previous = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
+            by_new_state
+                .entry(key)
+                .and_modify(|candidate| {
+                    *candidate = None;
+                    ambiguous_states.insert(key);
+                })
+                .or_insert(Some(previous));
+        }
+
+        let mut reachable_states = BTreeSet::new();
+        let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
+        let cycle_detected = loop {
+            if !reachable_states.insert(state) {
+                break true;
+            }
+            let Some(Some(previous)) = by_new_state.get(&state) else {
+                break false;
+            };
+            state = *previous;
+        };
+        Self {
+            table_id: &table.table_id,
+            reachable_states,
+            ambiguous_states,
+            cycle_detected,
+        }
+    }
+
+    pub(crate) fn proves_committed(&self, target: &CommitLogEntry) -> bool {
+        !self.cycle_detected
+            && self.table_id == target.table_id.as_str()
+            && !matches!(target.status, CommitLogStatus::Failed)
+            && !self
+                .ambiguous_states
+                .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
+            && self
+                .reachable_states
+                .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
+    }
 }
 
 pub(crate) fn table_catalog_recovery_summary(
@@ -76,7 +136,7 @@ pub(crate) fn table_catalog_recovery_summary(
     (metadata_status.unwrap_or(TableCatalogRecoveryStatus::Healthy), actions)
 }
 
-fn commit_logs_share_recovery_payload(left: &CommitLogEntry, right: &CommitLogEntry) -> bool {
+pub(crate) fn commit_logs_share_recovery_payload(left: &CommitLogEntry, right: &CommitLogEntry) -> bool {
     left.version == right.version
         && left.commit_id == right.commit_id
         && left.idempotency_key == right.idempotency_key
@@ -109,6 +169,7 @@ pub(crate) fn table_commit_recovery_entry(
     table: &TableEntry,
     commit_log: &CommitLogEntry,
     idempotency_commit: Option<&CommitLogEntry>,
+    historically_committed: bool,
 ) -> TableCommitRecoveryEntry {
     let idempotency_index_status = commit_idempotency_index_status(commit_log, idempotency_commit);
     let idempotency_index_present = matches!(
@@ -126,6 +187,11 @@ pub(crate) fn table_commit_recovery_entry(
         (
             TableCommitRecoveryState::ManualReview,
             "idempotency index points at a different commit payload".to_string(),
+        )
+    } else if matches!(commit_log.status, CommitLogStatus::Failed) {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "failed commit log cannot be finalized automatically".to_string(),
         )
     } else if table_matches_committed_log(table, commit_log) {
         if matches!(commit_log.status, CommitLogStatus::Committed) {
@@ -146,7 +212,12 @@ pub(crate) fn table_commit_recovery_entry(
                 "current table pointer already advanced but commit log is not finalized".to_string(),
             )
         }
-    } else if matches!(commit_log.status, CommitLogStatus::Committed) {
+    } else if matches!(commit_log.status, CommitLogStatus::Staged) && historically_committed {
+        (
+            TableCommitRecoveryState::FinalizationRequired,
+            "a later committed pointer proves this staged commit is part of table history".to_string(),
+        )
+    } else if matches!(commit_log.status, CommitLogStatus::Committed) && historically_committed {
         if idempotency_index_repair_required {
             (
                 TableCommitRecoveryState::IdempotencyIndexRepairRequired,
@@ -158,6 +229,11 @@ pub(crate) fn table_commit_recovery_entry(
                 "commit is finalized and may be older than the current table pointer".to_string(),
             )
         }
+    } else if matches!(commit_log.status, CommitLogStatus::Committed) {
+        (
+            TableCommitRecoveryState::ManualReview,
+            "committed log is not reachable from the current table pointer".to_string(),
+        )
     } else if table_matches_staged_base(table, commit_log) {
         (
             TableCommitRecoveryState::StagedBeforeTableUpdate,
@@ -193,9 +269,13 @@ pub(crate) fn record_table_commit_attempt(operation: &str) {
 fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &'static str {
     match result {
         Ok(_) => "success",
-        Err(TableCatalogStoreError::Conflict(_)) => "conflict",
+        Err(TableCatalogStoreError::Conflict(_) | TableCatalogStoreError::AlreadyExists(_)) => "conflict",
         Err(TableCatalogStoreError::Invalid(_)) => "invalid",
-        Err(TableCatalogStoreError::NotFound(_)) => "not_found",
+        Err(
+            TableCatalogStoreError::NotFound(_)
+            | TableCatalogStoreError::NamespaceNotFound(_)
+            | TableCatalogStoreError::TableNotFound(_),
+        ) => "not_found",
         Err(TableCatalogStoreError::Unsupported(_)) => "unsupported",
         Err(TableCatalogStoreError::Internal(_)) => "failure",
     }

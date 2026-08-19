@@ -103,6 +103,7 @@ pub enum StorageErrorCode {
     SourceStalled,
     Timeout,
     InvalidPath,
+    QuotaExceeded,
 }
 
 impl StorageErrorCode {
@@ -188,6 +189,7 @@ impl StorageErrorCode {
             Self::SourceStalled => 0x50,
             Self::Timeout => 0x51,
             Self::InvalidPath => 0x52,
+            Self::QuotaExceeded => 0x53,
         }
     }
 
@@ -273,6 +275,7 @@ impl StorageErrorCode {
             0x50 => Some(Self::SourceStalled),
             0x51 => Some(Self::Timeout),
             0x52 => Some(Self::InvalidPath),
+            0x53 => Some(Self::QuotaExceeded),
             _ => None,
         }
     }
@@ -347,6 +350,7 @@ mod tests {
         (StorageErrorCode::RebalanceAlreadyRunning, 0x40),
         (StorageErrorCode::OperationCanceled, 0x41),
         (StorageErrorCode::NamespaceLockQuorumUnavailable, 0x42),
+        (StorageErrorCode::QuotaExceeded, 0x53),
     ];
 
     const DISK_PRESERVATION_ERROR_CODES: &[(StorageErrorCode, u32)] = &[

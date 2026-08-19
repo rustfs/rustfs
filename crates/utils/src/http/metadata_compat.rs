@@ -14,6 +14,13 @@
 
 //! System metadata compatibility: write both x-rustfs-internal-* and x-minio-internal-*
 //! for MinIO interoperability. Read prefers RustFS, fallback to MinIO.
+//!
+//! This module is the canonical owner of these interop values. One deliberate
+//! copy exists: `crates/replication/src/http.rs` re-declares the subset it
+//! needs because the wire-contract crate must stay free of internal
+//! dependencies (arch guard in `scripts/check_architecture_migration_rules.sh`
+//! bans replication -> rustfs-utils). When changing a value here, check the
+//! pinned copy there; its tests pin the shared wire values byte-for-byte.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -23,6 +30,10 @@ pub const MINIO_INTERNAL_PREFIX: &str = "x-minio-internal-";
 // Key suffixes (lowercase, no prefix)
 pub const SUFFIX_INLINE_DATA: &str = "inline-data";
 pub const SUFFIX_DATA_MOVED: &str = "data-moved";
+/// Tags snapshot bound to a data-movement-owned target.
+pub const SUFFIX_DATA_MOVED_TAGS: &str = "data-moved-tags";
+/// Internal ownership marker for a data-movement multipart upload.
+pub const SUFFIX_DATA_MOVEMENT_UPLOAD: &str = "data-movement-upload";
 /// Transient flag for data movement
 pub const SUFFIX_DATA_MOV: &str = "data-mov";
 /// Transient flag for healing
@@ -37,6 +48,8 @@ pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";
 pub const SUFFIX_CRC: &str = "crc";
+/// JSON-encoded per-part S3 checksum maps retained across raw data movement.
+pub const SUFFIX_PART_CHECKSUMS: &str = "part-checksums";
 pub const SUFFIX_TRANSITION_STATUS: &str = "transition-status";
 pub const SUFFIX_TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const SUFFIX_TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
@@ -46,6 +59,7 @@ pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destina
 pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
+pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
@@ -125,8 +139,10 @@ pub fn internal_key_starts_with(key: &str, suffix_prefix: &str) -> bool {
 /// For keys like x-rustfs-internal-replication-reset-{arn}, strips the internal prefix and suffix_prefix,
 /// returning the remainder (e.g. "arn1"). Returns None if key does not match.
 pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Option<String> {
-    let rest = strip_internal_prefix(key)?;
-    rest.strip_prefix(suffix_prefix).map(|s| s.to_string())
+    let rest = strip_internal_prefix_preserving_case(key)?;
+    rest.get(..suffix_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(suffix_prefix))
+        .then(|| rest[suffix_prefix.len()..].to_string())
 }
 
 fn both_keys(suffix: &str) -> (String, String) {
@@ -520,6 +536,18 @@ mod tests {
         // A plain ASCII 'k' key still matches, and a non-matching suffix still fails.
         assert!(has_internal_suffix("x-rustfs-internal-tier-free-marker", SUFFIX_TIER_FV_MARKER));
         assert!(!has_internal_suffix(key, SUFFIX_COMPRESSION));
+    }
+
+    #[test]
+    fn internal_suffix_prefix_preserves_dynamic_identifier_case() {
+        assert_eq!(
+            internal_key_strip_suffix_prefix(
+                "X-Minio-Internal-Replication-Reset-arn:minio:replication::TenantA:bucket",
+                SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+            )
+            .as_deref(),
+            Some("arn:minio:replication::TenantA:bucket")
+        );
     }
 
     #[test]

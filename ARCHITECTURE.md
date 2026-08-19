@@ -1,6 +1,6 @@
 # ARCHITECTURE.md
 
-> Last updated: 2026-07-02 · Revision: 2
+> Last updated: 2026-08-12 · Revision: 3
 >
 > This document describes the high-level architecture of RustFS.
 > If you want to familiarize yourself with the code base, you are in the right place!
@@ -31,7 +31,7 @@ HTTP request
       → storage/ecfs (erasure coding, encryption, checksums)
         → ecstore (disk pool selection, data distribution)
           → rio (reader pipeline: encrypt → compress → hash → write)
-            → io-core (zero-copy I/O, buffer pool, direct I/O)
+            → io-core (buffer pool, storage profiling, admission control)
               → local disk / remote disk via RPC
 ```
 
@@ -55,7 +55,7 @@ rustfs/                      # Workspace root (virtual manifest)
 ├── crates/                  # library crates (authoritative list: Cargo.toml [workspace].members)
 │   ├── ecstore/             # Erasure-coded storage engine
 │   ├── rio/                 # Reader I/O pipeline (encrypt, compress, hash)
-│   ├── io-core/             # Zero-copy I/O, scheduling, buffer pool
+│   ├── io-core/             # Buffer pool, storage profiling, backpressure/deadlock policy, lock optimizer, operation progress
 │   ├── io-metrics/          # I/O metrics collection
 │   ├── common/              # Shared runtime state, globals, data usage types
 │   ├── config/              # Configuration types and parsing
@@ -101,7 +101,10 @@ refactors.
 
 The `rustfs` binary crate composes these libraries into the running server.
 `ecstore` remains the storage engine at the architectural center; its internal
-module split is tracked under `docs/architecture/`.
+module split is tracked under `docs/architecture/`. `rio-v2` is the
+feature-gated MinIO on-disk format compatibility I/O layer; it ships in no
+default build (lifecycle:
+[docs/architecture/minio-file-format-compat.md](docs/architecture/minio-file-format-compat.md)).
 
 ## Architecture Invariants
 
@@ -119,19 +122,44 @@ module split is tracked under `docs/architecture/`.
 
 3. **Each type has exactly one definition.** Types shared across crates must be defined
    in one crate and re-exported or imported by others.
-   - ⚠️ VIOLATED: `ReplicationStats` (4 copies), `LastMinuteLatency` (3 copies),
-     `BackpressureConfig` (3 copies), `DataUsageInfo` (2 copies).
+   - ⚠️ VIOLATED: `ReplicationStats` names three unrelated types
+     (`crates/data-usage/src/data_usage.rs`,
+     `crates/obs/src/metrics/collectors/replication.rs`,
+     `crates/ecstore/src/bucket/replication/replication_state.rs`) — a naming
+     collision, not copies; renaming is tracked in rustfs/backlog#1847.
+   - `LastMinuteLatency` has two deliberately different implementations: the
+     per-second bucketed accumulator in `crates/common/src/last_minute.rs` and
+     the in-memory endpoint-health sample tracker in
+     `crates/ecstore/src/bucket/bucket_target_sys.rs` (its doc comment explains
+     why it stays local).
+   - ✅ RESOLVED: `BackpressureConfig` and `DataUsageInfo` each have exactly one
+     definition (`crates/io-core/src/backpressure.rs`,
+     `crates/data-usage/src/data_usage.rs`). The zero-consumer
+     `BackpressureSettings` copy that lingered in io-metrics was removed
+     (rustfs/backlog#1833).
 
 4. **ecstore does not know about HTTP or S3 protocol details.** It operates on
    storage-level abstractions (objects, buckets, disks, pools).
+   - ⚠️ VIOLATED: 58 files under `crates/ecstore/src` reference `s3s`
+     (`rg -l 's3s' crates/ecstore/src | wc -l`), `crates/ecstore/src/client/`
+     is a ~9.4K-line embedded S3 HTTP client, and `crates/ecstore/Cargo.toml`
+     depends on `s3s`, `http`, `hyper`/`hyper-util`/`hyper-rustls`, and
+     `reqwest`. Target state: the engine's need to act as an S3 client
+     (tiering, replication targets) is served by an extracted client crate,
+     and ecstore holds no wire or DTO types.
 
 5. **The `rustfs` binary crate is the only place that wires everything together.**
    Individual crates should be testable in isolation.
 
 6. **Error types use `thiserror` with descriptive names** (e.g., `StorageError`,
    not bare `Error`).
-   - ⚠️ VIOLATED: 6 crates use `pub enum Error`; 2 crates use `snafu`;
-      `heal` use `anyhow` in library code.
+   - ✅ RESOLVED (strategy): `snafu` is gone from source
+     (`rg -l snafu crates/ rustfs/` is empty) and library code no longer uses
+     `anyhow` (remaining hits are test code and the `e2e_test` crate; `heal`
+     uses `thiserror`).
+   - ⚠️ VIOLATED (naming): 6 crates still export a bare `pub enum Error`:
+     `crypto`, `filemeta`, `heal`, `iam`, `policy`, and `replication`
+     (`src/resync.rs`) — all `thiserror`-derived.
 
 ## Known Structural Issues
 
@@ -140,13 +168,25 @@ module split is tracked under `docs/architecture/`.
 
 ### Critical
 
-- **common/scanner code duplication (~3K lines).** `scanner` depends on `common`
-  but maintains its own copies of `DataUsageInfo`, `LastMinuteLatency`, and related
-  types instead of importing them.
+- **scanner/data-usage duplicate `.usage-cache.bin` serialization types.** The
+  original finding ("common/scanner code duplication, ~3K lines") is resolved:
+  `scanner` imports the shared data-usage types from `rustfs-data-usage` (see
+  the `pub use rustfs_data_usage::…` re-exports at the top of
+  `crates/scanner/src/data_usage_define.rs`). What remains: `scanner` and
+  `data-usage` each hold their own serialization types for the scanner cache
+  file (`DataUsageCacheInfo`/`DataUsageEntryInfo` in
+  `crates/scanner/src/data_usage_define.rs` vs
+  `DataUsageCacheInfo`/`DataUsageEntry` in
+  `crates/data-usage/src/data_usage.rs`); convergence is tracked in
+  rustfs/backlog#1828.
 
-- **ecstore is a monolith (87K lines, 163 files).** It contains disk management,
-  bucket management, erasure coding, replication, lifecycle, RPC, and configuration
-  — all in one crate. It should be decomposed along its existing subdirectories.
+- **ecstore is a monolith (265 files, ~288K lines — roughly half is inline
+  `#[cfg(test)]` code).** Measured with
+  `find crates/ecstore/src -name '*.rs' | xargs wc -l`. It contains disk
+  management, bucket management, erasure coding, replication, lifecycle, RPC,
+  and configuration — all in one crate. It should be decomposed along its
+  existing subdirectories; the split plan lives in
+  [docs/architecture/ecstore-module-split-plan.md](docs/architecture/ecstore-module-split-plan.md).
 
 ### High
 
@@ -154,19 +194,26 @@ module split is tracked under `docs/architecture/`.
   `common → filemeta/madmin` edges must stay removed so leaf/helper crates do
   not regain upward dependencies.
 
-- **Three-layer BackpressureConfig/DeadlockConfig duplication** across io-core,
-  concurrency, and `rustfs/src/storage`. Storage policies now expose and consume
-  explicit projections into the concurrency/io-core policy shapes, and workload
+- **Three-layer backpressure/deadlock policy bridging** across io-core,
+  concurrency, and `rustfs/src/storage`. The config types are no longer
+  duplicated (`BackpressureConfig` and `DeadlockDetectorConfig` are each
+  defined once, in io-core). Storage policies expose and consume explicit
+  projections into the concurrency/io-core policy shapes, and workload
   admission snapshots are composed through provider registries; later work
   should use those bridges before deleting compatibility wrappers.
 
 ### Medium
 
-- **Inconsistent error handling.** Three strategies (thiserror/snafu/anyhow) and
-  mixed naming (bare `Error` vs descriptive names).
+- **Bare `Error` naming.** Error-handling strategy has converged on `thiserror`
+  (no `snafu`, no `anyhow` in library code); the remaining inconsistency is the
+  bare `pub enum Error` naming in the 6 crates listed under Invariant 6.
 
-- **Ambiguous common vs utils boundary.** Both described as "utilities and data
-  structures." Need clear ownership rules.
+- **`common` is mostly parked domain code, not shared utilities.** Of its
+  6,724 lines, ~83% is scanner/heal domain code stranded there to break
+  dependency cycles (`metrics.rs`, ~4,810 lines of scanner-domain metrics;
+  `heal_channel.rs`, ~776 lines of heal-domain channel types). The
+  "common vs utils" naming ambiguity is secondary to moving that code to its
+  domain owners.
 
 ## Cross-Cutting Concerns
 
@@ -232,7 +279,7 @@ The binary (`main.rs`) boots in this order:
 
 ```
                             ┌─────────┐
-                            │  rustfs │  (binary + lib, 75K lines)
+                            │  rustfs │  (binary + lib)
                             │  main   │
                             └────┬────┘
                                  │
@@ -255,7 +302,7 @@ The binary (`main.rs`) boots in this order:
               │                  │                  │
         ┌─────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐
         │  ecstore   │    │     rio     │    │   io-core   │
-        │ (87K,core) │    │  (readers)  │    │ (zero-copy) │
+        │   (core)   │    │  (readers)  │    │ (buffers)   │
         └─────┬──────┘    └─────────────┘    └─────────────┘
               │
      ┌─────┬──┼──┬─────┬──────┐
@@ -267,7 +314,7 @@ The binary (`main.rs`) boots in this order:
 
 - **"Where does S3 PutObject go?"**
   `server/` routes → `app/object_usecase` validates → `storage/ecfs` encodes →
-  `ecstore` distributes → `rio` encrypts/compresses → `io-core` writes
+  `ecstore` distributes → `rio` encrypts/compresses → `io-core` supplies buffers
 
 - **"Where are bucket policies enforced?"**
   `app/bucket_usecase` calls into `crates/policy/`

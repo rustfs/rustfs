@@ -19,11 +19,12 @@ use crate::heal::{
     resume::{
         CheckpointManager, ReplacementPhase, ReplacementTargetIdentity, ResumeManager, replacement_target_identities_match,
     },
-    storage::{HealStorageAPI, next_heal_listing_token},
+    storage::{HealBucketUsageBaseline, HealStorageAPI, next_heal_listing_token},
 };
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -178,6 +179,17 @@ pub enum HealPriority {
     Urgent = 3,
 }
 
+impl HealPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+}
+
 /// Heal options
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealOptions {
@@ -196,7 +208,7 @@ pub struct HealOptions {
     /// Whether to skip namespace locking
     #[serde(default)]
     pub no_lock: bool,
-    /// Timeout
+    /// Aggregate execution timeout across recoverable manager retries
     pub timeout: Option<Duration>,
     /// pool index
     pub pool_index: Option<usize>,
@@ -339,6 +351,20 @@ impl HealRequest {
 }
 
 /// Heal task
+/// Incremental view over a task's retained result items (HS-06).
+///
+/// `next_seq` is the cursor a client should pass on its next poll; `min_seq`
+/// is the oldest sequence still retained; `lagged` means the client's cursor
+/// fell behind `min_seq` and items were skipped — the client should restart
+/// from `min_seq`.
+#[derive(Debug, Clone)]
+pub struct HealResultWindow {
+    pub items: Vec<HealResultItem>,
+    pub next_seq: u64,
+    pub min_seq: u64,
+    pub lagged: bool,
+}
+
 pub struct HealTask {
     /// Task ID
     pub id: String,
@@ -361,8 +387,16 @@ pub struct HealTask {
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
     pub progress: Arc<RwLock<HealProgress>>,
-    /// Result items collected from storage heal calls.
-    pub result_items: Arc<RwLock<Vec<HealResultItem>>>,
+    /// Result items collected from storage heal calls, each stamped with a
+    /// monotonically increasing sequence number for incremental consumption
+    /// (the client passes the last seen seq back and receives only newer
+    /// items; see `get_result_items_since`).
+    pub result_items: Arc<RwLock<Vec<(u64, HealResultItem)>>>,
+    /// Next sequence number to assign; starts at 1.
+    next_item_seq: Arc<AtomicU64>,
+    /// Sequence number of the oldest item still inside the retention window;
+    /// equals `next_item_seq` while the window is empty.
+    min_available_seq: Arc<AtomicU64>,
     result_items_truncated: Arc<AtomicBool>,
     batch_failure: Arc<RwLock<Option<BatchHealFailure>>>,
     batch_failure_recorded: Arc<AtomicBool>,
@@ -414,6 +448,8 @@ impl HealTask {
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
+            next_item_seq: Arc::new(AtomicU64::new(1)),
+            min_available_seq: Arc::new(AtomicU64::new(1)),
             result_items_truncated: Arc::new(AtomicBool::new(false)),
             batch_failure: Arc::new(RwLock::new(None)),
             batch_failure_recorded: Arc::new(AtomicBool::new(false)),
@@ -440,6 +476,14 @@ impl HealTask {
             created_at: self.created_at,
             enqueued_at: SystemTime::now(),
         }
+    }
+
+    pub(crate) async fn retry_request_with_remaining_timeout(&self) -> Result<HealRequest> {
+        let mut request = self.retry_request();
+        if self.options.timeout.is_some() {
+            request.options.timeout = self.remaining_timeout().await?;
+        }
+        Ok(request)
     }
 
     pub(crate) fn from_replacement_recovery_request(
@@ -488,6 +532,61 @@ impl HealTask {
                 _ => "global".to_string(),
             },
         }
+    }
+
+    fn emit_trace_task_state(&self, state: &'static str, duration: Duration, error: Option<&Error>) {
+        trace_emit(|| {
+            let mut event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealTask)
+                .with_duration(duration)
+                .with_attr("task_id", self.id.as_str())
+                .with_attr("heal_type", self.heal_type.log_kind())
+                .with_attr("state", state)
+                .with_attr("source", self.source.as_str())
+                .with_attr("priority", self.priority.as_str())
+                .with_attr("retry_attempts", u64::from(self.retry_attempts))
+                .with_attr("dry_run", self.options.dry_run);
+
+            event = match &self.heal_type {
+                HealType::Cluster => event,
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::Bucket { bucket } => event.with_bucket(bucket.as_str()),
+                HealType::Prefix { bucket, prefix } => event.with_bucket(bucket.as_str()).with_object(prefix.as_str()),
+                HealType::ErasureSet { buckets, set_disk_id } => {
+                    let bucket_count = u64::try_from(buckets.len()).unwrap_or(u64::MAX);
+                    event
+                        .with_attr("set_disk_id", set_disk_id.as_str())
+                        .with_attr("bucket_count", bucket_count)
+                }
+                HealType::Metadata { bucket, object } => event.with_bucket(bucket.as_str()).with_object(object.as_str()),
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    let event = event.with_bucket(bucket.as_str()).with_object(object.as_str());
+                    match version_id {
+                        Some(version_id) => event.with_attr("version_id", version_id.as_str()),
+                        None => event,
+                    }
+                }
+                HealType::MRF { meta_path } => event.with_object(meta_path.as_str()),
+            };
+
+            match error {
+                Some(error) => event.with_attr("error", error.to_string()),
+                None => event,
+            }
+        });
     }
 
     async fn remaining_timeout(&self) -> Result<Option<Duration>> {
@@ -597,7 +696,7 @@ impl HealTask {
                 | EcstoreError::ObjectNotFound(_, _)
                 | EcstoreError::VersionNotFound(_, _, _),
             ) => true,
-            Error::Other(message) | Error::IO(message) => {
+            Error::Other(message) => {
                 message.contains("File not found")
                     || message.contains("file not found")
                     || message.contains("File version not found")
@@ -709,6 +808,7 @@ impl HealTask {
             queue_delay = ?queue_delay,
             "Heal task started"
         });
+        self.emit_trace_task_state("started", Duration::ZERO, None);
 
         let result = match &self.heal_type {
             HealType::Cluster => self.heal_cluster().await,
@@ -797,6 +897,14 @@ impl HealTask {
             }
         }
 
+        let terminal_state = match &result {
+            Ok(_) => "completed",
+            Err(Error::TaskCancelled) => "cancelled",
+            Err(Error::TaskTimeout) => "timed_out",
+            Err(_) => "failed",
+        };
+        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), result.as_ref().err());
+
         result
     }
 
@@ -827,7 +935,45 @@ impl HealTask {
     }
 
     pub async fn get_result_items(&self) -> Vec<HealResultItem> {
+        self.result_items.read().await.iter().map(|(_, item)| item.clone()).collect()
+    }
+
+    /// Sequence-stamped retained window, used when archiving a completed
+    /// task so incremental cursors survive the transition (HS-06).
+    pub async fn get_seqed_result_items(&self) -> Vec<(u64, HealResultItem)> {
         self.result_items.read().await.clone()
+    }
+
+    /// Incremental result window (HS-06): `since = None` returns the full
+    /// retained window (legacy snapshot semantics); `since = Some(seq)`
+    /// returns only items stamped with a sequence greater than `seq`.
+    /// `lagged` warns that the caller's cursor fell behind the window start
+    /// and items were skipped (the response carries `min_seq` as the catch-up
+    /// cursor).
+    pub async fn get_result_items_since(&self, since: Option<u64>) -> HealResultWindow {
+        let result_items = self.result_items.read().await;
+        let next_seq = self.next_item_seq.load(Ordering::Relaxed);
+        let min_seq = self.min_available_seq.load(Ordering::Relaxed);
+        let mut lagged = false;
+        let items = match since {
+            None => result_items.iter().map(|(_, item)| item.clone()).collect::<Vec<_>>(),
+            Some(cursor) => {
+                if cursor + 1 < min_seq {
+                    lagged = true;
+                }
+                result_items
+                    .iter()
+                    .filter(|(seq, _)| *seq > cursor)
+                    .map(|(_, item)| item.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        HealResultWindow {
+            items,
+            next_seq,
+            min_seq,
+            lagged,
+        }
     }
 
     pub fn result_items_truncated(&self) -> bool {
@@ -835,10 +981,17 @@ impl HealTask {
     }
 
     async fn record_result_item(&self, result: HealResultItem) {
+        let seq = self.next_item_seq.fetch_add(1, Ordering::Relaxed);
         let mut result_items = self.result_items.write().await;
         if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {
-            result_items.push(result);
+            result_items.push((seq, result));
         } else {
+            // Slide the window: the oldest item leaves and the cursor for the
+            // oldest still-available item moves forward with it.
+            result_items.remove(0);
+            self.min_available_seq
+                .store(result_items.first().map_or(seq, |(oldest, _)| *oldest), Ordering::Relaxed);
+            result_items.push((seq, result));
             self.result_items_truncated.store(true, Ordering::Relaxed);
         }
     }
@@ -1527,7 +1680,7 @@ impl HealTask {
             let (objects, next_token, is_truncated) = self
                 .await_with_control(
                     self.storage
-                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref()),
+                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false),
                 )
                 .await?;
 
@@ -1686,6 +1839,23 @@ impl HealTask {
             result = "recursive_ok",
             "Heal bucket recursive pass completed"
         );
+        Ok(())
+    }
+
+    async fn apply_erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<()> {
+        let baseline = match self
+            .await_with_control(self.storage.erasure_set_usage_baseline(buckets))
+            .await
+        {
+            Ok(Some(baseline)) => baseline,
+            Ok(None) => return Ok(()),
+            Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
+            Err(_) => return Ok(()),
+        };
+
+        let HealBucketUsageBaseline { objects_count, bytes } = baseline;
+        let mut progress = self.progress.write().await;
+        progress.set_total_baseline(objects_count, bytes);
         Ok(())
     }
 
@@ -2290,6 +2460,8 @@ impl HealTask {
             None
         };
 
+        self.apply_erasure_set_usage_baseline(&buckets).await?;
+
         let healing_marker = format!("{set_disk_id}:{}", self.id);
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
             let state = resume_manager.get_state().await;
@@ -2594,7 +2766,8 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(4, 4, 0, 0);
+            let bytes_processed = progress.bytes_processed;
+            progress.update_progress(4, 4, 0, bytes_processed);
         }
 
         match result {
@@ -2650,12 +2823,43 @@ mod tests {
     use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
     use super::*;
     use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
+    use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, TraceSubscription, TraceVal, subscribe_trace_events};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     use super::super::storage_api::status::BucketInfo;
+
+    #[tokio::test]
+    async fn retry_request_carries_remaining_timeout_budget() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage::default());
+        let mut request = HealRequest::bucket("bucket".to_string());
+        request.options.timeout = Some(Duration::from_secs(100));
+        let task = HealTask::from_request(request, storage.clone());
+        *task.task_start_instant.write().await = Some(Instant::now() - Duration::from_secs(40));
+
+        let retry = task
+            .retry_request_with_remaining_timeout()
+            .await
+            .expect("first retry should retain the unused timeout budget");
+        let first_remaining = retry.options.timeout.expect("configured timeout should remain present");
+        assert!(first_remaining <= Duration::from_secs(60));
+        assert!(first_remaining > Duration::from_secs(59));
+
+        let retry_task = HealTask::from_request(retry, storage);
+        *retry_task.task_start_instant.write().await = Some(Instant::now() - Duration::from_secs(20));
+        let second_retry = retry_task
+            .retry_request_with_remaining_timeout()
+            .await
+            .expect("second retry should retain only the unused aggregate budget");
+        let second_remaining = second_retry
+            .options
+            .timeout
+            .expect("configured timeout should remain present");
+        assert!(second_remaining <= Duration::from_secs(40));
+        assert!(second_remaining > Duration::from_secs(39));
+    }
 
     #[test]
     fn format_result_requires_every_requested_target_to_be_ok() {
@@ -2997,6 +3201,147 @@ mod tests {
         assert!(!*storage.listed.lock().unwrap());
     }
 
+    #[tokio::test]
+    async fn cleanup_pending_recovery_removes_checkpoint_without_rebuild_work() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+        let identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![identity],
+        )
+        .await
+        .expect("terminal replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("terminal replacement proof should persist before cleanup");
+        resume_manager
+            .mark_replacement_cleanup_pending()
+            .await
+            .expect("failed cleanup must retain a cleanup-pending state");
+        CheckpointManager::new(anchor.clone(), task_id.clone())
+            .await
+            .expect("checkpoint fixture should persist");
+        assert!(
+            CheckpointManager::has_checkpoint(&anchor, &task_id).await,
+            "checkpoint fixture must exist before restart cleanup"
+        );
+
+        let storage = Arc::new(MockStorage {
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec!["replacement-a".to_string()];
+
+        HealTask::from_replacement_recovery_request(request, storage.clone(), Some(anchor.endpoint().to_string()))
+            .execute()
+            .await
+            .expect("cleanup-pending recovery must finish terminal cleanup");
+
+        assert!(
+            !CheckpointManager::has_checkpoint(&anchor, &task_id).await,
+            "terminal cleanup must remove the retained checkpoint"
+        );
+        assert!(
+            !ResumeManager::has_resume_state(&anchor, &task_id).await,
+            "terminal cleanup must remove the retained resume state"
+        );
+        assert_eq!(*storage.global_format_calls.lock().unwrap(), 0);
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "terminal checkpoint cleanup must not format replacement targets"
+        );
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+        assert!(!*storage.listed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn verified_recovery_keeps_state_when_marker_clear_fails() {
+        let temp = TempDir::new().expect("temporary resume disk directory should be created");
+        let anchor = make_resume_disk(&temp).await;
+        let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+        let target = format!("replacement-marker-missing-{task_id}");
+        let identity = replacement_identity(&target, &target, &format!("identity-{target}"));
+        let resume_manager = ResumeManager::new_replacement_intent(
+            anchor.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket-a".to_string()],
+            vec![target.clone()],
+            vec![identity],
+        )
+        .await
+        .expect("verified replacement state should persist on the survivor anchor");
+        resume_manager
+            .mark_replacement_completed_and_verified()
+            .await
+            .expect("verified state must persist proof before marker cleanup");
+
+        let storage = Arc::new(MockStorage {
+            replacement_resume_disk: Mutex::new(Some(anchor.clone())),
+            replacement_targets_ready: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                pool_index: Some(0),
+                set_index: Some(0),
+                ..HealOptions::default()
+            },
+            HealPriority::Low,
+        );
+        request.id = task_id.clone();
+        request.source = HealRequestSource::AutoHeal;
+        request.heal_endpoints = vec![target];
+
+        let error = HealTask::from_replacement_recovery_request(request, storage.clone(), Some(anchor.endpoint().to_string()))
+            .execute()
+            .await
+            .expect_err("marker clear failure must keep the durable terminal state retryable");
+
+        assert!(error.to_string().contains("healing marker target is unavailable"));
+        let state = ResumeManager::load_replacement_intent(anchor.clone(), &task_id)
+            .await
+            .expect("verified state must remain for retry after marker clear failure")
+            .get_state()
+            .await;
+        assert!(state.completed);
+        assert_eq!(state.replacement_phase, ReplacementPhase::Verified);
+        assert_eq!(*storage.global_format_calls.lock().unwrap(), 0);
+        assert!(
+            storage.replacement_format_calls.lock().unwrap().is_empty(),
+            "marker cleanup retry must not format replacement targets again"
+        );
+        assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+        assert!(!*storage.listed.lock().unwrap());
+    }
+
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
@@ -3024,6 +3369,8 @@ mod tests {
         block_heal_object: Mutex<bool>,
         resume_disk: Mutex<Option<DiskStore>>,
         replacement_resume_disk: Mutex<Option<DiskStore>>,
+        usage_baseline: Mutex<Option<HealBucketUsageBaseline>>,
+        usage_baseline_error: Mutex<bool>,
     }
 
     #[test]
@@ -3086,11 +3433,69 @@ mod tests {
         assert_eq!(samples_logged, MAX_BUCKET_FAILURE_LOG_SAMPLES);
     }
 
+    #[tokio::test]
+    async fn execute_emits_heal_trace_task_state() {
+        let mut trace = subscribe_trace_events();
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(
+            HealRequest::object("bucket-a".to_string(), "object-a".to_string(), Some("version-a".to_string())),
+            storage,
+        );
+
+        task.execute().await.expect("mock object heal should complete");
+
+        let started = recv_trace_task_state(&mut trace, &task.id, "started").await;
+        assert_eq!(started.kind, TraceKind::Heal);
+        assert_eq!(started.func, TraceFunc::HealTask);
+        assert_eq!(started.bucket.as_deref(), Some("bucket-a"));
+        assert_eq!(started.object.as_deref(), Some("object-a"));
+        assert_eq!(trace_attr_string(&started, "heal_type").as_deref(), Some("object"));
+        assert_eq!(trace_attr_string(&started, "source").as_deref(), Some("internal"));
+        assert_eq!(trace_attr_string(&started, "version_id").as_deref(), Some("version-a"));
+
+        let completed = recv_trace_task_state(&mut trace, &task.id, "completed").await;
+        assert_eq!(completed.kind, TraceKind::Heal);
+        assert_eq!(completed.func, TraceFunc::HealTask);
+        assert_eq!(trace_attr_string(&completed, "state").as_deref(), Some("completed"));
+    }
+
+    async fn recv_trace_task_state(trace: &mut TraceSubscription, task_id: &str, state: &str) -> TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
+                .await
+                .expect("trace event should arrive")
+                .expect("trace bus should stay open");
+            if trace_attr_string(&event, "task_id").as_deref() == Some(task_id)
+                && trace_attr_string(&event, "state").as_deref() == Some(state)
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected trace state {state} for task {task_id}");
+    }
+
+    fn trace_attr_string(event: &TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                TraceVal::Bool(value) => value.to_string(),
+                TraceVal::U64(value) => value.to_string(),
+                TraceVal::I64(value) => value.to_string(),
+                TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
     /// Build a latest, non-delete-marker heal list item with no version id.
     fn heal_item(name: &str) -> HealListItem {
         HealListItem {
             name: name.to_string(),
             version_id: None,
+            mod_time_unix_nanos: None,
+            lifecycle_object_info: None,
             is_delete_marker: false,
         }
     }
@@ -3176,6 +3581,13 @@ mod tests {
                 name: bucket.to_string(),
                 ..Default::default()
             }))
+        }
+
+        async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
+            if *self.usage_baseline_error.lock().unwrap() {
+                return Err(Error::Other("usage baseline unavailable".to_string()));
+            }
+            Ok(*self.usage_baseline.lock().unwrap())
         }
 
         async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
@@ -3361,6 +3773,7 @@ mod tests {
             bucket: &str,
             prefix: &str,
             continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
             self.listed_prefixes.lock().unwrap().push(prefix.to_string());
             if *self.truncate_without_token.lock().unwrap() {
@@ -3534,6 +3947,69 @@ mod tests {
 
         assert_eq!(task.get_result_items().await.len(), MAX_RETAINED_HEAL_RESULT_ITEMS);
         assert!(task.result_items_truncated());
+    }
+
+    // HS-06 (backlog#1870): incremental result windows.
+    #[tokio::test]
+    async fn result_items_seq_is_monotonic_and_incremental_slices_work() {
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(HealRequest::bucket("bucket-a".to_string()), storage);
+
+        for round in 0..5u64 {
+            let item = HealResultItem {
+                object_size: round as usize,
+                ..Default::default()
+            };
+            task.record_result_item(item).await;
+        }
+
+        let full = task.get_result_items_since(None).await;
+        assert_eq!(full.items.len(), 5, "None keeps the full-snapshot semantics");
+        assert_eq!(full.next_seq, 6, "next_seq is one past the last assigned");
+        assert_eq!(full.min_seq, 1, "nothing was evicted yet");
+        assert!(!full.lagged);
+
+        // Incremental: only items newer than the cursor.
+        let incremental = task.get_result_items_since(Some(3)).await;
+        assert_eq!(
+            incremental.items.iter().map(|item| item.object_size).collect::<Vec<_>>(),
+            vec![3, 4],
+            "only sequences greater than the cursor are returned"
+        );
+        assert_eq!(incremental.next_seq, 6);
+
+        // A cursor at the head is not lagging.
+        assert!(!task.get_result_items_since(Some(0)).await.lagged);
+    }
+
+    #[tokio::test]
+    async fn result_items_window_slide_moves_min_seq_and_flags_lagging_cursors() {
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(HealRequest::bucket("bucket-a".to_string()), storage);
+
+        // Fill the window completely, then push two more items: seq 1 and 2
+        // are evicted by the slide.
+        for _ in 0..(MAX_RETAINED_HEAL_RESULT_ITEMS + 2) {
+            task.record_result_item(HealResultItem::default()).await;
+        }
+
+        let full = task.get_result_items_since(None).await;
+        assert_eq!(full.items.len(), MAX_RETAINED_HEAL_RESULT_ITEMS);
+        assert_eq!(full.min_seq, 3, "each evicted head item moved the oldest-available cursor");
+        assert!(task.result_items_truncated());
+
+        // A client still polling from before the eviction is lagging.
+        let lagging = task.get_result_items_since(Some(0)).await;
+        assert!(lagging.lagged, "a cursor behind min_seq must be flagged");
+        assert_eq!(lagging.min_seq, 3, "the response tells the client where to restart");
+
+        // A cursor inside the window is fine.
+        assert!(!task.get_result_items_since(Some(3)).await.lagged);
+
+        // The lagging client restarts from min_seq and gets the full window.
+        let catch_up = task.get_result_items_since(Some(3)).await;
+        assert_eq!(catch_up.items.len(), MAX_RETAINED_HEAL_RESULT_ITEMS - 1);
+        assert!(!catch_up.lagged);
     }
 
     #[tokio::test]
@@ -4473,6 +4949,73 @@ mod tests {
         assert!(error.to_string().contains("injected bucket prepass failure"));
         assert_eq!(storage.bucket_heal_calls.lock().unwrap().as_slice(), ["bucket-a".to_string()]);
         assert!(storage.object_heal_opts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_applies_usage_baseline_to_progress() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
+                objects_count: 10,
+                bytes: 8,
+            })),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("erasure set heal should complete");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 10);
+        assert_eq!(progress.objects_total_size, 8);
+        assert_eq!(progress.bytes_processed, 2);
+        assert!((progress.progress_percentage - 25.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn erasure_set_heal_ignores_usage_baseline_errors() {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline_error: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("usage baseline failures should not fail erasure set heal");
+
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_total_count, 0);
+        assert_eq!(progress.objects_total_size, 0);
     }
 
     #[tokio::test]

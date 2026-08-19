@@ -27,9 +27,10 @@ use crate::bucket::lifecycle::manual_transition_job::{
     ManualTransitionWorkerResult, claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
     load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_pending_task_records,
     manual_transition_job_id_from_record_object_name, manual_transition_job_lease_expired,
-    manual_transition_worker_result_task_key, persist_manual_transition_job_progress, reconcile_manual_transition_worker_results,
-    record_manual_transition_worker_result, record_manual_transition_worker_result_with_reason,
-    renew_manual_transition_job_lease, save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent,
+    manual_transition_worker_result_task_key, persist_manual_transition_job_progress_if_owned,
+    reconcile_manual_transition_worker_results_if_owned, record_manual_transition_worker_result,
+    record_manual_transition_worker_result_with_reason, renew_manual_transition_job_lease_if_owned,
+    save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent, update_manual_transition_job_record,
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
@@ -45,15 +46,13 @@ use crate::bucket::lifecycle::transition_transaction::run_transition_transaction
 use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
-use crate::error::{
-    error_resp_to_object_err, is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down,
-};
+use crate::error::{is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::object_api::{ObjectEncryptionResolver, ReadPlan};
 use crate::services::tier::{
     tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata},
     warm_backend::WarmBackendGetOpts,
@@ -78,8 +77,8 @@ use rustfs_common::metrics::{
 };
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-    DEFAULT_TRANSITION_WORKERS_CAP, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS, ENV_TRANSITION_WORKERS,
-    ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
+    DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
+    ENV_TRANSITION_WORKERS, ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
@@ -127,11 +126,23 @@ const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
 const EVENT_LIFECYCLE_NOT_ENQUEUED: &str = "lifecycle_not_enqueued";
 const EVENT_LIFECYCLE_DELETE_DISPATCHED: &str = "lifecycle_delete_dispatched";
 const EVENT_LIFECYCLE_DELETE_COMPLETED: &str = "lifecycle_delete_completed";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
 const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
 const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TimeFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub type TraceFn =
     Arc<dyn Fn(String, HashMap<String, String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
@@ -141,9 +152,21 @@ static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 pub const AMZ_ENCRYPTION_AES: &str = "AES256";
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
@@ -281,6 +304,10 @@ impl LifecycleSys {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     pub fn trace(oi: &ObjectInfo) -> TraceFn {
         let bucket = oi.bucket.clone();
         let name = oi.name.clone();
@@ -429,16 +456,23 @@ impl<'a> LifecycleExpiryTrace<'a> {
     }
 }
 
-#[allow(dead_code)]
 impl ExpiryStats {
     pub fn missed_tasks(&self) -> i64 {
         self.missed_expiry_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_free_vers_tasks(&self) -> i64 {
         self.missed_freevers_tasks.load(Ordering::SeqCst)
     }
 
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn missed_tier_journal_tasks(&self) -> i64 {
         self.missed_tier_journal_tasks.load(Ordering::SeqCst)
     }
@@ -571,6 +605,10 @@ async fn delete_free_version_remote_object(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_free_version_remote_object_then<T, F, Fut>(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
@@ -1745,7 +1783,7 @@ impl TransitionState {
                                 .await;
                             }
                             global_metrics().record_scanner_transition_failed(1);
-                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
+                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) {
                                 error!(
                                     event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
                                     component = LOG_COMPONENT_ECSTORE,
@@ -2016,18 +2054,25 @@ fn is_slow_down(err: &Error) -> bool {
     matches!(err, Error::SlowDown)
 }
 
-pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
-    //globalILMConfig.getExpirationWorkers()
-    if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS")
-        && let Ok(num_expirations) = env_expiration_workers.parse::<usize>()
-    {
-        workers = num_expirations;
+/// Resolves the expiry worker count from the single documented knob,
+/// `RUSTFS_MAX_EXPIRY_WORKERS`: a set, parsable, non-zero value wins;
+/// anything else falls back to `min(cpus, 16)`. The historical
+/// `_RUSTFS_ILM_EXPIRATION_WORKERS` silent override and the
+/// `RUSTFS_DEFAULT_EXPIRY_WORKERS` zero-fallback were undocumented, unset in
+/// every known deployment, and are removed (backlog#1832).
+fn expiry_worker_count() -> usize {
+    let default = std::cmp::min(num_cpus::get(), 16);
+    match env::var(ENV_MAX_EXPIRY_WORKERS) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(workers) if workers > 0 => workers,
+            _ => default,
+        },
+        Err(_) => default,
     }
+}
 
-    if workers == 0 {
-        workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
-    }
+pub async fn init_background_expiry(api: Arc<ECStore>) {
+    let workers = expiry_worker_count();
 
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
@@ -2212,7 +2257,18 @@ async fn recover_manual_transition_job(
 
     let recovery_unknown_snapshot = ManualTransitionQueueSnapshot::default();
     if record.scan_completed {
-        let reconciled = reconcile_manual_transition_worker_results(api.clone(), job_id, recovery_unknown_snapshot).await?;
+        let reconciled = match reconcile_manual_transition_worker_results_if_owned(
+            api.clone(),
+            job_id,
+            record.lease_id,
+            recovery_unknown_snapshot,
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+            Err(err) => return Err(err),
+        };
         if reconciled.is_terminal() {
             release_manual_transition_recovery_admission(api, &reconciled).await;
             return match reconciled.state {
@@ -2265,34 +2321,41 @@ async fn recover_manual_transition_job(
         replay,
         ManualTransitionPendingTaskReplay::Queued | ManualTransitionPendingTaskReplay::Deferred
     ) {
-        spawn_manual_transition_recovery_heartbeat(api, job_id);
+        spawn_manual_transition_recovery_heartbeat(api, job_id, recovery_lease_id);
         return Ok(ManualTransitionJobRecoveryOutcome::Resumed);
     }
 
-    let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-    if record.mark_unknown_if_worker_results_lost(recovery_unknown_snapshot)
-        || record.mark_unknown_if_recovery_would_skip_pending_page(recovery_unknown_snapshot)
+    let mut marked_unknown = false;
+    let record = match update_manual_transition_job_record(api.clone(), job_id, Some(recovery_lease_id), |record| {
+        marked_unknown = record.mark_unknown_if_worker_results_lost(recovery_unknown_snapshot)
+            || record.mark_unknown_if_recovery_would_skip_pending_page(recovery_unknown_snapshot);
+        marked_unknown
+    })
+    .await
     {
-        return match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => {
-                release_manual_transition_recovery_admission(api, &record).await;
-                Ok(ManualTransitionJobRecoveryOutcome::Unknown)
-            }
-            Err(Error::PreconditionFailed) => Ok(ManualTransitionJobRecoveryOutcome::Skipped),
-            Err(err) => Err(err),
-        };
+        Ok(record) => record,
+        Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+        Err(err) => return Err(err),
+    };
+    if marked_unknown {
+        release_manual_transition_recovery_admission(api, &record).await;
+        return Ok(ManualTransitionJobRecoveryOutcome::Unknown);
     }
 
     let mut options = record.resume_options();
     options.job_id = Some(job_id);
     options.cancel_check = Some(manual_transition_recovery_cancel_check(api.clone(), job_id));
-    options.progress_sink = Some(manual_transition_recovery_progress_sink(api.clone(), job_id));
+    options.progress_sink = Some(manual_transition_recovery_progress_sink(api.clone(), job_id, recovery_lease_id));
     let result = enqueue_transition_for_existing_objects_scoped(api.clone(), &record.bucket, options).await;
-    let final_record = finalize_recovered_manual_transition_job(api.clone(), job_id, result).await?;
+    let final_record = match finalize_recovered_manual_transition_job(api.clone(), job_id, recovery_lease_id, result).await {
+        Ok(record) => record,
+        Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+        Err(err) => return Err(err),
+    };
     if final_record.is_terminal() {
         release_manual_transition_recovery_admission(api, &final_record).await;
     } else {
-        spawn_manual_transition_recovery_heartbeat(api, job_id);
+        spawn_manual_transition_recovery_heartbeat(api, job_id, recovery_lease_id);
     }
     Ok(ManualTransitionJobRecoveryOutcome::Resumed)
 }
@@ -2376,11 +2439,11 @@ fn manual_transition_recovery_cancel_check(api: Arc<ECStore>, job_id: Uuid) -> M
     })
 }
 
-fn manual_transition_recovery_progress_sink(api: Arc<ECStore>, job_id: Uuid) -> ManualTransitionProgressSink {
+fn manual_transition_recovery_progress_sink(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> ManualTransitionProgressSink {
     Arc::new(move |report| {
         let api = api.clone();
         Box::pin(async move {
-            persist_manual_transition_job_progress(api, job_id, &report, manual_transition_queue_snapshot())
+            persist_manual_transition_job_progress_if_owned(api, job_id, lease_id, &report, manual_transition_queue_snapshot())
                 .await
                 .map(|_| ())
         })
@@ -2390,24 +2453,20 @@ fn manual_transition_recovery_progress_sink(api: Arc<ECStore>, job_id: Uuid) -> 
 async fn finalize_recovered_manual_transition_job(
     api: Arc<ECStore>,
     job_id: Uuid,
+    expected_lease_id: Uuid,
     result: Result<ManualTransitionRunReport, Error>,
 ) -> Result<ManualTransitionJobRecord, Error> {
-    for _ in 0..4 {
-        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+    update_manual_transition_job_record(api, job_id, Some(expected_lease_id), |record| {
         if record.is_terminal() {
-            return Ok(record);
+            return false;
         }
         match &result {
             Ok(report) => record.complete(report.clone(), manual_transition_queue_snapshot()),
             Err(err) => record.fail(format!("manual transition recovery failed: {err}")),
         }
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => return Ok(record),
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(Error::PreconditionFailed)
+        true
+    })
+    .await
 }
 
 async fn release_manual_transition_recovery_admission(api: Arc<ECStore>, record: &ManualTransitionJobRecord) {
@@ -2426,18 +2485,20 @@ async fn release_manual_transition_recovery_admission(api: Arc<ECStore>, record:
     }
 }
 
-fn spawn_manual_transition_recovery_heartbeat(api: Arc<ECStore>, job_id: Uuid) {
+fn spawn_manual_transition_recovery_heartbeat(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            match renew_manual_transition_job_lease(api.clone(), job_id, manual_transition_queue_snapshot()).await {
+            match renew_manual_transition_job_lease_if_owned(api.clone(), job_id, lease_id, manual_transition_queue_snapshot())
+                .await
+            {
                 Ok(record) if record.is_terminal() => {
                     release_manual_transition_recovery_admission(api, &record).await;
                     return;
                 }
                 Ok(_) => {}
-                Err(Error::ConfigNotFound) => return,
+                Err(Error::ConfigNotFound | Error::PreconditionFailed) => return,
                 Err(err) => {
                     warn!(
                         event = EVENT_LIFECYCLE_WORKER_STATE,
@@ -2455,23 +2516,18 @@ fn spawn_manual_transition_recovery_heartbeat(api: Arc<ECStore>, job_id: Uuid) {
 }
 
 async fn abandon_manual_transition_recovery_lease(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> Result<(), Error> {
-    for _ in 0..4 {
-        let (mut record, etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
-            Ok(record) => record,
-            Err(Error::ConfigNotFound) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if record.lease_id != lease_id || record.is_terminal() {
-            return Ok(());
+    match update_manual_transition_job_record(api, job_id, Some(lease_id), |record| {
+        if record.is_terminal() {
+            return false;
         }
         record.abandon_recovery_lease(lease_id);
-        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
-            Ok(()) => return Ok(()),
-            Err(Error::PreconditionFailed) => continue,
-            Err(err) => return Err(err),
-        }
+        true
+    })
+    .await
+    {
+        Ok(_) | Err(Error::ConfigNotFound | Error::PreconditionFailed) => Ok(()),
+        Err(err) => Err(err),
     }
-    Ok(())
 }
 
 fn tier_free_version_recovery_enabled() -> bool {
@@ -2851,12 +2907,37 @@ fn stale_upload_default_due(initiated: OffsetDateTime, default_expiry: StdDurati
     initiated + time::Duration::seconds(default_expiry.as_secs() as i64)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<String, String>, upload_dir: &str) -> Option<usize> {
+    stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
+}
+
+async fn stale_upload_current_size_with_opts(
+    set: &Arc<SetDisks>,
+    metadata: &HashMap<String, String>,
+    upload_dir: &str,
+    no_lock: bool,
+) -> Option<usize> {
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
     let upload_id = encode_stale_upload_id(upload_dir);
+    let data_movement = rustfs_utils::http::contains_key_str(metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD);
     let parts = set
-        .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+        .list_object_parts(
+            bucket,
+            object,
+            &upload_id,
+            None,
+            MAX_PARTS_COUNT,
+            &ObjectOptions {
+                data_movement,
+                no_lock,
+                ..Default::default()
+            },
+        )
         .await
         .ok()?;
 
@@ -2874,7 +2955,12 @@ async fn stale_upload_lifecycle_due(
     metadata: &HashMap<String, String>,
     initiated: OffsetDateTime,
     upload_dir: &str,
+    no_lock: bool,
 ) -> Option<OffsetDateTime> {
+    if rustfs_utils::http::contains_key_str(metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD) {
+        return None;
+    }
+
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
@@ -2887,7 +2973,9 @@ async fn stale_upload_lifecycle_due(
         name: object.clone(),
         user_tags: metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default(),
         mod_time: Some(initiated),
-        size: stale_upload_current_size(set, metadata, upload_dir).await.unwrap_or_default(),
+        size: stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock)
+            .await
+            .unwrap_or_default(),
         is_latest: true,
         delete_marker: false,
         user_defined: metadata.clone(),
@@ -2915,6 +3003,7 @@ async fn read_stale_multipart_candidate(
         FileInfoOpts {
             data: false,
             include_free_versions: false,
+            include_part_checksums: false,
         },
     ) {
         Ok(file_info) => (Some(file_info.metadata), file_info.mod_time),
@@ -2954,36 +3043,30 @@ fn merge_stale_multipart_candidate(
     }
 }
 
+fn is_multipart_sha_dir(path: &str) -> bool {
+    path.len() == 64 && path.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn multipart_sha_path(root: &str, entry: &str) -> Option<String> {
+    let sha_dir = entry.trim_end_matches('/');
+    is_multipart_sha_dir(sha_dir).then(|| {
+        if root.is_empty() {
+            sha_dir.to_string()
+        } else {
+            format!("{root}/{sha_dir}")
+        }
+    })
+}
+
 async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
     for disk in set.get_local_disks().await.into_iter().flatten() {
         if !disk.is_online().await {
             continue;
         }
 
-        let sha_dirs = match disk
-            .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, "", -1)
-            .await
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                    debug!(
-                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        error = ?err,
-                        reason = "multipart_root_list_failed",
-                        "Skipped empty multipart sha cleanup"
-                    );
-                }
-                continue;
-            }
-        };
-
-        for sha_dir in sha_dirs {
-            let sha_dir = sha_dir.trim_end_matches('/').to_string();
-            let upload_dirs = match disk
-                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+        for root in ["", crate::set_disk::DATA_MOVEMENT_MULTIPART_PREFIX] {
+            let sha_dirs = match disk
+                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, root, -1)
                 .await
             {
                 Ok(entries) => entries,
@@ -2993,9 +3076,8 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
                             event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            sha_dir = %sha_dir,
                             error = ?err,
-                            reason = "multipart_sha_dir_list_failed",
+                            reason = "multipart_root_list_failed",
                             "Skipped empty multipart sha cleanup"
                         );
                     }
@@ -3003,25 +3085,48 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
                 }
             };
 
-            if !upload_dirs.is_empty() {
-                continue;
-            }
+            for sha_dir in sha_dirs.into_iter().filter_map(|entry| multipart_sha_path(root, &entry)) {
+                let upload_dirs = match disk
+                    .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+                    .await
+                {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
+                            debug!(
+                                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                sha_dir = %sha_dir,
+                                error = ?err,
+                                reason = "multipart_sha_dir_list_failed",
+                                "Skipped empty multipart sha cleanup"
+                            );
+                        }
+                        continue;
+                    }
+                };
 
-            if let Err(err) = disk
-                .delete(RUSTFS_META_MULTIPART_BUCKET, &sha_dir, DeleteOptions::default())
-                .await
-                && err != DiskError::FileNotFound
-                && err != DiskError::VolumeNotFound
-            {
-                debug!(
-                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    sha_dir = %sha_dir,
-                    error = ?err,
-                    reason = "multipart_sha_dir_remove_failed",
-                    "Failed to remove empty multipart sha dir"
-                );
+                if !upload_dirs.is_empty() {
+                    continue;
+                }
+
+                if let Err(err) = disk
+                    .delete(RUSTFS_META_MULTIPART_BUCKET, &sha_dir, DeleteOptions::default())
+                    .await
+                    && err != DiskError::FileNotFound
+                    && err != DiskError::VolumeNotFound
+                {
+                    debug!(
+                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        sha_dir = %sha_dir,
+                        error = ?err,
+                        reason = "multipart_sha_dir_remove_failed",
+                        "Failed to remove empty multipart sha dir"
+                    );
+                }
             }
         }
     }
@@ -3039,30 +3144,9 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
             continue;
         }
 
-        let sha_dirs = match disk
-            .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, "", -1)
-            .await
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
-                    debug!(
-                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        error = ?err,
-                        reason = "multipart_root_list_failed",
-                        "Skipped stale multipart cleanup"
-                    );
-                }
-                continue;
-            }
-        };
-
-        for sha_dir in sha_dirs {
-            let sha_dir = sha_dir.trim_end_matches('/').to_string();
-            let upload_dirs = match disk
-                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+        for root in ["", crate::set_disk::DATA_MOVEMENT_MULTIPART_PREFIX] {
+            let sha_dirs = match disk
+                .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, root, -1)
                 .await
             {
                 Ok(entries) => entries,
@@ -3072,9 +3156,8 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                             event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            sha_dir = %sha_dir,
                             error = ?err,
-                            reason = "multipart_sha_dir_list_failed",
+                            reason = "multipart_root_list_failed",
                             "Skipped stale multipart cleanup"
                         );
                     }
@@ -3082,39 +3165,62 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                 }
             };
 
-            for upload_dir in upload_dirs {
-                let upload_dir = upload_dir.trim_end_matches('/').to_string();
-                let candidate_path = format!("{sha_dir}/{upload_dir}");
-                if candidates
-                    .get(&candidate_path)
-                    .is_some_and(|existing: &StaleMultipartUploadCandidate| existing.metadata.is_some())
+            for sha_dir in sha_dirs.into_iter().filter_map(|entry| multipart_sha_path(root, &entry)) {
+                let upload_dirs = match disk
+                    .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1)
+                    .await
                 {
-                    continue;
-                }
-
-                let candidate = match read_stale_multipart_candidate(disk.as_ref(), &sha_dir, &upload_dir).await {
-                    Ok(candidate) => candidate,
+                    Ok(entries) => entries,
                     Err(err) => {
-                        if err != DiskError::FileNotFound {
+                        if err != DiskError::FileNotFound && err != DiskError::VolumeNotFound {
                             debug!(
                                 event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                path = %candidate_path,
+                                sha_dir = %sha_dir,
                                 error = ?err,
-                                reason = "multipart_metadata_read_failed",
-                                "Multipart metadata unavailable during stale cleanup"
+                                reason = "multipart_sha_dir_list_failed",
+                                "Skipped stale multipart cleanup"
                             );
                         }
-                        let initiated = initiated_from_upload_dir(&upload_dir, None);
-                        StaleMultipartUploadCandidate {
-                            path: candidate_path,
-                            initiated,
-                            metadata: None,
-                        }
+                        continue;
                     }
                 };
-                merge_stale_multipart_candidate(&mut candidates, candidate);
+
+                for upload_dir in upload_dirs {
+                    let upload_dir = upload_dir.trim_end_matches('/').to_string();
+                    let candidate_path = format!("{sha_dir}/{upload_dir}");
+                    if candidates
+                        .get(&candidate_path)
+                        .is_some_and(|existing: &StaleMultipartUploadCandidate| existing.metadata.is_some())
+                    {
+                        continue;
+                    }
+
+                    let candidate = match read_stale_multipart_candidate(disk.as_ref(), &sha_dir, &upload_dir).await {
+                        Ok(candidate) => candidate,
+                        Err(err) => {
+                            if err != DiskError::FileNotFound {
+                                debug!(
+                                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                    path = %candidate_path,
+                                    error = ?err,
+                                    reason = "multipart_metadata_read_failed",
+                                    "Multipart metadata unavailable during stale cleanup"
+                                );
+                            }
+                            let initiated = initiated_from_upload_dir(&upload_dir, None);
+                            StaleMultipartUploadCandidate {
+                                path: candidate_path,
+                                initiated,
+                                metadata: None,
+                            }
+                        }
+                    };
+                    merge_stale_multipart_candidate(&mut candidates, candidate);
+                }
             }
         }
     }
@@ -3123,7 +3229,7 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let upload_dir = candidate.path.rsplit('/').next().unwrap_or_default().to_string();
         let mut due = stale_upload_default_due(candidate.initiated, default_expiry);
         if let Some(metadata) = candidate.metadata.as_ref()
-            && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir).await
+            && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir, false).await
             && lifecycle_due < due
         {
             due = lifecycle_due;
@@ -3133,34 +3239,49 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
             continue;
         }
 
-        match set.delete_all(RUSTFS_META_MULTIPART_BUCKET, &candidate.path).await {
+        let cleanup_guard = match set.lock_stale_multipart_cleanup(&candidate.path).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                debug!(
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    path = %candidate.path,
+                    error = ?err,
+                    reason = "multipart_cleanup_lock_or_recheck_failed",
+                    "Skipped stale multipart cleanup"
+                );
+                continue;
+            }
+        };
+        let current_metadata = cleanup_guard.file_info().metadata.clone();
+        let current_initiated = initiated_from_upload_dir(&upload_dir, cleanup_guard.file_info().mod_time);
+        let mut current_due = stale_upload_default_due(current_initiated, default_expiry);
+        if let Some(lifecycle_due) =
+            stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
+            && lifecycle_due < current_due
+        {
+            current_due = lifecycle_due;
+        }
+        if now < current_due || cleanup_guard.is_lock_lost() {
+            continue;
+        }
+
+        match cleanup_guard.delete(set).await {
             Ok(()) => {
                 deleted += 1;
                 let upload_id = encode_stale_upload_id(&upload_dir);
-                if let Some(metadata) = candidate.metadata.as_ref() {
-                    debug!(
-                        bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY).cloned().unwrap_or_default(),
-                        object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY).cloned().unwrap_or_default(),
-                        upload_id = %upload_id,
-                        due = ?due,
-                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        state = "removed",
-                        "Removed stale multipart upload"
-                    );
-                } else {
-                    debug!(
-                        path = %candidate.path,
-                        upload_id = %upload_id,
-                        due = ?due,
-                        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        state = "removed",
-                        "Removed stale multipart upload"
-                    );
-                }
+                debug!(
+                    bucket = current_metadata.get(RUSTFS_MULTIPART_BUCKET_KEY).cloned().unwrap_or_default(),
+                    object = current_metadata.get(RUSTFS_MULTIPART_OBJECT_KEY).cloned().unwrap_or_default(),
+                    upload_id = %upload_id,
+                    due = ?current_due,
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "removed",
+                    "Removed stale multipart upload"
+                );
             }
             Err(err) => debug!(
                 event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
@@ -3274,6 +3395,10 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
     if remote_delete_succeeded {
         opts.skip_decommissioned = true;
@@ -3318,6 +3443,9 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
             return;
         }
     };
+    if configs.table_bucket_enabled {
+        return;
+    }
     let Some(lifecycle) = configs.lifecycle else {
         return;
     };
@@ -3978,6 +4106,9 @@ async fn enqueue_expiry_for_existing_object_group(
 
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let configs = metadata_boundary::get_expiry_configs(&api, bucket).await?;
+    if configs.table_bucket_enabled {
+        return Ok(());
+    }
     let Some(lc) = configs.lifecycle else {
         return Ok(());
     };
@@ -4194,12 +4325,16 @@ pub async fn expire_transitioned_object(
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> Result<ObjectInfo, std::io::Error> {
+    let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
+        .await
+        .ok_or_else(|| std::io::Error::other("lifecycle expiry is not allowed for this bucket"))?;
     let snapshot = lifecycle_delete_config_snapshot(&api, oi)
         .await
         .map_err(std::io::Error::other)?;
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
+    opts.add_namespace_lock_guard(&publication_guard);
     opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
@@ -4251,6 +4386,10 @@ pub async fn expire_transitioned_object(
     Ok(dobj)
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
@@ -4285,6 +4424,10 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
     result
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     let tier = _tier.to_string();
     Arc::new(move || {
@@ -4303,6 +4446,10 @@ pub fn audit_tier_actions(_tier: &str, bytes: i64) -> TimeFn {
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn get_transitioned_object_reader(
     bucket: &str,
     object: &str,
@@ -4310,9 +4457,10 @@ pub async fn get_transitioned_object_reader(
     h: &HeaderMap,
     oi: &ObjectInfo,
     opts: &ObjectOptions,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
+    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr, resolver).await
 }
 
 fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::Error> {
@@ -4332,6 +4480,10 @@ fn validate_transition_remote_version(oi: &ObjectInfo) -> Result<bool, std::io::
     }
 }
 
+// The resolver joins the tier manager as the second injected port this read
+// needs; grouping the request half into a struct would churn every call site of
+// a bug fix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     bucket: &str,
     object: &str,
@@ -4340,6 +4492,7 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
     oi: &ObjectInfo,
     opts: &ObjectOptions,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+    resolver: Option<&dyn ObjectEncryptionResolver>,
 ) -> Result<GetObjectReader, std::io::Error> {
     validate_transition_remote_version(oi)?;
     let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
@@ -4357,11 +4510,16 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
 
     tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
 
-    let ret = new_getobjectreader(rs, oi, opts, h);
-    if let Err(err) = ret {
-        return Err(error_resp_to_object_err(err, vec![bucket, object]));
-    }
-    let (get_fn, off, length) = ret.expect("get_transitioned_object_reader should succeed after error check");
+    // The same read plan the local path uses, so the tier fetch is positioned in
+    // the object's *stored* coordinate system and the stream is handed the same
+    // decrypt/decompress transforms. Reading an encrypted object's ciphertext
+    // through a plaintext-coordinate range and skipping the transform is how a
+    // transitioned SSE object used to come back as silently corrupt bytes of the
+    // right length (rustfs/rustfs#6025).
+    let plan = ReadPlan::build_for_request(rs.clone(), oi, opts, h, resolver)
+        .await
+        .map_err(|err| std::io::Error::other(format!("building the read plan for {bucket}/{object} failed: {err}")))?;
+    let (off, length) = (plan.storage_offset() as i64, plan.storage_length());
     let mut gopts = WarmBackendGetOpts::default();
 
     if off >= 0 && length >= 0 {
@@ -4398,7 +4556,10 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
             );
             e
         })?;
-    Ok(attach_tier_operation_lease(get_fn(reader, h.clone()), tgt_client))
+    let object_reader = plan
+        .into_object_reader(Box::new(reader), oi)
+        .map_err(|err| std::io::Error::other(format!("wrapping the tier stream for {bucket}/{object} failed: {err}")))?;
+    Ok(attach_tier_operation_lease(object_reader, tgt_client))
 }
 
 struct TierOperationLeaseReader {
@@ -4789,6 +4950,43 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
         .await
 }
 
+async fn lifecycle_expiry_publication_guard(
+    api: &ECStore,
+    oi: &ObjectInfo,
+    bucket_incarnation_id: Uuid,
+) -> Option<rustfs_lock::NamespaceLockGuard> {
+    let result = async {
+        let lock = api
+            .new_ns_lock(&oi.bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await?;
+        let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
+        if guard.is_lock_lost() {
+            return Err(Error::other("table-bucket publication lock was lost before lifecycle delete admission"));
+        }
+        if !metadata_boundary::lifecycle_expiry_allowed(api, &oi.bucket, bucket_incarnation_id).await? {
+            return Ok(None);
+        }
+        Ok(Some(guard))
+    }
+    .await;
+    match result {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_DELETE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "authorize_lifecycle_expiry",
+                error = %err,
+                "Lifecycle delete admission failed"
+            );
+            None
+        }
+    }
+}
+
 pub async fn apply_expiry_on_transitioned_object(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
@@ -4812,6 +5010,9 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> bool {
+    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
+        return false;
+    };
     let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -4837,6 +5038,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
+    opts.add_namespace_lock_guard(&publication_guard);
 
     if lc_event.action.delete_versioned() {
         opts.version_id = oi.version_id.map(|v| v.to_string());
@@ -5002,6 +5204,10 @@ async fn lifecycle_delete_config_snapshot(api: &ECStore, oi: &ObjectInfo) -> Res
     ReplicationObjectBridge::delete_request_config(api, &oi.bucket).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
@@ -5023,6 +5229,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 
 #[cfg(test)]
 mod tests {
+    use super::expiry_worker_count;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -5033,17 +5240,18 @@ mod tests {
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
-        jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
+        get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, manual_transition_duration_elapsed, manual_transition_has_more_after_limit,
         manual_transition_recovery_progress_sink, manual_transition_version_marker, manual_transition_worker_failure_reason,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
-        persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
-        recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
-        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
-        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        persist_manual_transition_job_progress_if_owned, persist_manual_transition_page_checkpoint,
+        recover_manual_transition_job, recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
+        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -5053,18 +5261,19 @@ mod tests {
     };
     use crate::bucket::lifecycle::config_boundary;
     use crate::bucket::lifecycle::manual_transition_job::{
-        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-        ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason, ManualTransitionWorkerResult,
-        ManualTransitionWorkerResultRecord, claim_manual_transition_scope_admission,
+        ManualTransitionJobCasBarrier, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
+        ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason,
+        ManualTransitionWorkerResult, ManualTransitionWorkerResultRecord, claim_manual_transition_scope_admission,
         delete_manual_transition_scope_admission_if_current, legacy_manual_transition_scope_key,
-        load_manual_transition_job_record, load_manual_transition_scope_admission,
+        load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
         load_manual_transition_scope_admission_with_etag, load_manual_transition_task_record,
         manual_transition_scope_record_object_name, manual_transition_worker_result_object_name,
         manual_transition_worker_result_task_key, reconcile_manual_transition_worker_results,
         record_manual_transition_worker_result, record_manual_transition_worker_result_with_reason,
-        renew_manual_transition_job_lease, request_manual_transition_job_cancel, save_manual_transition_job_record,
-        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
-        save_manual_transition_task_if_absent, save_manual_transition_worker_result_if_absent,
+        renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel, save_manual_transition_job_record,
+        save_manual_transition_job_record_if_current, save_manual_transition_scope_admission_if_absent,
+        save_manual_transition_scope_admission_if_current, save_manual_transition_task_if_absent,
+        save_manual_transition_worker_result_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
@@ -5089,8 +5298,8 @@ mod tests {
     use crate::services::tier::tier::TierConfigMgr;
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::WarmBackend as _;
+    use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
-    #[cfg(feature = "test-util")]
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
@@ -5105,6 +5314,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
+    use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
@@ -5641,6 +5851,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         .expect("transitioned reader should open");
@@ -5705,6 +5916,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -5745,6 +5957,7 @@ mod tests {
             &object_info,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -5982,6 +6195,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -6005,6 +6219,7 @@ mod tests {
             &oi,
             &ObjectOptions::default(),
             &manager,
+            None,
         )
         .await
         {
@@ -7103,6 +7318,63 @@ mod tests {
         }
     }
 
+    // SAFETY: same contract as with_transition_worker_env — only used from
+    // `#[serial]` tests, so no concurrent reader/writer can access the process
+    // environment while `env::set_var`/`env::remove_var` is active.
+    #[allow(unsafe_code)]
+    fn with_expiry_worker_env<F>(value: Option<&str>, test_fn: F)
+    where
+        F: FnOnce(),
+    {
+        let original = env::var_os(ENV_MAX_EXPIRY_WORKERS);
+
+        match value {
+            Some(v) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, v);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test_fn));
+
+        match original {
+            Some(v) => unsafe {
+                env::set_var(ENV_MAX_EXPIRY_WORKERS, v);
+            },
+            None => unsafe {
+                env::remove_var(ENV_MAX_EXPIRY_WORKERS);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// backlog#1832: the single expiry knob must resolve all four env states
+    /// (unset / zero / valid / garbage); the removed `_RUSTFS_ILM_EXPIRATION_WORKERS`
+    /// override and `RUSTFS_DEFAULT_EXPIRY_WORKERS` fallback must stay gone.
+    #[test]
+    #[serial]
+    fn expiry_worker_count_resolves_all_env_states() {
+        let default = std::cmp::min(num_cpus::get(), 16);
+
+        with_expiry_worker_env(None, || {
+            assert_eq!(expiry_worker_count(), default, "unset env must fall back to min(cpus, 16)");
+        });
+        with_expiry_worker_env(Some("0"), || {
+            assert_eq!(expiry_worker_count(), default, "zero must fall back instead of spawning zero workers");
+        });
+        with_expiry_worker_env(Some("4"), || {
+            assert_eq!(expiry_worker_count(), 4, "a valid positive value must win");
+        });
+        with_expiry_worker_env(Some("not-a-number"), || {
+            assert_eq!(expiry_worker_count(), default, "garbage must fall back to the default");
+        });
+    }
+
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
     // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
     // process environment while `env::set_var`/`env::remove_var` is active.
@@ -7213,6 +7485,10 @@ mod tests {
     // process environment while `env::set_var`/`env::remove_var` is active.
     // SAFETY: keep this note adjacent to the allowance for the repository guard.
     #[allow(unsafe_code)]
+    #[allow(
+        dead_code,
+        reason = "transition-queue env fixture kept for tests that scope those vars; no test uses it today (backlog#1823)"
+    )]
     async fn with_transition_queue_env_async<F, Fut>(capacity: Option<&str>, timeout_ms: Option<&str>, test_fn: F)
     where
         F: FnOnce() -> Fut,
@@ -8503,9 +8779,10 @@ mod tests {
             ..Default::default()
         };
 
-        let persisted = persist_manual_transition_job_progress(ecstore.clone(), job_id, &report, queue_snapshot)
-            .await
-            .expect("page checkpoint should persist to the job record");
+        let persisted =
+            persist_manual_transition_job_progress_if_owned(ecstore.clone(), job_id, record.lease_id, &report, queue_snapshot)
+                .await
+                .expect("page checkpoint should persist to the job record");
 
         assert_eq!(persisted.state, ManualTransitionJobState::Running);
         assert_eq!(persisted.report.scanned, 1000);
@@ -8522,6 +8799,232 @@ mod tests {
         assert_eq!(admission.job_id, job_id);
         assert_eq!(admission.lease_id, loaded.lease_id);
         assert_eq!(admission.updated_at_unix_nanos, loaded.updated_at_unix_nanos);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_retries_heartbeat_cas_without_losing_checkpoint() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let record = ManualTransitionJobRecord::new(job_id, "manual-progress-cas-bucket", &options, "owner-a");
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running scope admission should save");
+        let lease_id = record.lease_id;
+        let barrier = ManualTransitionJobCasBarrier::install(job_id);
+        let progress_store = ecstore.clone();
+        let progress = tokio::spawn(async move {
+            persist_manual_transition_job_progress_if_owned(
+                progress_store,
+                job_id,
+                lease_id,
+                &ManualTransitionRunReport {
+                    bucket: "manual-progress-cas-bucket".to_string(),
+                    prefix: "logs/".to_string(),
+                    scanned: 1000,
+                    eligible: 900,
+                    enqueued: 800,
+                    continuation_token: Some("opaque-page-cursor".to_string()),
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queued: 7,
+                    active: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+
+        let heartbeat = renew_manual_transition_job_lease_if_owned(
+            ecstore.clone(),
+            job_id,
+            lease_id,
+            ManualTransitionQueueSnapshot {
+                queued: 2,
+                active: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("heartbeat should win the first CAS write");
+        barrier.release();
+        let checkpointed = progress
+            .await
+            .expect("progress task should join")
+            .expect("progress should retry its stale ETag");
+
+        assert_eq!(checkpointed.lease_id, heartbeat.lease_id);
+        assert_eq!(checkpointed.report.scanned, 1000);
+        assert_eq!(checkpointed.report.eligible, 900);
+        assert_eq!(checkpointed.report.enqueued, 800);
+        assert_eq!(checkpointed.report.continuation_token.as_deref(), Some("opaque-page-cursor"));
+        assert_eq!(checkpointed.queue_snapshot.queued, 7);
+        assert_eq!(checkpointed.queue_snapshot.active, 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_rejects_stale_recovery_lease() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let record = ManualTransitionJobRecord::new(
+            job_id,
+            "manual-progress-stale-lease-bucket",
+            &ManualTransitionRunOptions::default(),
+            "owner-a",
+        );
+        let stale_lease_id = record.lease_id;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+
+        let (mut recovered, etag) = load_manual_transition_job_record_with_etag(ecstore.clone(), job_id)
+            .await
+            .expect("running job record should load");
+        recovered.lease_id = Uuid::new_v4();
+        recovered.owner_id = "owner-b".to_string();
+        save_manual_transition_job_record_if_current(ecstore.clone(), &recovered, &etag)
+            .await
+            .expect("recovery owner should replace the lease");
+
+        let error = persist_manual_transition_job_progress_if_owned(
+            ecstore.clone(),
+            job_id,
+            stale_lease_id,
+            &ManualTransitionRunReport {
+                scanned: 1000,
+                continuation_token: Some("stale-owner-cursor".to_string()),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect_err("the stale owner must not update the recovered job");
+        let heartbeat_error = renew_manual_transition_job_lease_if_owned(
+            ecstore.clone(),
+            job_id,
+            stale_lease_id,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect_err("the stale owner must not renew the recovered job");
+
+        assert_eq!(error, Error::PreconditionFailed);
+        assert_eq!(heartbeat_error, Error::PreconditionFailed);
+        let loaded = load_manual_transition_job_record(ecstore, job_id)
+            .await
+            .expect("recovered job record should load");
+        assert_eq!(loaded.lease_id, recovered.lease_id);
+        assert_eq!(loaded.owner_id, "owner-b");
+        assert_eq!(loaded.report.scanned, 0);
+        assert!(loaded.report.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_reconcile_rejects_lease_takeover_during_cas() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-reconcile-lease-race-{}", job_id.simple());
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &ManualTransitionRunOptions::default(), "owner-a");
+        record.scan_completed = true;
+        let stale_lease_id = record.lease_id;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let task = ManualTransitionTaskRecord::new(job_id, &task_key, &bucket, "logs/a", None, "WARM");
+        assert!(
+            save_manual_transition_task_if_absent(ecstore.clone(), &task)
+                .await
+                .expect("task journal marker should save")
+        );
+
+        let barrier = ManualTransitionJobCasBarrier::install(job_id);
+        let heartbeat_store = ecstore.clone();
+        let heartbeat = tokio::spawn(async move {
+            renew_manual_transition_job_lease_if_owned(
+                heartbeat_store,
+                job_id,
+                stale_lease_id,
+                ManualTransitionQueueSnapshot::default(),
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+
+        let (mut recovered, etag) = load_manual_transition_job_record_with_etag(ecstore.clone(), job_id)
+            .await
+            .expect("running job record should load during reconciliation");
+        recovered.lease_id = Uuid::new_v4();
+        recovered.owner_id = "owner-b".to_string();
+        save_manual_transition_job_record_if_current(ecstore.clone(), &recovered, &etag)
+            .await
+            .expect("recovery owner should replace the lease");
+        barrier.release();
+
+        let error = heartbeat
+            .await
+            .expect("heartbeat task should join")
+            .expect_err("stale reconciliation must reject the recovery lease");
+        assert_eq!(error, Error::PreconditionFailed);
+        let loaded = load_manual_transition_job_record(ecstore, job_id)
+            .await
+            .expect("recovered job record should load");
+        assert_eq!(loaded.lease_id, recovered.lease_id);
+        assert_eq!(loaded.owner_id, "owner-b");
+        assert_eq!(loaded.state, ManualTransitionJobState::Running);
+        assert_eq!(loaded.report.enqueued, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_does_not_regress_newer_admission_lease() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let record = ManualTransitionJobRecord::new(
+            job_id,
+            "manual-progress-admission-order-bucket",
+            &ManualTransitionRunOptions::default(),
+            "owner-a",
+        );
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        let mut newer_admission = ManualTransitionScopeAdmission::from_job(&record);
+        newer_admission.lease_expires_at_unix_nanos = newer_admission.lease_expires_at_unix_nanos.saturating_add(60_000_000_000);
+        newer_admission.updated_at_unix_nanos = newer_admission.updated_at_unix_nanos.saturating_add(60_000_000_000);
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &newer_admission)
+            .await
+            .expect("newer scope admission should save");
+
+        persist_manual_transition_job_progress_if_owned(
+            ecstore.clone(),
+            job_id,
+            record.lease_id,
+            &ManualTransitionRunReport {
+                scanned: 1000,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("progress should preserve the newer admission lease");
+
+        let admission = load_manual_transition_scope_admission(ecstore, &record.scope_key)
+            .await
+            .expect("scope admission should load");
+        assert_eq!(admission.lease_expires_at_unix_nanos, newer_admission.lease_expires_at_unix_nanos);
+        assert_eq!(admission.updated_at_unix_nanos, newer_admission.updated_at_unix_nanos);
     }
 
     #[tokio::test]
@@ -8588,7 +9091,7 @@ mod tests {
             .await
             .expect("expired scope admission should save");
         let checkpoint_options = ManualTransitionRunOptions {
-            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id)),
+            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id, record.lease_id)),
             ..options
         };
         let report = ManualTransitionRunReport {
@@ -8677,7 +9180,7 @@ mod tests {
             prefix: prefix.to_string(),
             tier: Some("WARM".to_string()),
             dry_run: true,
-            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id)),
+            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id, record.lease_id)),
             ..Default::default()
         };
         let final_report = enqueue_transition_for_existing_objects_scoped(ecstore.clone(), &bucket, production_path_options)
@@ -9377,9 +9880,14 @@ mod tests {
             "new worker result marker must be created"
         );
 
-        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
-            .await
-            .expect("heartbeat should reconcile marker before unknown fallback");
+        let renewed = renew_manual_transition_job_lease_if_owned(
+            ecstore.clone(),
+            job_id,
+            record.lease_id,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("heartbeat should reconcile marker before unknown fallback");
 
         assert_eq!(renewed.state, ManualTransitionJobState::Completed);
         assert_eq!(renewed.report.transition_completed, 1);
@@ -9422,9 +9930,14 @@ mod tests {
             "new worker result marker must be created"
         );
 
-        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
-            .await
-            .expect("heartbeat should reconcile task and result journals");
+        let renewed = renew_manual_transition_job_lease_if_owned(
+            ecstore.clone(),
+            job_id,
+            record.lease_id,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("heartbeat should reconcile task and result journals");
 
         assert_eq!(renewed.state, ManualTransitionJobState::Completed);
         assert_eq!(renewed.report.enqueued, 1);
@@ -9739,9 +10252,10 @@ mod tests {
             .await
             .expect("running scope admission should save");
 
-        let checkpointed = persist_manual_transition_job_progress(
+        let checkpointed = persist_manual_transition_job_progress_if_owned(
             ecstore.clone(),
             job_id,
+            record.lease_id,
             &ManualTransitionRunReport {
                 bucket: bucket.to_string(),
                 prefix: "logs/".to_string(),
@@ -9830,7 +10344,7 @@ mod tests {
             compensation_running: 1,
         };
 
-        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, queue_snapshot)
+        let renewed = renew_manual_transition_job_lease_if_owned(ecstore.clone(), job_id, record.lease_id, queue_snapshot)
             .await
             .expect("running job heartbeat should persist queue pressure status");
 
@@ -9881,9 +10395,14 @@ mod tests {
             .await
             .expect("running job admission should save");
 
-        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
-            .await
-            .expect("lost worker result should persist unknown state");
+        let renewed = renew_manual_transition_job_lease_if_owned(
+            ecstore.clone(),
+            job_id,
+            record.lease_id,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("lost worker result should persist unknown state");
 
         assert_eq!(renewed.state, ManualTransitionJobState::Unknown);
         assert!(renewed.completed_at_unix_nanos.is_some());
@@ -10316,6 +10835,85 @@ mod tests {
                 .await
                 .is_ok(),
             "scanner must leave the due object intact"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_lifecycle_expiry_does_not_delete_from_table_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("table-bucket-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let mut reader = PutObjReader::from_vec(b"referenced table data".to_vec());
+        let object_info = ecstore
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("table data object should be created");
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket enablement should acquire the publication lock");
+        let expiry_store = ecstore.clone();
+        let expiry_object = object_info.clone();
+        let (expiry_started_tx, expiry_started_rx) = tokio::sync::oneshot::channel();
+        let mut expiry = tokio::spawn(async move {
+            let event = crate::bucket::lifecycle::lifecycle::Event {
+                action: IlmAction::DeleteAction,
+                ..Default::default()
+            };
+            let bucket_incarnation_id = expiry_store
+                .bucket_incarnation_id_from_disk(&expiry_object.bucket)
+                .await
+                .expect("bucket incarnation should be available");
+            expiry_started_tx.send(()).expect("lifecycle expiry start should be observed");
+            super::apply_expiry_on_non_transitioned_objects(
+                expiry_store,
+                &expiry_object,
+                &event,
+                &LcEventSrc::Scanner,
+                bucket_incarnation_id,
+            )
+            .await
+        });
+        expiry_started_rx.await.expect("lifecycle expiry should start");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut expiry)
+                .await
+                .is_err(),
+            "queued lifecycle expiry must wait for table-bucket enablement"
+        );
+
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
+        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        sys.persist_and_set(metadata)
+            .await
+            .expect("table bucket marker should be persisted");
+        sys.reload_from_store(&bucket)
+            .await
+            .expect("table bucket marker should become authoritative");
+        drop(enable_guard);
+        assert!(
+            !tokio::time::timeout(StdDuration::from_secs(2), expiry)
+                .await
+                .expect("queued lifecycle expiry should resume after enablement")
+                .expect("queued lifecycle expiry task should join"),
+            "a queued lifecycle task must be rejected after the bucket becomes table-enabled"
+        );
+        assert!(
+            ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_ok(),
+            "table data must remain readable after lifecycle admission rejects the delete"
         );
     }
 
@@ -11394,7 +11992,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial]
     async fn ecstore_new_succeeds_on_fresh_local_volumes() {
         let test_base_dir = format!("/tmp/rustfs_ecstore_empty_boot_{}", Uuid::new_v4());
@@ -11477,6 +12074,135 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn stale_multipart_cleanup_handles_data_movement_namespace() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-data-movement-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let create_upload = |object: &'static str, mod_time| {
+            let ecstore = ecstore.clone();
+            let bucket = bucket.clone();
+            async move {
+                let mut metadata = HashMap::new();
+                rustfs_utils::http::insert_str(
+                    &mut metadata,
+                    rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+                    "cleanup-test".to_string(),
+                );
+                ecstore
+                    .new_multipart_upload(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            data_movement: true,
+                            mod_time: Some(mod_time),
+                            user_defined: metadata,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("data movement multipart upload should be created")
+                    .upload_id
+            }
+        };
+
+        let stale_object = "stale-internal.bin";
+        let active_object = "active-internal.bin";
+        let now = OffsetDateTime::now_utc();
+        let stale_upload_id = create_upload(stale_object, now - time::Duration::hours(30)).await;
+        let active_upload_id = create_upload(active_object, now).await;
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(ecstore.clone(), now, StdDuration::from_secs(24 * 60 * 60)).await;
+        assert!(deleted >= 1, "expected stale data movement upload to be removed");
+
+        let internal_opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        let stale_err = ecstore
+            .get_multipart_info(&bucket, stale_object, &stale_upload_id, &internal_opts)
+            .await
+            .expect_err("stale data movement upload should be removed");
+        assert!(is_err_invalid_upload_id(&stale_err));
+        ecstore
+            .get_multipart_info(&bucket, active_object, &active_upload_id, &internal_opts)
+            .await
+            .expect("active data movement upload should remain available");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_waits_for_data_movement_part_commit() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-data-movement-lock-{}", Uuid::new_v4().simple());
+        let object = "stale-internal.bin";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "cleanup-lock-test".to_string(),
+        );
+        let opts = ObjectOptions {
+            data_movement: true,
+            mod_time: Some(OffsetDateTime::now_utc() - time::Duration::hours(30)),
+            user_defined: metadata,
+            ..Default::default()
+        };
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &opts)
+            .await
+            .expect("data movement multipart upload should be created");
+        let barrier = MultipartCommitBarrier::install(bucket.as_str(), object, MultipartCommitPause::PutPartAfterRename);
+        let put_store = ecstore.clone();
+        let put_bucket = bucket.clone();
+        let upload_id = upload.upload_id.clone();
+        let put_task = tokio::spawn(async move {
+            let mut data = PutObjReader::from_vec(vec![1, 2, 3, 4]);
+            put_store
+                .put_object_part(
+                    &put_bucket,
+                    object,
+                    &upload_id,
+                    1,
+                    &mut data,
+                    &ObjectOptions {
+                        data_movement: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let cleanup_store = ecstore.clone();
+        let mut cleanup_task = tokio::spawn(async move {
+            cleanup_stale_multipart_uploads_once_at(
+                cleanup_store,
+                OffsetDateTime::now_utc(),
+                StdDuration::from_secs(24 * 60 * 60),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(200), &mut cleanup_task)
+                .await
+                .is_err(),
+            "stale cleanup must wait for the in-flight part commit upload lock"
+        );
+
+        barrier.release();
+        put_task
+            .await
+            .expect("part upload task should join")
+            .expect("part upload should commit before stale cleanup");
+        let deleted = cleanup_task.await.expect("stale cleanup task should join");
+        assert!(deleted >= 1, "stale cleanup should proceed after the part commit releases its lock");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn stale_multipart_cleanup_applies_abort_incomplete_lifecycle_before_default_expiry() {
         let (_paths, ecstore) = setup_test_env().await;
         let bucket = format!("stale-lifecycle-{}", Uuid::new_v4().simple());
@@ -11547,6 +12273,58 @@ mod tests {
             .await
             .expect_err("multipart upload should be removed by zero-day lifecycle abort rule");
         assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_excludes_data_movement_from_abort_lifecycle() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-internal-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "logs/internal/object.bin";
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "lifecycle-exclusion-test".to_string(),
+        );
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    data_movement: true,
+                    mod_time: Some(initiated),
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("data movement multipart upload should be created");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        assert_eq!(deleted, 0, "bucket lifecycle must not remove active data movement uploads");
+
+        ecstore
+            .get_multipart_info(
+                &bucket,
+                object,
+                &upload.upload_id,
+                &ObjectOptions {
+                    data_movement: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("active data movement upload should remain available");
     }
 
     #[tokio::test]

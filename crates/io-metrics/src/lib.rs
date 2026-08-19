@@ -58,7 +58,7 @@ use std::sync::{
 /// When `false`, `record_put_object_path` and `record_put_object_stage_duration`
 /// become no-ops, and callers can skip the `Instant::now()` syscalls entirely.
 ///
-/// Set to `true` during startup when OTEL metric export is enabled.
+/// Enabled only through an explicit runtime opt-in.
 static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static GET_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -78,7 +78,7 @@ static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable detailed per-stage PUT metrics.
 ///
-/// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+/// Called once during startup after applying the detailed PUT attribution opt-in.
 pub fn set_put_stage_metrics_enabled(enabled: bool) {
     PUT_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -102,6 +102,23 @@ pub fn set_metrics_enabled(enabled: bool) {
 pub fn put_stage_metrics_enabled() -> bool {
     PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
+
+/// Start a PUT-stage timer only when detailed PUT attribution is enabled.
+#[inline(always)]
+pub fn put_stage_timer() -> Option<std::time::Instant> {
+    put_stage_metrics_enabled().then(std::time::Instant::now)
+}
+
+pub const PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT: &str = "set_disk_rename_quorum_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT: &str = "set_disk_rename_file_sync_permit_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT: &str = "set_disk_rename_global_file_sync_permit_wait";
+pub const PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC: &str = "set_disk_rename_file_fdatasync";
+pub const PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC: &str = "set_disk_rename_src_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC: &str = "set_disk_rename_dst_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC: &str = "set_disk_rename_backup_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC: &str = "set_disk_rename_ancestor_dir_fsync";
+pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rename_syscall";
 
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
@@ -173,7 +190,6 @@ pub mod backpressure_metrics;
 pub mod cache_config;
 pub mod capacity_metrics;
 pub mod collector;
-pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
@@ -260,13 +276,6 @@ pub use timeout_metrics::{
     record_operation_progress, record_stalled_operation, record_timeout_event,
 };
 
-// Config exports
-pub use config::{
-    BackpressureSettings, CacheSettings, DEFAULT_BASE_BUFFER_SIZE, DEFAULT_CACHE_MAX_CAPACITY, DEFAULT_CACHE_MAX_MEMORY,
-    DEFAULT_CACHE_TTL_SECS, DEFAULT_MAX_BUFFER_SIZE, DEFAULT_MAX_CONCURRENT_READS, DEFAULT_MIN_BUFFER_SIZE,
-    DeadlockDetectionSettings, IoConfig, IoSchedulerSettings, TimeoutSettings,
-};
-
 // Re-exports for convenience
 pub use collector::MetricsCollector;
 pub use performance::PerformanceMetrics;
@@ -294,6 +303,18 @@ pub const GET_OBJECT_SIZE_BUCKET_LE_256_KIB: &str = "le_256kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_512_KIB: &str = "le_512kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_1_MIB: &str = "le_1mib";
 pub const GET_OBJECT_SIZE_BUCKET_GT_1_MIB: &str = "gt_1mib";
+pub const GET_OBJECT_SIZE_BUCKET_UNKNOWN: &str = "unknown";
+
+pub struct GetObjectStreamingBodyFailure {
+    pub stage: &'static str,
+    pub reason: &'static str,
+    pub error_class: &'static str,
+    pub strategy: &'static str,
+    pub buffer_source: &'static str,
+    pub size_bucket: &'static str,
+    pub emitted_bytes: usize,
+    pub remaining_bytes: usize,
+}
 
 /// Return the bounded size bucket used by small-object GET diagnostics.
 #[inline(always)]
@@ -430,7 +451,7 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
 /// Record PutObject request start.
 #[inline(always)]
 pub fn record_put_object_request_start(concurrent_requests: usize) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_io_put_object_requests_total").increment(1);
@@ -440,7 +461,7 @@ pub fn record_put_object_request_start(concurrent_requests: usize) {
 /// Record PutObject request result.
 #[inline(always)]
 pub fn record_put_object_request_result(status: &str, duration_secs: f64) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_io_put_object_request_results_total", "status" => status.to_string()).increment(1);
@@ -477,22 +498,21 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
 
 /// Record the streaming strategy chosen for a GetObject response body.
 #[inline(always)]
-pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
+pub fn record_get_object_stream_strategy(strategy: &'static str, buffer_size_bytes: usize, response_size_bytes: i64) {
     if !get_stage_metrics_enabled() {
         return;
     }
-    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
-    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
-        .record(usize_to_f64(buffer_size_bytes));
-    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
+    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy).increment(1);
+    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy).record(usize_to_f64(buffer_size_bytes));
+    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy)
         .record(i64_non_negative_to_f64(response_size_bytes));
 }
 
 /// Record the response-body handoff shape from a GetObject reader into the S3 streaming body.
 #[inline(always)]
 pub fn record_get_object_response_handoff(
-    strategy: &str,
-    buffer_source: &str,
+    strategy: &'static str,
+    buffer_source: &'static str,
     buffer_size_bytes: usize,
     response_size_bytes: i64,
     duration_secs: f64,
@@ -502,26 +522,26 @@ pub fn record_get_object_response_handoff(
     }
     counter!(
         "rustfs_io_get_object_response_handoff_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .increment(1);
     histogram!(
         "rustfs_io_get_object_response_handoff_buffer_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(usize_to_f64(buffer_size_bytes));
     histogram!(
         "rustfs_io_get_object_response_handoff_response_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(i64_non_negative_to_f64(response_size_bytes));
     histogram!(
         "rustfs_io_get_object_response_handoff_duration_seconds",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(duration_secs);
     record_get_object_response_handoff_duration("s3_handler", duration_secs);
@@ -529,14 +549,18 @@ pub fn record_get_object_response_handoff(
 
 /// Record ReaderStream capacity chosen for GetObject handoff.
 #[inline(always)]
-pub fn record_get_object_reader_stream_buffer_size(strategy: &str, buffer_source: &str, buffer_size_bytes: usize) {
+pub fn record_get_object_reader_stream_buffer_size(
+    strategy: &'static str,
+    buffer_source: &'static str,
+    buffer_size_bytes: usize,
+) {
     if !get_stage_metrics_enabled() {
         return;
     }
     histogram!(
         "rustfs_io_get_object_reader_stream_buffer_size_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string()
+        "strategy" => strategy,
+        "buffer_source" => buffer_source
     )
     .record(usize_to_f64(buffer_size_bytes));
 }
@@ -544,8 +568,8 @@ pub fn record_get_object_reader_stream_buffer_size(strategy: &str, buffer_source
 /// Record ReaderStream poll outcomes for GetObject handoff attribution.
 #[inline(always)]
 pub fn record_get_object_reader_stream_poll(
-    strategy: &str,
-    buffer_source: &str,
+    strategy: &'static str,
+    buffer_source: &'static str,
     outcome: &'static str,
     remaining_before: usize,
     bytes: usize,
@@ -557,39 +581,77 @@ pub fn record_get_object_reader_stream_poll(
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     counter!(
         "rustfs_io_get_object_reader_stream_poll_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .increment(1);
     counter!(
         "rustfs_io_get_object_reader_stream_poll_bytes_total",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .increment(bytes);
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_remaining_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(usize_to_f64(remaining_before));
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_bytes",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(usize_to_f64(bytes as usize));
     histogram!(
         "rustfs_io_get_object_reader_stream_poll_duration_seconds",
-        "strategy" => strategy.to_string(),
-        "buffer_source" => buffer_source.to_string(),
+        "strategy" => strategy,
+        "buffer_source" => buffer_source,
         "outcome" => outcome
     )
     .record(duration_secs);
+}
+
+/// Record a GET response body failure with bounded attribution labels.
+#[inline(always)]
+pub fn record_get_object_streaming_body_failure(failure: GetObjectStreamingBodyFailure) {
+    if !metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_streaming_body_failure_total",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_io_get_object_streaming_body_failure_emitted_bytes",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .record(usize_to_f64(failure.emitted_bytes));
+    histogram!(
+        "rustfs_io_get_object_streaming_body_failure_remaining_bytes",
+        "stage" => failure.stage,
+        "reason" => failure.reason,
+        "error_class" => failure.error_class,
+        "strategy" => failure.strategy,
+        "buffer_source" => failure.buffer_source,
+        "size_bucket" => failure.size_bucket
+    )
+    .record(usize_to_f64(failure.remaining_bytes));
 }
 
 /// Record a poll of the single-chunk in-memory GetObject handoff stream.
@@ -745,8 +807,12 @@ pub fn record_get_object_metadata_cache_decision(path: &'static str, decision: &
 }
 
 /// Record aggregate metadata fanout shape for one GetObject metadata read.
+///
+/// The legacy `metadata_fanout_error_responses` series records every non-valid
+/// response, including not-found and ignored outcomes. Use
+/// `metadata_response_total` outcome labels for failure attribution.
 #[inline(always)]
-pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
+pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, non_valid: usize) {
     if !get_stage_metrics_enabled() {
         return;
     }
@@ -757,7 +823,18 @@ pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize,
     histogram!("rustfs_io_get_object_metadata_fanout_ignored_responses", "path" => path)
         .record(metadata_fanout_count_to_f64(ignored));
     histogram!("rustfs_io_get_object_metadata_fanout_error_responses", "path" => path)
-        .record(metadata_fanout_count_to_f64(errors));
+        .record(metadata_fanout_count_to_f64(non_valid));
+}
+
+/// Record task lifecycle shape for one GetObject metadata fanout.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_lifecycle(path: &'static str, scheduled: usize, completed: usize, cancelled: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_fanout_scheduled", "path" => path).record(metadata_fanout_count_to_f64(scheduled));
+    histogram!("rustfs_io_get_object_metadata_fanout_completed", "path" => path).record(metadata_fanout_count_to_f64(completed));
+    histogram!("rustfs_io_get_object_metadata_fanout_cancelled", "path" => path).record(metadata_fanout_count_to_f64(cancelled));
 }
 
 /// Record a guarded metadata early-stop hit for GetObject.
@@ -1859,7 +1936,7 @@ pub fn record_get_object(duration_ms: f64, size_bytes: i64) {
 /// * `zero_copy_eligible` - Whether the request was eligible for a zero-copy path
 #[inline(always)]
 pub fn record_put_object(duration_ms: f64, size_bytes: i64, zero_copy_eligible: bool) {
-    if !put_stage_metrics_enabled() {
+    if !metrics_enabled() {
         return;
     }
     counter!("rustfs_s3_put_object_total").increment(1);
@@ -1956,6 +2033,13 @@ pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
         return;
     }
     histogram!("rustfs_s3_put_object_stage_duration_ms", "stage" => stage).record(duration_ms);
+}
+
+#[inline(always)]
+pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Option<std::time::Instant>) {
+    if let Some(started_at) = started_at {
+        record_put_object_stage_duration(stage, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
 }
 
 /// Record generic internal operation stage duration (non-PUT paths).
@@ -2545,39 +2629,168 @@ mod tests {
     use super::*;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier, Mutex};
 
     // Serialize tests that mutate the process-global PUT_STAGE_METRICS_ENABLED flag.
-    static METRICS_FLAG_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static METRICS_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn test_record_zero_copy_read() {
-        record_zero_copy_read(1024, 10.5);
-        record_memory_copy_saved(1024);
-        record_zero_copy_fallback("test");
+    /// One row of a `DebuggingRecorder` snapshot.
+    pub(crate) type MetricRow = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
+
+    /// Every metric name present in a snapshot.
+    pub(crate) fn emitted_names(rows: &[MetricRow]) -> std::collections::HashSet<&str> {
+        rows.iter().map(|(composite, _, _, _)| composite.key().name()).collect()
     }
 
-    #[test]
-    fn test_record_bytes_pool_metrics() {
-        record_bytes_pool_acquire("small", 4096, true);
-        record_bytes_pool_return("small");
-        record_bytes_pool_allocated("small", 4096);
-        record_bytes_pool_hit_rate("small", 0.85);
+    /// Counter value for `name`, summed over every label set it was emitted with.
+    /// `None` means the counter never reached the recorder.
+    pub(crate) fn counter_total(rows: &[MetricRow], name: &str) -> Option<u64> {
+        let mut total = None;
+        for (composite, _, _, value) in rows {
+            if composite.kind() == MetricKind::Counter && composite.key().name() == name {
+                match value {
+                    DebugValue::Counter(count) => *total.get_or_insert(0) += count,
+                    other => panic!("{name} is registered as a counter but holds {other:?}"),
+                }
+            }
+        }
+        total
     }
 
-    #[test]
-    fn test_record_bytespool_acquisition_and_return() {
-        // Acquisition outcomes
-        record_bytespool_acquisition("small", "hit");
-        record_bytespool_acquisition("medium", "miss");
-        record_bytespool_acquisition("large", "hit");
-        record_bytespool_acquisition("xlarge", "miss");
+    /// Gauge value for `name`. Panics when several label sets carry it, so a caller
+    /// cannot silently assert on an arbitrary one.
+    pub(crate) fn gauge_value(rows: &[MetricRow], name: &str) -> Option<f64> {
+        let mut matching = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.kind() == MetricKind::Gauge && composite.key().name() == name);
+        let value = matching.next().map(|(_, _, _, value)| match value {
+            DebugValue::Gauge(value) => value.0,
+            other => panic!("{name} is registered as a gauge but holds {other:?}"),
+        });
+        assert!(
+            matching.next().is_none(),
+            "{name} carries several label sets; assert on the labelled rows instead"
+        );
+        value
+    }
 
-        // Return outcomes
-        record_bytespool_return("small", "recycled");
-        record_bytespool_return("medium", "dropped");
-        record_bytespool_return("large", "recycled");
-        record_bytespool_return("xlarge", "dropped");
+    /// Histogram samples for `name` across every label set, sorted so the assertion
+    /// does not depend on registry iteration order.
+    pub(crate) fn histogram_samples(rows: &[MetricRow], name: &str) -> Vec<f64> {
+        let mut samples: Vec<f64> = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.kind() == MetricKind::Histogram && composite.key().name() == name)
+            .flat_map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(samples) => samples.iter().map(|sample| sample.0),
+                other => panic!("{name} is registered as a histogram but holds {other:?}"),
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        samples
+    }
+
+    /// Replaces four smoke tests that called the zero-copy and bytes-pool recorders
+    /// and asserted nothing (rustfs/backlog#1836). The same calls now run against a
+    /// local recorder: every metric name these helpers own must be emitted, the
+    /// `from_pool` branch must pick the hit/miss counter, and the derived values
+    /// (byte totals, the hit rate's percent conversion) must match the inputs.
+    #[test]
+    fn zero_copy_and_bytes_pool_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_zero_copy_read(1024, 10.5);
+            record_memory_copy_saved(1024);
+            record_zero_copy_fallback("test");
+            record_zero_copy_write(2048, 20.5);
+            record_zero_copy_write_fallback("test");
+            record_bytes_saved(4096);
+            record_bytes_pool_acquire("small", 4096, true);
+            record_bytes_pool_acquire("small", 4096, false);
+            record_bytes_pool_return("small");
+            record_bytes_pool_allocated("small", 4096);
+            record_bytes_pool_hit_rate("small", 0.85);
+            record_bytespool_acquisition("small", "hit");
+            record_bytespool_acquisition("medium", "miss");
+            record_bytespool_return("small", "recycled");
+            record_bytespool_return("medium", "dropped");
+            set_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        let names = emitted_names(&rows);
+        for expected in [
+            "rustfs_zero_copy_reads_total",
+            "rustfs_zero_copy_read_size_bytes",
+            "rustfs_zero_copy_read_duration_ms",
+            mmap_copy::READS_TOTAL,
+            mmap_copy::READ_SIZE_BYTES,
+            mmap_copy::READ_DURATION_MS,
+            mmap_copy::BYTES_COPIED_TOTAL,
+            mmap_copy::FALLBACK_TOTAL,
+            "rustfs_zero_copy_memory_saved_bytes_total",
+            "rustfs_zero_copy_fallback_total",
+            "rustfs_zero_copy_write_total",
+            "rustfs_zero_copy_write_size_bytes",
+            "rustfs_zero_copy_write_duration_ms",
+            buffered_write::WRITES_TOTAL,
+            buffered_write::WRITE_SIZE_BYTES,
+            buffered_write::WRITE_DURATION_MS,
+            buffered_write::BYTES_COPIED_TOTAL,
+            buffered_write::FALLBACK_TOTAL,
+            "rustfs_zero_copy_write_fallback_total",
+            "rustfs_zero_copy_bytes_saved_total",
+            "rustfs_bytes_pool_acquisitions_total",
+            "rustfs_bytes_pool_size_bytes",
+            "rustfs_bytes_pool_hits_total",
+            "rustfs_bytes_pool_misses_total",
+            "rustfs_bytes_pool_returns_total",
+            "rustfs_bytes_pool_allocated_bytes",
+            "rustfs_bytes_pool_hit_rate",
+            "rustfs_io_bytespool_acquisition_total",
+            "rustfs_io_bytespool_return_total",
+        ] {
+            assert!(names.contains(expected), "{expected} must be emitted by its record helper");
+        }
+
+        assert_eq!(
+            counter_total(&rows, mmap_copy::BYTES_COPIED_TOTAL),
+            Some(1024),
+            "the read helper must count the read size, not the call"
+        );
+        assert_eq!(
+            counter_total(&rows, buffered_write::BYTES_COPIED_TOTAL),
+            Some(2048),
+            "the write helper must count the write size, not the call"
+        );
+        assert_eq!(counter_total(&rows, "rustfs_zero_copy_memory_saved_bytes_total"), Some(1024));
+        assert_eq!(counter_total(&rows, "rustfs_zero_copy_bytes_saved_total"), Some(4096));
+        assert_eq!(histogram_samples(&rows, "rustfs_zero_copy_read_duration_ms"), vec![10.5]);
+        assert_eq!(histogram_samples(&rows, "rustfs_zero_copy_write_duration_ms"), vec![20.5]);
+        assert_eq!(
+            counter_total(&rows, "rustfs_bytes_pool_hits_total"),
+            Some(1),
+            "only the from_pool acquisition counts as a hit"
+        );
+        assert_eq!(
+            counter_total(&rows, "rustfs_bytes_pool_misses_total"),
+            Some(1),
+            "only the non-pool acquisition counts as a miss"
+        );
+        assert_eq!(
+            gauge_value(&rows, "rustfs_bytes_pool_hit_rate"),
+            Some(85.0),
+            "the hit rate is exported as a percentage"
+        );
     }
 
     #[test]
@@ -2601,20 +2814,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_zero_copy_write() {
-        record_zero_copy_write(1024, 10.5);
-        record_zero_copy_write_fallback("test");
-        record_bytes_saved(1024);
-    }
-
-    // S3 Operation Metrics Tests
-    #[test]
-    fn test_record_get_object() {
-        record_get_object(100.0, 1024 * 1024);
-        record_get_object(50.0, 2048);
-    }
-
-    #[test]
     fn test_record_get_object_stage_metrics() {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
         record_get_object_stage_duration_by_size("legacy_duplex", "metadata", "plain_single_part", "le_4kib", 0.001);
@@ -2633,12 +2832,17 @@ mod tests {
         record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
         record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_path_resolve", 0.0001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_path_check", 0.0001);
+        record_get_object_stage_duration("legacy_duplex", "read_version_xlmeta_read", 0.0005);
+        record_get_object_stage_duration("legacy_duplex", "read_version_decode", 0.0002);
         record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
         record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
         record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
         record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
         record_get_object_metadata_response("legacy_duplex", "valid");
         record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_fanout_lifecycle("legacy_duplex", 4, 3, 1);
         record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
         record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
         record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
@@ -2710,6 +2914,38 @@ mod tests {
     }
 
     #[test]
+    fn metadata_fanout_lifecycle_records_named_histograms() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_get_stage_metrics_enabled(true);
+            record_get_object_metadata_fanout_lifecycle("legacy_duplex", 4, 3, 1);
+            set_get_stage_metrics_enabled(false);
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        for (name, expected) in [
+            ("rustfs_io_get_object_metadata_fanout_scheduled", 4.0),
+            ("rustfs_io_get_object_metadata_fanout_completed", 3.0),
+            ("rustfs_io_get_object_metadata_fanout_cancelled", 1.0),
+        ] {
+            let value = metrics.iter().find_map(|(composite, _, _, value)| {
+                let has_path = composite
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "path" && label.value() == "legacy_duplex");
+                (composite.kind() == MetricKind::Histogram && composite.key().name() == name && has_path).then_some(value)
+            });
+            assert!(
+                matches!(value, Some(DebugValue::Histogram(values)) if values.len() == 1 && values[0].0 == expected),
+                "{name} must record the exact fanout lifecycle sample"
+            );
+        }
+    }
+
+    #[test]
     fn test_record_get_object_fill_metrics() {
         record_get_object_fill_queued("codec_streaming", "single_inflight", 1);
         record_get_object_fill_started("codec_streaming", "single_inflight");
@@ -2725,17 +2961,95 @@ mod tests {
         assert!(0.0003_f64.is_sign_positive());
     }
 
+    /// Replaces five smoke tests (`test_record_get_object`, `test_record_put_object`,
+    /// `test_record_put_object_request_metrics`, `test_record_list_objects`,
+    /// `test_record_delete_object`) that called the S3 operation recorders and
+    /// asserted nothing (rustfs/backlog#1836). Besides pinning the metric names,
+    /// this pins the conditional emissions each helper owns: the zero-copy alias
+    /// counters fire only for an eligible PUT, the truncated/version counters only
+    /// for the truncated listing and the versioned delete.
     #[test]
-    fn test_record_put_object() {
-        record_put_object(200.0, 1024 * 1024, true);
-        record_put_object(100.0, 512, false);
-    }
+    fn s3_operation_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
 
-    #[test]
-    fn test_record_put_object_request_metrics() {
-        record_put_object_request_start(3);
-        record_put_object_request_result("ok", 0.25);
-        record_put_object_request_result("error", 0.5);
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            set_get_stage_metrics_enabled(true);
+            record_get_object(100.0, 1024 * 1024);
+            record_get_object(50.0, 2048);
+            record_put_object(200.0, 1024 * 1024, true);
+            record_put_object(100.0, 512, false);
+            record_put_object_request_start(3);
+            record_put_object_request_result("ok", 0.25);
+            record_put_object_request_result("error", 0.5);
+            record_list_objects(50.0, 100, false);
+            record_list_objects(75.0, 1000, true);
+            record_delete_object(25.0, false);
+            record_delete_object(30.0, true);
+            set_get_stage_metrics_enabled(false);
+            set_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        let names = emitted_names(&rows);
+        for expected in [
+            "rustfs_s3_get_object_total",
+            "rustfs_s3_get_object_duration_ms",
+            "rustfs_s3_get_object_size_bytes",
+            "rustfs_s3_put_object_total",
+            "rustfs_s3_put_object_duration_ms",
+            "rustfs_s3_put_object_size_bytes",
+            "rustfs_s3_put_object_zero_copy_enabled_total",
+            "rustfs_s3_put_object_zero_copy_eligible_total",
+            "rustfs_io_put_object_requests_total",
+            "rustfs_io_put_object_concurrent_requests",
+            "rustfs_io_put_object_request_results_total",
+            "rustfs_io_put_object_request_duration_seconds",
+            "rustfs_s3_list_objects_total",
+            "rustfs_s3_list_objects_duration_ms",
+            "rustfs_s3_list_objects_count",
+            "rustfs_s3_list_objects_truncated_total",
+            "rustfs_s3_delete_object_total",
+            "rustfs_s3_delete_object_duration_ms",
+            "rustfs_s3_delete_object_version_total",
+        ] {
+            assert!(names.contains(expected), "{expected} must be emitted by its record helper");
+        }
+
+        assert_eq!(counter_total(&rows, "rustfs_s3_get_object_total"), Some(2));
+        assert_eq!(counter_total(&rows, "rustfs_s3_put_object_total"), Some(2));
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_object_zero_copy_eligible_total"),
+            Some(1),
+            "only the zero-copy eligible PUT increments the eligibility counter"
+        );
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_object_zero_copy_enabled_total"),
+            Some(1),
+            "the historical alias must stay in step with the eligibility counter"
+        );
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_list_objects_truncated_total"),
+            Some(1),
+            "only the truncated listing increments the truncation counter"
+        );
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_delete_object_version_total"),
+            Some(1),
+            "only the versioned delete increments the version counter"
+        );
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_list_objects_count"),
+            vec![100.0, 1000.0],
+            "the object count, not the duration, belongs in the count histogram"
+        );
+        assert_eq!(
+            gauge_value(&rows, "rustfs_io_put_object_concurrent_requests"),
+            Some(3.0),
+            "the concurrency gauge must carry the reported in-flight request count"
+        );
     }
 
     #[test]
@@ -2749,6 +3063,63 @@ mod tests {
         record_put_object_diagnostics("zero_copy_eager", "eligible", 32 * 1024 * 1024, 256 * 1024, true);
         assert!(put_stage_metrics_enabled());
         set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn put_stage_sync_tail_labels_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stages = [
+            PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT,
+            PUT_STAGE_SET_DISK_RENAME_FILE_FDATASYNC,
+            PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
+            PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL,
+        ];
+        let unique = stages.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), stages.len());
+        assert!(
+            stages
+                .iter()
+                .all(|stage| stage.starts_with("set_disk_rename_") && !stage.contains('/') && !stage.contains('{'))
+        );
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            for stage in stages {
+                record_put_object_stage_duration(stage, 1.0);
+            }
+            set_put_stage_metrics_enabled(true);
+            for stage in stages {
+                record_put_object_stage_duration(stage, 1.0);
+            }
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let recorded = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "stage")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(recorded.len(), stages.len());
+        assert!(stages.iter().all(|stage| recorded.contains(*stage)));
     }
 
     #[test]
@@ -2771,6 +3142,56 @@ mod tests {
         record_put_object_stage_duration("set_disk_encode", 5.0);
         // Still disabled
         assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn put_stage_gate_does_not_disable_basic_put_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            set_put_stage_metrics_enabled(false);
+            record_put_object_request_start(1);
+            record_put_object_request_result("ok", 0.001);
+            record_put_object(1.0, 1024, false);
+            record_put_object_stage_duration("disabled_stage", 0.5);
+
+            set_put_stage_metrics_enabled(true);
+            record_put_object_stage_duration("enabled_stage", 0.5);
+
+            set_put_stage_metrics_enabled(false);
+            set_metrics_enabled(false);
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        assert!(metrics.iter().any(|(composite, _, _, _)| {
+            composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_s3_put_object_total"
+        }));
+        assert!(metrics.iter().any(|(composite, _, _, _)| {
+            composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_io_put_object_requests_total"
+        }));
+
+        let stages = metrics
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram && composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
+            })
+            .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(stages, ["enabled_stage"]);
+    }
+
+    #[test]
+    fn test_put_stage_timer_follows_metrics_switch() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_put_stage_metrics_enabled(false);
+        assert!(put_stage_timer().is_none());
+
+        set_put_stage_metrics_enabled(true);
+        assert!(put_stage_timer().is_some());
+        set_put_stage_metrics_enabled(false);
     }
 
     #[test]
@@ -2914,6 +3335,16 @@ mod tests {
         record_list_objects(50.0, 100, false);
         record_error("get_object", "timeout");
         record_cpu_usage(25.5);
+        record_get_object_streaming_body_failure(GetObjectStreamingBodyFailure {
+            stage: "reader_stream",
+            reason: "short_eof",
+            error_class: "short_eof",
+            strategy: "standard",
+            buffer_source: "selected",
+            size_bucket: GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
+            emitted_bytes: 1024,
+            remaining_bytes: 512,
+        });
 
         // Enabled: the same recorders run their emission bodies without panicking.
         set_metrics_enabled(true);
@@ -2922,78 +3353,185 @@ mod tests {
         record_list_objects(50.0, 100, false);
         record_error("get_object", "timeout");
         record_cpu_usage(25.5);
+        record_get_object_streaming_body_failure(GetObjectStreamingBodyFailure {
+            stage: "reader_stream",
+            reason: "reader_error",
+            error_class: "timeout",
+            strategy: "standard",
+            buffer_source: "selected",
+            size_bucket: GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
+            emitted_bytes: 2048,
+            remaining_bytes: 256,
+        });
 
         set_metrics_enabled(false);
     }
 
+    /// Replaces six smoke tests (`test_record_io_strategy`, `test_record_permit_wait`,
+    /// `test_record_io_load_level`, `test_record_cache_size`, `test_record_bandwidth`,
+    /// `test_record_data_transfer`) that called the scheduler, cache and bandwidth
+    /// recorders and asserted nothing (rustfs/backlog#1836). The derived bandwidth
+    /// value and the `all` tier fan-out are now pinned, not just the names.
     #[test]
-    fn test_record_list_objects() {
-        record_list_objects(50.0, 100, false);
-        record_list_objects(75.0, 1000, true);
+    fn io_scheduler_and_bandwidth_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_io_strategy("nvme", "sequential", 256 * 1024, 5);
+            record_io_strategy("ssd", "random", 64 * 1024, 10);
+            record_permit_wait(5.0);
+            record_permit_wait(10.5);
+            record_io_load_level("low", 2);
+            record_io_load_level("high", 15);
+            record_cache_size("l1", 50 * 1024 * 1024, 1000);
+            record_bandwidth(100 * 1024 * 1024, "high");
+            record_data_transfer(1024 * 1024, 100.0);
+            record_data_transfer(2048, 50.0);
+            set_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        let names = emitted_names(&rows);
+        for expected in [
+            "rustfs_io_strategy_total",
+            "rustfs_io_buffer_size_bytes",
+            "rustfs_io_concurrent_requests",
+            "rustfs_io_permit_wait_duration_ms",
+            "rustfs_io_load_level",
+            "rustfs_cache_size_bytes",
+            "rustfs_cache_entries",
+            "rustfs_bandwidth_current_bps",
+            "rustfs_bandwidth_observed_bps",
+            "rustfs_io_transfer_bytes_total",
+            "rustfs_io_transfer_duration_ms",
+            "rustfs_io_transfer_bandwidth_bps",
+        ] {
+            assert!(names.contains(expected), "{expected} must be emitted by its record helper");
+        }
+
+        assert_eq!(counter_total(&rows, "rustfs_io_strategy_total"), Some(2));
+        assert_eq!(counter_total(&rows, "rustfs_io_load_level"), Some(2));
+        assert_eq!(
+            gauge_value(&rows, "rustfs_io_concurrent_requests"),
+            Some(15.0),
+            "the shared concurrency gauge must hold the last reported value"
+        );
+        assert_eq!(histogram_samples(&rows, "rustfs_io_permit_wait_duration_ms"), vec![5.0, 10.5]);
+        assert_eq!(gauge_value(&rows, "rustfs_cache_entries"), Some(1000.0));
+        assert_eq!(gauge_value(&rows, "rustfs_cache_size_bytes"), Some((50 * 1024 * 1024) as f64));
+        assert_eq!(
+            counter_total(&rows, "rustfs_io_transfer_bytes_total"),
+            Some(1024 * 1024 + 2048),
+            "transferred bytes must accumulate across calls"
+        );
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_io_transfer_bandwidth_bps"),
+            vec![40960.0, 10_485_760.0],
+            "bandwidth must be derived as bytes * 1000 / duration_ms"
+        );
+
+        let mut bandwidth_by_tier: Vec<(&str, f64)> = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_bandwidth_current_bps")
+            .map(|(composite, _, _, value)| {
+                let tier = composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "tier")
+                    .map(|label| label.value())
+                    .expect("bandwidth gauges carry a tier label");
+                match value {
+                    DebugValue::Gauge(value) => (tier, value.0),
+                    other => panic!("rustfs_bandwidth_current_bps holds {other:?}"),
+                }
+            })
+            .collect();
+        bandwidth_by_tier.sort_by(|left, right| left.0.cmp(right.0));
+        assert_eq!(
+            bandwidth_by_tier,
+            vec![("all", 104_857_600.0), ("high", 104_857_600.0)],
+            "record_bandwidth must publish both the aggregate `all` series and the caller tier"
+        );
     }
 
+    /// Replaces five smoke tests (`test_record_memory_usage`,
+    /// `test_record_process_memory_split`, `test_record_cgroup_memory_split`,
+    /// `test_record_cpu_usage`, `test_record_disk_io`) that called the system
+    /// resource recorders and asserted nothing (rustfs/backlog#1836). The gauge
+    /// values pin the argument order and the usage-percent derivation, which name
+    /// checks alone cannot catch.
     #[test]
-    fn test_record_delete_object() {
-        record_delete_object(25.0, false);
-        record_delete_object(30.0, true);
+    fn system_resource_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_memory_usage(1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
+            record_process_memory_split(1024, 2048);
+            record_cgroup_memory_split(Some(1), Some(2), Some(3), Some(4), Some(5), Some(6));
+            record_cpu_usage(25.5);
+            record_disk_io(1024 * 1024, 2048, 100, 50);
+            record_disk_io(2048, 4096, 200, 100);
+            set_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_memory_used_bytes"), Some((1024 * 1024 * 1024) as f64));
+        assert_eq!(gauge_value(&rows, "rustfs_memory_total_bytes"), Some((4u64 * 1024 * 1024 * 1024) as f64));
+        assert_eq!(
+            gauge_value(&rows, "rustfs_memory_usage_percent"),
+            Some(25.0),
+            "usage percent must be used/total * 100"
+        );
+        assert_eq!(gauge_value(&rows, "rustfs_memory_process_resident_bytes"), Some(1024.0));
+        assert_eq!(
+            gauge_value(&rows, "rustfs_memory_process_virtual_bytes"),
+            Some(2048.0),
+            "resident and virtual bytes must not be swapped"
+        );
+        for (name, expected) in [
+            ("rustfs_memory_cgroup_current_bytes", 1.0),
+            ("rustfs_memory_cgroup_limit_bytes", 2.0),
+            ("rustfs_memory_cgroup_anon_bytes", 3.0),
+            ("rustfs_memory_cgroup_file_bytes", 4.0),
+            ("rustfs_memory_cgroup_active_file_bytes", 5.0),
+            ("rustfs_memory_cgroup_inactive_file_bytes", 6.0),
+        ] {
+            assert_eq!(gauge_value(&rows, name), Some(expected), "{name} must receive its own argument");
+        }
+        assert_eq!(gauge_value(&rows, "rustfs_cpu_usage_percent"), Some(25.5));
+        assert_eq!(counter_total(&rows, "rustfs_disk_read_bytes_total"), Some(1024 * 1024 + 2048));
+        assert_eq!(counter_total(&rows, "rustfs_disk_write_bytes_total"), Some(2048 + 4096));
+        assert_eq!(counter_total(&rows, "rustfs_disk_read_ops_total"), Some(300));
+        assert_eq!(
+            counter_total(&rows, "rustfs_disk_write_ops_total"),
+            Some(150),
+            "byte and op counters must not be crossed"
+        );
     }
 
-    // I/O Scheduler Metrics Tests
+    /// Boundary companion of the `Some(..)` case above: an absent cgroup field must
+    /// emit no gauge at all. Publishing `0` for a field the kernel does not expose
+    /// would read as a real measurement (rustfs/backlog#1836).
     #[test]
-    fn test_record_io_strategy() {
-        record_io_strategy("nvme", "sequential", 256 * 1024, 5);
-        record_io_strategy("ssd", "random", 64 * 1024, 10);
-    }
+    fn cgroup_memory_split_skips_absent_fields() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
 
-    #[test]
-    fn test_record_permit_wait() {
-        record_permit_wait(5.0);
-        record_permit_wait(10.5);
-    }
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_cgroup_memory_split(None, None, None, None, None, None);
+            set_metrics_enabled(false);
+        });
 
-    #[test]
-    fn test_record_io_load_level() {
-        record_io_load_level("low", 2);
-        record_io_load_level("medium", 5);
-        record_io_load_level("high", 15);
-    }
-
-    #[test]
-    fn test_record_cache_size() {
-        record_cache_size("l1", 50 * 1024 * 1024, 1000);
-        record_cache_size("l2", 200 * 1024 * 1024, 5000);
-    }
-
-    // Bandwidth Metrics Tests
-    #[test]
-    fn test_record_bandwidth() {
-        record_bandwidth(100 * 1024 * 1024, "high");
-        record_bandwidth(50 * 1024 * 1024, "medium");
-    }
-
-    #[test]
-    fn test_record_data_transfer() {
-        record_data_transfer(1024 * 1024, 100.0);
-        record_data_transfer(2048, 50.0);
-    }
-
-    // System Resource Metrics Tests
-    #[test]
-    fn test_record_memory_usage() {
-        record_memory_usage(1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-        record_memory_usage(2 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_record_process_memory_split() {
-        record_process_memory_split(1024, 2048);
-        record_process_memory_split(4096, 8192);
-    }
-
-    #[test]
-    fn test_record_cgroup_memory_split() {
-        record_cgroup_memory_split(Some(1), Some(2), Some(3), Some(4), Some(5), Some(6));
-        record_cgroup_memory_split(None, None, None, None, None, None);
+        let rows = snapshotter.snapshot().into_vec();
+        assert!(rows.is_empty(), "absent cgroup fields must emit nothing, got {:?}", emitted_names(&rows));
     }
 
     #[test]
@@ -3211,36 +3749,75 @@ mod tests {
         assert_eq!(current_get_object_buffered_bytes(), 0);
     }
 
+    /// Replaces three smoke tests (`test_record_error`, `test_record_timeout`,
+    /// `test_record_retry`) that called the failure recorders and asserted nothing
+    /// (rustfs/backlog#1836). The histogram samples pin that the timeout duration
+    /// and the retry attempt number reach their histogram rather than being folded
+    /// into the counters.
     #[test]
-    fn test_record_cpu_usage() {
-        record_cpu_usage(25.5);
-        record_cpu_usage(50.0);
-        record_cpu_usage(75.5);
-    }
+    fn failure_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
 
-    #[test]
-    fn test_record_disk_io() {
-        record_disk_io(1024 * 1024, 2048, 100, 50);
-        record_disk_io(2048, 4096, 200, 100);
-    }
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_error("get_object", "timeout");
+            record_error("put_object", "disk_error");
+            record_timeout("get_object", 5000.0);
+            record_timeout("list_objects", 10000.0);
+            record_retry("get_object", 1);
+            record_retry("put_object", 2);
+            set_metrics_enabled(false);
+        });
 
-    // Error and Timeout Metrics Tests
-    #[test]
-    fn test_record_error() {
-        record_error("get_object", "timeout");
-        record_error("put_object", "disk_error");
-    }
+        let rows = snapshotter.snapshot().into_vec();
+        let names = emitted_names(&rows);
+        for expected in [
+            "rustfs_errors_total",
+            "rustfs_timeouts_total",
+            "rustfs_timeouts_duration_ms",
+            "rustfs_retries_total",
+            "rustfs_retries_attempt",
+        ] {
+            assert!(names.contains(expected), "{expected} must be emitted by its record helper");
+        }
 
-    #[test]
-    fn test_record_timeout() {
-        record_timeout("get_object", 5000.0);
-        record_timeout("list_objects", 10000.0);
-    }
+        assert_eq!(
+            counter_total(&rows, "rustfs_errors_total"),
+            Some(2),
+            "each error is counted once under its own operation/type labels"
+        );
+        assert_eq!(counter_total(&rows, "rustfs_timeouts_total"), Some(2));
+        assert_eq!(counter_total(&rows, "rustfs_retries_total"), Some(2));
+        assert_eq!(histogram_samples(&rows, "rustfs_timeouts_duration_ms"), vec![5000.0, 10000.0]);
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_retries_attempt"),
+            vec![1.0, 2.0],
+            "the attempt number belongs in the histogram, not the retry counter"
+        );
 
-    #[test]
-    fn test_record_retry() {
-        record_retry("get_object", 1);
-        record_retry("put_object", 2);
+        let mut error_labels: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_errors_total")
+            .map(|(composite, _, _, _)| {
+                let label = |key: &str| {
+                    composite
+                        .key()
+                        .labels()
+                        .find(|label| label.key() == key)
+                        .map(|label| label.value())
+                        .expect("error counters carry operation and type labels")
+                };
+                (label("operation"), label("type"))
+            })
+            .collect();
+        error_labels.sort();
+        assert_eq!(
+            error_labels,
+            vec![("get_object", "timeout"), ("put_object", "disk_error")],
+            "operation and error type must not be swapped"
+        );
     }
 }
 
@@ -3384,42 +3961,116 @@ pub fn update_zero_copy_performance_metrics(copy_count: u32, throughput_mbps: f6
 #[cfg(test)]
 mod zero_copy_tests {
     use super::*;
+    use crate::tests::{METRICS_FLAG_LOCK, counter_total, emitted_names, gauge_value, histogram_samples};
+    use metrics_util::debugging::DebuggingRecorder;
 
+    /// Replaces six smoke tests (`test_record_zero_copy_buffer_operation`,
+    /// `test_record_memory_copy`, `test_record_shared_ref_operation`,
+    /// `test_record_bufreader_optimization`, `test_record_direct_io_operation`,
+    /// `test_update_zero_copy_performance_metrics`) whose own comment admitted they
+    /// only checked that the helpers compile and run (rustfs/backlog#1836). The same
+    /// calls now run against a local recorder, and the assertions pin the counter
+    /// split (operations vs bytes, copies vs copied bytes), the success/fallback
+    /// label mapping, and the three same-typed performance gauges.
     #[test]
-    fn test_record_zero_copy_buffer_operation() {
-        // This test verifies the function compiles and runs
-        // Actual metric verification requires a metrics recorder
-        record_zero_copy_buffer_operation("read", 1024);
-        record_zero_copy_buffer_operation("write", 2048);
-    }
+    fn zero_copy_helpers_emit_their_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
 
-    #[test]
-    fn test_record_memory_copy() {
-        record_memory_copy(1, 1024);
-        record_memory_copy(2, 2048);
-    }
+        metrics::with_local_recorder(&recorder, || {
+            set_metrics_enabled(true);
+            record_zero_copy_buffer_operation("read", 1024);
+            record_zero_copy_buffer_operation("write", 2048);
+            record_memory_copy(1, 1024);
+            record_memory_copy(2, 2048);
+            record_shared_ref_operation("create");
+            record_shared_ref_operation("share");
+            record_bufreader_optimization(1, 8192);
+            record_bufreader_optimization(2, 65536);
+            record_direct_io_operation("read", 4096, true);
+            record_direct_io_operation("write", 8192, false);
+            update_zero_copy_performance_metrics(2, 150.5, 1024 * 1024);
+            set_metrics_enabled(false);
+        });
 
-    #[test]
-    fn test_record_shared_ref_operation() {
-        record_shared_ref_operation("create");
-        record_shared_ref_operation("share");
-    }
+        let rows = snapshotter.snapshot().into_vec();
+        let names = emitted_names(&rows);
+        for expected in [
+            zero_copy::BUFFER_OPERATIONS_TOTAL,
+            zero_copy::BUFFER_BYTES_TOTAL,
+            zero_copy::MEMORY_COPY_TOTAL,
+            zero_copy::MEMORY_COPY_BYTES_TOTAL,
+            "rustfs_memory_copy_size_bytes",
+            zero_copy::SHARED_REF_OPERATIONS_TOTAL,
+            zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL,
+            zero_copy::BUFREADER_BUFFER_SIZE_BYTES,
+            zero_copy::DIRECT_IO_OPERATIONS_TOTAL,
+            zero_copy::DIRECT_IO_BYTES_TOTAL,
+            aligned_pread::OPERATIONS_TOTAL,
+            aligned_pread::BYTES_TOTAL,
+            zero_copy::AVG_COPY_COUNT,
+            zero_copy::THROUGHPUT_MBPS,
+            zero_copy::MEMORY_SAVED_BYTES,
+        ] {
+            assert!(names.contains(expected), "{expected} must be emitted by its record helper");
+        }
 
-    #[test]
-    fn test_record_bufreader_optimization() {
-        record_bufreader_optimization(1, 8192);
-        record_bufreader_optimization(2, 65536);
-    }
+        assert_eq!(counter_total(&rows, zero_copy::BUFFER_OPERATIONS_TOTAL), Some(2));
+        assert_eq!(
+            counter_total(&rows, zero_copy::BUFFER_BYTES_TOTAL),
+            Some(3072),
+            "buffer bytes must accumulate the sizes, not the call count"
+        );
+        assert_eq!(
+            counter_total(&rows, zero_copy::MEMORY_COPY_TOTAL),
+            Some(3),
+            "the copy counter takes the copy count argument"
+        );
+        assert_eq!(
+            counter_total(&rows, zero_copy::MEMORY_COPY_BYTES_TOTAL),
+            Some(3072),
+            "the copied-bytes counter takes the size argument"
+        );
+        assert_eq!(histogram_samples(&rows, "rustfs_memory_copy_size_bytes"), vec![1024.0, 2048.0]);
+        assert_eq!(counter_total(&rows, zero_copy::SHARED_REF_OPERATIONS_TOTAL), Some(2));
+        assert_eq!(counter_total(&rows, zero_copy::BUFREADER_LAYERS_ELIMINATED_TOTAL), Some(3));
+        assert_eq!(histogram_samples(&rows, zero_copy::BUFREADER_BUFFER_SIZE_BYTES), vec![8192.0, 65536.0]);
+        assert_eq!(counter_total(&rows, zero_copy::DIRECT_IO_BYTES_TOTAL), Some(12288));
+        assert_eq!(
+            counter_total(&rows, aligned_pread::BYTES_TOTAL),
+            Some(12288),
+            "the aligned-pread series must mirror the direct-IO series"
+        );
+        assert_eq!(gauge_value(&rows, zero_copy::AVG_COPY_COUNT), Some(2.0));
+        assert_eq!(gauge_value(&rows, zero_copy::THROUGHPUT_MBPS), Some(150.5));
+        assert_eq!(
+            gauge_value(&rows, zero_copy::MEMORY_SAVED_BYTES),
+            Some((1024 * 1024) as f64),
+            "the three performance gauges must not be filled from each other's argument"
+        );
 
-    #[test]
-    fn test_record_direct_io_operation() {
-        record_direct_io_operation("read", 4096, true);
-        record_direct_io_operation("write", 8192, false);
-    }
-
-    #[test]
-    fn test_update_zero_copy_performance_metrics() {
-        update_zero_copy_performance_metrics(2, 150.5, 1024 * 1024);
+        let mut direct_io_labels: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == zero_copy::DIRECT_IO_OPERATIONS_TOTAL)
+            .map(|(composite, _, _, _)| {
+                let label = |key: &str| {
+                    composite
+                        .key()
+                        .labels()
+                        .find(|label| label.key() == key)
+                        .map(|label| label.value())
+                        .expect("direct-IO counters carry operation and status labels")
+                };
+                (label("operation"), label("status"))
+            })
+            .collect();
+        direct_io_labels.sort();
+        assert_eq!(
+            direct_io_labels,
+            vec![("read", "success"), ("write", "fallback")],
+            "the success flag must map to the success/fallback status label"
+        );
     }
 
     #[test]

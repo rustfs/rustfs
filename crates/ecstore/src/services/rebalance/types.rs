@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
@@ -32,10 +31,9 @@ pub struct RebalanceStats {
     pub cleanup_warnings: RebalanceCleanupWarnings,
 }
 
-pub type RStats = Vec<Arc<RebalanceStats>>;
-
 #[derive(Debug, Default)]
 pub(super) struct RebalanceBucketConfigs {
+    pub(super) bucket_incarnation_id: Option<uuid::Uuid>,
     pub(super) lifecycle_config: Option<s3s::dto::BucketLifecycleConfiguration>,
     pub(super) object_lock_config: Option<s3s::dto::ObjectLockConfiguration>,
     pub(super) replication_config: Option<(s3s::dto::ReplicationConfiguration, OffsetDateTime)>,
@@ -134,7 +132,6 @@ impl RebalanceStopPropagationRecord {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct DiskStat {
     pub total_space: u64,

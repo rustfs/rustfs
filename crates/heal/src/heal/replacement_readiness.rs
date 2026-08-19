@@ -162,11 +162,12 @@ mod tests {
     mod linux_privileged_tests {
         use super::*;
         use std::error::Error;
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
+        use std::process::Command;
 
         const ENABLE_ENV: &str = "RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS";
+        const NAMESPACE_ENV: &str = "RUSTFS_PRIVILEGED_MOUNT_READINESS_TESTS_IN_NAMESPACE";
+        const MOUNT_SIZE: &str = "size=32m,mode=0700";
 
         struct MountGuard {
             mounts: Vec<std::path::PathBuf>,
@@ -174,11 +175,7 @@ mod tests {
 
         impl MountGuard {
             fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
-                let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
-                if rc != 0 {
-                    return Err(format!("unshare(CLONE_NEWNS) failed: {}", std::io::Error::last_os_error()).into());
-                }
-                make_mounts_private()?;
+                run_command("mount", &["--make-rprivate", "/"])?;
                 Ok(Self { mounts: Vec::new() })
             }
 
@@ -198,70 +195,46 @@ mod tests {
         impl Drop for MountGuard {
             fn drop(&mut self) {
                 for mount in self.mounts.iter().rev() {
-                    if let Ok(target) = c_path(mount) {
-                        let _ = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-                    }
+                    let _ = detach_mount(mount);
                 }
             }
         }
 
-        fn c_path(path: &Path) -> Result<CString, Box<dyn Error + Send + Sync>> {
-            Ok(CString::new(path.as_os_str().as_bytes())?)
+        fn run_command(program: &str, args: &[&str]) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let output = Command::new(program).args(args).output()?;
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(format!(
+                "{program} {} failed with status {}: stdout={} stderr={}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
         }
 
-        fn make_mounts_private() -> Result<(), Box<dyn Error + Send + Sync>> {
-            let root = CString::new("/")?;
-            let rc = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    root.as_ptr(),
-                    std::ptr::null(),
-                    (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
-                    std::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                return Err(format!("making the mount namespace private failed: {}", std::io::Error::last_os_error()).into());
-            }
-            Ok(())
+        fn path_to_string(path: &Path, label: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+            path.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{label} path is not UTF-8: {path:?}").into())
         }
 
         fn mount_tmpfs(target: &Path, label: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-            let source = CString::new(label)?;
-            let target = c_path(target)?;
-            let fstype = CString::new("tmpfs")?;
-            let data = CString::new("size=32m,mode=0700")?;
-            let rc = unsafe {
-                libc::mount(
-                    source.as_ptr(),
-                    target.as_ptr(),
-                    fstype.as_ptr(),
-                    (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-                    data.as_ptr().cast(),
-                )
-            };
-            if rc != 0 {
-                return Err(format!("mount(tmpfs) failed: {}", std::io::Error::last_os_error()).into());
-            }
-            Ok(())
+            let target = path_to_string(target, "tmpfs target")?;
+            run_command("mount", &["-t", "tmpfs", "-o", MOUNT_SIZE, label, &target])
         }
 
         fn mount_bind(source: &Path, target: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-            let source = c_path(source)?;
-            let target = c_path(target)?;
-            let rc = unsafe {
-                libc::mount(
-                    source.as_ptr(),
-                    target.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND as libc::c_ulong,
-                    std::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                return Err(format!("mount(MS_BIND) failed: {}", std::io::Error::last_os_error()).into());
-            }
-            Ok(())
+            let source = path_to_string(source, "bind source")?;
+            let target = path_to_string(target, "bind target")?;
+            run_command("mount", &["--bind", &source, &target])
+        }
+
+        fn detach_mount(target: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let target = path_to_string(target, "umount target")?;
+            run_command("umount", &[&target])
         }
 
         fn privileged_enabled() -> Result<bool, Box<dyn Error + Send + Sync>> {
@@ -271,10 +244,31 @@ mod tests {
             if !enabled {
                 return Ok(false);
             }
-            if unsafe { libc::geteuid() } != 0 {
-                return Err(format!("{ENABLE_ENV}=1 requires root or CAP_SYS_ADMIN").into());
-            }
             Ok(true)
+        }
+
+        fn run_current_test_in_mount_namespace() -> Result<(), Box<dyn Error + Send + Sync>> {
+            let test_name = std::thread::current()
+                .name()
+                .ok_or("privileged mount readiness test thread is unnamed")?
+                .to_owned();
+            let test_binary = std::env::current_exe()?;
+            let status = Command::new("unshare")
+                .arg("--mount")
+                .arg("--propagation")
+                .arg("private")
+                .arg("--")
+                .arg(test_binary)
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env(NAMESPACE_ENV, "1")
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+            Err(format!("{ENABLE_ENV}=1 requires Linux root or CAP_SYS_ADMIN; unshare exited with status {status}").into())
         }
 
         fn run_privileged_mount_test<F, Fut>(test: F) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -285,13 +279,13 @@ mod tests {
             if !privileged_enabled()? {
                 return Ok(());
             }
-            std::thread::spawn(move || {
-                let guard = MountGuard::new()?;
-                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                runtime.block_on(test(guard))
-            })
-            .join()
-            .map_err(|_| "privileged mount readiness test thread panicked")?
+            if std::env::var_os(NAMESPACE_ENV).is_none() {
+                return run_current_test_in_mount_namespace();
+            }
+
+            let guard = MountGuard::new()?;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(test(guard))
         }
 
         #[test]

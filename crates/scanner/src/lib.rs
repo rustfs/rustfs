@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(
     // missing_docs,
@@ -52,6 +53,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;
 pub mod error;
+pub mod prefix_usage;
 mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
@@ -63,6 +65,7 @@ pub(crate) mod storage_api;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
@@ -82,11 +85,16 @@ pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::SCANNER_ACTIVITY_PROTOCOL_VERSION;
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
 
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
+}
+
+pub fn scanner_runtime_initialized() -> bool {
+    SCANNER_RUNTIME_INSTANCES.load(Ordering::Relaxed) > 0
 }
 
 pub fn set_foreground_read_activity(active: usize) {
@@ -136,6 +144,26 @@ impl ScannerActivityGuard {
         SCANNER_ACTIVE_WORK_UNITS.fetch_add(1, Ordering::Relaxed);
         Self
     }
+}
+
+pub(crate) struct ScannerRuntimeGuard;
+
+impl ScannerRuntimeGuard {
+    pub(crate) fn new() -> Self {
+        SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ScannerRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = SCANNER_RUNTIME_INSTANCES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+    }
+}
+
+#[cfg(test)]
+fn reset_scanner_runtime_instances_for_test() {
+    SCANNER_RUNTIME_INSTANCES.store(0, Ordering::Relaxed);
 }
 
 impl Drop for ScannerActivityGuard {
@@ -558,5 +586,19 @@ mod tests {
 
         set_foreground_read_activity(0);
         assert_eq!(current_foreground_read_activity(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_guard_tracks_runtime_lifetime() {
+        reset_scanner_runtime_instances_for_test();
+        assert!(!scanner_runtime_initialized());
+
+        {
+            let _guard = ScannerRuntimeGuard::new();
+            assert!(scanner_runtime_initialized());
+        }
+
+        assert!(!scanner_runtime_initialized());
     }
 }

@@ -433,7 +433,7 @@ impl SessionCtxFactory {
             let path = Path::from(context.input.key.clone());
             store.put(&path, data_bytes.into()).await.map_err(|e| {
                 error!("put data into memory failed: {}", e.to_string());
-                QueryError::StoreError { e: e.to_string() }
+                QueryError::from(DataFusionError::from(e))
             })?;
 
             df_session_state.with_object_store(&store_url, store).build()
@@ -477,16 +477,11 @@ fn test_parquet_bytes() -> QueryResult<Vec<u8>> {
 
     let mut bytes = Vec::new();
     {
-        let mut writer =
-            ArrowWriter::try_new(&mut bytes, schema, None).map_err(|e| QueryError::StoreError { e: e.to_string() })?;
-        writer
-            .write(&first_batch)
-            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
-        writer.flush().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
-        writer
-            .write(&second_batch)
-            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
-        writer.close().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).map_err(DataFusionError::from)?;
+        writer.write(&first_batch).map_err(DataFusionError::from)?;
+        writer.flush().map_err(DataFusionError::from)?;
+        writer.write(&second_batch).map_err(DataFusionError::from)?;
+        writer.close().map_err(DataFusionError::from)?;
     }
     Ok(bytes)
 }
@@ -509,7 +504,8 @@ fn test_parquet_batch(
             Arc::new(Int32Array::from(salaries.to_vec())),
         ],
     )
-    .map_err(|e| QueryError::StoreError { e: e.to_string() })
+    .map_err(DataFusionError::from)
+    .map_err(QueryError::from)
 }
 
 #[cfg(test)]

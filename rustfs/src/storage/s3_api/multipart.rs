@@ -39,6 +39,11 @@ pub(crate) struct ListMultipartUploadsParams {
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
+    let transformed_parts = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || res
+            .user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key));
 
     ListPartsOutput {
         bucket: Some(res.bucket),
@@ -51,7 +56,14 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                     e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
                     part_number: p.part_num.try_into().ok(),
-                    size: p.size.try_into().ok(),
+                    // Compressed parts store fewer bytes than the client sent; S3
+                    // semantics report the uploaded (logical) size, matching
+                    // GetObjectAttributes ObjectParts.
+                    size: if p.actual_size > 0 || (transformed_parts && p.actual_size == 0) {
+                        Some(p.actual_size)
+                    } else {
+                        p.size.try_into().ok()
+                    },
                     ..Default::default()
                 })
                 .collect(),
@@ -140,7 +152,7 @@ pub(crate) fn parse_list_multipart_uploads_params(
     if let Some(key_marker) = &key_marker
         && !key_marker.starts_with(prefix.as_str())
     {
-        return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid key marker".to_string()));
     }
 
     Ok(ListMultipartUploadsParams {
@@ -245,6 +257,116 @@ mod tests {
         assert_eq!(parts[0].e_tag, Some(to_s3s_etag("etag-1")));
         assert_eq!(output.owner, Some(rustfs_owner()));
         assert_eq!(output.initiator, Some(rustfs_initiator()));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_logical_size_for_compressed_parts() {
+        let input = ListPartsInfo {
+            bucket: "bucket-a".to_string(),
+            object: "obj-a".to_string(),
+            upload_id: "upload-a".to_string(),
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Stored (compressed) bytes on disk vs. the logical size the client uploaded.
+                size: 1_024,
+                actual_size: 8_388_608,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].size,
+            Some(8_388_608),
+            "compressed parts must report the uploaded logical size, not the stored size"
+        );
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_compressed_parts() {
+        let mut user_defined = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        let input = ListPartsInfo {
+            user_defined,
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Legacy SSE writes an 8-byte end record for an empty part.
+                size: 8,
+                actual_size: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_encrypted_parts() {
+        let input = ListPartsInfo {
+            user_defined: std::collections::HashMap::from([(
+                rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )]),
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 8,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 8,
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+        assert_eq!(parts[1].size, Some(8));
+    }
+
+    #[test]
+    fn test_list_parts_output_falls_back_to_stored_size_when_actual_size_unknown() {
+        let input = ListPartsInfo {
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 1_024,
+                    // Uncompressed parts leave actual_size unset.
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 1_024,
+                    // Legacy/unknown sentinel must not leak a negative size to clients.
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].size, Some(1024));
+        assert_eq!(parts[1].size, Some(1024));
     }
 
     #[test]
@@ -390,7 +512,7 @@ mod tests {
         let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("other/key-marker".to_string()), None)
             .expect_err("expected invalid key marker");
 
-        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid key marker"));
     }
 

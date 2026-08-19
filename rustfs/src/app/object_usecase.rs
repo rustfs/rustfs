@@ -24,6 +24,8 @@ use super::storage_api::object_usecase::access::{
     has_bypass_governance_header, load_bucket_generation_from_store, recursive_force_delete_is_authorized,
     replication_request_authorized, req_info_mut, req_info_ref,
 };
+#[cfg(test)]
+use super::storage_api::object_usecase::bucket::quota::BucketQuota;
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::replication::{ReplicationState, replication_statuses_map};
@@ -44,9 +46,10 @@ use super::storage_api::object_usecase::bucket::{
     replication::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        force_delete_target_set, has_active_delete_rule, load_delete_config_snapshot, must_replicate_object,
-        persist_force_delete_intent, schedule_object_replication, schedule_replication_delete, schedule_replication_deletes,
-        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, load_delete_config_snapshot,
+        must_replicate_object, persist_force_delete_intent, record_replication_proxy, schedule_object_replication,
+        schedule_replication_delete, schedule_replication_deletes, set_deleted_object_replication_state,
+        should_schedule_delete_replication, should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -54,8 +57,8 @@ use super::storage_api::object_usecase::bucket::{
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size,
-    get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectAdmission, PutObjectGuard,
+    get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
@@ -63,8 +66,9 @@ use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
 use super::storage_api::object_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
-    record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-    record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
+    quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+    record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+    record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
 use super::storage_api::object_usecase::ecfs::FS;
@@ -83,10 +87,10 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
-    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, preserve_unclassified_user_metadata,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+    preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
-use super::storage_api::object_usecase::request_context::{self, spawn_traced};
+use super::storage_api::object_usecase::request_context::{self, spawn_traced, spawn_traced_join};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
@@ -113,9 +117,9 @@ use crate::app::runtime_sources::{
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
-use crate::server::convert_ecstore_object_info;
+use crate::shared_types::convert_ecstore_object_info;
 use crate::table_catalog;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
@@ -131,9 +135,12 @@ use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
-use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{EventName, get_request_host, get_request_port, get_request_user_agent};
 use rustfs_utils::CompressionAlgorithm;
+#[cfg(test)]
+use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+#[cfg(test)]
+use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP,
@@ -147,9 +154,8 @@ use rustfs_utils::http::{
         AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
         AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
         AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
-        SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     },
-    insert_str, remove_str,
+    insert_str, project_ssec_transport_headers, remove_str,
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
@@ -162,8 +168,9 @@ use s3s::dto::{
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
-    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
+    ServerSideEncryptionByDefault, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
@@ -193,7 +200,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
@@ -222,6 +229,7 @@ use crate::app::object_data_cache::{
 };
 #[cfg(test)]
 use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_cold_fill_disk_permit_owner_for_test};
+use crate::app::object_traffic_health::ObjectTrafficHealth;
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -535,6 +543,69 @@ pub(super) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckRe
     }
 }
 
+pub(super) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaCheckResult) -> S3Result<()> {
+    if result.uses_durable_reservations {
+        return Ok(());
+    }
+    let Some(quota_limit) = result.quota_limit else {
+        return Ok(());
+    };
+    let Some(current_usage) = result.current_usage else {
+        return Err(S3Error::with_message(
+            S3ErrorCode::ServiceUnavailable,
+            "Bucket quota check temporarily unavailable, please retry".to_string(),
+        ));
+    };
+    if current_usage > quota_limit {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        ));
+    }
+    let _ = opts.set_quota_admission(current_usage, quota_limit);
+    Ok(())
+}
+
+fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_size: u64) -> S3Result<()> {
+    let (Some(current_usage), Some(quota_limit)) = (result.current_usage, result.quota_limit) else {
+        return Ok(());
+    };
+    if new_size > quota_limit {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_legacy_archive_size_within_quota(result: &QuotaCheckResult, total_unpacked_size: u64) -> S3Result<()> {
+    if result.uses_durable_reservations {
+        return Ok(());
+    }
+    let (Some(current_usage), Some(quota_limit)) = (result.current_usage, result.quota_limit) else {
+        return Ok(());
+    };
+    let expected_usage = current_usage
+        .checked_add(total_unpacked_size)
+        .ok_or_else(|| s3_error!(InvalidArgument, "Archive total size overflowed quota accounting"))?;
+    if expected_usage > quota_limit {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn quota_accounting_object_size(info: &ObjectInfo, fail_closed: bool) -> S3Result<u64> {
+    match quota_object_size(info) {
+        Ok(size) => Ok(size),
+        Err(err) if fail_closed => Err(ApiError::from(err).into()),
+        Err(_) => Ok(info.size.max(0) as u64),
+    }
+}
+
 fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     let has_aws_chunked = |header_name: &str| {
         headers
@@ -707,15 +778,21 @@ const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
 const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
+const MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = 512 * 1024;
+const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
+const ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE: &str = "RUSTFS_GET_SMALL_BODY_ONCE_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
 const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
 const GET_READER_STREAM_POLL_PENDING: &str = "pending";
 const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
+const GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM: &str = "reader_stream";
+const GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR: &str = "reader_error";
+const GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF: &str = "short_eof";
 const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE: &str = "object_data_cache";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED: &str = "object_data_cache_materialized";
@@ -736,6 +813,18 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_small_body_once_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false))
+    }
 }
 
 fn is_get_seek_buffer_enabled() -> bool {
@@ -762,7 +851,73 @@ fn tune_reader_stream_buffer_size(
         return selected_size.max(LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
     }
 
+    if stream_strategy == GetObjectStreamStrategy::Standard
+        && response_content_length >= MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES
+    {
+        return selected_size.max(MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
+    }
+
     selected_size
+}
+
+fn get_object_stream_size_bucket(expected: usize) -> &'static str {
+    rustfs_io_metrics::get_object_size_bucket(i64::try_from(expected).unwrap_or(i64::MAX))
+}
+
+fn classify_get_object_stream_read_error(err: &std::io::Error) -> &'static str {
+    if let Some(inner) = err.get_ref() {
+        if inner.is::<rustfs_rio::IncompleteBody>() {
+            return "short_eof";
+        }
+
+        if inner.is::<rustfs_rio::ChecksumMismatch>() {
+            return "bitrot";
+        }
+
+        let error_msg = inner.to_string().to_lowercase();
+        if error_msg.contains("bitrot") {
+            return "bitrot";
+        }
+        if error_msg.contains("read quorum") || error_msg.contains("insufficient read quorum") || error_msg.contains("erasure") {
+            return "read_quorum";
+        }
+    }
+
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof => "short_eof",
+        std::io::ErrorKind::TimedOut => "timeout",
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
+        _ => "io",
+    }
+}
+
+fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
+    if error_class == "short_eof" {
+        GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF
+    } else {
+        GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+    }
+}
+
+fn record_get_object_reader_stream_failure(
+    reason: &'static str,
+    error_class: &'static str,
+    strategy: &'static str,
+    buffer_source: &'static str,
+    expected: usize,
+    emitted: usize,
+    remaining: usize,
+) {
+    rustfs_io_metrics::record_get_object_streaming_body_failure(rustfs_io_metrics::GetObjectStreamingBodyFailure {
+        stage: GET_STREAMING_BODY_FAILURE_STAGE_READER_STREAM,
+        reason,
+        error_class,
+        strategy,
+        buffer_source,
+        size_bucket: get_object_stream_size_bucket(expected),
+        emitted_bytes: emitted,
+        remaining_bytes: remaining,
+    });
 }
 
 pin_project! {
@@ -776,7 +931,7 @@ pin_project! {
 }
 
 struct MemoryTrackedBytesStream {
-    bytes: Bytes,
+    bytes: Option<Bytes>,
     emitted: bool,
     completed: bool,
     expected: usize,
@@ -789,6 +944,30 @@ struct MemoryTrackedBytesStream {
     source: &'static str,
     _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     lifecycle: GetObjectBodyLifecycle,
+}
+
+struct MemoryOnceBodyOwner {
+    bytes: Bytes,
+    _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    // Body::Once has no poll hook, so this opt-in path only holds the request
+    // guard until the bytes are dropped; the result status remains unknown.
+    _lifecycle: GetObjectBodyLifecycle,
+}
+
+impl MemoryOnceBodyOwner {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>, lifecycle: GetObjectBodyLifecycle) -> Self {
+        Self {
+            bytes,
+            _guard: guard,
+            _lifecycle: lifecycle,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MemoryOnceBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
 }
 
 #[derive(Default)]
@@ -890,7 +1069,7 @@ impl MemoryTrackedBytesStream {
     ) -> Self {
         let length_mismatch = bytes.len() != expected;
         Self {
-            bytes,
+            bytes: Some(bytes),
             emitted: false,
             completed: !length_mismatch && expected == 0,
             expected,
@@ -933,7 +1112,7 @@ where
 }
 
 impl futures::Stream for MemoryTrackedBytesStream {
-    type Item = std::io::Result<Bytes>;
+    type Item = Result<Bytes, S3StdError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -958,35 +1137,47 @@ impl futures::Stream for MemoryTrackedBytesStream {
         // differently sized body. This is a defense-in-depth backstop; the
         // buffered/cache callers reject the mismatch before headers are sent.
         if this.length_mismatch {
+            let actual = this.bytes.as_ref().map_or(0, Bytes::len);
             this.emitted = true;
             this.finish_err();
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "materialized GET body length mismatch: expected {}, got {}",
-                    this.expected,
-                    this.bytes.len()
-                ),
-            ))));
+                format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
+            )
+            .into())));
         }
 
-        let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
+        let Some(bytes) = this.bytes.take() else {
+            return Poll::Ready(None);
+        };
+        let bytes_len = bytes.len();
+        let first_byte_elapsed = (!bytes.is_empty()).then(|| this.started.elapsed());
         this.emitted = true;
         if let Some(elapsed) = first_byte_elapsed {
             rustfs_io_metrics::record_get_object_first_byte_latency(GET_OBJECT_STAGE_PATH_S3_HANDLER, elapsed.as_secs_f64());
         }
-        if this.bytes.len() >= this.expected {
+        if bytes_len >= this.expected {
             this.finish_ok();
         }
         if let Some(poll_start) = poll_start {
             rustfs_io_metrics::record_get_object_memory_body_stream_poll(
                 this.source,
                 GET_READER_STREAM_POLL_READY_DATA,
-                this.bytes.len(),
+                bytes_len,
                 poll_start.elapsed().as_secs_f64(),
             );
         }
-        Poll::Ready(Some(Ok(this.bytes.clone())))
+        Poll::Ready(Some(Ok(bytes)))
+    }
+}
+
+impl ByteStream for MemoryTrackedBytesStream {
+    fn remaining_length(&self) -> RemainingLength {
+        if self.emitted || self.bytes.is_none() {
+            RemainingLength::new_exact(0)
+        } else {
+            RemainingLength::new_exact(self.expected)
+        }
     }
 }
 
@@ -1349,9 +1540,9 @@ where
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
                 let bytes = buf.freeze();
                 *this.remaining -= bytes.len();
+                *this.emitted += bytes.len();
                 #[cfg(feature = "tracing-chunk-debug")]
                 {
-                    *this.emitted += bytes.len();
                     tracing::debug!(
                         emitted = *this.emitted,
                         expected = *this.expected,
@@ -1369,6 +1560,15 @@ where
                 this.reader.set(None);
                 let remaining = i64::try_from(*this.remaining).unwrap_or(i64::MAX);
                 let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining });
+                record_get_object_reader_stream_failure(
+                    GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF,
+                    "short_eof",
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1380,6 +1580,16 @@ where
             }
             Poll::Ready(Err(err)) => {
                 this.reader.set(None);
+                let error_class = classify_get_object_stream_read_error(&err);
+                record_get_object_reader_stream_failure(
+                    get_object_stream_failure_reason(error_class),
+                    error_class,
+                    this.strategy,
+                    this.buffer_source,
+                    *this.expected,
+                    *this.emitted,
+                    *this.remaining,
+                );
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
@@ -1436,8 +1646,6 @@ where
 
 struct GetObjectStreamingReader<R> {
     inner: Option<R>,
-    bucket: String,
-    key: String,
     // request_id + optional content_range are only used for diagnostic correlation and
     // failure bucketing; they do not alter stream behavior.
     request_id: String,
@@ -1458,8 +1666,8 @@ impl<R> GetObjectStreamingReader<R> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         inner: R,
-        bucket: &str,
-        key: &str,
+        _bucket: &str,
+        _key: &str,
         request_id: &str,
         content_range: Option<String>,
         expected: usize,
@@ -1469,8 +1677,6 @@ impl<R> GetObjectStreamingReader<R> {
     ) -> Self {
         Self {
             inner: Some(inner),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
             request_id: request_id.to_string(),
             content_range,
             expected,
@@ -1494,33 +1700,7 @@ impl<R> GetObjectStreamingReader<R> {
     // distinguish truncated upstream bodies, corruption, quorum issues, and
     // genuine downstream-close disconnects.
     fn classify_read_error(err: &std::io::Error) -> &'static str {
-        if let Some(inner) = err.get_ref() {
-            if inner.is::<rustfs_rio::IncompleteBody>() {
-                return "short_eof";
-            }
-
-            if inner.is::<rustfs_rio::ChecksumMismatch>() {
-                return "bitrot";
-            }
-
-            let error_msg = inner.to_string().to_lowercase();
-            if error_msg.contains("bitrot") {
-                return "bitrot";
-            }
-            if error_msg.contains("read quorum")
-                || error_msg.contains("insufficient read quorum")
-                || error_msg.contains("erasure")
-            {
-                return "read_quorum";
-            }
-        }
-
-        match err.kind() {
-            std::io::ErrorKind::UnexpectedEof => "short_eof",
-            std::io::ErrorKind::TimedOut => "timeout",
-            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
-            _ => "io",
-        }
+        classify_get_object_stream_read_error(err)
     }
 
     fn finish_ok(&mut self) {
@@ -1637,10 +1817,9 @@ impl<R> GetObjectStreamingReader<R> {
                 event = EVENT_GET_OBJECT_STREAM_BODY,
                 component = LOG_COMPONENT_APP,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
-                bucket = %self.bucket,
-                object = %self.key,
                 request_id = %self.request_id,
                 range = %self.content_range.as_deref().unwrap_or("full"),
+                size_bucket = get_object_stream_size_bucket(self.expected),
                 expected = self.expected,
                 emitted = self.emitted,
                 elapsed_ms = self.elapsed().as_millis(),
@@ -1674,10 +1853,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             resume_attempts = attempts,
@@ -1697,10 +1875,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1739,10 +1916,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                                         event = EVENT_GET_OBJECT_STREAM_BODY,
                                         component = LOG_COMPONENT_APP,
                                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                                        bucket = %self.bucket,
-                                        object = %self.key,
                                         request_id = %self.request_id,
                                         range = %self.content_range.as_deref().unwrap_or("full"),
+                                        size_bucket = get_object_stream_size_bucket(self.expected),
                                         expected = self.expected,
                                         emitted = self.emitted,
                                         elapsed_ms = elapsed.as_millis(),
@@ -1784,10 +1960,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
-                            bucket = %self.bucket,
-                            object = %self.key,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
+                            size_bucket = get_object_stream_size_bucket(self.expected),
                             expected = self.expected,
                             emitted = self.emitted,
                             elapsed_ms = self.elapsed().as_millis(),
@@ -1819,10 +1994,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         event = EVENT_GET_OBJECT_STREAM_BODY,
                         component = LOG_COMPONENT_APP,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
-                        bucket = %self.bucket,
-                        object = %self.key,
                         request_id = %self.request_id,
                         range = %self.content_range.as_deref().unwrap_or("full"),
+                        size_bucket = get_object_stream_size_bucket(self.expected),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1855,10 +2029,9 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
-            bucket = %self.bucket,
-            object = %self.key,
             request_id = %self.request_id,
             range = %self.content_range.as_deref().unwrap_or("full"),
+            size_bucket = get_object_stream_size_bucket(self.expected),
             expected = self.expected,
             emitted = self.emitted,
             elapsed_ms = self.elapsed().as_millis(),
@@ -2007,17 +2180,9 @@ impl GetObjectResumeContext {
         {
             opts.version_id = Some(version_id.to_string());
         }
-        let mut ssec_headers = HeaderMap::new();
-        for name in [SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER] {
-            if let Some(value) = request_headers.get(name) {
-                // The store's instrumented spans record the header argument at
-                // debug level; mark the replayed values sensitive so the SSE-C
-                // key is redacted there on every resume attempt.
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                ssec_headers.insert(name, value);
-            }
-        }
+        // Store spans record their header argument at debug level. Retain only
+        // the SSE-C inputs needed to reopen the reader and keep them redacted.
+        let ssec_headers = project_ssec_transport_headers(request_headers);
         Self {
             store,
             bucket: bucket.to_string(),
@@ -2125,10 +2290,11 @@ fn get_object_resume_control(ctx: GetObjectResumeContext) -> GetObjectResumeCont
 /// disks" failures keep the existing fail-loud behavior.
 fn is_object_relocation_error(err: &std::io::Error) -> bool {
     let Some(inner) = err.get_ref() else { return false };
-    matches!(
-        inner.downcast_ref::<StorageError>(),
-        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..))
-    )
+    match inner.downcast_ref::<StorageError>() {
+        Some(StorageError::FileNotFound | StorageError::ObjectNotFound(..) | StorageError::InsufficientReadQuorum(..)) => true,
+        Some(StorageError::Io(source)) => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 /// Resolve the S3 request-body inter-chunk read timeout from the environment.
@@ -2510,6 +2676,25 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
 }
 
+/// Managed SSE resolved from a bucket default encryption rule on the copy path.
+///
+/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
+/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
+/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
+/// instead lets a same-name copy under a malformed bucket default pass the
+/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
+/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
+/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
+/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
+/// (backlog#1826).
+fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
+    match sse.sse_algorithm.as_str() {
+        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    }
+}
+
 fn should_use_small_eager_put_path(
     size: i64,
     headers: &HeaderMap,
@@ -2543,16 +2728,16 @@ fn should_use_small_eager_put_path(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
 where
     R: AsyncRead + Unpin,
+    B: bytes::BufMut,
 {
-    let mut buf = pool.acquire_buffer(size).await;
-    buf.resize(size, 0);
     let mut filled = 0;
 
     while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
+        let mut remaining = (&mut *buf).limit(size - filled);
+        let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
             .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
         if read == 0 {
@@ -2562,13 +2747,22 @@ where
     }
 
     let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
+    let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
         .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
 
+    Ok(())
+}
+
+async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &BytesPool) -> S3Result<PooledBuffer>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = pool.acquire_buffer(size).await;
+    read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
 
@@ -2579,27 +2773,8 @@ async fn read_small_put_body_exact_direct<R>(mut body: R, size: usize) -> S3Resu
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = vec![0u8; size];
-    let mut filled = 0;
-
-    while filled < size {
-        let read = tokio::io::AsyncReadExt::read(&mut body, &mut buf[filled..size])
-            .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-        if read == 0 {
-            return Err(s3_error!(IncompleteBody));
-        }
-        filled += read;
-    }
-
-    let mut extra = [0u8; 1];
-    let extra_read = tokio::io::AsyncReadExt::read(&mut body, &mut extra)
-        .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
-    if extra_read != 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
+    let mut buf = Vec::with_capacity(size);
+    read_small_put_body_into(&mut body, &mut buf, size).await?;
     Ok(std::io::Cursor::new(buf))
 }
 
@@ -2823,6 +2998,10 @@ pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs:
     }
 }
 
+fn inject_accept_ranges_header(headers: &mut HeaderMap) {
+    headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
+}
+
 /// Derive the response-header echo pairs for an additional-checksum algorithm
 /// (XXHash3/64/128, SHA-512) from the server-computed content checksum, for
 /// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms
@@ -2932,6 +3111,11 @@ struct PutObjectChecksums {
     crc64nvme: Option<String>,
 }
 
+struct PutObjectCommitResult {
+    obj_info: ObjectInfo,
+    put_versioned: bool,
+}
+
 fn normalize_delete_objects_version_id(
     version_id: Option<String>,
 ) -> std::result::Result<(Option<String>, Option<Uuid>), String> {
@@ -2951,6 +3135,8 @@ fn normalize_delete_objects_version_id(
 
 #[cfg(test)]
 type DeleteSnapshotTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
+#[cfg(test)]
+type PutPostStoreTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
 
 #[cfg(test)]
 static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
@@ -2958,6 +3144,8 @@ static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>
 static DELETE_SOURCE_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 #[cfg(test)]
 static DELETE_OBJECTS_AUTH_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+#[cfg(test)]
+static PUT_POST_STORE_TEST_HOOK: OnceLock<Mutex<Option<PutPostStoreTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn install_delete_snapshot_test_hook(
@@ -3048,6 +3236,33 @@ async fn wait_for_delete_objects_auth_test_hook(bucket: &str) {
     };
     if let Some((_bucket, loaded, resume)) = hook {
         loaded.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+fn install_put_post_store_test_hook(bucket: String, entered: Arc<tokio::sync::Barrier>, resume: Arc<tokio::sync::Barrier>) {
+    *PUT_POST_STORE_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("PUT post-store test hook lock should not be poisoned") = Some((bucket, entered, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_put_post_store_test_hook(bucket: &str) {
+    let hook = {
+        let mut slot = PUT_POST_STORE_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("PUT post-store test hook lock should not be poisoned");
+        if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_bucket, entered, resume)) = hook {
+        entered.wait().await;
         resume.wait().await;
     }
 }
@@ -3745,13 +3960,6 @@ fn put_object_extract_limits() -> ArchiveLimits {
     ArchiveLimits::default()
 }
 
-fn put_object_extract_quota_exceeded(current_usage: u64, quota_limit: u64) -> S3Error {
-    S3Error::with_message(
-        S3ErrorCode::InvalidRequest,
-        format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
-    )
-}
-
 fn validate_put_object_extract_entry_count(count: usize, limits: ArchiveLimits) -> S3Result<()> {
     if count > limits.max_entries {
         return Err(s3_error!(
@@ -3895,6 +4103,14 @@ pub struct DefaultObjectUsecase {
     get_object_timeout_policy: Option<GetObjectTimeoutPolicy>,
 }
 
+async fn track_object_read_setup<F>(health: Option<&ObjectTrafficHealth>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let _progress = health.and_then(ObjectTrafficHealth::track_read_storage);
+    future.await
+}
+
 impl DefaultObjectUsecase {
     fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
         size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
@@ -3951,6 +4167,13 @@ impl DefaultObjectUsecase {
         current_object_data_cache_for_context(self.context.as_deref())
     }
 
+    fn object_traffic_health(&self) -> Option<Arc<ObjectTrafficHealth>> {
+        self.context
+            .as_ref()
+            .map(|context| context.object_traffic_health())
+            .or_else(|| current_app_context().map(|context| context.object_traffic_health()))
+    }
+
     fn base_buffer_size(&self) -> usize {
         self.context
             .clone()
@@ -3959,12 +4182,12 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
-    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<()> {
+    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<Option<QuotaCheckResult>> {
         let Some(metadata_sys) = self.bucket_metadata_sys() else {
-            return Ok(());
+            return Ok(None);
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(|_| ())
+        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(Some)
     }
 
     fn build_memory_bytes_blob(
@@ -3979,10 +4202,12 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(bytes_stream(
-            MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle),
-            remaining,
-        ));
+        let blob = if is_get_small_body_once_enabled() && bytes_len == remaining {
+            let owner = MemoryOnceBodyOwner::new(bytes, guard, lifecycle);
+            StreamingBlob::from_bytes(Bytes::from_owner(owner))
+        } else {
+            StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle))
+        };
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -4351,9 +4576,11 @@ impl DefaultObjectUsecase {
         rs: Option<HTTPRangeSpec>,
         opts: &ObjectOptions,
         part_number: Option<usize>,
+        object_traffic_health: Option<Arc<ObjectTrafficHealth>>,
     ) -> S3Result<GetObjectPreparedRead> {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
+        let store_headers = project_ssec_transport_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4366,10 +4593,12 @@ impl DefaultObjectUsecase {
                 key,
             )
             .await?;
-            let reader = store
-                .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
-                .await
-                .map_err(map_get_object_reader_error)?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             let read_setup =
                 Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
             return Ok(GetObjectPreparedRead { io_planning, read_setup });
@@ -4390,10 +4619,12 @@ impl DefaultObjectUsecase {
             .await?,
         );
         let mut prepared = Some(
-            store
-                .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
-                .await
-                .map_err(map_get_object_reader_error)?,
+            track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?,
         );
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
@@ -4491,9 +4722,10 @@ impl DefaultObjectUsecase {
             drop(metadata_admission.take());
             let outcome = coordinate_cold_fill(&coordinator, cache_key, waiter_deadline, Some(proposed_producer_deadline), {
                 let adapter = &cache_adapter;
-                let headers = &req.headers;
+                let headers = &store_headers;
                 let store = &store;
                 let range = &rs;
+                let object_traffic_health = &object_traffic_health;
                 move |producer| {
                     let adapter = Arc::clone(adapter);
                     let engine_plan = engine_plan.clone();
@@ -4503,6 +4735,7 @@ impl DefaultObjectUsecase {
                     let bucket = bucket.to_owned();
                     let key = key.to_owned();
                     let opts = opts.clone();
+                    let object_traffic_health = object_traffic_health.as_ref().map(Arc::clone);
                     async move {
                         let producer_deadline = producer.deadline();
                         let cancellation = producer.cancellation_token();
@@ -4548,7 +4781,10 @@ impl DefaultObjectUsecase {
                             }
                         };
 
-                        let prepare = store.prepare_get_object_reader(&bucket, &key, range.clone(), HeaderMap::new(), &opts);
+                        let prepare = track_object_read_setup(
+                            object_traffic_health.as_deref(),
+                            store.prepare_get_object_reader(&bucket, &key, range.clone(), HeaderMap::new(), &opts),
+                        );
                         let prepared = match match await_cold_fill_startup(prepare, &cancellation, producer_deadline).await {
                             Ok(result) => result,
                             Err(ColdFillStartupWaitError::Cancelled) => {
@@ -4602,7 +4838,8 @@ impl DefaultObjectUsecase {
                             || {
                                 #[cfg(test)]
                                 record_cold_fill_reader_open_for_test(&reader_open_plan);
-                                prepared.with_headers(h).into_reader()
+                                let open_reader = prepared.with_headers(h).into_reader();
+                                async move { track_object_read_setup(object_traffic_health.as_deref(), open_reader).await }
                             },
                             ColdFillProducerExecution {
                                 expected,
@@ -4647,11 +4884,10 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader = prepared
-                .with_headers(req.headers.clone())
-                .into_reader()
-                .await
-                .map_err(map_get_object_reader_error)?;
+            let reader =
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
+                    .await
+                    .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -4665,19 +4901,22 @@ impl DefaultObjectUsecase {
             )
             .await?;
             let reader = if legacy_hook_missed {
-                store
-                    .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
-                    .await
-                    .map_err(map_get_object_reader_error)?
-                    .with_headers(req.headers.clone())
-                    .into_reader()
+                let prepared = track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?;
+                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
                     .await
                     .map_err(map_get_object_reader_error)?
             } else {
-                store
-                    .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
-                    .await
-                    .map_err(map_get_object_reader_error)?
+                track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?
             };
             (io_planning, reader)
         };
@@ -5346,9 +5585,24 @@ impl DefaultObjectUsecase {
         }
     }
 
-    #[instrument(level = "info", skip(self, _fs, req))]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
+    #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        self.execute_put_object_boxed(_fs, req).await
+    }
+
+    fn execute_put_object_boxed<'a>(
+        &'a self,
+        _fs: &'a FS,
+        req: S3Request<PutObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + 'a {
+        Box::pin(self.execute_put_object_inner(_fs, req))
+    }
+
+    #[hotpath::measure(
+        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_put_object",
+        impl_type = "DefaultObjectUsecase"
+    )]
+    async fn execute_put_object_inner(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
         let mut req = req;
 
@@ -5450,14 +5704,58 @@ impl DefaultObjectUsecase {
         // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
         let mut size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
 
-        // Bucket-quota admission runs exactly once, and only now that the authoritative object length is known. `size` is the same basis the settle phase records via ObjectInfo.size (actual, pre-compression/pre-encryption logical size), NOT the aws-chunked wire Content-Length. When no quota is configured this stays a zero-extra-I/O fast path; once a hard quota is set, checker/config/usage faults fail closed with a retryable error.
-        self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
+        // The app check preserves the existing S3 error contract; the storage
+        // commit path reserves the exact net logical growth under its locks.
+        let quota_check = self
+            .check_bucket_quota(
+                &bucket,
+                quota_operation,
+                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+            )
+            .await?;
+        let quota_enabled = quota_check.as_ref().is_some_and(|result| result.quota_limit.is_some());
+        if quota_enabled && ciphertext_passthrough {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "SSE-C ciphertext replication is unavailable for quota-enabled buckets".to_string(),
+            ));
+        }
 
-        let ingress_stage_start = std::time::Instant::now();
+        let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
+        let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
             is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
+
+        // Resolve the store through the request-bound server context
+        // (backlog#1052 S6), not the process-global handle, so an embedded
+        // second server never writes into the first server's store.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
+
+        let put_admission = match get_concurrency_manager()
+            .admit_put_object()
+            .await
+            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+        {
+            PutObjectAdmission::Disabled => None,
+            PutObjectAdmission::Admitted(permit) => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            PutObjectAdmission::Rejected => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(s3_error!(
+                    SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate"
+                ));
+            }
+        };
 
         let mut put_request_guard = PutObjectGuard::new();
         let concurrent_put_requests = PutObjectGuard::concurrent_requests();
@@ -5485,8 +5783,8 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let use_small_eager_put_path =
-            should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_empty_or_small_eager_put_path = size == 0
+            || should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let zero_copy_eager_put_path_status =
             zero_copy_eager_put_path_status(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
@@ -5498,7 +5796,7 @@ impl DefaultObjectUsecase {
             "stream_compressed"
         } else if use_zero_copy_eager_put_path {
             "zero_copy_eager"
-        } else if use_small_eager_put_path {
+        } else if use_empty_or_small_eager_put_path {
             "small_eager"
         } else {
             "streaming"
@@ -5511,15 +5809,9 @@ impl DefaultObjectUsecase {
             use_large_put_concurrency_tuning,
         );
 
-        // Resolve the store through the request-bound server context
-        // (backlog#1052 S6), not the process-global handle, so an embedded
-        // second server never writes into the first server's store.
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-        validate_bucket_exists(&store, &bucket).await?;
-
+        let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -5584,8 +5876,12 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
+        let has_explicit_object_lock_retention = object_lock_mode.is_some()
+            || object_lock_retain_until_date.is_some()
+            || has_replication_retention_update(&req.headers, inbound_replication_put);
+        let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
         apply_put_request_metadata(
             &mut metadata,
             &req.headers,
@@ -5607,6 +5903,7 @@ impl DefaultObjectUsecase {
             has_explicit_object_lock_retention,
         )?;
 
+        let put_opts_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut opts: ObjectOptions = put_opts_with_replication_authorization(
             &bucket,
             &key,
@@ -5617,6 +5914,10 @@ impl DefaultObjectUsecase {
         )
         .await
         .map_err(ApiError::from)?;
+        if let Some(quota_check) = quota_check.as_ref() {
+            apply_quota_admission(&mut opts, quota_check)?;
+        }
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         apply_put_request_object_lock_opts(
             &bucket,
@@ -5635,10 +5936,11 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || object_lock_checks_required(&bucket).await;
+        let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
         // Outer None = prelookup skipped (accounting comes from the commit
         // backfill); Some(inner) = the previous current size as observed by the
         // lookup, with the pre-#1009 semantics kept bit-for-bit.
+        let prelookup_stage_start = (prelookup_required && put_stage_metrics_enabled).then(Instant::now);
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
                 get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
@@ -5652,7 +5954,11 @@ impl DefaultObjectUsecase {
             Some(match previous_current_info {
                 Ok(existing_obj_info) => {
                     validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
-                    Some(existing_obj_info.size.max(0) as u64)
+                    Some(if quota_enabled {
+                        quota_object_size(&existing_obj_info).map_err(ApiError::from)?
+                    } else {
+                        existing_obj_info.size.max(0) as u64
+                    })
                 }
                 Err(err) => {
                     if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
@@ -5664,8 +5970,15 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_prelookup", prelookup_stage_start);
 
         let actual_size = size;
+        if !ciphertext_passthrough && let Some(quota_check) = quota_check.as_ref() {
+            ensure_object_size_within_quota(
+                quota_check,
+                u64::try_from(actual_size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+            )?;
+        }
 
         let mut md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
@@ -5712,7 +6025,7 @@ impl DefaultObjectUsecase {
                 let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
                 rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
                 HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
-            } else if use_small_eager_put_path {
+            } else if use_empty_or_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -5752,15 +6065,13 @@ impl DefaultObjectUsecase {
             put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
         }
         rustfs_io_metrics::record_put_object_path(put_path);
-        rustfs_io_metrics::record_put_object_stage_duration(
-            "ingress_prepare",
-            ingress_stage_start.elapsed().as_secs_f64() * 1000.0,
-        );
+        rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
         let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
         let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
 
         // Apply encryption using unified SSE API.
+        let encryption_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let write_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
@@ -5804,8 +6115,9 @@ impl DefaultObjectUsecase {
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
-        let mut reader = PutObjReader::new(reader);
+        let reader = PutObjReader::new(reader);
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
@@ -5820,9 +6132,11 @@ impl DefaultObjectUsecase {
         // post-commit schedule (see the reuse site further down), so a
         // replication-config hot update can no longer split the two phases
         // (https://github.com/rustfs/backlog/issues/1320).
+        let replication_decision_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
@@ -5834,7 +6148,12 @@ impl DefaultObjectUsecase {
         }
 
         let cache_adapter = self.object_data_cache();
+        let cache_invalidate_before_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            "app_cache_invalidate_before",
+            cache_invalidate_before_stage_start,
+        );
 
         let store_put_watchdog = tokio_util::sync::CancellationToken::new();
         spawn_traced({
@@ -5866,87 +6185,148 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let (obj_info, backfilled_old_current_size) = match store
-            .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)
-        {
-            Ok(obj_info) => {
-                store_put_watchdog.cancel();
-                debug!(
-                    target: "rustfs::app::object_usecase",
-                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                    component = LOG_COMPONENT_APP,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    put_path = put_path,
-                    object_size = actual_size,
-                    duration_ms = start_time.elapsed().as_millis() as u64,
-                    result = "success",
-                    "PutObject store write returned"
-                );
-                obj_info
+        let object_traffic_health = if use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path {
+            self.object_traffic_health()
+        } else {
+            None
+        };
+        let put_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let opts = opts.clone();
+            let cache_adapter = cache_adapter.clone();
+            let request_id = request_id.clone();
+            let put_path = put_path.to_string();
+            let put_admission = put_admission;
+            async move {
+                let _put_admission = put_admission;
+                let object_traffic_progress = object_traffic_health
+                    .as_deref()
+                    .and_then(ObjectTrafficHealth::track_write_storage);
+                let mut reader = reader;
+                let store_put_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let (obj_info, backfilled_old_current_size) = match store
+                    .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
+                    .await
+                    .map_err(ApiError::from)
+                {
+                    Ok(obj_info) => {
+                        store_put_watchdog.cancel();
+                        debug!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            duration_ms = start_time.elapsed().as_millis() as u64,
+                            result = "success",
+                            "PutObject store write returned"
+                        );
+                        obj_info
+                    }
+                    Err(err) => {
+                        store_put_watchdog.cancel();
+                        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                        warn!(
+                            target: "rustfs::app::object_usecase",
+                            event = EVENT_PUT_OBJECT_STORE_RETURNED,
+                            component = LOG_COMPONENT_APP,
+                            subsystem = LOG_SUBSYSTEM_OBJECT,
+                            request_id = %request_id,
+                            bucket = %bucket,
+                            key = %key,
+                            put_path = %put_path,
+                            object_size = actual_size,
+                            duration_ms = start_time.elapsed().as_millis() as u64,
+                            result = "error",
+                            error = %err,
+                            "PutObject store write returned"
+                        );
+                        return Err(err.into());
+                    }
+                };
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                drop(_put_admission);
+                drop(object_traffic_progress);
+                #[cfg(test)]
+                wait_for_put_post_store_test_hook(&bucket).await;
+
+                let post_store_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+                let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+
+                let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                // Fast in-memory update for immediate quota and admin usage consistency.
+                // The previous current size comes from the prelookup when it ran,
+                // otherwise from the rename_data backfill (rustfs/backlog#1009); the
+                // backfill reproduces the lookup's observation bit for bit (latest
+                // version's ObjectInfo.size — 0 for a delete-marker latest — or
+                // not-found → None).
+                let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+                match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size))
+                {
+                    Some(previous_current_size) => {
+                        if put_versioned {
+                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                        } else {
+                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        }
+                    }
+                    None => {
+                        // Neither source could determine the previous state (peers
+                        // predating the backfill field during a rolling upgrade, or
+                        // sub-quorum metadata divergence). Record the components that
+                        // are correct regardless; the next authoritative scanner
+                        // refresh replaces the in-memory numbers.
+                        debug!(
+                            target: "rustfs::app::object_usecase",
+                            bucket = %bucket,
+                            key = %key,
+                            put_versioned,
+                            "put_object old-size backfill unknown; recording degraded usage delta"
+                        );
+                        record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, put_versioned).await;
+                    }
+                }
+
+                if dsc.replicate_any() {
+                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_post_store_bookkeeping", post_store_stage_start);
+
+                let capacity_update_stage_start = put_stage_metrics_enabled.then(Instant::now);
+                let manager = get_capacity_manager();
+                manager.record_write_operation().await;
+                rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
+
+                Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
+            }
+        });
+        let PutObjectCommitResult { obj_info, put_versioned } = match put_commit.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                let result: S3Result<S3Response<PutObjectOutput>> = Err(err);
+                put_request_guard.finish_err();
+                let _ = helper.complete(&result);
+                return result;
             }
             Err(err) => {
-                store_put_watchdog.cancel();
-                warn!(
-                    target: "rustfs::app::object_usecase",
-                    event = EVENT_PUT_OBJECT_STORE_RETURNED,
-                    component = LOG_COMPONENT_APP,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    request_id = %request_id,
-                    bucket = %bucket,
-                    key = %key,
-                    put_path = put_path,
-                    object_size = actual_size,
-                    duration_ms = start_time.elapsed().as_millis() as u64,
-                    result = "error",
-                    error = %err,
-                    "PutObject store write returned"
-                );
-                let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
+                let result: S3Result<S3Response<PutObjectOutput>> = Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("put object commit owner task failed: {err}"),
+                ));
                 put_request_guard.finish_err();
                 let _ = helper.complete(&result);
                 return result;
             }
         };
-
-        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
-        let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
-
-        let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Fast in-memory update for immediate quota and admin usage consistency.
-        // The previous current size comes from the prelookup when it ran,
-        // otherwise from the rename_data backfill (rustfs/backlog#1009); the
-        // backfill reproduces the lookup's observation bit for bit (latest
-        // version's ObjectInfo.size — 0 for a delete-marker latest — or
-        // not-found → None).
-        match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size)) {
-            Some(previous_current_size) => {
-                if put_versioned {
-                    record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
-                } else {
-                    record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
-                }
-            }
-            None => {
-                // Neither source could determine the previous state (peers
-                // predating the backfill field during a rolling upgrade, or
-                // sub-quorum metadata divergence). Record the components that
-                // are correct regardless; the next authoritative scanner
-                // refresh replaces the in-memory numbers.
-                debug!(
-                    target: "rustfs::app::object_usecase",
-                    bucket = %bucket,
-                    key = %key,
-                    put_versioned,
-                    "put_object old-size backfill unknown; recording degraded usage delta"
-                );
-                record_bucket_object_write_unknown_previous_memory(&bucket, obj_info.size.max(0) as u64, put_versioned).await;
-            }
-        }
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -5960,17 +6340,6 @@ impl DefaultObjectUsecase {
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
-
-        // Reuse the single replication decision computed before commit (see `dsc`
-        // above) so the pending metadata persisted with the object and the
-        // post-commit schedule always derive from the same immutable decision.
-        // Recomputing here would repeat the versioning/config/target traversal and,
-        // worse, allow a replication-config hot update between the two phases to
-        // produce a pending-without-schedule or schedule-without-pending divergence
-        // (https://github.com/rustfs/backlog/issues/1320).
-        if dsc.replicate_any() {
-            schedule_object_replication(obj_info.clone(), store, dsc).await;
-        }
 
         let mut checksums = PutObjectChecksums {
             crc32: input.checksum_crc32,
@@ -6010,11 +6379,6 @@ impl DefaultObjectUsecase {
         inject_additional_checksum_headers(&mut response.headers, &put_extra_checksum_headers);
         let result = Ok(response);
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
-
-        // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
 
         // Record PutObject metrics via zero-copy-metrics
         {
@@ -6140,6 +6504,7 @@ impl DefaultObjectUsecase {
         };
         let helper = helper.version_id(version_id_for_event);
         let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
@@ -6273,7 +6638,6 @@ impl DefaultObjectUsecase {
             content_encoding: info.content_encoding.clone(),
             cache_control,
             content_disposition,
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
@@ -6303,13 +6667,242 @@ impl DefaultObjectUsecase {
         })
     }
 
-    #[instrument(
-        level = "info",
-        skip(self, req),
-        fields(start_time=?time::OffsetDateTime::now_utc())
-    )]
-    #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
+    /// Headers a proxied read forwards verbatim to the replication target:
+    /// only the client's SSE-C key family, so the target performs the real
+    /// SSE-C decryption (never the replication-check exemption). HTTP
+    /// conditional headers (If-Match & co.) are deliberately NOT forwarded —
+    /// MinIO does not forward them either, and a remote 304/412 would leak a
+    /// conditional evaluation against a replica the local site never saw.
+    /// Range and part-number travel as typed SDK parameters instead.
+    fn proxy_read_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
+        const FORWARDED: &[&str] = &[
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ];
+        let mut forwarded = HeaderMap::new();
+        for name in FORWARDED {
+            if let Ok(header_name) = http::HeaderName::from_str(name)
+                && let Some(value) = headers.get(&header_name)
+            {
+                forwarded.insert(header_name, value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// True when a proxied SDK call failed because the target does not have
+    /// the object either (service-level not-found or a raw 404, which also
+    /// covers NoSuchVersion): the caller tries the next target silently.
+    fn proxy_sdk_error_is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+        err.raw_response().is_some_and(|resp| resp.status().as_u16() == 404)
+    }
+
+    /// Serve a GET whose local read failed with not-found by proxying to the
+    /// bucket's replication targets (MinIO `proxyGetToReplicationTarget`,
+    /// backlog#1675 P1-5). Returns None when no target can serve the object;
+    /// the caller then returns the original local error.
+    async fn proxy_get_object_to_replication_targets(
+        req: &S3Request<GetObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<GetObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .get_object(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt
+                    // (targets were available), one failed when no target
+                    // served it — never per target.
+                    record_replication_proxy(bucket, "GetObject", false).await;
+                    return Some(Self::proxy_sdk_get_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: GET against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "GetObject", true).await;
+        None
+    }
+
+    /// Serve a HEAD whose local lookup failed with not-found by proxying to
+    /// the bucket's replication targets (MinIO `proxyHeadToRepTarget`).
+    async fn proxy_head_object_to_replication_targets(
+        req: &S3Request<HeadObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<HeadObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .head_object_for_proxy(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "HeadObject", false).await;
+                    return Some(Self::proxy_sdk_head_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: HEAD against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "HeadObject", true).await;
+        None
+    }
+
+    /// Translate a proxied SDK GET response into the s3s output, forwarding
+    /// the body as a stream (no buffering, no local persistence).
+    fn proxy_sdk_get_output_to_s3s(remote: aws_sdk_s3::operation::get_object::GetObjectOutput) -> GetObjectOutput {
+        let body = remote.body;
+        let body_stream = tokio_util::io::ReaderStream::with_capacity(body.into_async_read(), 64 * 1024);
+        GetObjectOutput {
+            body: Some(StreamingBlob::wrap(body_stream)),
+            content_length: remote.content_length,
+            content_range: remote.content_range,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            tag_count: remote.tag_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
+    }
+
+    /// Translate a proxied SDK HEAD response into the s3s output.
+    ///
+    /// Known gaps: the SDK's HeadObjectOutput does not model 206/Content-Range
+    /// for a ranged HEAD (the SDK exposes no content_range member on HEAD),
+    /// and s3s' typed HeadObjectOutput has no tag_count field (the local path
+    /// injects x-amz-tagging-count as a raw header) — both are dropped for
+    /// proxied HEADs.
+    fn proxy_sdk_head_output_to_s3s(remote: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> HeadObjectOutput {
+        HeadObjectOutput {
+            content_length: remote.content_length,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        self.execute_get_object_boxed(req).await
+    }
+
+    fn execute_get_object_boxed(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<GetObjectOutput>>> + Send + '_ {
+        Box::pin(self.execute_get_object_inner(req))
+    }
+
+    #[hotpath::measure(
+        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_get_object",
+        impl_type = "DefaultObjectUsecase"
+    )]
+    async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -6352,6 +6945,10 @@ impl DefaultObjectUsecase {
         // naming nonexistent buckets fail before the versioning lookup in
         // get_opts. The store comes from the request-bound server context
         // (backlog#1052 S6), not the process-global handle.
+        let object_traffic_health = self.object_traffic_health();
+        let object_metadata_progress = object_traffic_health
+            .as_deref()
+            .and_then(ObjectTrafficHealth::track_read_metadata);
         let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let Some(store) = self.object_store() else {
             lifecycle.finish_err();
@@ -6392,6 +6989,7 @@ impl DefaultObjectUsecase {
             rs,
             opts,
         } = request_context;
+        drop(object_metadata_progress);
 
         let manager = get_concurrency_manager();
 
@@ -6407,11 +7005,26 @@ impl DefaultObjectUsecase {
                 rs,
                 &opts,
                 part_number,
+                object_traffic_health,
             )
             .await
         {
             Ok(prepared_read) => prepared_read,
             Err(err) => {
+                // Active-active replication lag window: an object missing
+                // locally (and only missing — other errors keep their
+                // semantics) may still be served by proxying the GET to a
+                // replication target (backlog#1675 P1-5).
+                if matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
+                    && let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await
+                {
+                    lifecycle.finish_ok();
+                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    inject_accept_ranges_header(&mut response.headers);
+                    let result = Ok(response);
+                    let _ = helper.version_id(version_id_for_event).complete(&result);
+                    return result;
+                }
                 lifecycle.finish_err();
                 return Err(err);
             }
@@ -6567,9 +7180,10 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+        let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        opts.include_part_checksums = object_attributes_requested(&object_attributes, ObjectAttributes::OBJECT_PARTS);
 
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
@@ -6756,8 +7370,15 @@ impl DefaultObjectUsecase {
         result
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    pub fn execute_copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_ {
+        Box::pin(self.execute_copy_object_inner(req))
+    }
+
+    #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
+    async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -7016,7 +7637,7 @@ impl DefaultObjectUsecase {
         if _self_copy_lock_guard.is_some() {
             current_opts.no_lock = true;
         }
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info, &dst_opts)?;
                 if let Some(expected) = expected_current_version_id.as_deref()
@@ -7024,7 +7645,7 @@ impl DefaultObjectUsecase {
                 {
                     return Err(s3_error!(PreconditionFailed));
                 }
-                Some(existing_obj_info.size.max(0) as u64)
+                Some((existing_obj_info.size.max(0) as u64, quota_object_size(&existing_obj_info)))
             }
             Err(err) => {
                 if expected_current_version_id.is_some() {
@@ -7045,11 +7666,7 @@ impl DefaultObjectUsecase {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
                         .as_ref()
-                        .and_then(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
-                            "aws:kms" => Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
-                            _ => None,
-                        })
+                        .map(bucket_default_write_sse)
                 })
             })
         });
@@ -7349,37 +7966,78 @@ impl DefaultObjectUsecase {
 
         src_info.user_defined = Arc::new(user_defined);
 
-        self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
+        let quota_check = self
+            .check_bucket_quota(
+                &bucket,
+                QuotaOperation::CopyObject,
+                u64::try_from(actual_size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+            )
             .await?;
+        let quota_enabled = quota_check.as_ref().is_some_and(|result| result.quota_limit.is_some());
+        if let Some(quota_check) = quota_check.as_ref() {
+            apply_quota_admission(&mut dst_opts, quota_check)?;
+        }
+        let previous_current_size = match previous_current_sizes {
+            Some((_, Ok(logical_size))) if quota_enabled => Some(logical_size),
+            Some((_, Err(err))) if quota_enabled => return Err(ApiError::from(err).into()),
+            Some((physical_size, _)) => Some(physical_size),
+            None => None,
+        };
+        if let Some(quota_check) = quota_check.as_ref() {
+            ensure_object_size_within_quota(
+                quota_check,
+                u64::try_from(actual_size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+            )?;
+        }
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
-        let oi = store
-            .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
-            .await
-            .map_err(ApiError::from)?;
-        drop(_self_copy_lock_guard);
+        let copy_commit = spawn_traced_join({
+            let store = Arc::clone(&store);
+            let src_bucket = src_bucket.clone();
+            let src_key = src_key.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let src_opts = src_opts.clone();
+            let dst_opts = dst_opts.clone();
+            async move {
+                let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
+                let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
+                let _self_copy_lock_guard = _self_copy_lock_guard;
 
-        // Reuse the single pre-commit replication decision (see `dsc` above) so
-        // the persisted pending marker and the schedule always agree, mirroring
-        // the PUT path.
-        if dsc.replicate_any() {
-            schedule_object_replication(oi.clone(), store.clone(), dsc).await;
-        }
+                let oi = store
+                    .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+                    .await
+                    .map_err(ApiError::from)?;
 
-        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
-        let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+                // Reuse the single pre-commit replication decision (see `dsc` above) so
+                // the persisted pending marker and the schedule always agree, mirroring
+                // the PUT path.
+                if dsc.replicate_any() {
+                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc).await;
+                }
 
-        let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Update quota tracking after successful copy
-        if has_bucket_metadata {
-            if dest_versioned {
-                record_bucket_object_version_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
-            } else {
-                record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+                maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+                let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
+
+                let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                if has_bucket_metadata {
+                    let committed_size = quota_accounting_object_size(&oi, quota_enabled)?;
+                    if dest_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                    }
+                }
+
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                Ok::<_, S3Error>((oi, dest_versioned))
             }
-        }
+        });
+        let (oi, dest_versioned) = copy_commit.await.map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
+        })??;
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
         let dest_version = if dest_versioned { raw_dest_version } else { None };
@@ -7427,7 +8085,7 @@ impl DefaultObjectUsecase {
             }
         }
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
+            e_tag: oi.etag.as_ref().map(|etag| to_s3s_etag(etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             checksum_crc32: response_checksums.crc32,
             checksum_crc32c: response_checksums.crc32c,
@@ -7458,7 +8116,6 @@ impl DefaultObjectUsecase {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -8277,6 +8934,17 @@ impl DefaultObjectUsecase {
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
                     }
+                    // Active-active replication lag window: an object missing
+                    // locally may still be served by proxying the HEAD to a
+                    // replication target (backlog#1675 P1-5).
+                    if let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                        let result = Ok(response);
+                        let _ = helper
+                            .version_id(req.input.version_id.clone().unwrap_or_default())
+                            .complete(&result);
+                        return result;
+                    }
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
                 // Other errors, such as insufficient permissions, still return the original error
@@ -8850,6 +9518,17 @@ impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase")]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        self.execute_put_object_extract_boxed(req).await
+    }
+
+    fn execute_put_object_extract_boxed(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<PutObjectOutput>>> + Send + '_ {
+        Box::pin(self.execute_put_object_extract_inner(req))
+    }
+
+    async fn execute_put_object_extract_inner(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
         let auth_method = req.method.clone();
@@ -8965,7 +9644,12 @@ impl DefaultObjectUsecase {
         }
         validate_object_key(&key, "PUT")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
-        self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
+        let _ = self
+            .check_bucket_quota(
+                &bucket,
+                QuotaOperation::PutObject,
+                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
+            )
             .await?;
 
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
@@ -9022,14 +9706,17 @@ impl DefaultObjectUsecase {
 
         let extract_options = resolve_put_object_extract_options(&req.headers)?;
         let extract_limits = put_object_extract_limits();
-        let extract_quota_snapshot = if let Some(metadata_sys) = self.bucket_metadata_sys() {
+        let extract_quota_check = if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys);
             let check_result =
                 map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
-            check_result.current_usage.zip(check_result.quota_limit)
+            Some(check_result)
         } else {
             None
         };
+        let extract_quota_enabled = extract_quota_check
+            .as_ref()
+            .is_some_and(|result| result.quota_limit.is_some());
         let version_id = match event_version_id {
             Some(v) => v.to_string(),
             None => String::new(),
@@ -9109,10 +9796,8 @@ impl DefaultObjectUsecase {
                 .checked_add(entry_size)
                 .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
             validate_put_object_extract_total_size(total_unpacked_size, extract_limits)?;
-            if let Some((current_usage, quota_limit)) = extract_quota_snapshot
-                && current_usage.saturating_add(total_unpacked_size) > quota_limit
-            {
-                return Err(put_object_extract_quota_exceeded(current_usage, quota_limit));
+            if let Some(quota_check) = extract_quota_check.as_ref() {
+                ensure_legacy_archive_size_within_quota(quota_check, total_unpacked_size)?;
             }
             let mut size =
                 i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
@@ -9157,6 +9842,9 @@ impl DefaultObjectUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+            if let Some(quota_check) = extract_quota_check.as_ref() {
+                apply_quota_admission(&mut opts, quota_check)?;
+            }
             opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
             opts.object_lock_config_snapshot = Some(Arc::clone(&object_lock_config_snapshot));
             let pax_authorization =
@@ -9300,19 +9988,18 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            let committed_size = quota_accounting_object_size(&obj_info, extract_quota_enabled)?;
             let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
             match previous_current_size_from_backfill(backfilled_old_current_size) {
                 Some(previous_current_size) => {
                     if extract_versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
-                            .await;
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
                     } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
                     }
                 }
                 None => {
-                    record_bucket_object_write_unknown_previous_memory(&bucket, obj_info.size.max(0) as u64, extract_versioned)
-                        .await;
+                    record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, extract_versioned).await;
                 }
             }
             let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
@@ -9420,6 +10107,13 @@ pub(super) async fn object_lock_checks_required(bucket: &str) -> bool {
         .map_or(true, |metadata| metadata.object_locking())
 }
 
+fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
+    match state {
+        metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
+        metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,
+    }
+}
+
 /// rustfs/backlog#1009: map the rename_data old-size backfill onto the
 /// `previous_current_size` value the usage-accounting helpers expect. Outer
 /// `None` = unknown (no quorum agreement, or a peer predates the field) — the
@@ -9439,7 +10133,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -9599,6 +10294,34 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    #[test]
+    fn inject_accept_ranges_header_writes_static_bytes_value() {
+        let mut headers = HeaderMap::new();
+        inject_accept_ranges_header(&mut headers);
+
+        assert_eq!(headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+    }
+
+    #[tokio::test]
+    async fn finalize_get_object_response_injects_accept_ranges_header() {
+        let req = build_request(GetObjectInput::default(), Method::GET);
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let response = DefaultObjectUsecase::finalize_get_object_response(
+            helper,
+            "bucket",
+            &req.method,
+            &req.headers,
+            None,
+            String::new(),
+            GetObjectOutput::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("finalize response");
+
+        assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -9632,6 +10355,46 @@ mod tests {
         assert!(lookup_opts.http_preconditions.is_none());
         assert_eq!(lookup_opts.version_id.as_deref(), Some(version_id.as_str()));
         assert!(lookup_opts.no_lock);
+    }
+
+    // A malformed bucket-default algorithm reaches this resolution only through
+    // corrupt or hand-edited bucket metadata (PutBucketEncryption validates the
+    // value), so the invariant is pinned here rather than end-to-end: the copy
+    // path must resolve managed AES256 exactly like PUT/extract. With an
+    // unencrypted same-name source and no SSE-C, the resolved default alone
+    // keeps `copy_changes_encryption` true, so the metadata-only shortcut stays
+    // off while `sse_encryption` mints a fresh DEK (backlog#1826).
+    #[test]
+    fn copy_bucket_default_unknown_sse_algorithm_falls_back_to_aes256() {
+        let config = ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
+                    kms_master_key_id: None,
+                }),
+                bucket_key_enabled: None,
+            }],
+        };
+
+        let effective_sse = config
+            .rules
+            .first()
+            .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+            .map(bucket_default_write_sse);
+
+        assert_eq!(effective_sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+
+        // Valid algorithms map to themselves, byte-identical to the PUT path.
+        for (configured, expected) in [
+            (ServerSideEncryption::AES256, ServerSideEncryption::AES256),
+            (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
+        ] {
+            let sse = ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from_static(configured),
+                kms_master_key_id: None,
+            };
+            assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
+        }
     }
 
     #[test]
@@ -9672,6 +10435,19 @@ mod tests {
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
         assert!(metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
         assert_eq!(metadata.get("x-amz-meta-x-amz-object-lock-mode").map(String::as_str), Some("GOVERNANCE"));
+
+        let mut replication_headers = HeaderMap::new();
+        insert_header(&mut replication_headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(
+            &mut replication_headers,
+            rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            "2026-01-01T00:00:00Z",
+        );
+        let mut replica_metadata = HashMap::new();
+        let explicit_clear = has_replication_retention_update(&replication_headers, true);
+        apply_bucket_default_lock_retention("bucket", &state, &mut replica_metadata, explicit_clear).unwrap();
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
+        assert!(!replica_metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
@@ -10003,6 +10779,23 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
+    }
+
+    #[test]
+    fn object_lock_checks_required_reuses_authoritative_state() {
+        assert!(!object_lock_checks_required_for_state(
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        ));
+
+        let configured = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        assert!(object_lock_checks_required_for_state(&configured));
+        assert!(object_lock_checks_required_for_state(&metadata_sys::ObjectLockConfigState::Fabricated));
     }
 
     #[test]
@@ -11142,6 +11935,348 @@ mod tests {
         (store, context)
     }
 
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn object_progress_tracks_real_get_and_small_put_lock_waits() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let context = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("false"))], async {
+            crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await
+        })
+        .await;
+        let store = context.object_store();
+        let bucket = format!("object-progress-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("object progress bucket must be created");
+        put_real_cold_fill_object(&store, &bucket, object, b"initial").await;
+
+        let metadata_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let metadata_resume = Arc::new(tokio::sync::Barrier::new(2));
+        crate::storage::options::install_versioning_config_test_hook(
+            bucket.clone(),
+            Arc::clone(&metadata_entered),
+            Arc::clone(&metadata_resume),
+        );
+        let metadata_input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("metadata GET input must build");
+        let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let metadata_get = tokio::spawn(async move {
+            metadata_usecase
+                .execute_get_object(build_request(metadata_input, Method::GET))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
+            .await
+            .expect("GET must enter the bucket metadata stage");
+        assert!(object_traffic_health.snapshot().read_stalled);
+        assert!(!metadata_get.is_finished(), "GET must still be waiting in bucket metadata");
+        metadata_resume.wait().await;
+        let metadata_response = tokio::time::timeout(Duration::from_secs(10), metadata_get)
+            .await
+            .expect("metadata GET must finish after release")
+            .expect("metadata GET task must join")
+            .expect("metadata GET must succeed after release");
+        assert!(!object_traffic_health.snapshot().read_stalled);
+        drop(metadata_response);
+
+        let read_lock = store
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("read test namespace lock must be created")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("read test namespace lock must be held");
+        let get_input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("GET input must build");
+        let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let get = tokio::spawn(async move { get_usecase.execute_get_object(build_request(get_input, Method::GET)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !object_traffic_health.read_storage_stalled_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked GET must publish a storage stall");
+        assert!(!get.is_finished(), "GET must still be waiting for the held namespace lock");
+        drop(read_lock);
+        let get_response = tokio::time::timeout(Duration::from_secs(10), get)
+            .await
+            .expect("GET must finish after releasing the lock")
+            .expect("GET task must join")
+            .expect("GET must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().read_stalled);
+        drop(get_response);
+
+        let write_lock = store
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("write test namespace lock must be created")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("write test namespace lock must be held");
+        let post_store_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let post_store_resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
+        let payload = Bytes::from_static(b"replacement");
+        let put_input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let put_usecase = DefaultObjectUsecase::with_context(Some(context));
+        let put = tokio::spawn(async move {
+            put_usecase
+                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked small PUT must publish a storage stall");
+        assert!(!put.is_finished(), "PUT must still be waiting for the held namespace lock");
+        drop(write_lock);
+        tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
+            .await
+            .expect("PUT must reach the first post-store hook");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        assert!(!put.is_finished(), "PUT must remain blocked after the store guard has ended");
+        post_store_resume.wait().await;
+        tokio::time::timeout(Duration::from_secs(10), put)
+            .await
+            .expect("PUT must finish after releasing the lock")
+            .expect("PUT task must join")
+            .expect("PUT must succeed after releasing the lock");
+        let recovered = object_traffic_health.snapshot();
+        assert!(!recovered.read_stalled);
+        assert!(!recovered.write_stalled);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn cancelled_put_request_completes_post_commit_publication() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("put-owner-tail-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("PUT owner-tail bucket must be created");
+
+        let old_body = Bytes::from_static(b"old body that must be invalidated");
+        let old_info = put_real_cold_fill_object(&store, &bucket, object, &old_body).await;
+        let adapter = context.object_data_cache();
+        let old_plan = real_cold_fill_plan(&adapter, &bucket, object, &old_info);
+
+        let post_store_entered = Arc::new(tokio::sync::Barrier::new(2));
+        let post_store_resume = Arc::new(tokio::sync::Barrier::new(2));
+        install_put_post_store_test_hook(bucket.clone(), Arc::clone(&post_store_entered), Arc::clone(&post_store_resume));
+
+        let payload = Bytes::from_static(b"published despite caller cancellation");
+        let put_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
+            .build()
+            .expect("PUT input must build");
+        let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let put = tokio::spawn(async move {
+            put_usecase
+                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
+            .await
+            .expect("PUT must reach the post-store owner-tail hook");
+        assert_eq!(
+            adapter.fill_body(&old_plan, old_body.clone()).await,
+            rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted,
+            "test must republish the old body while the owner tail is paused"
+        );
+        put.abort();
+        post_store_resume.wait().await;
+        let _ = put.await.expect_err("outer request task must be cancelled");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    adapter.lookup_body(&old_plan).await,
+                    rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-commit owner tail must invalidate stale body cache after caller cancellation");
+
+        let recovered = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cancelled request's owned commit must still publish the object");
+        assert_eq!(recovered.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
+    }
+
+    #[tokio::test]
+    async fn object_progress_tracks_zero_byte_and_zero_copy_put_lock_waits() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let context =
+            crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+        let store = context.object_store();
+        let bucket = format!("progress-buffered-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("buffered PUT progress bucket must be created");
+
+        let extra_body_object = "zero-byte-extra.bin";
+        let extra_body_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(extra_body_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"x")))))
+            .content_length(Some(88))
+            .build()
+            .expect("zero-byte extra-body PUT input must build");
+        let extra_body_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut extra_body_request = build_request(extra_body_input, Method::PUT);
+        extra_body_request.headers = streaming_headers(Some("0"));
+        let extra_body_err = extra_body_usecase
+            .execute_put_object(&FS::new(), extra_body_request)
+            .await
+            .expect_err("decoded zero-byte PUT with body data must fail");
+        assert_eq!(extra_body_err.code(), &S3ErrorCode::UnexpectedContent);
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        let lookup_err = store
+            .get_object_info(&bucket, extra_body_object, &ObjectOptions::default())
+            .await
+            .expect_err("rejected zero-byte PUT must not create an object");
+        assert!(is_err_object_not_found(&lookup_err));
+
+        let zero_object = "zero-byte.bin";
+        let zero_write_lock = store
+            .new_ns_lock(&bucket, zero_object)
+            .await
+            .expect("zero-byte PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-byte PUT namespace lock must be held");
+        let (body_polled_tx, body_polled_rx) = tokio::sync::oneshot::channel();
+        let (body_release_tx, body_release_rx) = tokio::sync::oneshot::channel();
+        let pending_zero_body = StreamingBlob::wrap(futures::stream::once(async move {
+            body_polled_tx.send(()).expect("zero-byte body poll signal must be received");
+            body_release_rx.await.expect("zero-byte body EOF must be released");
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let zero_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(zero_object.to_string())
+            .body(Some(pending_zero_body))
+            .content_length(Some(87))
+            .build()
+            .expect("zero-byte PUT input must build");
+        let zero_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+        let mut zero_request = build_request(zero_input, Method::PUT);
+        zero_request.headers = streaming_headers(Some("0"));
+        let zero_put = tokio::spawn(async move { zero_usecase.execute_put_object(&FS::new(), zero_request).await });
+
+        tokio::time::timeout(Duration::from_secs(30), body_polled_rx)
+            .await
+            .expect("zero-byte PUT body must be polled for EOF")
+            .expect("zero-byte PUT body poll signal must be sent");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for request EOF");
+
+        body_release_tx.send(()).expect("zero-byte PUT body EOF must be released");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fully received zero-byte PUT must publish a storage stall");
+        assert!(!zero_put.is_finished(), "zero-byte PUT must still be waiting for the held namespace lock");
+
+        drop(zero_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_put)
+            .await
+            .expect("zero-byte PUT must finish after releasing the lock")
+            .expect("zero-byte PUT task must join")
+            .expect("zero-byte PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+
+        let zero_copy_object = "zero-copy-eager.jpg";
+        let zero_copy_payload = Bytes::from(vec![b'z'; 1024 * 1024 + 1]);
+        let zero_copy_size = i64::try_from(zero_copy_payload.len()).expect("zero-copy payload length must fit i64");
+        let zero_copy_headers = HeaderMap::new();
+        assert!(!is_disk_compressible(&zero_copy_headers, zero_copy_object));
+        assert_eq!(
+            zero_copy_eager_put_path_status(zero_copy_size, &zero_copy_headers, false, false, false),
+            PUT_EAGER_STATUS_ELIGIBLE,
+            "test payload must exercise the production zero-copy eager path",
+        );
+        let zero_copy_write_lock = store
+            .new_ns_lock(&bucket, zero_copy_object)
+            .await
+            .expect("zero-copy PUT namespace lock must be created")
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("zero-copy PUT namespace lock must be held");
+        let zero_copy_input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key(zero_copy_object.to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(zero_copy_payload))))
+            .content_length(Some(zero_copy_size))
+            .build()
+            .expect("zero-copy PUT input must build");
+        let zero_copy_usecase = DefaultObjectUsecase::with_context(Some(context));
+        let zero_copy_put = tokio::spawn(async move {
+            zero_copy_usecase
+                .execute_put_object(&FS::new(), build_request(zero_copy_input, Method::PUT))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !object_traffic_health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked zero-copy eager PUT must publish a storage stall");
+        assert!(
+            !zero_copy_put.is_finished(),
+            "zero-copy PUT must still be waiting for the held namespace lock"
+        );
+
+        drop(zero_copy_write_lock);
+        tokio::time::timeout(Duration::from_secs(30), zero_copy_put)
+            .await
+            .expect("zero-copy PUT must finish after releasing the lock")
+            .expect("zero-copy PUT task must join")
+            .expect("zero-copy PUT must succeed after releasing the lock");
+        assert!(!object_traffic_health.snapshot().write_stalled);
+    }
+
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
         let mut reader = PutObjReader::from_vec(body.to_vec());
         store
@@ -12099,7 +13234,10 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("a short memory body must fail the stream instead of serving a truncated body");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
         assert!(stream.next().await.is_none(), "stream must terminate after the error");
     }
 
@@ -12118,7 +13256,62 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn memory_blob_preserves_exact_remaining_length() {
+        let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            GetObjectBodyLifecycle::disabled(),
+        );
+
+        assert_eq!(blob.remaining_length().exact(), Some(5));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_holds_guard_until_bytes_drop() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let initial = GetObjectGuard::concurrent_count();
+            let guard = GetObjectGuard::new();
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"hello"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::tracked(guard),
+            );
+            let mut body = s3s::Body::from(blob);
+            let bytes = body.take_bytes().expect("opt-in exact memory body should stay on Body::Once");
+
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+            drop(bytes);
+            assert_eq!(GetObjectGuard::concurrent_count(), initial);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_rejects_length_mismatch() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"test"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::disabled(),
+            );
+            let mut body = s3s::Body::from(blob);
+
+            assert!(body.take_bytes().is_none(), "mismatched memory body must keep the guarded stream path");
+        });
     }
 
     #[tokio::test]
@@ -12396,6 +13589,7 @@ mod tests {
             StorageError::FileNotFound,
             StorageError::ObjectNotFound("test-bucket".to_string(), "relocated-object".to_string()),
             StorageError::InsufficientReadQuorum("test-bucket".to_string(), "relocated-object".to_string()),
+            StorageError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "relocated shard disappeared")),
         ] {
             let reopen_count = Arc::new(AtomicUsize::new(0));
             let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
@@ -13319,6 +14513,12 @@ mod tests {
         request_headers.insert(SSEC_KEY_MD5_HEADER, HeaderValue::from_static("bWQ1"));
         request_headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=test"));
         request_headers.insert("x-amz-security-token", HeaderValue::from_static("session-token"));
+        let store_headers = project_ssec_transport_headers(&request_headers);
+        assert_eq!(store_headers.len(), 3, "only store-consumed SSE-C headers are forwarded");
+        assert!(store_headers.values().all(HeaderValue::is_sensitive));
+        assert!(store_headers.get(http::header::AUTHORIZATION).is_none());
+        assert!(store_headers.get("x-amz-security-token").is_none());
+        assert!(!format!("{store_headers:?}").contains("dGVzdC1rZXk="));
         let plain_info = ObjectInfo {
             size: 11,
             ..Default::default()
@@ -14584,7 +15784,11 @@ mod tests {
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, MI_B as i64, GetObjectStreamStrategy::Standard),
-            128 * 1024
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(256 * 1024, 2 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            MID_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::LargeSequentialReadahead),
@@ -14731,16 +15935,65 @@ mod tests {
         );
     }
 
+    struct FragmentedBody {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for FragmentedBody {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining()).min(2);
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InitializedLengthProbe {
+        data: std::io::Cursor<Vec<u8>>,
+        initialized_lengths: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for InitializedLengthProbe {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")
+                .push(buf.initialized().len());
+            let position = usize::try_from(self.data.position()).expect("test cursor position should fit usize");
+            let remaining = &self.data.get_ref()[position..];
+            let copied = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..copied]);
+            self.data
+                .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
-    async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
+    async fn read_small_put_body_exact_pooled_reads_exact_bytes_without_prefill() {
         let pool = get_concurrency_manager().bytes_pool();
-        let body = std::io::Cursor::new(b"hello".to_vec());
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
 
         let buffer = read_small_put_body_exact_pooled(body, 5, pool.as_ref())
             .await
             .expect("pooled exact read should succeed");
 
         assert_eq!(&buffer[..5], b"hello");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first pooled body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -14754,6 +16007,131 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_pooled_rejects_extra_body() {
+        let pool = get_concurrency_manager().bytes_pool();
+        let body = std::io::Cursor::new(b"hello!".to_vec());
+
+        let err = match read_small_put_body_exact_pooled(body, 5, pool.as_ref()).await {
+            Ok(_) => panic!("extra pooled body should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_exact_bytes_without_prefill() {
+        let body = std::io::Cursor::new(b"hello".to_vec());
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(reader.get_ref().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_short_and_extra_bodies() {
+        let short = read_small_put_body_exact_direct(std::io::Cursor::new(b"hell".to_vec()), 5)
+            .await
+            .expect_err("short direct body should fail");
+        assert_eq!(short.code(), &S3ErrorCode::IncompleteBody);
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(b"hello!".to_vec()), 5)
+            .await
+            .expect_err("extra direct body should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_handles_empty_body_boundary() {
+        let empty = read_small_put_body_exact_direct(std::io::Cursor::new(Vec::<u8>::new()), 0)
+            .await
+            .expect("empty direct body should succeed");
+        assert!(empty.get_ref().is_empty());
+
+        let extra = read_small_put_body_exact_direct(std::io::Cursor::new(vec![1u8]), 0)
+            .await
+            .expect_err("non-empty body declared as empty should fail");
+        assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_error_after_partial_read() {
+        struct PartialThenError {
+            delivered_prefix: bool,
+        }
+
+        impl AsyncRead for PartialThenError {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.delivered_prefix {
+                    return Poll::Ready(Err(std::io::Error::other("body read failed")));
+                }
+
+                self.delivered_prefix = true;
+                buf.put_slice(b"he");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let err = read_small_put_body_exact_direct(PartialThenError { delivered_prefix: false }, 5)
+            .await
+            .expect_err("a partial body followed by an I/O error must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_accepts_fragmented_body() {
+        let reader = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect("a fragmented exact-length body should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_rejects_fragmented_extra_body() {
+        let err = read_small_put_body_exact_direct(
+            FragmentedBody {
+                data: std::io::Cursor::new(b"hello!".to_vec()),
+            },
+            5,
+        )
+        .await
+        .expect_err("a fragmented body longer than declared must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_exact_direct_reads_into_uninitialized_spare_capacity() {
+        let initialized_lengths = Arc::new(Mutex::new(Vec::new()));
+        let body = InitializedLengthProbe {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            initialized_lengths: Arc::clone(&initialized_lengths),
+        };
+
+        let reader = read_small_put_body_exact_direct(body, 5)
+            .await
+            .expect("direct exact read should succeed");
+
+        assert_eq!(reader.get_ref().as_slice(), b"hello");
+        assert_eq!(
+            initialized_lengths
+                .lock()
+                .expect("initialized-length probe lock should not poison")[0],
+            0,
+            "the first body read must use uninitialized spare capacity rather than a zero-filled slice"
+        );
     }
 
     #[tokio::test]
@@ -14940,6 +16318,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_object_stream_failure_labels_are_low_cardinality() {
+        assert_eq!(get_object_stream_failure_reason("short_eof"), GET_STREAMING_BODY_FAILURE_REASON_SHORT_EOF);
+        assert_eq!(
+            get_object_stream_failure_reason("timeout"),
+            GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
+        );
+        assert_eq!(
+            get_object_stream_size_bucket(4 * 1024 * 1024),
+            rustfs_io_metrics::GET_OBJECT_SIZE_BUCKET_GT_1_MIB
+        );
+    }
+
     #[tokio::test]
     async fn disk_read_permit_reader_releases_permit_at_eof() {
         use tokio::io::AsyncReadExt;
@@ -15122,13 +16513,6 @@ mod tests {
 
         let err = validate_put_object_extract_entry_path("toolong-path", limits).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
-    }
-
-    #[test]
-    fn put_object_extract_quota_exceeded_matches_existing_error_shape() {
-        let err = put_object_extract_quota_exceeded(10, 8);
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 10 bytes, limit: 8 bytes"));
     }
 
     #[tokio::test]
@@ -15615,8 +16999,12 @@ mod tests {
             .expect("create self-copy test bucket");
         let payload = b"object whose key equals its bucket".to_vec();
         let mut reader = PutObjReader::from_vec(payload.clone());
+        let setup_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
         store
-            .put_object(&bucket, &bucket, &mut reader, &ObjectOptions::default())
+            .put_object(&bucket, &bucket, &mut reader, &setup_opts)
             .await
             .expect("put object whose key equals its bucket");
 
@@ -16181,7 +17569,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
             .bucket("test-bucket".to_string())
@@ -16324,7 +17711,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
         let restore_request = RestoreRequest {
             days: Some(1),
@@ -16855,7 +18241,97 @@ mod tests {
             quota_limit: Some(2048),
             operation_size: 512,
             remaining: Some(512),
+            uses_durable_reservations: true,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quota_rejects_ciphertext_replication_before_polling_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_store, bucket) =
+            crate::app::gating_test_env::durable_quota_test_bucket("ciphertext-replication-early-reject", 4096).await;
+        let body_polled = Arc::new(AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body = StreamingBlob::wrap(futures::stream::once(async move {
+            body_polled_in_stream.store(true, Ordering::Release);
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"ciphertext"))
+        }));
+        let input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key("object".to_string())
+            .body(Some(body))
+            .content_length(Some(10))
+            .build()
+            .expect("ciphertext replication PUT input should build");
+        let mut request = build_request(input, Method::PUT);
+        insert_header(&mut request.headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        request
+            .headers
+            .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        request.extensions.insert(crate::storage::access::ReqInfo {
+            replication_request_authorized: true,
+            ..Default::default()
+        });
+
+        let err = DefaultObjectUsecase::from_global()
+            .execute_put_object(&FS::new(), request)
+            .await
+            .expect_err("quota-enabled ciphertext replication should fail at ingress");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(!body_polled.load(Ordering::Acquire), "rejected ciphertext body must not be consumed");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_quota_rejects_full_put_before_polling_the_body() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GI_B: u64 = 1024 * 1024 * 1024;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let bucket = format!("legacy-quota-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create legacy quota test bucket");
+        crate::app::storage_api::test::data_usage::seed_bucket_usage_memory_for_test(&bucket, 4 * GI_B).await;
+        let metadata_sys = DefaultObjectUsecase::from_global()
+            .bucket_metadata_sys()
+            .expect("test app context should expose bucket metadata");
+        QuotaChecker::new(metadata_sys)
+            .set_quota_config(
+                &bucket,
+                BucketQuota {
+                    quota: Some(5 * GI_B),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("configure legacy quota");
+
+        let body_polled = Arc::new(AtomicBool::new(false));
+        let body_polled_in_stream = Arc::clone(&body_polled);
+        let body = StreamingBlob::wrap(futures::stream::once(async move {
+            body_polled_in_stream.store(true, Ordering::Release);
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        }));
+        let input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key("object".to_string())
+            .body(Some(body))
+            .content_length(Some(i64::try_from(2 * GI_B).expect("test size should fit i64")))
+            .build()
+            .expect("legacy quota PUT input should build");
+
+        let err = DefaultObjectUsecase::from_global()
+            .execute_put_object(&FS::new(), build_request(input, Method::PUT))
+            .await
+            .expect_err("4 GiB used plus a 2 GiB PUT must exceed a 5 GiB legacy quota");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(!body_polled.load(Ordering::Acquire), "legacy quota rejection must not consume the body");
     }
 
     #[test]
@@ -16868,9 +18344,418 @@ mod tests {
         assert_eq!(result.remaining, Some(512));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn concurrent_puts_share_durable_bucket_quota_reservations() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-put-quota", 6000).await;
+
+        let first_opts = ObjectOptions::default();
+        let second_opts = ObjectOptions::default();
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x73; 4096]);
+            first_store.put_object(&first_bucket, "first", &mut reader, &first_opts).await
+        });
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x74; 4096]);
+            store.put_object(&bucket, "second", &mut reader, &second_opts).await
+        });
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first PUT task should not panic");
+        let second = second.expect("second PUT task should not panic");
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let denied = first.err().or_else(|| second.err()).expect("one PUT must be denied");
+        assert!(matches!(
+            denied,
+            StorageError::QuotaExceeded {
+                current: 4096,
+                limit: 6000
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn concurrent_within_limit_puts_keep_independent_mutation_fences() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-fence-quota", 8192).await;
+        let first_barrier = PutObjectCommitBarrier::install(&bucket, "first", PutObjectCommitPause::BeforeQuotaRename);
+        let second_barrier = PutObjectCommitBarrier::install(&bucket, "second", PutObjectCommitPause::BeforeQuotaRename);
+
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x75; 4096]);
+            first_store
+                .put_object(&first_bucket, "first", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        let second_store = Arc::clone(&store);
+        let second_bucket = bucket.clone();
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x76; 4096]);
+            second_store
+                .put_object(&second_bucket, "second", &mut reader, &ObjectOptions::default())
+                .await
+        });
+
+        first_barrier.wait_until_paused().await;
+        second_barrier.wait_until_paused().await;
+        first_barrier.release();
+        second_barrier.release();
+
+        first
+            .await
+            .expect("first PUT task should not panic")
+            .expect("first within-limit PUT should commit");
+        second
+            .await
+            .expect("second PUT task should not panic")
+            .expect("second within-limit PUT should commit");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn put_rejects_rotated_quota_capability_before_rename() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-put-quota", 4096).await;
+        let barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::BeforeQuotaRename);
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x77; 4096]);
+            put_store
+                .put_object(&put_bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert!(
+            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
+            "the gating environment must have a current fleet proof"
+        );
+        barrier.release();
+
+        let err = put
+            .await
+            .expect("PUT task should not panic")
+            .expect_err("a replaced fleet proof must fence the authoritative rename");
+        assert!(matches!(
+            err,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "quota_reservation",
+                ..
+            }
+        ));
+        store
+            .get_object_info(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect_err("proof rotation before rename must leave no committed object");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_quota_reclaims_overwrites_and_deleted_bytes() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("quota-delta-reconcile", 4096).await;
+
+        for byte in [0x41, 0x42] {
+            let mut reader = PutObjReader::from_vec(vec![byte; 4096]);
+            store
+                .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("same-size overwrite must consume no additional quota");
+        }
+
+        store
+            .delete_object(&bucket, "object", ObjectOptions::default())
+            .await
+            .expect("delete quota-tracked object");
+        let mut replacement = PutObjReader::from_vec(vec![0x43; 4096]);
+        store
+            .put_object(&bucket, "replacement", &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("deleted bytes must be reclaimed before rejecting a replacement");
+
+        let mut excess = PutObjReader::from_vec(vec![0x44]);
+        let err = store
+            .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
+            .await
+            .expect_err("one byte beyond the reclaimed exact quota must be denied");
+        assert!(matches!(
+            err,
+            StorageError::QuotaExceeded {
+                current: 4096,
+                limit: 4096
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_put_has_zero_quota_growth() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("data-movement-put-quota", 0).await;
+        let mut reader = PutObjReader::from_vec(vec![0x79; 4096]);
+        let stored = store
+            .put_object(
+                &bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    data_movement: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("moving an already-accounted object between pools must have zero quota growth");
+        assert_eq!(stored.size, 4096);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_put_releases_durable_quota_reservation() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("cancelled-put-quota", 4096).await;
+
+        let barrier = PutObjectCommitBarrier::install(&bucket, "cancelled", PutObjectCommitPause::AfterQuotaReservation);
+        let cancelled_store = Arc::clone(&store);
+        let cancelled_bucket = bucket.clone();
+        let cancelled = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x51; 4096]);
+            cancelled_store
+                .put_object(&cancelled_bucket, "cancelled", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        cancelled.abort();
+        let cancelled_result = cancelled.await;
+        assert!(cancelled_result.is_err(), "the paused request must be cancelled");
+        drop(barrier);
+
+        let mut replacement = PutObjReader::from_vec(vec![0x52; 4096]);
+        store
+            .put_object(&bucket, "replacement", &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("cancelling before commit must release the complete reservation");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_put_after_commit_marker_is_reconciled() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("cancelled-spawned-put-quota", 4096).await;
+        let commit_barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::BeforeQuotaRename);
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+            first_store
+                .put_object(&first_bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        commit_barrier.wait_until_paused().await;
+        first.abort();
+        assert!(first.await.is_err(), "the outer request task must be cancelled");
+        drop(commit_barrier);
+
+        store
+            .get_object_info(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect_err("cancelling before rename must not commit the object");
+        let mut replacement = PutObjReader::from_vec(vec![0x54; 4096]);
+        store
+            .put_object(&bucket, "replacement", &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("the next admission must reap the abandoned commit marker");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn committed_put_survives_quota_ledger_settlement_failure() {
+        use crate::app::storage_api::test::set_disk::{
+            PutObjectCommitBarrier, PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
+        };
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("settlement-failure-quota", 4096).await;
+        let barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::BeforeQuotaRename);
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x59; 4096]);
+            put_store
+                .put_object(&put_bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        fail_next_quota_ledger_save_for_test();
+        barrier.release();
+        put.await
+            .expect("PUT task should not panic")
+            .expect("a post-commit ledger failure must not change the successful write result");
+        let stored = store
+            .get_object_info(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("the committed object must remain visible");
+        assert_eq!(stored.size, 4096);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn suspended_null_version_overwrite_uses_exact_quota_delta() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("suspended-version-quota", 6200).await;
+        let mut versioned_reader = PutObjReader::from_vec(vec![0x61; 4096]);
+        store
+            .put_object(
+                &bucket,
+                "object",
+                &mut versioned_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write UUID version");
+
+        for (size, byte) in [(1024, 0x62), (2048, 0x63)] {
+            let mut reader = PutObjReader::from_vec(vec![byte; size]);
+            store
+                .put_object(
+                    &bucket,
+                    "object",
+                    &mut reader,
+                    &ObjectOptions {
+                        version_suspended: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("suspended write should replace only the exact null version");
+        }
+
+        let mut excess = PutObjReader::from_vec(vec![0x64; 57]);
+        let err = store
+            .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
+            .await
+            .expect_err("UUID plus replacement null version must consume 6144 bytes");
+        assert!(matches!(
+            err,
+            StorageError::QuotaExceeded {
+                current: 6144,
+                limit: 6200
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_quota_reservation_observes_lowered_config_revision() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("lowered-quota-revision", 8192).await;
+        let mut initial = PutObjReader::from_vec(vec![0x71; 4096]);
+        store
+            .put_object(&bucket, "initial", &mut initial, &ObjectOptions::default())
+            .await
+            .expect("write under original quota");
+
+        let metadata_sys = DefaultObjectUsecase::from_global()
+            .bucket_metadata_sys()
+            .expect("test app context should expose bucket metadata");
+        QuotaChecker::new(metadata_sys)
+            .set_quota_config(&bucket, BucketQuota::new(Some(4096)))
+            .await
+            .expect("lower bucket quota");
+        let mut excess = PutObjReader::from_vec(vec![0x72]);
+        let err = store
+            .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
+            .await
+            .expect_err("reservation must not use the stale larger quota revision");
+        assert!(matches!(
+            err,
+            StorageError::QuotaExceeded {
+                current: 4096,
+                limit: 4096
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quota_enable_waits_for_unlimited_commit() {
+        use crate::app::storage_api::test::metadata_sys::ConfigWriteLockProbe;
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("quota-config-fence", 8192).await;
+        let metadata_sys = DefaultObjectUsecase::from_global()
+            .bucket_metadata_sys()
+            .expect("test app context should expose bucket metadata");
+        QuotaChecker::new(Arc::clone(&metadata_sys))
+            .set_quota_config(&bucket, BucketQuota::new(None))
+            .await
+            .expect("clear quota before the fenced write");
+        let barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::AfterQuotaReservation);
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x73; 4096]);
+            put_store
+                .put_object(&put_bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let update_probe = ConfigWriteLockProbe::install(&bucket);
+        let update_bucket = bucket.clone();
+        let update = tokio::spawn(async move {
+            QuotaChecker::new(metadata_sys)
+                .set_quota_config(&update_bucket, BucketQuota::new(Some(0)))
+                .await
+        });
+        update_probe.wait_until_attempted().await;
+        assert!(
+            !update.is_finished(),
+            "quota mutation must wait for the reservation's metadata transaction guard"
+        );
+
+        barrier.release();
+        put.await
+            .expect("PUT task should not panic")
+            .expect("the write linearized before the quota update must commit");
+        update
+            .await
+            .expect("quota update task should not panic")
+            .expect("quota update should proceed after commit");
+
+        let mut excess = PutObjReader::from_vec(vec![0x74]);
+        let err = store
+            .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
+            .await
+            .expect_err("writes after the zero-byte quota update must be denied");
+        assert!(matches!(err, StorageError::QuotaExceeded { current: 4096, limit: 0 }));
+    }
+
     #[test]
     fn quota_admission_rejects_over_limit() {
         let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn legacy_quota_admission_rejects_already_over_limit() {
+        let result = QuotaCheckResult {
+            allowed: true,
+            current_usage: Some(6),
+            quota_limit: Some(5),
+            operation_size: 0,
+            remaining: Some(0),
+            uses_durable_reservations: false,
+        };
+        let mut opts = ObjectOptions::default();
+        let err =
+            apply_quota_admission(&mut opts, &result).expect_err("legacy completion must not bypass an already exceeded quota");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -16885,6 +18770,45 @@ mod tests {
         )
         .expect_err("a checker fault must fail closed");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn legacy_archive_quota_rejects_cumulative_size_and_overflow() {
+        let legacy = QuotaCheckResult {
+            allowed: true,
+            current_usage: Some(4),
+            quota_limit: Some(5),
+            operation_size: 0,
+            remaining: Some(1),
+            uses_durable_reservations: false,
+        };
+        assert!(ensure_legacy_archive_size_within_quota(&legacy, 2).is_err());
+        assert!(ensure_legacy_archive_size_within_quota(&legacy, 1).is_ok());
+
+        let maxed = QuotaCheckResult {
+            current_usage: Some(u64::MAX),
+            quota_limit: Some(u64::MAX),
+            ..legacy
+        };
+        assert!(ensure_legacy_archive_size_within_quota(&maxed, 1).is_err());
+    }
+
+    #[test]
+    fn early_quota_filter_rejects_only_an_individually_impossible_object() {
+        let stale_full_usage = QuotaCheckResult {
+            allowed: true,
+            current_usage: Some(4096),
+            quota_limit: Some(4096),
+            operation_size: 0,
+            remaining: Some(0),
+            uses_durable_reservations: true,
+        };
+
+        ensure_object_size_within_quota(&stale_full_usage, 4096)
+            .expect("commit-time ledger must decide whether stale usage was reclaimed");
+        let err = ensure_object_size_within_quota(&stale_full_usage, 4097)
+            .expect_err("an object larger than the whole quota can never fit");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]

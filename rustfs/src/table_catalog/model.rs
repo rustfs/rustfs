@@ -1067,13 +1067,19 @@ pub(crate) struct TableCatalogBackingProfile {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogBackingKind {
     ObjectBacked,
-    StrongKvWal,
+    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
+    #[serde(rename = "STRONG_KV_WAL")]
+    DurableStrongSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogAuthority {
     RustfsSysObject,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     LinearizableMetadataKv,
 }
 
@@ -1081,6 +1087,10 @@ pub(crate) enum TableCatalogAuthority {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogConsistencyMode {
     ConditionalObjectCas,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     LinearizableCas,
 }
 
@@ -1088,6 +1098,10 @@ pub(crate) enum TableCatalogConsistencyMode {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogDurabilityMode {
     StagedCommitLogBeforePointerUpdate,
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     WalBeforeStateMachineApply,
 }
 
@@ -1203,7 +1217,9 @@ pub(crate) enum TableCatalogBackingMigrationStep {
     ReplayCommitLog,
     VerifyCurrentPointer,
     EnableSingleWriterFencing,
-    CutOverLinearizableReads,
+    // RUSTFS_COMPAT_TODO(table-catalog-backing-manifest-v1-wire-labels): Keep the version 1 wire label for existing clients. Remove after a versioned manifest with an explicit client migration contract replaces it.
+    #[serde(rename = "CUT_OVER_LINEARIZABLE_READS")]
+    CutOverDurableSnapshotReads,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1213,6 +1229,8 @@ pub(crate) enum TableCatalogBackingMigrationBlocker {
     CommitManualReviewRequired,
     WarehouseIndexBackfillRequired,
     DuplicateWarehousePrefix,
+    DuplicateTableIdentity,
+    TableViewIdentifierCollision,
     DurableStrongSnapshotChanged,
 }
 
@@ -1222,6 +1240,8 @@ pub(crate) enum TableCatalogBackingMigrationAction {
     RunCatalogRecovery,
     BackfillWarehouseIndex,
     ReviewDuplicateWarehousePrefixes,
+    ReviewDuplicateTableIdentities,
+    ReviewTableViewIdentifierCollisions,
     SnapshotObjectBackedCatalog,
     EnableDurableStrongBacking,
     VerifyDurableStrongSnapshot,
@@ -1401,12 +1421,20 @@ pub(crate) struct TableCommitRecoveryReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) struct NamespaceMarker {
     pub version: u16,
     pub namespace: String,
 }
 
 impl NamespaceMarker {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn new(namespace: &Namespace) -> Self {
         Self {
             version: TABLE_NAMESPACE_MARKER_VERSION,
@@ -1415,11 +1443,19 @@ impl NamespaceMarker {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn namespace_marker_json(namespace: &Namespace) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&NamespaceMarker::new(namespace))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) struct TableMarker {
     pub version: u16,
     pub namespace: String,
@@ -1428,6 +1464,10 @@ pub(crate) struct TableMarker {
 }
 
 impl TableMarker {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn new(namespace: &Namespace, table: &IdentifierSegment) -> Self {
         Self {
             version: TABLE_RESOURCE_MARKER_VERSION,
@@ -1438,17 +1478,29 @@ impl TableMarker {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn table_marker_json(namespace: &Namespace, table: &IdentifierSegment) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&TableMarker::new(namespace, table))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) struct TableMetadataPointer {
     pub version: u16,
     pub metadata_location: String,
 }
 
 impl TableMetadataPointer {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn new(metadata_location: String) -> Self {
         Self {
             version: TABLE_METADATA_POINTER_VERSION,
@@ -1457,10 +1509,18 @@ impl TableMetadataPointer {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn table_metadata_pointer_json(metadata_location: String) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&TableMetadataPointer::new(metadata_location))
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn parse_table_metadata_pointer(data: &[u8]) -> Result<TableMetadataPointer, serde_json::Error> {
     serde_json::from_slice(data)
 }

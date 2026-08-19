@@ -32,8 +32,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hyper_rustls::ConfigBuilderExt;
 use rumqttc::{
-    AsyncClient, Broker, ClientError, ConnectionError, EventLoop, Incoming, MqttOptions, Outgoing, PublishNoticeError, QoS,
-    Transport, mqttbytes::Error as MqttBytesError,
+    AsyncClient, Broker, ClientError, ConnectionError, EventLoop, Incoming, MqttOptions, Outgoing, ProtocolViolation,
+    PublishNoticeError, PublishOptions, QoS, Transport, mqttbytes::Error as MqttBytesError,
 };
 use rustfs_config::{
     EnableState, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_WS_PATH_ALLOWLIST,
@@ -791,7 +791,7 @@ where
                 .as_ref()
                 .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
             let notice = client
-                .publish_tracked(&self.args.topic, self.args.qos, false, body)
+                .publish_tracked(&self.args.topic, body, PublishOptions::new(self.args.qos))
                 .await
                 .map_err(|error| classify_mqtt_client_error(&error))?;
             drop(client_guard);
@@ -1145,7 +1145,7 @@ async fn run_mqtt_event_loop(mut eventloop: EventLoop, connected_status: Arc<Ato
                         );
                         connected_status.store(false, Ordering::SeqCst);
                     }
-                    rumqttc::Event::Incoming(Incoming::PingResp(_)) => {
+                    rumqttc::Event::Incoming(Incoming::PingResp) => {
                         trace!(target_id = %target_id, "Received PingResp from broker. Connection is alive.");
                     }
                     rumqttc::Event::Incoming(Incoming::SubAck(suback)) => {
@@ -1257,7 +1257,11 @@ async fn run_mqtt_event_loop(mut eventloop: EventLoop, connected_status: Arc<Ato
 /// copy is preserved and replayed rather than dropped (backlog#971).
 fn classify_mqtt_client_error(err: &ClientError) -> TargetError {
     match err {
-        ClientError::Request(_) | ClientError::TryRequest(_) | ClientError::TrackingUnavailable => TargetError::NotConnected,
+        ClientError::RequestChannelFull(_) | ClientError::RequestChannelDisconnected(_) | ClientError::TrackingUnavailable => {
+            TargetError::NotConnected
+        }
+        ClientError::InvalidRequest(_) => TargetError::Request(format!("Invalid MQTT publish request: {err}")),
+        _ => TargetError::NotConnected,
     }
 }
 
@@ -1270,10 +1274,14 @@ fn classify_mqtt_notice_error(err: &PublishNoticeError) -> TargetError {
         PublishNoticeError::Recv
         | PublishNoticeError::SessionReset
         | PublishNoticeError::Qos0NotFlushed
+        | PublishNoticeError::BrokerOnlySessionResume
+        | PublishNoticeError::SessionPersistence(_)
         | PublishNoticeError::TopicAliasReplayUnavailable(_) => TargetError::NotConnected,
+        PublishNoticeError::RetainNotSupported => TargetError::Request(format!("MQTT broker rejected publish: {err}")),
         PublishNoticeError::V5PubAck(_) | PublishNoticeError::V5PubRec(_) | PublishNoticeError::V5PubComp(_) => {
             TargetError::Request(format!("MQTT broker rejected publish: {err}"))
         }
+        _ => TargetError::NotConnected,
     }
 }
 
@@ -1299,12 +1307,13 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
                         | MqttBytesError::MalformedPacket // Package format error
                         | MqttBytesError::PayloadTooLong // Too long load
                         | MqttBytesError::PayloadSizeLimitExceeded { .. } // Load size limit exceeded
-                        | MqttBytesError::TopicNotUtf8 // Topic Non-UTF-8 (Serious Agreement Violation)
+                        | MqttBytesError::TopicNotUtf8 { .. } // Topic Non-UTF-8 (Serious Agreement Violation)
                     )
                 }
                 // Others that are fatal StateError variants
                 rumqttc::StateError::InvalidState          // The internal state machine is in invalid state
-                | rumqttc::StateError::WrongPacket         // Agreement Violation: Unexpected Data Packet Received
+                | rumqttc::StateError::ProtocolViolation(ProtocolViolation::UnexpectedIncomingPacket(_)) // Agreement Violation: Unexpected Data Packet Received
+                | rumqttc::StateError::ProtocolViolation(_) // Agreement Violation
                 | rumqttc::StateError::Unsolicited(_)      // Agreement Violation: Unsolicited ACK Received
                 | rumqttc::StateError::CollisionTimeout    // Agreement Violation (if this stage occurs)
                 | rumqttc::StateError::EmptySubscription   // Agreement violation (if this stage occurs)
@@ -1727,8 +1736,8 @@ where
 mod tests {
     use super::{
         AsyncClient, ClientError, MQTT_RECONNECT_BACKOFF_MAX, MQTT_RECONNECT_BACKOFF_MIN, MQTTArgs, MQTTTarget, MQTTTlsConfig,
-        MqttOptions, PublishNoticeError, QoS, QueuedPayloadMeta, classify_mqtt_client_error, classify_mqtt_notice_error,
-        next_reconnect_backoff, reconnect_supervisor, validate_mqtt_broker_url,
+        MqttOptions, PublishNoticeError, PublishOptions, QoS, QueuedPayloadMeta, classify_mqtt_client_error,
+        classify_mqtt_notice_error, next_reconnect_backoff, reconnect_supervisor, validate_mqtt_broker_url,
     };
     use crate::error::TargetError;
     use crate::target::{REDACTED_SECRET, TargetType};
@@ -1794,7 +1803,7 @@ mod tests {
             .capacity(1)
             .build();
         client
-            .publish("fill", QoS::AtLeastOnce, false, b"fill".as_slice())
+            .publish("fill", b"fill".as_slice(), PublishOptions::new(QoS::AtLeastOnce))
             .await
             .expect("first publish should fill the local channel");
         *target.client.lock().await = Some(client);

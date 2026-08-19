@@ -18,10 +18,12 @@ use crate::disk::error_reduce::{
 };
 use crate::erasure::coding::BitrotWriterWrapper;
 use crate::erasure::coding::Erasure;
+use crate::erasure::coding::erasure::EncodedBlock;
 use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use rustfs_utils::HashAlgorithm;
 use std::sync::Arc;
 use std::time::Instant;
 use std::vec;
@@ -89,6 +91,11 @@ fn use_bytesmut_ingest() -> bool {
     *CACHED_BYTESMUT_INGEST.get_or_init(|| {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     })
+}
+
+fn small_ingest_capacity(erasure: &Erasure, size_hint: usize) -> usize {
+    let data_len = size_hint.min(erasure.block_size);
+    erasure.encoded_capacity_for_data_len(data_len).min(erasure.block_size)
 }
 
 /// Keeps the encoder producer scoped to its parent future. Tokio detaches a
@@ -159,6 +166,7 @@ where
     if total == 0 { Ok(None) } else { Ok(Some(total)) }
 }
 
+#[allow(dead_code, reason = "byte accounting asserted by this file's tests (backlog#1823)")]
 fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
@@ -218,8 +226,8 @@ async fn send_queued<T>(
     sender.send(InflightEntry::new(entry, bytes)).await
 }
 
-fn queued_batch_bytes(batch: &[Vec<Bytes>]) -> usize {
-    batch.iter().map(|block| queued_block_bytes(block)).sum()
+fn queued_batch_bytes(batch: &[EncodedBlock]) -> usize {
+    batch.iter().map(EncodedBlock::queued_bytes).sum()
 }
 
 fn dominant_error_summary_label(summary: &WriteQuorumFailureSummary) -> &'static str {
@@ -331,7 +339,7 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
-    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: &Bytes) {
+    async fn write_shard(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>, shard: &[u8]) {
         match writer_opt {
             Some(writer) => {
                 match writer.write(shard).await {
@@ -356,12 +364,20 @@ impl<'a> MultiWriter<'a> {
     }
 
     pub async fn write(&mut self, data: Vec<Bytes>) -> std::io::Result<()> {
-        assert_eq!(data.len(), self.writers.len());
+        self.write_shards(data.iter().map(Bytes::as_ref)).await
+    }
+
+    async fn write_block(&mut self, block: &EncodedBlock) -> std::io::Result<()> {
+        self.write_shards(block.shards()).await
+    }
+
+    async fn write_shards<'b>(&mut self, shards: impl ExactSizeIterator<Item = &'b [u8]>) -> std::io::Result<()> {
+        assert_eq!(shards.len(), self.writers.len());
 
         let budget = self.next_progress_budget();
         {
             let mut futures = FuturesUnordered::new();
-            for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(data.iter()) {
+            for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(shards) {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
@@ -485,10 +501,10 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
-    async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(Vec<Bytes>, Vec<u8>)> {
+    async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(EncodedBlock, Vec<u8>)> {
         let encode_stage_start = stage_timer_if_enabled();
         let encode_once = move || {
-            let res = self.encode_data(&encode_buf[..len]);
+            let res = self.encode_data_block(&encode_buf[..len]);
             (res, encode_buf)
         };
 
@@ -513,9 +529,9 @@ impl Erasure {
         Ok((res?, returned_buf))
     }
 
-    async fn encode_block_bytes_mut(self: Arc<Self>, encode_buf: BytesMut, len: usize) -> std::io::Result<Vec<Bytes>> {
+    async fn encode_block_bytes_mut(self: Arc<Self>, encode_buf: BytesMut, len: usize) -> std::io::Result<EncodedBlock> {
         let encode_stage_start = stage_timer_if_enabled();
-        let encode_once = move || self.encode_data_bytes_mut(encode_buf, len);
+        let encode_once = move || self.encode_data_bytes_mut_block(encode_buf, len);
 
         let res = match tokio::runtime::Handle::current().runtime_flavor() {
             // Same rationale as encode_block: inline the short EC burst on the
@@ -540,13 +556,14 @@ impl Erasure {
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
         require_single_block: bool,
+        size_hint: usize,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
         use tokio::io::AsyncReadExt;
 
-        let mut buf = Vec::with_capacity(self.block_size);
+        let mut buf = Vec::with_capacity(small_ingest_capacity(&self, size_hint));
         let total = if require_single_block {
             let read_limit = self
                 .block_size
@@ -570,11 +587,44 @@ impl Erasure {
             ));
         }
 
-        let shards = self.encode_data_owned(buf)?;
+        let block = self.encode_data_owned_block(buf)?;
         let mut mw = MultiWriter::new(writers, quorum);
-        mw.write(shards).await?;
+        mw.write_block(&block).await?;
         mw.shutdown().await?;
         Ok((reader, total))
+    }
+
+    /// Encode a small inline object directly into its per-disk bitrot payloads.
+    /// The returned bytes are the same `[hash][shard]` representation produced
+    /// by `BitrotWriter`, ready to be embedded in each disk's staged `xl.meta`.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub(crate) async fn encode_inline_shards_with_size_hint<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize, Vec<Bytes>)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::with_capacity(small_ingest_capacity(&self, size_hint));
+        let total = reader.read_to_end(&mut buf).await?;
+        if total == 0 {
+            return Ok((reader, 0, Vec::new()));
+        }
+
+        let block = self.encode_data_owned_block(buf)?;
+        let mut inline_shards = Vec::with_capacity(block.shards().len());
+        for shard in block.shards() {
+            let hash = HashAlgorithm::HighwayHash256S.hash_encode(shard);
+            let mut encoded = BytesMut::with_capacity(hash.as_ref().len() + shard.len());
+            encoded.extend_from_slice(hash.as_ref());
+            encoded.extend_from_slice(shard);
+            inline_shards.push(encoded.freeze());
+        }
+
+        Ok((reader, total, inline_shards))
     }
 
     #[hotpath::measure(impl_type = "Erasure")]
@@ -618,7 +668,7 @@ impl Erasure {
         let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
         let max_inflight_bytes = erasure_encode_max_inflight_bytes();
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
-        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Bytes>>>(inflight_blocks);
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<EncodedBlock>>(inflight_blocks);
 
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
@@ -640,7 +690,7 @@ impl Erasure {
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
                             buf = BytesMut::with_capacity(ingest_capacity);
-                            let queued_bytes = queued_block_bytes(&res);
+                            let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
                             if let Err(err) = send_queued(&tx, res, queued_bytes).await {
@@ -670,7 +720,7 @@ impl Erasure {
                             let encode_buf = std::mem::take(&mut buf);
                             let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                             buf = returned_buf;
-                            let queued_bytes = queued_block_bytes(&res);
+                            let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
                             if let Err(err) = send_queued(&tx, res, queued_bytes).await {
@@ -714,9 +764,9 @@ impl Erasure {
             if block.is_empty() {
                 break;
             }
-            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_block_bytes(&block));
+            let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(block.queued_bytes());
             let write_stage_start = stage_timer_if_enabled();
-            if let Err(err) = writers.write(block).await {
+            if let Err(err) = writers.write_block(&block).await {
                 write_err = Some(err);
                 break;
             }
@@ -763,7 +813,7 @@ impl Erasure {
         let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
         let batch_blocks = encode_batch_block_count().min(inflight_blocks);
         let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
-        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<Vec<Bytes>>>>(channel_capacity);
+        let (tx, mut rx) = mpsc::channel::<InflightEntry<Vec<EncodedBlock>>>(channel_capacity);
 
         let mut task = AbortOnDropTask::new(tokio::spawn(async move {
             let block_size = self.block_size;
@@ -780,7 +830,7 @@ impl Erasure {
                         let encode_buf = std::mem::take(&mut buf);
                         let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                         buf = returned_buf;
-                        let queued_bytes = queued_block_bytes(&res);
+                        let queued_bytes = res.queued_bytes();
                         pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
                         pending_batch.push(res);
                         drop(pending_batch_stage.take());
@@ -839,7 +889,7 @@ impl Erasure {
             let _writer_stage = rustfs_io_metrics::track_ec_encode_writer_bytes(queued_batch_bytes(&batch));
             let write_stage_start = stage_timer_if_enabled();
             for block in batch {
-                if let Err(err) = writers.write(block).await {
+                if let Err(err) = writers.write_block(&block).await {
                     write_err = Some(err);
                     break;
                 }
@@ -880,7 +930,24 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, false).await
+        let size_hint = self.block_size;
+        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
+    }
+
+    /// Size-aware inline fast path. `size_hint` only controls the bounded initial
+    /// allocation; reads remain authoritative.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub async fn encode_inline_small_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_small_direct(reader, writers, quorum, false, size_hint).await
     }
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
@@ -895,7 +962,24 @@ impl Erasure {
     where
         R: AsyncRead + Send + Sync + Unpin,
     {
-        self.encode_small_direct(reader, writers, quorum, true).await
+        let size_hint = self.block_size;
+        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
+    }
+
+    /// Size-aware single-block fast path. `size_hint` only controls the bounded
+    /// initial allocation; reads remain authoritative.
+    #[hotpath::measure(impl_type = "Erasure")]
+    pub async fn encode_single_block_non_inline_with_size_hint<R>(
+        self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+        size_hint: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin,
+    {
+        self.encode_small_direct(reader, writers, quorum, true, size_hint).await
     }
 }
 
@@ -1855,7 +1939,11 @@ mod tests {
         let baseline = rustfs_io_metrics::current_ec_encode_inflight_bytes();
         let (tx, rx) = mpsc::channel(2);
         let mut rx = rx;
-        let batch = vec![vec![Bytes::from_static(b"queued")], vec![Bytes::from_static(b"batch")]];
+        let erasure = Erasure::new(1, 0, 16);
+        let batch = vec![
+            erasure.encode_data_block(b"queued").expect("first block should encode"),
+            erasure.encode_data_block(b"batch").expect("second block should encode"),
+        ];
         let batch_bytes = queued_batch_bytes(&batch);
 
         send_queued(&tx, batch, batch_bytes).await.expect("batch should be queued");
@@ -2078,6 +2166,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_inline_small_drops_stalled_write() {
+        const BLOCK_SIZE: usize = 16;
+
+        let (writer_entered_tx, writer_entered) = oneshot::channel();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writers = vec![Some(bitrot_writer_plain(
+            StallOnWriteWithSignal {
+                entered: Some(writer_entered_tx),
+                writes: writes.clone(),
+            },
+            BLOCK_SIZE,
+        ))];
+        let erasure = Arc::new(Erasure::new(1, 0, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(vec![0xA5; BLOCK_SIZE - 1]));
+        let encode = tokio::spawn(async move { erasure.encode_inline_small(reader, &mut writers, 1).await });
+
+        tokio::time::timeout(Duration::from_secs(1), writer_entered)
+            .await
+            .expect("inline writer should enter before cancellation")
+            .expect("stalling writer should signal entry");
+        encode.abort();
+        assert!(
+            matches!(encode.await, Err(err) if err.is_cancelled()),
+            "inline encode task should be cancelled"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation must drop the stalled write instead of polling it again"
+        );
+    }
+
+    #[tokio::test]
     async fn encode_returns_unexpected_eof_for_truncated_limited_reader() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed);
@@ -2196,11 +2317,11 @@ mod tests {
             .expect("bytesmut encode should succeed on current-thread runtime");
 
         let expected_shard_size = payload.len().div_ceil(erasure.data_shards);
-        assert_eq!(shards.len(), erasure.total_shard_count());
-        assert!(shards.iter().all(|shard| shard.len() == expected_shard_size));
+        assert_eq!(shards.shards().len(), erasure.total_shard_count());
+        assert!(shards.shards().all(|shard| shard.len() == expected_shard_size));
 
         let mut restored = Vec::new();
-        for shard in shards.iter().take(erasure.data_shards) {
+        for shard in shards.shards().take(erasure.data_shards) {
             restored.extend_from_slice(shard);
         }
         restored.truncate(payload.len());
@@ -2293,11 +2414,49 @@ mod tests {
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
         let reader = tokio::io::BufReader::new(Cursor::new(Vec::<u8>::new()));
-        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, 1).await.unwrap();
+        let (_reader, total) = erasure
+            .encode_inline_small_with_size_hint(reader, &mut writers, 1, 0)
+            .await
+            .unwrap();
 
         assert_eq!(total, 0);
         // No shutdown was called, so nothing should be committed
         assert!(committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_inline_shards_matches_writer_bitrot_layout() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        for uses_legacy in [false, true] {
+            let erasure = Arc::new(Erasure::new_with_options(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE, uses_legacy));
+            for payload in [Vec::new(), vec![0xA5], vec![0x5A; BLOCK_SIZE - 1], vec![0xC3; BLOCK_SIZE]] {
+                let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+                let (_reader, total, inline_shards) = erasure
+                    .clone()
+                    .encode_inline_shards_with_size_hint(reader, payload.len())
+                    .await
+                    .expect("inline shards should encode");
+
+                assert_eq!(total, payload.len());
+                if payload.is_empty() {
+                    assert!(inline_shards.is_empty());
+                    continue;
+                }
+
+                let raw_shards = erasure.encode_data(&payload).expect("reference shards should encode");
+                assert_eq!(inline_shards.len(), DATA_SHARDS + PARITY_SHARDS);
+                for (inline, raw) in inline_shards.iter().zip(raw_shards) {
+                    let mut writer =
+                        BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), raw.len(), checksum_algo.clone());
+                    writer.write(&raw).await.expect("reference writer should accept shard");
+                    writer.shutdown().await.expect("reference writer should shutdown");
+                    assert_eq!(inline.as_ref(), writer.into_inline_data().expect("reference writer should retain bytes"));
+                }
+            }
+        }
     }
 
     /// encode_inline_small: small payload is encoded into the correct number of shards
@@ -2325,7 +2484,10 @@ mod tests {
         let payload = b"hello inline small";
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
-        let (_reader, total) = erasure.encode_inline_small(reader, &mut writers, DATA_SHARDS).await.unwrap();
+        let (_reader, total) = erasure
+            .encode_inline_small_with_size_hint(reader, &mut writers, DATA_SHARDS, 1)
+            .await
+            .unwrap();
 
         assert_eq!(total, payload.len());
         // All shards must have received data (shutdown flushed the bitrot header + shard bytes)
@@ -2392,7 +2554,7 @@ mod tests {
         let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
         let reader = tokio::io::BufReader::new(Cursor::new(payload));
         let err = erasure
-            .encode_single_block_non_inline(reader, &mut writers, DATA_SHARDS)
+            .encode_single_block_non_inline_with_size_hint(reader, &mut writers, DATA_SHARDS, BLOCK_SIZE)
             .await
             .expect_err("single-block fast path must reject oversized readers");
 
@@ -2401,6 +2563,21 @@ mod tests {
         for c in committed {
             assert!(c.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn small_ingest_capacity_uses_bounded_size_hint() {
+        let erasure = Erasure::new(4, 2, 1024 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, 0), 0);
+        assert_eq!(small_ingest_capacity(&erasure, 4 * 1024), 6 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, 16 * 1024), 24 * 1024);
+        assert_eq!(small_ingest_capacity(&erasure, usize::MAX), 1024 * 1024);
+
+        let legacy = Erasure::new_with_options(4, 2, 1024 * 1024, true);
+        assert_eq!(small_ingest_capacity(&legacy, 4 * 1024), 6 * 1024);
+
+        let high_parity = Erasure::new(4, 12, 1024 * 1024);
+        assert_eq!(small_ingest_capacity(&high_parity, usize::MAX), 1024 * 1024);
     }
 
     #[tokio::test]
@@ -2445,7 +2622,7 @@ mod tests {
         assert_eq!(&next[..], &data[16..]);
     }
 
-    async fn committed_shards_for_ingest_mode(use_bytesmut_ingest: bool, uses_legacy: bool, payload: &[u8]) -> Vec<Vec<u8>> {
+    async fn committed_shards_for_pipeline(pipeline: EncodePipeline, uses_legacy: bool, payload: &[u8]) -> Vec<Vec<u8>> {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
         const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
@@ -2459,10 +2636,16 @@ mod tests {
 
         let erasure = Arc::new(Erasure::new_with_options(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE, uses_legacy));
         let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
-        let (_reader, total) = erasure
-            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, use_bytesmut_ingest)
-            .await
-            .expect("encode should succeed");
+        let (_reader, total) = match pipeline {
+            EncodePipeline::Vec => {
+                erasure
+                    .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, false)
+                    .await
+            }
+            EncodePipeline::BytesMut => erasure.encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true).await,
+            EncodePipeline::Batched => erasure.encode_batched(reader, &mut writers, DATA_SHARDS).await,
+        }
+        .expect("encode should succeed");
         assert_eq!(total, payload.len());
 
         committed
@@ -2471,31 +2654,64 @@ mod tests {
             .collect()
     }
 
-    /// HP-10 (rustfs/backlog#931) merge gate: the BytesMut ingest path must produce
-    /// byte-for-byte identical shard streams to the default Vec ingest path, for both
-    /// legacy-aware shard-size formulas, across empty, sub-block, exactly-full-block,
-    /// and multi-block-with-partial-tail payloads.
+    async fn expected_committed_shards(uses_legacy: bool, payload: &[u8]) -> Vec<Vec<u8>> {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers: Vec<BitrotWriterWrapper> = committed
+            .iter()
+            .map(|c| bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS))
+            .collect();
+        let erasure = Erasure::new_with_options(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE, uses_legacy);
+
+        for block in payload.chunks(BLOCK_SIZE) {
+            let shards = erasure.encode_data(block).expect("reference block should encode");
+            for (writer, shard) in writers.iter_mut().zip(shards) {
+                let written = writer.write(&shard).await.expect("reference shard should write");
+                assert_eq!(written, shard.len());
+            }
+        }
+        for writer in &mut writers {
+            writer.shutdown().await.expect("reference writer should commit");
+        }
+
+        committed
+            .iter()
+            .map(|c| c.lock().expect("committed buffer should be lockable").clone())
+            .collect()
+    }
+
+    /// The streaming and batched paths must produce the same bitrot-wrapped shard
+    /// bytes as the public block encoder for both shard-size formulas and all block
+    /// boundary shapes.
     #[tokio::test]
     async fn bytesmut_ingest_matches_vec_ingest_byte_for_byte() {
         const BLOCK_SIZE: usize = 64;
         let payloads: Vec<Vec<u8>> = vec![
             Vec::new(),
-            b"tiny".to_vec(),
+            vec![1],
+            vec![2; BLOCK_SIZE - 1],
             (0..BLOCK_SIZE as u32).map(|i| i as u8).collect(), // exactly one full block
-            vec![3u8; BLOCK_SIZE * 4],                         // whole number of blocks
+            vec![4; BLOCK_SIZE + 1],
+            vec![3u8; BLOCK_SIZE * 4],                                           // whole number of blocks
             (0..(BLOCK_SIZE * 3 + 7) as u32).map(|i| (i % 251) as u8).collect(), // partial tail
         ];
 
         for uses_legacy in [false, true] {
             for payload in &payloads {
-                let vec_path = committed_shards_for_ingest_mode(false, uses_legacy, payload).await;
-                let bytesmut_path = committed_shards_for_ingest_mode(true, uses_legacy, payload).await;
-                assert_eq!(
-                    vec_path,
-                    bytesmut_path,
-                    "ingest paths must be byte-identical (legacy={uses_legacy}, payload_len={})",
-                    payload.len()
-                );
+                let expected = expected_committed_shards(uses_legacy, payload).await;
+                for pipeline in [EncodePipeline::Vec, EncodePipeline::BytesMut, EncodePipeline::Batched] {
+                    let actual = committed_shards_for_pipeline(pipeline, uses_legacy, payload).await;
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "streaming shards must match the public block encoder (legacy={uses_legacy}, payload_len={})",
+                        payload.len()
+                    );
+                }
             }
         }
     }

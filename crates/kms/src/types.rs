@@ -217,6 +217,12 @@ pub enum RotationDueReason {
     /// The key has never been rotated and has existed longer than the
     /// configured maximum age.
     NeverRotated,
+    /// The key has wrapped more data keys than the configured maximum.
+    ///
+    /// Counted per key-material version, so a rotation restarts the budget.
+    /// The count is an over-estimate by construction (see the backend's
+    /// reservation accounting), so this verdict errs toward rotating early.
+    Wraps,
     /// The backend cannot rotate keys at all, so no age makes one due.
     Unsupported,
 }
@@ -259,6 +265,14 @@ pub struct KeyInfo {
     /// verdict to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_due_reason: Option<RotationDueReason>,
+    /// Wrap operations reserved against the key's current material, reported
+    /// only by backends that count wraps (the Vault KV2 backend today). An
+    /// approximate value that by design overestimates the wraps actually
+    /// performed. In-process transport for the deletion worker's aggregate
+    /// wrap gauge, deliberately kept off the serialized admin surface: per-key
+    /// exposure would need its own contract decision and snapshot pin.
+    #[serde(skip)]
+    pub wrap_budget_reserved: Option<u64>,
 }
 
 impl From<MasterKeyInfo> for KeyInfo {
@@ -277,6 +291,7 @@ impl From<MasterKeyInfo> for KeyInfo {
             created_by: master_key.created_by,
             rotation_due: false,
             rotation_due_reason: None,
+            wrap_budget_reserved: None,
         }
     }
 }

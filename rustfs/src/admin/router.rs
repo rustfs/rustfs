@@ -17,7 +17,8 @@ use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
-    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
+    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, SsecPassthroughCapability, TargetClient,
+    append_version_id_query,
 };
 use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -42,6 +43,7 @@ use crate::server::{
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::HeaderValue;
@@ -66,6 +68,12 @@ use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
+use rustfs_utils::http::headers::{
+    AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_SHA1, AMZ_CHECKSUM_SHA256, AMZ_CHECKSUM_TYPE,
+};
+use rustfs_utils::http::object_encryption_keys::{
+    REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+};
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -206,6 +214,16 @@ struct ReplicationResetStatusTarget {
 
 const REPLICATION_CHECK_PROBE_PREFIX: &str = ".rustfs.sys/replication-check/";
 const REPLICATION_CHECK_ERROR_MAX_BYTES: usize = 512;
+/// RustFS extension code (no madmin analogue): the target does not adopt the
+/// source version id, breaking the version-identity replication contract.
+const REPLICATION_CHECK_CODE_VERSION_MISMATCH: &str = "BucketRemoteTargetVersionMismatch";
+/// RustFS extension code (no madmin analogue): the target drops the
+/// `X-Rustfs-Replication-*` SSE-C passthrough headers, so an SSE-C replica
+/// would lose its decryption material (N2 fail-closed).
+const REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH: &str = "BucketRemoteSsecPassthroughUnsupported";
+/// Syntactically valid stand-in SSE-C key MD5 for the passthrough probe (the
+/// probe object is never decrypted; it only has to round-trip the metadata).
+const REPLICATION_CHECK_SSEC_PROBE_KEY_MD5: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct ReplicationCheckResponse {
@@ -245,6 +263,10 @@ struct ReplicationCheckPhases {
     object_lock: ReplicationCheckPhaseStatus,
     #[serde(rename = "Put")]
     put: ReplicationCheckPhaseStatus,
+    #[serde(rename = "VersionFidelity")]
+    version_fidelity: ReplicationCheckPhaseStatus,
+    #[serde(rename = "SsecPassthrough")]
+    ssec_passthrough: ReplicationCheckPhaseStatus,
     #[serde(rename = "DeleteMarker")]
     delete_marker: ReplicationCheckPhaseStatus,
     #[serde(rename = "VersionDelete")]
@@ -259,6 +281,11 @@ struct ReplicationCheckPhaseStatus {
     status: &'static str,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Machine-readable failure code (RustFS extension key; Go decoders
+    /// ignore unknown keys). Only set for failures that a caller is expected
+    /// to branch on, e.g. `BucketRemoteTargetVersionMismatch`.
+    #[serde(rename = "Code", skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 impl Default for ReplicationCheckPhaseStatus {
@@ -266,6 +293,7 @@ impl Default for ReplicationCheckPhaseStatus {
         Self {
             status: "SKIPPED",
             error: None,
+            code: None,
         }
     }
 }
@@ -275,6 +303,7 @@ impl ReplicationCheckPhaseStatus {
         Self {
             status: "OK",
             error: None,
+            code: None,
         }
     }
 
@@ -282,6 +311,14 @@ impl ReplicationCheckPhaseStatus {
         Self {
             status: "FAILED",
             error: Some(bound_replication_check_error(error.into())),
+            code: None,
+        }
+    }
+
+    fn failed_with_code(error: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            code: Some(code),
+            ..Self::failed(error)
         }
     }
 }
@@ -1010,28 +1047,24 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         )?;
     }
     if let Some(checksum_crc32) = &output.checksum_crc32 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32"), checksum_crc32.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC32), checksum_crc32.clone())?;
     }
     if let Some(checksum_crc32c) = &output.checksum_crc32c {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-crc32c"), checksum_crc32c.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC32C), checksum_crc32c.clone())?;
     }
     if let Some(checksum_crc64nvme) = &output.checksum_crc64nvme {
-        insert_string_header(
-            &mut headers,
-            HeaderName::from_static("x-amz-checksum-crc64nvme"),
-            checksum_crc64nvme.clone(),
-        )?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_CRC64NVME), checksum_crc64nvme.clone())?;
     }
     if let Some(checksum_sha1) = &output.checksum_sha1 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha1"), checksum_sha1.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_SHA1), checksum_sha1.clone())?;
     }
     if let Some(checksum_sha256) = &output.checksum_sha256 {
-        insert_string_header(&mut headers, HeaderName::from_static("x-amz-checksum-sha256"), checksum_sha256.clone())?;
+        insert_string_header(&mut headers, HeaderName::from_static(AMZ_CHECKSUM_SHA256), checksum_sha256.clone())?;
     }
     if let Some(checksum_type) = &output.checksum_type {
         insert_string_header(
             &mut headers,
-            HeaderName::from_static("x-amz-checksum-type"),
+            HeaderName::from_static(AMZ_CHECKSUM_TYPE),
             checksum_type.as_str().to_string(),
         )?;
     }
@@ -1093,12 +1126,12 @@ fn clear_object_lambda_variant_headers(headers: &mut HeaderMap) {
         http::header::ETAG,
         http::header::LAST_MODIFIED,
         http::header::EXPIRES,
-        HeaderName::from_static("x-amz-checksum-crc32"),
-        HeaderName::from_static("x-amz-checksum-crc32c"),
-        HeaderName::from_static("x-amz-checksum-crc64nvme"),
-        HeaderName::from_static("x-amz-checksum-sha1"),
-        HeaderName::from_static("x-amz-checksum-sha256"),
-        HeaderName::from_static("x-amz-checksum-type"),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC32),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC32C),
+        HeaderName::from_static(AMZ_CHECKSUM_CRC64NVME),
+        HeaderName::from_static(AMZ_CHECKSUM_SHA1),
+        HeaderName::from_static(AMZ_CHECKSUM_SHA256),
+        HeaderName::from_static(AMZ_CHECKSUM_TYPE),
         HeaderName::from_static("x-amz-tagging-count"),
         HeaderName::from_static("x-amz-request-route"),
         HeaderName::from_static("x-amz-request-token"),
@@ -1527,7 +1560,8 @@ async fn build_replication_metrics_response(
     let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
-    let body = serialize_replication_metrics_body(&bucket_stats, route)?;
+    let node_name = crate::runtime_sources::current_local_node_name().await.unwrap_or_default();
+    let body = serialize_replication_metrics_body(&bucket_stats, route, &node_name)?;
 
     let mut resp = S3Response::with_status(Body::from(body), StatusCode::OK);
     resp.headers
@@ -1587,12 +1621,24 @@ fn apply_replication_metrics_runtime_fields(
     bucket_stats
 }
 
-fn serialize_replication_metrics_body(bucket_stats: &BucketStats, route: ReplicationExtRoute) -> S3Result<Vec<u8>> {
+/// Serialize the metrics body in the minio-go wire shapes
+/// (`replication.Metrics` for v1, `replication.MetricsV2` for v2). The
+/// internal `BucketStats` serde names are the intra-cluster peer-RPC wire
+/// format and must never appear here — see
+/// `crate::admin::replication_metrics_wire`.
+fn serialize_replication_metrics_body(
+    bucket_stats: &BucketStats,
+    route: ReplicationExtRoute,
+    node_name: &str,
+) -> S3Result<Vec<u8>> {
+    use crate::admin::replication_metrics_wire::{MetricsV2Wire, MetricsWire};
     match route {
         ReplicationExtRoute::MetricsV1 => {
-            serde_json::to_vec(&bucket_stats.replication_stats).map_err(|e| s3_error!(InternalError, "{e}"))
+            serde_json::to_vec(&MetricsWire::from(&bucket_stats.replication_stats)).map_err(|e| s3_error!(InternalError, "{e}"))
         }
-        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(bucket_stats).map_err(|e| s3_error!(InternalError, "{e}")),
+        ReplicationExtRoute::MetricsV2 => {
+            serde_json::to_vec(&MetricsV2Wire::from_stats(bucket_stats, node_name)).map_err(|e| s3_error!(InternalError, "{e}"))
+        }
         ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Err(s3_error!(InternalError, "invalid route for metrics response"))
         }
@@ -1819,7 +1865,7 @@ fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatu
     let data = serde_json::to_vec(&ReplicationCheckResponse {
         status: status.to_string(),
         active_mutation: true,
-        mutation_description: "Writes a probe object, creates a delete marker, deletes the probe version, and cleans up all probe artifacts on each target.",
+        mutation_description: "Writes probe objects (including an SSE-C passthrough probe), creates a delete marker, deletes the probe versions, and cleans up all probe artifacts on each target.",
         probe_namespace: REPLICATION_CHECK_PROBE_PREFIX,
         targets,
     })
@@ -2036,6 +2082,25 @@ async fn check_replication_target(
         time: OffsetDateTime::now_utc(),
     };
     execute_replication_probe(&mut result, &mut operations).await;
+
+    // Sync the probe verdict into the runtime capability cache: the
+    // replication worker then fails SSE-C replication closed on a flagged
+    // target (or skips its own HEAD-back audit on a proven one) without
+    // re-learning what the probe just established.
+    match (result.phases.ssec_passthrough.status, result.phases.ssec_passthrough.code) {
+        ("OK", _) => {
+            BucketTargetSys::get()
+                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Supported)
+                .await;
+        }
+        ("FAILED", Some(REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH)) => {
+            BucketTargetSys::get()
+                .record_ssec_passthrough_capability(&target.arn, SsecPassthroughCapability::Unsupported)
+                .await;
+        }
+        _ => {}
+    }
+
     result
 }
 
@@ -2046,12 +2111,53 @@ fn fail_replication_check_target(result: &mut ReplicationCheckTargetStatus, erro
     }
 }
 
+/// The probe PUT reports both sides of the version-identity contract: the
+/// source version id it sent (header + `?versionId=` query, the exact shape
+/// live replication uses) and the version id the target answered with.
+struct ReplicationProbePutOutcome {
+    sent_version_id: String,
+    response_version_id: Option<String>,
+}
+
+/// Outcome of the SSE-C passthrough probe: whether the HEAD-back of the probe
+/// replica echoed SSE-C evidence (the customer-algorithm header a RustFS
+/// target restores from the passthrough transport headers), plus the version
+/// the target assigned so cleanup can address it.
+struct ReplicationSsecProbeOutcome {
+    evidence_present: bool,
+    version_id: Option<String>,
+}
+
+struct ReplicationProbeMultipartError {
+    primary: S3ClientError,
+    cleanup_error: Option<String>,
+}
+
+impl From<S3ClientError> for ReplicationProbeMultipartError {
+    fn from(primary: S3ClientError) -> Self {
+        Self {
+            primary,
+            cleanup_error: None,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 trait ReplicationProbeOperations {
-    async fn put(&mut self) -> Result<Option<String>, S3ClientError>;
+    async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError>;
+    /// Multipart decides the target version at initiate time and only reports
+    /// it on completion, so the identity contract has to be probed separately
+    /// there: a target can adopt PutObject version ids and still mint its own
+    /// for CreateMultipartUpload.
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError>;
+    /// PUT a probe version carrying the SSE-C passthrough transport headers,
+    /// HEAD it back through the replication-check channel, and report whether
+    /// the SSE-C evidence survived. Cleanup of the created version is the
+    /// caller's job (the outcome carries its version id).
+    async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError>;
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
     async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String>;
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String>;
 }
 
 struct RemoteReplicationProbeOperations<'a> {
@@ -2063,8 +2169,16 @@ struct RemoteReplicationProbeOperations<'a> {
 
 #[async_trait::async_trait]
 impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
-    async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+    async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
         put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
+        multipart_put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+        ssec_passthrough_probe_object(self.client, self.bucket, self.key, self.time).await
     }
 
     async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
@@ -2090,20 +2204,50 @@ impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
         .map(|_| ())
     }
 
-    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String> {
         cleanup_replication_probe(self.client, self.bucket, self.key, known_version_ids).await
     }
 }
 
+/// `None` when the target adopted the source version id on this path.
+fn version_fidelity_error(api: &str, outcome: &ReplicationProbePutOutcome) -> Option<String> {
+    if outcome.response_version_id.as_deref() == Some(outcome.sent_version_id.as_str()) {
+        return None;
+    }
+    Some(format!(
+        "target assigned version id {} instead of adopting the source version id {} on {api}; \
+         version-addressed replication (version deletes, heal) cannot converge on this target",
+        outcome.response_version_id.as_deref().unwrap_or("<none>"),
+        outcome.sent_version_id,
+    ))
+}
+
 async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, operations: &mut impl ReplicationProbeOperations) {
     let mut probe_version_id = None;
+    let mut multipart_probe_version_id = None;
+    let mut ssec_probe_version_id = None;
     let mut delete_marker_version_id = None;
     let mut cleanup_required = true;
+    let mut multipart_cleanup_error = None;
 
     match operations.put().await {
-        Ok(version_id) => {
-            probe_version_id = version_id;
+        Ok(outcome) => {
             result.phases.put = ReplicationCheckPhaseStatus::passed();
+            // P1-19 version-identity contract: replication only converges on
+            // targets that adopt the source version id — version-addressed
+            // deletes and heal re-drives never match a minted id. Judge it
+            // from the probe PUT's own response; on mismatch the later
+            // mutation phases are pointless (they address by version id), but
+            // cleanup still runs against whatever id the target assigned.
+            match version_fidelity_error("PutObject", &outcome) {
+                None => result.phases.version_fidelity = ReplicationCheckPhaseStatus::passed(),
+                Some(error) => {
+                    result.phases.version_fidelity =
+                        ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
+                    fail_replication_check_target(result, error);
+                }
+            }
+            probe_version_id = outcome.response_version_id;
         }
         Err(err) => {
             let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
@@ -2115,7 +2259,61 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
-    if result.phases.put.status == "OK" {
+    // The multipart path fixes the target version at initiate and only
+    // reports it on completion, so a target can adopt PutObject ids and still
+    // mint its own here — probe it before declaring the contract met.
+    if result.phases.version_fidelity.status == "OK" {
+        match operations.multipart_put().await {
+            Ok(outcome) => {
+                multipart_probe_version_id = outcome.response_version_id.clone();
+                if let Some(error) = version_fidelity_error("CreateMultipartUpload", &outcome) {
+                    result.phases.version_fidelity =
+                        ReplicationCheckPhaseStatus::failed_with_code(&error, REPLICATION_CHECK_CODE_VERSION_MISMATCH);
+                    fail_replication_check_target(result, error);
+                }
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err.primary, ReplicationCheckFailureContext::ReplicateObject);
+                result.phases.version_fidelity = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+                multipart_cleanup_error = err.cleanup_error;
+            }
+        }
+    }
+
+    // N2: probe SSE-C passthrough with the same transport headers live
+    // replication sends. A target that drops them (MinIO, generic S3) stores
+    // the probe as a plain object and echoes no SSE-C evidence on the
+    // HEAD-back; SSE-C replicas there would silently lose their decryption
+    // material, so the target must be flagged with a machine-readable code.
+    // Deliberately unlike VersionFidelity, a failed SsecPassthrough phase
+    // does NOT fail the target overall: version-identity drift breaks the
+    // replication contract for every object, while dropped SSE-C passthrough
+    // headers only limit a capability — a plaintext-only deployment against a
+    // MinIO target is perfectly healthy and must not turn red. The phase's
+    // own FAILED + machine-readable Code remains for madmin consumers (and
+    // the verdict still reaches the runtime capability cache).
+    if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
+        match operations.ssec_passthrough_probe().await {
+            Ok(outcome) => {
+                ssec_probe_version_id = outcome.version_id;
+                if outcome.evidence_present {
+                    result.phases.ssec_passthrough = ReplicationCheckPhaseStatus::passed();
+                } else {
+                    let error = "target drops SSE-C passthrough replication headers; \
+                         SSE-C replicas would lose their decryption material on this target";
+                    result.phases.ssec_passthrough =
+                        ReplicationCheckPhaseStatus::failed_with_code(error, REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH);
+                }
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+                result.phases.ssec_passthrough = ReplicationCheckPhaseStatus::failed(&error);
+            }
+        }
+    }
+
+    if result.phases.put.status == "OK" && result.phases.version_fidelity.status == "OK" {
         match operations.create_delete_marker(probe_version_id.as_deref()).await {
             Ok(version_id) => {
                 delete_marker_version_id = version_id;
@@ -2138,19 +2336,32 @@ async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, op
         }
     }
 
-    if cleanup_required {
-        match operations
-            .cleanup([probe_version_id.as_deref(), delete_marker_version_id.as_deref()])
+    let cleanup_result = if cleanup_required {
+        operations
+            .cleanup([
+                probe_version_id.as_deref(),
+                multipart_probe_version_id.as_deref(),
+                ssec_probe_version_id.as_deref(),
+                delete_marker_version_id.as_deref(),
+            ])
             .await
-        {
-            Ok(()) => result.phases.cleanup = ReplicationCheckPhaseStatus::passed(),
-            Err(error) => {
-                result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
-                fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
-            }
-        }
     } else {
+        Ok(())
+    };
+
+    let mut cleanup_errors = Vec::new();
+    if let Some(error) = multipart_cleanup_error {
+        cleanup_errors.push(error);
+    }
+    if let Err(error) = cleanup_result {
+        cleanup_errors.push(error);
+    }
+    if cleanup_errors.is_empty() {
         result.phases.cleanup = ReplicationCheckPhaseStatus::passed();
+    } else {
+        let error = cleanup_errors.join("; ");
+        result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
+        fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
     }
 }
 
@@ -2225,13 +2436,7 @@ fn build_replication_probe_remove_options(now: OffsetDateTime, replication_delet
     }
 }
 
-async fn put_replication_probe_object(
-    target_client: &TargetClient,
-    target_bucket: &str,
-    probe_key: &str,
-    now: OffsetDateTime,
-) -> Result<Option<String>, S3ClientError> {
-    let options = build_replication_probe_put_options(now);
+fn build_replication_probe_headers(options: &PutObjectOptions) -> HeaderMap {
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
     insert_header(
@@ -2245,8 +2450,166 @@ async fn put_replication_probe_object(
         HeaderName::from_static("x-amz-replication-status"),
         HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
     );
+    headers
+}
 
-    target_client
+/// Probe the identity contract on the multipart path: initiate carrying the
+/// source version as `?versionId=` (where the target fixes the version),
+/// upload one small part, and read the version the completion reports.
+async fn multipart_put_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let headers = build_replication_probe_headers(&options);
+
+    let initiate_headers = headers.clone();
+    let initiate_version_id = sent_version_id.clone();
+    let created = target_client
+        .client
+        .create_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in initiate_headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            let uri = append_version_id_query(req.uri(), &initiate_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map_err(S3ClientError::from)
+        .map_err(ReplicationProbeMultipartError::from)?;
+    let upload_id = created
+        .upload_id()
+        .ok_or_else(|| S3ClientError::new("target multipart initiate returned no upload id"))
+        .map_err(ReplicationProbeMultipartError::from)?
+        .to_string();
+
+    let uploaded = match target_client
+        .client
+        .upload_part()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .send()
+        .await
+    {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            return Err(abort_failed_replication_probe_multipart(
+                target_client,
+                target_bucket,
+                probe_key,
+                &upload_id,
+                S3ClientError::from(error),
+            )
+            .await);
+        }
+    };
+
+    let completed_part = CompletedPart::builder()
+        .part_number(1)
+        .set_e_tag(uploaded.e_tag().map(ToOwned::to_owned))
+        .build();
+    let complete_headers = headers.clone();
+    let completed = match target_client
+        .client
+        .complete_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(vec![completed_part]))
+                .build(),
+        )
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in complete_headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+    {
+        Ok(completed) => completed,
+        Err(error) => {
+            return Err(abort_failed_replication_probe_multipart(
+                target_client,
+                target_bucket,
+                probe_key,
+                &upload_id,
+                S3ClientError::from(error),
+            )
+            .await);
+        }
+    };
+
+    Ok(ReplicationProbePutOutcome {
+        sent_version_id,
+        response_version_id: completed.version_id().map(ToOwned::to_owned),
+    })
+}
+
+async fn abort_failed_replication_probe_multipart(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    upload_id: &str,
+    primary_error: S3ClientError,
+) -> ReplicationProbeMultipartError {
+    match target_client
+        .client
+        .abort_multipart_upload()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .upload_id(upload_id)
+        .send()
+        .await
+    {
+        Ok(_) => ReplicationProbeMultipartError::from(primary_error),
+        Err(error) => {
+            let abort_error = S3ClientError::from(error);
+            if abort_error.code.as_deref() == Some("NoSuchUpload") {
+                ReplicationProbeMultipartError::from(primary_error)
+            } else {
+                ReplicationProbeMultipartError {
+                    primary: primary_error,
+                    cleanup_error: Some("failed to abort multipart replication probe".to_string()),
+                }
+            }
+        }
+    }
+}
+
+async fn put_replication_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationProbePutOutcome, S3ClientError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let headers = build_replication_probe_headers(&options);
+
+    // Carry the source version as `?versionId=` exactly like a live
+    // replication PUT (P0-5 shape): the probe must exercise the query the
+    // real data path relies on, and the response tells us whether the target
+    // adopts the id. The probe id is always a fresh non-nil UUID, so the
+    // null-version mapping in the live path does not apply here.
+    let query_version_id = sent_version_id.clone();
+    let response = target_client
         .client
         .put_object()
         .bucket(target_bucket)
@@ -2259,12 +2622,84 @@ async fn put_replication_probe_object(
             for (key, value) in headers.clone() {
                 req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
+            let uri = append_version_id_query(req.uri(), &query_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
             Result::<_, std::io::Error>::Ok(req)
         })
         .send()
         .await
-        .map(|output| output.version_id().map(ToOwned::to_owned))
-        .map_err(S3ClientError::from)
+        .map_err(S3ClientError::from)?;
+
+    Ok(ReplicationProbePutOutcome {
+        sent_version_id,
+        response_version_id: response.version_id().map(ToOwned::to_owned),
+    })
+}
+
+/// PUT a fresh probe version carrying the SSE-C passthrough transport headers
+/// (the wire shape live SSE-C replication uses), then HEAD it back through the
+/// worker channel (replication-check exemption + proxy suppression). A RustFS
+/// target restores the transport headers into stored SSE-C metadata and its
+/// HEAD echoes `x-amz-server-side-encryption-customer-algorithm`; a target
+/// that dropped the headers echoes nothing. The probe body is never SSE-C
+/// encrypted — only the metadata round-trip matters — and the version is
+/// deleted by the shared probe cleanup.
+async fn ssec_passthrough_probe_object(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    now: OffsetDateTime,
+) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+    let options = build_replication_probe_put_options(now);
+    let sent_version_id = options.internal.source_version_id.clone();
+    let mut headers = build_replication_probe_headers(&options);
+    // These are full wire names (not x-rustfs/x-minio suffixes), so they must
+    // be inserted verbatim — `insert_header` would mangle them.
+    for (name, value) in [
+        (REPLICATION_SSEC_ALGORITHM_HEADER, "AES256"),
+        (REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_CHECK_SSEC_PROBE_KEY_MD5),
+        (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "8"),
+    ] {
+        let name = name
+            .parse::<HeaderName>()
+            .map_err(|err| S3ClientError::new(format!("invalid ssec probe header name: {err}")))?;
+        let value =
+            HeaderValue::from_str(value).map_err(|err| S3ClientError::new(format!("invalid ssec probe header value: {err}")))?;
+        headers.insert(name, value);
+    }
+
+    let query_version_id = sent_version_id.clone();
+    let response = target_client
+        .client
+        .put_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .content_length(8)
+        .body(AwsByteStream::from_static(b"aaaaaaaa"))
+        .customize()
+        .map_request(move |mut req| {
+            for (key, value) in headers.clone() {
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
+            }
+            let uri = append_version_id_query(req.uri(), &query_version_id);
+            req.set_uri(uri).map_err(std::io::Error::other)?;
+            Result::<_, std::io::Error>::Ok(req)
+        })
+        .send()
+        .await
+        .map_err(S3ClientError::from)?;
+    let version_id = response.version_id().map(ToOwned::to_owned);
+
+    let head_version = version_id.clone().or_else(|| Some(sent_version_id.clone()));
+    let head = target_client
+        .head_object(target_bucket, probe_key, head_version)
+        .await
+        .map_err(S3ClientError::from)?;
+
+    Ok(ReplicationSsecProbeOutcome {
+        evidence_present: head.sse_customer_algorithm().is_some_and(|algorithm| !algorithm.is_empty()),
+        version_id,
+    })
 }
 
 async fn delete_replication_probe_object(
@@ -2628,7 +3063,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
             let usecase = default_object_usecase();
-            let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
+            let get_resp = usecase.execute_get_object(get_req).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {
@@ -3431,6 +3866,18 @@ mod tests {
     #[derive(Default)]
     struct ScriptedReplicationProbe {
         put_error: Option<&'static str>,
+        /// Version id the scripted target answers with on PUT; None models a
+        /// mirroring target that echoes the sent source version id.
+        minted_version_id: Option<&'static str>,
+        /// Same, for the multipart leg: a target may mirror PutObject ids and
+        /// still mint its own at CreateMultipartUpload.
+        minted_multipart_version_id: Option<&'static str>,
+        /// Transport failure of the SSE-C passthrough probe itself.
+        ssec_probe_error: Option<&'static str>,
+        /// Models a MinIO-like target that drops the SSE-C passthrough
+        /// headers: the probe HEAD-back echoes no SSE-C evidence. The default
+        /// (false) models a RustFS target that preserves them.
+        ssec_evidence_missing: bool,
         delete_marker_error: Option<&'static str>,
         version_delete_error: Option<&'static str>,
         cleanup_error: Option<&'static str>,
@@ -3449,11 +3896,33 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ReplicationProbeOperations for ScriptedReplicationProbe {
-        async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+        async fn put(&mut self) -> Result<ReplicationProbePutOutcome, S3ClientError> {
             self.calls.push("put");
             match self.put_error {
                 Some(code) => Err(scripted_probe_error(code)),
-                None => Ok(Some("object-version".to_string())),
+                None => Ok(ReplicationProbePutOutcome {
+                    sent_version_id: "object-version".to_string(),
+                    response_version_id: Some(self.minted_version_id.unwrap_or("object-version").to_string()),
+                }),
+            }
+        }
+
+        async fn multipart_put(&mut self) -> Result<ReplicationProbePutOutcome, ReplicationProbeMultipartError> {
+            self.calls.push("multipart-put");
+            Ok(ReplicationProbePutOutcome {
+                sent_version_id: "multipart-version".to_string(),
+                response_version_id: Some(self.minted_multipart_version_id.unwrap_or("multipart-version").to_string()),
+            })
+        }
+
+        async fn ssec_passthrough_probe(&mut self) -> Result<ReplicationSsecProbeOutcome, S3ClientError> {
+            self.calls.push("ssec-probe");
+            match self.ssec_probe_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(ReplicationSsecProbeOutcome {
+                    evidence_present: !self.ssec_evidence_missing,
+                    version_id: Some("ssec-version".to_string()),
+                }),
             }
         }
 
@@ -3473,7 +3942,7 @@ mod tests {
             }
         }
 
-        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 4]) -> Result<(), String> {
             self.calls.push("cleanup");
             self.cleanup_ids = known_version_ids
                 .into_iter()
@@ -3484,6 +3953,109 @@ mod tests {
                 None => Ok(()),
             }
         }
+    }
+
+    /// P1-19: a target that mints its own version ids must fail the
+    /// VersionFidelity phase with the machine-readable mismatch code, skip
+    /// the version-addressed mutation phases (they cannot mean anything on a
+    /// drifting target), and still clean up using the id the target actually
+    /// assigned — the source-derived id would never match.
+    #[tokio::test]
+    async fn replication_probe_flags_version_minting_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            minted_version_id: Some("target-minted-version"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "cleanup"]);
+        assert_eq!(result.status, "FAILED");
+        assert_eq!(result.phases.put.status, "OK");
+        assert_eq!(result.phases.version_fidelity.status, "FAILED");
+        assert_eq!(result.phases.version_fidelity.code, Some(REPLICATION_CHECK_CODE_VERSION_MISMATCH));
+        assert_eq!(result.phases.delete_marker.status, "SKIPPED");
+        assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.ssec_passthrough.status, "SKIPPED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+        assert_eq!(operations.cleanup_ids, [Some("target-minted-version".to_string()), None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn replication_probe_passes_version_fidelity_for_mirroring_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe::default();
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.phases.version_fidelity.status, "OK");
+        assert_eq!(result.phases.version_fidelity.code, None);
+        assert_eq!(result.phases.ssec_passthrough.status, "OK");
+        assert_eq!(result.phases.ssec_passthrough.code, None);
+    }
+
+    /// N2: a target that drops the SSE-C passthrough transport headers must
+    /// fail the SsecPassthrough phase with the machine-readable code while the
+    /// target overall stays OK — deliberately unlike VersionFidelity: this is
+    /// a capability limit, not a broken replication contract, and a
+    /// plaintext-only deployment against such a target must not turn red. The
+    /// other mutation phases keep running and the probe version is cleaned up.
+    #[tokio::test]
+    async fn replication_probe_flags_ssec_passthrough_dropping_target_without_failing_target() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            ssec_evidence_missing: true,
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
+        assert_eq!(result.status, "OK", "a capability-only failure must not fail the target overall");
+        assert_eq!(result.error, None);
+        assert_eq!(result.phases.ssec_passthrough.status, "FAILED");
+        assert_eq!(result.phases.ssec_passthrough.code, Some(REPLICATION_CHECK_CODE_SSEC_PASSTHROUGH));
+        assert_eq!(
+            operations.cleanup_ids,
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
+                Some("marker-version".to_string())
+            ]
+        );
+    }
+
+    /// A transport failure of the SSE-C probe is not evidence of a dropping
+    /// target: the phase fails without the capability code (the runtime cache
+    /// stays Unknown and the worker keeps auditing), and the target overall
+    /// stays OK.
+    #[tokio::test]
+    async fn replication_probe_ssec_transport_failure_carries_no_capability_code() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            ssec_probe_error: Some("InternalError"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.phases.ssec_passthrough.status, "FAILED");
+        assert_eq!(result.phases.ssec_passthrough.code, None);
+        assert_eq!(operations.cleanup_ids[2], None, "a failed ssec probe leaves no version to clean");
     }
 
     #[tokio::test]
@@ -3514,8 +4086,26 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
-        assert_eq!(operations.cleanup_ids, [Some("object-version".to_string()), None]);
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
+        assert_eq!(
+            operations.cleanup_ids,
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
+                None
+            ]
+        );
         assert_eq!(result.phases.delete_marker.status, "FAILED");
         assert_eq!(result.phases.version_delete.status, "OK");
         assert_eq!(result.phases.cleanup.status, "OK");
@@ -3532,10 +4122,25 @@ mod tests {
 
         execute_replication_probe(&mut result, &mut operations).await;
 
-        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.calls,
+            [
+                "put",
+                "multipart-put",
+                "ssec-probe",
+                "delete-marker",
+                "version-delete",
+                "cleanup"
+            ]
+        );
         assert_eq!(
             operations.cleanup_ids,
-            [Some("object-version".to_string()), Some("marker-version".to_string())]
+            [
+                Some("object-version".to_string()),
+                Some("multipart-version".to_string()),
+                Some("ssec-version".to_string()),
+                Some("marker-version".to_string())
+            ]
         );
         assert_eq!(result.phases.version_delete.status, "FAILED");
         assert_eq!(result.phases.cleanup.status, "FAILED");
@@ -3808,22 +4413,37 @@ mod tests {
         assert!(err.message().unwrap_or_default().contains("rule-stale"));
     }
 
+    /// The v1 body must decode into minio-go `replication.Metrics` (exact
+    /// json tags); Go's decoder matches case-insensitively but does not
+    /// ignore underscores, so the internal snake_case names read as all-zero.
     #[test]
-    fn serialize_replication_metrics_body_v1_returns_replication_stats_only() {
+    fn serialize_replication_metrics_body_v1_returns_minio_go_metrics_shape() {
         let mut stats = BucketStats {
             uptime: 99,
             ..Default::default()
         };
         stats.replication_stats.replica_count = 7;
+        stats.replication_stats.replicated_size = 2048;
+        stats
+            .replication_stats
+            .stats
+            .entry("arn:minio:replication::t:b".to_string())
+            .or_default()
+            .replicated_count = 5;
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1).expect("metrics v1 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV1, "node-1:9000")
+            .expect("metrics v1 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
-        assert_eq!(payload["replica_count"], 7);
+        assert_eq!(payload["replicaCount"], 7);
+        assert_eq!(payload["completedReplicationSize"], 2048);
+        assert_eq!(payload["Stats"]["arn:minio:replication::t:b"]["replicationCount"], 5);
         assert!(payload.get("uptime").is_none());
         assert!(payload.get("proxy_stats").is_none());
+        // The internal snake_case names must not leak into the wire body.
+        assert!(payload.get("replica_count").is_none());
+        assert!(payload.get("q_stat").is_none());
     }
 
     #[test]
@@ -3909,22 +4529,48 @@ mod tests {
         assert_eq!(target.current_bandwidth_bytes_per_sec, 3000.0);
     }
 
+    /// The v2 body must decode into minio-go `replication.MetricsV2`
+    /// (`uptime`/`currStats`/`queueStats`); `mc replicate status` reads
+    /// `currStats` and `queueStats.nodes` and silently shows zeros when the
+    /// keys do not match.
     #[test]
-    fn serialize_replication_metrics_body_v2_returns_full_bucket_stats() {
+    fn serialize_replication_metrics_body_v2_returns_minio_go_metrics_v2_shape() {
         let mut stats = BucketStats {
             uptime: 99,
             ..Default::default()
         };
         stats.replication_stats.replica_count = 7;
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_count
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_bytes
+            .store(1200, std::sync::atomic::Ordering::Relaxed);
+        stats.replication_stats.q_stat = stats.replication_stats.q_stat.snapshot();
         stats.proxy_stats.put_total = 3;
 
-        let body =
-            serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2).expect("metrics v2 body should serialize");
+        let body = serialize_replication_metrics_body(&stats, ReplicationExtRoute::MetricsV2, "node-1:9000")
+            .expect("metrics v2 body should serialize");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
 
         assert_eq!(payload["uptime"], 99);
-        assert_eq!(payload["replication_stats"]["replica_count"], 7);
-        assert_eq!(payload["proxy_stats"]["put_total"], 3);
+        assert_eq!(payload["currStats"]["replicaCount"], 7);
+        assert_eq!(payload["currStats"]["queued"]["curr"]["count"], 4.0);
+        // The queue snapshot must surface at least one node: mc derives the
+        // worker/queue panels from queueStats.nodes and treats an empty list
+        // as "no data".
+        assert_eq!(payload["queueStats"]["nodes"][0]["queueStats"]["curr"]["count"], 4.0);
+        assert_eq!(payload["queueStats"]["nodes"][0]["uptime"], 99);
+        // The internal snake_case names must not leak into the wire body.
+        assert!(payload.get("replication_stats").is_none());
+        assert!(payload.get("queue_stats").is_none());
+        assert!(payload.get("proxy_stats").is_none());
     }
 
     #[test]
@@ -4671,6 +5317,11 @@ mod tests {
             Url::parse(&format!("https://object-lambda.test:{}/transform", address.port())).expect("object lambda TLS endpoint");
         let mut config = object_lambda_test_config(endpoint.clone());
         config.client_ca = ca_path.to_string_lossy().into_owned();
+        // This is the only object-lambda test that performs a real TLS
+        // handshake; under a full-suite nextest run the CPU contention from
+        // neighboring tests pushes it past the helper's tight 2s request
+        // deadline. SNI preservation, not latency, is under test here.
+        config.response_header_timeout = Some(Duration::from_secs(30));
 
         let response = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
             .expect("object lambda TLS client should build")

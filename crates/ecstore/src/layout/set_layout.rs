@@ -4,6 +4,7 @@ use std::io::{Error, Result};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 pub(crate) struct StaticSetLayoutSnapshot {
     pub(crate) deployment_id: Uuid,
     pub(crate) set_count: usize,
@@ -12,6 +13,7 @@ pub(crate) struct StaticSetLayoutSnapshot {
     pub(crate) distribution_algo: DistributionAlgoVersion,
 }
 
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 impl StaticSetLayoutSnapshot {
     pub(crate) fn from_format(format: &FormatV3) -> Self {
         let disk_ids = format.erasure.sets.clone();
@@ -39,17 +41,20 @@ impl StaticSetLayoutSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 pub(crate) struct SetDiskPosition {
     pub(crate) set_index: usize,
     pub(crate) disk_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 pub(crate) struct RuntimeSetLayoutPlan {
     pub(crate) sets: Vec<Vec<RuntimeSetDrivePlan>>,
     lock_hosts_by_set: Vec<Vec<String>>,
 }
 
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 impl RuntimeSetLayoutPlan {
     pub(crate) fn from_endpoint_hosts<S>(set_count: usize, drives_per_set: usize, endpoint_hosts: &[S]) -> Result<Self>
     where
@@ -108,6 +113,7 @@ impl RuntimeSetLayoutPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "ESET-001 layout model; exercised by this file's tests (backlog#1823)")]
 pub(crate) struct RuntimeSetDrivePlan {
     pub(crate) set_index: usize,
     pub(crate) disk_index: usize,

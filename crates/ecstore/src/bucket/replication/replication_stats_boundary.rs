@@ -15,7 +15,9 @@
 #[cfg(test)]
 pub(crate) use rustfs_replication::FailStats;
 pub(crate) use rustfs_replication::{
-    ActiveWorkerStat, BucketReplicationStat, InQueueMetric, ProxyMetric, ProxyStatsCache, QueueCache, ReplicationMetricScope,
-    SRMetricsSummary, XferStats,
+    ActiveWorkerStat, ProxyMetric, ProxyStatsCache, QueueCache, ReplicationMetricScope, SRMetricsSummary,
 };
-pub use rustfs_replication::{BucketReplicationStats, BucketStats};
+// Public so the admin wire DTOs (rustfs/src/admin/replication_metrics_wire.rs)
+// can project the internal stats onto the minio-go response shapes through
+// the storage_api facade chain.
+pub use rustfs_replication::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};

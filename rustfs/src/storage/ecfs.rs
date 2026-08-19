@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::StorageVersioningConfigExt as _;
 use super::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
     BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
     decode_tags_to_map, delete_bucket_metadata_config_if_incarnation, encode_tags, get_bucket_accelerate_config,
-    get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config,
-    get_bucket_website_config, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
-    record_replication_proxy, serialize, update_bucket_metadata_config_if_incarnation,
+    get_bucket_logging_config, get_bucket_object_lock_config, get_bucket_request_payment_config, get_bucket_website_config,
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
+    update_bucket_metadata_config_if_incarnation,
 };
-use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::ApiError;
 use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
@@ -34,7 +34,7 @@ use crate::storage::storage_api::ecfs_consumer::contract::{
 use crate::storage::storage_api::ecfs_consumer::object_lock::{
     parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
 };
-use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::{ECStore, runtime_sources};
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
@@ -45,7 +45,7 @@ use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
-use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
+use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, insert_str};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -59,7 +59,7 @@ const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
-    ReplicateDecision, must_replicate_metadata, schedule_metadata_replication,
+    ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
@@ -105,18 +105,152 @@ impl FS {
         &self.server_ctx
     }
 
-    async fn replication_tagging_enabled(bucket: &str, object: &str) -> bool {
-        get_bucket_replication_config(bucket)
-            .await
-            .map(|(cfg, _)| cfg.has_active_rules(object, true))
-            .unwrap_or(false)
+    /// Not-found classifier for proxied SDK tagging calls: a raw 404 covers
+    /// NoSuchKey and NoSuchVersion alike; the caller silently tries the next
+    /// replication target.
+    fn proxy_sdk_error_is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+        err.raw_response().is_some_and(|resp| resp.status().as_u16() == 404)
     }
 
-    async fn record_replication_tagging_metric(bucket: &str, object: &str, api: &str, is_err: bool) {
-        if !Self::replication_tagging_enabled(bucket, object).await {
-            return;
+    /// Selector options for a tagging proxy. Reuses `get_opts` so the
+    /// anti-loop `source-proxy-request` header family and the bucket's
+    /// version-suspension state gate proxying exactly like GET/HEAD.
+    async fn tagging_proxy_opts(
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        headers: &http::HeaderMap,
+    ) -> Option<ObjectOptions> {
+        get_opts(bucket, object, version_id, None, headers).await.ok()
+    }
+
+    /// Serve a GetObjectTagging for an object missing locally by proxying to
+    /// the bucket's replication targets (MinIO `proxyGetTaggingToRepTarget`,
+    /// backlog#1675 P1-5). None means no target had the object.
+    async fn proxy_get_object_tagging(
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        headers: &http::HeaderMap,
+    ) -> Option<TagSet> {
+        let opts = Self::tagging_proxy_opts(bucket, object, version_id, headers).await?;
+        let targets = get_read_proxy_targets(bucket, object, &opts).await;
+        if targets.is_empty() {
+            return None;
         }
-        record_replication_proxy(bucket, api, is_err).await;
+        for target in targets {
+            match target
+                .get_object_tagging(&target.bucket, object, opts.version_id.clone())
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "GetObjectTagging", false).await;
+                    return Some(
+                        remote
+                            .tag_set
+                            .into_iter()
+                            .map(|tag| Tag {
+                                key: Some(tag.key),
+                                value: Some(tag.value),
+                            })
+                            .collect(),
+                    );
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, object, arn = %target.arn, "tagging proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, object, arn = %target.arn, error = %err, "tagging proxy: GetObjectTagging against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "GetObjectTagging", true).await;
+        None
+    }
+
+    /// Apply a PutObjectTagging for an object missing locally on a
+    /// replication target (MinIO `proxyTaggingToRepTarget`).
+    async fn proxy_put_object_tagging(
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        headers: &http::HeaderMap,
+        tag_set: &TagSet,
+    ) -> Option<()> {
+        let opts = Self::tagging_proxy_opts(bucket, object, version_id, headers).await?;
+        let mut tagging = aws_sdk_s3::types::Tagging::builder();
+        for tag in tag_set {
+            let sdk_tag = aws_sdk_s3::types::Tag::builder()
+                .key(tag.key.clone().unwrap_or_default())
+                .value(tag.value.clone().unwrap_or_default())
+                .build()
+                .ok()?;
+            tagging = tagging.tag_set(sdk_tag);
+        }
+        let tagging = tagging.build().ok()?;
+        let targets = get_read_proxy_targets(bucket, object, &opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        for target in targets {
+            match target
+                .put_object_tagging(&target.bucket, object, opts.version_id.clone(), tagging.clone())
+                .await
+            {
+                Ok(_) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "PutObjectTagging", false).await;
+                    return Some(());
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, object, arn = %target.arn, "tagging proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, object, arn = %target.arn, error = %err, "tagging proxy: PutObjectTagging against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "PutObjectTagging", true).await;
+        None
+    }
+
+    /// Apply a DeleteObjectTagging for an object missing locally on a
+    /// replication target (MinIO `proxyTaggingToRepTarget`).
+    async fn proxy_delete_object_tagging(
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        headers: &http::HeaderMap,
+    ) -> Option<()> {
+        let opts = Self::tagging_proxy_opts(bucket, object, version_id, headers).await?;
+        let targets = get_read_proxy_targets(bucket, object, &opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        for target in targets {
+            match target
+                .delete_object_tagging(&target.bucket, object, opts.version_id.clone())
+                .await
+            {
+                Ok(_) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "DeleteObjectTagging", false).await;
+                    return Some(());
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, object, arn = %target.arn, "tagging proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, object, arn = %target.arn, error = %err, "tagging proxy: DeleteObjectTagging against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "DeleteObjectTagging", true).await;
+        None
     }
 
     pub async fn get_object_tag_conditions_for_policy(
@@ -128,6 +262,15 @@ impl FS {
         let Some(store) = self.server_ctx.object_store() else {
             return Ok(std::collections::HashMap::new());
         };
+        Self::get_object_tag_conditions_for_policy_from_store(store.as_ref(), bucket, object, version_id).await
+    }
+
+    pub(crate) async fn get_object_tag_conditions_for_policy_from_store(
+        store: &ECStore,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+    ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
         let opts = ObjectOptions {
             version_id: version_id.map(String::from),
             ..Default::default()
@@ -292,7 +435,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_copy_object(req)).await
+        usecase.execute_copy_object(req).await
     }
 
     #[instrument(
@@ -438,7 +581,27 @@ impl S3 for FS {
         let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let existing_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => info,
+            Err(e) => {
+                // Replication lag window: apply the tagging delete on a
+                // replication target that already has the object
+                // (backlog#1675 P1-5). No local object exists, so no bucket
+                // notification event is emitted for the proxied write.
+                if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && Self::proxy_delete_object_tagging(&bucket, &object, version_id.clone(), &req.headers)
+                        .await
+                        .is_some()
+                {
+                    counter!("rustfs_delete_object_tagging_success").increment(1);
+                    let duration = start_time.elapsed();
+                    histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete")
+                        .record(duration.as_secs_f64());
+                    return Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
+                }
+                return Err(ApiError::from(e).into());
+            }
+        };
         let dsc = must_replicate_metadata(
             &bucket,
             &object,
@@ -452,11 +615,15 @@ impl S3 for FS {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_TAGGING_TIMESTAMP,
+                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            );
             opts.eval_metadata = Some(eval_metadata);
         }
 
         let delete_tags_result = store.delete_object_tags(&bucket, &object, &opts).await;
-        Self::record_replication_tagging_metric(&bucket, &object, "DeleteObjectTagging", delete_tags_result.is_err()).await;
         let object_info = delete_tags_result.map_err(|e| {
             error!(
                 component = LOG_COMPONENT_STORAGE,
@@ -695,7 +862,7 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         crate::hp_guard!("S3::get_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_get_object(req)).await
+        usecase.execute_get_object(req).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -914,32 +1081,49 @@ impl S3 for FS {
             ..Default::default()
         };
 
-        let tags_result = store.get_object_tags(bucket, object, &opts).await;
-        Self::record_replication_tagging_metric(bucket, object, "GetObjectTagging", tags_result.is_err()).await;
-        let tags = tags_result.map_err(|e| {
-            if is_err_object_not_found(&e) {
-                debug!(
+        let tags = match store.get_object_tags(bucket, object, &opts).await {
+            Ok(tags) => tags,
+            Err(e) => {
+                // Replication lag window: the object may exist on a
+                // replication target even though it is missing locally —
+                // proxy the tagging read there (backlog#1675 P1-5).
+                if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && let Some(tag_set) =
+                        Self::proxy_get_object_tagging(bucket, object, req.input.version_id.clone(), &req.headers).await
+                {
+                    counter!("rustfs_get_object_tagging_success").increment(1);
+                    let duration = start_time.elapsed();
+                    histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "get")
+                        .record(duration.as_secs_f64());
+                    return Ok(S3Response::new(GetObjectTaggingOutput {
+                        tag_set,
+                        version_id: req.input.version_id.clone(),
+                    }));
+                }
+                if is_err_object_not_found(&e) {
+                    debug!(
+                        component = LOG_COMPONENT_STORAGE,
+                        subsystem = LOG_SUBSYSTEM_TAGGING,
+                        event = "object_tagging_not_found",
+                        bucket = %bucket,
+                        object = %object,
+                        error = %e,
+                        "Object tags not found"
+                    );
+                    return Err(s3_error!(NoSuchKey));
+                }
+                error!(
                     component = LOG_COMPONENT_STORAGE,
                     subsystem = LOG_SUBSYSTEM_TAGGING,
-                    event = "object_tagging_not_found",
+                    event = "object_tagging_get_failed",
                     bucket = %bucket,
                     object = %object,
                     error = %e,
-                    "Object tags not found"
+                    "Failed to load object tags"
                 );
-                return s3_error!(NoSuchKey);
+                return Err(ApiError::from(e).into());
             }
-            error!(
-                component = LOG_COMPONENT_STORAGE,
-                subsystem = LOG_SUBSYSTEM_TAGGING,
-                event = "object_tagging_get_failed",
-                bucket = %bucket,
-                object = %object,
-                error = %e,
-                "Failed to load object tags"
-            );
-            ApiError::from(e).into()
-        })?;
+        };
 
         let tag_set = decode_tags(tags.as_str());
         debug!(
@@ -1252,7 +1436,7 @@ impl S3 for FS {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_put_object(self, req)).await
+        usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1615,14 +1799,36 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let tags = encode_tags(tagging.tag_set);
+        let tags = encode_tags(tagging.tag_set.clone());
         debug!("Encoded tags: {}", tags);
 
         let version_id = req.input.version_id.clone();
         let mut opts = get_opts(&bucket, &object, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let existing_object_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
+        let existing_object_info = match store.get_object_info(&bucket, &object, &opts).await {
+            Ok(info) => info,
+            Err(e) => {
+                // Replication lag window: apply the tagging update on a
+                // replication target that already has the object
+                // (backlog#1675 P1-5). No local object exists, so no bucket
+                // notification event is emitted for the proxied write.
+                if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && Self::proxy_put_object_tagging(&bucket, &object, version_id.clone(), &req.headers, &tagging.tag_set)
+                        .await
+                        .is_some()
+                {
+                    counter!("rustfs_put_object_tagging_success").increment(1);
+                    let duration = start_time.elapsed();
+                    histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put")
+                        .record(duration.as_secs_f64());
+                    return Ok(S3Response::new(PutObjectTaggingOutput {
+                        version_id: req.input.version_id.clone(),
+                    }));
+                }
+                return Err(ApiError::from(e).into());
+            }
+        };
         let dsc = must_replicate_metadata(
             &bucket,
             &object,
@@ -1636,11 +1842,15 @@ impl S3 for FS {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+            insert_str(
+                &mut eval_metadata,
+                SUFFIX_TAGGING_TIMESTAMP,
+                OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+            );
             opts.eval_metadata = Some(eval_metadata);
         }
 
         let put_tags_result = store.put_object_tags(&bucket, &object, &tags, &opts).await;
-        Self::record_replication_tagging_metric(&bucket, &object, "PutObjectTagging", put_tags_result.is_err()).await;
         let object_info = put_tags_result.map_err(|e| {
             error!("Failed to put object tags: {}", e);
             counter!("rustfs_put_object_tagging_failure").increment(1);

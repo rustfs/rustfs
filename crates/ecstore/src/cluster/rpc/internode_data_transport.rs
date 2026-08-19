@@ -31,7 +31,7 @@ use rustfs_config::{
     DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
     KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
-use rustfs_rio::{HttpReader, HttpWriter};
+use rustfs_rio::{ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -43,6 +43,10 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+#[allow(
+    dead_code,
+    reason = "live in the cfg(not(test)) half of build_internode_data_transport_from_env (backlog#1823)"
+)]
 static INTERNODE_DATA_TRANSPORT: OnceLock<std::result::Result<Arc<dyn InternodeDataTransport>, String>> = OnceLock::new();
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
@@ -134,6 +138,10 @@ fn put_file_capability_status_is_legacy(status: u16) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "capability-negotiation seam; constructed only by transport test doubles (backlog#1823)"
+)]
 pub struct InternodeDataTransportCapabilities {
     /// Backend can open a streaming remote disk reader.
     pub streaming_read: bool,
@@ -150,6 +158,10 @@ pub struct InternodeDataTransportCapabilities {
 }
 
 impl InternodeDataTransportCapabilities {
+    #[allow(
+        dead_code,
+        reason = "capability-negotiation seam; used by transport test doubles (backlog#1823)"
+    )]
     pub const fn tcp_http() -> Self {
         Self {
             streaming_read: true,
@@ -221,6 +233,17 @@ pub struct NsScannerCapabilityRequest {
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
+    async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+        self.open_read(request).await
+    }
+    /// Opens an owned-chunk stream when this transport can retain receive-buffer
+    /// ownership. `None` preserves the established `open_read` fallback.
+    async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        Ok(None)
+    }
+    async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        self.open_read_chunks(request).await
+    }
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
     async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
@@ -229,7 +252,12 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
         Err(Error::MethodNotAllowed)
     }
+    // Interface facet nobody calls yet: every transport implements both, but no
+    // caller negotiates on them. Kept for the internode transport split
+    // (backlog#1350); deleting them would delete the seam and six impls.
+    #[allow(dead_code, reason = "unused capability-negotiation facet (backlog#1823)")]
     fn name(&self) -> &'static str;
+    #[allow(dead_code, reason = "unused capability-negotiation facet (backlog#1823)")]
     fn capabilities(&self) -> InternodeDataTransportCapabilities;
 }
 
@@ -245,6 +273,34 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
         Ok(Box::new(
             HttpReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
         ))
+    }
+
+    async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Box::new(
+            HttpReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        ))
+    }
+
+    async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Some(Box::new(
+            HttpChunkReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        )))
+    }
+
+    async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
+        let url = build_read_file_stream_url(&request);
+        let mut headers = json_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        Ok(Some(Box::new(
+            HttpChunkReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout)
+                .await?,
+        )))
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
@@ -656,6 +712,10 @@ fn build_internode_data_transport_result(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "live in the cfg(test) half of build_internode_data_transport_from_env, which bypasses the process static (backlog#1823)"
+)]
 pub fn build_internode_data_transport(configured_transport: Option<&str>) -> Result<Arc<dyn InternodeDataTransport>> {
     build_internode_data_transport_result(configured_transport).map_err(Error::other)
 }

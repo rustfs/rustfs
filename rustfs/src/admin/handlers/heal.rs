@@ -53,6 +53,7 @@ const LOG_SUBSYSTEM_HEAL_ADMIN: &str = "heal_admin";
 const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
 const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const LEGACY_ROOT_HEAL_RESPONSE_ID: &str = ".";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
 const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
@@ -65,6 +66,9 @@ struct HealInitParams {
     client_token: String,
     force_start: bool,
     force_stop: bool,
+    /// Incremental result cursor (HS-06): only result items with a sequence
+    /// greater than this are returned; absent means full snapshot.
+    since_seq: Option<u64>,
 }
 
 fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
@@ -96,6 +100,16 @@ fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> 
                         return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
                     }
                     hip.force_stop = parse_heal_query_bool(value.as_ref())?;
+                }
+                "sinceSeq" => {
+                    if !seen.insert("sinceSeq") {
+                        return Err(s3_error!(InvalidArgument, "duplicate heal query parameter"));
+                    }
+                    hip.since_seq = Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| s3_error!(InvalidArgument, "sinceSeq must be a non-negative integer"))?,
+                    );
                 }
                 _ => return Err(s3_error!(InvalidArgument, "unknown heal query parameter")),
             }
@@ -148,6 +162,26 @@ fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
     }
 
     Ok(())
+}
+
+fn encode_heal_control_path(bucket: &str, obj_prefix: &str) -> String {
+    if bucket.is_empty() && obj_prefix.is_empty() {
+        return String::new();
+    }
+
+    path_join(&[PathBuf::from(bucket), PathBuf::from(obj_prefix)])
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
+    if !client_token.is_empty() {
+        return client_token.to_string();
+    }
+    if heal_path.is_empty() {
+        return LEGACY_ROOT_HEAL_RESPONSE_ID.to_string();
+    }
+    heal_path.to_string()
 }
 
 pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -296,6 +330,7 @@ fn add_source_counts(total: &mut rustfs_heal::HealSourceCounts, next: rustfs_hea
     total.auto_heal = total.auto_heal.saturating_add(next.auto_heal);
     total.internal = total.internal.saturating_add(next.internal);
     total.read_repair = total.read_repair.saturating_add(next.read_repair);
+    total.mrf = total.mrf.saturating_add(next.mrf);
 }
 
 fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_heal::HealOperationsSnapshot) {
@@ -956,7 +991,15 @@ fn reject_heal_admission(result: rustfs_common::heal_channel::HealAdmissionResul
             result.result_label(),
             result.reason_label()
         ),
-        HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => s3_error!(
+        // Overlap rejections (HS-06) share this arm: the s3s footprint
+        // ratchet forbids new s3_error! sites, and the typed reason is
+        // preserved through reason_label() ("already_running" /
+        // "overlapping_paths") so madmin-style clients can distinguish.
+        HealAdmissionResult::Dropped(
+            HealAdmissionDropReason::PolicyDropped
+            | HealAdmissionDropReason::AlreadyRunning
+            | HealAdmissionDropReason::OverlappingPaths,
+        ) => s3_error!(
             OperationAborted,
             "heal request not admitted: admission={}, reason={}",
             result.result_label(),
@@ -1368,9 +1411,8 @@ impl Operation for HealHandler {
             "start_heal"
         };
 
-        let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
+        let heal_path = encode_heal_control_path(&hip.bucket, &hip.obj_prefix);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1380,8 +1422,9 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::query(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path,
                 client_token.clone(),
+                hip.since_seq,
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
             let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;
@@ -1412,7 +1455,6 @@ impl Operation for HealHandler {
             );
             return Ok(json_response(StatusCode::OK, body));
         } else if hip.force_stop {
-            let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
             let request_id = uuid::Uuid::new_v4().to_string();
             let context = app_context
@@ -1422,22 +1464,12 @@ impl Operation for HealHandler {
             let envelope = rustfs_protos::heal_control::Envelope::cancel(
                 request_id.clone(),
                 new_heal_control_metadata(&route)?,
-                heal_path_str,
+                heal_path.clone(),
                 client_token.clone(),
             )
             .map_err(|err| s3_error!(InternalError, "encode heal control cancel failed: {err}"))?;
-            let response = submit_cluster_heal_channel_command(
-                context,
-                route,
-                envelope,
-                &request_id,
-                if client_token.is_empty() {
-                    heal_path.to_string_lossy().into_owned()
-                } else {
-                    client_token.clone()
-                },
-            )
-            .await?;
+            let response_id = heal_control_response_id(&heal_path, &client_token);
+            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, response_id).await?;
             if !response.success {
                 return Err(s3_error!(
                     InternalError,
@@ -1579,11 +1611,12 @@ mod tests {
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
         aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
-        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
-        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
-        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status,
-        reject_heal_admission, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
+        encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
+        map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
+        query_peer_replacement_recovery_status, reject_heal_admission, should_handle_root_heal_directly,
+        validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use crate::storage::rpc::node_service::heal::{
@@ -2113,6 +2146,20 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_heal_control_path_keeps_root_empty() {
+        assert_eq!(encode_heal_control_path("", ""), "");
+        assert_eq!(encode_heal_control_path("bucket", ""), "bucket");
+        assert_eq!(encode_heal_control_path("bucket", "prefix"), "bucket/prefix");
+    }
+
+    #[test]
+    fn test_heal_control_response_id_preserves_existing_contract() {
+        assert_eq!(heal_control_response_id("", ""), ".");
+        assert_eq!(heal_control_response_id("bucket", ""), "bucket");
+        assert_eq!(heal_control_response_id("", "task-id"), "task-id");
+    }
+
+    #[test]
     fn test_extract_heal_init_params_rejects_prefix_without_bucket() {
         let err = validate_heal_target("", "prefix").expect_err("must reject empty bucket");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
@@ -2329,6 +2376,7 @@ mod tests {
             auto_heal: value,
             internal: value,
             read_repair: value,
+            mrf: value,
         };
         let operations = |value| rustfs_heal::HealOperationsSnapshot {
             queue_length: value,

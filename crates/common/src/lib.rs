@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bucket_stats;
 // pub mod error;
 pub mod globals;
 pub mod heal_channel;
 pub mod last_minute;
 pub mod metrics;
+pub mod mrf_channel;
 mod readiness;
+pub mod table_catalog;
+pub mod trace_bus;
 
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};

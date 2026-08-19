@@ -41,6 +41,14 @@ pub const XXHASH_64_NAME: &str = "xxhash64";
 pub const XXHASH_128_NAME: &str = "xxhash128";
 pub const MD5_NAME: &str = "md5";
 
+/// One of three deliberately separate checksum registries (backlog#1833):
+/// this enum owns the **streaming-hash algorithm registry**, including the
+/// RustFS extensions (sha512, xxhash3/64/128). The on-disk xl.meta bitset
+/// lives in `rustfs_rio::ChecksumType` (crates/rio/src/checksum.rs, varint
+/// bits are append-only), and the MinIO-port client keeps its own
+/// `ChecksumMode` (crates/ecstore/src/client/checksum.rs). When adding an
+/// algorithm, extend all three (or record why not) — they do not derive from
+/// each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChecksumAlgorithm {
@@ -468,13 +476,19 @@ impl Checksum for Xxhash64 {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Content-MD5 is not a ChecksumAlgorithm variant and has no arm in into_impl: S3 carries it as its own header, separate from the x-amz-checksum-* family. This impl exists so the two paths share the Checksum trait, and is asserted by this crate's tests (backlog#1823)"
+)]
 struct Md5 {
     hasher: md5::Md5,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Content-MD5 is not a ChecksumAlgorithm variant and has no arm in into_impl: S3 carries it as its own header, separate from the x-amz-checksum-* family. This impl exists so the two paths share the Checksum trait, and is asserted by this crate's tests (backlog#1823)"
+)]
 impl Md5 {
     fn update(&mut self, bytes: &[u8]) {
         use md5::Digest;

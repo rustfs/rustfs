@@ -425,6 +425,15 @@ impl BucketMetadata {
         }
     }
 
+    /// Metadata for a physically new user bucket. Existing or fabricated legacy
+    /// metadata must use [`Self::new`] so upgrades do not rewrite their
+    /// durability posture.
+    pub fn new_with_default_durability(name: &str) -> Self {
+        let mut metadata = Self::new(name);
+        metadata.durability_config_json = super::durability::new_bucket_durability_config_json();
+        metadata
+    }
+
     pub fn save_file_path(&self) -> String {
         format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
     }
@@ -1302,7 +1311,7 @@ mod test {
         assert!(bm.object_locking(), "object lock active via parsed config");
     }
 
-    /// backlog#580: KNOWN GAP (weisd 2026-03-06 "inline_data 前缀不同"). RustFS's
+    /// backlog#580: KNOWN GAP (flagged 2026-03-06: "inline_data 前缀不同"). RustFS's
     /// inline-data extraction does not yet recover the object body from a
     /// MinIO-written bucket-metadata object: `into_fileinfo(read_data=true).data`
     /// returns bytes that are not the `.metadata.bin` blob (no `format|version`
@@ -1310,7 +1319,7 @@ mod test {
     /// inline-data framing is handled on the read path.
     /// backlog#580: prove RustFS reads a MinIO-written **inlined** bucket-metadata
     /// object end-to-end. MinIO stores inline data as `[bitrot hash][object body]`
-    /// (the "`inline_data` 前缀不同" that weisd flagged on 2026-03-06 is that
+    /// (the "`inline_data` 前缀不同" gap flagged on 2026-03-06 is that
     /// bitrot prefix, not a format incompatibility). Running the raw inline shard
     /// through RustFS's `BitrotReader` with the default `HighwayHash256S` must
     /// verify the checksum and yield the exact `.metadata.bin` blob.
@@ -1376,6 +1385,43 @@ mod test {
         assert!(!old.bucket_incarnation_id.is_nil());
         assert!(!new.bucket_incarnation_id.is_nil());
         assert_ne!(old.bucket_incarnation_id, new.bucket_incarnation_id);
+    }
+
+    #[test]
+    fn regular_bucket_metadata_constructor_does_not_seed_durability() {
+        temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            let metadata = BucketMetadata::new("legacy-or-fabricated");
+            assert!(metadata.durability_config_json.is_empty());
+            assert!(metadata.durability_config().is_none());
+        });
+    }
+
+    #[test]
+    fn new_bucket_metadata_constructor_seeds_default_durability() {
+        temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            let metadata = BucketMetadata::new_with_default_durability("new-user-bucket");
+            assert_eq!(
+                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+
+            let encoded = metadata.marshal_msg().expect("marshal metadata");
+            let decoded = BucketMetadata::unmarshal(&encoded).expect("unmarshal metadata");
+            assert_eq!(decoded.durability_config_json, metadata.durability_config_json);
+            assert_eq!(
+                decoded.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
+                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
+            );
+        });
+    }
+
+    #[test]
+    fn new_bucket_metadata_constructor_can_inherit_global_durability() {
+        temp_env::with_var(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, Some("inherit"), || {
+            let metadata = BucketMetadata::new_with_default_durability("strict-fleet-new-bucket");
+            assert!(metadata.durability_config_json.is_empty());
+            assert!(metadata.durability_config().is_none());
+        });
     }
 
     #[test]

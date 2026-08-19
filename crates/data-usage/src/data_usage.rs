@@ -846,8 +846,15 @@ impl DataUsageEntry {
     }
 }
 
-/// Data usage cache info
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Read-only projection of the scanner's `.usage-cache.bin` info block.
+///
+/// The canonical wire format is written by the hand-written map-encoded
+/// `Serialize` on the scanner-side `DataUsageCacheInfo`
+/// (`crates/scanner/src/data_usage_define.rs`), which carries 16 fields.
+/// This type decodes only the shared subset and is deliberately not
+/// `Serialize`: a derived (array) encoding of this 6-field subset would
+/// corrupt the cache for scanner readers, so no write path may exist here.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
     pub name: String,
     pub next_cycle: u64,
@@ -863,8 +870,163 @@ pub struct DataUsageCacheInfo {
     pub snapshot_complete: bool,
 }
 
-/// Data usage cache
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Prefix-level usage over a raw entry map — the shared core behind
+/// [`DataUsageCache::prefix_usage`], usable by any cache-shaped reader (the
+/// scanner's writer-side cache has the same map type).
+///
+/// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+/// names come straight off the child keys — no reverse mapping exists or is
+/// needed. A compacted prefix carries its aggregate but no children, which
+/// the `compacted` flag reports so callers can say why the breakdown is
+/// empty. `truncated` is set when the breakdown exceeded `max_entries` and
+/// was cut (largest first).
+pub fn prefix_usage_in_cache(
+    cache: &HashMap<String, DataUsageEntry>,
+    bucket: &str,
+    prefix: &str,
+    max_entries: usize,
+) -> Option<PrefixUsageQuery> {
+    let prefix = prefix.trim_matches('/');
+    let root = if prefix.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{bucket}/{prefix}")
+    };
+    let entry = cache.get(&hash_path(&root).key())?.clone();
+
+    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
+
+    let child_prefix = format!("{root}/");
+    let mut sub_prefixes: Vec<PrefixUsageEntry> = entry
+        .children
+        .iter()
+        .filter_map(|child_key| {
+            let child = cache.get(child_key)?;
+            let child_flat = flatten_entry(cache, child, 1)?;
+            // Child keys are literal `bucket/pre/name` paths; a trailing
+            // slash marks a directory object and is display-only here.
+            let name = child_key
+                .strip_prefix(child_prefix.as_str())
+                .unwrap_or(child_key.as_str())
+                .trim_end_matches('/')
+                .to_string();
+            Some(PrefixUsageEntry {
+                prefix: name,
+                usage: PrefixUsageSummary::from_entry(&child_flat),
+            })
+        })
+        .collect();
+    sub_prefixes.sort_by(|left, right| {
+        right
+            .usage
+            .size
+            .cmp(&left.usage.size)
+            .then_with(|| left.prefix.cmp(&right.prefix))
+    });
+    let truncated = sub_prefixes.len() > max_entries;
+    sub_prefixes.truncate(max_entries);
+
+    Some(PrefixUsageQuery {
+        usage,
+        compacted: entry.compacted,
+        truncated,
+        sub_prefixes,
+    })
+}
+
+/// Maximum subtree depth [`flatten_entry`] will walk before declaring the
+/// cache corrupt — the same bound the scanner's checked flatten uses.
+const PREFIX_USAGE_MAX_DEPTH: usize = 1024;
+
+/// Flatten one entry's subtree into an aggregate: the free-function twin of
+/// [`DataUsageCache::flatten`], carrying the scanner checked-flatten
+/// hardening so a corrupt cache (cycles, over-deep trees, overflowing
+/// counters) yields `None` instead of unbounded recursion or wrapped totals.
+fn flatten_entry(cache: &HashMap<String, DataUsageEntry>, root: &DataUsageEntry, depth: usize) -> Option<DataUsageEntry> {
+    if depth > PREFIX_USAGE_MAX_DEPTH {
+        return None;
+    }
+    let mut flattened = DataUsageEntry::default();
+    if !flattened.checked_merge(root) {
+        return None;
+    }
+    flattened.compacted = root.compacted;
+    // The root itself is not pre-seeded: it is merged above, and a corrupt
+    // child edge pointing back at the root's own key is still terminated by
+    // the visited set on first encounter.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<(&String, usize)> = root.children.iter().map(|child| (child, depth + 1)).collect();
+    while let Some((key, child_depth)) = pending.pop() {
+        if child_depth > PREFIX_USAGE_MAX_DEPTH || !visited.insert(key.as_str()) {
+            return None;
+        }
+        let entry = cache.get(key)?;
+        if !flattened.checked_merge(entry) {
+            return None;
+        }
+        pending.extend(entry.children.iter().map(|child| (child, child_depth + 1)));
+    }
+    flattened.children.clear();
+    Some(flattened)
+}
+
+/// Flattened counters of one prefix subtree, as returned by
+/// [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageSummary {
+    pub size: u64,
+    pub objects: u64,
+    pub versions: u64,
+    pub delete_markers: u64,
+}
+
+impl PrefixUsageSummary {
+    fn from_entry(entry: &DataUsageEntry) -> Self {
+        Self {
+            size: entry.size as u64,
+            objects: entry.objects as u64,
+            versions: entry.versions as u64,
+            delete_markers: entry.delete_markers as u64,
+        }
+    }
+
+    /// Add another set's counters into this one (entries are partitioned by
+    /// set, so per-set results sum).
+    pub fn merge(&mut self, other: &Self) {
+        self.size = self.size.saturating_add(other.size);
+        self.objects = self.objects.saturating_add(other.objects);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+    }
+}
+
+/// One first-level sub-prefix row of a [`PrefixUsageQuery`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PrefixUsageEntry {
+    pub prefix: String,
+    pub usage: PrefixUsageSummary,
+}
+
+/// Result of [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageQuery {
+    pub usage: PrefixUsageSummary,
+    /// The prefix entry was compacted by the scanner: its aggregate is valid
+    /// but no sub-prefix breakdown exists on disk.
+    pub compacted: bool,
+    /// The breakdown had more entries than `max_entries`; the largest remain.
+    pub truncated: bool,
+    pub sub_prefixes: Vec<PrefixUsageEntry>,
+}
+
+/// Read-only projection of a scanner-written `.usage-cache.bin` file.
+///
+/// The scanner-side `DataUsageCache` (`crates/scanner/src/data_usage_define.rs`)
+/// owns the persisted format; this type only decodes it (see
+/// [`DataUsageCacheInfo`]) and must never grow a serialization path.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCache {
     pub info: DataUsageCacheInfo,
     pub cache: HashMap<String, DataUsageEntry>,
@@ -984,6 +1146,21 @@ impl DataUsageCache {
             Some(due) => due.compacted,
             None => false,
         }
+    }
+
+    /// Prefix-level usage for one bucket subtree, plus the one-level
+    /// breakdown below it (rustfs/backlog#1872, MinIO
+    /// `loadPrefixUsageFromBackend` parity and beyond: arbitrary prefixes and
+    /// full counters instead of first-level sizes only).
+    ///
+    /// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+    /// names come straight off the child keys — no reverse mapping exists or
+    /// is needed. A compacted prefix carries its aggregate but no children,
+    /// which the `compacted` flag reports so callers can say why the
+    /// breakdown is empty. `truncated` is set when the breakdown exceeded
+    /// `max_entries` and was cut (largest first).
+    pub fn prefix_usage(&self, bucket: &str, prefix: &str, max_entries: usize) -> Option<PrefixUsageQuery> {
+        prefix_usage_in_cache(&self.cache, bucket, prefix, max_entries)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
@@ -1186,31 +1363,10 @@ impl DataUsageCache {
         }
     }
 
-    pub fn marshal_msg(&self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut buf = Vec::new();
-        self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-        Ok(buf)
-    }
-
     pub fn unmarshal(buf: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let t: Self = rmp_serde::from_slice(buf)?;
         Ok(t)
     }
-
-    // Note: load and save methods are storage-specific and should be implemented
-    // in the ecstore crate where storage access is available
-}
-
-/// Trait for storage-specific operations on DataUsageCache
-#[async_trait::async_trait]
-pub trait DataUsageCacheStorage {
-    /// Load data usage cache from backend storage
-    async fn load(store: &dyn std::any::Any, name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
-    where
-        Self: Sized;
-
-    /// Save data usage cache to backend storage
-    async fn save(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // Helper structs and functions for cache operations
@@ -1830,6 +1986,202 @@ mod tests {
         assert_eq!(decoded.size, 12);
         assert_eq!(decoded.failed_objects, 2);
         assert!(decoded.all_tier_stats.is_none());
+    }
+
+    /// Scanner-written `.usage-cache.bin` bytes: a 2-element array of the
+    /// canonical 16-field map-encoded info block and one map-encoded entry.
+    /// Captured from the canonical writer's `marshal_msg` — see
+    /// `usage_cache_wire_format_is_pinned` in
+    /// `crates/scanner/src/data_usage_define.rs`, which pins these exact
+    /// bytes and documents regeneration. Hardcoded here because a
+    /// dev-dependency on rustfs-scanner would pull the whole ecstore tree
+    /// into this crate's test build, and a fixture generated at test runtime
+    /// could not detect writer drift anyway.
+    const SCANNER_USAGE_CACHE_WIRE_FIXTURE: &[u8] = &[
+        0x92, 0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65,
+        0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72,
+        0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x09, 0xab, 0x6c, 0x61, 0x73, 0x74, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x92,
+        0xce, 0x65, 0x53, 0xf1, 0x00, 0x00, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67, 0xc3,
+        0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74,
+        0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x81,
+        0xb0, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x2f, 0x6c, 0x6f, 0x73, 0x74, 0x0b, 0xb1, 0x73,
+        0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xb2, 0x77, 0x69, 0x72,
+        0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x2f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0xaf, 0x73, 0x63, 0x61, 0x6e,
+        0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67,
+        0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x91, 0x9a, 0xa6, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0xab, 0x77, 0x69, 0x72, 0x65,
+        0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xa6, 0x62, 0x72, 0x6f, 0x6b, 0x65, 0x6e, 0xc0, 0x01, 0x64, 0xcc, 0xc8, 0x03,
+        0xa8, 0x64, 0x65, 0x66, 0x65, 0x72, 0x72, 0x65, 0x64, 0xa6, 0x62, 0x75, 0x64, 0x67, 0x65, 0x74, 0xab, 0x6f, 0x62, 0x6a,
+        0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63, 0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x92, 0x01, 0x02, 0xb1,
+        0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc3, 0xb0, 0x73,
+        0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0xdc, 0x00, 0x20, 0x03, 0x03,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79,
+        0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x01, 0x81, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65,
+        0x74, 0x8b, 0xa8, 0x63, 0x68, 0x69, 0x6c, 0x64, 0x72, 0x65, 0x6e, 0x90, 0xa4, 0x73, 0x69, 0x7a, 0x65, 0xcd, 0x10, 0x00,
+        0xa7, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x03, 0xa8, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x05, 0xae,
+        0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72, 0x73, 0x01, 0xa9, 0x6f, 0x62, 0x6a, 0x5f,
+        0x73, 0x69, 0x7a, 0x65, 0x73, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x6f, 0x62,
+        0x6a, 0x5f, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x72,
+        0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0xc0, 0xa9, 0x63, 0x6f,
+        0x6d, 0x70, 0x61, 0x63, 0x74, 0x65, 0x64, 0xc3, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65,
+        0x63, 0x74, 0x73, 0x02, 0xae, 0x61, 0x6c, 0x6c, 0x5f, 0x74, 0x69, 0x65, 0x72, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0x91,
+        0x81, 0xa4, 0x57, 0x41, 0x52, 0x4d, 0x93, 0xcd, 0x08, 0x00, 0x02, 0x01,
+    ];
+
+    #[test]
+    fn thin_usage_cache_decodes_scanner_wire_fixture() {
+        let decoded =
+            DataUsageCache::unmarshal(SCANNER_USAGE_CACHE_WIRE_FIXTURE).expect("thin projection decodes a scanner-written cache");
+
+        // The six fields shared with the scanner's 16-field info block; the
+        // remaining ten (lifecycle, replication, checkpoint, heals, ...) must
+        // be skipped, not error.
+        assert_eq!(decoded.info.name, "wire-bucket");
+        assert_eq!(decoded.info.next_cycle, 7);
+        assert_eq!(
+            decoded.info.last_update,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        assert!(decoded.info.skip_healing);
+        assert_eq!(decoded.info.failed_objects.get("wire-bucket/lost"), Some(&11));
+        assert!(decoded.info.snapshot_complete);
+
+        // Entries use the shared canonical map-encoded type end to end.
+        let entry = decoded.cache.get("wire-bucket").expect("fixture entry decodes");
+        assert_eq!(entry.size, 4096);
+        assert_eq!(entry.objects, 3);
+        assert_eq!(entry.versions, 5);
+        assert_eq!(entry.delete_markers, 1);
+        assert!(entry.compacted);
+        assert_eq!(entry.failed_objects, 2);
+        assert_eq!(
+            entry.all_tier_stats.as_ref().and_then(|tiers| tiers.tiers.get("WARM")),
+            Some(&TierStats {
+                total_size: 2048,
+                num_versions: 2,
+                num_objects: 1,
+            })
+        );
+    }
+
+    /// Build a cache shaped like `bucket/{a,b/{c,d}},bucket/loose` with
+    /// distinct counters so aggregation is observable.
+    fn prefix_usage_fixture_cache() -> DataUsageCache {
+        let mut cache = DataUsageCache::default();
+        let mut insert = |path: &str, parent: &str, size: usize, objects: usize, versions: usize, delete_markers: usize| {
+            cache.replace(
+                path,
+                parent,
+                DataUsageEntry {
+                    size,
+                    objects,
+                    versions,
+                    delete_markers,
+                    ..Default::default()
+                },
+            );
+        };
+        insert("bucket", "", 0, 0, 0, 0);
+        insert("bucket/a", "bucket", 100, 1, 1, 0);
+        insert("bucket/b", "bucket", 0, 0, 0, 0);
+        insert("bucket/b/c", "bucket/b", 200, 2, 2, 1);
+        insert("bucket/b/d", "bucket/b", 40, 1, 3, 0);
+        insert("bucket/loose", "bucket", 10, 1, 1, 1);
+        cache
+    }
+
+    #[test]
+    fn prefix_usage_aggregates_bucket_root_and_one_level_below() {
+        let cache = prefix_usage_fixture_cache();
+
+        let root = cache
+            .prefix_usage("bucket", "", 100)
+            .expect("root query must find the bucket entry");
+        assert_eq!(root.usage.size, 350, "root aggregate flattens the whole subtree");
+        assert_eq!(root.usage.objects, 5);
+        assert_eq!(root.usage.versions, 7);
+        assert_eq!(root.usage.delete_markers, 2);
+        assert!(!root.compacted);
+        assert!(!root.truncated);
+        // Breakdown is one level: b (240) before a (100) before loose (10),
+        // each flattened to its own subtree total.
+        let names: Vec<(&str, u64)> = root
+            .sub_prefixes
+            .iter()
+            .map(|entry| (entry.prefix.as_str(), entry.usage.size))
+            .collect();
+        assert_eq!(names, vec![("b", 240), ("a", 100), ("loose", 10)]);
+    }
+
+    #[test]
+    fn prefix_usage_drills_into_arbitrary_prefixes() {
+        let cache = prefix_usage_fixture_cache();
+
+        let b = cache.prefix_usage("bucket", "b", 100).expect("nested prefix must resolve");
+        assert_eq!(b.usage.size, 240);
+        assert_eq!(b.usage.versions, 5);
+        let names: Vec<&str> = b.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["c", "d"]);
+
+        // Prefix slashes are normalized away.
+        let slashed = cache.prefix_usage("bucket", "/b/", 100).expect("slash-insensitive lookup");
+        assert_eq!(slashed.usage.size, 240);
+
+        assert!(cache.prefix_usage("bucket", "absent", 100).is_none(), "unknown prefix must be a miss");
+        assert!(cache.prefix_usage("other", "", 100).is_none(), "unknown bucket must be a miss");
+    }
+
+    #[test]
+    fn prefix_usage_reports_and_respects_truncation() {
+        let cache = prefix_usage_fixture_cache();
+        let capped = cache.prefix_usage("bucket", "", 2).expect("root query");
+        assert!(capped.truncated, "three children capped to two must flag truncation");
+        let names: Vec<&str> = capped.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["b", "a"], "largest prefixes survive the cut");
+    }
+
+    #[test]
+    fn prefix_usage_marks_compacted_entries() {
+        let mut cache = DataUsageCache::default();
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                size: 999,
+                objects: 9,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+
+        let compacted = cache.prefix_usage("bucket", "", 100).expect("compacted root resolves");
+        assert!(compacted.compacted, "compaction must be visible to callers");
+        assert_eq!(compacted.usage.size, 999);
+        assert!(compacted.sub_prefixes.is_empty(), "a compacted entry carries no children");
+    }
+
+    #[test]
+    fn prefix_usage_rejects_cyclic_and_dangling_caches() {
+        // A self-referencing child (corrupt cache) must yield a miss for the
+        // whole query, not unbounded recursion.
+        let mut cache = prefix_usage_fixture_cache();
+        if let Some(entry) = cache.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b".to_string());
+        }
+        assert!(cache.prefix_usage("bucket", "b", 100).is_none(), "a cyclic subtree must be rejected");
+        // The unaffected sibling still answers.
+        assert!(cache.prefix_usage("bucket", "a", 100).is_some());
+
+        // A child key with no entry (dangling link) is rejected rather than
+        // silently dropped: half a tree would under-report usage.
+        let mut dangling = prefix_usage_fixture_cache();
+        if let Some(entry) = dangling.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b/ghost".to_string());
+        }
+        assert!(
+            dangling.prefix_usage("bucket", "b", 100).is_none(),
+            "a dangling child link must be rejected"
+        );
     }
 
     #[test]

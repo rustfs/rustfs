@@ -172,6 +172,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
+    #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
     pub(crate) fn is_for_store_bucket(
         &self,
         store_id: Uuid,
@@ -211,6 +212,26 @@ impl ObjectLockConfigSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaAdmission {
+    current_usage: u64,
+    quota_limit: u64,
+}
+
+impl QuotaAdmission {
+    pub(crate) fn current_usage(self) -> u64 {
+        self.current_usage
+    }
+
+    pub(crate) fn quota_limit(self) -> u64 {
+        self.quota_limit
+    }
+
+    pub(crate) fn remaining(self) -> u64 {
+        self.quota_limit - self.current_usage
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -240,6 +261,9 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Materialize the data-movement per-part checksum sidecar for APIs that
+    /// return part checksums. Ordinary object reads leave it encoded.
+    pub include_part_checksums: bool,
     pub src_pool_idx: usize,
     pub user_defined: HashMap<String, String>,
     pub preserve_etag: Option<String>,
@@ -253,6 +277,26 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     pub replication_request: bool,
+    /// True when the inbound request carried the
+    /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
+    /// value "true": the request was already proxied by a replication peer,
+    /// so this server must not proxy a local miss onward (anti-loop,
+    /// MinIO-compatible). The header only disables proxying — it grants no
+    /// capability — so no authorization gate is required to honor it.
+    pub proxy_request: bool,
+    /// True when the `source-proxy-request` header family was present at
+    /// all, regardless of value (MinIO's `ProxyHeaderSet`). A replication
+    /// peer sends `source-proxy-request: false` on its worker convergence
+    /// HEADs precisely so the receiver answers locally instead of proxying
+    /// back — otherwise a proxied 404->200 echo makes the worker believe the
+    /// object already converged and it never replicates it.
+    pub proxy_header_set: bool,
+    /// Source-cluster LWW timestamps carried by an authorized replication
+    /// request; None when the source never modified the category. Only the
+    /// replication-authorized options builders may set these.
+    pub replication_tagging_timestamp: Option<OffsetDateTime>,
+    pub replication_retention_timestamp: Option<OffsetDateTime>,
+    pub replication_legalhold_timestamp: Option<OffsetDateTime>,
     /// Authorized SSE-C replication passthrough: the body is already
     /// ciphertext, so the write path must not encrypt or compress it and
     /// stores the restored encryption metadata verbatim. Only the
@@ -275,12 +319,22 @@ pub struct ObjectOptions {
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+    /// Server-derived bucket-quota snapshot for commit-boundary admission.
+    pub quota_admission: Option<QuotaAdmission>,
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
 impl ObjectOptions {
+    pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
+        self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
+            current_usage,
+            quota_limit,
+        });
+        self.quota_admission.is_some()
+    }
+
     pub(crate) fn overwrites_existing_version(&self) -> bool {
         self.version_id.is_some() || !self.versioned || self.version_suspended
     }

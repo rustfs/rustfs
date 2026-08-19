@@ -14,11 +14,30 @@
 
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
+use std::future::poll_fn;
 use std::io::IoSlice;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
-use uuid::Uuid;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
+const EVENT_BITROT_SHORT_SHARD_READ: &str = "bitrot_short_shard_read";
+const EVENT_BITROT_HASH_MISMATCH: &str = "bitrot_hash_mismatch";
+const MAX_RETAINED_CHUNKS_PER_BLOCK: usize = 64;
+const MAX_CHUNK_POLLS_PER_YIELD: usize = MAX_RETAINED_CHUNKS_PER_BLOCK + 1;
+
+/// Result of polling an optional owned-chunk handoff.
+pub enum ShardChunkRead {
+    /// The source does not support owned-chunk handoff and remains untouched.
+    Unsupported,
+    /// The source reached EOF.
+    Eof,
+    /// A non-empty chunk containing at most the requested number of bytes.
+    Chunk(bytes::Bytes),
+}
 
 /// A shard source that may already hold its bytes in memory.
 ///
@@ -37,6 +56,12 @@ pub trait ShardSource: AsyncRead + Send + Sync + Unpin {
     /// an `AsyncRead` of `n` bytes would have done, so the two can be mixed.
     fn try_take_block(&mut self, _n: usize) -> Option<bytes::Bytes> {
         None
+    }
+
+    /// Polls one owned chunk when the source supports chunk handoff.
+    /// `Unsupported` must leave the source untouched.
+    fn poll_read_chunk(self: Pin<&mut Self>, _cx: &mut Context<'_>, _max: usize) -> Poll<std::io::Result<ShardChunkRead>> {
+        Poll::Ready(Ok(ShardChunkRead::Unsupported))
     }
 }
 
@@ -71,9 +96,11 @@ pin_project! {
         // contiguous on-disk `[hash][data]` block so both are pulled in a single
         // pass; grown lazily and never shrunk.
         buf: Vec<u8>,
+        // Reused owned chunk vector for the remote HTTP fast path. Keeping the
+        // allocation with the reader avoids allocating once per bitrot block.
+        chunks: Vec<bytes::Bytes>,
         skip_verify: bool,
         last_verify_duration: Duration,
-        id: Uuid,
     }
 }
 
@@ -88,14 +115,19 @@ where
             hash_algo: algo,
             shard_size,
             buf: Vec::new(),
+            chunks: Vec::new(),
             skip_verify,
             last_verify_duration: Duration::ZERO,
-            id: Uuid::new_v4(),
         }
     }
 
     pub(crate) fn last_verify_duration(&self) -> Duration {
         self.last_verify_duration
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inner_ref(&self) -> &R {
+        &self.inner
     }
 
     /// Read a single (hash+data) block, verify hash, and copy `out.len()` bytes
@@ -118,7 +150,7 @@ where
 
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.copy_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)
@@ -157,7 +189,7 @@ where
         }
         let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
         if filled < need {
-            return Err(short_shard_read(&self.id, filled.saturating_sub(self.hash_algo.size()), want));
+            return Err(short_shard_read(filled.saturating_sub(self.hash_algo.size()), want));
         }
         Ok(())
     }
@@ -166,15 +198,23 @@ where
     /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
     fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
         if data_len < want {
-            return Err(short_shard_read(&self.id, data_len, want));
+            return Err(short_shard_read(data_len, want));
         }
         Ok(data_len)
     }
 }
 
 /// A truncated shard is `UnexpectedEof`, not a short success (backlog#799 B2).
-fn short_shard_read(id: &Uuid, got: usize, want: usize) -> std::io::Error {
-    error!("bitrot reader short shard read: id={id} got {got} of {want} bytes");
+fn short_shard_read(got: usize, want: usize) -> std::io::Error {
+    error!(
+        event = EVENT_BITROT_SHORT_SHARD_READ,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_ERASURE,
+        state = "failed",
+        got,
+        want,
+        "short shard read: got {got} of {want} bytes"
+    );
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("short shard read: got {got} of {want} bytes"))
 }
 
@@ -184,12 +224,7 @@ fn short_shard_read(id: &Uuid, got: usize, want: usize) -> std::io::Error {
 /// hash never reaches the caller's buffer. The verify duration is returned
 /// rather than stored so this stays a free function usable while `self` is
 /// borrowed for the block.
-fn split_and_verify<'a>(
-    hash_algo: &HashAlgorithm,
-    skip_verify: bool,
-    block: &'a [u8],
-    id: &Uuid,
-) -> std::io::Result<(&'a [u8], Duration)> {
+fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a [u8]) -> std::io::Result<(&'a [u8], Duration)> {
     let (hash, data) = block.split_at(hash_algo.size());
     if skip_verify {
         return Ok((data, Duration::ZERO));
@@ -198,7 +233,14 @@ fn split_and_verify<'a>(
     let actual_hash = hash_algo.hash_encode(data);
     let verify = verify_start.elapsed();
     if actual_hash.as_ref() != hash {
-        error!("bitrot reader hash mismatch, id={id} data_len={}", data.len());
+        error!(
+            event = EVENT_BITROT_HASH_MISMATCH,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ERASURE,
+            state = "failed",
+            data_len = data.len(),
+            "bitrot hash mismatch"
+        );
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
     }
     Ok((data, verify))
@@ -248,15 +290,130 @@ where
 
         let need = hash_size + want;
 
-        // In-memory fast path: the block is already resident, so slice it instead
-        // of copying it into the scratch buffer first (rustfs/backlog#1159). One
-        // copy (`extend_from_slice`) instead of two. A source that cannot serve
-        // `need` bytes returns `None` and falls through to the scratch path,
-        // keeping the short-read contract.
         if let Some(block) = self.inner.try_take_block(need) {
-            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block, &self.id)?;
+            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
             out.extend_from_slice(data);
             self.last_verify_duration = verify;
+            return Ok(want);
+        }
+
+        self.chunks.clear();
+        let handed_off = {
+            let inner = &mut self.inner;
+            let chunks = &mut self.chunks;
+            let tail_buf = &mut self.buf;
+            let mut received = 0usize;
+            poll_fn(|cx| {
+                for _ in 0..MAX_CHUNK_POLLS_PER_YIELD {
+                    let next = match Pin::new(&mut *inner).poll_read_chunk(cx, need - received) {
+                        Poll::Ready(Ok(next)) => next,
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    let chunk = match next {
+                        ShardChunkRead::Unsupported if received == 0 => return Poll::Ready(Ok(false)),
+                        ShardChunkRead::Unsupported => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "chunk handoff became unavailable after transferring data",
+                            )));
+                        }
+                        ShardChunkRead::Eof => {
+                            return Poll::Ready(Err(short_shard_read(received.saturating_sub(hash_size), want)));
+                        }
+                        ShardChunkRead::Chunk(chunk) => chunk,
+                    };
+
+                    if received == 0 {
+                        tail_buf.clear();
+                    }
+                    if chunk.is_empty() {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "chunk handoff returned an empty chunk",
+                        )));
+                    }
+                    let remaining = need - received;
+                    if chunk.len() > remaining {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "chunk handoff exceeded its requested boundary",
+                        )));
+                    }
+                    received += chunk.len();
+
+                    if chunks.len() == MAX_RETAINED_CHUNKS_PER_BLOCK {
+                        if tail_buf.is_empty() {
+                            tail_buf.reserve_exact(need - (received - chunk.len()));
+                        }
+                        tail_buf.extend_from_slice(&chunk);
+                    } else {
+                        chunks.push(chunk);
+                    }
+
+                    if received == need {
+                        return Poll::Ready(Ok(true));
+                    }
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            })
+            .await?
+        };
+        if handed_off {
+            if self.chunks.len() == 1 && self.buf.is_empty() {
+                let block = &self.chunks[0];
+                let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, block)?;
+                out.extend_from_slice(data);
+                self.last_verify_duration = verify;
+                return Ok(want);
+            }
+
+            let block_chunks = || {
+                self.chunks
+                    .iter()
+                    .map(|chunk| chunk.as_ref())
+                    .chain((!self.buf.is_empty()).then_some(self.buf.as_slice()))
+            };
+            if !self.skip_verify {
+                let verify_start = std::time::Instant::now();
+                let actual_hash = self
+                    .hash_algo
+                    .hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
+                        let start = (*skip).min(chunk.len());
+                        *skip -= start;
+                        Some(&chunk[start..])
+                    }));
+                let verify = verify_start.elapsed();
+                let mut hash_offset = 0;
+                let mut remaining = hash_size;
+                for chunk in block_chunks() {
+                    let take = remaining.min(chunk.len());
+                    if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
+                        error!(
+                            event = EVENT_BITROT_HASH_MISMATCH,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_ERASURE,
+                            state = "failed",
+                            data_len = want,
+                            "bitrot hash mismatch"
+                        );
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+                    }
+                    hash_offset += take;
+                    remaining -= take;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                self.last_verify_duration = verify;
+            }
+            let mut skip = hash_size;
+            for chunk in block_chunks() {
+                let start = skip.min(chunk.len());
+                skip -= start;
+                out.extend_from_slice(&chunk[start..]);
+            }
             return Ok(want);
         }
 
@@ -264,7 +421,7 @@ where
         // the sink differs (`extend_from_slice` into `out` instead of
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
         out.extend_from_slice(data);
         self.last_verify_duration = verify;
         Ok(want)
@@ -663,20 +820,422 @@ impl BitrotWriterWrapper {
     }
 }
 
+// --- startup bitrot self-test (rustfs/backlog#1873, MinIO bitrotSelfTest parity) ---
+//
+// A broken hash implementation (bad SIMD feature combination, platform drift, a
+// key-handling regression) fails silently: every shard reads back "corrupt",
+// heal rewrites data that was fine, and cross-platform clusters disagree about
+// which copy is healthy. The self-test below pins the algorithms the moment a
+// process starts, so a drifted build announces itself instead of quietly
+// rewriting objects. See docs/rustfs-heal-scanner-vs-minio-comprehensive-
+// analysis-2026-08-16.md §6 HS-11.
+
+/// Length of the deterministic self-test payload.
+pub const BITROT_SELF_TEST_PAYLOAD_LEN: usize = 4096;
+
+/// Known-answer digest of [`bitrot_self_test_payload`] under `HighwayHash256S`
+/// (the production default). Pinned so any platform or build where the
+/// implementation drifts fails startup instead of miss-hashing shards.
+const BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S: [u8; 32] = [
+    0xb9, 0x32, 0xa2, 0xaa, 0x4a, 0xb7, 0x33, 0x6a, 0xa3, 0xca, 0x7e, 0x61, 0x9d, 0x86, 0x52, 0x14, 0x6e, 0x7f, 0xd8, 0x9e, 0xea,
+    0x08, 0xd9, 0x8c, 0x33, 0x85, 0x87, 0x19, 0x30, 0xd6, 0xed, 0x06,
+];
+
+/// Known-answer digest of the same payload under `HighwayHash256SLegacy`.
+const BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S_LEGACY: [u8; 32] = [
+    0x98, 0x24, 0x71, 0x4f, 0x16, 0xbb, 0x48, 0x39, 0xed, 0x68, 0xfa, 0x63, 0x5e, 0xd9, 0x07, 0x61, 0xdf, 0x0a, 0xff, 0xcf, 0x7d,
+    0x8c, 0xa8, 0xc7, 0xc0, 0xb6, 0x6f, 0x05, 0xdb, 0xda, 0x5a, 0x22,
+];
+
+/// FIPS 180-2 test vector: SHA-256 of the ASCII string "abc". Unlike the
+/// Highway digests above this one is externally verifiable, so it guards the
+/// whole `HashAlgorithm` plumbing even for readers who distrust pinned
+/// self-computed constants.
+const BITROT_SELF_TEST_KAT_SHA256_ABC: [u8; 32] = [
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96,
+    0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+];
+
+/// Deterministic self-test payload: xorshift64* from a fixed seed, so every
+/// platform and every run hashes the same 4096 bytes.
+fn bitrot_self_test_payload() -> [u8; BITROT_SELF_TEST_PAYLOAD_LEN] {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut payload = [0u8; BITROT_SELF_TEST_PAYLOAD_LEN];
+    for byte in payload.iter_mut() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        *byte = state.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8;
+    }
+    payload
+}
+
+/// Why a bitrot self-test failed.
+#[derive(Debug)]
+pub enum BitrotSelfTestError {
+    /// A known-answer digest mismatched the pinned constant.
+    KnownAnswerMismatch {
+        algorithm: &'static str,
+        got: String,
+        want: String,
+    },
+    /// A freshly encoded shard failed `bitrot_verify`.
+    RoundtripVerify { algorithm: &'static str, detail: String },
+    /// A verified roundtrip read back different bytes than were written.
+    RoundtripReadback { algorithm: &'static str },
+    /// A deliberately tampered shard was not rejected by `bitrot_verify`.
+    TamperNotRejected {
+        algorithm: &'static str,
+        tampered: &'static str,
+    },
+}
+
+impl std::fmt::Display for BitrotSelfTestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KnownAnswerMismatch { algorithm, got, want } => {
+                write!(f, "known-answer mismatch for {algorithm}: got {got}, want {want}")
+            }
+            Self::RoundtripVerify { algorithm, detail } => write!(f, "{algorithm} roundtrip shard failed verification: {detail}"),
+            Self::RoundtripReadback { algorithm } => write!(f, "{algorithm} roundtrip read back different bytes"),
+            Self::TamperNotRejected { algorithm, tampered } => {
+                write!(f, "{algorithm} tampered shard ({tampered}) was not rejected")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BitrotSelfTestError {}
+
+fn self_test_hex(bytes: &[u8]) -> String {
+    rustfs_utils::hex(bytes)
+}
+
+// (kept as a named one-liner so every KAT failure site reads the same; the
+// underlying formatter is the shared `rustfs_utils::hex`)
+
+/// Compare a digest against its pinned constant. Split out so a test can drive
+/// it with a wrong constant and prove the mismatch path fires.
+fn bitrot_kat_check(
+    algorithm: &'static str,
+    algo: &HashAlgorithm,
+    payload: &[u8],
+    expected: &[u8; 32],
+) -> Result<(), BitrotSelfTestError> {
+    let digest = algo.hash_encode(payload);
+    let digest = digest.as_ref();
+    if digest.len() != expected.len() || digest != expected.as_slice() {
+        return Err(BitrotSelfTestError::KnownAnswerMismatch {
+            algorithm,
+            got: self_test_hex(digest),
+            want: self_test_hex(expected),
+        });
+    }
+    Ok(())
+}
+
+/// Encode `payload` with `shard_size` blocks, verify it end to end, and read
+/// every block back through `BitrotReader` comparing bytes.
+async fn bitrot_roundtrip_check(
+    algorithm: &'static str,
+    algo: HashAlgorithm,
+    payload: &[u8],
+    shard_size: usize,
+) -> Result<(), BitrotSelfTestError> {
+    let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+    for chunk in payload.chunks(shard_size) {
+        writer
+            .write(chunk)
+            .await
+            .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+                algorithm,
+                detail: format!("encode failed: {err}"),
+            })?;
+    }
+    let encoded = writer.into_inner().into_inner();
+
+    let on_disk = bitrot_shard_file_size(payload.len(), shard_size, algo.clone());
+    if encoded.len() != on_disk {
+        return Err(BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: format!("encoded {} bytes, size formula says {on_disk}", encoded.len()),
+        });
+    }
+    bitrot_verify(std::io::Cursor::new(encoded.clone()), on_disk, payload.len(), algo.clone(), shard_size)
+        .await
+        .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: err.to_string(),
+        })?;
+
+    let mut reader = BitrotReader::new(std::io::Cursor::new(encoded), shard_size, algo, false);
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let want = shard_size.min(payload.len() - offset);
+        let mut buf = vec![0u8; want];
+        let read = reader
+            .read(&mut buf)
+            .await
+            .map_err(|err| BitrotSelfTestError::RoundtripVerify {
+                algorithm,
+                detail: format!("read back failed at offset {offset}: {err}"),
+            })?;
+        if read != want || buf[..read] != payload[offset..offset + read] {
+            return Err(BitrotSelfTestError::RoundtripReadback { algorithm });
+        }
+        offset += read;
+    }
+    Ok(())
+}
+
+/// Flip one byte and require `bitrot_verify` to reject the result.
+async fn bitrot_tamper_check(
+    algorithm: &'static str,
+    algo: HashAlgorithm,
+    payload: &[u8],
+    shard_size: usize,
+    tampered: &'static str,
+    flip_at: usize,
+) -> Result<(), BitrotSelfTestError> {
+    let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+    for chunk in payload.chunks(shard_size) {
+        writer.write(chunk).await.expect("self-test encode should not fail");
+    }
+    let mut corrupt = writer.into_inner().into_inner();
+    let flip_index = flip_at % corrupt.len();
+    corrupt[flip_index] ^= 0x80;
+
+    let on_disk = bitrot_shard_file_size(payload.len(), shard_size, algo.clone());
+    match bitrot_verify(std::io::Cursor::new(corrupt), on_disk, payload.len(), algo, shard_size).await {
+        // The flipped byte must be rejected as a hash mismatch specifically, not
+        // by any incidental read error: an in-memory cursor cannot fail reads,
+        // so accepting any other failure here would mask a verify path that
+        // errors out before it ever compares hashes.
+        Err(err) if err.to_string().contains("hash mismatch") => Ok(()),
+        Ok(()) => Err(BitrotSelfTestError::TamperNotRejected { algorithm, tampered }),
+        Err(err) => Err(BitrotSelfTestError::RoundtripVerify {
+            algorithm,
+            detail: format!("tampered shard rejected with an unexpected error: {err}"),
+        }),
+    }
+}
+
+/// Verify every bitrot algorithm this crate can write or verify in production:
+/// both streaming Highway variants roundtrip end to end (encode → size formula
+/// → `bitrot_verify` → read back) and reject a flipped byte in both the data
+/// and the leading hash, while all three hashed algorithms reproduce their
+/// pinned known-answer digests.
+///
+/// Runs in well under a millisecond on 4 KiB of data; callers may run it inline
+/// at startup. Pure CPU, no allocation beyond a few KiB of scratch.
+pub async fn bitrot_self_test() -> Result<(), BitrotSelfTestError> {
+    let payload = bitrot_self_test_payload();
+
+    // Externally verifiable vector first: it guards the HashAlgorithm plumbing
+    // itself, before any self-pinned constants are consulted.
+    let abc = HashAlgorithm::SHA256.hash_encode(b"abc");
+    if abc.as_ref() != BITROT_SELF_TEST_KAT_SHA256_ABC.as_slice() {
+        return Err(BitrotSelfTestError::KnownAnswerMismatch {
+            algorithm: "SHA256",
+            got: self_test_hex(abc.as_ref()),
+            want: self_test_hex(&BITROT_SELF_TEST_KAT_SHA256_ABC),
+        });
+    }
+
+    bitrot_kat_check(
+        "HighwayHash256S",
+        &HashAlgorithm::HighwayHash256S,
+        &payload,
+        &BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S,
+    )?;
+    bitrot_kat_check(
+        "HighwayHash256SLegacy",
+        &HashAlgorithm::HighwayHash256SLegacy,
+        &payload,
+        &BITROT_SELF_TEST_KAT_HIGHWAY_HASH256S_LEGACY,
+    )?;
+
+    for (algorithm, algo) in [
+        ("HighwayHash256S", HashAlgorithm::HighwayHash256S),
+        ("HighwayHash256SLegacy", HashAlgorithm::HighwayHash256SLegacy),
+    ] {
+        // Full blocks plus a partial tail, exactly like a real part stripe.
+        let tail_len = 2 * 1024 + 333;
+        bitrot_roundtrip_check(algorithm, algo.clone(), &payload, 1024).await?;
+        bitrot_roundtrip_check(algorithm, algo.clone(), &payload[..tail_len], 1024).await?;
+        // One flipped byte in the final data block, one in the first leading
+        // hash: both must fail verification.
+        bitrot_tamper_check(algorithm, algo.clone(), &payload, 1024, "final data byte", payload.len() - 1).await?;
+        bitrot_tamper_check(algorithm, algo, &payload, 1024, "leading hash byte", 0).await?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ShardSource;
     use super::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_kat_check, bitrot_self_test,
+        bitrot_self_test_payload, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
     };
+    use super::{MAX_RETAINED_CHUNKS_PER_BLOCK, ShardChunkRead, ShardSource};
+    use bytes::Bytes;
     use rustfs_utils::HashAlgorithm;
-    use std::io::{Cursor, IoSlice};
+    use std::collections::VecDeque;
+    use std::io::{self, Cursor, IoSlice};
+    use std::pin::Pin;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    struct FragmentedSource {
+        chunks: VecDeque<Bytes>,
+    }
+
+    impl FragmentedSource {
+        fn new(bytes: Vec<u8>, fragment_sizes: &[usize]) -> Self {
+            let mut chunks = VecDeque::new();
+            let mut offset = 0;
+            for &size in fragment_sizes {
+                let end = (offset + size).min(bytes.len());
+                if offset < end {
+                    chunks.push_back(Bytes::copy_from_slice(&bytes[offset..end]));
+                }
+                offset = end;
+            }
+            if offset < bytes.len() {
+                chunks.push_back(Bytes::copy_from_slice(&bytes[offset..]));
+            }
+            Self { chunks }
+        }
+    }
+
+    impl AsyncRead for FragmentedSource {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("fragmented source must use chunk handoff")))
+        }
+    }
+
+    impl ShardSource for FragmentedSource {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<ShardChunkRead>> {
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Poll::Ready(Ok(ShardChunkRead::Eof));
+            };
+            if chunk.len() > max {
+                self.chunks.push_front(chunk.split_off(max));
+                chunk.truncate(max);
+            }
+            Poll::Ready(Ok(ShardChunkRead::Chunk(chunk)))
+        }
+    }
+
+    struct GeneratedChunkSource {
+        bytes: Bytes,
+        offset: usize,
+        fragment_size: usize,
+        fail_at: Option<usize>,
+    }
+
+    impl GeneratedChunkSource {
+        fn new(bytes: Vec<u8>, fragment_size: usize) -> Self {
+            assert!(fragment_size > 0);
+            Self {
+                bytes: Bytes::from(bytes),
+                offset: 0,
+                fragment_size,
+                fail_at: None,
+            }
+        }
+
+        fn failing(bytes: Vec<u8>, fragment_size: usize, fail_at: usize) -> Self {
+            Self {
+                fail_at: Some(fail_at),
+                ..Self::new(bytes, fragment_size)
+            }
+        }
+    }
+
+    impl AsyncRead for GeneratedChunkSource {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("generated source must use chunk handoff")))
+        }
+    }
+
+    impl ShardSource for GeneratedChunkSource {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<ShardChunkRead>> {
+            if self.fail_at == Some(self.offset) {
+                return Poll::Ready(Err(rustfs_rio::new_test_internode_http_io_error(
+                    rustfs_rio::InternodeHttpErrorKind::BodyStreamAborted,
+                )));
+            }
+            if self.offset == self.bytes.len() {
+                return Poll::Ready(Ok(ShardChunkRead::Eof));
+            }
+            let error_limit = self.fail_at.unwrap_or(self.bytes.len());
+            let take = self
+                .fragment_size
+                .min(max)
+                .min(error_limit - self.offset)
+                .min(self.bytes.len() - self.offset);
+            let start = self.offset;
+            self.offset += take;
+            Poll::Ready(Ok(ShardChunkRead::Chunk(self.bytes.slice(start..start + take))))
+        }
+    }
+
+    struct InvalidChunkSource {
+        mode: InvalidChunkMode,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InvalidChunkMode {
+        Empty,
+        Oversized,
+        UnsupportedAfterChunk,
+        Unsupported,
+    }
+
+    impl AsyncRead for InvalidChunkSource {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("invalid source must use chunk handoff")))
+        }
+    }
+
+    impl ShardSource for InvalidChunkSource {
+        fn poll_read_chunk(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, max: usize) -> Poll<io::Result<ShardChunkRead>> {
+            match self.mode {
+                InvalidChunkMode::Empty => Poll::Ready(Ok(ShardChunkRead::Chunk(Bytes::new()))),
+                InvalidChunkMode::Oversized => Poll::Ready(Ok(ShardChunkRead::Chunk(Bytes::from(vec![0; max + 1])))),
+                InvalidChunkMode::UnsupportedAfterChunk => {
+                    self.mode = InvalidChunkMode::Unsupported;
+                    Poll::Ready(Ok(ShardChunkRead::Chunk(Bytes::from_static(b"x"))))
+                }
+                InvalidChunkMode::Unsupported => Poll::Ready(Ok(ShardChunkRead::Unsupported)),
+            }
+        }
+    }
+
+    struct ScratchReuseSource {
+        block: Option<Bytes>,
+        saw_reused_scratch: bool,
+    }
+
+    impl AsyncRead for ScratchReuseSource {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let Some(block) = self.block.take() else {
+                return Poll::Ready(Ok(()));
+            };
+            self.saw_reused_scratch = buf.initialize_unfilled()[..block.len()].iter().all(|byte| *byte == 0xa5);
+            buf.put_slice(&block);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl ShardSource for ScratchReuseSource {}
 
     #[derive(Default)]
     struct VectoredCountingWriter {
@@ -784,6 +1343,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bitrot_self_test_payload_is_deterministic() {
+        // Two independent builds of the payload must agree byte for byte, or
+        // the pinned known-answer digests below would be meaningless.
+        assert_eq!(bitrot_self_test_payload(), bitrot_self_test_payload());
+    }
+
+    #[test]
+    fn bitrot_self_test_rejects_a_wrong_known_answer_digest() {
+        let payload = bitrot_self_test_payload();
+        let wrong = [0u8; 32];
+        let err = bitrot_kat_check("HighwayHash256S", &HashAlgorithm::HighwayHash256S, &payload, &wrong)
+            .expect_err("a zeroed digest must never match");
+        match err {
+            super::BitrotSelfTestError::KnownAnswerMismatch { algorithm, .. } => assert_eq!(algorithm, "HighwayHash256S"),
+            other => panic!("expected KnownAnswerMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bitrot_self_test_passes() {
+        bitrot_self_test()
+            .await
+            .expect("the pinned digests and roundtrip checks must all pass on this platform");
+    }
+
     #[tokio::test]
     async fn vectored_test_writers_cover_fallback_flush_and_shutdown_paths() {
         let mut counting = VectoredCountingWriter::default();
@@ -883,7 +1468,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x80;
         let err = bitrot_verify(
-            Cursor::new(corrupt),
+            std::io::Cursor::new(corrupt),
             super::bitrot_shard_file_size(data.len(), shard_size, algo.clone()),
             data.len(),
             algo,
@@ -976,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn bitrot_reader_rejects_output_buffers_larger_than_shard_size() {
-        let mut reader = BitrotReader::new(Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
+        let mut reader = BitrotReader::new(std::io::Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
         let mut out = [0u8; 5];
         let err = reader
             .read(&mut out)
@@ -1101,7 +1686,7 @@ mod tests {
             (HashAlgorithm::HighwayHash256, true),
         ] {
             let label = format!("{algo:?}");
-            let writer = Cursor::new(Vec::<u8>::new());
+            let writer = std::io::Cursor::new(Vec::<u8>::new());
             let mut w = BitrotWriter::new(writer, shard_size, algo.clone());
             w.write(&[7u8; 16]).await.unwrap();
             let written = w.into_inner().into_inner();
@@ -1186,7 +1771,7 @@ mod tests {
     }
 
     async fn encode_one_block(payload: &[u8], shard_size: usize, algo: HashAlgorithm) -> Vec<u8> {
-        let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo);
+        let mut w = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo);
         w.write(payload).await.unwrap();
         w.into_inner().into_inner()
     }
@@ -1294,7 +1879,7 @@ mod tests {
         for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::HighwayHash256SLegacy] {
             for &size in &[1usize, 16, 17, 32, 40, 48] {
                 let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
-                let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+                let mut w = BitrotWriter::new(std::io::Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
                 for chunk in payload.chunks(shard_size) {
                     w.write(chunk).await.unwrap();
                 }
@@ -1368,14 +1953,14 @@ mod tests {
             w.write(&data).await.expect("write shard");
 
             let mut via_read = vec![0u8; SHARD];
-            let n1 = BitrotReader::new(Cursor::new(encoded.clone()), SHARD, algo.clone(), false)
+            let n1 = BitrotReader::new(std::io::Cursor::new(encoded.clone()), SHARD, algo.clone(), false)
                 .read(&mut via_read)
                 .await
                 .expect("read");
 
             // A buffer with only capacity — no initialized bytes at all.
             let mut via_append: Vec<u8> = Vec::with_capacity(SHARD);
-            let n2 = BitrotReader::new(Cursor::new(encoded), SHARD, algo.clone(), false)
+            let n2 = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo.clone(), false)
                 .read_appending(&mut via_append, SHARD)
                 .await
                 .expect("read_appending");
@@ -1400,7 +1985,7 @@ mod tests {
             encoded.truncate(encoded.len() - 1);
 
             let mut out: Vec<u8> = Vec::with_capacity(SHARD);
-            let err = BitrotReader::new(Cursor::new(encoded), SHARD, algo.clone(), false)
+            let err = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo.clone(), false)
                 .read_appending(&mut out, SHARD)
                 .await
                 .expect_err("a truncated shard must not succeed");
@@ -1426,12 +2011,76 @@ mod tests {
         encoded[last] ^= 0xff;
 
         let mut out: Vec<u8> = Vec::with_capacity(SHARD);
-        let err = BitrotReader::new(Cursor::new(encoded), SHARD, algo, false)
+        let err = BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo, false)
             .read_appending(&mut out, SHARD)
             .await
             .expect_err("a corrupt shard must not verify");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(out.is_empty(), "corrupt bytes must never reach the caller's buffer");
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_verifies_data_split_across_hash_boundaries() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data: Vec<u8> = (0..SHARD).map(|index| (index % 251) as u8).collect();
+        let mut encoded = Vec::new();
+        BitrotWriter::new(&mut encoded, SHARD, algo.clone())
+            .write(&data)
+            .await
+            .expect("write shard");
+
+        let mut output = Vec::with_capacity(SHARD);
+        BitrotReader::new(FragmentedSource::new(encoded, &[3, 11, 19, 37, 128]), SHARD, algo, false)
+            .read_appending(&mut output, SHARD)
+            .await
+            .expect("fragmented shard must verify");
+
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_never_appends_a_corrupt_shard() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let mut encoded = Vec::new();
+        BitrotWriter::new(&mut encoded, SHARD, algo.clone())
+            .write(&vec![9u8; SHARD])
+            .await
+            .expect("write shard");
+        let last = encoded.len() - 1;
+        encoded[last] ^= 0xff;
+
+        let mut output = Vec::with_capacity(SHARD);
+        let err = BitrotReader::new(FragmentedSource::new(encoded, &[7, 17, 31]), SHARD, algo, false)
+            .read_appending(&mut output, SHARD)
+            .await
+            .expect_err("corrupt fragmented shard must fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_does_not_hash_when_verification_is_skipped() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let mut encoded = Vec::new();
+        BitrotWriter::new(&mut encoded, SHARD, algo.clone())
+            .write(&vec![9u8; SHARD])
+            .await
+            .expect("write shard");
+        encoded[0] ^= 0xff;
+
+        let mut output = Vec::with_capacity(SHARD);
+        let mut reader = BitrotReader::new(FragmentedSource::new(encoded, &[7, 17, 31]), SHARD, algo, true);
+        reader
+            .read_appending(&mut output, SHARD)
+            .await
+            .expect("skipped verification must accept fragmented shard bytes");
+
+        assert_eq!(reader.last_verify_duration(), Duration::ZERO);
+        assert_eq!(output, vec![9u8; SHARD]);
     }
 
     #[tokio::test]
@@ -1474,7 +2123,7 @@ mod tests {
             "Cursor<Bytes> must be able to hand out a block, otherwise the fast path is dead code"
         );
         assert_eq!(mem.position(), 8, "taking a block must advance like a read of the same length");
-        let mut streamed = Cursor::new(encoded.clone());
+        let mut streamed = std::io::Cursor::new(encoded.clone());
         assert!(
             ShardSource::try_take_block(&mut streamed, 8).is_none(),
             "a non-Bytes source must stay on the streaming path"
@@ -1485,13 +2134,24 @@ mod tests {
 
         // Equivalence: same bytes out of both paths.
         let mut via_mem: Vec<u8> = Vec::with_capacity(SHARD);
-        BitrotReader::new(Cursor::new(Bytes::from(encoded.clone())), SHARD, algo.clone(), false)
+        let mut memory_reader = BitrotReader::new(Cursor::new(Bytes::from(encoded.clone())), SHARD, algo.clone(), false);
+        memory_reader
             .read_appending(&mut via_mem, SHARD)
             .await
             .expect("in-memory read");
+        assert_eq!(
+            memory_reader.chunks.capacity(),
+            0,
+            "the synchronous fast path must not allocate chunk storage"
+        );
+        assert_eq!(
+            memory_reader.buf.capacity(),
+            0,
+            "the synchronous fast path must not allocate scratch storage"
+        );
 
         let mut via_stream: Vec<u8> = Vec::with_capacity(SHARD);
-        BitrotReader::new(Cursor::new(encoded), SHARD, algo, false)
+        BitrotReader::new(std::io::Cursor::new(encoded), SHARD, algo, false)
             .read_appending(&mut via_stream, SHARD)
             .await
             .expect("streaming read");
@@ -1524,5 +2184,153 @@ mod tests {
             .expect_err("a corrupt shard must not verify on the fast path either");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(out.is_empty(), "corrupt bytes must never reach the caller's buffer");
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_reuses_initialized_scratch() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![7u8; SHARD];
+        let encoded = encode_one_block(&data, SHARD, algo.clone()).await;
+        let source = ScratchReuseSource {
+            block: Some(Bytes::copy_from_slice(&encoded)),
+            saw_reused_scratch: false,
+        };
+        let mut reader = BitrotReader::new(source, SHARD, algo, false);
+        reader.buf = vec![0xa5; encoded.len()];
+        let mut output = Vec::new();
+
+        reader
+            .read_appending(&mut output, SHARD)
+            .await
+            .expect("streaming fallback should verify");
+
+        assert!(reader.inner.saw_reused_scratch, "capability probing must not clear reusable scratch");
+        assert_eq!(output, data);
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_bounds_production_sized_one_byte_fragments() {
+        const SHARD: usize = 1024 * 1024 / 4;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data: Vec<u8> = (0..SHARD).map(|index| (index % 251) as u8).collect();
+        let encoded = encode_one_block(&data, SHARD, algo.clone()).await;
+        let encoded_len = encoded.len();
+        let mut reader = BitrotReader::new(GeneratedChunkSource::new(encoded, 1), SHARD, algo, false);
+        let mut output = Vec::with_capacity(SHARD);
+
+        reader
+            .read_appending(&mut output, SHARD)
+            .await
+            .expect("one-byte fragments should verify with bounded retained state");
+
+        assert_eq!(output, data);
+        assert_eq!(reader.chunks.len(), MAX_RETAINED_CHUNKS_PER_BLOCK);
+        assert!(reader.chunks.capacity() <= MAX_RETAINED_CHUNKS_PER_BLOCK);
+        assert_eq!(reader.buf.len(), encoded_len - MAX_RETAINED_CHUNKS_PER_BLOCK);
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_keeps_sixty_four_frames_zero_copy_and_respects_poll_budget() {
+        const SHARD: usize = 1024 * 1024;
+        const FRAME: usize = 16 * 1024;
+        let algo = HashAlgorithm::HighwayHash256S;
+
+        let small_data = vec![3u8; 4096];
+        let small_encoded = encode_one_block(&small_data, 4096, algo.clone()).await;
+        let mut exact_reader =
+            BitrotReader::new(FragmentedSource::new(small_encoded.clone(), &[1; 63]), 4096, algo.clone(), false);
+        let mut exact_output = Vec::new();
+        exact_reader
+            .read_appending(&mut exact_output, 4096)
+            .await
+            .expect("exactly sixty-four frames should verify");
+        assert_eq!(exact_output, small_data);
+        assert_eq!(exact_reader.chunks.len(), MAX_RETAINED_CHUNKS_PER_BLOCK);
+        assert!(exact_reader.buf.is_empty(), "the threshold itself must remain zero-copy");
+
+        let mut yielded_reader = BitrotReader::new(FragmentedSource::new(small_encoded, &[1; 65]), 4096, algo.clone(), false);
+        let mut yielded_output = Vec::new();
+        let mut yielded_read = Box::pin(yielded_reader.read_appending(&mut yielded_output, 4096));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(yielded_read.as_mut(), &mut cx).is_pending());
+        assert!(matches!(std::future::Future::poll(yielded_read.as_mut(), &mut cx), Poll::Ready(Ok(4096))));
+        drop(yielded_read);
+        assert_eq!(yielded_output, small_data);
+
+        let data = vec![7u8; SHARD];
+        let encoded = encode_one_block(&data, SHARD, algo.clone()).await;
+        let mut reader = BitrotReader::new(FragmentedSource::new(encoded, &[FRAME; 64]), SHARD, algo, false);
+        let mut output = Vec::with_capacity(SHARD);
+        let mut read = Box::pin(reader.read_appending(&mut output, SHARD));
+        assert!(
+            matches!(std::future::Future::poll(read.as_mut(), &mut cx), Poll::Ready(Ok(SHARD))),
+            "sixty-five normal HTTP frames should complete without a cooperative yield"
+        );
+        drop(read);
+
+        assert_eq!(output, data);
+        assert_eq!(reader.chunks.len(), MAX_RETAINED_CHUNKS_PER_BLOCK);
+        assert_eq!(reader.buf.len(), HashAlgorithm::HighwayHash256S.size());
+    }
+
+    #[tokio::test]
+    async fn chunked_tail_failures_preserve_errors_and_output() {
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let data = vec![7u8; SHARD];
+        let encoded = encode_one_block(&data, SHARD, algo.clone()).await;
+        let sentinel = vec![1u8, 2, 3];
+
+        let mut short_output = sentinel.clone();
+        let short_err = BitrotReader::new(GeneratedChunkSource::new(encoded[..100].to_vec(), 1), SHARD, algo.clone(), false)
+            .read_appending(&mut short_output, SHARD)
+            .await
+            .expect_err("EOF after the retention threshold must stay a short read");
+        assert_eq!(short_err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(short_output, sentinel);
+
+        let mut corrupt = encoded.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        let mut corrupt_output = sentinel.clone();
+        let corrupt_err = BitrotReader::new(GeneratedChunkSource::new(corrupt, 1), SHARD, algo.clone(), false)
+            .read_appending(&mut corrupt_output, SHARD)
+            .await
+            .expect_err("corrupt coalesced tail must fail verification");
+        assert_eq!(corrupt_err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(corrupt_output, sentinel);
+
+        let mut failed_output = sentinel.clone();
+        let body_err = BitrotReader::new(GeneratedChunkSource::failing(encoded, 1, 65), SHARD, algo, false)
+            .read_appending(&mut failed_output, SHARD)
+            .await
+            .expect_err("a terminal body error must not become EOF");
+        let source = body_err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<rustfs_rio::InternodeHttpError>())
+            .expect("body error should retain internode classification");
+        assert_eq!(source.kind(), rustfs_rio::InternodeHttpErrorKind::BodyStreamAborted);
+        assert_eq!(failed_output, sentinel);
+    }
+
+    #[tokio::test]
+    async fn chunked_handoff_rejects_invalid_source_contracts() {
+        const SHARD: usize = 64;
+        for mode in [
+            InvalidChunkMode::Empty,
+            InvalidChunkMode::Oversized,
+            InvalidChunkMode::UnsupportedAfterChunk,
+        ] {
+            let source = InvalidChunkSource { mode };
+            let mut output = vec![9u8];
+            let err = BitrotReader::new(source, SHARD, HashAlgorithm::HighwayHash256S, false)
+                .read_appending(&mut output, SHARD)
+                .await
+                .expect_err("invalid chunk contracts must fail closed");
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(output, vec![9u8]);
+        }
     }
 }

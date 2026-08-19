@@ -214,6 +214,21 @@ fn pool_write_quorum(participant_count: usize) -> usize {
     (participant_count / 2) + 1
 }
 
+/// Error for a peer that reported `success = false` without an error payload.
+///
+/// The message must stay identical across the peers of one operation: `reduce_errs`
+/// buckets `Error::Io` by kind plus rendered message, so any per-peer detail (address,
+/// timing) would split one shared failure into single-count buckets and downgrade a real
+/// dominant error into `ErasureWriteQuorum`.
+///
+/// `peer_rest_client` carries the same helper over `StorageError` for the same response shape.
+fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
+    match bucket {
+        Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
+        None => Error::other(format!("{op}: peer returned failure without error details")),
+    }
+}
+
 fn reduce_pool_write_quorum_errs(per_pool_errs: &[Option<Error>]) -> Option<Error> {
     if per_pool_errs.is_empty() {
         return Some(Error::ErasureWriteQuorum);
@@ -854,7 +869,6 @@ impl PeerS3Client for LocalPeerS3Client {
 
 #[derive(Debug)]
 pub struct RemotePeerS3Client {
-    pub node: Option<Node>,
     pub pools: Option<Vec<usize>>,
     addr: String,
     /// Health tracker for connection monitoring
@@ -886,7 +900,6 @@ impl RemotePeerS3Client {
     pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
         let addr = node.as_ref().map(|v| v.url.to_string()).unwrap_or_default();
         let client = Self {
-            node,
             pools,
             addr,
             health: Arc::new(DiskHealthTracker::new()),
@@ -903,10 +916,6 @@ impl RemotePeerS3Client {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
-    }
-
-    pub fn get_addr(&self) -> String {
-        self.addr.clone()
     }
 
     /// Start health monitoring for the remote peer
@@ -1084,7 +1093,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("heal_bucket", Some(bucket)))
                     };
                 }
 
@@ -1111,7 +1120,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("list_bucket", None))
                     };
                 }
                 let bucket_infos = response
@@ -1142,9 +1151,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(format!(
-                            "make_bucket({bucket}): peer returned failure without error details"
-                        )))
+                        Err(peer_failure_without_details("make_bucket", Some(bucket)))
                     };
                 }
 
@@ -1168,7 +1175,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("get_bucket_info", Some(bucket)))
                     };
                 }
                 let bucket_info = serde_json::from_str::<BucketInfo>(&response.bucket_info)?;
@@ -1196,7 +1203,7 @@ impl PeerS3Client for RemotePeerS3Client {
                     return if let Some(err) = response.error {
                         Err(err.into())
                     } else {
-                        Err(Error::other(""))
+                        Err(peer_failure_without_details("delete_bucket", Some(bucket)))
                     };
                 }
 
@@ -1208,6 +1215,10 @@ impl PeerS3Client for RemotePeerS3Client {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "local bucket-heal path reached only by this file's tests (backlog#1823)"
+)]
 pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
     let disks = clone_drives().await;
     heal_bucket_local_on_disks(bucket, opts, disks).await
@@ -1404,6 +1415,10 @@ pub(crate) async fn heal_bucket_local_on_disks(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "reached only through heal_bucket_local, which only tests call (backlog#1823)"
+)]
 async fn clone_drives() -> Vec<Option<DiskStore>> {
     runtime_sources::local_disk_entries().await
 }
@@ -1585,15 +1600,7 @@ mod tests {
     }
 
     fn test_remote_peer(addr: &str) -> RemotePeerS3Client {
-        let node = Node {
-            url: url::Url::parse(addr).expect("test peer URL should parse"),
-            pools: vec![0],
-            is_local: false,
-            grid_host: addr.to_string(),
-        };
-
         RemotePeerS3Client {
-            node: Some(node),
             pools: Some(vec![0]),
             addr: addr.to_string(),
             health: Arc::new(DiskHealthTracker::new()),
@@ -2319,5 +2326,38 @@ mod tests {
             .map(|call_count| call_count.load(Ordering::SeqCst))
             .collect::<Vec<_>>();
         assert_eq!(calls, vec![1, 1, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn peer_failure_without_details_names_operation_and_bucket() {
+        for op in ["heal_bucket", "make_bucket", "get_bucket_info", "delete_bucket"] {
+            let message = peer_failure_without_details(op, Some("ops-bucket")).to_string();
+            assert!(message.contains(op), "{op} message must name the operation: {message}");
+            assert!(message.contains("ops-bucket"), "{op} message must name the bucket: {message}");
+        }
+
+        let message = peer_failure_without_details("list_bucket", None).to_string();
+        assert!(message.contains("list_bucket"), "cluster-wide message must name the operation");
+        assert!(!message.trim().is_empty());
+    }
+
+    #[test]
+    fn peer_failure_without_details_keeps_one_reduce_errs_bucket_per_operation() {
+        // reduce_errs groups Io errors by kind plus rendered message: peers failing the
+        // same operation on the same bucket must still reach quorum as one dominant error.
+        let per_pool_errs = vec![
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+            Some(peer_failure_without_details("delete_bucket", Some("shared"))),
+        ];
+        assert_eq!(
+            reduce_pool_write_quorum_errs(&per_pool_errs),
+            Some(peer_failure_without_details("delete_bucket", Some("shared")))
+        );
+
+        assert_ne!(
+            peer_failure_without_details("delete_bucket", Some("shared")),
+            peer_failure_without_details("get_bucket_info", Some("shared"))
+        );
     }
 }

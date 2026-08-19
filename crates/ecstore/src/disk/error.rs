@@ -113,6 +113,9 @@ pub enum DiskError {
     #[error("bit-rot hash algorithm is invalid")]
     BitrotHashAlgoInvalid,
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("Rename across devices not allowed, please fix your backend configuration")]
     CrossDeviceLink,
 
@@ -143,6 +146,9 @@ pub enum DiskError {
     #[error("io error {0}")]
     Io(#[source] io::Error),
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("source stalled")]
     SourceStalled,
 
@@ -331,7 +337,14 @@ impl From<std::io::Error> for DiskError {
         }
         match e.downcast::<DiskError>() {
             Ok(disk_error) => disk_error,
-            Err(io_error) => DiskError::Io(io_error),
+            // Mirror `From<io::Error> for StorageError`: a StorageError boxed
+            // through `From<StorageError> for io::Error` must recover its typed
+            // classification instead of degrading to `DiskError::Io`, which
+            // quorum aggregation (`reduce_errs`) would count as a distinct error.
+            Err(io_error) => match io_error.downcast::<crate::error::StorageError>() {
+                Ok(storage_error) => storage_error.into(),
+                Err(io_error) => DiskError::Io(io_error),
+            },
         }
     }
 }
@@ -635,19 +648,6 @@ impl Hash for DiskError {
 // is currently commented out to avoid complexity. These can be re-enabled
 // when needed for specific disk quorum checking and error aggregation logic.
 
-/// Bitrot errors
-#[derive(Debug, thiserror::Error)]
-pub enum BitrotErrorType {
-    #[error("bitrot checksum verification failed")]
-    BitrotChecksumMismatch { expected: String, got: String },
-}
-
-impl From<BitrotErrorType> for DiskError {
-    fn from(e: BitrotErrorType) -> Self {
-        DiskError::other(e)
-    }
-}
-
 /// Context wrapper for file access errors
 #[derive(Debug, thiserror::Error)]
 pub struct FileAccessDeniedWithContext {
@@ -863,19 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bitrot_error_type() {
-        let bitrot_error = BitrotErrorType::BitrotChecksumMismatch {
-            expected: "abc123".to_string(),
-            got: "def456".to_string(),
-        };
-
-        assert!(bitrot_error.to_string().contains("bitrot checksum verification failed"));
-
-        let disk_error: DiskError = bitrot_error.into();
-        assert!(matches!(disk_error, DiskError::Io(_)));
-    }
-
-    #[test]
     fn test_file_access_denied_with_context() {
         let path = PathBuf::from("/test/path");
         let io_error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
@@ -951,6 +938,27 @@ mod tests {
         // Convert io::Error back to DiskError
         let recovered_disk_error: DiskError = io_with_disk_error.into();
         assert_eq!(original_disk_error, recovered_disk_error);
+    }
+
+    #[test]
+    fn test_io_error_with_storage_error_inside() {
+        use crate::error::StorageError;
+
+        // An io::Error boxing a disk-representable StorageError (as produced by
+        // `From<StorageError> for io::Error`) must recover the typed DiskError
+        // variant instead of degrading to an opaque DiskError::Io.
+        let io_with_storage_error: std::io::Error = StorageError::FaultyRemoteDisk.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FaultyRemoteDisk);
+
+        let io_with_storage_error: std::io::Error = StorageError::FileAccessDenied.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FileAccessDenied);
+
+        // A StorageError with no DiskError analog stays an opaque Io error.
+        let io_with_bucket_error: std::io::Error = StorageError::BucketNotFound("bucket".to_string()).into();
+        let recovered: DiskError = io_with_bucket_error.into();
+        assert!(matches!(recovered, DiskError::Io(_)));
     }
 
     #[test]

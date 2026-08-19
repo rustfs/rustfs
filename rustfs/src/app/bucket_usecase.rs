@@ -74,7 +74,7 @@ use crate::app::runtime_sources::{
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
-use crate::server::RemoteAddr;
+use crate::shared_types::RemoteAddr;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
@@ -738,6 +738,22 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConf
         Err(StorageError::ConfigNotFound) => {}
         Err(err) => return Err(ApiError::from(err).into()),
     }
+    // AWS S3 and MinIO both refuse to suspend versioning while a replication
+    // configuration exists: suspension would start minting null versions that
+    // the replication engine (versioned by contract) can never converge.
+    if config.suspended() {
+        match metadata_sys::get_replication_config(bucket).await {
+            Ok(_) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidBucketState,
+                    "A replication configuration is present on this bucket, bucket wide versioning cannot be suspended."
+                        .to_string(),
+                ));
+            }
+            Err(StorageError::ConfigNotFound) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
+    }
 
     Ok(())
 }
@@ -1140,6 +1156,19 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
         rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
+}
+
+/// Status-independent presence of the expiry subset that site replication
+/// propagates (`replicateILMExpiry`): expiration / noncurrent-version
+/// expiration only. Distinct from [`lifecycle_has_expiry_rules`], which
+/// filters on ENABLED for scanner scheduling — editing a Disabled expiry rule
+/// must still advance the replication axis. Del-marker expiration and
+/// abort-multipart are site-local and never travel.
+fn lifecycle_rules_have_expiry(config: &BucketLifecycleConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some())
 }
 
 fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
@@ -2170,7 +2199,24 @@ impl DefaultBucketUsecase {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
-        input_cfg.expiry_updated_at = Some(Timestamp::from(time::OffsetDateTime::now_utc()));
+        // Stamp the expiry axis only when the expiry subset can have changed
+        // (MinIO: HasExpiry() || expiryRuleRemoved). Site-replication peers
+        // judge lc-config staleness on this axis; a transition-only edit that
+        // advanced it would let this site's stale expiry subset shadow — and
+        // roll back — a newer peer expiry edit fleet-wide.
+        let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((previous, _)) => {
+                if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
+                    Some(Timestamp::from(time::OffsetDateTime::now_utc()))
+                } else {
+                    previous.expiry_updated_at
+                }
+            }
+            // No previous config (or unreadable): stamping is the
+            // conservative pre-existing behavior.
+            Err(_) => lifecycle_rules_have_expiry(&input_cfg).then(|| Timestamp::from(time::OffsetDateTime::now_utc())),
+        };
+        input_cfg.expiry_updated_at = previous_expiry_updated_at;
         let data = serialize_config(&input_cfg)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_LIFECYCLE_CONFIG, data, expected_incarnation_id)
             .await
@@ -2181,7 +2227,14 @@ impl DefaultBucketUsecase {
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
             Some(serialize_config(&input_cfg).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
-        item.expiry_updated_at = item.updated_at;
+        // The item travels with the expiry axis, not the wall clock: a site
+        // whose expiry knowledge is old (or absent — UNIX_EPOCH) must not
+        // out-rank newer peer expiry state at the receivers.
+        item.expiry_updated_at = input_cfg
+            .expiry_updated_at
+            .clone()
+            .map(time::OffsetDateTime::from)
+            .or(Some(time::OffsetDateTime::UNIX_EPOCH));
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
         }

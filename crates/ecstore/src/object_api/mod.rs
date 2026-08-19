@@ -13,7 +13,6 @@
 // limitations under the License.
 
 // #730: object API readers keep staged compatibility paths during facade migration.
-#![allow(dead_code)]
 
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::replication::{
@@ -23,7 +22,7 @@ use crate::bucket::replication::{
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
-use crate::io_support::rio::{HashReader, LimitReader};
+use crate::io_support::rio::{HardLimitReader, HashReader};
 use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
     range::HTTPRangeSpec,

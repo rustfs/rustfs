@@ -48,6 +48,23 @@ impl RestoreCleanupIdentity {
     }
 }
 
+fn ensure_restore_metadata_lock_held(bucket: &str, object: &str, opts: &ObjectOptions, mode: &'static str) -> Result<()> {
+    if opts
+        .namespace_lock_fence
+        .as_ref()
+        .is_some_and(NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
 impl SetDisks {
     pub(super) async fn finalize_restore_metadata(
         &self,
@@ -75,17 +92,20 @@ impl SetDisks {
             version_id,
             versioned: opts.versioned,
             version_suspended: opts.version_suspended,
+            include_part_checksums: true,
             ..Default::default()
         };
         let (mut fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
-            .await?;
+            .await?
+            .into_owned();
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(&fi.metadata, expected_operation_id)?;
         }
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Err(Error::other("restored object changed before restore metadata finalization"));
         }
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_finalize_metadata")?;
         let restore_expiry =
             lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
         fi.metadata.insert(
@@ -101,7 +121,7 @@ impl SetDisks {
             bucket,
             object,
             fi.clone(),
-            disks.as_slice(),
+            &disks,
             &UpdateMetadataOpts {
                 replace_user_metadata: true,
                 ..Default::default()
@@ -141,11 +161,13 @@ impl SetDisks {
             version_id,
             versioned: opts.versioned,
             version_suspended: opts.version_suspended,
+            include_part_checksums: true,
             ..Default::default()
         };
         let (mut fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
-            .await?;
+            .await?
+            .into_owned();
         if let Some(expected_operation_id) = expected_operation_id {
             match restore_operation_id_from_metadata(&fi.metadata)? {
                 Some(actual_operation_id) if actual_operation_id == expected_operation_id => {}
@@ -155,6 +177,7 @@ impl SetDisks {
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Ok(());
         }
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_cleanup_metadata")?;
         fi.metadata.remove(X_AMZ_RESTORE.as_str());
         fi.metadata.remove(AMZ_RESTORE_EXPIRY_DAYS);
         fi.metadata.remove(AMZ_RESTORE_REQUEST_DATE);
@@ -170,7 +193,7 @@ impl SetDisks {
             bucket,
             object,
             fi,
-            disks.as_slice(),
+            &disks,
             &UpdateMetadataOpts {
                 replace_user_metadata: true,
                 ..Default::default()

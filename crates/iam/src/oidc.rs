@@ -25,7 +25,7 @@ use openidconnect::{
     JsonWebKeySetUrl, LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl,
     ProviderMetadataWithLogout, RedirectUrl, RequestTokenError, Scope,
 };
-use reqwest::Client;
+use reqwest::{Certificate, Client};
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_OIDC_RESPONSE_SIZE};
@@ -38,7 +38,6 @@ use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
@@ -258,6 +257,7 @@ fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) 
         }
         OidcHttpError::Reqwest(_) => ("request", String::new()),
         OidcHttpError::Http(_) => ("http_build", String::new()),
+        OidcHttpError::ExtraRootCa(_) => ("extra_root_ca", String::new()),
         OidcHttpError::ForbiddenOutbound(_) => ("forbidden_outbound", String::new()),
         OidcHttpError::ResponseTooLarge(limit) => ("response_too_large", limit.to_string()),
     }
@@ -270,6 +270,7 @@ fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) 
 pub enum OidcHttpError {
     Reqwest(reqwest::Error),
     Http(http::Error),
+    ExtraRootCa(String),
     /// The outbound destination was rejected by the shared egress policy before any
     /// connection was attempted (invalid URL, loopback/link-local/metadata/private IP,
     /// or a malformed allow-origins configuration).
@@ -284,6 +285,7 @@ impl std::fmt::Display for OidcHttpError {
         match self {
             Self::Reqwest(e) => write!(f, "{e}"),
             Self::Http(e) => write!(f, "{e}"),
+            Self::ExtraRootCa(reason) => write!(f, "failed to load OIDC extra root CA bundle: {reason}"),
             Self::ForbiddenOutbound(reason) => write!(f, "outbound request rejected: {reason}"),
             Self::ResponseTooLarge(limit) => write!(f, "oidc response body exceeds {limit} bytes"),
         }
@@ -295,9 +297,46 @@ impl std::error::Error for OidcHttpError {
         match self {
             Self::Reqwest(e) => Some(e),
             Self::Http(e) => Some(e),
-            Self::ForbiddenOutbound(_) | Self::ResponseTooLarge(_) => None,
+            Self::ExtraRootCa(_) | Self::ForbiddenOutbound(_) | Self::ResponseTooLarge(_) => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OidcExtraRootCaMaterial {
+    pub generation: u64,
+    pub root_ca_pem: Option<Vec<u8>>,
+}
+
+type OidcExtraRootCaFuture = Pin<Box<dyn Future<Output = Result<OidcExtraRootCaMaterial, String>> + Send>>;
+type OidcExtraRootCaLoader = dyn Fn() -> OidcExtraRootCaFuture + Send + Sync;
+
+#[derive(Clone)]
+pub struct OidcExtraRootCaProvider {
+    loader: Arc<OidcExtraRootCaLoader>,
+}
+
+impl OidcExtraRootCaProvider {
+    pub fn new<F, Fut>(loader: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<OidcExtraRootCaMaterial, String>> + Send + 'static,
+    {
+        Self {
+            loader: Arc::new(move || Box::pin(loader())),
+        }
+    }
+
+    async fn load(&self) -> Result<OidcExtraRootCaMaterial, String> {
+        (self.loader)().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct CachedOidcExtraRootCerts {
+    generation: u64,
+    initialized: bool,
+    certs: Vec<Certificate>,
 }
 
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
@@ -311,8 +350,24 @@ pub(crate) struct ReqwestHttpClient {
     /// `None` in production: the process-cached outbound policy from the environment is used.
     /// `Some(..)` only in tests, to explicitly allow a loopback mock endpoint.
     policy_override: Option<OutboundPolicy>,
+    extra_root_certs: Arc<RwLock<CachedOidcExtraRootCerts>>,
+    extra_root_ca_provider: Option<OidcExtraRootCaProvider>,
     #[cfg(test)]
     dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
+}
+
+fn parse_oidc_extra_root_certs(source: &str, pem: &[u8]) -> Result<Vec<Certificate>, String> {
+    if pem.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(Vec::new());
+    }
+    Certificate::from_pem_bundle(pem).map_err(|err| format!("failed to parse OIDC extra root CA bundle from {source}: {err}"))
+}
+
+fn oidc_extra_root_certs(root_ca_pem: Option<&[u8]>) -> Result<Vec<Certificate>, String> {
+    match root_ca_pem {
+        Some(pem) => parse_oidc_extra_root_certs("RustFS outbound TLS material", pem),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Build a reqwest client pinned to the shared outbound egress policy for a single request.
@@ -326,6 +381,7 @@ pub(crate) struct ReqwestHttpClient {
 fn build_oidc_http_client(
     uri: &str,
     policy_override: Option<&OutboundPolicy>,
+    extra_root_certs: &[Certificate],
     #[cfg(test)] dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
 ) -> Result<(Client, Url), OidcHttpError> {
     let url = Url::parse(uri).map_err(|_| OidcHttpError::ForbiddenOutbound("invalid outbound OIDC URL".to_string()))?;
@@ -355,6 +411,9 @@ fn build_oidc_http_client(
         .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
     if bypass_proxy {
         builder = builder.no_proxy();
+    }
+    if !extra_root_certs.is_empty() {
+        builder = builder.tls_certs_merge(extra_root_certs.iter().cloned());
     }
     builder.build().map(|client| (client, url)).map_err(OidcHttpError::Reqwest)
 }
@@ -410,11 +469,63 @@ fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
 
 impl ReqwestHttpClient {
     fn new() -> Result<Self, String> {
+        Self::new_with_extra_root_certs(Vec::new())
+    }
+
+    fn extra_root_cert_cache(certs: Vec<Certificate>) -> Arc<RwLock<CachedOidcExtraRootCerts>> {
+        Arc::new(RwLock::new(CachedOidcExtraRootCerts {
+            generation: 0,
+            initialized: true,
+            certs,
+        }))
+    }
+
+    fn new_with_extra_root_certs(extra_root_certs: Vec<Certificate>) -> Result<Self, String> {
         Ok(Self {
             policy_override: None,
+            extra_root_certs: Self::extra_root_cert_cache(extra_root_certs),
+            extra_root_ca_provider: None,
             #[cfg(test)]
             dns_resolver_override: None,
         })
+    }
+
+    fn new_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<Self, String> {
+        Ok(Self {
+            policy_override: None,
+            extra_root_certs: Arc::new(RwLock::new(CachedOidcExtraRootCerts::default())),
+            extra_root_ca_provider: Some(extra_root_ca_provider),
+            #[cfg(test)]
+            dns_resolver_override: None,
+        })
+    }
+
+    async fn current_extra_root_certs(&self) -> Result<Vec<Certificate>, OidcHttpError> {
+        let Some(provider) = self.extra_root_ca_provider.as_ref() else {
+            return self
+                .extra_root_certs
+                .read()
+                .map(|cache| cache.certs.clone())
+                .map_err(|e| OidcHttpError::ExtraRootCa(format!("extra root certificate cache lock poisoned: {e}")));
+        };
+
+        let material = provider.load().await.map_err(OidcHttpError::ExtraRootCa)?;
+        if let Ok(cache) = self.extra_root_certs.read()
+            && cache.initialized
+            && cache.generation == material.generation
+        {
+            return Ok(cache.certs.clone());
+        }
+
+        let certs = oidc_extra_root_certs(material.root_ca_pem.as_deref()).map_err(OidcHttpError::ExtraRootCa)?;
+        let mut cache = self
+            .extra_root_certs
+            .write()
+            .map_err(|e| OidcHttpError::ExtraRootCa(format!("extra root certificate cache lock poisoned: {e}")))?;
+        cache.generation = material.generation;
+        cache.initialized = true;
+        cache.certs = certs.clone();
+        Ok(certs)
     }
 
     /// Test-only constructor that pins outbound requests to an explicit policy, so a
@@ -423,6 +534,28 @@ impl ReqwestHttpClient {
     fn with_policy(policy: OutboundPolicy) -> Self {
         Self {
             policy_override: Some(policy),
+            extra_root_certs: Self::extra_root_cert_cache(Vec::new()),
+            extra_root_ca_provider: None,
+            dns_resolver_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_policy_and_extra_root_certs(policy: OutboundPolicy, extra_root_certs: Vec<Certificate>) -> Self {
+        Self {
+            policy_override: Some(policy),
+            extra_root_certs: Self::extra_root_cert_cache(extra_root_certs),
+            extra_root_ca_provider: None,
+            dns_resolver_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_policy_and_extra_root_ca_provider(policy: OutboundPolicy, extra_root_ca_provider: OidcExtraRootCaProvider) -> Self {
+        Self {
+            policy_override: Some(policy),
+            extra_root_certs: Arc::new(RwLock::new(CachedOidcExtraRootCerts::default())),
+            extra_root_ca_provider: Some(extra_root_ca_provider),
             dns_resolver_override: None,
         }
     }
@@ -431,6 +564,8 @@ impl ReqwestHttpClient {
     fn with_policy_and_dns_resolver(policy: OutboundPolicy, resolver: Arc<dyn reqwest::dns::Resolve>) -> Self {
         Self {
             policy_override: Some(policy),
+            extra_root_certs: Self::extra_root_cert_cache(Vec::new()),
+            extra_root_ca_provider: None,
             dns_resolver_override: Some(resolver),
         }
     }
@@ -461,9 +596,11 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 );
             }
 
+            let extra_root_certs = self.current_extra_root_certs().await?;
             let (client, url) = build_oidc_http_client(
                 &uri,
                 self.policy_override.as_ref(),
+                &extra_root_certs,
                 #[cfg(test)]
                 self.dns_resolver_override.clone(),
             )?;
@@ -678,7 +815,22 @@ fn trusted_aud(other_audiences: &[String], audience: &Audience) -> bool {
 impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
-        let http_client = ReqwestHttpClient::new()?;
+        Self::new_with_extra_root_ca(None).await
+    }
+
+    /// Parse environment variables and discover providers with an additional outbound root CA bundle.
+    pub(crate) async fn new_with_extra_root_ca(root_ca_pem: Option<&[u8]>) -> Result<Self, String> {
+        let http_client = ReqwestHttpClient::new_with_extra_root_certs(oidc_extra_root_certs(root_ca_pem)?)?;
+        Self::new_with_http_client(http_client).await
+    }
+
+    pub(crate) async fn new_with_extra_root_ca_provider(extra_root_ca_provider: OidcExtraRootCaProvider) -> Result<Self, String> {
+        let http_client = ReqwestHttpClient::new_with_extra_root_ca_provider(extra_root_ca_provider)?;
+        http_client.current_extra_root_certs().await.map_err(|err| err.to_string())?;
+        Self::new_with_http_client(http_client).await
+    }
+
+    async fn new_with_http_client(http_client: ReqwestHttpClient) -> Result<Self, String> {
         let server_config = crate::server_config::current_server_config();
         let parsed_configs = load_effective_oidc_provider_configs(server_config.as_ref());
         let mut configs = HashMap::new();
@@ -1874,7 +2026,14 @@ pub fn load_effective_oidc_provider_configs(server_config: Option<&ServerConfig>
 }
 
 pub async fn validate_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-    let http_client = ReqwestHttpClient::new()?;
+    validate_oidc_provider_config_with_extra_root_ca(config, None).await
+}
+
+pub async fn validate_oidc_provider_config_with_extra_root_ca(
+    config: &OidcProviderConfig,
+    root_ca_pem: Option<&[u8]>,
+) -> Result<OidcProviderValidationResult, String> {
+    let http_client = ReqwestHttpClient::new_with_extra_root_certs(oidc_extra_root_certs(root_ca_pem)?)?;
     let state = OidcSys::discover_provider(config, &http_client).await?;
 
     Ok(OidcProviderValidationResult {
@@ -2438,6 +2597,50 @@ mod tests {
         }
     }
 
+    fn read_mock_oidc_request_path(stream: &mut impl std::io::Read) -> String {
+        let mut request_bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => request_bytes.extend_from_slice(&buffer[..n]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+                Err(_) => break,
+            }
+            if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if request_bytes.len() >= 8192 {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&request_bytes);
+        request
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn mock_oidc_response(path: &str, discovery_body: &str, expected_jwks_path: &str, jwks_body: &str) -> String {
+        let (status, body) = if path.contains("/.well-known/openid-configuration") {
+            (200, discovery_body)
+        } else if path == expected_jwks_path {
+            (200, jwks_body)
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        };
+
+        format!(
+            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            if status == 200 { "OK" } else { "Not Found" },
+            body.len()
+        )
+    }
+
     fn start_mock_oidc_discovery_server<F>(
         build_discovery_issuer: F,
         max_requests: usize,
@@ -2445,7 +2648,6 @@ mod tests {
     where
         F: Fn(&str) -> (String, String, String) + Send + 'static,
     {
-        use std::io::Read;
         use std::io::Write;
         use std::net::{Shutdown, TcpListener};
         use std::sync::mpsc;
@@ -2516,41 +2718,8 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("failed to set discovery mock read timeout");
 
-                let mut request_bytes = Vec::new();
-                let mut buffer = [0u8; 4096];
-                loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(n) => request_bytes.extend_from_slice(&buffer[..n]),
-                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                    if request_bytes.len() >= 8192 {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request_bytes);
-                let path = request.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
-
-                let (status, body) = if path.contains("/.well-known/openid-configuration") {
-                    (200, discovery_body.as_str())
-                } else if path == expected_jwks_path {
-                    (200, jwks_body)
-                } else {
-                    (404, r#"{"error":"not found"}"#)
-                };
-
-                let response = format!(
-                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    if status == 200 { "OK" } else { "Not Found" },
-                    body.len()
-                );
-
+                let path = read_mock_oidc_request_path(&mut stream);
+                let response = mock_oidc_response(&path, &discovery_body, &expected_jwks_path, jwks_body);
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
                 let _ = stream.shutdown(Shutdown::Both);
@@ -2566,6 +2735,114 @@ mod tests {
             .expect("mock OIDC discovery server should become ready");
 
         Some((base, handle))
+    }
+
+    fn start_mock_oidc_tls_discovery_server<F>(
+        build_discovery_issuer: F,
+        max_requests: usize,
+    ) -> Option<(String, String, std::thread::JoinHandle<()>)>
+    where
+        F: Fn(&str) -> (String, String, String) + Send + 'static,
+    {
+        use std::io::Write;
+        use std::net::{Shutdown, TcpListener};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const IDLE_SHUTDOWN: Duration = Duration::from_secs(1);
+        const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate OIDC TLS test certificate");
+        let cert_pem = certified.cert.pem();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                    .expect("convert OIDC TLS test private key"),
+            )
+            .expect("build OIDC TLS mock server config");
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test TLS listener should bind: {err}"),
+        };
+        let base = format!("https://{}", listener.local_addr().expect("listener local address should be available"));
+        let (discovery_issuer, discovery_jwks_uri, expected_jwks_path) = build_discovery_issuer(&base);
+        let discovery_body = serde_json::json!({
+            "issuer": discovery_issuer,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "jwks_uri": discovery_jwks_uri,
+            "response_types_supported": ["code"],
+            "response_modes_supported": ["query"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+        .to_string();
+        let jwks_body = r#"{"keys":[]}"#;
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let server_config = Arc::new(server_config);
+            listener
+                .set_nonblocking(true)
+                .expect("failed to set TLS discovery mock listener non-blocking");
+            let _ = ready_tx.send(());
+
+            let mut seen = 0usize;
+            let start = Instant::now();
+            let mut last_completed = Instant::now();
+
+            loop {
+                if seen > 0 && last_completed.elapsed() >= IDLE_SHUTDOWN {
+                    break;
+                }
+                if start.elapsed() >= ABSOLUTE_CAP {
+                    break;
+                }
+
+                let tcp_stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                tcp_stream
+                    .set_nonblocking(false)
+                    .expect("failed to set TLS discovery mock stream blocking");
+                tcp_stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("failed to set TLS discovery mock read timeout");
+
+                seen += 1;
+                let connection = match rustls::ServerConnection::new(server_config.clone()) {
+                    Ok(connection) => connection,
+                    Err(_) => break,
+                };
+                let mut stream = rustls::StreamOwned::new(connection, tcp_stream);
+                let path = read_mock_oidc_request_path(&mut stream);
+                let response = mock_oidc_response(&path, &discovery_body, &expected_jwks_path, jwks_body);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.sock.shutdown(Shutdown::Both);
+                last_completed = Instant::now();
+
+                if seen >= max_requests {
+                    break;
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("mock TLS OIDC discovery server should become ready");
+
+        Some((base, cert_pem, handle))
     }
 
     fn discovery_error_contains_all_variants(err: &str, base: &str) -> bool {
@@ -2588,6 +2865,100 @@ mod tests {
             authorization_endpoint: state.metadata.authorization_endpoint().to_string(),
             token_endpoint: state.metadata.token_endpoint().map(ToString::to_string),
         })
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_accepts_extra_root_ca_for_https_provider() {
+        let Some((base, ca_pem, handle)) = start_mock_oidc_tls_discovery_server(
+            |base| (format!("{base}/application/o/rustfs"), format!("{base}/jwks"), "/jwks".to_string()),
+            4,
+        ) else {
+            return;
+        };
+        let config_url = format!("{base}/application/o/rustfs");
+        let config = build_mocked_oidc_provider_config("default", &config_url);
+        let origin = Url::parse(&config.config_url)
+            .expect("mock config_url should parse")
+            .origin()
+            .ascii_serialization();
+        let policy = OutboundPolicy::from_allowed_origins(&origin).expect("loopback TLS origin should be allowed");
+        let extra_root_certs =
+            parse_oidc_extra_root_certs("test OIDC TLS CA", ca_pem.as_bytes()).expect("test CA bundle should parse");
+        let http_client = ReqwestHttpClient::with_policy_and_extra_root_certs(policy, extra_root_certs);
+
+        let state = OidcSys::discover_provider(&config, &http_client)
+            .await
+            .expect("OIDC discovery should trust the extra root CA");
+
+        assert_eq!(state.metadata.issuer().to_string(), format!("{base}/application/o/rustfs"));
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_refreshes_extra_root_ca_when_generation_changes() {
+        let Some((base_a, ca_pem_a, handle_a)) = start_mock_oidc_tls_discovery_server(
+            |base| (format!("{base}/application/o/rustfs-a"), format!("{base}/jwks"), "/jwks".to_string()),
+            4,
+        ) else {
+            return;
+        };
+        let Some((base_b, ca_pem_b, handle_b)) = start_mock_oidc_tls_discovery_server(
+            |base| (format!("{base}/application/o/rustfs-b"), format!("{base}/jwks"), "/jwks".to_string()),
+            4,
+        ) else {
+            assert!(handle_a.join().is_ok());
+            return;
+        };
+
+        let origin_a = Url::parse(&base_a)
+            .expect("mock base A should parse")
+            .origin()
+            .ascii_serialization();
+        let origin_b = Url::parse(&base_b)
+            .expect("mock base B should parse")
+            .origin()
+            .ascii_serialization();
+        let allowed_origins = format!("{origin_a},{origin_b}");
+        let policy = OutboundPolicy::from_allowed_origins(&allowed_origins).expect("loopback TLS origins should be allowed");
+        let material = Arc::new(Mutex::new(OidcExtraRootCaMaterial {
+            generation: 1,
+            root_ca_pem: Some(ca_pem_a.into_bytes()),
+        }));
+        let provider = OidcExtraRootCaProvider::new({
+            let material = material.clone();
+            move || {
+                let material = material.clone();
+                async move {
+                    material
+                        .lock()
+                        .map(|material| material.clone())
+                        .map_err(|e| format!("test OIDC extra CA material lock poisoned: {e}"))
+                }
+            }
+        });
+        let http_client = ReqwestHttpClient::with_policy_and_extra_root_ca_provider(policy, provider);
+
+        let config_a = build_mocked_oidc_provider_config("a", &format!("{base_a}/application/o/rustfs-a"));
+        let state_a = OidcSys::discover_provider(&config_a, &http_client)
+            .await
+            .expect("OIDC discovery should trust initial extra root CA");
+        assert_eq!(state_a.metadata.issuer().to_string(), format!("{base_a}/application/o/rustfs-a"));
+
+        {
+            let mut material = material
+                .lock()
+                .expect("test OIDC extra CA material lock should not be poisoned");
+            material.generation = 2;
+            material.root_ca_pem = Some(ca_pem_b.into_bytes());
+        }
+        let config_b = build_mocked_oidc_provider_config("b", &format!("{base_b}/application/o/rustfs-b"));
+        let state_b = OidcSys::discover_provider(&config_b, &http_client)
+            .await
+            .expect("OIDC discovery should refresh extra root CA after generation change");
+
+        assert_eq!(state_b.metadata.issuer().to_string(), format!("{base_b}/application/o/rustfs-b"));
+        assert!(handle_a.join().is_ok());
+        assert!(handle_b.join().is_ok());
     }
 
     #[tokio::test]
@@ -2945,7 +3316,7 @@ mod tests {
         // Cloud metadata endpoint is never allowed.
         assert!(
             matches!(
-                build_oidc_http_client("http://169.254.169.254/latest/meta-data/", None, None),
+                build_oidc_http_client("http://169.254.169.254/latest/meta-data/", None, &[], None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "metadata endpoint must be rejected"
@@ -2953,7 +3324,7 @@ mod tests {
         // Loopback is rejected by default (no allow-origins configured).
         assert!(
             matches!(
-                build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", None, None),
+                build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", None, &[], None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "loopback must be rejected by default"
@@ -2961,7 +3332,7 @@ mod tests {
         // A public hostname passes the up-front shape/host check; the resolved IP is still
         // re-classified at connection time by the pinned resolver.
         assert!(
-            build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None, None).is_ok(),
+            build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None, &[], None).is_ok(),
             "public https endpoint should build"
         );
     }
@@ -2981,13 +3352,13 @@ mod tests {
     fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
         let policy = OutboundPolicy::from_allowed_origins("http://127.0.0.1:8080").expect("origin should parse");
         assert!(
-            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy), None).is_ok(),
+            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy), &[], None).is_ok(),
             "explicitly allow-listed loopback origin should build"
         );
         // A metadata endpoint stays forbidden even when a loopback origin is allow-listed.
         assert!(
             matches!(
-                build_oidc_http_client("http://169.254.169.254/", Some(&policy), None),
+                build_oidc_http_client("http://169.254.169.254/", Some(&policy), &[], None),
                 Err(OidcHttpError::ForbiddenOutbound(_))
             ),
             "metadata endpoint stays forbidden despite an unrelated allow-list entry"
@@ -3190,8 +3561,9 @@ mod tests {
 
     #[test]
     fn oidc_metadata_endpoint_rejection_does_not_offer_allowlist_bypass() {
-        let error = build_oidc_http_client("http://169.254.169.254/latest/meta-data/", Some(&OutboundPolicy::default()), None)
-            .expect_err("metadata endpoint must remain forbidden");
+        let error =
+            build_oidc_http_client("http://169.254.169.254/latest/meta-data/", Some(&OutboundPolicy::default()), &[], None)
+                .expect_err("metadata endpoint must remain forbidden");
         let message = error.to_string();
 
         assert!(message.contains("metadata endpoint"));

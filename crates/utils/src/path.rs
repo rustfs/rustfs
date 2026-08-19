@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -44,12 +45,17 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 /// If the object name ends with a slash, it is considered a directory object.
 /// The trailing slash is removed and `GLOBAL_DIR_SUFFIX` is appended.
 /// If it does not end with a slash, the name is returned as is.
-pub fn encode_dir_object(object: &str) -> String {
+pub fn encode_dir_object_ref(object: &str) -> Cow<'_, str> {
     if has_suffix(object, SLASH_SEPARATOR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
+        Cow::Owned(format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX))
     } else {
-        object.to_string()
+        Cow::Borrowed(object)
     }
+}
+
+/// Owned compatibility wrapper for callers that retain or mutate the encoded name.
+pub fn encode_dir_object(object: &str) -> String {
+    encode_dir_object_ref(object).into_owned()
 }
 
 /// Checks if the given object name represents a directory object.
@@ -64,7 +70,6 @@ pub fn is_dir_object(object: &str) -> bool {
 ///
 /// If the object name ends with `GLOBAL_DIR_SUFFIX`, it is replaced with a slash.
 /// Otherwise, the name is returned as is.
-#[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
         format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
@@ -438,6 +443,12 @@ impl LazyBuf {
 /// The returned path ends in a slash only if it represents a root directory, such as `/` on Unix or `C:/` on Windows.
 ///
 /// If the result of this process is an empty string, `clean` returns the string `.`.
+///
+/// Note: `crates/policy/src/policy/utils/path.rs` deliberately keeps its own
+/// slash-only Go `path.Clean` port instead of using this function — S3
+/// ARN/resource matching must not treat backslashes as separators, and this
+/// Windows-aware version would change policy evaluation semantics on Windows.
+/// Do not consolidate the two (backlog#1833).
 pub fn clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
@@ -601,6 +612,17 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn encode_dir_object_ref_borrows_objects_and_encodes_directories() {
+        let object = "prefix/object";
+        let encoded = encode_dir_object_ref(object);
+        assert!(matches!(encoded, Cow::Borrowed(value) if value == object));
+
+        let encoded = encode_dir_object_ref("prefix/directory/");
+        assert!(matches!(encoded, Cow::Owned(ref value) if value == "prefix/directory__XLDIR__"));
+        assert_eq!(encode_dir_object("prefix/directory/"), encoded);
+    }
 
     #[test]
     fn test_trim_etag() {

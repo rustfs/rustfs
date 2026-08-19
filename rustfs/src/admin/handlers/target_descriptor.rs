@@ -38,10 +38,10 @@ use rustfs_utils::egress::OutboundPolicy;
 use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::io::{Error, ErrorKind};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
@@ -535,10 +535,11 @@ pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
         if !Path::new(queue_dir).is_absolute() {
             return Err(s3_error!(InvalidArgument, "queue_dir must be an absolute path"));
         }
-        retry_with_backoff(
+        rustfs_utils::retry::retry_with_backoff(
             || async { tokio::fs::metadata(queue_dir).await.map(|_| ()) },
             3,
             Duration::from_millis(100),
+            rustfs_utils::retry::DEFAULT_RETRY_CAP,
         )
         .await
         .map_err(|e| match e.kind() {
@@ -663,31 +664,6 @@ fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, conf
         config_targets,
         env_targets,
     })
-}
-
-async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, Error>>,
-{
-    let mut attempts = 0;
-    let mut delay = base_delay;
-    let mut last_err = None;
-
-    while attempts < max_attempts {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                last_err = Some(e);
-                attempts += 1;
-                if attempts < max_attempts {
-                    sleep(delay).await;
-                    delay = delay.saturating_mul(2);
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| Error::other("retry_with_backoff: unknown error")))
 }
 
 async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<()> {

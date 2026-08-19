@@ -357,6 +357,16 @@ async fn test_namespace_lock_with_local_manager() {
 }
 
 #[tokio::test]
+async fn namespace_lock_preserves_shared_namespace_storage() {
+    let namespace: Arc<str> = Arc::from("shared-namespace");
+    let namespace_ptr = Arc::as_ptr(&namespace);
+    let local = LocalLock::new_shared(namespace.clone(), Arc::new(GlobalLockManager::new()));
+
+    assert_eq!(local.namespace(), namespace.as_ref());
+    assert_eq!(local.namespace().as_ptr(), namespace_ptr.cast::<u8>());
+}
+
+#[tokio::test]
 async fn test_namespace_lock_with_clients() {
     let clients = vec![ClientFactory::create_local(), ClientFactory::create_local()];
     let lock = NamespaceLock::with_clients("multi-client".to_string(), clients);
@@ -828,6 +838,117 @@ async fn test_namespace_lock_distributed_reclaims_expired_same_resource_after_fa
         flaky_clients.iter().all(|client| client.release_attempts() >= 1),
         "unlock retries should have been attempted before TTL-based reclamation"
     );
+}
+
+#[tokio::test]
+async fn four_node_failed_release_converges_without_replica_repair() {
+    let managers = (0..4).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| {
+            Arc::new(FlakyReleaseClient {
+                inner: LocalClient::with_manager_and_reaper_interval(manager.clone(), Duration::from_millis(5)),
+                failed_releases_remaining: AtomicUsize::new(usize::MAX),
+                release_attempts: AtomicUsize::new(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::Distributed(DistributedLock::new("four-node-expired-lease".to_string(), clients, 3));
+    let resource = create_test_object_key("bucket", "object-four-node-expired");
+    let request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(300))
+        .with_ttl(Duration::from_millis(40));
+
+    let mut guard = lock
+        .acquire_guard(&request)
+        .await
+        .expect("initial acquire should not error")
+        .expect("initial acquire should reach quorum");
+    assert!(guard.release(), "release should be acknowledged while RPC cleanup is pending");
+
+    for _ in 0..40 {
+        if flaky_clients.iter().all(|client| client.release_attempts() >= 3) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let all_reaped =
+            futures::future::join_all(flaky_clients.iter().map(|client| client.inner.check_status(&request.lock_id)))
+                .await
+                .into_iter()
+                .all(|status| status.expect("status should not error").is_none());
+        if all_reaped {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "all four local lease entries must converge");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for suffix in ["chunk-0", "chunk-1", ".rustfs.sys/multipart/upload-0"] {
+        for client in &flaky_clients {
+            let orphan = LockRequest::new(create_test_object_key("bucket", suffix), LockType::Exclusive, "orphan")
+                .with_ttl(Duration::from_millis(25));
+            assert!(client.inner.acquire_lock(&orphan).await.expect("orphan acquire").success);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let recovered = lock
+        .acquire_guard(
+            &LockRequest::new(resource, LockType::Exclusive, "owner-b")
+                .with_acquire_timeout(Duration::from_millis(300))
+                .with_ttl(Duration::from_millis(40)),
+        )
+        .await
+        .expect("recovery acquire should not error")
+        .expect("four-node quorum should recover after local reapers run");
+    drop(recovered);
+}
+
+#[tokio::test]
+async fn four_node_stale_quorum_contention_respects_acquire_deadline() {
+    let managers = (0..4).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let node_clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager_and_reaper_interval(manager.clone(), Duration::from_millis(5))))
+        .collect::<Vec<_>>();
+    let resource = create_test_object_key("bucket", "stale-quorum");
+    let stale = LockRequest::new(resource.clone(), LockType::Exclusive, "stale-owner").with_ttl(Duration::from_millis(180));
+    for client in &node_clients {
+        assert!(client.acquire_lock(&stale).await.expect("stale acquire").success);
+    }
+
+    let clients = node_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::Distributed(DistributedLock::new("stale-quorum-deadline".to_string(), clients, 3));
+    let contender = LockRequest::new(resource.clone(), LockType::Exclusive, "new-owner")
+        .with_acquire_timeout(Duration::from_millis(150))
+        .with_ttl(Duration::from_millis(100));
+    let started = tokio::time::Instant::now();
+    let response = lock.acquire_guard(&contender).await.expect("contention should not error");
+    assert!(response.is_none(), "unexpired leases must not be force-reclaimed");
+    assert!(started.elapsed() < Duration::from_millis(350), "acquire must respect its deadline");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let recovered = lock
+        .acquire_guard(
+            &LockRequest::new(resource, LockType::Exclusive, "new-owner")
+                .with_acquire_timeout(Duration::from_millis(300))
+                .with_ttl(Duration::from_millis(100)),
+        )
+        .await
+        .expect("post-expiry acquire should not error")
+        .expect("quorum should recover after local reapers clear stale leases");
+    drop(recovered);
 }
 
 #[tokio::test]

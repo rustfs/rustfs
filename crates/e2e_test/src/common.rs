@@ -32,6 +32,7 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use std::ffi::OsStr;
 use std::fs as stdfs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -51,6 +52,11 @@ pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
     &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
+const TEST_PORT_MIN: u16 = 20_000;
+const TEST_PORT_RANGE: u16 = 40_000;
+const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
+const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
+const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -65,6 +71,77 @@ fn configured_capture_log_path(temp_dir: &str) -> Option<String> {
     }
 
     capture_log_path(Path::new(&log_dir), temp_dir).map(|path| path.to_string_lossy().into_owned())
+}
+
+struct PortAllocatorGuard;
+
+impl PortAllocatorGuard {
+    async fn acquire() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match stdfs::create_dir(TEST_PORT_LOCK_DIR) {
+                Ok(()) => return Ok(Self),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    remove_stale_port_allocator_lock();
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+}
+
+impl Drop for PortAllocatorGuard {
+    fn drop(&mut self) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn advance_test_port(port: u16) -> u16 {
+    let offset = (port - TEST_PORT_MIN + 1) % TEST_PORT_RANGE;
+    TEST_PORT_MIN + offset
+}
+
+fn seeded_test_port() -> u16 {
+    let offset = (Uuid::new_v4().as_u128() % u128::from(TEST_PORT_RANGE)) as u16;
+    TEST_PORT_MIN + offset
+}
+
+fn read_next_test_port() -> u16 {
+    stdfs::read_to_string(TEST_PORT_COUNTER_PATH)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| (TEST_PORT_MIN..TEST_PORT_MIN + TEST_PORT_RANGE).contains(port))
+        .unwrap_or_else(seeded_test_port)
+}
+
+fn remove_stale_port_allocator_lock() {
+    let Ok(metadata) = stdfs::metadata(TEST_PORT_LOCK_DIR) else {
+        return;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return;
+    };
+    if modified.elapsed().is_ok_and(|elapsed| elapsed > TEST_PORT_LOCK_STALE_AFTER) {
+        let _ = stdfs::remove_dir(TEST_PORT_LOCK_DIR);
+    }
+}
+
+fn write_next_test_port(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stdfs::write(TEST_PORT_COUNTER_PATH, port.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn capture_command_logs(
+    command: &mut Command,
+    log_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(log_path) = log_path else {
+        return Ok(());
+    };
+    let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+    let stderr_file = file.try_clone()?;
+    command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
+    Ok(())
 }
 
 pub(crate) fn build_test_s3_config(
@@ -495,10 +572,21 @@ impl RustFSTestEnvironment {
     /// Find an available port for the test
     pub async fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        Ok(port)
+        let _guard = PortAllocatorGuard::acquire().await?;
+        let mut next_port = read_next_test_port();
+
+        for _ in 0..TEST_PORT_RANGE {
+            let port = next_port;
+            next_port = advance_test_port(next_port);
+            write_next_test_port(next_port)?;
+
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+                drop(listener);
+                return Ok(port);
+            }
+        }
+
+        Err("no available E2E test port found".into())
     }
 
     /// Kill any existing RustFS processes
@@ -557,13 +645,7 @@ impl RustFSTestEnvironment {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        // Optionally capture the child's stdout+stderr to a file so the test can
-        // grep server logs (e.g. to confirm which GET reader path was taken).
-        if let Some(log_path) = &self.capture_log_path {
-            let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
-            let stderr_file = file.try_clone()?;
-            command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
-        }
+        capture_command_logs(&mut command, self.capture_log_path.as_deref())?;
         let process = command.args(&args).spawn()?;
 
         self.process = Some(process);
@@ -1051,6 +1133,7 @@ pub struct RustFSTestClusterEnvironment {
     pub secret_key: String,
     pub extra_env: Vec<(String, String)>,
     pub node_extra_env: Vec<Vec<(String, String)>>,
+    pub node_capture_log_paths: Vec<Option<String>>,
     pub topology: ClusterTopology,
 }
 
@@ -1150,6 +1233,7 @@ impl RustFSTestClusterEnvironment {
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         })
     }
@@ -1176,6 +1260,20 @@ impl RustFSTestClusterEnvironment {
     {
         self.ensure_node_index(node_idx)?;
         self.node_extra_env[node_idx].push((key.into(), value.into()));
+        Ok(())
+    }
+
+    /// Capture stdout+stderr for a single cluster node process.
+    pub fn set_node_capture_log_path<P>(
+        &mut self,
+        node_idx: usize,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: Into<String>,
+    {
+        self.ensure_node_index(node_idx)?;
+        self.node_capture_log_paths[node_idx] = Some(path.into());
         Ok(())
     }
 
@@ -1268,6 +1366,7 @@ impl RustFSTestClusterEnvironment {
             for (key, value) in &self.node_extra_env[i] {
                 command.env(key, value);
             }
+            capture_command_logs(&mut command, self.node_capture_log_paths[i].as_deref())?;
 
             let process = command.current_dir(&node.data_dir).spawn()?;
 
@@ -1294,6 +1393,7 @@ impl RustFSTestClusterEnvironment {
 
         let binary_path = rustfs_binary_path();
         let volumes_arg = self.build_volumes_arg();
+        let log_path = self.node_capture_log_paths[node_idx].clone();
         let node = &mut self.nodes[node_idx];
         info!("Starting cluster node {} on {}", node_idx, node.address);
 
@@ -1312,6 +1412,7 @@ impl RustFSTestClusterEnvironment {
         for (key, value) in &self.node_extra_env[node_idx] {
             command.env(key, value);
         }
+        capture_command_logs(&mut command, log_path.as_deref())?;
 
         let process = command.current_dir(&node.data_dir).spawn()?;
         node.process = Some(process);
@@ -1563,6 +1664,7 @@ mod tests {
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],
+            node_capture_log_paths: vec![None; topology.node_count],
             topology,
         }
     }
@@ -1656,6 +1758,16 @@ mod tests {
             env.node_extra_env[2].as_slice(),
             [("RUSTFS_INTERNODE_RPC_MSGPACK_ONLY".to_string(), "true".to_string())]
         );
+    }
+
+    #[test]
+    fn cluster_node_log_capture_supports_per_node_paths() {
+        let mut env = fake_cluster(ClusterTopology::single_pool(3));
+        env.set_node_capture_log_path(1, "/tmp/node1.log").unwrap();
+        assert_eq!(env.node_capture_log_paths[0], None);
+        assert_eq!(env.node_capture_log_paths[1], Some("/tmp/node1.log".to_string()));
+        assert_eq!(env.node_capture_log_paths[2], None);
+        assert!(env.set_node_capture_log_path(3, "/tmp/invalid.log").is_err());
     }
 
     #[test]

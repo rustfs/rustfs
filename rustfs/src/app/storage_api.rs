@@ -47,6 +47,8 @@ pub(crate) mod capacity {
 pub(crate) mod data_usage {
     use std::sync::Arc;
 
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::quota_object_size;
+
     pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
@@ -67,7 +69,7 @@ pub(crate) mod data_usage {
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, store_data_usage_in_backend,
+        compute_bucket_usage, live_bucket_usage_computations, seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
@@ -597,6 +599,8 @@ pub(crate) mod bucket {
             pub(crate) type QuotaChecker = crate::storage::storage_api::ecstore_bucket::quota::checker::QuotaChecker;
         }
 
+        #[cfg(test)]
+        pub(crate) type BucketQuota = crate::storage::storage_api::ecstore_bucket::quota::BucketQuota;
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
         pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
         pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
@@ -622,6 +626,24 @@ pub(crate) mod bucket {
         pub(crate) const REPLICATE_INCOMING_DELETE: &str = replication_contracts::REPLICATE_INCOMING_DELETE;
         #[cfg(test)]
         pub(crate) use replication_contracts::replication_statuses_map;
+
+        /// Remote replication-target client used by the read-proxy path.
+        pub(crate) type ProxyTargetClient = crate::storage::storage_api::ecstore_bucket::bucket_target_sys::TargetClient;
+
+        /// Proxy-request metric recorder (get/head/tagging totals + failures).
+        pub(crate) use crate::storage::storage_api::record_replication_proxy;
+
+        /// Replication targets eligible to serve a proxied GET/HEAD/Tagging of
+        /// an object not present locally (MinIO `getProxyTargets`; empty when
+        /// the request was itself proxied, versioning is suspended, or no
+        /// replication rule matches). backlog#1675 P1-5.
+        pub(crate) async fn get_read_proxy_targets(
+            bucket: &str,
+            object: &str,
+            opts: &crate::storage::storage_api::StorageObjectOptions,
+        ) -> Vec<Arc<ProxyTargetClient>> {
+            replication_contracts::get_proxy_targets(bucket, object, opts).await
+        }
 
         pub(crate) async fn persist_force_delete_intent(
             store: Arc<crate::storage::storage_api::ECStore>,
@@ -932,13 +954,15 @@ pub(crate) mod bucket {
 
 pub(crate) mod concurrency {
     pub(crate) use crate::storage::storage_api::concurrency_consumer::{
-        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard,
+        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectAdmission, PutObjectGuard,
         get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
 
 pub(crate) mod compression {
-    pub(crate) use crate::storage::storage_api::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use crate::storage::storage_api::ecstore_compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod deadlock_detector {
@@ -990,13 +1014,14 @@ pub(crate) mod options {
         copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
         extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
         get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
-        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
-        preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
+        has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        parse_copy_source_range, preserve_unclassified_user_metadata, put_opts_with_replication_authorization,
+        validate_archive_content_encoding,
     };
 }
 
 pub(crate) mod request_context {
-    pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
+    pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced, spawn_traced_join};
 }
 
 pub(crate) mod sse {
@@ -1148,8 +1173,10 @@ pub(crate) mod multipart_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse};
-    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectOptions, StoragePutObjReader};
+    pub(crate) use super::{
+        access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
+    };
+    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
 }
 
 pub(crate) mod select_object {
@@ -1210,4 +1237,14 @@ pub(crate) mod test {
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
     };
+    pub(crate) mod set_disk {
+        pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
+            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+            fail_next_quota_ledger_save_for_test,
+        };
+    }
+
+    pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
+    }
 }

@@ -30,6 +30,15 @@ pub const RUSTFS_MULTIPART_CHECKSUM: &str = "x-rustfs-multipart-checksum";
 pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-type";
 
 /// Checksum type enumeration with flags
+///
+/// One of three deliberately separate checksum registries (backlog#1833):
+/// this bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
+/// varint-serialized into xl.meta (see `append_to`), so bits are append-only
+/// and must never be renumbered. `rustfs_checksums::ChecksumAlgorithm`
+/// (crates/checksums/src/lib.rs) owns the streaming-hash algorithm registry,
+/// and the MinIO-port client keeps its own `ChecksumMode`
+/// (crates/ecstore/src/client/checksum.rs). When adding an algorithm, extend
+/// all three (or record why not) — they do not derive from each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 

@@ -930,6 +930,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         DELETE_TABLE_NAMESPACE,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
@@ -1214,6 +1215,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/tables/rename",
+        SET_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
         GET_TABLE,
@@ -1452,10 +1459,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
+    // The default stream enumerates object names/version ids and requires
+    // ReplicationDiff (MinIO parity); only ?aggregate=true relaxes to
+    // GetReplicationMetrics in the handler.
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/replication/mrf",
-        GET_REPLICATION_METRICS,
+        REPLICATION_DIFF,
         RouteRiskLevel::Sensitive,
     ),
 ];
@@ -1546,6 +1556,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/datausageinfo",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
@@ -1660,7 +1675,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 96);
+        assert_eq!(table_specs.count(), 98);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
@@ -1679,6 +1694,8 @@ mod tests {
         );
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
         assert_action(
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",

@@ -65,7 +65,7 @@ enum FillPolicy {
 }
 
 impl FillPolicy {
-    fn from_env() -> Self {
+    fn load() -> Self {
         match rustfs_utils::get_env_usize(
             ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
             DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
@@ -73,6 +73,22 @@ impl FillPolicy {
             2 => Self::DualInFlight,
             _ => Self::SingleInFlight,
         }
+    }
+
+    fn from_env() -> Self {
+        #[cfg(test)]
+        {
+            Self::load()
+        }
+        #[cfg(not(test))]
+        {
+            Self::cached_core(Self::load)
+        }
+    }
+
+    fn cached_core(load: impl FnOnce() -> Self) -> Self {
+        static CACHED: std::sync::OnceLock<FillPolicy> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(load)
     }
 
     const fn max_inflight(self) -> usize {
@@ -122,6 +138,10 @@ where
     S: ShardStripeSource + Send + 'static,
     E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
 {
+    #[allow(
+        dead_code,
+        reason = "default-metrics-path constructor used only by this file's tests (backlog#1823)"
+    )]
     pub(crate) fn new(source: S, engine: E, total_length: usize) -> io::Result<Self> {
         Self::new_with_metrics_path(source, engine, total_length, GET_OBJECT_PATH_CODEC_STREAMING)
     }
@@ -479,22 +499,30 @@ where
     let mut deferred_error = None;
     let fill_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-    let state = source.read_next_stripe().await;
+    let mut state = source.read_next_stripe().await;
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
     let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     let mut output_buf = reusable_buffers.pop().unwrap_or_default();
-    let result =
-        match decode_stripe_into(metrics_path, stage_metrics_enabled, engine, workspace, state, remaining, &mut output_buf) {
-            Ok(true) => Ok(Some(output_buf)),
-            Ok(false) => {
-                reusable_buffers.push(output_buf);
-                Ok(None)
-            }
-            Err(err) => {
-                reusable_buffers.push(output_buf);
-                Err(err)
-            }
-        };
+    let result = match decode_stripe_into(
+        metrics_path,
+        stage_metrics_enabled,
+        engine,
+        workspace,
+        &mut state,
+        remaining,
+        &mut output_buf,
+    ) {
+        Ok(true) => Ok(Some(output_buf)),
+        Ok(false) => {
+            reusable_buffers.push(output_buf);
+            Ok(None)
+        }
+        Err(err) => {
+            reusable_buffers.push(output_buf);
+            Err(err)
+        }
+    };
+    source.recycle_stripe(state);
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
     if let Ok(Some(first_buf)) = result.as_ref() {
         let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
@@ -503,7 +531,7 @@ where
                 break;
             }
             let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-            let state = source.read_next_stripe().await;
+            let mut state = source.read_next_stripe().await;
             record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
             let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let mut queued_buf = reusable_buffers.pop().unwrap_or_default();
@@ -512,10 +540,11 @@ where
                 stage_metrics_enabled,
                 engine,
                 workspace,
-                state,
+                &mut state,
                 remaining_after_first,
                 &mut queued_buf,
             );
+            source.recycle_stripe(state);
             record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
             match queued_result {
                 Ok(true) => {
@@ -654,6 +683,10 @@ pub(crate) struct SyncErasureDecodeReader<R> {
 }
 
 impl<R> SyncErasureDecodeReader<R> {
+    #[allow(
+        dead_code,
+        reason = "default-metrics-path constructor used only by this file's tests (backlog#1823)"
+    )]
     pub(crate) fn new(inner: R) -> Self {
         Self::new_with_metrics_path(inner, GET_OBJECT_PATH_CODEC_STREAMING)
     }
@@ -717,7 +750,7 @@ fn decode_stripe_into<E>(
     stage_metrics_enabled: bool,
     engine: &E,
     workspace: &mut E::Workspace,
-    state: StripeReadState,
+    state: &mut StripeReadState,
     remaining: usize,
     output: &mut Vec<u8>,
 ) -> io::Result<bool>
@@ -725,7 +758,7 @@ where
     E: ErasureDecodeEngine,
 {
     output.clear();
-    if state.slots().is_empty() {
+    if state.is_empty() {
         return Ok(false);
     }
     if !state.can_decode() {
@@ -741,13 +774,12 @@ where
         );
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
         let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        emit_data_shards_into(&state, engine.data_shards(), engine.block_size(), remaining, output)?;
+        emit_data_shards_into(state, engine.data_shards(), engine.block_size(), remaining, output)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_EMIT, emit_stage_start);
         return Ok(true);
     }
 
-    let (mut shards, _errs) = state.into_parts();
-    let reconstruct_outcome = match engine.reconstruct_into(&mut shards, workspace) {
+    let reconstruct_outcome = match engine.reconstruct_into(state.shards_mut(), workspace) {
         Ok(outcome) => outcome,
         Err(err) => {
             record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
@@ -757,7 +789,7 @@ where
     rustfs_io_metrics::record_get_object_reconstruct_outcome(metrics_path, engine.engine_name(), reconstruct_outcome);
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
-    if shards.len() < engine.data_shards() {
+    if state.shards_mut().len() < engine.data_shards() {
         return Err(io::Error::new(
             ErrorKind::UnexpectedEof,
             "decoded stripe has fewer shards than data shard count",
@@ -766,7 +798,7 @@ where
 
     let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     reserve_output_capacity(output, engine.block_size().min(remaining));
-    for shard in shards.iter().take(engine.data_shards()) {
+    for shard in state.shards_mut().iter().take(engine.data_shards()) {
         if output.len() >= remaining {
             break;
         }
@@ -781,6 +813,7 @@ where
     Ok(true)
 }
 
+#[allow(dead_code, reason = "shard emission asserted by this file's tests (backlog#1823)")]
 fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     emit_data_shards_into(state, data_shards, block_size, remaining, &mut output)?;
@@ -806,10 +839,7 @@ fn emit_data_shards_into(
         if output.len() >= remaining {
             break;
         }
-        let Some(slot) = state.slot_by_index(index) else {
-            return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
-        };
-        let Some(shard) = slot.data_bytes() else {
+        let Some(shard) = state.data_bytes(index) else {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
         };
         let copy_len = shard.len().min(remaining - output.len());
@@ -826,7 +856,7 @@ mod tests {
     };
     use crate::erasure::coding::decode::ParallelReader;
     use crate::erasure::coding::{BitrotReader, BitrotWriter, Erasure};
-    use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
+    use crate::set_disk::shard_source::StripeReadState;
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
     use std::future::{pending, poll_fn};
@@ -843,6 +873,13 @@ mod tests {
         stripes: VecDeque<StripeReadState>,
         read_quorum: usize,
         read_count: Option<Arc<AtomicUsize>>,
+    }
+
+    struct RecordingStripeSource {
+        stripes: VecDeque<StripeReadState>,
+        read_quorum: usize,
+        reads: usize,
+        recycles: usize,
     }
 
     struct BlockingSource {
@@ -899,25 +936,43 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ShardStripeSource for VecStripeSource {
-        async fn read_next_stripe(&mut self) -> StripeReadState {
+        async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
             if let Some(read_count) = &self.read_count {
                 read_count.fetch_add(1, Ordering::SeqCst);
             }
-            self.stripes
-                .pop_front()
-                .unwrap_or_else(|| StripeReadState::new(Vec::new(), self.read_quorum))
+            Box::new(
+                self.stripes
+                    .pop_front()
+                    .unwrap_or_else(|| StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum)),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ShardStripeSource for RecordingStripeSource {
+        async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
+            self.reads += 1;
+            Box::new(
+                self.stripes
+                    .pop_front()
+                    .unwrap_or_else(|| StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum)),
+            )
+        }
+
+        fn recycle_stripe(&mut self, _state: Box<StripeReadState>) {
+            self.recycles += 1;
         }
     }
 
     #[async_trait::async_trait]
     impl ShardStripeSource for BlockingSource {
-        async fn read_next_stripe(&mut self) -> StripeReadState {
+        async fn read_next_stripe(&mut self) -> Box<StripeReadState> {
             let _guard = BlockingSourceDropGuard {
                 dropped: Arc::clone(&self.dropped),
             };
             self.started.notify_one();
             pending::<()>().await;
-            StripeReadState::new(Vec::new(), self.read_quorum)
+            Box::new(StripeReadState::from_parts(Vec::new(), Vec::new(), self.read_quorum))
         }
     }
 
@@ -1088,6 +1143,23 @@ mod tests {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("99"), || {
             assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
         });
+    }
+
+    #[test]
+    fn fill_policy_production_cache_loads_once() {
+        use std::cell::Cell;
+
+        let loads = Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(
+                FillPolicy::cached_core(|| {
+                    loads.set(loads.get() + 1);
+                    FillPolicy::DualInFlight
+                }),
+                FillPolicy::DualInFlight
+            );
+        }
+        assert_eq!(loads.get(), 1, "the production fill policy must not re-read the environment per reader");
     }
 
     #[test]
@@ -1689,7 +1761,10 @@ mod tests {
             .pop_front()
             .expect("first stripe should exist");
         let mut source = VecStripeSource {
-            stripes: VecDeque::from([first_state, StripeReadState::new(Vec::new(), erasure.data_shards)]),
+            stripes: VecDeque::from([
+                first_state,
+                StripeReadState::from_parts(Vec::new(), Vec::new(), erasure.data_shards),
+            ]),
             read_quorum: erasure.data_shards,
             read_count: None,
         };
@@ -1724,13 +1799,14 @@ mod tests {
             .stripes
             .pop_front()
             .expect("first stripe should exist");
-        let mut source = VecStripeSource {
+        let mut source = RecordingStripeSource {
             stripes: VecDeque::from([
                 first_state,
-                StripeReadState::new(vec![ShardSlot::data(0, vec![1])], erasure.data_shards),
+                StripeReadState::from_parts(vec![Some(vec![1])], Vec::new(), erasure.data_shards),
             ]),
             read_quorum: erasure.data_shards,
-            read_count: None,
+            reads: 0,
+            recycles: 0,
         };
         let engine = LegacyEcDecodeEngine::new(erasure);
         let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
@@ -1756,6 +1832,8 @@ mod tests {
                 .kind(),
             ErrorKind::Other
         );
+        assert_eq!(source.reads, 2, "the fill must read the primary and queued stripe");
+        assert_eq!(source.recycles, source.reads, "every completed stripe read must be recycled");
     }
 
     #[tokio::test]
@@ -1768,7 +1846,7 @@ mod tests {
                     .stripes
                     .pop_front()
                     .expect("first stripe should exist"),
-                StripeReadState::new(Vec::new(), erasure.data_shards),
+                StripeReadState::from_parts(Vec::new(), Vec::new(), erasure.data_shards),
             ]),
             read_quorum: erasure.data_shards,
             read_count: None,
@@ -2028,17 +2106,11 @@ mod tests {
     }
 
     #[test]
-    fn emit_data_shards_preserves_output_order_for_out_of_order_slots() {
-        let state = StripeReadState::new(
-            vec![
-                ShardSlot::data(1, b"cd".to_vec()),
-                ShardSlot::data(0, b"ab".to_vec()),
-                ShardSlot::data(2, b"ef".to_vec()),
-            ],
-            2,
-        );
+    fn emit_data_shards_preserves_output_order() {
+        let state =
+            StripeReadState::from_parts(vec![Some(b"ab".to_vec()), Some(b"cd".to_vec()), Some(b"ef".to_vec())], Vec::new(), 2);
 
-        let output = emit_data_shards(&state, 3, 6, 5).expect("out-of-order data slots should emit by shard index");
+        let output = emit_data_shards(&state, 3, 6, 5).expect("data slots should emit by shard index");
 
         assert_eq!(output, b"abcde");
     }
@@ -2051,27 +2123,27 @@ mod tests {
         };
         let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
         let mut output = Vec::with_capacity(1);
-        let short_state = StripeReadState::new(vec![ShardSlot::data(0, vec![1, 2, 3, 4])], 1);
+        let mut short_state = StripeReadState::from_parts(vec![Some(vec![1, 2, 3, 4])], Vec::new(), 1);
 
         let err = decode_stripe_into(
             GET_OBJECT_PATH_CODEC_STREAMING,
             false,
             &engine,
             &mut workspace,
-            short_state,
+            &mut short_state,
             8,
             &mut output,
         )
         .expect_err("decoded stripe shorter than data shard count must fail");
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
 
-        let missing_state = StripeReadState::from_parts(vec![None, Some(vec![5, 6, 7, 8])], Vec::new(), 1);
+        let mut missing_state = StripeReadState::from_parts(vec![None, Some(vec![5, 6, 7, 8])], Vec::new(), 1);
         let err = decode_stripe_into(
             GET_OBJECT_PATH_CODEC_STREAMING,
             false,
             &engine,
             &mut workspace,
-            missing_state,
+            &mut missing_state,
             8,
             &mut output,
         )
@@ -2080,6 +2152,35 @@ mod tests {
 
         reserve_output_capacity(&mut output, 32);
         assert!(output.capacity() >= 32);
+    }
+
+    #[test]
+    fn decode_stripe_reconstructs_in_place_without_replacing_slot_storage() {
+        let erasure = Erasure::new(2, 1, 8);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
+        let encoded = erasure.encode_data(b"abcdefgh").expect("test stripe should encode");
+        let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        shards[0] = None;
+        let mut state = StripeReadState::from_parts(shards, vec![Some(DiskError::FileCorrupt)], 2);
+        let before = state.scratch_storage();
+        let mut output = Vec::new();
+
+        let decoded = decode_stripe_into(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            false,
+            &engine,
+            &mut workspace,
+            &mut state,
+            8,
+            &mut output,
+        )
+        .expect("degraded stripe should reconstruct");
+
+        assert!(decoded);
+        assert_eq!(output, b"abcdefgh");
+        assert_eq!(state.scratch_storage().0, before.0, "reconstruction must retain shard slot storage");
+        assert_eq!(state.scratch_storage().1, before.1, "unused error storage must not be rebuilt");
     }
 
     #[tokio::test]

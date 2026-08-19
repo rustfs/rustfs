@@ -39,7 +39,6 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
     INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
-use rustfs_utils::net::bytes_stream;
 use s3s::Body;
 use s3s::dto::StreamingBlob;
 use serde::de::DeserializeOwned;
@@ -51,7 +50,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{self, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::{io::ReaderStream, sync::CancellationToken};
 use tower::Service;
@@ -663,15 +662,24 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+    let read_buffer_size = read_file_stream_buffer_size(length);
+    let read_limit = if length == 0 {
+        u64::MAX
+    } else {
+        u64::try_from(length).unwrap_or(u64::MAX)
+    };
+    let stream = ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
     });
+    Box::pin(stream)
+}
 
+fn read_file_stream_buffer_size(length: usize) -> usize {
     if length == 0 {
-        Box::pin(stream)
+        DEFAULT_READ_BUFFER_SIZE
     } else {
-        Box::pin(bytes_stream(stream, length))
+        length.min(DEFAULT_READ_BUFFER_SIZE)
     }
 }
 
@@ -1664,7 +1672,7 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskError, InternodeRpcService, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER,
+        DEFAULT_READ_BUFFER_SIZE, DiskError, InternodeRpcService, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER,
         LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY,
         NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH,
         NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
@@ -1673,10 +1681,10 @@ mod tests {
         append_walk_dir_completion, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
         ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
         put_file_capability_response, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
-        read_file_body_stream, remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
-        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
-        verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
-        write_put_file_body_chunks_to_writer,
+        read_file_body_stream, read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
+        supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
+        verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
+        write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
     };
     use crate::storage::storage_api::ecstore_rpc::{build_put_file_auth_trailer, gen_signature_headers};
     use crate::storage::storage_api::rpc_consumer::http_service::{DiskAPI as _, DiskOption, DiskStore, Endpoint, new_disk};
@@ -1703,6 +1711,23 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;
+
+    struct RejectExtraPollReader {
+        emitted: bool,
+    }
+
+    impl io::AsyncRead for RejectExtraPollReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut io::ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.emitted {
+                return Poll::Ready(Err(io::Error::other("reader polled past the requested length")));
+            }
+
+            let bytes = b"hello world";
+            buf.put_slice(&bytes[..buf.remaining().min(bytes.len())]);
+            self.emitted = true;
+            Poll::Ready(Ok(()))
+        }
+    }
 
     async fn new_put_file_test_disk() -> (DiskStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp directory should be created");
@@ -2842,11 +2867,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_body_stream_truncates_to_requested_length() {
-        let (reader, mut writer) = tokio::io::duplex(64);
-        tokio::spawn(async move {
-            writer.write_all(b"hello world").await.expect("write succeeds");
-        });
-
+        let reader = RejectExtraPollReader { emitted: false };
         let mut stream = read_file_body_stream(reader, 5, INTERNODE_OPERATION_READ_FILE_STREAM);
         let mut out = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -2854,6 +2875,18 @@ mod tests {
         }
 
         assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn read_file_body_stream_sizes_buffer_to_requested_length() {
+        for (length, expected_capacity) in [
+            (0, DEFAULT_READ_BUFFER_SIZE),
+            (40 * 1024, 40 * 1024),
+            (DEFAULT_READ_BUFFER_SIZE, DEFAULT_READ_BUFFER_SIZE),
+            (DEFAULT_READ_BUFFER_SIZE + 1, DEFAULT_READ_BUFFER_SIZE),
+        ] {
+            assert_eq!(read_file_stream_buffer_size(length), expected_capacity);
+        }
     }
 
     #[test]

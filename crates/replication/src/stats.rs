@@ -520,6 +520,14 @@ struct FailureSample {
 pub struct FailStats {
     pub count: i64,
     pub size: i64,
+    /// Rolling-window snapshots refreshed at collection time
+    /// ([`Self::refresh_windows`]). The raw samples (`recent`) are process
+    /// local (serde-skipped), so these fields are what survives the peer-RPC
+    /// wire and [`Self::merge`]-based cluster aggregation.
+    #[serde(default)]
+    pub last_minute: FailedMetric,
+    #[serde(default)]
+    pub last_hour: FailedMetric,
     #[serde(skip)]
     recent: VecDeque<FailureSample>,
 }
@@ -535,6 +543,17 @@ impl FailStats {
         self.size = self.size.saturating_add(size);
         self.recent.push_back(FailureSample { observed_at, size });
         self.prune(observed_at);
+    }
+
+    /// Recompute the serializable rolling-window snapshots from the local
+    /// samples. Called at the collection point (per-node stats snapshot),
+    /// never on the failure hot path — the two deque scans are O(window) and
+    /// `add_size` runs under the bucket-stats write lock. Only meaningful on
+    /// the live per-node struct: a deserialized or merged struct has no
+    /// samples, and refreshing it would wipe the aggregated windows.
+    pub fn refresh_windows(&mut self) {
+        self.last_minute = self.recent_since(Duration::from_secs(60));
+        self.last_hour = self.recent_since(Duration::from_secs(3600));
     }
 
     fn prune(&mut self, observed_at: Instant) {
@@ -565,6 +584,16 @@ impl FailStats {
         Self {
             count: self.count.saturating_add(other.count),
             size: self.size.saturating_add(other.size),
+            // The window snapshots sum across nodes; the raw samples do not
+            // travel and stay empty on aggregated structs.
+            last_minute: FailedMetric {
+                count: self.last_minute.count.saturating_add(other.last_minute.count),
+                size: self.last_minute.size.saturating_add(other.last_minute.size),
+            },
+            last_hour: FailedMetric {
+                count: self.last_hour.count.saturating_add(other.last_hour.count),
+                size: self.last_hour.size.saturating_add(other.last_hour.size),
+            },
             recent: VecDeque::new(),
         }
     }
@@ -636,7 +665,9 @@ impl BucketReplicationStat {
     }
 
     pub fn update_xfer_rate(&mut self, size: i64, duration: Duration) {
-        if size > 1024 * 1024 {
+        // Same boundary as the worker-pool split and minio-go's
+        // Large/Small transfer-summary labels: >= 128 MiB is "large".
+        if size >= crate::runtime::MIN_LARGE_OBJ_SIZE {
             self.xfer_rate_lrg.add_size(size, duration);
         } else {
             self.xfer_rate_sml.add_size(size, duration);

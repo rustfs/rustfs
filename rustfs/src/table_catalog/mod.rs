@@ -18,8 +18,6 @@
 //! S3 object behavior. It defines the stable internal boundary that later
 //! catalog routes and object guards can share.
 
-#![allow(dead_code)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
@@ -72,9 +70,11 @@ pub(crate) use error::{TableCatalogStoreError, TableCatalogStoreResult};
 pub(crate) use iceberg::*;
 pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use identifier::{
-    default_table_data_dir_path, default_table_delete_dir_path, default_table_metadata_dir_path,
-    default_table_metadata_file_path, default_view_metadata_file_path, is_valid_table_metadata_location,
-    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, validate_bucket_object_mutation,
+    default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
+    default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
+    default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_table_metadata_location_for_entry,
+    is_valid_view_metadata_location, metadata_location_from_metadata_file_path, table_metadata_dir_path_for_entry,
+    table_metadata_file_path_for_entry, validate_bucket_object_mutation,
 };
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
@@ -85,16 +85,35 @@ pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved
 pub(crate) const TABLE_BUCKET_CATALOG_TYPE: &str = "iceberg-rest";
 pub(crate) const TABLE_BUCKET_CONFIG_VERSION: u16 = 1;
 pub(crate) const DEFAULT_WAREHOUSE_ID: &str = "default";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
+    "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
+pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2: &str = "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2";
+pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED: &str =
+    "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
 pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
+pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
 pub(crate) const TABLE_MANIFEST_AVRO_MAX_SIZE: usize = 128 * 1024 * 1024;
@@ -102,17 +121,37 @@ const TABLE_MANIFEST_AVRO_MAX_DECODED_SIZE: usize = 128 * 1024 * 1024;
 const TABLE_MANIFEST_AVRO_MAX_RECORDS: usize = 1_000_000;
 const TABLE_MANIFEST_AVRO_MAX_HEADER_ENTRIES: usize = 1_024;
 const TABLE_COMMIT_MAX_MANIFESTS: usize = 10_000;
+const TABLE_COMMIT_MAX_MANIFEST_TRAVERSALS: usize = 20_000;
 const TABLE_COMMIT_MAX_AVRO_BYTES: usize = 512 * 1024 * 1024;
 const TABLE_COMMIT_MAX_FILE_REFERENCES: usize = 1_000_000;
-const TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY: usize = 16;
+const TABLE_COMMIT_MAX_STATISTICS_OBJECTS: usize = 1_024;
+const TABLE_COMMIT_MAX_STATISTICS_BYTES: usize = 512 * 1024 * 1024;
+const TABLE_STATISTICS_FILE_MAX_SIZE: usize = 128 * 1024 * 1024;
+pub(crate) const TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY: usize = 16;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";
 const TABLE_ROOT: &str = "tables";
 const VIEW_ROOT: &str = "views";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const NAMESPACE_MARKER_FILE: &str = "namespace.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const TABLE_MARKER_FILE: &str = "table.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const CURRENT_POINTER_FILE: &str = "current.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const LIFECYCLE_FILE: &str = "lifecycle.json";
 const METADATA_DIR: &str = "metadata";
 const DATA_DIR: &str = "data";
@@ -154,10 +193,12 @@ const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
 const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
 const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
 const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
-const STRONG_TABLE_CATALOG_SNAPSHOT_VERSION: u16 = 1;
+const STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION: u16 = 1;
+const STRONG_TABLE_CATALOG_SNAPSHOT_VERSION: u16 = 2;
 const STRONG_TABLE_CATALOG_BACKING_ROOT: &str = "strong-backing";
 const STRONG_TABLE_CATALOG_SNAPSHOT_FILE: &str = "snapshot.json";
-const TABLE_CATALOG_MIGRATION_VERSION: u16 = 1;
+const TABLE_CATALOG_MIGRATION_MIN_READ_VERSION: u16 = 1;
+const TABLE_CATALOG_MIGRATION_VERSION: u16 = 2;
 const TABLE_CATALOG_MIGRATION_ROOT: &str = "backing-migration";
 const TABLE_CATALOG_MIGRATION_FENCE_FILE: &str = "durable-strong-fence.json";
 const TABLE_CATALOG_MIGRATION_FENCE_LOCK: &str = "durable-strong-fence.lock";
@@ -349,6 +390,9 @@ fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStor
         other => TableCatalogStoreError::Internal(format!("{action}: {other}")),
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests;

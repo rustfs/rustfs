@@ -12,33 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::event::targetid::TargetID;
 use std::sync::atomic::AtomicI64;
 
+/// Placeholder notification target list held by `EventNotifier`.
+///
+/// The working notification stack lives in `rustfs-notify` / `rustfs-targets`;
+/// this type never grew past its counter. `total_events` is read by the
+/// notifier's log line but nothing increments it, so that field reports zero.
 #[derive(Default)]
+#[allow(
+    dead_code,
+    reason = "held only by the dead ecstore EventNotifier; see services/event_notification.rs (backlog#1823)"
+)]
 pub struct TargetList {
-    pub current_send_calls: AtomicI64,
     pub total_events: AtomicI64,
-    pub events_skipped: AtomicI64,
-    pub events_errors_total: AtomicI64,
-    //pub targets: HashMap<TargetID, Target>,
-    //pub queue:   AsyncEvent,
-    //pub targetStats: HashMap<TargetID, TargetStat>,
 }
 
 impl TargetList {
     pub fn new() -> TargetList {
         TargetList::default()
     }
-}
-
-struct TargetStat {
-    current_send_calls: i64,
-    total_events: i64,
-    failed_events: i64,
-}
-
-struct TargetIDResult {
-    id: TargetID,
-    err: std::io::Error,
 }

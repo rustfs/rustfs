@@ -30,7 +30,6 @@ use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Cursor;
@@ -285,8 +284,610 @@ async fn allow_anonymous_put_object(
     Ok(())
 }
 
+/// One rejected POST Object upload driven end-to-end (backlog#1838): starts a
+/// fresh server, allows anonymous PutObject on `bucket`, posts an anonymous
+/// POST Object form whose policy carries `policy_conditions` and whose form
+/// carries `form_fields` on top of the mandatory key+policy fields, then
+/// asserts the expected status, error code, and lowercase-body mention.
+/// `case` prefixes every assertion message so a failing table row is
+/// identifiable at a glance.
+#[allow(clippy::too_many_arguments)]
+async fn run_post_object_policy_case(
+    bucket: &str,
+    object_key: &str,
+    policy_conditions: Vec<serde_json::Value>,
+    form_fields: &[(&str, &str)],
+    file_body: &[u8],
+    expected_status: reqwest::StatusCode,
+    expected_code: &str,
+    expected_mention: &str,
+    case: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    allow_anonymous_put_object(&admin_client, bucket).await?;
+
+    let policy = encode_post_policy(policy_conditions);
+
+    let mut post_form = reqwest::multipart::Form::new()
+        .text("key", object_key.to_string())
+        .text("policy", policy);
+    for (name, value) in form_fields {
+        post_form = post_form.text(name.to_string(), value.to_string());
+    }
+    let post_form = post_form.part(
+        "file",
+        reqwest::multipart::Part::bytes(file_body.to_vec())
+            .file_name("upload.txt")
+            .mime_str("text/plain")?,
+    );
+
+    let post_resp = local_http_client()
+        .post(format!("{}/{}", env.url, bucket))
+        .multipart(post_form)
+        .send()
+        .await?;
+
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    let response_body_lower = response_body.to_ascii_lowercase();
+
+    assert_eq!(status, expected_status, "[{case}] unexpected status, body: {response_body}");
+    assert!(
+        response_body.contains(expected_code),
+        "[{case}] response should contain {expected_code}, got: {response_body}"
+    );
+    assert!(
+        response_body_lower.contains(expected_mention),
+        "[{case}] response should mention {expected_mention}, got: {response_body}"
+    );
+
+    Ok(())
+}
+
+/// Table-driven fold of the nine `*_missing_from_policy_conditions` POST
+/// Object tests (backlog#1838 PR1). Every row keeps its original test's exact
+/// bucket, key, form field, file body, and expected error strings; the shared
+/// shape is: policy pins bucket + key + content-length-range only, the form
+/// smuggles one extra field the policy never declared, and the upload must be
+/// rejected with 403 AccessDenied naming the offending field.
 #[tokio::test]
-#[serial]
+async fn test_anonymous_post_object_rejects_fields_missing_from_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    // (case, bucket, object_key, form field, file body, expected code, expected mention)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        (&'static str, &'static str),
+        &'static [u8],
+        &'static str,
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "cache-control",
+            "anon-post-policy-cache-control-missing",
+            "uploads/cache-control-missing.txt",
+            ("Cache-Control", "max-age=60"),
+            b"post-policy-cache-control-missing",
+            "AccessDenied",
+            "cache-control",
+        ),
+        (
+            "content-language",
+            "anon-post-policy-content-language-missing",
+            "uploads/content-language-missing.txt",
+            ("Content-Language", "en-US"),
+            b"post-policy-content-language-missing",
+            "AccessDenied",
+            "content-language",
+        ),
+        (
+            "content-encoding",
+            "anon-post-policy-content-encoding-missing",
+            "uploads/content-encoding-missing.txt",
+            ("Content-Encoding", "gzip"),
+            b"post-policy-content-encoding-missing",
+            "AccessDenied",
+            "content-encoding",
+        ),
+        (
+            "website-redirect-location",
+            "anon-post-policy-website-redirect-missing",
+            "uploads/website-redirect-missing.txt",
+            ("x-amz-website-redirect-location", "/docs/landing.html"),
+            b"post-policy-website-redirect-missing",
+            "AccessDenied",
+            "x-amz-website-redirect-location",
+        ),
+        (
+            "expires",
+            "anon-post-policy-expires-missing",
+            "uploads/expires-missing-object.txt",
+            ("Expires", "Wed, 21 Oct 2037 07:28:00 GMT"),
+            b"post-policy-expires-missing",
+            "AccessDenied",
+            "expires",
+        ),
+        (
+            "tagging",
+            "anon-post-policy-tagging-missing",
+            "uploads/tagging-missing-object.txt",
+            ("x-amz-tagging", "project=alpha&env=test"),
+            b"post-policy-tagging-missing",
+            "AccessDenied",
+            "x-amz-tagging",
+        ),
+        (
+            "metadata",
+            "anon-post-policy-meta-reject",
+            "uploads/meta-reject-object.txt",
+            ("x-amz-meta-project", "alpha-demo"),
+            b"post-policy-body",
+            "<Code>AccessDenied</Code>",
+            "x-amz-meta-project",
+        ),
+        (
+            "metadata-new-key",
+            "anon-post-policy-meta-name-missing",
+            "uploads/meta-name-missing.txt",
+            ("x-amz-meta-name", "demo-name"),
+            b"post-policy-meta-name-missing",
+            "<Code>AccessDenied</Code>",
+            "x-amz-meta-name",
+        ),
+        (
+            "content-type",
+            "anon-post-policy-content-type-missing",
+            "uploads/content-type-missing.txt",
+            ("Content-Type", "text/plain"),
+            b"post-policy-content-type-missing",
+            "AccessDenied",
+            "content-type",
+        ),
+    ];
+
+    for (case, bucket, object_key, form_field, file_body, expected_code, expected_mention) in cases {
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[*form_field],
+            file_body,
+            reqwest::StatusCode::FORBIDDEN,
+            expected_code,
+            expected_mention,
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Table-driven fold of the seven `*_policy_mismatch` POST Object tests
+/// (backlog#1838 PR2). Every row keeps its original test's exact bucket, key,
+/// policy value, mismatched form value, file body, and expected error strings;
+/// the shared shape is: the policy pins the field to one exact value, the form
+/// sends a different one, and the upload must be rejected with 400
+/// InvalidPolicyDocument naming the field.
+#[tokio::test]
+async fn test_anonymous_post_object_rejects_exact_condition_policy_mismatches()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    // (case, bucket, object_key, field, policy value, mismatched form value, file body, expected code, expected mention)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+        &'static str,
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "content-disposition",
+            "anon-post-policy-content-disposition-reject",
+            "uploads/content-disposition-reject.txt",
+            "Content-Disposition",
+            "attachment; filename=\"payload.bin\"",
+            "inline",
+            b"post-policy-content-disposition-mismatch",
+            "InvalidPolicyDocument",
+            "content-disposition",
+        ),
+        (
+            "content-language",
+            "anon-post-policy-content-language-reject",
+            "uploads/content-language-reject.txt",
+            "Content-Language",
+            "en-US",
+            "fr-FR",
+            b"post-policy-content-language-mismatch",
+            "InvalidPolicyDocument",
+            "content-language",
+        ),
+        (
+            "content-encoding",
+            "anon-post-policy-content-encoding-reject",
+            "uploads/content-encoding-reject.txt",
+            "Content-Encoding",
+            "gzip",
+            "br",
+            b"post-policy-content-encoding-mismatch",
+            "InvalidPolicyDocument",
+            "content-encoding",
+        ),
+        (
+            "website-redirect-location",
+            "anon-post-policy-website-redirect-reject",
+            "uploads/website-redirect-reject-object.txt",
+            "x-amz-website-redirect-location",
+            "/docs/landing.html",
+            "/docs/other.html",
+            b"website-redirect-mismatch",
+            "InvalidPolicyDocument",
+            "x-amz-website-redirect-location",
+        ),
+        (
+            "metadata-uuid-exact",
+            "anon-post-policy-meta-uuid-mismatch",
+            "uploads/meta-uuid-mismatch.txt",
+            "x-amz-meta-uuid",
+            "14365123651274",
+            "151274",
+            b"post-policy-meta-uuid-mismatch",
+            "<Code>InvalidPolicyDocument</Code>",
+            "x-amz-meta-uuid",
+        ),
+        (
+            "sigv4-algorithm",
+            "anon-post-policy-sigv4-algorithm-mismatch",
+            "uploads/sigv4-algorithm-mismatch.txt",
+            "x-amz-algorithm",
+            "AWS4-HMAC-SHA256",
+            "incorrect",
+            b"post-policy-sigv4-algorithm-mismatch",
+            "<Code>InvalidPolicyDocument</Code>",
+            "x-amz-algorithm",
+        ),
+        (
+            "sigv4-credential",
+            "anon-post-policy-sigv4-credential-mismatch",
+            "uploads/sigv4-credential-mismatch.txt",
+            "x-amz-credential",
+            "KVGKMDUQ23TCZXTLTHLP/20160727/us-east-1/s3/aws4_request",
+            "incorrect",
+            b"post-policy-sigv4-credential-mismatch",
+            "<Code>InvalidPolicyDocument</Code>",
+            "x-amz-credential",
+        ),
+        (
+            "cache-control",
+            "anon-post-policy-cache-control-reject",
+            "uploads/cache-control-reject.txt",
+            "Cache-Control",
+            "max-age=60",
+            "max-age=120",
+            b"post-policy-cache-control-mismatch",
+            "InvalidPolicyDocument",
+            "cache-control",
+        ),
+        (
+            "expires",
+            "anon-post-policy-expires-reject",
+            "uploads/expires-reject-object.txt",
+            "Expires",
+            "Wed, 21 Oct 2037 07:28:00 GMT",
+            "Wed, 21 Oct 2037 08:28:00 GMT",
+            b"post-policy-expires-mismatch",
+            "InvalidPolicyDocument",
+            "expires",
+        ),
+        (
+            "tagging",
+            "anon-post-policy-tagging-reject",
+            "uploads/tagging-reject-object.txt",
+            "x-amz-tagging",
+            "project=alpha&env=test",
+            "project=alpha&env=prod",
+            b"post-policy-tagging-mismatch",
+            "InvalidPolicyDocument",
+            "x-amz-tagging",
+        ),
+        (
+            "storage-class",
+            "anon-post-storage-class-mismatch",
+            "post-storage-class-mismatch-object.txt",
+            "x-amz-storage-class",
+            "STANDARD_IA",
+            "ONEZONE_IA",
+            b"post-storage-class-mismatch",
+            "<Code>InvalidPolicyDocument</Code>",
+            "storage-class",
+        ),
+        (
+            "content-type",
+            "anon-post-policy-content-type",
+            "post-policy-content-type-object.txt",
+            "Content-Type",
+            "image/jpeg",
+            "application/octet-stream",
+            b"post-policy-body",
+            "<Code>InvalidPolicyDocument</Code>",
+            "content-type",
+        ),
+        (
+            "success-action-status",
+            "anon-post-policy-status-mismatch",
+            "uploads/status-mismatch-object.txt",
+            "success_action_status",
+            "201",
+            "204",
+            b"post-policy-body",
+            "<Code>InvalidPolicyDocument</Code>",
+            "success_action_status",
+        ),
+        (
+            "metadata-field-exact",
+            "anon-post-policy-meta-exact-mismatch",
+            "uploads/meta-exact-mismatch-object.txt",
+            "x-amz-meta-project",
+            "alpha-demo",
+            "beta-demo",
+            b"post-policy-body",
+            "<Code>InvalidPolicyDocument</Code>",
+            "x-amz-meta-project",
+        ),
+    ];
+
+    for (case, bucket, object_key, field, policy_value, form_value, file_body, expected_code, expected_mention) in cases {
+        let mut pinned_condition = serde_json::Map::new();
+        pinned_condition.insert((*field).to_string(), serde_json::Value::String((*policy_value).to_string()));
+
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::Value::Object(pinned_condition),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[(*field, *form_value)],
+            file_body,
+            reqwest::StatusCode::BAD_REQUEST,
+            expected_code,
+            expected_mention,
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Table-driven fold of the two object-lock `*_policy_mismatch` tests
+/// (backlog#1838 PR3): the policy pins both object-lock fields, the form sends
+/// one of them with a different value, and the upload must be rejected with
+/// 400 InvalidPolicyDocument naming the mismatched field.
+#[tokio::test]
+async fn test_anonymous_post_object_rejects_object_lock_policy_mismatches() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    init_logging();
+
+    // (case, bucket, object_key, form mode, form retain-until, file body, expected mention)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "retention",
+            "anon-post-policy-object-lock-retention-reject",
+            "uploads/object-lock-retention-reject.txt",
+            "GOVERNANCE",
+            "2037-10-21T08:28:00Z",
+            b"post-policy-object-lock-retention-mismatch",
+            "x-amz-object-lock-retain-until-date",
+        ),
+        (
+            "mode",
+            "anon-post-policy-object-lock-mode-reject",
+            "uploads/object-lock-mode-reject.txt",
+            "COMPLIANCE",
+            "2037-10-21T07:28:00Z",
+            b"post-policy-object-lock-mode-mismatch",
+            "x-amz-object-lock-mode",
+        ),
+    ];
+
+    for (case, bucket, object_key, form_mode, form_retain, file_body, expected_mention) in cases {
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::json!({ "x-amz-object-lock-mode": "GOVERNANCE" }),
+                serde_json::json!({ "x-amz-object-lock-retain-until-date": "2037-10-21T07:28:00Z" }),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[
+                ("x-amz-object-lock-mode", *form_mode),
+                ("x-amz-object-lock-retain-until-date", *form_retain),
+            ],
+            file_body,
+            reqwest::StatusCode::BAD_REQUEST,
+            "InvalidPolicyDocument",
+            expected_mention,
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Table-driven fold of the three SSE-KMS `*_policy_mismatch` tests
+/// (backlog#1838 PR3): the policy pins the SSE mode and one KMS parameter to
+/// exact values, the form sends a different parameter value, and the upload
+/// must be rejected with 400 InvalidPolicyDocument naming the parameter.
+#[tokio::test]
+async fn test_anonymous_post_object_rejects_sse_kms_policy_mismatches() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    // (case, bucket, object_key, kms field, policy value, mismatched form value, file body, expected mention)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [u8],
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "key-id",
+            "anon-post-sse-kms-keyid-mismatch",
+            "post-sse-kms-keyid-mismatch-object.txt",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "expected-key",
+            "other-key",
+            b"post-sse-kms-keyid-mismatch-body",
+            "aws-kms-key-id",
+        ),
+        (
+            "context",
+            "anon-post-sse-kms-context-mismatch",
+            "post-sse-kms-context-mismatch-object.txt",
+            "x-amz-server-side-encryption-context",
+            "e30=",
+            "eyJrIjoiYiJ9",
+            b"post-sse-kms-context-mismatch-body",
+            "server-side-encryption-context",
+        ),
+        (
+            "bucket-key-enabled",
+            "anon-post-sse-kms-bucket-key-mismatch",
+            "post-sse-kms-bucket-key-mismatch-object.txt",
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            "false",
+            "true",
+            b"post-sse-kms-bucket-key-mismatch-body",
+            "bucket-key-enabled",
+        ),
+    ];
+
+    for (case, bucket, object_key, field, policy_value, form_value, file_body, expected_mention) in cases {
+        let mut pinned_condition = serde_json::Map::new();
+        pinned_condition.insert((*field).to_string(), serde_json::Value::String((*policy_value).to_string()));
+
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+                serde_json::Value::Object(pinned_condition),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[("x-amz-server-side-encryption", "aws:kms"), (*field, *form_value)],
+            file_body,
+            reqwest::StatusCode::BAD_REQUEST,
+            "<Code>InvalidPolicyDocument</Code>",
+            expected_mention,
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Table-driven fold of the three SSE-KMS `*_outside_policy_conditions` tests
+/// (backlog#1838 PR3): the policy pins only the SSE mode, the form smuggles
+/// one extra KMS parameter the policy never declared, and the request must
+/// sail past policy validation and be rejected at runtime with 501
+/// NotImplemented (SSE-KMS POST uploads are not implemented), not with a
+/// policy error.
+#[tokio::test]
+async fn test_anonymous_post_object_rejects_sse_kms_params_outside_policy_conditions()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    // (case, bucket, object_key, extra kms form field, file body)
+    type Case = (&'static str, &'static str, &'static str, (&'static str, &'static str), &'static [u8]);
+    let cases: &[Case] = &[
+        (
+            "key-id",
+            "anon-post-sse-kms-keyid",
+            "post-sse-kms-keyid-object.txt",
+            ("x-amz-server-side-encryption-aws-kms-key-id", "test-key"),
+            b"post-sse-kms-body",
+        ),
+        (
+            "context",
+            "anon-post-sse-kms-context",
+            "post-sse-kms-context-object.txt",
+            ("x-amz-server-side-encryption-context", "e30="),
+            b"post-sse-kms-context-body",
+        ),
+        (
+            "bucket-key-enabled",
+            "anon-post-sse-kms-bucket-key",
+            "post-sse-kms-bucket-key-object.txt",
+            ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+            b"post-sse-kms-bucket-key-body",
+        ),
+    ];
+
+    for (case, bucket, object_key, kms_field, file_body) in cases {
+        run_post_object_policy_case(
+            bucket,
+            object_key,
+            vec![
+                serde_json::json!({ "bucket": bucket }),
+                serde_json::json!({ "key": object_key }),
+                serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
+                serde_json::json!(["content-length-range", 0, 1024]),
+            ],
+            &[("x-amz-server-side-encryption", "aws:kms"), *kms_field],
+            file_body,
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+            "<Code>NotImplemented</Code>",
+            "notimplemented",
+            case,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -360,7 +961,6 @@ async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -394,7 +994,6 @@ async fn test_anonymous_post_object_requires_auth() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_honors_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -458,7 +1057,6 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -531,7 +1129,6 @@ async fn test_anonymous_post_object_honors_success_action_redirect() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -577,7 +1174,6 @@ async fn test_anonymous_post_object_defaults_to_no_content() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -624,355 +1220,6 @@ async fn test_anonymous_post_object_rejects_sse_kms() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_with_key_id_outside_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-keyid";
-    let object_key = "post-sse-kms-keyid-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-aws-kms-key-id", "test-key")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-
-    assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        "SSE-KMS key id should not fail policy validation before runtime rejection"
-    );
-    assert!(
-        response_body.contains("<Code>NotImplemented</Code>"),
-        "response should contain NotImplemented code, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_with_context_outside_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-context";
-    let object_key = "post-sse-kms-context-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-context", "e30=")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-context-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-
-    assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        "SSE-KMS context should not fail policy validation before runtime rejection"
-    );
-    assert!(
-        response_body.contains("<Code>NotImplemented</Code>"),
-        "response should contain NotImplemented code, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_key_id_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-keyid-mismatch";
-    let object_key = "post-sse-kms-keyid-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!({ "x-amz-server-side-encryption-aws-kms-key-id": "expected-key" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-aws-kms-key-id", "other-key")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-keyid-mismatch-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("aws-kms-key-id"),
-        "response should mention the conflicting kms key id field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_context_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-context-mismatch";
-    let object_key = "post-sse-kms-context-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!({ "x-amz-server-side-encryption-context": "e30=" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-context", "eyJrIjoiYiJ9")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-context-mismatch-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("server-side-encryption-context"),
-        "response should mention the conflicting kms context field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_with_bucket_key_enabled_outside_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-bucket-key";
-    let object_key = "post-sse-kms-bucket-key-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-bucket-key-enabled", "true")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-bucket-key-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-
-    assert_eq!(
-        status,
-        reqwest::StatusCode::NOT_IMPLEMENTED,
-        "SSE-KMS bucket-key-enabled should not fail policy validation before runtime rejection"
-    );
-    assert!(
-        response_body.contains("<Code>NotImplemented</Code>"),
-        "response should contain NotImplemented code, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sse_kms_bucket_key_enabled_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-sse-kms-bucket-key-mismatch";
-    let object_key = "post-sse-kms-bucket-key-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-server-side-encryption": "aws:kms" }),
-        serde_json::json!({ "x-amz-server-side-encryption-bucket-key-enabled": "false" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-server-side-encryption", "aws:kms")
-        .text("x-amz-server-side-encryption-bucket-key-enabled", "true")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-sse-kms-bucket-key-mismatch-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("bucket-key-enabled"),
-        "response should mention the conflicting bucket-key-enabled field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1030,7 +1277,6 @@ async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1103,7 +1349,6 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1177,7 +1422,6 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1228,7 +1472,6 @@ async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_sse_s3_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1292,7 +1535,6 @@ async fn test_anonymous_post_object_accepts_sse_s3_missing_from_policy_condition
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1346,7 +1588,6 @@ async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1397,64 +1638,6 @@ async fn test_anonymous_post_object_rejects_storage_class_missing_from_policy_co
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_storage_class_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-storage-class-mismatch";
-    let object_key = "post-storage-class-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-storage-class": "STANDARD_IA" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-storage-class", "ONEZONE_IA")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-storage-class-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("storage-class"),
-        "response should mention storage class mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_storage_class_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -1506,7 +1689,6 @@ async fn test_anonymous_post_object_rejects_invalid_storage_class_value() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_algorithm_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1562,7 +1744,6 @@ async fn test_anonymous_post_object_rejects_checksum_algorithm_missing_from_poli
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_algorithm_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1619,7 +1800,6 @@ async fn test_anonymous_post_object_rejects_checksum_algorithm_policy_mismatch()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_checksum_auxiliary_fields_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1683,7 +1863,6 @@ async fn test_anonymous_post_object_rejects_checksum_auxiliary_fields_missing_fr
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1760,7 +1939,6 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -1819,7 +1997,6 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_duplicate_key_form_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -1869,7 +2046,6 @@ async fn test_anonymous_post_object_rejects_duplicate_key_form_values() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -1917,7 +2093,6 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_status() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -1965,7 +2140,6 @@ async fn test_anonymous_post_object_rejects_invalid_success_action_redirect()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2020,7 +2194,6 @@ async fn test_anonymous_post_object_rejects_form_fields_missing_from_policy_cond
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2077,7 +2250,6 @@ async fn test_anonymous_post_object_accepts_form_fields_covered_by_policy_condit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -2132,7 +2304,6 @@ async fn test_anonymous_post_object_rejects_starts_with_policy_mismatch() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_content_length_range_violation()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2185,64 +2356,6 @@ async fn test_anonymous_post_object_rejects_content_length_range_violation()
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_success_action_status_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-status-mismatch";
-    let object_key = "uploads/status-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "success_action_status": "201" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("success_action_status", "204")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("success_action_status"),
-        "response should mention the conflicting status field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_success_action_status_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2299,7 +2412,6 @@ async fn test_anonymous_post_object_accepts_success_action_status_exact_policy_m
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_success_action_redirect_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2356,7 +2468,6 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_policy_misma
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_success_action_redirect_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2422,7 +2533,6 @@ async fn test_anonymous_post_object_accepts_success_action_redirect_exact_policy
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2475,7 +2585,6 @@ async fn test_anonymous_post_object_rejects_success_action_redirect_missing_from
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_metadata_field_covered_by_starts_with()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2530,7 +2639,6 @@ async fn test_anonymous_post_object_accepts_metadata_field_covered_by_starts_wit
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_type_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2588,7 +2696,6 @@ async fn test_anonymous_post_object_accepts_content_type_field_exact_policy_matc
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_type_field_covered_by_starts_with()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2646,7 +2753,6 @@ async fn test_anonymous_post_object_accepts_content_type_field_covered_by_starts
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_disposition_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2704,61 +2810,6 @@ async fn test_anonymous_post_object_accepts_content_disposition_field_exact_poli
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_disposition_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-disposition-reject";
-    let object_key = "uploads/content-disposition-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Content-Disposition": "attachment; filename=\"payload.bin\"" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Disposition", "inline")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-disposition-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("content-disposition"),
-        "response should mention content-disposition mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2816,114 +2867,6 @@ async fn test_anonymous_post_object_accepts_cache_control_field_exact_policy_mat
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_cache_control_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-cache-control-reject";
-    let object_key = "uploads/cache-control-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Cache-Control": "max-age=60" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Cache-Control", "max-age=120")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-cache-control-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("cache-control"),
-        "response should mention cache-control mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_cache_control_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-cache-control-missing";
-    let object_key = "uploads/cache-control-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Cache-Control", "max-age=60")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-cache-control-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("cache-control"),
-        "response should mention cache-control, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -2981,114 +2924,6 @@ async fn test_anonymous_post_object_accepts_content_language_field_exact_policy_
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_language_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-language-reject";
-    let object_key = "uploads/content-language-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Content-Language": "en-US" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Language", "fr-FR")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-language-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("content-language"),
-        "response should mention content-language mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_language_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-language-missing";
-    let object_key = "uploads/content-language-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Language", "en-US")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-language-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-language"),
-        "response should mention content-language, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_content_encoding_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3146,114 +2981,6 @@ async fn test_anonymous_post_object_accepts_content_encoding_field_exact_policy_
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_encoding_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-encoding-reject";
-    let object_key = "uploads/content-encoding-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Content-Encoding": "gzip" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Encoding", "br")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-encoding-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("content-encoding"),
-        "response should mention content-encoding mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_encoding_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-encoding-missing";
-    let object_key = "uploads/content-encoding-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Encoding", "gzip")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-encoding-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-encoding"),
-        "response should mention content-encoding, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_website_redirect_location_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3311,114 +3038,6 @@ async fn test_anonymous_post_object_accepts_website_redirect_location_exact_poli
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_website_redirect_location_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-website-redirect-missing";
-    let object_key = "uploads/website-redirect-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-website-redirect-location", "/docs/landing.html")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-website-redirect-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("x-amz-website-redirect-location"),
-        "response should mention x-amz-website-redirect-location, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_website_redirect_location_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-website-redirect-reject";
-    let object_key = "uploads/website-redirect-reject-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-website-redirect-location": "/docs/landing.html" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-website-redirect-location", "/docs/other.html")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"website-redirect-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("x-amz-website-redirect-location"),
-        "response should mention x-amz-website-redirect-location mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3476,114 +3095,6 @@ async fn test_anonymous_post_object_accepts_expires_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_expires_field_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-expires-reject";
-    let object_key = "uploads/expires-reject-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Expires": "Wed, 21 Oct 2037 07:28:00 GMT" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Expires", "Wed, 21 Oct 2037 08:28:00 GMT")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-expires-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("expires"),
-        "response should mention Expires mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_expires_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-expires-missing";
-    let object_key = "uploads/expires-missing-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Expires", "Wed, 21 Oct 2037 07:28:00 GMT")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-expires-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("expires"),
-        "response should mention Expires, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_retention_without_permission()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3639,129 +3150,6 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_without_permis
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_object_lock_retention_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-object-lock-retention-reject";
-    let object_key = "uploads/object-lock-retention-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client
-        .create_bucket()
-        .bucket(bucket)
-        .object_lock_enabled_for_bucket(true)
-        .send()
-        .await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-object-lock-mode": "GOVERNANCE" }),
-        serde_json::json!({ "x-amz-object-lock-retain-until-date": "2037-10-21T07:28:00Z" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-object-lock-mode", "GOVERNANCE")
-        .text("x-amz-object-lock-retain-until-date", "2037-10-21T08:28:00Z")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-object-lock-retention-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("x-amz-object-lock-retain-until-date"),
-        "response should mention x-amz-object-lock-retain-until-date mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_object_lock_mode_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-object-lock-mode-reject";
-    let object_key = "uploads/object-lock-mode-reject.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client
-        .create_bucket()
-        .bucket(bucket)
-        .object_lock_enabled_for_bucket(true)
-        .send()
-        .await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-object-lock-mode": "GOVERNANCE" }),
-        serde_json::json!({ "x-amz-object-lock-retain-until-date": "2037-10-21T07:28:00Z" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-object-lock-mode", "COMPLIANCE")
-        .text("x-amz-object-lock-retain-until-date", "2037-10-21T07:28:00Z")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-object-lock-mode-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("x-amz-object-lock-mode"),
-        "response should mention x-amz-object-lock-mode mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3821,7 +3209,6 @@ async fn test_anonymous_post_object_rejects_object_lock_retention_missing_from_p
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_without_permission()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3874,7 +3261,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_without_permi
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_policy_mismatch()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3933,7 +3319,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_policy_mismat
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_object_lock_legal_hold_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -3991,7 +3376,6 @@ async fn test_anonymous_post_object_rejects_object_lock_legal_hold_missing_from_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4057,227 +3441,6 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_tagging_field_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-tagging-reject";
-    let object_key = "uploads/tagging-reject-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-tagging": "project=alpha&env=test" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-tagging", "project=alpha&env=prod")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-tagging-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("InvalidPolicyDocument"));
-    assert!(
-        response_body_lower.contains("x-amz-tagging"),
-        "response should mention x-amz-tagging mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_tagging_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-tagging-missing";
-    let object_key = "uploads/tagging-missing-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-tagging", "project=alpha&env=test")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-tagging-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("x-amz-tagging"),
-        "response should mention x-amz-tagging, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_field_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-reject";
-    let object_key = "uploads/meta-reject-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-project", "alpha-demo")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(
-        response_body.contains("<Code>AccessDenied</Code>"),
-        "response should contain AccessDenied code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("x-amz-meta-project"),
-        "response should mention the missing metadata field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_field_exact_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-exact-mismatch";
-    let object_key = "uploads/meta-exact-mismatch-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-meta-project": "alpha-demo" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-project", "beta-demo")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("x-amz-meta-project"),
-        "response should mention the conflicting metadata field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_accepts_metadata_field_exact_policy_match()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4336,7 +3499,6 @@ async fn test_anonymous_post_object_accepts_metadata_field_exact_policy_match()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4389,222 +3551,6 @@ async fn test_anonymous_post_object_allows_x_ignore_fields_outside_policy_condit
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_field_missing_from_policy_conditions_for_new_key()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-name-missing";
-    let object_key = "uploads/meta-name-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-name", "demo-name")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-meta-name-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("<Code>AccessDenied</Code>"));
-    assert!(
-        response_body_lower.contains("x-amz-meta-name"),
-        "response should mention x-amz-meta-name, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_metadata_uuid_exact_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-meta-uuid-mismatch";
-    let object_key = "uploads/meta-uuid-mismatch.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-meta-uuid": "14365123651274" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-meta-uuid", "151274")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-meta-uuid-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("<Code>InvalidPolicyDocument</Code>"));
-    assert!(
-        response_body_lower.contains("x-amz-meta-uuid"),
-        "response should mention x-amz-meta-uuid mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sigv4_algorithm_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-sigv4-algorithm-mismatch";
-    let object_key = "uploads/sigv4-algorithm-mismatch.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-algorithm": "AWS4-HMAC-SHA256" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-algorithm", "incorrect")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-sigv4-algorithm-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("<Code>InvalidPolicyDocument</Code>"));
-    assert!(
-        response_body_lower.contains("x-amz-algorithm"),
-        "response should mention x-amz-algorithm mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_sigv4_credential_policy_mismatch()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-sigv4-credential-mismatch";
-    let object_key = "uploads/sigv4-credential-mismatch.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "x-amz-credential": "KVGKMDUQ23TCZXTLTHLP/20160727/us-east-1/s3/aws4_request" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("x-amz-credential", "incorrect")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-sigv4-credential-mismatch".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(response_body.contains("<Code>InvalidPolicyDocument</Code>"));
-    assert!(
-        response_body_lower.contains("x-amz-credential"),
-        "response should mention x-amz-credential mismatch, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4657,7 +3603,6 @@ async fn test_anonymous_post_object_rejects_sigv4_date_policy_mismatch() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -4712,7 +3657,6 @@ async fn test_anonymous_post_object_rejects_mismatched_bucket_form_field() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_multiple_bucket_values() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -4764,7 +3708,6 @@ async fn test_anonymous_post_object_rejects_multiple_bucket_values() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -4820,117 +3763,6 @@ async fn test_anonymous_post_object_rejects_extra_content_disposition_field()
 }
 
 #[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_type_policy_mismatch() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-type";
-    let object_key = "post-policy-content-type-object.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!({ "Content-Type": "image/jpeg" }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Type", "application/octet-stream")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-body".to_vec())
-                .file_name("upload.txt")
-                .mime_str("application/octet-stream")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert!(
-        response_body.contains("<Code>InvalidPolicyDocument</Code>"),
-        "response should contain InvalidPolicyDocument code, got: {response_body}"
-    );
-    assert!(
-        response_body_lower.contains("content-type"),
-        "response should mention the conflicting field, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
-async fn test_anonymous_post_object_rejects_content_type_missing_from_policy_conditions()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    init_logging();
-
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-
-    let bucket = "anon-post-policy-content-type-missing";
-    let object_key = "uploads/content-type-missing.txt";
-
-    let admin_client = env.create_s3_client();
-    admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
-
-    let policy = encode_post_policy(vec![
-        serde_json::json!({ "bucket": bucket }),
-        serde_json::json!({ "key": object_key }),
-        serde_json::json!(["content-length-range", 0, 1024]),
-    ]);
-
-    let post_form = reqwest::multipart::Form::new()
-        .text("key", object_key.to_string())
-        .text("policy", policy)
-        .text("Content-Type", "text/plain")
-        .part(
-            "file",
-            reqwest::multipart::Part::bytes(b"post-policy-content-type-missing".to_vec())
-                .file_name("upload.txt")
-                .mime_str("text/plain")?,
-        );
-
-    let post_resp = local_http_client()
-        .post(format!("{}/{}", env.url, bucket))
-        .multipart(post_form)
-        .send()
-        .await?;
-
-    let status = post_resp.status();
-    let response_body = post_resp.text().await?;
-    let response_body_lower = response_body.to_ascii_lowercase();
-
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(response_body.contains("AccessDenied"));
-    assert!(
-        response_body_lower.contains("content-type"),
-        "response should mention content-type, got: {response_body}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5001,7 +3833,6 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_objects()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5066,7 +3897,6 @@ async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5114,7 +3944,6 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5157,7 +3986,6 @@ async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5193,7 +4021,6 @@ async fn test_signed_put_object_extract_rejects_invalid_storage_class() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5247,7 +4074,6 @@ async fn test_signed_put_object_rejects_write_offset_bytes_header() -> Result<()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_error_body()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5286,7 +4112,6 @@ async fn test_raw_signed_put_object_write_offset_bytes_returns_minio_compatible_
 }
 
 #[tokio::test]
-#[serial]
 async fn test_anonymous_put_object_write_offset_bytes_returns_minio_compatible_error_body()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5345,7 +4170,6 @@ async fn test_anonymous_put_object_write_offset_bytes_returns_minio_compatible_e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5410,7 +4234,6 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5466,7 +4289,6 @@ async fn test_signed_put_object_extract_rejects_bucket_default_sse_kms() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5531,7 +4353,6 @@ async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_object_lock_legal_hold() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -5586,7 +4407,6 @@ async fn test_signed_put_object_extract_preserves_object_lock_legal_hold() -> Re
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -5646,7 +4466,6 @@ async fn test_signed_put_object_extract_preserves_object_lock_retention() -> Res
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_pax_retention_overrides_request_retention()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5710,7 +4529,6 @@ async fn test_signed_put_object_extract_pax_retention_overrides_request_retentio
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5744,7 +4562,6 @@ async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5780,7 +4597,6 @@ async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -5834,7 +4650,6 @@ async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retention_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -6144,7 +4959,6 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_accepts_compat_header() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6186,7 +5000,6 @@ async fn test_signed_put_object_extract_accepts_compat_header() -> Result<(), Bo
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_preserves_directory_markers_by_default()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -6247,7 +5060,6 @@ async fn test_signed_put_object_extract_preserves_directory_markers_by_default()
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tar_gz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6299,7 +5111,6 @@ async fn test_signed_put_object_extract_expands_tar_gz_archive() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tgz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6351,7 +5162,6 @@ async fn test_signed_put_object_extract_expands_tgz_archive() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tbz2_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6403,7 +5213,6 @@ async fn test_signed_put_object_extract_expands_tbz2_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_txz_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6455,7 +5264,6 @@ async fn test_signed_put_object_extract_expands_txz_archive() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -6529,7 +5337,6 @@ async fn test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_e
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_normalizes_prefix_header_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6572,7 +5379,6 @@ async fn test_signed_put_object_extract_normalizes_prefix_header_value() -> Resu
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -6624,7 +5430,6 @@ async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -6658,7 +5463,6 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_signed_put_object_extract_rejects_invalid_tar_gz_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 

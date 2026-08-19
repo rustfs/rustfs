@@ -14,6 +14,7 @@
 
 use super::runtime_sources;
 use crate::admin::console::is_console_path;
+use crate::app::object_traffic_health::ObjectTrafficHealth;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -1238,19 +1239,31 @@ where
 }
 
 #[derive(Clone)]
-pub struct PublicHealthEndpointLayer;
+pub struct PublicHealthEndpointLayer {
+    server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+}
+
+impl PublicHealthEndpointLayer {
+    pub fn new(server_ctx: Arc<crate::runtime_sources::ServerContextSlot>) -> Self {
+        Self { server_ctx }
+    }
+}
 
 impl<S> Layer<S> for PublicHealthEndpointLayer {
     type Service = PublicHealthEndpointService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        PublicHealthEndpointService { inner }
+        PublicHealthEndpointService {
+            inner,
+            server_ctx: Arc::clone(&self.server_ctx),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct PublicHealthEndpointService<S> {
     inner: S,
+    server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
 }
 
 fn health_endpoint_enabled() -> bool {
@@ -1318,6 +1331,7 @@ async fn health_kms_ready() -> bool {
 async fn build_public_health_http_response<RestBody, GrpcBody>(
     method: Method,
     path: String,
+    object_traffic_health: Option<Arc<ObjectTrafficHealth>>,
 ) -> Response<HybridBody<RestBody, GrpcBody>>
 where
     RestBody: From<Bytes>,
@@ -1342,7 +1356,7 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_probe_readiness(probe).await;
+    let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
@@ -1388,7 +1402,11 @@ where
         if is_public_health_endpoint_request(method, path) {
             let method = method.clone();
             let path = path.to_owned();
-            return Box::pin(async move { Ok(build_public_health_http_response(method, path).await) });
+            let object_traffic_health = self
+                .server_ctx
+                .installed_app_context()
+                .map(|context| context.object_traffic_health());
+            return Box::pin(async move { Ok(build_public_health_http_response(method, path, object_traffic_health).await) });
         }
 
         let mut inner = self.inner.clone();
@@ -2185,6 +2203,17 @@ mod tests {
     use temp_env::{async_with_vars, with_var};
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
+    fn public_health_layer() -> PublicHealthEndpointLayer {
+        PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new())
+    }
+
+    async fn public_health_layer_with_tracker(object_traffic_health: Arc<ObjectTrafficHealth>) -> PublicHealthEndpointLayer {
+        let app_context = crate::app::gating_test_env::app_context_with_object_traffic_health(object_traffic_health).await;
+        let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+        assert!(server_ctx.install(app_context));
+        PublicHealthEndpointLayer::new(server_ctx)
+    }
+
     #[derive(Clone, Debug)]
     struct CaptureService;
 
@@ -2651,7 +2680,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2846,7 +2875,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2874,7 +2903,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2899,7 +2928,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2924,7 +2953,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2948,11 +2977,105 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn public_readiness_aliases_use_the_installed_object_progress() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+                let stalled = object_traffic_health
+                    .track_read_storage()
+                    .expect("read tracking must be enabled");
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer_with_tracker(Arc::clone(&object_traffic_health))
+                    .await
+                    .layer(inner);
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("canonical readiness request"),
+                    )
+                    .await
+                    .expect("canonical readiness response");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("readiness body")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                assert_eq!(payload["ready"], false);
+                assert_eq!(payload["degradedReasons"], serde_json::json!(["object_read_stalled"]));
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(MINIO_HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("MinIO readiness request"),
+                    )
+                    .await
+                    .expect("MinIO readiness response");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(
+                    BodyExt::collect(response.into_body())
+                        .await
+                        .expect("HEAD body")
+                        .to_bytes()
+                        .is_empty()
+                );
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_COMPAT_LIVE_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("liveness request"),
+                    )
+                    .await
+                    .expect("liveness response");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+                drop(stalled);
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("recovered readiness request"),
+                    )
+                    .await
+                    .expect("recovered readiness response");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    BodyExt::collect(response.into_body())
+                        .await
+                        .expect("HEAD body")
+                        .to_bytes()
+                        .is_empty()
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_handles_minio_health_cluster_before_inner_service() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -2977,7 +3100,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3002,7 +3125,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3027,7 +3150,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3069,7 +3192,7 @@ mod tests {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
             let calls = inner.calls();
-            let mut service = PublicHealthEndpointLayer.layer(inner);
+            let mut service = public_health_layer().layer(inner);
 
             let response = service
                 .call(
@@ -3092,7 +3215,7 @@ mod tests {
     async fn public_health_endpoint_layer_forwards_non_health_requests() {
         let inner = CountingHybridService::default();
         let calls = inner.calls();
-        let mut service = PublicHealthEndpointLayer.layer(inner);
+        let mut service = public_health_layer().layer(inner);
 
         let response = service
             .call(

@@ -14,9 +14,12 @@
 
 use rustfs_iam::{
     federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
-    get_oidc, init_oidc_sys,
+    get_oidc, init_oidc_sys_with_extra_root_ca_provider,
+    oidc::{OidcExtraRootCaMaterial, OidcExtraRootCaProvider},
 };
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io::{Error, Result},
     sync::Arc,
 };
@@ -50,7 +53,7 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
         }
     }
 
-    match init_oidc_sys().await {
+    match init_oidc_sys_with_extra_root_ca_provider(oidc_extra_root_ca_provider()).await {
         Ok(()) => {
             if let Some(oidc) = get_oidc() {
                 let adapter = Arc::new(StandardOidcAdapter::new(oidc));
@@ -71,4 +74,41 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
     }
 
     Ok(())
+}
+
+pub(crate) fn oidc_extra_root_ca_provider() -> OidcExtraRootCaProvider {
+    OidcExtraRootCaProvider::new(current_oidc_extra_root_ca_material)
+}
+
+pub(crate) async fn current_oidc_extra_root_ca_material() -> std::result::Result<OidcExtraRootCaMaterial, String> {
+    let outbound_tls = crate::runtime_sources::current_outbound_tls_state().await;
+    let outbound_generation = outbound_tls.as_ref().map(|state| state.generation.0).unwrap_or_default();
+    let mut root_ca_pem = outbound_tls.as_ref().and_then(|state| state.root_ca_pem.clone());
+
+    if let Some(extra_ca_pem) = crate::server::tls_material::load_configured_oidc_extra_ca_cert()
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        match root_ca_pem.as_mut() {
+            Some(root_ca_pem) => {
+                if !root_ca_pem.is_empty() && !root_ca_pem.ends_with(b"\n") {
+                    root_ca_pem.push(b'\n');
+                }
+                root_ca_pem.extend_from_slice(&extra_ca_pem);
+            }
+            None => root_ca_pem = Some(extra_ca_pem),
+        }
+    }
+
+    Ok(OidcExtraRootCaMaterial {
+        generation: oidc_extra_root_ca_generation(outbound_generation, root_ca_pem.as_deref()),
+        root_ca_pem,
+    })
+}
+
+fn oidc_extra_root_ca_generation(outbound_generation: u64, root_ca_pem: Option<&[u8]>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    outbound_generation.hash(&mut hasher);
+    root_ca_pem.hash(&mut hasher);
+    hasher.finish()
 }

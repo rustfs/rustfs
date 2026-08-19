@@ -59,6 +59,10 @@ impl fmt::Debug for Credentials {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[allow(
+    dead_code,
+    reason = "MinIO-parity bucket-target service discriminator with no caller in this port (backlog#1823)"
+)]
 pub enum ServiceType {
     #[default]
     Replication,

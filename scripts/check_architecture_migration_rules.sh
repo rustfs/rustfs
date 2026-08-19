@@ -242,6 +242,7 @@ REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_c
 REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_resync_boundary_bypass_hits.txt"
 REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_object_decision_boundary_bypass_hits.txt"
 REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_object_compare_contract_backslide_hits.txt"
+REPLICATION_M2_DECISION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_m2_decision_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
 STORAGE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_crate_bypass_hits.txt"
@@ -2981,7 +2982,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_resync_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct|enum)\s+(?:ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)|fn\s+(?:resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch))\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct|enum)\s+(?:ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)|fn\s+(?:resync_state_accepts_update|resync_status_duration|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" || replication_resync_status=$?
   if [[ "$replication_resync_status" -ne 0 && "$replication_resync_status" -ne 1 ]]; then
@@ -2996,7 +2997,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_resync_boundary_status=0
-  rg -n --with-filename 'rustfs_replication::(resync::(RESYNC_META_FORMAT|RESYNC_META_VERSION|WIRE_ZERO_TIME_UNIX)|mrf::(MRF_META_FORMAT|MRF_META_VERSION)|(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b)' \
+  rg -n --with-filename 'rustfs_replication::(resync::(RESYNC_META_FORMAT|RESYNC_META_VERSION|WIRE_ZERO_TIME_UNIX)|mrf::(MRF_META_FORMAT|MRF_META_VERSION)|(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|resync_status_duration|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b)' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' \
     --glob '!replication_resync_boundary.rs' >"$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" || replication_resync_boundary_status=$?
@@ -3005,7 +3006,7 @@ fi
   fi
 
   replication_resync_boundary_grouped_status=0
-  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b' \
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|resync_status_duration|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' \
     --glob '!replication_resync_boundary.rs' >>"$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" || replication_resync_boundary_grouped_status=$?
@@ -3021,7 +3022,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_object_decision_boundary_status=0
-  rg -n --with-filename 'rustfs_replication::(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_target_for_object|should_retry_delete_marker_purge)\b' \
+  rg -n --with-filename 'rustfs_replication::(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_marker_purge_mrf_entry|delete_marker_purge_version_id|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replicate_delete_outcome|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_existing_delete_replication_info|resync_target_for_object|should_retry_delete_marker_purge|target_delete_version_id)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' \
     --glob '!replication_object_decision_boundary.rs' >"$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE" || replication_object_decision_boundary_status=$?
@@ -3030,7 +3031,7 @@ fi
   fi
 
   replication_object_decision_boundary_grouped_status=0
-  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_target_for_object|should_retry_delete_marker_purge)\b' \
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_marker_purge_mrf_entry|delete_marker_purge_version_id|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replicate_delete_outcome|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_existing_delete_replication_info|resync_target_for_object|should_retry_delete_marker_purge|target_delete_version_id)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' \
     --glob '!replication_object_decision_boundary.rs' >>"$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE" || replication_object_decision_boundary_grouped_status=$?
@@ -3056,6 +3057,25 @@ fi
 
 if [[ -s "$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication object comparison contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_m2_decision_status=0
+  # M2-moved pure decision contracts must not be redefined in ECStore. The
+  # ssec_passthrough_evidence_present name is deliberately absent: ECStore
+  # keeps a thin HeadObjectOutput adapter under that name in
+  # replication_target_boundary.rs which delegates to the crate-owned pure fn.
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:enum\s+(?:SsecPassthroughCapability|SsecPassthroughGate)|fn\s+(?:replicate_delete_outcome|target_delete_version_id|delete_marker_purge_version_id|delete_marker_purge_mrf_entry|resync_existing_delete_replication_info|version_identity_drifted|is_replication_target_offline_error|ssec_passthrough_gate))\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' >"$REPLICATION_M2_DECISION_CONTRACT_BACKSLIDE_HITS_FILE" || replication_m2_decision_status=$?
+  if [[ "$replication_m2_decision_status" -ne 0 && "$replication_m2_decision_status" -ne 1 ]]; then
+    exit "$replication_m2_decision_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_M2_DECISION_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "M2-moved replication decision contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_M2_DECISION_CONTRACT_BACKSLIDE_HITS_FILE")"
 fi
 
 (
@@ -3728,6 +3748,12 @@ fi
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
+  # M2-moved target decision contracts (pure gate family, offline classifier,
+  # version identity drift) route through the target boundary only.
+  rg -n -U --with-filename 'rustfs_replication::\{[^;]*\b(?:SsecPassthroughCapability|SsecPassthroughGate|is_replication_target_offline_error|ssec_passthrough_gate|ssec_passthrough_evidence_present|version_identity_drifted)\b|rustfs_replication::(?:SsecPassthroughCapability|SsecPassthroughGate|is_replication_target_offline_error|ssec_passthrough_gate|ssec_passthrough_evidence_present|version_identity_drifted)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
 ) >"$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE" ]]; then
@@ -4033,7 +4059,7 @@ if [[ -s "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE" ]]; then
   report_failure "remote tier delete state access must stay behind ECStore tier sweeper owner helpers: $(paste -sd '; ' "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE")"
 fi
 
-RUSTFS_OWNER_LOCAL_STATIC_NAMES='(KEYSTONE_AUTH|KEYSTONE_MAPPER|KEYSTONE_CONFIG|LICENSE_STATE|LICENSE_VERIFIER|CPU_CONT_GUARD|PROFILING_CANCEL_TOKEN|MEMORY_SYSTEM|DIAL9_TELEMETRY_GUARD|DISPLAY_CONFIG_SNAPSHOT|GLOBAL_CONFIG_SNAPSHOT|BUFFER_CONFIG_SINGLETON|BUFFER_PROFILE_ENABLED|LEGACY_CREDENTIAL_WARNED_KEYS|CONSOLE_CONFIG|ACTIVE_HTTP_REQUESTS|USE_STARSHARD_CACHE|BUCKET_CACHE_SMALL|BUCKET_CACHE_LARGE|GLOBAL_SSE_DEK_PROVIDER|SSE_TEST_LOCK|AUTH_FS|LOCK_STATS|DEADLOCK_DETECTOR|GET_OBJECT_BUFFER_THRESHOLD_WARNED|GET_READER_STREAM_BUFFER_SIZE_OVERRIDE|OBJECT_SEEK_SUPPORT_THRESHOLD|OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS|SUPPORTED_HEADERS|SITE_REPLICATION_PEER_CLIENT|SITE_REPLICATION_STATE_LOCK|AUDIT_MODULE_ENABLED|NOTIFY_MODULE_ENABLED|PERSISTED_NOTIFY_MODULE_ENABLED|PERSISTED_AUDIT_MODULE_ENABLED|PERSISTED_MODULE_SWITCH_CONFIGURED|DELETE_TAIL_TOTAL|DELETE_CLEANUP_TOTAL|DELETE_REPLICATION_TOTAL|DELETE_NOTIFY_TOTAL|EMBEDDED_SERVER_STARTED|TEST_OUTBOUND_TLS_GENERATION|TEST_REMAINING_FAILURES|CAPACITY_DIRTY_SCOPE_ENV|CAPACITY_DIRTY_SCOPE_INIT|GLOBAL_ENV)'
+RUSTFS_OWNER_LOCAL_STATIC_NAMES='(KEYSTONE_AUTH|KEYSTONE_MAPPER|KEYSTONE_CONFIG|LICENSE_STATE|LICENSE_VERIFIER|CPU_CONT_GUARD|PROFILING_CANCEL_TOKEN|MEMORY_SYSTEM|DIAL9_TELEMETRY_GUARD|DISPLAY_CONFIG_SNAPSHOT|GLOBAL_CONFIG_SNAPSHOT|BUFFER_CONFIG_SINGLETON|BUFFER_PROFILE_ENABLED|LEGACY_CREDENTIAL_WARNED_KEYS|CONSOLE_CONFIG|ACTIVE_HTTP_REQUESTS|USE_STARSHARD_CACHE|BUCKET_CACHE_SMALL|BUCKET_CACHE_LARGE|GLOBAL_SSE_DEK_PROVIDER|SSE_TEST_LOCK|AUTH_FS|LOCK_STATS|DEADLOCK_DETECTOR|GET_OBJECT_BUFFER_THRESHOLD_WARNED|GET_READER_STREAM_BUFFER_SIZE_OVERRIDE|OBJECT_SEEK_SUPPORT_THRESHOLD|OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS|SUPPORTED_HEADERS|SITE_REPLICATION_PEER_CLIENT|AUDIT_MODULE_ENABLED|NOTIFY_MODULE_ENABLED|PERSISTED_NOTIFY_MODULE_ENABLED|PERSISTED_AUDIT_MODULE_ENABLED|PERSISTED_MODULE_SWITCH_CONFIGURED|DELETE_TAIL_TOTAL|DELETE_CLEANUP_TOTAL|DELETE_REPLICATION_TOTAL|DELETE_NOTIFY_TOTAL|EMBEDDED_SERVER_STARTED|TEST_OUTBOUND_TLS_GENERATION|TEST_REMAINING_FAILURES|CAPACITY_DIRTY_SCOPE_ENV|CAPACITY_DIRTY_SCOPE_INIT|GLOBAL_ENV)'
 
 (
   cd "$ROOT_DIR"
@@ -5419,6 +5445,87 @@ require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn set_disks_implements_storage_heal_operations_contract()" \
   "SetDisks storage-api HealOperations compile-time coverage test"
+
+# --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
+# ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
+# and madmin as leaf crates that depend only on external crates. Allowlist:
+# io-metrics -> rustfs-s3-ops (contract crate; leaf-allowance adjudication is
+# tracked as backlog#1834 PR2). Adding any other rustfs-* dependency to a leaf
+# crate needs a maintainer decision, not a quiet Cargo.toml edit.
+LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
+: >"$LEAF_CRATE_DEP_HITS_FILE"
+(
+  cd "$ROOT_DIR"
+  for leaf in config credentials crypto io-metrics madmin; do
+    manifest="crates/${leaf}/Cargo.toml"
+    [[ -f "$manifest" ]] || continue
+    leaf_dep_status=0
+    rg -n --with-filename '^rustfs-[a-z0-9-]+ *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
+    if [[ "$leaf_dep_status" -ne 0 && "$leaf_dep_status" -ne 1 ]]; then
+      exit "$leaf_dep_status"
+    fi
+    if [[ "$leaf" == "io-metrics" ]]; then
+      rg -v '^[^:]*:[0-9]+:rustfs-s3-ops *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+    else
+      cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
+    fi
+  done
+)
+
+if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
+  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+fi
+
+# --- ecstore module-level lint blankets (backlog#1823 step 9) ---
+#
+# Two rules:
+#   1. ecstore carries zero `#![allow(dead_code)]` after the step 2 burn-down;
+#      the count may only stay at zero.
+#   2. Every other module-level blanket (unused_variables / unused_must_use /
+#      clippy::all) must match scripts/ecstore-module-lint-register.txt exactly.
+#      Exact match, not "no additions": a one-way rule lets the register rot
+#      into an amnesty list, which is what backlog#1834 found in the
+#      layer-dependency baseline.
+
+ECSTORE_LINT_REGISTER="${ROOT_DIR}/scripts/ecstore-module-lint-register.txt"
+ECSTORE_DEAD_CODE_HITS="${TMP_DIR}/ecstore_dead_code_blankets.txt"
+ECSTORE_LINT_ACTUAL="${TMP_DIR}/ecstore_lint_actual.txt"
+ECSTORE_LINT_EXPECTED="${TMP_DIR}/ecstore_lint_expected.txt"
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\(dead_code\)\]' crates/ecstore/src/ 2>/dev/null || true
+) >"$ECSTORE_DEAD_CODE_HITS"
+
+if [[ -s "$ECSTORE_DEAD_CODE_HITS" ]]; then
+  report_failure "ecstore must carry no module-level #![allow(dead_code)] (backlog#1823 step 2 cleared them; re-add an item-level allow with a reason instead): $(paste -sd '; ' "$ECSTORE_DEAD_CODE_HITS")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n '^#!\[allow\((unused_variables|unused_must_use|clippy::all)\)\]' crates/ecstore/src/ 2>/dev/null |
+    sed -E 's#^([^:]+):[0-9]+:\#!\[allow\(([^)]+)\)\]#\1|\2#' | sort -u
+) >"$ECSTORE_LINT_ACTUAL"
+
+if [[ ! -f "$ECSTORE_LINT_REGISTER" ]]; then
+  report_failure "missing scripts/ecstore-module-lint-register.txt (backlog#1823 step 9)"
+else
+  rg -v '^\s*(#|$)' "$ECSTORE_LINT_REGISTER" | sort -u >"$ECSTORE_LINT_EXPECTED"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_EXPECTED"; then
+      report_failure "new ecstore module-level lint blanket '${entry}' is not in scripts/ecstore-module-lint-register.txt; prefer an item-level allow with a reason, or add the line with a rationale in the PR description (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_ACTUAL"
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if ! rg -qxF "$entry" "$ECSTORE_LINT_ACTUAL"; then
+      report_failure "scripts/ecstore-module-lint-register.txt lists '${entry}' but the blanket is gone; delete the line in the same PR so the register can only shrink (backlog#1823 step 9)"
+    fi
+  done <"$ECSTORE_LINT_EXPECTED"
+fi
 
 if (( FAILURES > 0 )); then
   exit 1

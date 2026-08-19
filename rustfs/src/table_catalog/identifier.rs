@@ -87,6 +87,10 @@ impl Namespace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub struct TableIdentifier {
     warehouse: IdentifierSegment,
     namespace: Namespace,
@@ -94,6 +98,10 @@ pub struct TableIdentifier {
 }
 
 impl TableIdentifier {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn new(warehouse: IdentifierSegment, namespace: Namespace, name: IdentifierSegment) -> Self {
         Self {
             warehouse,
@@ -116,6 +124,10 @@ impl TableIdentifier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub struct TablePathResolver {
     reserved_prefix: &'static str,
 }
@@ -129,14 +141,26 @@ impl Default for TablePathResolver {
 }
 
 impl TablePathResolver {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn current_pointer_path(&self, table: &TableIdentifier) -> String {
         format!("{}/{}", self.table_root(table), CURRENT_POINTER_FILE)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn metadata_dir_path(&self, table: &TableIdentifier) -> String {
         format!("{}/{}", self.table_root(table), METADATA_DIR)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn metadata_file_path(&self, table: &TableIdentifier, metadata_file_name: &str) -> String {
         format!("{}/{}", self.metadata_dir_path(table), metadata_file_name)
     }
@@ -169,6 +193,10 @@ pub(crate) fn default_namespace_root_prefix() -> String {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_namespace_marker_path(namespace: &Namespace) -> String {
     format!("{}{}/{}", default_namespace_root_prefix(), namespace.storage_id(), NAMESPACE_MARKER_FILE)
 }
@@ -177,6 +205,18 @@ pub(crate) fn default_table_root_prefix(namespace: &Namespace) -> String {
     format!("{}{}/{}/", default_namespace_root_prefix(), namespace.storage_id(), TABLE_ROOT)
 }
 
+pub(crate) fn default_table_publication_lock_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
+    format!("{}{}/publication.lock", default_table_root_prefix(namespace), table.as_str())
+}
+
+pub(crate) fn default_table_bucket_publication_lock_path() -> String {
+    rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH.to_string()
+}
+
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_marker_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), TABLE_MARKER_FILE)
 }
@@ -217,14 +257,26 @@ pub(crate) fn default_table_metadata_file_path(
     format!("{}/{}", default_table_metadata_dir_path(namespace, table), metadata_file_name)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_current_pointer_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), CURRENT_POINTER_FILE)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_lifecycle_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), LIFECYCLE_FILE)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn namespace_name_from_marker_path(object_key: &str) -> Option<String> {
     let prefix = default_namespace_root_prefix();
     let suffix = format!("/{NAMESPACE_MARKER_FILE}");
@@ -236,6 +288,10 @@ pub(crate) fn namespace_name_from_marker_path(object_key: &str) -> Option<String
         .map(|value| value.replace('/', "."))
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn table_name_from_marker_path(namespace: &Namespace, object_key: &str) -> Option<String> {
     let prefix = default_table_root_prefix(namespace);
     let suffix = format!("/{TABLE_MARKER_FILE}");
@@ -258,6 +314,68 @@ pub(crate) fn metadata_location_from_metadata_file_path(
         .strip_prefix(prefix.as_str())
         .filter(|value| is_valid_table_metadata_file_name(value))
         .map(|_| object_key.to_string())
+}
+
+fn table_metadata_dir_from_object_key(object_key: &str) -> Option<String> {
+    let namespace_root = default_namespace_root_prefix();
+    let relative = object_key.strip_prefix(&namespace_root)?;
+    let (namespace_storage_id, table_path) = relative.rsplit_once(&format!("/{TABLE_ROOT}/"))?;
+    Namespace::from_segments(namespace_storage_id.split('/').map(str::to_string).collect()).ok()?;
+    let (table_name, metadata_file_name) = table_path.split_once(&format!("/{METADATA_DIR}/"))?;
+    IdentifierSegment::parse(table_name).ok()?;
+    if !is_valid_table_metadata_file_name(metadata_file_name) {
+        return None;
+    }
+    Some(format!("{namespace_root}{namespace_storage_id}/{TABLE_ROOT}/{table_name}/{METADATA_DIR}"))
+}
+
+pub(crate) fn table_metadata_dir_path_for_entry(entry: &TableEntry) -> TableCatalogStoreResult<String> {
+    let object_key = table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location).ok_or_else(|| {
+        TableCatalogStoreError::Invalid("current metadata location must be inside a table metadata directory".to_string())
+    })?;
+    if let Some(metadata_dir) = table_metadata_dir_from_object_key(&object_key) {
+        return Ok(metadata_dir);
+    }
+    if is_reserved_table_object_key(&object_key) {
+        return Err(TableCatalogStoreError::Invalid(
+            "current metadata location has an invalid protected table metadata path".to_string(),
+        ));
+    }
+    let (metadata_dir, metadata_file_name) = object_key.rsplit_once('/').ok_or_else(|| {
+        TableCatalogStoreError::Invalid("current metadata location must be inside a table metadata directory".to_string())
+    })?;
+    if metadata_dir
+        .strip_suffix(&format!("/{METADATA_DIR}"))
+        .is_none_or(str::is_empty)
+        || !is_valid_table_metadata_file_name(metadata_file_name)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "current metadata location must be inside a table metadata directory".to_string(),
+        ));
+    }
+    Ok(metadata_dir.to_string())
+}
+
+pub(crate) fn is_valid_table_metadata_location_for_entry(entry: &TableEntry, metadata_location: &str) -> bool {
+    let Ok(metadata_dir) = table_metadata_dir_path_for_entry(entry) else {
+        return false;
+    };
+    let Some(object_key) = table_catalog_object_key_from_location(&entry.table_bucket, metadata_location) else {
+        return false;
+    };
+    object_key
+        .strip_prefix(&format!("{metadata_dir}/"))
+        .is_some_and(is_valid_table_metadata_file_name)
+}
+
+pub(crate) fn table_metadata_file_path_for_entry(
+    entry: &TableEntry,
+    metadata_file_name: &str,
+) -> TableCatalogStoreResult<String> {
+    if !is_valid_table_metadata_file_name(metadata_file_name) {
+        return Err(TableCatalogStoreError::Invalid("invalid table metadata file name".to_string()));
+    }
+    Ok(format!("{}/{}", table_metadata_dir_path_for_entry(entry)?, metadata_file_name))
 }
 
 pub(crate) fn is_valid_table_metadata_location(

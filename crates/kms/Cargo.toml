@@ -35,6 +35,10 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thr
 uuid = { workspace = true, features = ["serde", "v4", "fast-rng", "macro-diagnostics"] }
 jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
+# Observes fields a persisted-format deserialization ignored, per the
+# repository rule that formats too compatibility-bound for
+# deny_unknown_fields must at least warn (AGENTS.md).
+serde_ignored = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -62,7 +66,7 @@ moka = { workspace = true, features = ["future"] }
 # Additional dependencies
 md-5 = { workspace = true }
 arc-swap = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["http"] }
 rustfs-security-governance = { workspace = true }
 # `EventName` for KMS audit records. A leaf crate with no rustfs dependencies,
 # so the audit sink can live outside this crate without a second, drifting

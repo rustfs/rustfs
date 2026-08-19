@@ -39,7 +39,6 @@
 //! - `metadata.rs`, `replication.rs`, `shard_source.rs` — supporting helpers.
 
 // #730: SetDisks still hosts staged read/heal/write migration helpers.
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
@@ -59,7 +58,10 @@ use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
-    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+    GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
     GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX,
     GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE,
@@ -100,9 +102,7 @@ use crate::storage_api_contracts::{
 };
 use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
-    bucket::lifecycle::bucket_lifecycle_ops::{
-        LifecycleOps, gen_transition_objname, get_transitioned_object_reader_with_tier_manager, put_restore_opts,
-    },
+    bucket::lifecycle::bucket_lifecycle_ops::{LifecycleOps, get_transitioned_object_reader_with_tier_manager, put_restore_opts},
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::storageclass,
     disk::{
@@ -174,15 +174,14 @@ use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::Path,
-    sync::Arc,
     time::Duration,
 };
 use time::OffsetDateTime;
@@ -247,8 +246,8 @@ impl SetDisks {
             no_lock: true,
             ..Default::default()
         };
-        let (current, _, _) = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
-        restore_operation_id_from_metadata(&current.metadata)?
+        let current = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
+        restore_operation_id_from_metadata(&current.fi().metadata)?
             .filter(|actual| *actual == expected)
             .ok_or_else(|| Error::other(format!("restore operation id changed before {mode}: expected {expected}")))?;
         Ok(())
@@ -288,6 +287,7 @@ pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+pub(crate) const DATA_MOVEMENT_MULTIPART_PREFIX: &str = "data-movement";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 /// Validate disk metadata at a boundary that may legitimately return a delete
@@ -584,10 +584,14 @@ fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
 ///
 /// **Deprecated**: Use `adaptive_duplex_buffer_size()` for object-size-aware sizing.
 pub fn get_duplex_buffer_size() -> usize {
-    rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
-        rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
-    )
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
+            rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
+        )
+        .max(1)
+    })
 }
 
 /// Get adaptive duplex buffer size based on object size.
@@ -597,12 +601,15 @@ pub fn get_duplex_buffer_size() -> usize {
 fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
     const KB: usize = 1024;
     const MB: usize = 1024 * 1024;
-    match object_size {
-        0..=1_048_576 => 64 * KB,           // <= 1MB: 64KB
+    let target = match object_size {
+        0..=131_072 => 64 * KB,             // <= 128KB: 64KB
+        131_073..=1_048_576 => 512 * KB,    // <= 1MB: reduce duplex backpressure without a 1MB pipe per request
         1_048_577..=16_777_216 => MB,       // <= 16MB: 1MB
         16_777_217..=268_435_456 => 4 * MB, // <= 256MB: 4MB
         _ => 8 * MB,                        // > 256MB: 8MB
-    }
+    };
+    let object_cap = usize::try_from(object_size).ok().filter(|size| *size > 0).unwrap_or(target);
+    target.min(object_cap.max(64 * KB)).min(get_duplex_buffer_size())
 }
 
 // ============================================================================
@@ -613,7 +620,9 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
 // Each flag has a corresponding `*_ROLLOUT_PCT` for percentage-based gradual rollout.
 // ============================================================================
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
@@ -632,9 +641,11 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+// Meet the direct-memory path at its default ceiling. Codec streaming remains
+// rollout-gated and starts where the eager small-object path ends.
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD;
 const ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = MI_B;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
@@ -664,7 +675,13 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: &str = "RUSTFS_
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: usize = 512 * 1024;
 
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY";
-const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = false;
+// On by default (rustfs/backlog#1802): a small object whose data shards are
+// inlined in xl.meta is reassembled straight from the already-resolved
+// metadata, skipping the Erasure reconstruct pipeline. The path has a complete
+// fallback — if the inline reassembly returns None, the GET proceeds through
+// the normal shard-read pipeline, so a miss is correctness-neutral. Set to
+// `false` to force the legacy path (kill switch).
+const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = true;
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD";
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 1024;
 
@@ -672,23 +689,37 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 // Enabled by default (backlog#872): the early-stop path only engages for
-// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
-// reads by default, without version_id / healing / free-version needs) and
-// still requires a full read-quorum agreement before stopping. Set the env var
-// to `false` to fall back to full-wait metadata fanout.
+// requests `should_allow_metadata_early_stop` classifies as safe (latest-version
+// reads by default, without version_id / healing / free-version needs) and still
+// requires a full read-quorum agreement before stopping. Data-read requests add
+// a separate inline-shard verifier before cancelling the remaining fanout. Set
+// the env var to `false` to fall back to full-wait metadata fanout.
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = false;
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
+
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET";
+const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX: &str = "RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX";
 
 // --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
 
@@ -703,8 +734,8 @@ pub(crate) use core::io_primitives::disk_call_counters;
 mod ctx;
 mod metadata;
 mod ops;
-#[cfg(test)]
-pub(crate) use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
+#[cfg(any(test, feature = "test-util"))]
+pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
@@ -720,10 +751,91 @@ mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 
-pub(crate) struct PreparedGetObjectMetadata {
+pub(in crate::set_disk) struct GetObjectFileInfo {
+    owned: Option<OwnedGetObjectFileInfo>,
+    shared: Option<Arc<GetObjectMetadataCacheEntry>>,
+}
+
+struct OwnedGetObjectFileInfo {
     fi: FileInfo,
-    files: Vec<FileInfo>,
-    disks: Vec<Option<DiskStore>>,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
+}
+
+impl GetObjectFileInfo {
+    fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                fi,
+                parts_metadata,
+                online_disks,
+            }),
+            shared: None,
+        }
+    }
+
+    fn shared(entry: Arc<GetObjectMetadataCacheEntry>) -> Self {
+        Self {
+            owned: None,
+            shared: Some(entry),
+        }
+    }
+
+    fn fi(&self) -> &FileInfo {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.fi,
+            (None, Some(entry)) => &entry.fi,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn parts_metadata(&self) -> &[FileInfo] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.parts_metadata,
+            (None, Some(entry)) => &entry.parts_metadata,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn online_disks(&self) -> &[Option<DiskStore>] {
+        match (&self.owned, &self.shared) {
+            (Some(snapshot), None) => &snapshot.online_disks,
+            (None, Some(entry)) => &entry.online_disks,
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => {
+                let OwnedGetObjectFileInfo {
+                    fi,
+                    parts_metadata,
+                    online_disks,
+                } = snapshot;
+                (fi, parts_metadata, online_disks)
+            }
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks),
+                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone()),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_valid_representation(&self) -> bool {
+        self.owned.is_some() ^ self.shared.is_some()
+    }
+
+    #[cfg(test)]
+    fn shared_entry(&self) -> Option<&Arc<GetObjectMetadataCacheEntry>> {
+        self.shared.as_ref()
+    }
+}
+
+pub(crate) struct PreparedGetObjectMetadata {
+    snapshot: GetObjectFileInfo,
     object_info: Option<ObjectInfo>,
 }
 
@@ -741,7 +853,7 @@ impl PreparedGetObjectMetadata {
     }
 
     pub(crate) fn read_semantics_identity(&self) -> [u8; 32] {
-        SetDisks::file_info_quorum_hash(&self.fi)
+        SetDisks::file_info_quorum_hash(self.snapshot.fi())
     }
 }
 
@@ -783,18 +895,49 @@ mod prepared_get_object_metadata_tests {
     use super::*;
     use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::object_api::{BLOCK_SIZE_V2, PutObjReader};
-    use crate::set_disk::core::io_primitives::disk_call_counters;
+    use crate::set_disk::core::io_primitives::{bounded_metadata_fanout_order, disk_call_counters, rename_fanout_barrier};
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::test_metrics::CapturingRecorder;
     use http::HeaderMap;
     use tokio::io::AsyncReadExt;
 
+    const READ_VERSION_BARRIER_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn object_with_initial_data_shards(bucket: &str, prefix: &str) -> String {
+        (0..1000)
+            .map(|index| format!("{prefix}-{index}.bin"))
+            .find(|name| {
+                let order = bounded_metadata_fanout_order(bucket, name, 4, 2);
+                let distribution = FileInfo::new(&[bucket, name].join("/"), 2, 2).erasure.distribution;
+                let mut seen = [false; 2];
+                for disk_index in order.into_iter().take(3) {
+                    if let Some(block_index @ 1..=2) = distribution.get(disk_index).copied() {
+                        seen[block_index - 1] = true;
+                    }
+                }
+                seen.into_iter().all(|seen| seen)
+            })
+            .expect("test should find an object whose initial fanout covers both data shards")
+    }
+
+    #[allow(
+        dead_code,
+        reason = "test fixture no assertion in this module uses today; the live namesake lives in io_primitives tests (backlog#1823)"
+    )]
+    fn bounded_spare_disk_index(bucket: &str, object: &str) -> usize {
+        *bounded_metadata_fanout_order(bucket, object, 4, 2)
+            .get(3)
+            .expect("4-disk test geometry should leave one bounded spare disk")
+    }
+
     #[tokio::test]
     async fn prepared_metadata_is_consumed_exactly_once() {
+        let snapshot = GetObjectFileInfo::owned(FileInfo::default(), Vec::new(), Vec::new());
+        assert!(snapshot.has_valid_representation());
+        assert!(snapshot.shared_entry().is_none());
         let metadata = PreparedGetObjectMetadata {
-            fi: FileInfo::default(),
-            files: Vec::new(),
-            disks: Vec::new(),
+            snapshot,
             object_info: None,
         };
 
@@ -804,6 +947,44 @@ mod prepared_get_object_metadata_tests {
         })
         .await;
         assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    #[test]
+    fn cache_hit_consumers_release_snapshot_at_legacy_ownership() {
+        let fi = FileInfo {
+            name: "object".to_owned(),
+            ..Default::default()
+        };
+        let cached = Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            parts_metadata: vec![fi.clone()],
+            fi,
+            online_disks: vec![None],
+            read_quorum: 0,
+        });
+        let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
+
+        assert!(snapshot.has_valid_representation());
+        assert!(std::mem::size_of::<GetObjectFileInfo>() >= std::mem::size_of::<OwnedGetObjectFileInfo>());
+        assert!(
+            std::mem::size_of::<GetObjectFileInfo>()
+                <= std::mem::size_of::<OwnedGetObjectFileInfo>() + 2 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(Arc::strong_count(&cached), 2, "a cache hit must add one snapshot reference");
+        assert_eq!(snapshot.fi().name, "object");
+        assert_eq!(snapshot.parts_metadata().len(), 1);
+        assert_eq!(snapshot.online_disks().len(), 1);
+        assert_eq!(Arc::strong_count(&cached), 2, "borrowing consumers must not clone the snapshot");
+
+        let (owned_fi, owned_parts, disks) = snapshot.into_owned();
+        assert_eq!(owned_fi.name, "object");
+        assert_eq!(owned_parts.len(), 1);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&cached),
+            1,
+            "legacy ownership must release the cache snapshot after cloning its owned inputs"
+        );
     }
 
     #[tokio::test]
@@ -836,11 +1017,8 @@ mod prepared_get_object_metadata_tests {
                     .prepare_get_object_metadata(bucket, object, &opts)
                     .await
                     .expect("prepared metadata should resolve");
-                assert_eq!(
-                    calls.total(disk_call_counters::KIND_READ_VERSION),
-                    4,
-                    "preparation should fan out to each online disk exactly once"
-                );
+                let prepared_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
+                assert_eq!(prepared_calls, 4, "default prepared GET metadata should keep full data-read fanout");
 
                 let mut reader = set_disks
                     .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
@@ -867,6 +1045,310 @@ mod prepared_get_object_metadata_tests {
             4,
             "reader construction must consume prepared metadata instead of repeating the fanout"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn inline_data_read_early_stop_defaults_return_exact_body() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "inline-data-read-early-stop-reader";
+        let object = object_with_initial_data_shards(bucket, "inline-data-read-early-stop-reader-object");
+        let payload = b"inline early-stop reader payload".repeat(256);
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (restored, object_size, calls_total) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                let opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                set_disks
+                    .put_object(bucket, &object, &mut put_reader, &opts)
+                    .await
+                    .expect("inline object should be written");
+
+                temp_env::async_with_vars(
+                    [
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
+                    ],
+                    async {
+                        let slow_parity_disk = bounded_spare_disk_index(bucket, &object);
+                        let barrier =
+                            rename_fanout_barrier::arm(&object, slow_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                        let calls = disk_call_counters::observe(&object);
+                        let set_disks_for_read = Arc::clone(&set_disks);
+                        let opts_for_read = opts.clone();
+                        let object_for_read = object.clone();
+                        let mut open_reader = tokio::spawn(async move {
+                            set_disks_for_read
+                                .get_object_reader(bucket, &object_for_read, None, HeaderMap::new(), &opts_for_read)
+                                .await
+                        });
+
+                        tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+                            .await
+                            .expect("default inline GET should pause a slow parity metadata read");
+                        let mut reader = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut open_reader)
+                            .await
+                            .expect("default production inline GET should return before the paused parity metadata response")
+                            .expect("inline GET reader task should not panic")
+                            .expect("inline GET reader should open");
+                        let object_size = reader.object_info.size;
+                        let mut restored = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut restored)
+                            .await
+                            .expect("inline GET body should stream");
+
+                        (restored, object_size, calls.total(disk_call_counters::KIND_READ_VERSION))
+                    },
+                )
+                .await
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(object_size, payload.len() as i64);
+        assert_eq!(restored, payload);
+        assert_eq!(
+            calls_total, 4,
+            "default production inline GET should schedule the initial bounded quorum plus one hedge"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_scheduled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "default production GET should record all scheduled metadata tasks"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_completed",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![3.0],
+            "default production GET should record only observed metadata responses as completed"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_cancelled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![1.0],
+            "default production GET should record the aborted slow parity metadata task"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn prepared_metadata_uses_full_fanout_even_when_data_read_early_stop_is_enabled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "prepared-metadata-early-stop-enabled";
+        let object = object_with_initial_data_shards(bucket, "prepared-metadata-early-stop-enabled-object");
+        let payload = b"prepared metadata early-stop enabled payload".repeat(16);
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (restored, calls_total) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                let opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                set_disks
+                    .put_object(bucket, &object, &mut put_reader, &opts)
+                    .await
+                    .expect("object should be written");
+
+                temp_env::async_with_vars(
+                    [
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                    ],
+                    async {
+                        let calls = disk_call_counters::observe(&object);
+                        let metadata = set_disks
+                            .prepare_get_object_metadata(bucket, &object, &opts)
+                            .await
+                            .expect("prepared metadata should resolve");
+                        let calls_total = calls.total(disk_call_counters::KIND_READ_VERSION);
+
+                        let mut reader = set_disks
+                            .get_object_reader_with_prepared_metadata(bucket, &object, None, HeaderMap::new(), &opts, metadata)
+                            .await
+                            .expect("prepared body reader should open");
+                        let mut restored = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut restored)
+                            .await
+                            .expect("prepared body should stream");
+                        (restored, calls_total)
+                    },
+                )
+                .await
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            calls_total, 4,
+            "prepared metadata must opt out of data-read early-stop until the read shape is known"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_scheduled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "prepared metadata should schedule the full metadata fanout"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_completed",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![4.0],
+            "prepared metadata must wait for every scheduled metadata response"
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_io_get_object_metadata_fanout_cancelled",
+                &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+            ),
+            vec![0.0],
+            "prepared metadata must not cancel metadata responses"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn data_read_early_stop_request_shapes_full_wait_in_production_reader() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "data-read-early-stop-shape-reader";
+        let payload = b"shape-gated inline reader payload".repeat(256);
+
+        for (object_prefix, range, configure_opts, expected_body) in [
+            (
+                "data-read-early-stop-range-reader-object",
+                Some(HTTPRangeSpec {
+                    start: 0,
+                    end: 3,
+                    is_suffix_length: false,
+                }),
+                None,
+                payload[..4].to_vec(),
+            ),
+            ("data-read-early-stop-part-reader-object", None, Some(1), payload.clone()),
+        ] {
+            let recorder = CapturingRecorder::default();
+            let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+            rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+            let (restored, calls_total) = metrics::with_local_recorder(&recorder, || {
+                runtime.block_on(async {
+                    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                    let object = object_with_initial_data_shards(bucket, object_prefix);
+                    let mut opts = ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    };
+                    opts.part_number = configure_opts;
+
+                    set_disks
+                        .make_bucket(bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("bucket should be created");
+                    let mut put_reader = PutObjReader::from_vec(payload.clone());
+                    set_disks
+                        .put_object(bucket, &object, &mut put_reader, &opts)
+                        .await
+                        .expect("inline object should be written");
+
+                    temp_env::async_with_vars(
+                        [
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
+                        ],
+                        async {
+                            let calls = disk_call_counters::observe(&object);
+                            let mut reader = set_disks
+                                .get_object_reader(bucket, &object, range, HeaderMap::new(), &opts)
+                                .await
+                                .expect("shape-gated GET reader should open");
+                            let mut restored = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut restored)
+                                .await
+                                .expect("shape-gated GET body should stream");
+                            (restored, calls.total(disk_call_counters::KIND_READ_VERSION))
+                        },
+                    )
+                    .await
+                })
+            });
+            rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+            assert_eq!(restored, expected_body);
+            assert_eq!(calls_total, 4, "shape-gated production GET should keep full metadata fanout");
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_scheduled",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![4.0],
+                "shape-gated production GET should schedule the full metadata fanout"
+            );
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_completed",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![4.0],
+                "shape-gated production GET must wait for every scheduled metadata response"
+            );
+            assert_eq!(
+                recorder.histogram_values(
+                    "rustfs_io_get_object_metadata_fanout_cancelled",
+                    &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)]
+                ),
+                vec![0.0],
+                "shape-gated production GET must not cancel metadata responses"
+            );
+        }
     }
 
     #[tokio::test]
@@ -972,12 +1454,10 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<PreparedGetObjectMetadata> {
-        let (fi, files, disks) = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
-        let object_info = build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
+        let object_info = build_get_object_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
         Ok(PreparedGetObjectMetadata {
-            fi,
-            files,
-            disks,
+            snapshot,
             object_info: Some(object_info),
         })
     }
@@ -1092,24 +1572,6 @@ pub fn is_deadlock_detection_enabled() -> bool {
 // All functions use `OnceLock` for caching. Environment variable changes
 // require process restart to take effect.
 // ============================================================================
-
-/// Check if codec streaming is enabled (base flag).
-///
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
-/// In test mode, bypasses cache to allow per-test env var overrides.
-fn is_get_codec_streaming_enabled() -> bool {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-        })
-    }
-}
 
 /// Check if multipart codec streaming is enabled.
 ///
@@ -1240,6 +1702,95 @@ fn is_get_metadata_early_stop_bounded_fanout_enabled() -> bool {
     }
 }
 
+#[derive(Debug)]
+struct GetMetadataSlowtailFaultConfig {
+    delay: Duration,
+    disks: Arc<[usize]>,
+    bucket: Option<String>,
+    object_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GetMetadataSlowtailFaultRequest {
+    delay: Duration,
+    disks: Arc<[usize]>,
+}
+
+impl GetMetadataSlowtailFaultRequest {
+    fn delay_for_disk(&self, disk_index: usize) -> Option<Duration> {
+        self.disks.contains(&disk_index).then_some(self.delay)
+    }
+}
+
+fn parse_get_metadata_slowtail_fault_disks(raw: &str) -> Option<Vec<usize>> {
+    let mut disks = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let Ok(index) = item.parse::<usize>() else {
+            return None;
+        };
+        if !disks.contains(&index) {
+            disks.push(index);
+        }
+    }
+    (!disks.is_empty()).then_some(disks)
+}
+
+fn load_get_metadata_slowtail_fault_config() -> Option<GetMetadataSlowtailFaultConfig> {
+    let delay_ms = rustfs_utils::get_env_u64(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, 0);
+    if delay_ms == 0 {
+        return None;
+    }
+    let disks = parse_get_metadata_slowtail_fault_disks(&std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS).ok()?)?;
+    let bucket = std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let object_prefix = std::env::var(ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX)
+        .ok()
+        .filter(|value| !value.is_empty());
+    Some(GetMetadataSlowtailFaultConfig {
+        delay: Duration::from_millis(delay_ms),
+        disks: Arc::from(disks.into_boxed_slice()),
+        bucket,
+        object_prefix,
+    })
+}
+
+fn get_metadata_slowtail_fault_request(bucket: &str, object: &str, read_data: bool) -> Option<GetMetadataSlowtailFaultRequest> {
+    if !read_data {
+        return None;
+    }
+
+    #[cfg(test)]
+    let config = load_get_metadata_slowtail_fault_config();
+    #[cfg(test)]
+    let config = config.as_ref()?;
+    #[cfg(not(test))]
+    let config = ({
+        static CACHED: OnceLock<Option<GetMetadataSlowtailFaultConfig>> = OnceLock::new();
+        CACHED.get_or_init(load_get_metadata_slowtail_fault_config).as_ref()
+    })?;
+
+    if let Some(expected_bucket) = &config.bucket
+        && expected_bucket != bucket
+    {
+        return None;
+    }
+    if let Some(expected_prefix) = &config.object_prefix
+        && !object.starts_with(expected_prefix)
+    {
+        return None;
+    }
+    Some(GetMetadataSlowtailFaultRequest {
+        delay: config.delay,
+        disks: config.disks.clone(),
+    })
+}
+
+#[cfg(test)]
+fn get_metadata_slowtail_fault_delay(bucket: &str, object: &str, disk_index: usize, read_data: bool) -> Option<Duration> {
+    get_metadata_slowtail_fault_request(bucket, object, read_data)?.delay_for_disk(disk_index)
+}
+
 /// Check if multipart reads prefetch the next part's bitrot reader setup
 /// while the current part decodes (backlog#870).
 ///
@@ -1265,22 +1816,10 @@ fn is_multipart_reader_setup_prefetch_enabled() -> bool {
     }
 }
 
-// --- Rollout Percentage Functions ---
-
-fn get_codec_streaming_rollout_pct() -> u32 {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<u32> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-        })
-    }
-}
-
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1315,31 +1854,19 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
     (hash as u32) < rollout_pct
 }
 /// Should this specific request use codec streaming?
-pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
-    let base = is_get_codec_streaming_enabled();
-    let pct = get_codec_streaming_rollout_pct();
-    is_optimization_enabled_for_request(base, pct, bucket, object)
+fn should_use_codec_streaming(config: GetCodecStreamingConfig, bucket: &str, object: &str) -> bool {
+    is_optimization_enabled_for_request(config.enabled, config.rollout_pct, bucket, object)
 }
 
 /// Should this specific request use metadata early-stop?
+#[allow(
+    dead_code,
+    reason = "percentage-rollout facet of the metadata early-stop switch; its predicate has no caller while the sibling enable flag is live (backlog#1823)"
+)]
 pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
     let base = is_get_metadata_early_stop_enabled();
     let pct = get_metadata_early_stop_rollout_pct();
     is_optimization_enabled_for_request(base, pct, bucket, object)
-}
-
-fn get_codec_streaming_min_size() -> usize {
-    if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
-        return rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE);
-    }
-
-    match get_codec_streaming_engine() {
-        GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
-            ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-            DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
-        ),
-        GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
-    }
 }
 
 fn is_get_codec_streaming_data_blocks_first_enabled() -> bool {
@@ -1444,8 +1971,18 @@ enum GetCodecStreamingEngine {
     Rustfs,
 }
 
-fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
-    let engine = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetCodecStreamingConfig {
+    enabled: bool,
+    rollout: GetCodecStreamingRollout,
+    rollout_pct: u32,
+    body_compat_confirmed: bool,
+    header_compat_confirmed: bool,
+    engine: GetCodecStreamingEngine,
+    min_size: usize,
+}
+
+fn parse_get_codec_streaming_engine(engine: &str) -> GetCodecStreamingEngine {
     match engine.trim() {
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_RUSTFS) => GetCodecStreamingEngine::Rustfs,
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_LEGACY) => GetCodecStreamingEngine::Legacy,
@@ -1453,8 +1990,7 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
     }
 }
 
-fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
-    let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
+fn parse_get_codec_streaming_rollout(rollout: &str) -> GetCodecStreamingRollout {
     match rollout.trim() {
         // Clean production token. `internal`/`benchmark` remain accepted aliases
         // for backward compatibility; all three opt the fast path in.
@@ -1471,20 +2007,58 @@ fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
     }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Body compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_body_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true)
+fn load_get_codec_streaming_config() -> GetCodecStreamingConfig {
+    let engine = parse_get_codec_streaming_engine(&rustfs_utils::get_env_str(
+        ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+        DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE,
+    ));
+    let min_size = if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+    } else {
+        match engine {
+            GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+            ),
+            GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        }
+    };
+
+    GetCodecStreamingConfig {
+        enabled: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE),
+        rollout: parse_get_codec_streaming_rollout(&rustfs_utils::get_env_str(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT,
+        )),
+        rollout_pct: rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT,
+        ),
+        body_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true),
+        header_compat_confirmed: rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true),
+        engine,
+        min_size,
+    }
 }
 
-/// Emergency kill-switch (defaults to `true`). Set
-/// `RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=false` to force the fast path
-/// off. Header compatibility is confirmed by the parity e2e net + bench (backlog#1183),
-/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
-fn is_get_codec_streaming_header_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true)
+fn get_codec_streaming_config_cached_core(load: impl FnOnce() -> GetCodecStreamingConfig) -> GetCodecStreamingConfig {
+    static CACHED: OnceLock<GetCodecStreamingConfig> = OnceLock::new();
+    *CACHED.get_or_init(load)
+}
+
+fn get_codec_streaming_config() -> GetCodecStreamingConfig {
+    #[cfg(test)]
+    {
+        load_get_codec_streaming_config()
+    }
+    #[cfg(not(test))]
+    {
+        get_codec_streaming_config_cached_core(load_get_codec_streaming_config)
+    }
+}
+
+fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
+    get_codec_streaming_config().engine
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -1610,8 +2184,6 @@ enum GetDirectMemoryFallbackReason {
     Range,
     PartNumber,
     VersionId,
-    Versioned,
-    VersionSuspended,
     InclFreeVersions,
     SkipFreeVersion,
     DataMovement,
@@ -1637,8 +2209,6 @@ impl GetDirectMemoryFallbackReason {
             Self::Range => "range",
             Self::PartNumber => "part_number",
             Self::VersionId => "version_id",
-            Self::Versioned => "versioned",
-            Self::VersionSuspended => "version_suspended",
             Self::InclFreeVersions => "incl_free_versions",
             Self::SkipFreeVersion => "skip_free_version",
             Self::DataMovement => "data_movement",
@@ -1726,6 +2296,7 @@ fn classify_get_codec_streaming_object_class(
     GetCodecStreamingObjectClass::PlainSinglePart
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn is_get_small_object_direct_memory_eligible_with_threshold(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -1762,12 +2333,11 @@ fn get_small_object_direct_memory_decision_with_threshold(
     if opts.version_id.is_some() {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionId);
     }
-    if opts.versioned {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned);
-    }
-    if opts.version_suspended {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionSuspended);
-    }
+    // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+    // `fi` here is the already-resolved target version, so reassembling its inlined
+    // data shards is correct whether the bucket is versioned or not. This direct-memory
+    // decision still falls back for an explicit versionId (the `version_id` check above);
+    // a delete-marker latest is rejected below.
     if opts.incl_free_versions {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InclFreeVersions);
     }
@@ -1858,43 +2428,43 @@ fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
-    range: &Option<HTTPRangeSpec>,
     part_number: Option<usize>,
+    object_class: GetCodecStreamingObjectClass,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
 ) -> GetCodecStreamingGate {
-    let object_class = classify_get_codec_streaming_object_class(range, object_info, fi);
+    let config = get_codec_streaming_config();
 
-    if !is_get_codec_streaming_enabled() {
+    if !config.enabled {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !get_codec_streaming_rollout().is_opted_in() {
+    if !config.rollout.is_opted_in() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !should_use_codec_streaming(bucket, object) {
+    if !should_use_codec_streaming(config, bucket, object) {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_body_compat_confirmed() {
+    if !config.body_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
-    if !is_get_codec_streaming_header_compat_confirmed() {
+    if !config.header_compat_confirmed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed),
@@ -1967,7 +2537,7 @@ fn get_codec_streaming_reader_gate(
             };
         }
     }
-    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+    let Ok(min_size) = i64::try_from(config.min_size) else {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
@@ -2285,12 +2855,12 @@ mod write_layout_tests {
 
         let held_layout = resolve_write_layout(&held, 0, 4, 2, None, false).expect("held snapshot should remain valid");
         assert_eq!(held_layout.parity_drives, 2);
-        assert!(held.should_inline(512, false));
+        assert!(held.should_inline(512, held_layout.data_drives, false));
 
         let current = published.load_full();
         let current_layout = resolve_write_layout(&current, 0, 4, 2, None, false).expect("new snapshot should resolve");
         assert_eq!(current_layout.parity_drives, 1);
-        assert!(!current.should_inline(512, false));
+        assert!(!current.should_inline(512, current_layout.data_drives, false));
     }
 }
 
@@ -2329,12 +2899,19 @@ pub struct SetDisks {
     pub default_parity_count: usize,
     pub set_index: usize,
     pub pool_index: usize,
+    /// Stable namespace shared by every object lock created for this set.
+    set_lock_namespace: Arc<str>,
     pub format: FormatV3,
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
     get_object_metadata_cache_generations: Arc<[AtomicU64]>,
+    /// GET codecs keyed by every persisted layout dimension that affects
+    /// decoding. Clones of a set share the memoized shells.
+    erasure_cache: Arc<ErasureCache>,
     pub lockers: Vec<Arc<dyn LockClient>>,
+    shared_lockers: Arc<[Arc<dyn LockClient>]>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
     /// Per-instance runtime context (Phase 5, backlog#939).
     ///
@@ -2353,6 +2930,137 @@ pub struct SetDisks {
     capacity_dirty_generation: Arc<AtomicU64>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
+}
+
+const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ErasureCacheKey {
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
+    uses_legacy: bool,
+}
+
+struct ErasureCache {
+    entries: parking_lot::RwLock<HashMap<ErasureCacheKey, Arc<coding::Erasure>>>,
+}
+
+impl std::fmt::Debug for ErasureCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ErasureCache")
+            .field("entries", &self.entries.read().len())
+            .finish()
+    }
+}
+
+impl ErasureCache {
+    fn new() -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_try_insert(
+        &self,
+        key: ErasureCacheKey,
+    ) -> std::result::Result<Arc<coding::Erasure>, coding::ErasureConstructionError> {
+        if let Some(erasure) = self.entries.read().get(&key) {
+            return Ok(Arc::clone(erasure));
+        }
+
+        // Serialize first construction for a key so concurrent cold GETs still
+        // create exactly one shell. Codec construction never awaits.
+        let mut entries = self.entries.write();
+        if let Some(erasure) = entries.get(&key) {
+            return Ok(Arc::clone(erasure));
+        }
+        let erasure = Arc::new(coding::Erasure::try_new_with_options(
+            key.data_shards,
+            key.parity_shards,
+            key.block_size,
+            key.uses_legacy,
+        )?);
+        if entries.len() < ERASURE_CACHE_MAX_ENTRIES {
+            entries.insert(key, Arc::clone(&erasure));
+        }
+        Ok(erasure)
+    }
+
+    fn get_for_file_info(&self, fi: &FileInfo) -> Result<Arc<coding::Erasure>> {
+        self.get_or_try_insert(ErasureCacheKey {
+            data_shards: fi.erasure.data_blocks,
+            parity_shards: fi.erasure.parity_blocks,
+            block_size: fi.erasure.block_size,
+            uses_legacy: fi.uses_legacy_checksum,
+        })
+        .map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+mod erasure_cache_tests {
+    use super::*;
+
+    #[test]
+    fn reuses_shells_and_keeps_every_layout_dimension_in_the_key() {
+        let cache = ErasureCache::new();
+        let base = ErasureCacheKey {
+            data_shards: 4,
+            parity_shards: 2,
+            block_size: 1_048_576,
+            uses_legacy: false,
+        };
+        let first = cache.get_or_try_insert(base).expect("modern shell should construct");
+        let reused = cache.get_or_try_insert(base).expect("same modern shell should be cached");
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        for distinct in [
+            ErasureCacheKey { data_shards: 3, ..base },
+            ErasureCacheKey {
+                parity_shards: 1,
+                ..base
+            },
+            ErasureCacheKey {
+                block_size: 524_288,
+                ..base
+            },
+            ErasureCacheKey {
+                uses_legacy: true,
+                ..base
+            },
+        ] {
+            let shell = cache.get_or_try_insert(distinct).expect("distinct shell should construct");
+            assert!(!Arc::ptr_eq(&first, &shell));
+        }
+        assert_eq!(cache.entries.read().len(), 5);
+    }
+
+    #[test]
+    fn does_not_cache_invalid_layouts_or_grow_past_the_bound() {
+        let cache = ErasureCache::new();
+        let invalid = ErasureCacheKey {
+            data_shards: 4,
+            parity_shards: 2,
+            block_size: 0,
+            uses_legacy: false,
+        };
+        assert!(cache.get_or_try_insert(invalid).is_err());
+        assert!(cache.entries.read().is_empty());
+
+        for block_size in 1..=(ERASURE_CACHE_MAX_ENTRIES + 1) {
+            cache
+                .get_or_try_insert(ErasureCacheKey {
+                    data_shards: 4,
+                    parity_shards: 2,
+                    block_size,
+                    uses_legacy: false,
+                })
+                .expect("bounded cache fixture should construct");
+        }
+        assert_eq!(cache.entries.read().len(), ERASURE_CACHE_MAX_ENTRIES);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2458,7 +3166,7 @@ impl Hash for GetObjectMetadataCacheKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
@@ -2470,11 +3178,13 @@ struct GetObjectMetadataCacheEntry {
 
 #[derive(Clone, Debug)]
 struct DiskHealthEntry {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     last_check: Instant,
     online: bool,
 }
 
 impl DiskHealthEntry {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn cached_value(&self) -> Option<bool> {
         if self.last_check.elapsed() <= DISK_HEALTH_CACHE_TTL {
             Some(self.online)
@@ -2730,6 +3440,8 @@ impl SetDisks {
         instance_ctx: Arc<InstanceContext>,
     ) -> Arc<Self> {
         let ctx = instance_ctx;
+        let set_lock_namespace: Arc<str> = format!("set-{pool_index}-{set_index}").into();
+        let shared_lockers = Arc::from(lockers.to_vec());
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -2737,6 +3449,7 @@ impl SetDisks {
             default_parity_count,
             set_index,
             pool_index,
+            set_lock_namespace,
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
@@ -2750,7 +3463,9 @@ impl SetDisks {
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>(),
             ),
+            erasure_cache: Arc::new(ErasureCache::new()),
             lockers,
+            shared_lockers,
             // Sourced from the instance context so each instance owns its lock
             // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the
             // process lock-manager singleton, so this is unchanged.
@@ -3063,6 +3778,7 @@ fn multipart_put_large_batch_min_size_bytes() -> usize {
     })
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
     if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
         SmallWritePath::Inline
@@ -3185,23 +3901,28 @@ async fn try_read_inline_data_shards_direct(
         return None;
     }
 
-    let mut body = Vec::with_capacity(object_size);
-    let mut remaining = object_size;
-    for reader in readers.iter_mut().take(data_shards) {
+    let shards_needed = object_size.div_ceil(read_length);
+    if shards_needed > data_shards {
+        return None;
+    }
+    let encoded_capacity = read_length.checked_mul(shards_needed)?;
+    let mut body = Vec::with_capacity(encoded_capacity);
+    for reader in readers.iter_mut().take(shards_needed) {
         let reader = reader.as_mut()?;
-        let mut shard = vec![0u8; read_length];
-        let Ok(read) = reader.read(&mut shard).await else {
+        let Ok(read) = reader.read_appending(&mut body, read_length).await else {
             return None;
         };
         if read != read_length {
             return None;
         }
 
-        let take = remaining.min(shard.len());
-        body.extend_from_slice(&shard[..take]);
-        remaining -= take;
-        if remaining == 0 {
-            return Some(Bytes::from(body));
+        if body.len() >= object_size {
+            let body = Bytes::from(body);
+            return Some(if body.len() == object_size {
+                body
+            } else {
+                body.slice(..object_size)
+            });
         }
     }
 
@@ -3263,8 +3984,17 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
     parts_metadata: &'a [FileInfo],
     fi: &FileInfo,
     data_shards: usize,
-    mut disk_is_online: impl FnMut(usize) -> bool,
+    disk_is_online: impl FnMut(usize) -> bool,
 ) -> Option<Vec<&'a FileInfo>> {
+    collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, fi, data_shards, disk_is_online).ok()
+}
+
+fn collect_inline_data_shard_fileinfos_by_index_or_reason<'a>(
+    parts_metadata: &'a [FileInfo],
+    fi: &FileInfo,
+    data_shards: usize,
+    mut disk_is_online: impl FnMut(usize) -> bool,
+) -> std::result::Result<Vec<&'a FileInfo>, &'static str> {
     let distribution = &fi.erasure.distribution;
     let mut data_files = vec![None; data_shards];
 
@@ -3272,21 +4002,35 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
         if !disk_is_online(disk_index) {
             continue;
         }
-        let block_index = *distribution.get(disk_index)?;
+        let Some(&block_index) = distribution.get(disk_index) else {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+        };
         if block_index == 0 || block_index > data_shards {
             continue;
         }
+        if file_info.name.is_empty() {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD);
+        }
+        if file_info.erasure.index != block_index {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
+        }
         if !file_info.has_valid_erasure_geometry() {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+        }
+        if !core::io_primitives::metadata_early_stop_candidate_matches(file_info, fi) {
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH);
         }
         if file_info.data.as_ref().is_none_or(|data| data.is_empty()) {
-            continue;
+            return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD);
         }
 
         data_files[block_index - 1] = Some(file_info);
     }
 
-    data_files.into_iter().collect()
+    data_files
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD)
 }
 
 impl SetDisks {
@@ -3613,6 +4357,7 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 ///
 /// Fail closed: when bucket metadata cannot be resolved the check stays on, so
 /// object-lock protection is never skipped because of a metadata lookup miss.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(crate) fn object_lock_delete_check_required(bucket_meta: Option<&crate::bucket::metadata::BucketMetadata>) -> bool {
     bucket_meta.is_none_or(|meta| meta.object_locking())
 }
@@ -3733,8 +4478,10 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
     if opts.version_id.is_some() {
         // Decommission/rebalance may recreate a delete marker on a new pool before that
         // exact version exists there, so we must still treat it as a mark-delete write.
-        if opts.data_movement && opts.delete_marker && !version_found {
+        let data_movement_missing_delete_marker = opts.data_movement && opts.delete_marker && !version_found;
+        if data_movement_missing_delete_marker {
             mark_delete = true;
+            delete_marker = true;
         }
 
         let delete_marker_version_purge = version_found && goi.delete_marker && !opts.version_purge_status().is_empty();
@@ -3743,7 +4490,10 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
             mark_delete = false;
         }
 
-        if opts.version_purge_status().is_empty() && opts.delete_marker_replication_status().is_empty() {
+        if !data_movement_missing_delete_marker
+            && opts.version_purge_status().is_empty()
+            && opts.delete_marker_replication_status().is_empty()
+        {
             mark_delete = false;
         }
 
@@ -3785,6 +4535,19 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let storage_class_config = self.storage_class_config_snapshot();
+        let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
+            && opts.bucket_lifecycle_lock_fence.is_none()
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+        {
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let _lock_guard = if !opts.no_lock {
             Some(
                 self.new_ns_lock(bucket, object)
@@ -3796,6 +4559,12 @@ impl SetDisks {
         } else {
             None
         };
+
+        if opts.http_preconditions.is_some()
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
+        }
 
         let disks = self.disks.read().await.clone();
         let storage_class = opts.user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str);
@@ -3809,6 +4578,20 @@ impl SetDisks {
         )?;
         let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
         let write_quorum = layout.write_quorum;
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+            || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "decommission_tiered_object_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
         let parts_metadata = vec![fi.clone(); disks.len()];
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
@@ -3848,15 +4631,6 @@ impl Hash for ObjProps {
         self.successor_mod_time.hash(state);
         self.num_versions.hash(state);
     }
-}
-
-#[derive(Default, Clone, Debug)]
-pub struct HealEntryResult {
-    pub bytes: usize,
-    pub success: bool,
-    pub skipped: bool,
-    pub entry_done: bool,
-    pub name: String,
 }
 
 fn is_object_dangling(
@@ -4635,6 +5409,7 @@ pub fn is_valid_storage_class(storage_class: &str) -> bool {
 }
 
 /// Returns true if the storage class is a cold storage tier that requires special handling
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn is_cold_storage_class(storage_class: &str) -> bool {
     matches!(
         storage_class,
@@ -4643,6 +5418,7 @@ pub fn is_cold_storage_class(storage_class: &str) -> bool {
 }
 
 /// Returns true if the storage class is an infrequent access tier
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn is_infrequent_access_class(storage_class: &str) -> bool {
     matches!(
         storage_class,
@@ -4889,6 +5665,111 @@ mod tests {
             matches!(local_guard, NamespaceLockGuard::Fast(_)),
             "a plain-erasure instance context must select the local lock strategy"
         );
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_reuses_the_set_namespace_allocation() {
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+
+        assert_eq!(&*set.set_lock_namespace, "set-0-0");
+        let before = Arc::strong_count(&set.set_lock_namespace);
+        let lock = set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.set_lock_namespace),
+            before + 1,
+            "each lock should share the set namespace instead of formatting a new String"
+        );
+        drop(lock);
+        assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_shares_clients_without_changing_quorum() {
+        let healthy: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let set = make_test_set_disks_with_ctx(vec![healthy.clone(), failing.clone()], ctx).await;
+
+        assert!(Arc::ptr_eq(&set.lockers[0], &healthy));
+        assert!(Arc::ptr_eq(&set.lockers[1], &failing));
+        let clients_before = Arc::strong_count(&set.shared_lockers);
+        let healthy_before = Arc::strong_count(&healthy);
+        let failing_before = Arc::strong_count(&failing);
+        let write_lock = set
+            .new_ns_lock("bucket", "write-object")
+            .await
+            .expect("namespace lock should be created");
+
+        assert_eq!(
+            Arc::strong_count(&set.shared_lockers),
+            clients_before + 1,
+            "each object lock should share one client slice allocation"
+        );
+        assert_eq!(
+            Arc::strong_count(&healthy),
+            healthy_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+        assert_eq!(
+            Arc::strong_count(&failing),
+            failing_before,
+            "constructing an object lock must not clone each client Arc"
+        );
+
+        let write_error = write_lock
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect_err("one healthy client must not satisfy the two-client write quorum");
+        assert!(
+            matches!(
+                write_error,
+                LockError::QuorumNotReached {
+                    required: 2,
+                    achieved: 1
+                }
+            ),
+            "the shared client representation must preserve the exact write quorum result: {write_error}"
+        );
+        let read_lock = set
+            .new_ns_lock("bucket", "read-object")
+            .await
+            .expect("second namespace lock should be created");
+        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
+        let read_guard = read_lock
+            .get_read_lock(Duration::from_millis(500))
+            .await
+            .expect("one healthy client should satisfy the two-client read quorum");
+        assert!(matches!(read_guard, NamespaceLockGuard::Standard(_)));
+    }
+
+    #[tokio::test]
+    async fn new_ns_lock_uses_the_current_public_client_domain() {
+        let stale_a: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let stale_b: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let healthy_a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let healthy_b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let set = make_test_set_disks_with_ctx(vec![stale_a, stale_b], ctx).await;
+        let mut set = (*set).clone();
+        set.lockers = vec![healthy_a, healthy_b];
+
+        let lock = set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should use the current public clients");
+        let guard = lock
+            .get_write_lock(Duration::from_millis(500))
+            .await
+            .expect("the current healthy clients should satisfy the two-client quorum");
+        assert!(matches!(guard, NamespaceLockGuard::Standard(_)));
     }
 
     struct SetupTypeGuard {
@@ -5205,6 +6086,22 @@ mod tests {
     fn resolve_delete_version_state_creates_marker_for_missing_latest_versioned_delete() {
         let opts = ObjectOptions {
             versioned: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &ObjectInfo::default(), false);
+
+        assert!(mark_delete);
+        assert!(delete_marker);
+    }
+
+    #[test]
+    fn resolve_delete_version_state_creates_missing_suspended_data_movement_marker() {
+        let opts = ObjectOptions {
+            version_suspended: true,
+            version_id: Some(Uuid::nil().to_string()),
+            data_movement: true,
+            delete_marker: true,
             ..Default::default()
         };
 
@@ -6101,6 +6998,100 @@ mod tests {
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
     }
 
+    async fn recv_abandoned_parts_trace(
+        trace: &mut rustfs_common::trace_bus::TraceSubscription,
+        bucket: &str,
+        object: &str,
+        state: &str,
+    ) -> rustfs_common::trace_bus::TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), trace.recv())
+                .await
+                .expect("abandoned-parts trace event should arrive")
+                .expect("trace bus should stay open");
+            if event.kind == rustfs_common::trace_bus::TraceKind::Heal
+                && event.func == rustfs_common::trace_bus::TraceFunc::HealCheckAbandonedParts
+                && event.bucket.as_deref() == Some(bucket)
+                && event.object.as_deref() == Some(object)
+                && trace_attr_string(&event, "state").as_deref() == Some(state)
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected abandoned-parts trace state {state} for {bucket}/{object}");
+    }
+
+    fn trace_attr_string(event: &rustfs_common::trace_bus::TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                rustfs_common::trace_bus::TraceVal::Bool(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::U64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::I64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn check_abandoned_parts_dry_run_counts_without_deleting() {
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        let object_dir = dir.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        fs::create_dir_all(object_dir.join(orphan.to_string()))
+            .await
+            .expect("orphan data dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                dry_run: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dry-run abandoned-parts check should succeed");
+        let dry_run_trace = recv_abandoned_parts_trace(&mut trace, "bucket", "obj", "dry_run_matched").await;
+        assert_eq!(trace_attr_string(&dry_run_trace, "dry_run").as_deref(), Some("true"));
+        assert_eq!(trace_attr_string(&dry_run_trace, "data_dirs").as_deref(), Some("1"));
+
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(object_dir.join(orphan.to_string()).exists(), "dry-run must not remove orphaned data dir");
+
+        set.check_abandoned_parts(
+            "bucket",
+            "obj",
+            &HealOpts {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("abandoned-parts check should reclaim stale data dir");
+        let reclaim_trace = recv_abandoned_parts_trace(&mut trace, "bucket", "obj", "reclaimed").await;
+        assert_eq!(trace_attr_string(&reclaim_trace, "dry_run").as_deref(), Some("false"));
+        assert_eq!(trace_attr_string(&reclaim_trace, "data_dirs").as_deref(), Some("1"));
+
+        assert!(
+            object_dir.join(live.to_string()).exists(),
+            "referenced data dir must remain after reclaim"
+        );
+        assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
+    }
+
     #[tokio::test]
     async fn reclaim_orphan_data_dirs_recovers_deferred_cleanup_after_restart() {
         let (dir, disk) = make_single_local_disk().await;
@@ -6897,6 +7888,7 @@ mod tests {
             rustfs_filemeta::FileInfoOpts {
                 data: false,
                 include_free_versions: false,
+                include_part_checksums: true,
             },
         )
         .expect("test file metadata should decode as file info")
@@ -7025,20 +8017,92 @@ mod tests {
     fn test_latest_fileinfo_selection_preserves_degraded_read_quorum_without_competing_latest() {
         let mod_time = OffsetDateTime::now_utc();
         let data_dir = Uuid::new_v4();
-        let metas = vec![
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 1),
-            quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 2),
-            FileInfo::default(),
-            FileInfo::default(),
-        ];
+        let mut first = quorum_test_fileinfo(mod_time, data_dir, "part-etag-old", 1);
+        rustfs_utils::http::insert_str(
+            &mut first.metadata,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            r#"[[1,[["CRC32C","AAAAAA=="]]]]"#.to_string(),
+        );
+        let mut second = first.clone();
+        second.erasure.index = 2;
+        let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
         let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
 
-        let (_, selected, selected_quorum) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
-            .expect("read quorum should remain enough when no competing latest is visible");
+        let (_, mut selected, selected_quorum) =
+            SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+                .expect("read quorum should remain enough when no competing latest is visible");
 
         assert_eq!(selected_quorum, 2);
         assert_eq!(selected.data_dir, Some(data_dir));
         assert_eq!(selected.parts[0].etag, "part-etag-old");
+        assert!(selected.parts[0].checksums.is_none());
+        SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect("requested part checksums should hydrate after winner selection");
+        assert_eq!(
+            selected.parts[0]
+                .checksums
+                .as_ref()
+                .and_then(|checksums| checksums.get("CRC32C"))
+                .map(String::as_str),
+            Some("AAAAAA==")
+        );
+    }
+
+    #[test]
+    fn test_degraded_fileinfo_selection_rejects_malformed_part_checksum_metadata() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let mut first = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+        rustfs_utils::http::insert_str(&mut first.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, "not-json".to_string());
+        let mut second = first.clone();
+        second.erasure.index = 2;
+        let metas = vec![first, second, FileInfo::default(), FileInfo::default()];
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+
+        let (_, mut selected, _) = SetDisks::select_valid_fileinfo(&vec![None; metas.len()], &metas, &errs, "", 2, 3)
+            .expect("winner selection should defer sidecar decoding");
+        let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect_err("a malformed degraded winner must fail closed when checksums are requested");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn test_pick_valid_fileinfo_rejects_malformed_part_checksum_metadata() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let mut meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+        rustfs_utils::http::insert_str(&mut meta.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, "not-json".to_string());
+        let mut second = meta.clone();
+        second.erasure.index = 2;
+
+        let mut selected = SetDisks::pick_valid_fileinfo(&[meta, second], Some(mod_time), None, 2)
+            .expect("winner selection should defer sidecar decoding");
+        let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut selected)
+            .expect_err("a malformed winning part-checksum sidecar must fail closed when checksums are requested");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn test_part_checksum_hydration_rejects_invalid_algorithm_and_value() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        for encoded in [
+            r#"[[1,[["UNKNOWN","AAAAAA=="]]]]"#,
+            r#"[[1,[["CRC32C","not-base64"]]]]"#,
+            r#"[[1,[["CRC32C","AA=="]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA==-0"]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA==-1"]]]]"#,
+            r#"[[1,[["CRC32C","AAAAAA=="],["crc32c","BBBBBB=="]]]]"#,
+        ] {
+            let mut meta = quorum_test_fileinfo(mod_time, data_dir, "part-etag", 1);
+            rustfs_utils::http::insert_str(&mut meta.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, encoded.to_string());
+
+            let err = SetDisks::hydrate_selected_fileinfo_part_checksums(&mut meta)
+                .expect_err("invalid persisted part checksum metadata must fail closed");
+            assert_eq!(err, DiskError::FileCorrupt);
+        }
     }
 
     #[test]
@@ -8677,9 +9741,11 @@ mod tests {
             128 * 1024
         ));
 
+        // Bucket-level versioning no longer blocks the inline path (rustfs/backlog#1802):
+        // a latest-version read on a versioned bucket is eligible.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
-        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+        assert!(is_get_small_object_direct_memory_eligible_with_threshold(
             &None,
             &object_info,
             &fi,
@@ -8740,11 +9806,13 @@ mod tests {
             GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Range)
         );
 
+        // Bucket-level versioning no longer falls back (rustfs/backlog#1802): the
+        // latest version on a versioned bucket is served inline like any other.
         let mut versioned_opts = opts.clone();
         versioned_opts.versioned = true;
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &versioned_opts, true, 128 * 1024),
-            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned)
+            GetDirectMemoryDecision::Use { object_size: 1024 }
         );
 
         let mut encrypted = object_info.clone();
@@ -8792,8 +9860,6 @@ mod tests {
         assert_eq!(GetDirectMemoryFallbackReason::Range.as_str(), "range");
         assert_eq!(GetDirectMemoryFallbackReason::PartNumber.as_str(), "part_number");
         assert_eq!(GetDirectMemoryFallbackReason::VersionId.as_str(), "version_id");
-        assert_eq!(GetDirectMemoryFallbackReason::Versioned.as_str(), "versioned");
-        assert_eq!(GetDirectMemoryFallbackReason::VersionSuspended.as_str(), "version_suspended");
         assert_eq!(GetDirectMemoryFallbackReason::InclFreeVersions.as_str(), "incl_free_versions");
         assert_eq!(GetDirectMemoryFallbackReason::SkipFreeVersion.as_str(), "skip_free_version");
         assert_eq!(GetDirectMemoryFallbackReason::DataMovement.as_str(), "data_movement");
@@ -8840,11 +9906,21 @@ mod tests {
         ));
     }
 
-    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
-        let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+    async fn inline_bitrot_files_for_payload_with_mode(
+        payload: &[u8],
+        uses_legacy: bool,
+    ) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        let erasure = coding::Erasure::new_with_options(4, 2, 1024 * 1024, uses_legacy);
         let read_length = erasure.shard_file_offset(0, payload.len(), payload.len());
-        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let checksum_algo = if uses_legacy {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            HashAlgorithm::HighwayHash256S
+        };
         let shards = erasure.encode_data(payload).expect("payload should encode");
+        let version_id = Some(Uuid::new_v4());
+        let data_dir = Some(Uuid::new_v4());
+        let mod_time = Some(OffsetDateTime::now_utc());
         let mut files = Vec::with_capacity(shards.len());
 
         for shard in shards {
@@ -8857,6 +9933,16 @@ mod tests {
             writer.shutdown().await.expect("inline writer should shutdown");
             let data = writer.into_inline_data().expect("inline data should be retained");
             let mut file = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
+            file.volume = "bucket".to_string();
+            file.name = "object".to_string();
+            file.size = i64::try_from(payload.len()).expect("test payload should fit i64");
+            file.is_latest = true;
+            file.version_id = version_id;
+            file.data_dir = data_dir;
+            file.mod_time = mod_time;
+            file.metadata.insert("etag".to_string(), "etag-inline".to_string());
+            file.add_object_part(1, "part-etag-inline".to_string(), payload.len(), file.mod_time, file.size, None, None);
+            file.set_inline_data();
             file.erasure.index = files.len() + 1;
             file.data = Some(Bytes::from(data));
             files.push(file);
@@ -8865,16 +9951,44 @@ mod tests {
         (erasure, files, read_length, checksum_algo)
     }
 
+    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        inline_bitrot_files_for_payload_with_mode(payload, false).await
+    }
+
+    fn disk_ordered_fileinfos(files: &[FileInfo]) -> Vec<FileInfo> {
+        let distribution = &files
+            .first()
+            .expect("inline data shard fixture should include metadata")
+            .erasure
+            .distribution;
+        distribution
+            .iter()
+            .map(|block_index| {
+                files
+                    .get(block_index.checked_sub(1).expect("erasure block indexes are one-based"))
+                    .expect("inline data shard fixture should include every distributed shard")
+                    .clone()
+            })
+            .collect()
+    }
+
     fn inline_data_shard_fileinfo(
-        name: &str,
         data_blocks: usize,
         parity_blocks: usize,
         erasure_index: usize,
         distribution: &[usize],
         data: Option<&'static [u8]>,
     ) -> FileInfo {
-        let mut fi = FileInfo::new(name, data_blocks, parity_blocks);
-        fi.name = name.to_string();
+        let mut fi = FileInfo::new("object", data_blocks, parity_blocks);
+        fi.name = "object".to_string();
+        fi.volume = "bucket".to_string();
+        fi.size = 4;
+        fi.is_latest = true;
+        fi.data_dir = Some(Uuid::nil());
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        fi.metadata.insert("etag".to_string(), "etag-inline".to_string());
+        fi.add_object_part(1, "part-etag-inline".to_string(), 4, fi.mod_time, 4, None, None);
+        fi.set_inline_data();
         fi.erasure.index = erasure_index;
         fi.erasure.distribution = distribution.to_vec();
         fi.data = data.map(Bytes::from_static);
@@ -8884,36 +9998,41 @@ mod tests {
     #[test]
     fn collect_inline_data_shards_by_index_uses_distribution_order() {
         let distribution = vec![3, 1, 5, 2, 4, 6];
-        let mut fi = FileInfo::new("object", 4, 2);
+        let mut fi = inline_data_shard_fileinfo(4, 2, 1, &distribution, Some(b"x"));
+        fi.erasure.index = 1;
         fi.erasure.distribution = distribution.clone();
         let files = vec![
-            inline_data_shard_fileinfo("block-3", 4, 2, 3, &distribution, Some(b"c")),
-            inline_data_shard_fileinfo("block-1", 4, 2, 1, &distribution, Some(b"a")),
-            inline_data_shard_fileinfo("parity-5", 4, 2, 5, &distribution, Some(b"p")),
-            inline_data_shard_fileinfo("block-2", 4, 2, 2, &distribution, Some(b"b")),
-            inline_data_shard_fileinfo("block-4", 4, 2, 4, &distribution, Some(b"d")),
-            inline_data_shard_fileinfo("parity-6", 4, 2, 6, &distribution, Some(b"q")),
+            inline_data_shard_fileinfo(4, 2, 3, &distribution, Some(b"c")),
+            inline_data_shard_fileinfo(4, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo(4, 2, 5, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo(4, 2, 2, &distribution, Some(b"b")),
+            inline_data_shard_fileinfo(4, 2, 4, &distribution, Some(b"d")),
+            inline_data_shard_fileinfo(4, 2, 6, &distribution, Some(b"q")),
         ];
 
         let data_files =
             collect_inline_data_shard_fileinfos_by_index(&files, &fi, 4, |_| true).expect("all data shards should be collected");
 
         assert_eq!(
-            data_files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
-            ["block-1", "block-2", "block-3", "block-4"]
+            data_files
+                .iter()
+                .map(|file| file.data.as_deref().expect("fixture carries inline bytes"))
+                .collect::<Vec<_>>(),
+            [b"a".as_slice(), b"b".as_slice(), b"c".as_slice(), b"d".as_slice()]
         );
     }
 
     #[test]
     fn collect_inline_data_shards_by_index_rejects_missing_data_shard() {
         let distribution = vec![1, 2, 3, 4];
-        let mut fi = FileInfo::new("object", 2, 2);
+        let mut fi = inline_data_shard_fileinfo(2, 2, 1, &distribution, Some(b"x"));
+        fi.erasure.index = 1;
         fi.erasure.distribution = distribution.clone();
         let files = vec![
-            inline_data_shard_fileinfo("block-1", 2, 2, 1, &distribution, Some(b"a")),
-            inline_data_shard_fileinfo("block-2", 2, 2, 2, &distribution, None),
-            inline_data_shard_fileinfo("parity-3", 2, 2, 3, &distribution, Some(b"p")),
-            inline_data_shard_fileinfo("parity-4", 2, 2, 4, &distribution, Some(b"q")),
+            inline_data_shard_fileinfo(2, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo(2, 2, 2, &distribution, None),
+            inline_data_shard_fileinfo(2, 2, 3, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo(2, 2, 4, &distribution, Some(b"q")),
         ];
 
         assert!(collect_inline_data_shard_fileinfos_by_index(&files, &fi, 2, |_| true).is_none());
@@ -8945,14 +10064,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_data_shards_direct_read_reassembles_legacy_payload_with_padding() {
+        let payload = b"legacy inline payload whose size is not divisible by the data shard count";
+        let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload_with_mode(payload, true).await;
+        assert_ne!(payload.len() % erasure.data_shards, 0, "test payload must exercise EC padding");
+        let mut readers = build_inline_bitrot_readers(
+            &files,
+            erasure.data_shards,
+            "bucket",
+            "object",
+            read_length,
+            erasure.shard_size(),
+            &checksum_algo,
+            false,
+        )
+        .await
+        .expect("legacy inline bitrot readers should build");
+
+        let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, payload.len())
+            .await
+            .expect("legacy data shard direct read should succeed");
+
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
     async fn inline_data_shards_direct_read_rejects_corrupt_shard() {
         let payload = b"small inline object payload that will be corrupted";
         let (erasure, mut files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
-        let first = files[0].data.as_mut().expect("first shard should exist");
-        let mut corrupted = first.to_vec();
+        let second = files[1].data.as_mut().expect("second shard should exist");
+        let mut corrupted = second.to_vec();
         let last = corrupted.last_mut().expect("encoded shard should not be empty");
         *last ^= 0xff;
-        *first = Bytes::from(corrupted);
+        *second = Bytes::from(corrupted);
 
         let mut readers = build_inline_bitrot_readers(
             &files,
@@ -8969,7 +10114,7 @@ mod tests {
 
         let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len()).await;
 
-        assert!(body.is_none());
+        assert!(body.is_none(), "a later corrupt shard must discard the already-appended body prefix");
     }
 
     #[test]
@@ -9020,10 +10165,8 @@ mod tests {
 
         let payload = vec![b'i'; 192 * 1024];
         let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
-        let mut fi = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
-        fi.size = payload.len() as i64;
-        fi.data = files[0].data.clone();
-        fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
+        let fi = files[0].clone();
+        let disk_files = disk_ordered_fileinfos(&files);
 
         let disks = vec![Some(disk); erasure.total_shard_count()];
         let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
@@ -9031,8 +10174,9 @@ mod tests {
         let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
             "bucket",
             "object",
+            Arc::new(ErasureCache::new()),
             &fi,
-            &files,
+            &disk_files,
             &disks,
             true,
             GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
@@ -9041,6 +10185,70 @@ mod tests {
         .await
         .expect("direct-memory inline data shard read should not fail")
         .expect("inline data shard path should be used");
+
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn direct_memory_versioned_bucket_uses_inline_data_shards_for_latest() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let payload = vec![b'v'; 64 * 1024];
+        let payload_size = i64::try_from(payload.len()).expect("test payload size should fit i64");
+        let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
+        let fi = files[0].clone();
+        let disk_files = disk_ordered_fileinfos(&files);
+
+        let mut object_info = ObjectInfo {
+            size: payload_size,
+            actual_size: payload_size,
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                actual_size: payload_size,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        object_info.inlined = true;
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Use {
+                object_size: payload.len()
+            }
+        );
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            "bucket",
+            "object",
+            Arc::new(ErasureCache::new()),
+            &fi,
+            &disk_files,
+            &vec![Some(disk); erasure.total_shard_count()],
+            true,
+            GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+            metrics_size_bucket,
+        )
+        .await
+        .expect("versioned latest direct-memory read should not fail")
+        .expect("versioned latest should use inline data shards");
 
         assert_eq!(body.as_ref(), payload);
     }
@@ -9111,6 +10319,7 @@ mod tests {
         let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             &fi,
             &files,
             &disks,
@@ -9196,6 +10405,7 @@ mod tests {
             SetDisks::get_object_with_fileinfo(
                 bucket,
                 object,
+                Arc::new(ErasureCache::new()),
                 range_offset,
                 range_length as i64,
                 &mut writer,
@@ -9307,6 +10517,7 @@ mod tests {
             SetDisks::get_object_with_fileinfo(
                 bucket,
                 object,
+                Arc::new(ErasureCache::new()),
                 0,
                 total_size as i64,
                 &mut writer,
@@ -10571,6 +11782,20 @@ mod tests {
 
         assert!(marker.delete_marker);
         let marker_version = marker.version_id.expect("versioned delete marker should carry a version id");
+        let create_only = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks.check_write_precondition(bucket, object, &create_only).await,
+            Some(StorageError::PreconditionFailed),
+            "data movement must not replace a target delete marker"
+        );
         let err = match set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
             .await
@@ -11102,11 +12327,18 @@ mod tests {
             .expect_err("unsupported copy_object_part should return a typed error");
         assert!(matches!(copy_part_err, StorageError::NotImplemented));
 
-        let abandoned_err = set_disks
-            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+        set_disks
+            .check_abandoned_parts(
+                "bucket",
+                "object",
+                &HealOpts {
+                    dry_run: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
-            .expect_err("abandoned-parts check should stay in the upper reconciliation layer");
-        assert!(matches!(abandoned_err, StorageError::NotImplemented));
+            .expect("abandoned-parts check should be callable on empty disk sets");
     }
 
     #[tokio::test]
@@ -11131,5 +12363,14 @@ mod tests {
                 "offline (None) disk slot must map to DiskNotFound in-place, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_duplex_buffer_size_raises_mid_sized_gets_without_penalizing_tiny_objects() {
+        assert_eq!(adaptive_duplex_buffer_size(64 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(128 * 1024), 64 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(256 * 1024), 256 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(1024 * 1024), 512 * 1024);
+        assert_eq!(adaptive_duplex_buffer_size(2 * 1024 * 1024), 1024 * 1024);
     }
 }

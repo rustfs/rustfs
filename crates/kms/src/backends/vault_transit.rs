@@ -27,6 +27,7 @@ use crate::backends::{
 use crate::config::{KmsConfig, VaultTransitConfig};
 use crate::encryption::{DataKeyEnvelope, generate_key_material};
 use crate::error::{KmsError, Result};
+use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
@@ -100,6 +101,23 @@ fn is_cas_conflict(error: &ClientError) -> bool {
     )
 }
 
+/// Whether a transit LIST failed with the 404 Vault uses for "mounted, but no
+/// keys yet".
+///
+/// Vault answers a LIST on a mounted transit engine that holds no keys with a
+/// 404 whose `errors` array is empty — the mount routed and answered the
+/// request, so the engine is reachable. A 404 for a path with no mount behind
+/// it instead carries a "no handler for route" message, so the empty `errors`
+/// array is what separates "engine reachable but empty" from "engine missing".
+///
+/// An empty non-transit engine (e.g. KV v1) at the configured path answers
+/// with byte-identical 404s, so this probe cannot detect that misconfiguration
+/// — no LIST-based probe can. The data path still fails hard on the first real
+/// transit operation against such a mount.
+fn is_empty_transit_list(error: &ClientError) -> bool {
+    matches!(error, ClientError::APIError { code: 404, errors } if errors.is_empty())
+}
+
 #[derive(Debug, Clone)]
 struct TransitKeyMetadata {
     key_usage: KeyUsage,
@@ -114,7 +132,12 @@ struct TransitKeyMetadata {
 }
 
 /// Serializable version of TransitKeyMetadata for KV v2 persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written so fields the current build does not know
+/// are counted and warned about instead of vanishing silently — this record
+/// is compatibility-bound in both directions (older and newer builds read
+/// each other's writes), so `deny_unknown_fields` is not an option.
+#[derive(Debug, Clone, Serialize)]
 struct TransitKeyMetadataPersisted {
     key_usage: KeyUsage,
     description: Option<String>,
@@ -125,6 +148,168 @@ struct TransitKeyMetadataPersisted {
     origin: String,
     created_by: Option<String>,
     current_version: u32,
+}
+
+impl UnknownFieldSummary {
+    fn record_for_transit_key_metadata(&self) {
+        let Some((field, field_name_truncated, field_count)) = self.record("vault-transit-key-metadata") else {
+            return;
+        };
+
+        static RECORDS_WITH_UNKNOWN_FIELDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let observed_records = RECORDS_WITH_UNKNOWN_FIELDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if observed_records.is_power_of_two() {
+            tracing::warn!(
+                field = ?field,
+                field_name_truncated,
+                field_count,
+                observed_records,
+                "Vault Transit key metadata record contains unknown fields"
+            );
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TransitKeyMetadataPersisted {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+        use std::fmt;
+
+        enum Field {
+            KeyUsage,
+            Description,
+            Tags,
+            KeyState,
+            CreatedAt,
+            DeletionDate,
+            Origin,
+            CreatedBy,
+            CurrentVersion,
+            Unknown(BoundedUnknownFieldName),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a Vault Transit key metadata field name")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(match value {
+                            "key_usage" => Field::KeyUsage,
+                            "description" => Field::Description,
+                            "tags" => Field::Tags,
+                            "key_state" => Field::KeyState,
+                            "created_at" => Field::CreatedAt,
+                            "deletion_date" => Field::DeletionDate,
+                            "origin" => Field::Origin,
+                            "created_by" => Field::CreatedBy,
+                            "current_version" => Field::CurrentVersion,
+                            _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct TransitKeyMetadataPersistedVisitor;
+
+        impl<'de> Visitor<'de> for TransitKeyMetadataPersistedVisitor {
+            type Value = TransitKeyMetadataPersisted;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Vault Transit key metadata record")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                macro_rules! read_field {
+                    ($slot:ident, $name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(de::Error::duplicate_field($name));
+                        }
+                        $slot = Some(map.next_value()?);
+                    }};
+                }
+
+                let mut key_usage = None;
+                let mut description = None;
+                let mut tags = None;
+                let mut key_state = None;
+                let mut created_at = None;
+                let mut deletion_date = None;
+                let mut origin = None;
+                let mut created_by = None;
+                let mut current_version = None;
+                let mut unknown_fields = UnknownFieldSummary::default();
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::KeyUsage => read_field!(key_usage, "key_usage"),
+                        Field::Description => read_field!(description, "description"),
+                        Field::Tags => read_field!(tags, "tags"),
+                        Field::KeyState => read_field!(key_state, "key_state"),
+                        Field::CreatedAt => read_field!(created_at, "created_at"),
+                        Field::DeletionDate => read_field!(deletion_date, "deletion_date"),
+                        Field::Origin => read_field!(origin, "origin"),
+                        Field::CreatedBy => read_field!(created_by, "created_by"),
+                        Field::CurrentVersion => read_field!(current_version, "current_version"),
+                        Field::Unknown(field) => {
+                            let _: IgnoredAny = map.next_value()?;
+                            unknown_fields.observe(field);
+                        }
+                    }
+                }
+
+                let metadata = TransitKeyMetadataPersisted {
+                    key_usage: key_usage.ok_or_else(|| de::Error::missing_field("key_usage"))?,
+                    description: description.unwrap_or(None),
+                    tags: tags.ok_or_else(|| de::Error::missing_field("tags"))?,
+                    key_state: key_state.ok_or_else(|| de::Error::missing_field("key_state"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?,
+                    deletion_date: deletion_date.unwrap_or(None),
+                    origin: origin.ok_or_else(|| de::Error::missing_field("origin"))?,
+                    created_by: created_by.unwrap_or(None),
+                    current_version: current_version.ok_or_else(|| de::Error::missing_field("current_version"))?,
+                };
+                unknown_fields.record_for_transit_key_metadata();
+                Ok(metadata)
+            }
+        }
+
+        const FIELDS: &[&str] = &[
+            "key_usage",
+            "description",
+            "tags",
+            "key_state",
+            "created_at",
+            "deletion_date",
+            "origin",
+            "created_by",
+            "current_version",
+        ];
+        deserializer.deserialize_struct("TransitKeyMetadataPersisted", FIELDS, TransitKeyMetadataPersistedVisitor)
+    }
 }
 
 impl TransitKeyMetadata {
@@ -230,6 +415,7 @@ impl VaultTransitKmsClient {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
             attempt_timeout: kms_config.effective_timeout(),
+            skip_tls_verify: config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
         };
         let source = token_source_for(&config.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(
@@ -706,6 +892,7 @@ impl VaultTransitKmsClient {
             created_by: metadata.created_by,
             rotation_due: false,
             rotation_due_reason: None,
+            wrap_budget_reserved: None,
         })
     }
 
@@ -1074,12 +1261,17 @@ impl VaultTransitKmsClient {
         let mut all_keys = self
             .run("vault_transit_list_keys", OpClass::ReadIdempotent, move || async move {
                 let vault = self.vault().map_err(AttemptError::fatal)?;
-                key::list(&vault.client, &self.config.mount_path).await.map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}")))
-                })
+                match key::list(&vault.client, &self.config.mount_path).await {
+                    Ok(response) => Ok(response.keys),
+                    // An empty transit engine answers LIST with a bare 404;
+                    // that is an empty listing, not a backend failure.
+                    Err(error) if is_empty_transit_list(&error) => Ok(Vec::new()),
+                    Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                        KmsError::backend_error(format!("Failed to list Vault Transit keys: {e}"))
+                    })),
+                }
             })
-            .await?
-            .keys;
+            .await?;
         // Vault's own LIST ordering is not part of its contract, so the sort is
         // what makes the marker a stable cursor across calls.
         all_keys.sort_unstable();
@@ -1252,12 +1444,17 @@ impl VaultTransitKmsClient {
     pub(crate) async fn health_check(&self) -> Result<()> {
         self.run("vault_transit_health_check", OpClass::ReadIdempotent, move || async move {
             let vault = self.vault().map_err(AttemptError::fatal)?;
-            key::list(&vault.client, &self.config.mount_path)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    AttemptError::from_vaultrs(e, |e| KmsError::backend_error(format!("Vault Transit health check failed: {e}")))
-                })
+            match key::list(&vault.client, &self.config.mount_path).await {
+                Ok(_) => Ok(()),
+                // A brand-new transit mount holds no keys until something
+                // creates one, and this check gates startup before the service
+                // creates its own probe key — treating "empty" as unhealthy
+                // would keep a first-ever deployment from ever starting.
+                Err(error) if is_empty_transit_list(&error) => Ok(()),
+                Err(e) => Err(AttemptError::from_vaultrs(e, |e| {
+                    KmsError::backend_error(format!("Vault Transit health check failed: {e}"))
+                })),
+            }
         })
         .await
     }
@@ -1916,6 +2113,107 @@ mod tests {
         );
     }
 
+    /// Regression test for the first-boot chicken-and-egg on a fresh transit
+    /// mount (rustfs/backlog#1774).
+    ///
+    /// Vault answers a LIST on a mounted-but-empty transit engine with a 404
+    /// carrying an empty `errors` array. The health check gates startup before
+    /// the service creates its probe key, so this 404 must count as healthy —
+    /// failing it means a first-ever deployment on a fresh mount can never
+    /// start until an operator creates some transit key out-of-band.
+    #[tokio::test]
+    async fn health_check_passes_on_an_empty_transit_engine() {
+        let (vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 404,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        client
+            .health_check()
+            .await
+            .expect("an empty transit engine is reachable and must pass the health check");
+
+        let requests = vault.requests();
+        assert_eq!(
+            requests,
+            vec!["LIST /v1/transit/keys".to_string()],
+            "the empty-list 404 must be accepted on the first attempt, not retried"
+        );
+    }
+
+    /// A 404 whose body says "no handler for route" means no transit engine is
+    /// mounted at the configured path at all; that must keep failing the
+    /// health check instead of riding the empty-engine allowance.
+    #[tokio::test]
+    async fn health_check_fails_when_the_transit_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::error(
+            404,
+            "no handler for route \"transit/keys\". route entry not found.",
+        )])
+        .await;
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("a missing transit mount must fail the health check");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The empty-engine allowance is scoped to 404 alone: any other status
+    /// whose body happens to carry an empty `errors` array (an intermediary
+    /// answering for Vault, for instance) must keep failing the health check.
+    #[tokio::test]
+    async fn health_check_fails_on_a_non_404_error_with_an_empty_errors_body() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 403,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        let error = client
+            .health_check()
+            .await
+            .expect_err("only a 404 may ride the empty-engine allowance");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The listing's own copy of the discriminator must not widen into "every
+    /// LIST failure is an empty listing" — a missing mount still fails loudly.
+    #[tokio::test]
+    async fn list_fails_when_the_transit_mount_is_missing() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::error(
+            404,
+            "no handler for route \"transit/keys\". route entry not found.",
+        )])
+        .await;
+
+        let error = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect_err("a missing transit mount must fail the listing, not empty it");
+        assert!(matches!(error, KmsError::BackendError { .. }), "got {error:?}");
+    }
+
+    /// The same empty-engine 404 on the listing path is an empty result set,
+    /// not a backend failure.
+    #[tokio::test]
+    async fn list_keys_returns_an_empty_page_on_an_empty_transit_engine() {
+        let (_vault, client) = scripted_client(vec![ScriptedResponse::Http {
+            status: 404,
+            body: serde_json::json!({ "errors": [] }).to_string(),
+        }])
+        .await;
+
+        let response = client
+            .list_keys(&ListKeysRequest::default(), None)
+            .await
+            .expect("an empty transit engine must list as empty, not fail");
+        assert!(response.keys.is_empty(), "got {:?}", response.keys);
+        assert!(!response.truncated, "an empty listing has nothing left to page through");
+        assert_eq!(response.next_marker, None);
+    }
+
     fn test_vault_transit_config() -> VaultTransitConfig {
         VaultTransitConfig {
             address: "http://127.0.0.1:8200".to_string(),
@@ -2131,6 +2429,41 @@ mod tests {
         let metadata = TransitKeyMetadata::synthesized();
         assert_eq!(metadata.key_state, KeyState::Enabled);
         assert!(metadata.deletion_date.is_none());
+    }
+
+    #[test]
+    fn transit_key_metadata_unknown_fields_remain_readable_and_are_observed() {
+        // A record written by a newer build carries fields this build does not
+        // know. It must stay readable — and the drop must be visible, not
+        // silent (rustfs/backlog#1641). Only the field name may be logged.
+        let persisted: TransitKeyMetadataPersisted = TransitKeyMetadata::synthesized().into();
+        let mut value = serde_json::to_value(&persisted).expect("serialize metadata record");
+        let object = value.as_object_mut().expect("metadata record serializes to an object");
+        object.insert("field_from_the_future".to_string(), serde_json::json!("field value must not be logged"));
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let parsed: TransitKeyMetadataPersisted = metrics::with_local_recorder(&recorder, || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                serde_json::from_value(value).expect("unknown fields must remain readable")
+            })
+        });
+        assert_eq!(parsed.key_state, KeyState::Enabled);
+        assert_eq!(crate::test_support::unknown_field_metric(&recorder, "vault-transit-key-metadata"), 1);
+
+        let output = logs.output();
+        assert!(
+            output.contains("Vault Transit key metadata record contains unknown fields"),
+            "got: {output}"
+        );
+        assert!(output.contains("field_from_the_future"));
+        assert!(!output.contains("field value must not be logged"));
     }
 
     /// KV2 write acknowledgement (`SecretVersionMetadata`) for `kv2::set`.

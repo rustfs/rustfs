@@ -54,6 +54,10 @@ use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
+    http::headers::{
+        AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_SHA1,
+        AMZ_CHECKSUM_SHA256,
+    },
     net::get_endpoint_url,
     retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer},
 };
@@ -101,6 +105,10 @@ where
 
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
+#[allow(
+    dead_code,
+    reason = "reachable only from the unused transition client methods below (backlog#1823)"
+)]
 const C_ONLINE: i32 = 1;
 
 fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
@@ -320,6 +328,10 @@ impl TransitionClient {
         Ok(client)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client surface with no caller in this port (backlog#1823)"
+    )]
     fn endpoint_url(&self) -> Url {
         self.endpoint_url.clone()
     }
@@ -348,12 +360,20 @@ impl TransitionClient {
             .to_string())
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn trace_errors_only_off(&self) {
         if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
             *trace_errors_only = false;
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn trace_off(&self) {
         if let Ok(mut is_trace_enabled) = self.is_trace_enabled.lock() {
             *is_trace_enabled = false;
@@ -363,12 +383,20 @@ impl TransitionClient {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
         if let Ok(mut endpoint) = self.s3_accelerate_endpoint.lock() {
             *endpoint = accelerate_endpoint.to_string();
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
         if let Ok(mut dual_stack) = self.s3_dual_stack_enabled.lock() {
             *dual_stack = enabled;
@@ -398,10 +426,18 @@ impl TransitionClient {
         (hash_algos, hash_sums)
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn is_online(&self) -> bool {
         !self.is_offline()
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn mark_offline(&self) {
         self.health_status
             .compare_exchange(C_ONLINE, C_OFFLINE, Ordering::SeqCst, Ordering::SeqCst);
@@ -411,10 +447,18 @@ impl TransitionClient {
         self.health_status.load(Ordering::SeqCst) == C_OFFLINE
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn health_check(hc_duration: Duration) {
         let _ = hc_duration;
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity transition client method with no caller in this port (backlog#1823)"
+    )]
     fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
@@ -1006,16 +1050,6 @@ impl TransitionCore {
         client.abort_multipart_upload(bucket_name, object, upload_id).await
     }
 
-    pub async fn get_bucket_policy(&self, bucket_name: &str) -> Result<String, std::io::Error> {
-        let client = self.0.clone();
-        client.get_bucket_policy(bucket_name).await
-    }
-
-    pub async fn put_bucket_policy(&self, bucket_name: &str, bucket_policy: &str) -> Result<(), std::io::Error> {
-        let client = self.0.clone();
-        client.put_bucket_policy(bucket_name, bucket_policy).await
-    }
-
     pub async fn get_object(
         &self,
         bucket_name: &str,
@@ -1112,6 +1146,7 @@ impl Default for ObjectInfo {
 }
 
 impl ObjectInfo {
+    #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
     pub(crate) fn remote_version(
         &self,
         capabilities: ProviderVersionCapabilities,
@@ -1352,12 +1387,12 @@ pub(crate) fn to_object_info_for_provider(
     };
 
     // Extract checksums
-    let checksum_crc32 = get_header("x-amz-checksum-crc32");
-    let checksum_crc32c = get_header("x-amz-checksum-crc32c");
-    let checksum_sha1 = get_header("x-amz-checksum-sha1");
-    let checksum_sha256 = get_header("x-amz-checksum-sha256");
-    let checksum_crc64nvme = get_header("x-amz-checksum-crc64nvme");
-    let checksum_mode = get_header("x-amz-checksum-mode");
+    let checksum_crc32 = get_header(AMZ_CHECKSUM_CRC32);
+    let checksum_crc32c = get_header(AMZ_CHECKSUM_CRC32C);
+    let checksum_sha1 = get_header(AMZ_CHECKSUM_SHA1);
+    let checksum_sha256 = get_header(AMZ_CHECKSUM_SHA256);
+    let checksum_crc64nvme = get_header(AMZ_CHECKSUM_CRC64NVME);
+    let checksum_mode = get_header(AMZ_CHECKSUM_MODE);
 
     // Build and return the ObjectInfo struct
     Ok(ObjectInfo {

@@ -340,6 +340,10 @@ impl ReplicationStats {
     }
 
     /// Site replication update replica statistics
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     fn sr_update_replica_stat(&self, size: i64) {
         self.sr_stats.replica_size.fetch_add(size, Ordering::Relaxed);
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);
@@ -704,6 +708,12 @@ impl ReplicationStats {
         } else {
             BucketReplicationStats::new()
         };
+        // Stamp the serializable failure windows from the live samples: the
+        // samples themselves do not cross the peer-RPC wire, so this snapshot
+        // is what cluster aggregation and the metrics endpoints see.
+        for stat in replication_stats.stats.values_mut() {
+            stat.fail_stats.refresh_windows();
+        }
         let uptime = if cache.contains_key(bucket) {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1149,6 +1159,31 @@ mod tests {
 
         let all = stats.get_all().await;
         assert!(all.contains_key("proxy-only-bucket"));
+    }
+
+    /// Pins the read-proxy metric contract (backlog#1675 P1-5): the API
+    /// strings the GET/HEAD/Tagging proxy paths record map onto the
+    /// get/head/tagging totals, and only unexpected failures raise the
+    /// failed counters.
+    #[tokio::test]
+    async fn test_proxy_stats_map_read_proxy_apis_to_totals() {
+        let stats = ReplicationStats::new();
+        stats.inc_proxy("proxy-bucket", "GetObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObject", true).await;
+        stats.inc_proxy("proxy-bucket", "HeadObject", false).await;
+        stats.inc_proxy("proxy-bucket", "GetObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "PutObjectTagging", false).await;
+        stats.inc_proxy("proxy-bucket", "DeleteObjectTagging", true).await;
+
+        let metric = stats.get_proxy_stats("proxy-bucket").await;
+        assert_eq!(metric.get_total, 2);
+        assert_eq!(metric.get_failed, 1);
+        assert_eq!(metric.head_total, 1);
+        assert_eq!(metric.head_failed, 0);
+        assert_eq!(metric.get_tag_total, 1);
+        assert_eq!(metric.put_tag_total, 1);
+        assert_eq!(metric.delete_tag_total, 1);
+        assert_eq!(metric.delete_tag_failed, 1);
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use crate::admin::runtime_sources::{
     current_object_store_handle_for_context, current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::error::StorageError;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
@@ -195,7 +196,9 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 }
 
 fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bool)> {
-    let mut config: KmsConfig = serde_json::from_slice(data)?;
+    // The observing loader warns about fields this build ignores, per the
+    // repository unknown-field rule for compatibility-bound formats.
+    let mut config: KmsConfig = rustfs_kms::config::kms_config_from_persisted_json(data)?;
     // The immediate-deletion gate is per-server operator state, never stored,
     // so a config loaded from cluster storage still has to pick it up here.
     config.allow_immediate_deletion = rustfs_kms::config::allow_immediate_deletion_from_env();
@@ -276,8 +279,11 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
             }
         },
         Err(e) => {
-            // Config not found is normal on first run
-            if e.to_string().contains("ConfigNotFound") || e.to_string().contains("not found") {
+            // Config not found is normal on first run: `read_config` maps a missing or
+            // empty config object to `ConfigNotFound`, so that variant is the only
+            // "absent" signal reaching here. Every other not-found variant (disk,
+            // volume, bucket) means degraded storage and must stay a warning.
+            if matches!(e, StorageError::ConfigNotFound) {
                 info!(
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_KMS,

@@ -15,28 +15,35 @@
 # Package Workflow - Build DEB/RPM packages
 #
 # This workflow builds DEB and RPM packages from pre-built Linux binaries
-# and uploads them to Cloudflare R2.
+# and uploads them to Cloudflare R2 and the GitHub release.
 #
 # Trigger:
-# - release published: automatically package when a GitHub release is published
-# - workflow_dispatch: manual trigger with optional tag/run_id
+# - workflow_run: automatically package after "Build and Release" completes
+#   for a release tag (the mac/windows/linux binaries are already uploaded
+#   to the GitHub release before packaging starts)
+# - workflow_dispatch: manual fallback (backfill / re-run) with optional tag/run_id
 #
 # Flow:
-# 1. Find the Build workflow run for the release tag
+# 1. Resolve the triggering Build workflow run for the release tag
 # 2. Download Linux binaries (x86_64-gnu, aarch64-gnu) from build artifacts
 # 3. Build DEB packages for amd64 and arm64
 # 4. Build RPM packages for x86_64 and aarch64
-# 5. Upload all packages to Cloudflare R2
+# 5. Upload all packages to Cloudflare R2 and the GitHub release
 
 name: Package DEB/RPM
 
 permissions:
-  contents: read
+  # contents: write is required to upload packages to the GitHub release
+  contents: write
   actions: read
 
 on:
-  release:
-    types: [ published ]
+  # Follows the same pattern as docker.yml: run after the release build
+  # workflow completes, so packaging is triggered only by release tags
+  # (e.g. 1.0.0-rc.2, 1.0.0-rc.3), never by development builds.
+  workflow_run:
+    workflows: [ "Build and Release" ]
+    types: [ completed ]
   workflow_dispatch:
     inputs:
       tag:
@@ -49,13 +56,26 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.event.inputs.tag || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.run_id }}
   cancel-in-progress: true
+
+env:
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
 
 jobs:
   # Resolve which build run to use and extract version info
   resolve:
     name: Resolve Build
+    # Auto-trigger only from successful tag builds of "Build and Release".
+    # Tag pushes arrive as event == push with head_branch != main (a
+    # non-main push head_branch is the release tag name). Manual dispatch
+    # stays available as a fallback for backfills and re-runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch != 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -75,8 +95,8 @@ jobs:
           set -euo pipefail
 
           # Determine tag
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            TAG="${HEAD_BRANCH}"
           elif [[ -n "$INPUT_TAG" ]]; then
             TAG="$INPUT_TAG"
           else
@@ -92,6 +112,11 @@ jobs:
             # Explicit run ID takes priority
             BUILD_RUN_ID="$INPUT_RUN_ID"
             echo "Using explicit build run ID: $BUILD_RUN_ID"
+
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Use the Build and Release run that triggered this workflow
+            BUILD_RUN_ID="${WORKFLOW_RUN_ID}"
+            echo "Using triggering workflow run: $BUILD_RUN_ID"
 
           elif [[ -n "$TAG" ]]; then
             # Find the build run that produced this tag
@@ -265,6 +290,12 @@ jobs:
           Homepage: https://rustfs.com
           EOF
 
+          # Declare /etc/default/rustfs as a conffile so dpkg preserves user
+          # modifications on upgrade instead of silently overwriting them.
+          cat > "${PKG_DIR}/DEBIAN/conffiles" << 'CONFFILES'
+          /etc/default/rustfs
+          CONFFILES
+
           cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
           #!/bin/bash
           set -e
@@ -322,6 +353,17 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential
           sudo gem install fpm
 
+          # Create config file for fpm (DEB build creates it in its package dir structure,
+          # but fpm needs the file to exist before packaging)
+          mkdir -p ./tmp-pkg/etc/default
+          cat > ./tmp-pkg/etc/default/rustfs << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
           fpm -s dir -t rpm \
             --name rustfs \
             --version "$VERSION" \
@@ -362,6 +404,7 @@ jobs:
             ) \
             --config-files /etc/default/rustfs \
             ./bin/rustfs=/usr/bin/rustfs \
+            ./tmp-pkg/etc/default/rustfs=/etc/default/rustfs \
             deploy/build/rustfs.service=/lib/systemd/system/rustfs.service \
             LICENSE=/usr/share/doc/rustfs/LICENSE \
             README.md=/usr/share/doc/rustfs/README.md
@@ -443,6 +486,54 @@ jobs:
             done
             echo "✅ Latest packages updated"
           fi
+
+      - name: Upload packages to GitHub Release
+        if: needs.resolve.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.resolve.outputs.tag }}"
+          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
+          RPM_FILE="${{ steps.rpm.outputs.rpm_file }}"
+
+          # Upload the packages, then refresh the release checksums so the new
+          # assets are covered, matching the binary release flow.
+          for f in "$DEB_FILE" "$RPM_FILE"; do
+            if [[ -n "$f" && -f "$f" ]]; then
+              echo "📤 Uploading $(basename "$f") to GitHub release ${TAG}..."
+              gh release upload "$TAG" "$f" --clobber
+            fi
+          done
+
+          CHECKSUM_DIR="$(mktemp -d)"
+          gh release download "$TAG" -p 'SHA256SUMS' -p 'SHA512SUMS' \
+            -D "$CHECKSUM_DIR" --clobber 2>/dev/null || true
+
+          for spec in "SHA256SUMS:sha256sum" "SHA512SUMS:sha512sum"; do
+            asset="${spec%%:*}"
+            checksum_cmd="${spec##*:}"
+            checksum_file="${CHECKSUM_DIR}/${asset}"
+
+            touch "$checksum_file"
+
+            for f in "$DEB_FILE" "$RPM_FILE"; do
+              if [[ -n "$f" && -f "$f" ]]; then
+                base="$(basename "$f")"
+                # Remove any stale entry, then append the fresh digest
+                grep -Fv -- "$base" "$checksum_file" > "${checksum_file}.tmp" || true
+                mv "${checksum_file}.tmp" "$checksum_file"
+                (cd "$(dirname "$f")" && "$checksum_cmd" -- "$base") >> "$checksum_file"
+              fi
+            done
+
+            echo "📤 Updating ${asset} for release ${TAG}..."
+            gh release upload "$TAG" "$checksum_file" --clobber
+          done
+
+          echo "✅ GitHub release assets updated"
 
   # Summary
   summary:

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! System memory metrics collector.
 //!
 //! Collects memory-related metrics including total, used, free,

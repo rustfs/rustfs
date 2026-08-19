@@ -27,7 +27,6 @@
 - **指标收集**：统一的指标记录和上报
 - **带宽监控**：实时带宽观测和分析
 - **性能指标**：I/O 性能指标收集
-- **统一配置**：集中式配置管理
 - **导出边界**：通过 `metrics` 主动上报，由 `rustfs-obs` 负责 OTEL 导出，不提供 Prometheus HTTP 端点
 
 ## ✨ 核心功能
@@ -172,30 +171,6 @@ println!("读取速率: {} bytes/s", snapshot.read_bytes_per_sec);
 println!("写入速率: {} bytes/s", snapshot.write_bytes_per_sec);
 ```
 
-### 统一配置 (IoConfig)
-
-集中式配置管理：
-
-```rust
-use rustfs_io_metrics::{
-    IoConfig, CacheSettings, IoSchedulerSettings,
-    BackpressureSettings, TimeoutSettings,
-};
-
-let config = IoConfig::new()
-    .with_cache(CacheSettings::new()
-        .with_max_capacity(10_000)
-        .with_ttl(std::time::Duration::from_secs(300)))
-    .with_scheduler(IoSchedulerSettings::new()
-        .with_max_concurrent_reads(64))
-    .with_backpressure(BackpressureSettings::new())
-    .with_timeout(TimeoutSettings::new());
-
-// 访问配置
-println!("缓存容量: {}", config.cache.max_capacity);
-println!("最大并发读: {}", config.scheduler.max_concurrent_reads);
-```
-
 ## 📊 指标类型
 
 ### I/O 调度指标
@@ -233,21 +208,6 @@ println!("最大并发读: {}", config.scheduler.max_concurrent_reads);
 | `operation_duration_secs` | 操作时长 | Histogram |
 | `operation_progress` | 操作进度 | Gauge |
 
-## 🔧 配置
-
-### 代码配置
-
-```rust
-use rustfs_io_metrics::{CacheSettings, IoConfig};
-
-let settings = CacheSettings::new()
-    .with_max_capacity(5000)
-    .with_ttl(std::time::Duration::from_secs(600))
-    .with_max_memory(200 * 1024 * 1024);
-
-let config = IoConfig::new().with_cache(settings);
-```
-
 ## 📁 模块结构
 
 ```
@@ -256,7 +216,6 @@ rustfs-io-metrics/
 │   ├── lib.rs               # 模块入口
 │   ├── cache_config.rs      # 缓存配置
 │   ├── adaptive_ttl.rs      # 自适应 TTL
-│   ├── config.rs            # 统一配置
 │   ├── io_metrics.rs        # I/O 指标
 │   ├── backpressure_metrics.rs # 背压指标
 │   ├── deadlock_metrics.rs  # 死锁指标
@@ -297,7 +256,6 @@ cargo doc --package rustfs-io-metrics --no-deps --open
 
 - [Crate API 概览](./src/lib.rs)
 - [指标示例](./examples/metrics_example.rs)
-- [配置模块](./src/config.rs)
 - [自适应 TTL 模块](./src/adaptive_ttl.rs)
 
 ## 🔗 相关模块

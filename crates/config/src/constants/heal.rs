@@ -177,3 +177,40 @@ pub const DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: usize = 80;
 
 /// Default foreground pressure recheck delay for heal scheduler, in milliseconds.
 pub const DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS: u64 = 250;
+
+/// Environment variable that toggles the MRF (mission repair feed) intent
+/// pipeline: error paths deliver repair intents to the heal runtime, and
+/// unconsumed intents are replayed from the durable journal after a restart.
+pub const ENV_HEAL_MRF_ENABLE: &str = "RUSTFS_HEAL_MRF_ENABLE";
+
+/// Environment variable for the MRF in-memory queue capacity (intent count).
+pub const ENV_HEAL_MRF_QUEUE_SIZE: &str = "RUSTFS_HEAL_MRF_QUEUE_SIZE";
+
+/// Environment variable for the MRF journal byte budget. The journal is
+/// compacted once its on-disk size crosses this bound.
+pub const ENV_HEAL_MRF_JOURNAL_MAX_BYTES: &str = "RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES";
+
+/// Environment variable for the MRF journal replay batch size (intents per
+/// replay push round).
+pub const ENV_HEAL_MRF_REPLAY_BATCH: &str = "RUSTFS_HEAL_MRF_REPLAY_BATCH";
+
+/// Default behavior keeps the MRF intent pipeline enabled.
+pub const DEFAULT_HEAL_MRF_ENABLE: bool = true;
+
+/// Default MRF queue capacity (matches MinIO's 100k MRF list ceiling).
+pub const DEFAULT_HEAL_MRF_QUEUE_SIZE: usize = 100_000;
+
+/// Default MRF journal byte budget (8 MiB), mirroring the channel payload cap.
+pub const DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default MRF replay batch size.
+pub const DEFAULT_HEAL_MRF_REPLAY_BATCH: usize = 256;
+
+/// Environment variable selecting how admin heal starts behave when the
+/// requested path overlaps an already running or queued heal: `merge`
+/// (default, keep today's dedup/merge semantics) or `minio_error` (return a
+/// typed already-running / overlapping-paths rejection like madmin).
+pub const ENV_HEAL_OVERLAP_POLICY: &str = "RUSTFS_HEAL_OVERLAP_POLICY";
+
+/// Default overlap policy: merge duplicate/overlapping requests.
+pub const DEFAULT_HEAL_OVERLAP_POLICY: &str = "merge";

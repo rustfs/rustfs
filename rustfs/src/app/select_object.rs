@@ -15,12 +15,13 @@ use datafusion::arrow::{
     json::{WriterBuilder as JsonWriterBuilder, writer::LineDelimited},
     record_batch::RecordBatch,
 };
+#[cfg(test)]
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::RANGE};
 use rustfs_s3select_api::{
-    QueryError, S3SelectPolicyError,
+    QueryError, SelectError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
@@ -28,6 +29,11 @@ use rustfs_s3select_query::instance::s3_select_query_timeout;
 use rustfs_utils::http::headers::{
     AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
     AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
+};
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
 };
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
@@ -49,14 +55,14 @@ use tracing::info;
 
 const MAX_SELECT_EXPRESSION_BYTES: usize = 256 * 1024;
 const RECORDS_CHUNK_TARGET: usize = 128 * 1024;
+const DATA_SOURCE_PATH_UNSUPPORTED_CODE: &str = "DataSourcePathUnsupported";
+const INVALID_QUERY_CODE: &str = "InvalidQuery";
 const PARSE_SELECT_FAILURE_CODE: &str = "ParseSelectFailure";
+const BUSY_MESSAGE: &str = "The service is unavailable. Try again later.";
 const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
-const SELECT_MINIO_SSEC_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
-const SELECT_MINIO_S3_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key";
-const SELECT_MINIO_KMS_SEALED_KEY: &str = "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key";
-const SELECT_MINIO_KMS_KEY_ID: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
-const SELECT_MINIO_KMS_CONTEXT: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
-const SELECT_RUSTFS_KMS_KEY_ID: &str = "x-rustfs-encryption-key-id";
+const SLOW_DOWN_MESSAGE: &str = "Reduce your request rate.";
+const UNSUPPORTED_SQL_STRUCTURE_MESSAGE: &str = "We encountered an unsupported SQL structure. Check the SQL Reference.";
+// No canonical owner exists for the KMS key ARN prefix; keep it local.
 const SELECT_KMS_ARN_PREFIX: &str = "arn:aws:kms:";
 
 #[derive(Clone, Debug)]
@@ -82,12 +88,7 @@ trait SelectSnapshotFence {
 
 impl SelectSnapshotFence for Arc<StorageSelectObjectSnapshot> {
     fn ensure_snapshot_valid(&self) -> S3Result<()> {
-        self.ensure_valid().map_err(|error| {
-            let message = error.to_string();
-            let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, message);
-            s3_error.set_source(Box::new(error));
-            s3_error
-        })
+        self.ensure_valid().map_err(internal_select_error)
     }
 }
 
@@ -128,7 +129,7 @@ pub async fn execute_select_object_content(
     let terminal_permit = tx
         .clone()
         .try_reserve_owned()
-        .map_err(|_| s3_error!(InternalError, "can't reserve Select terminal event capacity"))?;
+        .map_err(|_| map_select_error_to_s3(&SelectError::InternalError))?;
     let response = select_object_response(rx, &snapshot.object_info().user_defined, &req.headers)?;
     spawn_traced(async move {
         send_select_events_until_deadline(
@@ -189,8 +190,8 @@ fn select_metadata_value<'a>(metadata: &'a HashMap<String, String>, name: &str) 
 fn select_snapshot_kms_key_id(metadata: &HashMap<String, String>) -> S3Result<Option<&str>> {
     let values = [
         select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?,
-        select_metadata_value(metadata, SELECT_RUSTFS_KMS_KEY_ID)?,
-        select_metadata_value(metadata, SELECT_MINIO_KMS_KEY_ID)?,
+        select_metadata_value(metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER)?,
+        select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER)?,
     ];
     let mut resolved = None;
     for value in values.into_iter().flatten() {
@@ -205,9 +206,9 @@ fn select_snapshot_kms_key_id(metadata: &HashMap<String, String>) -> S3Result<Op
 fn select_snapshot_sse_mode(metadata: &HashMap<String, String>) -> S3Result<Option<SelectSnapshotSseMode>> {
     let public_mode = select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION)?;
     let customer_algorithm = select_metadata_value(metadata, SSEC_ALGORITHM_HEADER)?;
-    let has_ssec_marker = select_metadata_value(metadata, SELECT_MINIO_SSEC_SEALED_KEY)?.is_some();
-    let has_s3_marker = select_metadata_value(metadata, SELECT_MINIO_S3_SEALED_KEY)?.is_some();
-    let has_kms_marker = select_metadata_value(metadata, SELECT_MINIO_KMS_SEALED_KEY)?.is_some();
+    let has_ssec_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)?.is_some();
+    let has_s3_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)?.is_some();
+    let has_kms_marker = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)?.is_some();
 
     let public_mode = match public_mode {
         Some(AMZ_ENCRYPTION_AES) => Some(SelectSnapshotSseMode::S3),
@@ -268,7 +269,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
     match mode {
         SelectSnapshotSseMode::S3 => {
             if select_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID)?.is_some()
-                || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some()
+                || select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)?.is_some()
                 || select_metadata_value(metadata, SSEC_KEY_MD5_HEADER)?.is_some()
             {
                 return Err(invalid_select_snapshot_sse_metadata());
@@ -292,7 +293,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
                     &format!("{SELECT_KMS_ARN_PREFIX}{key_id}"),
                 )?;
             }
-            if let Some(context) = select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)? {
+            if let Some(context) = select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)? {
                 let context = HeaderValue::from_str(context).map_err(|_| invalid_select_snapshot_sse_metadata())?;
                 let mut validation_headers = HeaderMap::with_capacity(1);
                 validation_headers.insert(X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT, context.clone());
@@ -302,7 +303,7 @@ fn select_snapshot_sse_response_headers(metadata: &HashMap<String, String>, requ
             }
         }
         SelectSnapshotSseMode::Customer => {
-            if kms_key_id.is_some() || select_metadata_value(metadata, SELECT_MINIO_KMS_CONTEXT)?.is_some() {
+            if kms_key_id.is_some() || select_metadata_value(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)?.is_some() {
                 return Err(invalid_select_snapshot_sse_metadata());
             }
             let algorithm = request_headers
@@ -338,7 +339,7 @@ async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
     let outcome = match timeout_at(deadline, send_select_events(output, &tx, validation, &snapshot_lease)).await {
         Ok(outcome) => outcome,
         Err(_) => SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(
-            S3SelectPolicyError::QueryTimeout {
+            SelectError::QueryTimeout {
                 seconds: timeout_seconds,
             }
             .into(),
@@ -416,12 +417,14 @@ async fn send_select_events(
     let stats = SelectObjectContentEvent::Stats(StatsEvent {
         details: Some(progress.to_stats()),
     });
-    if tx.send(Ok(stats)).await.is_err() {
-        return SelectProducerOutcome::ReceiverClosed;
-    }
+    let stats_permit = match tx.reserve().await {
+        Ok(permit) => permit,
+        Err(_) => return SelectProducerOutcome::ReceiverClosed,
+    };
     if let Err(error) = snapshot_fence.ensure_snapshot_valid() {
         return SelectProducerOutcome::Terminal(Err(error));
     }
+    stats_permit.send(Ok(stats));
     SelectProducerOutcome::Terminal(Ok(SelectObjectContentEvent::End(EndEvent::default())))
 }
 
@@ -441,7 +444,9 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
 
     let output_format = normalize_output_serialization(&mut input.request.output_serialization)?;
     if input.request.expression.trim().is_empty() {
-        return Err(parse_select_failure(EMPTY_SELECT_EXPRESSION_MESSAGE));
+        return Err(map_select_error_to_s3(&SelectError::ParseSelectFailure {
+            message: EMPTY_SELECT_EXPRESSION_MESSAGE.to_string(),
+        }));
     }
     let progress_enabled = input
         .request
@@ -466,13 +471,17 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         return Err(S3Error::new(S3ErrorCode::ObjectSerializationConflict));
     }
 
-    if let Some(compression) = input.compression_type.as_ref()
-        && compression.as_str() != CompressionType::NONE
-    {
-        return Err(s3_error!(
-            NotImplemented,
-            "SelectObjectContent currently supports only uncompressed input"
-        ));
+    if let Some(compression) = input.compression_type.as_ref() {
+        match compression.as_str() {
+            CompressionType::NONE => {}
+            CompressionType::GZIP | CompressionType::BZIP2 => {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "SelectObjectContent currently supports only uncompressed input"
+                ));
+            }
+            _ => return Err(map_select_error_to_s3(&SelectError::InvalidCompressionFormat)),
+        }
     }
     input.compression_type = Some(CompressionType::from_static(CompressionType::NONE));
 
@@ -483,8 +492,18 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
                 "CSV AllowQuotedRecordDelimiter is not supported by SelectObjectContent"
             ));
         }
-        csv.file_header_info
+        let file_header_info = csv
+            .file_header_info
             .get_or_insert_with(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+        if !matches!(
+            file_header_info.as_str(),
+            FileHeaderInfo::NONE | FileHeaderInfo::USE | FileHeaderInfo::IGNORE
+        ) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidFileHeaderInfo,
+                "The FileHeaderInfo value is not valid. Only NONE, USE, and IGNORE are supported.",
+            ));
+        }
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
@@ -575,12 +594,6 @@ fn invalid_scan_range_error() -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
 }
 
-fn parse_select_failure(message: impl Into<String>) -> S3Error {
-    let mut err = S3Error::with_message(S3ErrorCode::Custom(PARSE_SELECT_FAILURE_CODE.into()), message.into());
-    err.set_status_code(StatusCode::BAD_REQUEST);
-    err
-}
-
 fn validate_single_byte(value: Option<&str>, code: S3ErrorCode) -> S3Result<()> {
     if let Some(value) = value
         && value.len() != 1
@@ -646,12 +659,14 @@ async fn prepare_select_object_snapshot(
 
 fn map_prepare_snapshot_error(err: StoragePrepareSelectObjectSnapshotError) -> S3Error {
     match err {
-        StoragePrepareSelectObjectSnapshotError::Storage(err) => ApiError::from(err).into(),
-        err => {
-            let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, err.to_string());
-            s3_error.set_source(Box::new(err));
+        StoragePrepareSelectObjectSnapshotError::Storage(err) => {
+            let mut s3_error: S3Error = ApiError::from(err).into();
+            if s3_error.code() == &S3ErrorCode::InternalError {
+                s3_error.set_message(SelectError::InternalError.to_string());
+            }
             s3_error
         }
+        err => internal_select_error(err),
     }
 }
 
@@ -719,9 +734,7 @@ fn encode_csv_batch(batch: &RecordBatch, config: &CSVOutput) -> S3Result<Vec<u8>
     }
 
     let mut writer = builder.build(&mut buffer);
-    writer
-        .write(batch)
-        .map_err(|err| s3_error!(InternalError, "can't encode Select output to CSV: {}", err))?;
+    writer.write(batch).map_err(internal_select_error)?;
     drop(writer);
     Ok(buffer)
 }
@@ -739,12 +752,8 @@ fn encode_json_batch(batch: &RecordBatch, config: &JSONOutput) -> S3Result<Vec<u
     let mut writer = JsonWriterBuilder::new()
         .with_explicit_nulls(true)
         .build::<_, LineDelimited>(&mut buffer);
-    writer
-        .write(batch)
-        .map_err(|err| s3_error!(InternalError, "can't encode Select output to JSON: {}", err))?;
-    writer
-        .finish()
-        .map_err(|err| s3_error!(InternalError, "can't finish Select JSON output: {}", err))?;
+    writer.write(batch).map_err(internal_select_error)?;
+    writer.finish().map_err(internal_select_error)?;
     drop(writer);
 
     if let Some(delimiter) = config.record_delimiter.as_deref()
@@ -813,122 +822,60 @@ fn clamp_i64(value: u64) -> i64 {
 }
 
 fn map_query_error_to_s3(err: QueryError) -> S3Error {
-    if err.is_snapshot_consistency_error() {
-        let message = err.to_string();
-        let mut s3_error = S3Error::with_message(S3ErrorCode::InternalError, message);
-        s3_error.set_source(Box::new(err));
-        return s3_error;
-    }
-    if let Some(policy_error) = err.s3_select_policy_error() {
-        let message = policy_error.to_string();
-        return match policy_error {
-            S3SelectPolicyError::UnsupportedSqlStructure { .. } => {
-                S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message)
-            }
-            S3SelectPolicyError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
-            S3SelectPolicyError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
-            _ => S3Error::with_message(S3ErrorCode::InternalError, message),
-        };
-    }
-    let message = err.to_string();
+    let select_error = err.select_error();
+    map_select_error_to_s3(&select_error)
+}
+
+fn map_select_error_to_s3(err: &SelectError) -> S3Error {
     match err {
-        QueryError::Parser { .. } => parse_select_failure(message),
-        QueryError::MultiStatement { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message),
-        QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
-        QueryError::Datafusion { source } if is_resource_exhausted(source.as_ref()) => {
-            S3Error::with_message(S3ErrorCode::Busy, message)
+        SelectError::InvalidCompressionFormat => S3Error::with_message(S3ErrorCode::InvalidCompressionFormat, err.to_string()),
+        SelectError::InvalidDataSource => S3Error::with_message(S3ErrorCode::InvalidDataSource, err.to_string()),
+        SelectError::TruncatedInput => S3Error::with_message(S3ErrorCode::TruncatedInput, err.to_string()),
+        SelectError::CsvParsingError => S3Error::with_message(S3ErrorCode::CSVParsingError, err.to_string()),
+        SelectError::JsonParsingError => S3Error::with_message(S3ErrorCode::JSONParsingError, err.to_string()),
+        SelectError::ParquetParsingError => S3Error::with_message(S3ErrorCode::ParquetParsingError, err.to_string()),
+        SelectError::ParseSelectFailure { message } => custom_bad_request(PARSE_SELECT_FAILURE_CODE, message.clone()),
+        SelectError::InvalidQuery => custom_bad_request(INVALID_QUERY_CODE, err.to_string()),
+        SelectError::InvalidDataType => S3Error::with_message(S3ErrorCode::InvalidDataType, err.to_string()),
+        SelectError::IncorrectSqlFunctionArgumentType => {
+            S3Error::with_message(S3ErrorCode::IncorrectSqlFunctionArgumentType, err.to_string())
         }
-        QueryError::Datafusion { source } if is_unexpected_eof(source.as_ref()) => {
-            S3Error::with_message(S3ErrorCode::InternalError, message)
+        SelectError::DataSourcePathUnsupported => custom_bad_request(DATA_SOURCE_PATH_UNSUPPORTED_CODE, err.to_string()),
+        SelectError::UnsupportedSqlStructure { .. } => {
+            S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, UNSUPPORTED_SQL_STRUCTURE_MESSAGE)
         }
-        QueryError::Datafusion { source } if is_invalid_object_size(source.as_ref()) => {
-            S3Error::with_message(S3ErrorCode::InternalError, message)
+        SelectError::UnsupportedSqlOperation => S3Error::with_message(S3ErrorCode::UnsupportedSqlOperation, err.to_string()),
+        SelectError::EvaluatorBindingDoesNotExist => {
+            S3Error::with_message(S3ErrorCode::EvaluatorBindingDoesNotExist, err.to_string())
         }
-        QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
+        SelectError::AmbiguousFieldName => S3Error::with_message(S3ErrorCode::AmbiguousFieldName, err.to_string()),
+        SelectError::InvalidScanRange => {
             S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
         }
-        QueryError::Datafusion { .. } if looks_like_missing_binding(&message) => {
-            S3Error::with_message(S3ErrorCode::EvaluatorBindingDoesNotExist, message)
+        SelectError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, SLOW_DOWN_MESSAGE),
+        SelectError::QueryTimeout { .. } | SelectError::ResourceExhausted => {
+            S3Error::with_message(S3ErrorCode::Busy, BUSY_MESSAGE)
         }
-        QueryError::Datafusion { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlOperation, message),
-        QueryError::StoreError { .. } if looks_like_invalid_scan_range(&message) => {
-            S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
+        SelectError::BucketNotFound => S3Error::with_message(S3ErrorCode::NoSuchBucket, err.to_string()),
+        SelectError::ObjectNotFound => S3Error::with_message(S3ErrorCode::NoSuchKey, err.to_string()),
+        SelectError::Canceled | SelectError::InternalError => {
+            S3Error::with_message(S3ErrorCode::InternalError, SelectError::InternalError.to_string())
         }
-        QueryError::StoreError { .. } if looks_like_bucket_not_found(&message) => {
-            S3Error::with_message(S3ErrorCode::NoSuchBucket, message)
-        }
-        QueryError::StoreError { .. } if looks_like_object_not_found(&message) => {
-            S3Error::with_message(S3ErrorCode::NoSuchKey, message)
-        }
-        QueryError::StoreError { .. } => S3Error::with_message(S3ErrorCode::InternalError, message),
-        QueryError::BuildQueryDispatcher { .. }
-        | QueryError::Cancel
-        | QueryError::FunctionNotExists { .. }
-        | QueryError::FunctionExists { .. } => S3Error::with_message(S3ErrorCode::InternalError, message),
     }
+}
+
+fn internal_select_error(_error: impl std::error::Error + Send + Sync + 'static) -> S3Error {
+    map_select_error_to_s3(&SelectError::InternalError)
+}
+
+fn custom_bad_request(code: &'static str, message: String) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom(code.into()), message);
+    err.set_status_code(StatusCode::BAD_REQUEST);
+    err
 }
 
 fn select_query_timeout_error(seconds: u64) -> S3Error {
-    map_query_error_to_s3(S3SelectPolicyError::QueryTimeout { seconds }.into())
-}
-
-fn looks_like_bucket_not_found(message: &str) -> bool {
-    message.contains("NoSuchBucket") || message.contains("bucket not found") || message.contains("BucketNotFound")
-}
-
-const MAX_ERROR_SOURCE_DEPTH: usize = 16;
-
-fn error_chain_any(
-    mut err: &(dyn std::error::Error + 'static),
-    predicate: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
-) -> bool {
-    for _ in 0..MAX_ERROR_SOURCE_DEPTH {
-        if predicate(err) {
-            return true;
-        }
-        let Some(source) = err.source() else {
-            return false;
-        };
-        err = source;
-    }
-    false
-}
-
-fn is_resource_exhausted(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_any(err, |err| {
-        err.downcast_ref::<DataFusionError>()
-            .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
-    })
-}
-
-fn is_unexpected_eof(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_any(err, |err| {
-        err.downcast_ref::<std::io::Error>()
-            .is_some_and(|err| err.kind() == std::io::ErrorKind::UnexpectedEof)
-    })
-}
-
-fn is_invalid_object_size(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_any(err, |err| err.downcast_ref::<std::num::TryFromIntError>().is_some())
-}
-
-fn looks_like_object_not_found(message: &str) -> bool {
-    message.contains("NoSuchKey")
-        || message.contains("NoSuchVersion")
-        || message.contains("ObjectNotFound")
-        || message.contains("object not found")
-        || message.contains("NotFound")
-}
-
-fn looks_like_missing_binding(message: &str) -> bool {
-    message.contains("No field named")
-        || message.contains("field not found")
-        || message.contains("Schema error")
-        || message.contains("No such column")
-}
-
-fn looks_like_invalid_scan_range(message: &str) -> bool {
-    message.contains("ScanRange:") || message.contains(INVALID_SCAN_RANGE_MESSAGE)
+    map_query_error_to_s3(SelectError::QueryTimeout { seconds }.into())
 }
 
 fn is_json_document(json: &JSONInput) -> bool {
@@ -942,14 +889,62 @@ mod tests {
     use super::*;
     use datafusion::{
         arrow::{
-            array::{Array, ListArray},
-            datatypes::{Field, Int32Type, Schema},
+            array::{Array, ListArray, StringArray},
+            datatypes::{DataType, Field, Int32Type, Schema},
+            error::ArrowError,
         },
         physical_plan::stream::RecordBatchStreamAdapter,
         sql::sqlparser::parser::ParserError,
     };
     use rustfs_test_utils::TestECStoreEnv;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
+
+    fn event_stream_headers(mut bytes: &[u8]) -> Vec<Vec<(String, String)>> {
+        let mut messages = Vec::new();
+        while !bytes.is_empty() {
+            assert!(bytes.len() >= 16, "event-stream message is truncated");
+            let total_len = u32::from_be_bytes(bytes[0..4].try_into().expect("event-stream total length")) as usize;
+            let headers_len = u32::from_be_bytes(bytes[4..8].try_into().expect("event-stream headers length")) as usize;
+            assert!(total_len >= 16 && total_len <= bytes.len(), "invalid event-stream message length");
+            assert!(12 + headers_len <= total_len - 4, "invalid event-stream headers length");
+
+            let mut headers = &bytes[12..12 + headers_len];
+            let mut decoded = Vec::new();
+            while !headers.is_empty() {
+                let name_len = headers[0] as usize;
+                assert!(headers.len() >= name_len + 4, "event-stream header is truncated");
+                let name = std::str::from_utf8(&headers[1..1 + name_len])
+                    .expect("event-stream header name should be UTF-8")
+                    .to_string();
+                assert_eq!(headers[1 + name_len], 7, "expected an event-stream string header");
+                let value_len = u16::from_be_bytes(
+                    headers[2 + name_len..4 + name_len]
+                        .try_into()
+                        .expect("event-stream header value length"),
+                ) as usize;
+                assert!(headers.len() >= name_len + 4 + value_len, "event-stream header value is truncated");
+                let value = std::str::from_utf8(&headers[4 + name_len..4 + name_len + value_len])
+                    .expect("event-stream header value should be UTF-8")
+                    .to_string();
+                decoded.push((name, value));
+                headers = &headers[4 + name_len + value_len..];
+            }
+            messages.push(decoded);
+            bytes = &bytes[total_len..];
+        }
+        messages
+    }
+
+    async fn http_xml_error(error: S3Error) -> (StatusCode, String) {
+        let response = error.to_http_response().expect("S3 error should serialize to HTTP");
+        let status = response.status();
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("S3 error body should be readable")
+            .to_bytes();
+        let body = std::str::from_utf8(&body).expect("S3 error XML should be UTF-8").to_string();
+        (status, body)
+    }
 
     struct LeaseDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -1010,22 +1005,8 @@ mod tests {
             .expect_err("production fence adapter must reject a lost storage snapshot");
 
         assert_eq!(error.code(), &S3ErrorCode::InternalError);
-        assert!(error.to_string().contains("namespace lock was lost"));
-    }
-
-    #[derive(Debug)]
-    struct CyclicError;
-
-    impl std::fmt::Display for CyclicError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("cyclic error")
-        }
-    }
-
-    impl std::error::Error for CyclicError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(self)
-        }
+        assert_eq!(error.message(), Some("An internal error occurred."));
+        assert!(error.source().is_none());
     }
 
     fn base_input() -> SelectObjectContentInput {
@@ -1066,8 +1047,8 @@ mod tests {
     fn select_snapshot_sse_s3_headers_are_whitelisted() {
         let metadata = HashMap::from([
             (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_AES.to_string()),
-            (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "default".to_string()),
-            (SELECT_MINIO_KMS_KEY_ID.to_string(), "default".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "default".to_string()),
+            (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "default".to_string()),
             ("x-amz-meta-private".to_string(), "private-value".to_string()),
         ]);
 
@@ -1086,9 +1067,9 @@ mod tests {
             let metadata = HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), key_id.to_string()),
-                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), key_id.to_string()),
-                (SELECT_MINIO_KMS_KEY_ID.to_string(), key_id.to_string()),
-                (SELECT_MINIO_KMS_CONTEXT.to_string(), context.to_string()),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), key_id.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), key_id.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), context.to_string()),
             ]);
 
             let headers = select_snapshot_sse_response_headers(&metadata, &HeaderMap::new())
@@ -1162,16 +1143,16 @@ mod tests {
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
             ]),
-            HashMap::from([(SELECT_MINIO_KMS_SEALED_KEY.to_string(), "sealed".to_string())]),
+            HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), "sealed".to_string())]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
-                (SELECT_RUSTFS_KMS_KEY_ID.to_string(), "key-2".to_string()),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "key-2".to_string()),
             ]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
                 (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
-                (SELECT_MINIO_KMS_CONTEXT.to_string(), invalid_context.to_string()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(), invalid_context.to_string()),
             ]),
             HashMap::from([
                 (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), AMZ_ENCRYPTION_KMS.to_string()),
@@ -1272,15 +1253,15 @@ mod tests {
     #[test]
     fn map_query_policy_errors_to_s3_errors() {
         let unsupported = map_query_error_to_s3(
-            S3SelectPolicyError::UnsupportedSqlStructure {
+            SelectError::UnsupportedSqlStructure {
                 message: "JOIN is not supported".to_string(),
             }
             .into(),
         );
-        let saturated = map_query_error_to_s3(S3SelectPolicyError::QueryConcurrencyLimit.into());
-        let timed_out = map_query_error_to_s3(S3SelectPolicyError::QueryTimeout { seconds: 300 }.into());
+        let saturated = map_query_error_to_s3(SelectError::QueryConcurrencyLimit.into());
+        let timed_out = map_query_error_to_s3(SelectError::QueryTimeout { seconds: 300 }.into());
         let stream_timed_out = map_query_error_to_s3(QueryError::Datafusion {
-            source: Box::new(DataFusionError::External(Box::new(S3SelectPolicyError::QueryTimeout { seconds: 300 }))),
+            source: Box::new(DataFusionError::External(Box::new(SelectError::QueryTimeout { seconds: 300 }))),
         });
         let exhausted = map_query_error_to_s3(QueryError::Datafusion {
             source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
@@ -1289,6 +1270,9 @@ mod tests {
             }))),
         });
         let truncated = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::External(Box::new(SelectError::TruncatedInput))),
+        });
+        let raw_storage_short_read = map_query_error_to_s3(QueryError::Datafusion {
             source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated object stream")),
@@ -1302,19 +1286,114 @@ mod tests {
         });
 
         assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
-        assert_eq!(unsupported.message(), Some("Unsupported S3 Select SQL structure: JOIN is not supported"));
+        assert_eq!(unsupported.message(), Some(UNSUPPORTED_SQL_STRUCTURE_MESSAGE));
         assert_eq!(saturated.code(), &S3ErrorCode::SlowDown);
-        assert_eq!(saturated.message(), Some("S3 Select query concurrency limit reached"));
         assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
-        assert_eq!(timed_out.message(), Some("S3 Select query exceeded the 300-second execution limit"));
         assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
-        assert_eq!(
-            stream_timed_out.message(),
-            Some("S3 Select query exceeded the 300-second execution limit")
-        );
         assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
-        assert_eq!(truncated.code(), &S3ErrorCode::InternalError);
+        assert_eq!(truncated.code(), &S3ErrorCode::TruncatedInput);
+        assert_eq!(raw_storage_short_read.code(), &S3ErrorCode::InternalError);
         assert_eq!(invalid_object_size.code(), &S3ErrorCode::InternalError);
+        assert_eq!(invalid_object_size.message(), Some("An internal error occurred."));
+    }
+
+    #[test]
+    fn every_select_error_has_an_explicit_protocol_mapping() {
+        let cases = vec![
+            (
+                SelectError::InvalidCompressionFormat,
+                S3ErrorCode::InvalidCompressionFormat,
+                StatusCode::BAD_REQUEST,
+            ),
+            (SelectError::InvalidDataSource, S3ErrorCode::InvalidDataSource, StatusCode::BAD_REQUEST),
+            (SelectError::TruncatedInput, S3ErrorCode::TruncatedInput, StatusCode::BAD_REQUEST),
+            (SelectError::CsvParsingError, S3ErrorCode::CSVParsingError, StatusCode::BAD_REQUEST),
+            (SelectError::JsonParsingError, S3ErrorCode::JSONParsingError, StatusCode::BAD_REQUEST),
+            (
+                SelectError::ParquetParsingError,
+                S3ErrorCode::ParquetParsingError,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::ParseSelectFailure {
+                    message: "invalid SELECT expression".to_string(),
+                },
+                S3ErrorCode::Custom(PARSE_SELECT_FAILURE_CODE.into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::InvalidQuery,
+                S3ErrorCode::Custom(INVALID_QUERY_CODE.into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (SelectError::InvalidDataType, S3ErrorCode::InvalidDataType, StatusCode::BAD_REQUEST),
+            (
+                SelectError::IncorrectSqlFunctionArgumentType,
+                S3ErrorCode::IncorrectSqlFunctionArgumentType,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::DataSourcePathUnsupported,
+                S3ErrorCode::Custom(DATA_SOURCE_PATH_UNSUPPORTED_CODE.into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::UnsupportedSqlStructure {
+                    message: "JOIN is not supported".to_string(),
+                },
+                S3ErrorCode::UnsupportedSqlStructure,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::UnsupportedSqlOperation,
+                S3ErrorCode::UnsupportedSqlOperation,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SelectError::EvaluatorBindingDoesNotExist,
+                S3ErrorCode::EvaluatorBindingDoesNotExist,
+                StatusCode::BAD_REQUEST,
+            ),
+            (SelectError::AmbiguousFieldName, S3ErrorCode::AmbiguousFieldName, StatusCode::BAD_REQUEST),
+            (
+                SelectError::InvalidScanRange,
+                S3ErrorCode::InvalidRequestParameter,
+                StatusCode::BAD_REQUEST,
+            ),
+            (SelectError::QueryConcurrencyLimit, S3ErrorCode::SlowDown, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                SelectError::QueryTimeout { seconds: 300 },
+                S3ErrorCode::Busy,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (SelectError::ResourceExhausted, S3ErrorCode::Busy, StatusCode::SERVICE_UNAVAILABLE),
+            (SelectError::BucketNotFound, S3ErrorCode::NoSuchBucket, StatusCode::NOT_FOUND),
+            (SelectError::ObjectNotFound, S3ErrorCode::NoSuchKey, StatusCode::NOT_FOUND),
+            (SelectError::Canceled, S3ErrorCode::InternalError, StatusCode::INTERNAL_SERVER_ERROR),
+            (SelectError::InternalError, S3ErrorCode::InternalError, StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+
+        for (select_error, expected_code, expected_status) in cases {
+            let error = map_select_error_to_s3(&select_error);
+            assert_eq!(error.code(), &expected_code, "wrong mapping for {select_error:?}");
+            assert_eq!(error.status_code(), Some(expected_status), "wrong status for {select_error:?}");
+            assert!(
+                error.message().is_some_and(|message| !message.is_empty()),
+                "missing protocol message for {select_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_query_details_are_not_exposed_to_clients() {
+        let private_detail = "node-1:/private/object/path physical_plan=secret";
+        let error = map_query_error_to_s3(QueryError::from(DataFusionError::Internal(private_detail.to_string())));
+
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("An internal error occurred."));
+        assert!(!error.message().is_some_and(|message| message.contains(private_detail)));
+        assert!(!format!("{error:?}").contains(private_detail));
+        assert!(error.source().is_none());
     }
 
     #[test]
@@ -1329,23 +1408,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_snapshot_invalid_logical_size_fails_with_internal_error_and_source() {
+    fn prepare_snapshot_invalid_logical_size_fails_with_redacted_internal_error() {
         let err = map_prepare_snapshot_error(StoragePrepareSelectObjectSnapshotError::InvalidLogicalSize { size: -1 });
 
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(
-            err.source()
-                .is_some_and(|source| source.downcast_ref::<StoragePrepareSelectObjectSnapshotError>().is_some())
-        );
-    }
-
-    #[test]
-    fn error_source_matching_stops_at_the_depth_bound() {
-        let err = CyclicError;
-
-        assert!(!is_resource_exhausted(&err));
-        assert!(!is_unexpected_eof(&err));
-        assert!(!is_invalid_object_size(&err));
+        assert!(err.source().is_none());
+        assert_eq!(err.message(), Some("An internal error occurred."));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1423,6 +1491,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn successful_stream_serializes_records_stats_and_end_without_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["row"]))])
+            .expect("test record batch should be valid");
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok::<_, DataFusionError>(batch) }),
+        ));
+        let (producer, rx, lease_released) = spawn_test_producer(output, 4);
+        producer.await.expect("producer should finish successfully");
+
+        let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+        let mut encoded = Vec::new();
+        while let Some(chunk) = byte_stream.next().await {
+            encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
+        }
+        let messages = event_stream_headers(&encoded);
+        let event_types = messages
+            .iter()
+            .filter_map(|headers| {
+                headers
+                    .iter()
+                    .find_map(|(name, value)| (name == ":event-type").then_some(value.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(event_types, ["Cont", "Records", "Stats", "End"]);
+        assert!(!messages.iter().flatten().any(|(name, value)| {
+            (name == ":message-type" && value == "error") || name == ":error-code" || name == ":error-message"
+        }));
+        assert!(lease_released.await.is_ok(), "End should release the snapshot lease");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn eof_at_deadline_uses_reserved_slot_for_stats_then_end() {
         let output = Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(Schema::empty()),
@@ -1455,7 +1556,7 @@ mod tests {
             Arc::new(Schema::empty()),
             futures::stream::once(async {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                Err(DataFusionError::External(Box::new(S3SelectPolicyError::QueryConcurrencyLimit)))
+                Err(DataFusionError::External(Box::new(SelectError::QueryConcurrencyLimit)))
             }),
         ));
         let (producer, mut rx, lease_released) = spawn_test_producer(output, 2);
@@ -1473,6 +1574,172 @@ mod tests {
         assert_eq!(stream_error.code(), &S3ErrorCode::SlowDown);
         assert!(rx.recv().await.is_none());
         assert!(lease_released.await.is_ok(), "stream error should release the snapshot lease");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_errors_use_http_codes_before_stream_and_error_frames_after_stream() {
+        fn csv_error() -> DataFusionError {
+            DataFusionError::ArrowError(Box::new(ArrowError::CsvError("private CSV parser state".to_string())), None)
+        }
+        fn json_error() -> DataFusionError {
+            DataFusionError::ArrowError(Box::new(ArrowError::JsonError("private JSON parser state".to_string())), None)
+        }
+        fn parquet_error() -> DataFusionError {
+            DataFusionError::ParquetError(Box::new(datafusion::parquet::errors::ParquetError::General(
+                "private Parquet parser state".to_string(),
+            )))
+        }
+        fn truncated_error() -> DataFusionError {
+            DataFusionError::External(Box::new(SelectError::TruncatedInput))
+        }
+        fn timeout_error() -> DataFusionError {
+            DataFusionError::External(Box::new(SelectError::QueryTimeout { seconds: 300 }))
+        }
+
+        let cases = [
+            (
+                csv_error as fn() -> DataFusionError,
+                S3ErrorCode::CSVParsingError,
+                StatusCode::BAD_REQUEST,
+                b"CSVParsingError" as &[u8],
+            ),
+            (json_error, S3ErrorCode::JSONParsingError, StatusCode::BAD_REQUEST, b"JSONParsingError"),
+            (
+                parquet_error,
+                S3ErrorCode::ParquetParsingError,
+                StatusCode::BAD_REQUEST,
+                b"ParquetParsingError",
+            ),
+            (truncated_error, S3ErrorCode::TruncatedInput, StatusCode::BAD_REQUEST, b"TruncatedInput"),
+            (timeout_error, S3ErrorCode::Busy, StatusCode::SERVICE_UNAVAILABLE, b"Busy"),
+        ];
+
+        for (source, expected_code, expected_status, encoded_code) in cases {
+            let pre_stream = map_query_error_to_s3(QueryError::from(source()));
+            assert_eq!(pre_stream.code(), &expected_code);
+            assert_eq!(pre_stream.status_code(), Some(expected_status));
+            let expected_code_text = expected_code.as_str().to_string();
+            let (status, body) = http_xml_error(pre_stream).await;
+            assert_eq!(status, expected_status);
+            assert!(body.contains(&format!("<Code>{expected_code_text}</Code>")));
+            assert!(body.contains("<Message>"));
+
+            let output = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures::stream::once(async move { Err(source()) }),
+            ));
+            let (producer, rx, lease_released) = spawn_test_producer(output, 2);
+            producer.await.expect("producer should emit the terminal Select error");
+
+            let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+            let mut encoded = Vec::new();
+            while let Some(chunk) = byte_stream.next().await {
+                encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
+            }
+            let messages = event_stream_headers(&encoded);
+            let terminal_headers = messages.last().expect("event stream should contain a terminal error");
+            let encoded_code = std::str::from_utf8(encoded_code).expect("test error code should be UTF-8");
+            assert!(
+                terminal_headers
+                    .iter()
+                    .any(|(name, value)| name == ":message-type" && value == "error")
+            );
+            assert!(
+                terminal_headers
+                    .iter()
+                    .any(|(name, value)| name == ":error-code" && value == encoded_code)
+            );
+            assert!(
+                terminal_headers
+                    .iter()
+                    .any(|(name, value)| name == ":error-message" && !value.is_empty() && !value.contains("private"))
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .flatten()
+                    .any(|(name, value)| { name == ":event-type" && matches!(value.as_str(), "Stats" | "End") })
+            );
+            assert!(lease_released.await.is_ok(), "error frame should release the snapshot lease");
+        }
+    }
+
+    #[tokio::test]
+    async fn sql_and_compression_errors_serialize_as_http_xml() {
+        let sql_error = map_query_error_to_s3(QueryError::Parser {
+            source: ParserError::ParserError("unexpected token".to_string()),
+        });
+        let (sql_status, sql_body) = http_xml_error(sql_error).await;
+        assert_eq!(sql_status, StatusCode::BAD_REQUEST);
+        assert!(sql_body.contains("<Code>ParseSelectFailure</Code>"));
+        assert!(sql_body.contains("<Message>"));
+
+        let mut input = base_input();
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static("SNAPPY"));
+        let compression_error =
+            validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown compression must fail before streaming");
+        let (compression_status, compression_body) = http_xml_error(compression_error).await;
+        assert_eq!(compression_status, StatusCode::BAD_REQUEST);
+        assert!(compression_body.contains("<Code>InvalidCompressionFormat</Code>"));
+        assert!(compression_body.contains("<Message>"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_after_records_omits_stats_and_end() {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["row"]))])
+            .expect("test record batch should be valid");
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter([
+                Ok(batch),
+                Err(DataFusionError::ArrowError(
+                    Box::new(ArrowError::CsvError("private CSV parser state".to_string())),
+                    None,
+                )),
+            ]),
+        ));
+        let (producer, rx, lease_released) = spawn_test_producer(output, 3);
+
+        producer
+            .await
+            .expect("producer should emit records followed by the terminal error");
+
+        let mut byte_stream = SelectObjectContentEventStream::new(ReceiverStream::new(rx)).into_byte_stream();
+        let mut encoded = Vec::new();
+        while let Some(chunk) = byte_stream.next().await {
+            encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
+        }
+        let messages = event_stream_headers(&encoded);
+        assert_eq!(
+            messages
+                .iter()
+                .filter_map(|headers| {
+                    headers
+                        .iter()
+                        .find_map(|(name, value)| (name == ":event-type").then_some(value.as_str()))
+                })
+                .collect::<Vec<_>>(),
+            ["Cont", "Records"]
+        );
+        let terminal_headers = messages.last().expect("stream should contain a terminal error");
+        assert!(
+            terminal_headers
+                .iter()
+                .any(|(name, value)| name == ":message-type" && value == "error")
+        );
+        assert!(
+            terminal_headers
+                .iter()
+                .any(|(name, value)| name == ":error-code" && value == "CSVParsingError")
+        );
+        assert!(
+            !messages
+                .iter()
+                .flatten()
+                .any(|(name, value)| { name == ":event-type" && matches!(value.as_str(), "Stats" | "End") })
+        );
+        assert!(lease_released.await.is_ok(), "error should release the snapshot lease");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1497,6 +1764,8 @@ mod tests {
             .expect("encoder failure should send one terminal error")
             .expect_err("terminal event should be an error");
         assert_eq!(encoder_error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(encoder_error.message(), Some("An internal error occurred."));
+        assert!(encoder_error.source().is_none());
         assert!(rx.recv().await.is_none());
         assert!(lease_released.await.is_ok(), "encoder error should release the snapshot lease");
     }
@@ -1628,8 +1897,7 @@ mod tests {
         };
         assert_eq!(error.code(), &S3ErrorCode::InternalError);
         assert_eq!(snapshot_fence.0.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Stats(_)))));
-        assert!(rx.try_recv().is_err(), "snapshot loss after Stats must not enqueue End");
+        assert!(rx.try_recv().is_err(), "snapshot loss must not enqueue Stats or End");
     }
 
     #[test]
@@ -1655,6 +1923,27 @@ mod tests {
                 .as_ref()
                 .map(|value| value.as_str()),
             Some(CompressionType::NONE)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_csv_header_mode_before_streaming() {
+        let mut input = base_input();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV")
+            .file_header_info = Some(FileHeaderInfo::from_static("INVALID"));
+
+        let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown header mode must fail");
+
+        assert_eq!(error.code(), &S3ErrorCode::InvalidFileHeaderInfo);
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            error.message(),
+            Some("The FileHeaderInfo value is not valid. Only NONE, USE, and IGNORE are supported.")
         );
     }
 
@@ -1980,26 +2269,8 @@ mod tests {
     }
 
     #[test]
-    fn map_store_error_not_found_to_no_such_key() {
-        let err = map_query_error_to_s3(QueryError::StoreError {
-            e: "ObjectStore NotFound: bucket/object.csv".to_string(),
-        });
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
-    }
-
-    #[test]
-    fn map_store_error_bucket_not_found_to_no_such_bucket() {
-        let err = map_query_error_to_s3(QueryError::StoreError {
-            e: "bucket not found".to_string(),
-        });
-        assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
-    }
-
-    #[test]
-    fn map_scan_range_store_error_to_invalid_request_parameter() {
-        let err = map_query_error_to_s3(QueryError::StoreError {
-            e: "ScanRange: Start after EOF".to_string(),
-        });
+    fn map_typed_scan_range_error_to_invalid_request_parameter() {
+        let err = map_query_error_to_s3(SelectError::InvalidScanRange.into());
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequestParameter);
         assert_eq!(err.message(), Some(INVALID_SCAN_RANGE_MESSAGE));
     }

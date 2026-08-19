@@ -22,10 +22,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Baselines verified on 2026-08-06. Lower-only; see header.
-S3S_IMPORT_FILES_BASELINE=236
-S3_ERROR_LINES_BASELINE=1678
+# Baselines verified on 2026-08-11. Lower-only; see header.
+# Excludes crates/e2e_test/ — test infrastructure legitimately uses s3s
+# to verify S3 behavior and does not widen the production s3s surface.
+S3S_IMPORT_FILES_BASELINE=211
+S3_ERROR_LINES_BASELINE=1620
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
+E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -42,8 +45,8 @@ run_rg_to() {
     fi
 }
 
-run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust
-run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust
+run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust $E2E_TEST_GLOB
+run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust $E2E_TEST_GLOB
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
 s3_error_lines="$(awk -F: '{sum += $NF} END {print sum + 0}' "$TMP_DIR/error_lines")"
@@ -76,9 +79,9 @@ check_ratchet() {
 }
 
 check_ratchet "files importing s3s" "$s3s_import_files" "$S3S_IMPORT_FILES_BASELINE" \
-    "rg -l '$S3S_PATH_PATTERN' --type rust"
+    "rg -l '$S3S_PATH_PATTERN' --type rust $E2E_TEST_GLOB"
 check_ratchet "s3_error! invocation lines" "$s3_error_lines" "$S3_ERROR_LINES_BASELINE" \
-    "rg -c 's3_error!' --type rust"
+    "rg -c 's3_error!' --type rust $E2E_TEST_GLOB"
 
 if ((status != 0)); then
     exit 1

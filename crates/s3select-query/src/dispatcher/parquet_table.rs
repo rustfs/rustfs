@@ -38,7 +38,7 @@ use datafusion::{
 };
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use rustfs_s3select_api::{
-    QueryError, QueryResult,
+    QueryResult,
     object_store::{SelectScanRange, scan_range_from_bounds},
 };
 use s3s::dto::SelectObjectContentInput;
@@ -106,7 +106,10 @@ impl ParquetSelectTable {
         let object_store_url = table_path.object_store();
         let object_location = Path::from(input.key.clone());
         let store = state.runtime_env().object_store(&object_store_url)?;
-        let object_meta = store.head(&object_location).await.map_err(query_store_error)?;
+        let object_meta = store
+            .head(&object_location)
+            .await
+            .map_err(datafusion::common::DataFusionError::from)?;
 
         let reader = ObjectStoreParquetReader {
             store: Arc::clone(&store),
@@ -115,7 +118,7 @@ impl ParquetSelectTable {
         };
         let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
-            .map_err(query_store_error)?;
+            .map_err(datafusion::common::DataFusionError::from)?;
         let schema = Arc::clone(builder.schema());
         let metadata = Arc::clone(builder.metadata());
         let access_plan = parquet_access_plan(input, object_meta.size, metadata.as_ref())?;
@@ -180,7 +183,8 @@ fn parquet_access_plan(
     let Some(scan_range) = input.request.scan_range.as_ref() else {
         return Ok(None);
     };
-    let scan_range = scan_range_from_bounds(scan_range.start, scan_range.end, object_size).map_err(query_store_error)?;
+    let scan_range = scan_range_from_bounds(scan_range.start, scan_range.end, object_size)
+        .map_err(datafusion::common::DataFusionError::from)?;
     Ok(scan_range.map(|range| Arc::new(access_plan_for_scan_range(range, metadata))))
 }
 
@@ -214,10 +218,6 @@ fn parquet_store_error(err: ObjectStoreError) -> ParquetError {
     ParquetError::External(Box::new(err))
 }
 
-fn query_store_error(err: impl fmt::Display) -> QueryError {
-    QueryError::StoreError { e: err.to_string() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +227,13 @@ mod tests {
             datatypes::{DataType, Field, Schema, SchemaRef},
             record_batch::RecordBatch,
         },
+        object_store::memory::InMemory,
         parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+        prelude::SessionContext,
+    };
+    use rustfs_s3select_api::SelectError;
+    use s3s::dto::{
+        CSVOutput, ExpressionType, InputSerialization, OutputSerialization, ParquetInput, ScanRange, SelectObjectContentRequest,
     };
     use std::{
         fs::File,
@@ -273,6 +279,85 @@ mod tests {
         let plan = access_plan_for_scan_range(SelectScanRange::new(100, 190), metadata.as_ref());
         assert!(plan.should_scan(0));
         assert!(!plan.should_scan(1));
+    }
+
+    #[test]
+    fn parquet_access_plan_has_typed_invalid_scan_range_error() {
+        let metadata = two_row_group_metadata();
+        let mut input = parquet_input("test.parquet");
+        input.request.scan_range = Some(ScanRange {
+            start: Some(10),
+            end: None,
+        });
+
+        let error = parquet_access_plan(&input, 10, metadata.as_ref()).expect_err("out-of-bounds range must fail");
+
+        assert_eq!(error.select_error(), SelectError::InvalidScanRange);
+    }
+
+    #[tokio::test]
+    async fn try_new_preserves_missing_object_error() {
+        let store = Arc::new(InMemory::new());
+        let context = parquet_session(store);
+        let state = context.state();
+
+        let error = match ParquetSelectTable::try_new(&state, &parquet_input("missing.parquet")).await {
+            Ok(_) => panic!("missing parquet object must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.select_error(), SelectError::ObjectNotFound);
+    }
+
+    #[tokio::test]
+    async fn try_new_preserves_parquet_metadata_error() {
+        let store = Arc::new(InMemory::new());
+        let object = Path::from("corrupt.parquet");
+        store
+            .put(&object, Bytes::from_static(b"not a parquet file").into())
+            .await
+            .expect("put corrupt parquet object");
+        let context = parquet_session(store);
+        let state = context.state();
+
+        let error = match ParquetSelectTable::try_new(&state, &parquet_input(object.as_ref())).await {
+            Ok(_) => panic!("corrupt parquet metadata must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.select_error(), SelectError::ParquetParsingError);
+    }
+
+    fn parquet_session(store: Arc<dyn ObjectStore>) -> SessionContext {
+        let context = SessionContext::new();
+        let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("valid test object store URL");
+        context.register_object_store(store_url.as_ref(), store);
+        context
+    }
+
+    fn parquet_input(key: &str) -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: key.to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM S3Object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    parquet: Some(ParquetInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
     }
 
     fn two_row_group_metadata() -> Arc<ParquetMetaData> {

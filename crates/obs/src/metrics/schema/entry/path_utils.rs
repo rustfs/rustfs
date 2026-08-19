@@ -14,7 +14,6 @@
 
 /// Format the path to the metric name format
 /// Replace '/' and '-' with '_'
-#[allow(dead_code)]
 pub fn format_path_to_metric_name(path: &str) -> String {
     path.trim_start_matches('/').replace(['/', '-'], "_")
 }

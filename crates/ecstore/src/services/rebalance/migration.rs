@@ -5,6 +5,7 @@ use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_fo
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
+use crate::store::ECStore;
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_utils::path::encode_dir_object;
@@ -21,15 +22,23 @@ pub(crate) struct MigrationVersionResult {
     pub error: Option<Error>,
 }
 
-pub(super) fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
+pub(super) fn rebalance_delete_marker_opts(
+    version: &FileInfo,
+    version_id: Option<String>,
+    src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
+) -> ObjectOptions {
+    let version_suspended = version.version_id.is_none() && version_id.is_none();
     ObjectOptions {
-        versioned: true,
-        version_id,
+        versioned: !version_suspended,
+        version_suspended,
+        version_id: version_id.or_else(|| version_suspended.then(|| uuid::Uuid::nil().to_string())),
         mod_time: version.mod_time,
         src_pool_idx,
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
+        expected_bucket_incarnation_id,
         delete_replication: version
             .replication_state_internal
             .as_ref()
@@ -38,7 +47,12 @@ pub(super) fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Optio
     }
 }
 
-fn rebalance_remote_tiered_opts(version: &FileInfo, version_id: Option<String>, src_pool_idx: usize) -> ObjectOptions {
+fn rebalance_remote_tiered_opts(
+    version: &FileInfo,
+    version_id: Option<String>,
+    src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
+) -> ObjectOptions {
     ObjectOptions {
         versioned: version_id.is_some(),
         version_id,
@@ -46,6 +60,21 @@ fn rebalance_remote_tiered_opts(version: &FileInfo, version_id: Option<String>, 
         user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
+        include_part_checksums: true,
+        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        expected_bucket_incarnation_id,
+        ..Default::default()
+    }
+}
+
+pub(super) fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+    ObjectOptions {
+        version_id,
+        no_lock: true,
+        data_movement: true,
+        raw_data_movement_read: true,
+        skip_decommissioned: true,
+        skip_rebalancing: true,
         ..Default::default()
     }
 }
@@ -70,8 +99,19 @@ pub(crate) trait MigrationBackend: Send + Sync {
     ) -> Result<()>;
 }
 
+pub(crate) struct RebalanceMigrationBackend<'a> {
+    source: &'a SetDisks,
+    store: &'a ECStore,
+}
+
+impl<'a> RebalanceMigrationBackend<'a> {
+    pub(crate) fn new(source: &'a SetDisks, store: &'a ECStore) -> Self {
+        Self { source, store }
+    }
+}
+
 #[async_trait::async_trait]
-impl MigrationBackend for SetDisks {
+impl MigrationBackend for RebalanceMigrationBackend<'_> {
     async fn get_object_reader_for_migration(
         &self,
         bucket: &str,
@@ -80,7 +120,7 @@ impl MigrationBackend for SetDisks {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
-        self.get_object_reader(bucket, object, range, h, opts).await
+        self.source.get_object_reader(bucket, object, range, h, opts).await
     }
 
     async fn move_remote_version_for_migration(
@@ -90,7 +130,7 @@ impl MigrationBackend for SetDisks {
         fi: &FileInfo,
         opts: &ObjectOptions,
     ) -> Result<()> {
-        self.decommission_tiered_object(bucket, object, fi, opts).await
+        self.store.decommission_tiered_object(bucket, object, fi, opts).await
     }
 }
 
@@ -101,6 +141,7 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut, D, DFut>(
     pool_index: usize,
     version: &FileInfo,
     version_id: Option<String>,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
     max_attempts: usize,
     ignore_data_usage_cache: bool,
     transfer: F,
@@ -113,12 +154,13 @@ where
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
 {
-    migrate_entry_version_with_retry_wait(
+    migrate_entry_version_with_retry_wait_and_incarnation(
         set,
         bucket,
         pool_index,
         version,
         version_id,
+        expected_bucket_incarnation_id,
         max_attempts,
         ignore_data_usage_cache,
         transfer,
@@ -129,12 +171,52 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, D, DFut, W, WFut>(
     set: &Backend,
     bucket: String,
     pool_index: usize,
     version: &FileInfo,
     version_id: Option<String>,
+    max_attempts: usize,
+    ignore_data_usage_cache: bool,
+    transfer: F,
+    delete_marker: D,
+    wait_retry: W,
+) -> MigrationVersionResult
+where
+    Backend: MigrationBackend + ?Sized,
+    F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
+    DFut: Future<Output = Result<ObjectInfo>> + Send,
+    W: FnMut(Duration) -> WFut + Send,
+    WFut: Future<Output = ()> + Send,
+{
+    migrate_entry_version_with_retry_wait_and_incarnation(
+        set,
+        bucket,
+        pool_index,
+        version,
+        version_id,
+        None,
+        max_attempts,
+        ignore_data_usage_cache,
+        transfer,
+        delete_marker,
+        wait_retry,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_entry_version_with_retry_wait_and_incarnation<Backend, F, Fut, D, DFut, W, WFut>(
+    set: &Backend,
+    bucket: String,
+    pool_index: usize,
+    version: &FileInfo,
+    version_id: Option<String>,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
     max_attempts: usize,
     ignore_data_usage_cache: bool,
     mut transfer: F,
@@ -169,7 +251,7 @@ where
                 &bucket,
                 &version.name,
                 version,
-                &rebalance_remote_tiered_opts(version, version_id, pool_index),
+                &rebalance_remote_tiered_opts(version, version_id, pool_index, expected_bucket_incarnation_id),
             )
             .await
         {
@@ -212,7 +294,7 @@ where
         if let Err(err) = delete_marker(
             bucket.clone(),
             version.name.clone(),
-            rebalance_delete_marker_opts(version, version_id, pool_index),
+            rebalance_delete_marker_opts(version, version_id, pool_index, expected_bucket_incarnation_id),
         )
         .await
         {
@@ -255,11 +337,7 @@ where
                 &encode_dir_object(&version.name),
                 None,
                 HeaderMap::new(),
-                &ObjectOptions {
-                    version_id: version_id.clone(),
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &rebalance_object_migration_read_opts(version_id.clone()),
             )
             .await
         {

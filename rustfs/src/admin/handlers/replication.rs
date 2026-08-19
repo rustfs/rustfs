@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -35,9 +35,8 @@ use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::PeerRestClient;
 use crate::admin::utils::read_compatible_admin_body;
-use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
@@ -454,17 +453,7 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
 }
 
 async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(InvalidRequest, "get cred failed"));
-    };
-
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
-
-    Ok(cred)
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await
 }
 
 #[allow(dead_code)]
@@ -546,8 +535,13 @@ impl Operation for GetReplicationMetricsHandler {
 
         let bucket_stats = cluster_replication_stats(bucket, app_context_from_req(&req)).await;
 
-        let data = serde_json::to_vec(&bucket_stats.replication_stats)
-            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
+        // Same minio-go `replication.Metrics` wire shape as
+        // `?replication-metrics` — the internal snake_case stats are the peer
+        // RPC wire format and must not leak here.
+        let data = serde_json::to_vec(&crate::admin::replication_metrics_wire::MetricsWire::from(
+            &bucket_stats.replication_stats,
+        ))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
@@ -1164,7 +1158,7 @@ struct MrfResponse {
 fn build_mrf_response(
     bucket: String,
     bucket_stats: &BucketStats,
-    durable: crate::admin::storage_api::replication::DurableMrfBacklog,
+    durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
 ) -> MrfResponse {
     let observation_scope = if bucket_stats.replication_stats.cluster_complete {
         "cluster_aggregated"
@@ -1234,7 +1228,10 @@ fn build_mrf_response(
         total_failed_size,
         queued_count: queued.count,
         queued_size: queued.bytes,
-        per_object_entries_available: false,
+        // The default (non-aggregate) response mode streams the durable
+        // backlog per object, so the enumerable API exists whenever the
+        // backlog is readable.
+        per_object_entries_available: durable.available,
         runtime_stats_available: bucket_stats.replication_stats.provider_available,
         cluster_complete: bucket_stats.replication_stats.cluster_complete,
         observed_node_count: bucket_stats.replication_stats.observed_node_count,
@@ -1246,23 +1243,165 @@ fn build_mrf_response(
     }
 }
 
+/// One durable MRF backlog entry rendered for the default (madmin-compatible)
+/// stream. Field names are the exact json tags of madmin-go `ReplicationMRF`
+/// (replication-api.go), which `mc replicate backlog` decodes one JSON
+/// document at a time. `Size` and `TargetARNs` are RustFS extension keys with
+/// no madmin counterpart; Go decoders ignore unknown keys.
+#[derive(Debug, Serialize)]
+struct MrfEntryDocument {
+    /// The durable backlog is a cluster-shared ledger with no per-node
+    /// attribution, so the madmin `nodeName` tag is always empty.
+    #[serde(rename = "nodeName")]
+    node_name: String,
+    #[serde(rename = "bucket")]
+    bucket: String,
+    #[serde(rename = "object")]
+    object: String,
+    #[serde(rename = "versionId")]
+    version_id: String,
+    #[serde(rename = "retryCount")]
+    retry_count: i32,
+    #[serde(rename = "Size")]
+    size: i64,
+    #[serde(rename = "TargetARNs", skip_serializing_if = "Vec::is_empty")]
+    target_arns: Vec<String>,
+}
+
+/// Upper bound on the number of documents one stream response emits. The
+/// durable ledger is not bounded by the in-memory pending cap (recovery can
+/// persist far larger generations), and the body is buffered before send, so
+/// an unbounded read could stage hundreds of MB per request. The handler
+/// rejects a response beyond this bound instead of returning a partial 200.
+const REPLICATION_MRF_MAX_STREAM_ENTRIES: usize = 10_000;
+
+/// Project the durable backlog into madmin `ReplicationMRF` documents,
+/// scoped to `bucket` when it is non-empty (madmin allows an empty bucket to
+/// mean "across all buckets"), bounded by
+/// [`REPLICATION_MRF_MAX_STREAM_ENTRIES`]. Returns the documents and whether
+/// the backlog was truncated.
+fn mrf_entry_documents(
+    bucket: &str,
+    durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
+) -> (Vec<MrfEntryDocument>, bool) {
+    let mut documents = Vec::new();
+    let mut truncated = false;
+    for entry in durable
+        .entries
+        .iter()
+        .filter(|entry| bucket.is_empty() || entry.bucket == bucket)
+    {
+        if documents.len() >= REPLICATION_MRF_MAX_STREAM_ENTRIES {
+            truncated = true;
+            break;
+        }
+        documents.push(MrfEntryDocument {
+            node_name: String::new(),
+            bucket: entry.bucket.clone(),
+            object: entry.object.clone(),
+            // Delete-marker purge entries track the marker version separately;
+            // fall back to it so those rows still carry a version identity.
+            // The nil UUID is RustFS's in-memory null-version sentinel and
+            // must leave as the S3 wire token, not a zero UUID.
+            version_id: entry
+                .version_id
+                .or(entry.delete_marker_version_id)
+                .map(|v| {
+                    if v.is_nil() {
+                        rustfs_filemeta::NULL_VERSION_ID.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .unwrap_or_default(),
+            retry_count: entry.retry_count,
+            size: entry.size,
+            target_arns: entry.target_arns.clone(),
+        });
+    }
+    (documents, truncated)
+}
+
+/// Render the MRF backlog as a response body.
+///
+/// Default (madmin-compatible) mode emits one `ReplicationMRF` JSON document
+/// per line with no envelope — madmin's `BucketReplicationMRF` reads the body
+/// with a `json.Decoder` loop, so an envelope object would decode as a single
+/// entry whose `"Bucket"` key case-insensitively matches
+/// `ReplicationMRF.Bucket` (a phantom row in `mc replicate backlog`), and an
+/// empty backlog must render an empty body so the loop ends on io.EOF with
+/// zero rows.
+///
+/// `aggregate=true` (RustFS extension) keeps the enveloped counter shape;
+/// backlog-source health (`RuntimeStatsAvailable`/`DurableBacklogAvailable`)
+/// is only representable there — an unreadable ledger fails the stream
+/// request outright in the handler (madmin only decodes the body of a 200,
+/// so an empty stream would read as a healthy zero-row backlog).
+fn render_mrf_backlog(
+    response: &MrfResponse,
+    durable: &crate::admin::storage_api::replication::DurableMrfBacklog,
+    aggregate: bool,
+) -> Result<(Vec<u8>, bool), serde_json::Error> {
+    if aggregate {
+        return Ok((serde_json::to_vec(response)?, false));
+    }
+
+    let (documents, truncated) = mrf_entry_documents(&response.bucket, durable);
+    let mut data = Vec::new();
+    for entry in documents {
+        serde_json::to_writer(&mut data, &entry)?;
+        data.push(b'\n');
+    }
+    Ok((data, truncated))
+}
+
+fn ensure_complete_mrf_stream(truncated: bool) -> S3Result<()> {
+    if truncated {
+        return Err(S3Error::with_message(
+            S3ErrorCode::ServiceUnavailable,
+            "durable MRF backlog exceeds the stream limit; narrow the bucket scope or drain the backlog".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// `GET /v3/replication/mrf`
 ///
 /// Reports the failed-replication backlog (MinIO's MRF concept) for a bucket.
 ///
-/// Compatibility note: MinIO returns a stream of individual MRF entries. RustFS
-/// deliberately returns aggregate runtime and durable counters instead.
-/// `PerObjectEntriesAvailable` remains false until an enumerable API exists.
-/// `PerTargetDurableEntriesAvailable` is false when the durable backlog includes
-/// older entries that cannot be attributed to a target.
+/// The default response is a madmin-compatible stream of `ReplicationMRF`
+/// documents built from the durable backlog ledger (in-memory failures that
+/// have not been flushed yet — the persister runs every few seconds — are not
+/// visible). `?aggregate=true` (RustFS extension) returns the enveloped
+/// runtime + durable counter shape instead; `PerTargetDurableEntriesAvailable`
+/// is false there when the durable backlog includes older entries that cannot
+/// be attributed to a target.
+///
+/// The madmin `node` parameter is accepted but has no filtering effect: the
+/// durable ledger is cluster-shared with no per-node attribution, so every
+/// node serves the same (complete) backlog.
+///
+/// Authorization: the stream requires `admin:ReplicationDiff` (it enumerates
+/// object names and version ids, MinIO parity); `?aggregate=true` carries no
+/// object identities and requires only `admin:GetReplicationMetrics`.
 pub struct ReplicationMrfHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ReplicationMrfHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
-
         let queries = extract_query_params(&req.uri);
+        let aggregate = queries.get("aggregate").map(String::as_str) == Some("true");
+        // The default stream enumerates object names and version ids, which
+        // a metrics-only principal must not see; gate it on the same action
+        // MinIO uses for this endpoint. The aggregate counters carry no
+        // object identities and keep the metrics action.
+        let action = if aggregate {
+            AdminAction::GetReplicationMetricsAction
+        } else {
+            AdminAction::ReplicationDiff
+        };
+        validate_replication_admin_request(&req, action).await?;
+
         let Some(bucket) = queries.get("bucket").filter(|b| !b.is_empty()).cloned() else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
@@ -1286,14 +1425,48 @@ impl Operation for ReplicationMrfHandler {
             return Err(ApiError::from(err).into());
         }
 
+        if let Some(node) = queries.get("node").filter(|node| !node.is_empty() && node.as_str() != "all") {
+            // The durable backlog ledger is cluster-shared with no per-node
+            // attribution, so a node-scoped request still sees the complete
+            // (superset) backlog.
+            debug!(node = %node, "replication mrf node filter has no effect on the cluster-shared backlog");
+        }
+
         let durable = crate::admin::storage_api::replication::read_durable_mrf_backlog(store).await;
         let bucket_stats = cluster_replication_stats(&bucket, app_context_from_req(&req)).await;
-        let response = build_mrf_response(bucket, &bucket_stats, durable);
+        let response = build_mrf_response(bucket, &bucket_stats, &durable);
 
-        let data = serde_json::to_vec(&response)
+        if !durable.available && !aggregate {
+            // The madmin stream has no envelope to carry source health, and
+            // madmin only decodes the body of a 200 — an empty stream would
+            // read as a clean, healthy zero-row backlog. Fail loudly instead;
+            // aggregate mode still reports the availability fields.
+            tracing::warn!(
+                bucket = %response.bucket,
+                "durable MRF backlog is unreadable; failing the stream request — use aggregate=true to see source health"
+            );
+            return Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "durable MRF backlog is unreadable; retry, or use aggregate=true for source health".to_string(),
+            ));
+        }
+
+        let (data, truncated) = render_mrf_backlog(&response, &durable, aggregate)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if truncated {
+            tracing::warn!(
+                event = "replication_mrf_stream_rejected",
+                component = "admin",
+                subsystem = "replication",
+                result = "rejected",
+                bucket = %response.bucket,
+                max_entries = REPLICATION_MRF_MAX_STREAM_ENTRIES,
+                "replication mrf stream exceeds the response limit"
+            );
+        }
+        ensure_complete_mrf_stream(truncated)?;
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
@@ -1303,7 +1476,8 @@ mod tests {
     use super::{
         REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
         ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
-        parse_remote_target_update_ops, render_replication_diff, unique_replication_peers, validate_remote_target_tls_settings,
+        parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff, unique_replication_peers,
+        validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -1521,7 +1695,7 @@ mod tests {
             ],
         };
 
-        let response = build_mrf_response("bucket-a".to_string(), &stats, durable);
+        let response = build_mrf_response("bucket-a".to_string(), &stats, &durable);
         let json = serde_json::to_value(response).expect("MRF response should serialize");
 
         assert_eq!(json["TotalFailedCount"], 3);
@@ -1533,7 +1707,9 @@ mod tests {
         assert_eq!(json["RuntimeStatsAvailable"], true);
         assert_eq!(json["ClusterComplete"], false);
         assert_eq!(json["Targets"][0]["ObservationScope"], "partial_cluster");
-        assert_eq!(json["PerObjectEntriesAvailable"], false);
+        // The bare stream enumerates the durable backlog per object, so a
+        // readable backlog advertises the enumerable API.
+        assert_eq!(json["PerObjectEntriesAvailable"], true);
         assert_eq!(json["PerTargetDurableEntriesAvailable"], true);
 
         let targets = json["Targets"].as_array().expect("targets should serialize as an array");
@@ -1580,7 +1756,7 @@ mod tests {
             }],
         };
 
-        let response = build_mrf_response("bucket-a".to_string(), &stats, durable);
+        let response = build_mrf_response("bucket-a".to_string(), &stats, &durable);
         let json = serde_json::to_value(response).expect("MRF response should serialize");
 
         assert_eq!(json["DurableBacklogAvailable"], true);
@@ -1598,7 +1774,7 @@ mod tests {
 
     #[test]
     fn mrf_response_distinguishes_unavailable_sources_from_valid_zero() {
-        let unavailable = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), DurableMrfBacklog::default());
+        let unavailable = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &DurableMrfBacklog::default());
         let unavailable_json = serde_json::to_value(unavailable).expect("unavailable response should serialize");
         assert_eq!(unavailable_json["RuntimeStatsAvailable"], false);
         assert_eq!(unavailable_json["DurableBacklogAvailable"], false);
@@ -1611,7 +1787,7 @@ mod tests {
         let valid_empty = build_mrf_response(
             "bucket-a".to_string(),
             &valid_empty_stats,
-            DurableMrfBacklog {
+            &DurableMrfBacklog {
                 available: true,
                 entries: Vec::new(),
             },
@@ -1622,6 +1798,153 @@ mod tests {
         assert_eq!(valid_empty_json["TotalFailedCount"], 0);
         assert_eq!(valid_empty_json["DurableCount"], 0);
         assert_eq!(valid_empty_json["PerTargetDurableEntriesAvailable"], true);
+    }
+
+    fn sample_durable_backlog() -> DurableMrfBacklog {
+        DurableMrfBacklog {
+            available: true,
+            entries: vec![
+                MrfReplicateEntry {
+                    bucket: "bucket-a".to_string(),
+                    object: "object-a".to_string(),
+                    version_id: Some(uuid::Uuid::from_u128(7)),
+                    retry_count: 2,
+                    size: 250,
+                    op: MrfOpKind::Object,
+                    target_arns: vec!["arn-a".to_string()],
+                    ..Default::default()
+                },
+                MrfReplicateEntry {
+                    bucket: "other-bucket".to_string(),
+                    object: "object-b".to_string(),
+                    version_id: None,
+                    retry_count: 0,
+                    size: 999,
+                    op: MrfOpKind::Object,
+                    target_arns: Vec::new(),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    /// madmin's `BucketReplicationMRF` decodes the body one `ReplicationMRF`
+    /// JSON document at a time; the default response must therefore be a bare
+    /// document stream with madmin's exact json tags, not an envelope.
+    #[test]
+    fn mrf_stream_renders_bare_madmin_documents() {
+        let durable = sample_durable_backlog();
+        let response = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &durable);
+
+        let (body, _) = render_mrf_backlog(&response, &durable, false).expect("stream body should serialize");
+        let text = String::from_utf8(body).expect("body should be utf-8");
+        let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+
+        // Only the entry matching the requested bucket is streamed.
+        assert_eq!(lines.len(), 1, "expected one MRF document, got: {text}");
+        let doc: serde_json::Value = serde_json::from_str(lines[0]).expect("each line should be a JSON document");
+        assert_eq!(doc["bucket"], "bucket-a");
+        assert_eq!(doc["object"], "object-a");
+        assert_eq!(doc["versionId"], uuid::Uuid::from_u128(7).to_string());
+        assert_eq!(doc["retryCount"], 2);
+        // madmin `ReplicationMRF` has a `nodeName` tag; the durable backlog is
+        // cluster-shared, so RustFS reports an empty node name.
+        assert_eq!(doc["nodeName"], "");
+        // The envelope keys must not leak into the stream: a `"Bucket"` key
+        // would case-insensitively populate `ReplicationMRF.Bucket` and render
+        // a phantom row in `mc replicate backlog`.
+        assert!(doc.get("Bucket").is_none());
+        assert!(doc.get("Targets").is_none());
+    }
+
+    /// An empty backlog must produce an empty body: madmin's decoder loop then
+    /// terminates on io.EOF with zero rows instead of one phantom row.
+    #[test]
+    fn mrf_stream_renders_empty_body_for_no_entries() {
+        let durable = DurableMrfBacklog {
+            available: true,
+            entries: Vec::new(),
+        };
+        let response = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &durable);
+
+        let (body, _) = render_mrf_backlog(&response, &durable, false).expect("stream body should serialize");
+        assert!(
+            body.is_empty(),
+            "empty backlog must serialize to an empty body, got: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// `?aggregate=true` (RustFS extension) keeps the enveloped counter shape.
+    #[test]
+    fn mrf_aggregate_envelope_retains_counters() {
+        let durable = sample_durable_backlog();
+        let response = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &durable);
+
+        let (body, _) = render_mrf_backlog(&response, &durable, true).expect("aggregate body should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("aggregate body should be one JSON object");
+        assert_eq!(json["Bucket"], "bucket-a");
+        assert_eq!(json["DurableCount"], 1);
+        assert_eq!(json["DurableBacklogAvailable"], true);
+        // The bare stream is an enumerable per-object API, so the aggregate
+        // shell now truthfully advertises it whenever the backlog is readable.
+        assert_eq!(json["PerObjectEntriesAvailable"], true);
+    }
+
+    /// The nil UUID is RustFS's in-memory null-version sentinel; the wire
+    /// token is `null`, never the zero UUID (second review round).
+    #[test]
+    fn mrf_stream_maps_nil_version_to_null_token() {
+        let durable = DurableMrfBacklog {
+            available: true,
+            entries: vec![MrfReplicateEntry {
+                bucket: "bucket-a".to_string(),
+                object: "null-version-object".to_string(),
+                version_id: Some(uuid::Uuid::nil()),
+                retry_count: 1,
+                size: 10,
+                op: MrfOpKind::Object,
+                ..Default::default()
+            }],
+        };
+        let response = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &durable);
+
+        let (body, truncated) = render_mrf_backlog(&response, &durable, false).expect("stream body should serialize");
+        assert!(!truncated);
+        let doc: serde_json::Value =
+            serde_json::from_str(String::from_utf8(body).expect("utf-8").lines().next().expect("one line"))
+                .expect("line should be a JSON document");
+        assert_eq!(doc["versionId"], "null");
+    }
+
+    /// The durable ledger is not bounded by the in-memory pending cap; the
+    /// stream must stop at the documented bound and signal truncation
+    /// (second review round).
+    #[test]
+    fn mrf_stream_truncates_at_the_documented_bound() {
+        let entries = (0..super::REPLICATION_MRF_MAX_STREAM_ENTRIES + 1)
+            .map(|index| MrfReplicateEntry {
+                bucket: "bucket-a".to_string(),
+                object: format!("object-{index}"),
+                retry_count: 1,
+                op: MrfOpKind::Object,
+                ..Default::default()
+            })
+            .collect();
+        let durable = DurableMrfBacklog {
+            available: true,
+            entries,
+        };
+        let response = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), &durable);
+
+        let (body, truncated) = render_mrf_backlog(&response, &durable, false).expect("stream body should serialize");
+        assert!(truncated, "one entry past the bound must signal truncation");
+        assert_eq!(
+            String::from_utf8(body).expect("utf-8").lines().count(),
+            super::REPLICATION_MRF_MAX_STREAM_ENTRIES
+        );
+        let error = super::ensure_complete_mrf_stream(truncated).expect_err("partial streams must not return 200");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]

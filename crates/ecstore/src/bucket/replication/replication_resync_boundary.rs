@@ -15,17 +15,42 @@
 use super::replication_error_boundary::{Error, Result};
 use super::replication_filemeta_boundary::MrfReplicateEntry;
 
+/// Kept test-only: the runtime consumer was the worker HEAD's fake proxy
+/// counting (removed in backlog#1675 P1-5); the resyncer tests still pin the
+/// classifier's semantics for the real client read-proxy failure accounting.
+#[cfg(test)]
+pub(crate) use rustfs_replication::should_count_head_proxy_failure;
 pub use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus};
 pub(crate) use rustfs_replication::{
-    is_version_id_mismatch, resync_state_accepts_update, sanitize_resync_error_detail, should_auto_resume_resync,
-    should_count_head_proxy_failure,
+    is_version_id_mismatch, resync_state_accepts_update, resync_status_duration, sanitize_resync_error_detail,
+    should_auto_resume_resync,
 };
 
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
 pub(crate) const RESYNC_FILE_MAX_BYTES: usize = rustfs_replication::RESYNC_FILE_MAX_BYTES;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const WIRE_ZERO_TIME_UNIX: i64 = rustfs_replication::resync::WIRE_ZERO_TIME_UNIX;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT;
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
 
 fn map_replication_error(err: rustfs_replication::Error) -> Error {

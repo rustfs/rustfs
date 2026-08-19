@@ -24,6 +24,7 @@ impl RustfsCodecDecodeWorkspace {
     }
 
     #[inline]
+    #[allow(dead_code, reason = "workspace width asserted by decode_reader tests (backlog#1823)")]
     pub(crate) fn shard_len(&self) -> usize {
         self.shard_len
     }
@@ -74,6 +75,13 @@ impl ShardBufferPool {
     pub(crate) fn put(&mut self, index: usize, buf: Vec<u8>) {
         self.ensure_slots(index + 1);
         self.buffers[index] = Some(buf);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_allocation(&self, index: usize) -> Option<(*const u8, usize)> {
+        self.buffers
+            .get(index)
+            .and_then(|buf| buf.as_ref().map(|buf| (buf.as_ptr(), buf.capacity())))
     }
 
     #[cfg(test)]

@@ -12,4 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use super::replication_resync_boundary::ResyncStatusType;
+/// Cross-crate lock identity used to fence table-bucket publication against
+/// object mutations that bypass the S3 request authorization layer.
+pub const TABLE_BUCKET_PUBLICATION_LOCK_PATH: &str = ".rustfs-table/warehouses/default/publication.lock";

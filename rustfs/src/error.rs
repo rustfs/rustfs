@@ -298,6 +298,7 @@ impl From<StorageError> for ApiError {
             | StorageError::ErasureWriteQuorum
             | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::SlowDown,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
+            StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
             StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
@@ -325,7 +326,11 @@ impl From<StorageError> for ApiError {
             _ => S3ErrorCode::InternalError,
         };
 
-        let message = if code == S3ErrorCode::InternalError {
+        let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
+            err.to_string()
+        } else if code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)) {
+            ApiError::error_code_to_message(&code)
+        } else if code == S3ErrorCode::InternalError {
             err.to_string()
         } else if let StorageError::InvalidArgument(_, _, reason) = &err
             && !reason.is_empty()
@@ -525,6 +530,25 @@ mod tests {
     }
 
     #[test]
+    fn storage_io_internal_error_redacts_public_message_and_retains_source() {
+        let sensitive_path = "/sensitive/storage/path";
+        let api_error = ApiError::from(StorageError::Io(IoError::new(
+            ErrorKind::PermissionDenied,
+            format!("permission denied: {sensitive_path}"),
+        )));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        assert!(!api_error.message.contains(sensitive_path));
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains(sensitive_path)));
+    }
+
+    #[test]
     fn test_kms_service_unavailable_maps_to_retryable_error() {
         let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
 
@@ -623,6 +647,7 @@ mod tests {
             (StorageError::DecommissionNotStarted, S3ErrorCode::InvalidRequest),
             (StorageError::DecommissionAlreadyRunning, S3ErrorCode::InvalidRequest),
             (StorageError::RebalanceAlreadyRunning, S3ErrorCode::InvalidRequest),
+            (StorageError::QuotaExceeded { current: 5, limit: 10 }, S3ErrorCode::InvalidRequest),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),
             (StorageError::ObjectNotFound("test".into(), "test".into()), S3ErrorCode::NoSuchKey),
             (StorageError::ConfigNotFound, S3ErrorCode::NoSuchKey),
@@ -668,13 +693,35 @@ mod tests {
     }
 
     #[test]
+    fn test_api_error_from_storage_io_copy_object_terminal_error_stays_internal() {
+        let io_error = IoError::other(StorageError::FileCorrupt);
+        let storage_error: StorageError = io_error.into();
+        assert!(matches!(storage_error, StorageError::FileCorrupt));
+
+        let api_error: ApiError = storage_error.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::FileCorrupt));
+    }
+
+    #[test]
     fn test_api_error_from_iam_error() {
         let iam_error = rustfs_iam::error::Error::other("IAM test error");
         let api_error: ApiError = iam_error.into();
 
-        // IAM error is first converted to StorageError, then to ApiError
-        assert!(api_error.source.is_some());
-        assert!(api_error.message.contains("test error"));
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::InternalError));
+        let source = api_error
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<StorageError>())
+            .expect("API error should retain the storage error source");
+        assert!(matches!(source, StorageError::Io(io_error) if io_error.to_string().contains("IAM test error")));
     }
 
     #[test]
@@ -706,6 +753,14 @@ mod tests {
 
         assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn quota_exceeded_preserves_existing_s3_error_contract() {
+        let api_error: ApiError = StorageError::QuotaExceeded { current: 5, limit: 10 }.into();
+
+        assert_eq!(api_error.code, S3ErrorCode::InvalidRequest);
+        assert_eq!(api_error.message, "Bucket quota exceeded. Current usage: 5 bytes, limit: 10 bytes");
     }
 
     #[test]

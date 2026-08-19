@@ -46,7 +46,6 @@ use rustfs_config::{
     SCANNER_SUB_SYS,
 };
 use rustfs_filemeta::FileInfo;
-use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -199,8 +198,6 @@ fn is_server_config_decrypt_error(err: &Error) -> bool {
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
 pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
-
-static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
 
 type ServerConfigDecryptFn = crate::bucket::migration::LegacyBlobDecryptFn;
 
@@ -582,6 +579,44 @@ where
         },
     )
     .await
+}
+
+/// `delete_config` with `no_lock` set — for callers already holding the
+/// config object's namespace lock (e.g. inside `with_config_object_write_lock`),
+/// where the locked variant would self-deadlock.
+pub async fn delete_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<()>
+where
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
+    match api
+        .delete_object(
+            RUSTFS_META_BUCKET,
+            file,
+            ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
+                Err(Error::ConfigNotFound)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 #[instrument(skip(api))]

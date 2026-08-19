@@ -230,7 +230,7 @@ config:
         vault_backend: "" # Only support vault kv2 and vault transit.
         vault_address: ""
         vault_token: "" # Rendered into a dedicated Secret, never into the config ConfigMap.
-        vault_mount_path: ""
+        vault_mount_path: "" # Transit engine mount for vault-transit; KV2 engine mount for vault. Unset means "secret" for KV2, which only a dev-mode Vault has by default.
         default_key: ""
 
 
@@ -369,7 +369,14 @@ gatewayApi:
     https:
       name: websecure
       port: 8443
+    tls: # Optional TLS passthrough listener; renders a TLSRoute so TLS terminates at the RustFS backend.
+      enabled: false
+      name: tls
+      port: 443
+      # Service port that terminates TLS on the backend; defaults to the console port.
+      backendPort: null
   hostname: example.rustfs.com
+  httpToHttpsRedirect: true
   existingGateway:
     name: ""
     namespace: ""

@@ -17,14 +17,21 @@
 //!
 //! Use suffix-based API: `get_header(headers, SUFFIX_FORCE_DELETE)` queries both
 //! x-rustfs-force-delete and x-minio-force-delete.
+//!
+//! This module is the canonical owner of these interop values. One deliberate
+//! copy exists: `crates/replication/src/http.rs` re-declares the subset it
+//! needs because the wire-contract crate must stay free of internal
+//! dependencies (arch guard in `scripts/check_architecture_migration_rules.sh`
+//! bans replication -> rustfs-utils). When changing a value here, check the
+//! pinned copy there; its tests pin the shared wire values byte-for-byte.
 
 use http::{HeaderMap, HeaderValue};
 use std::borrow::Cow;
 
 const RUSTFS_PREFIX: &str = "x-rustfs-";
 const MINIO_PREFIX: &str = "x-minio-";
-const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
-const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+pub const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+pub const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
 const MINIO_INTERNAL_ENCRYPTION_PREFIX: &str = "x-minio-internal-server-side-encryption-";
 const MINIO_INTERNAL_ENCRYPTED_MULTIPART: &str = "x-minio-internal-encrypted-multipart";
 const RUSTFS_ENCRYPTION_ORIGINAL_SIZE: &str = super::object_encryption_keys::INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER;
@@ -43,6 +50,14 @@ pub const SUFFIX_SOURCE_DELETEMARKER: &str = "source-deletemarker";
 pub const SUFFIX_SOURCE_PROXY_REQUEST: &str = "source-proxy-request";
 pub const SUFFIX_SOURCE_REPLICATION_REQUEST: &str = "source-replication-request";
 pub const SUFFIX_SOURCE_REPLICATION_CHECK: &str = "source-replication-check";
+// LWW timestamps for replicated tag/retention/legal-hold modifications. MinIO
+// declares these with mixed case (internal/http/headers.go:
+// X-Minio-Source-Replication-Tagging-Timestamp / -Retention-Timestamp /
+// -LegalHold-Timestamp); HTTP header names compare case-insensitively, so the
+// lowercase suffix forms interoperate. Values are RFC3339 on the wire.
+pub const SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP: &str = "source-replication-tagging-timestamp";
+pub const SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP: &str = "source-replication-retention-timestamp";
+pub const SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP: &str = "source-replication-legalhold-timestamp";
 pub const SUFFIX_REPLICATION_SSEC_CRC: &str = "replication-ssec-crc";
 
 /// Returns true if the key is object-encryption metadata understood by RustFS or MinIO.
@@ -187,6 +202,27 @@ mod tests {
             (RUSTFS_ENCRYPTION_ORIGINAL_SIZE.to_string(), "42".to_string()),
         ]);
         assert_eq!(get_object_encryption_original_size(&metadata).expect("valid size"), Some(42));
+    }
+
+    #[test]
+    fn replication_timestamp_headers_match_minio_wire_names() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, "2026-01-02T03:04:05Z");
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, "2026-01-02T03:04:06Z");
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, "2026-01-02T03:04:07Z");
+
+        // The exact names MinIO's object-api-options.go reads (its Get()
+        // canonicalizes case, so a case-insensitive match is wire-equivalent).
+        for name in [
+            "X-Minio-Source-Replication-Tagging-Timestamp",
+            "X-Minio-Source-Replication-Retention-Timestamp",
+            "X-Minio-Source-Replication-LegalHold-Timestamp",
+            "x-rustfs-source-replication-tagging-timestamp",
+            "x-rustfs-source-replication-retention-timestamp",
+            "x-rustfs-source-replication-legalhold-timestamp",
+        ] {
+            assert!(headers.contains_key(name), "replication timestamp header {name} must be written");
+        }
     }
 
     #[test]

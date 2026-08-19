@@ -32,6 +32,11 @@ workspace = true
 
 [features]
 default = []
+# Compiles the controlled list-objects namespace-journal chaos injector into a
+# production binary (it is always available to tests). Off by default so the
+# RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
+# state in a stock build (backlog#1832).
+list-chaos = []
 rio-v2 = ["dep:rustfs-rio-v2"]
 hotpath = [
     "hotpath/hotpath",
@@ -268,6 +273,7 @@ proptest = "1"
 rcgen.workspace = true
 insta = { workspace = true, features = ["yaml", "json"] }
 rustfs-crypto = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }

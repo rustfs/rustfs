@@ -184,6 +184,22 @@ perf record -F 99 -g -- sleep 180
 perf report --stdio > target/hotpath-abba/cluster-pr-XXXX/telemetry/perf-report.txt
 ```
 
+When using samply against an already-running RustFS service, attach through the
+bounded helper instead of calling `samply record -p` directly:
+
+```bash
+scripts/run_samply_attach_window.sh \
+  --pid "$RUSTFS_PID" \
+  --duration-secs 180 \
+  --output target/hotpath-abba/cluster-pr-XXXX/telemetry/samply-A1-get-4mib.json.gz
+```
+
+Run one attach window per ABBA leg or focused verification cell. After every
+window, confirm that the `.json.gz` profile and `.syms.json` sidecar are
+non-empty, that no `samply` process is still attached to the RustFS PID, and
+that any temporary `perf_event_paranoid` change has been restored before the
+next cell starts.
+
 For allocation profiling, build the candidate with:
 
 ```bash
@@ -267,11 +283,14 @@ The AI agent should execute this sequence:
    CPU model, memory size, disk layout, and whether the run is local or cluster.
 2. Run `scripts/run_hotpath_warp_abba.sh --dry-run` with the final arguments.
 3. Run the real ABBA command with `--rounds >= 3`.
-4. Preserve the full output directory without editing generated CSV files.
-5. Read `summary.md`, `candidate_gate.md`, and `baseline_drift_gate.md`.
-6. Summarize only measured facts: candidate deltas, baseline drift, CPU or
+4. For samply CPU attribution, use `scripts/run_samply_attach_window.sh` for
+   each bounded attach window and reject the cell if the profile is empty or a
+   stale `samply` process remains.
+5. Preserve the full output directory without editing generated CSV files.
+6. Read `summary.md`, `candidate_gate.md`, and `baseline_drift_gate.md`.
+7. Summarize only measured facts: candidate deltas, baseline drift, CPU or
    memory saturation, and any failed workloads.
-7. Post the summary and artifact location to the tracking issue or PR.
+8. Post the summary and artifact location to the tracking issue or PR.
 
 Do not report a performance win or loss when the baseline drift gate failed on
 the same workload and no rerun was collected.

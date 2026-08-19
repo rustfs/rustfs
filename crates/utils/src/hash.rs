@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use blake2::{Blake2b512, Digest as Blake2Digest};
+use blake2::Blake2b512;
 use highway::{HighwayHash, HighwayHasher, Key};
 use md5::Md5;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 /// Magic HH-256 key: HH-256 hash of first 100 decimals of π as utf-8 with zero key.
 const MAGIC_HIGHWAY_HASH256_KEY: [u8; 32] = [
@@ -140,6 +140,62 @@ impl HashAlgorithm {
         }
     }
 
+    /// Hash byte slices as one logical byte stream without concatenating them.
+    #[inline]
+    pub fn hash_encode_slices<'a, I>(&self, slices: I) -> impl AsRef<[u8]>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        match self {
+            HashAlgorithm::Md5 => {
+                let mut hasher = Md5::new();
+                for slice in slices {
+                    hasher.update(slice);
+                }
+                HashEncoded::Md5(hasher.finalize().into())
+            }
+            HashAlgorithm::HighwayHash256 => {
+                let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+                for slice in slices {
+                    hasher.append(slice);
+                }
+                HashEncoded::HighwayHash256(u8x32_from_u64x4(hasher.finalize256()))
+            }
+            HashAlgorithm::SHA256 => {
+                let mut hasher = Sha256::new();
+                for slice in slices {
+                    hasher.update(slice);
+                }
+                HashEncoded::Sha256(hasher.finalize().into())
+            }
+            HashAlgorithm::HighwayHash256S => {
+                let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
+                for slice in slices {
+                    hasher.append(slice);
+                }
+                HashEncoded::HighwayHash256S(u8x32_from_u64x4(hasher.finalize256()))
+            }
+            HashAlgorithm::HighwayHash256SLegacy => {
+                let mut hasher = HighwayHasher::new(LEGACY_HIGHWAY_HASH256_PARSED_KEY);
+                for slice in slices {
+                    hasher.append(slice);
+                }
+                HashEncoded::HighwayHash256SLegacy(u8x32_from_u64x4(hasher.finalize256()))
+            }
+            HashAlgorithm::BLAKE2b512 => {
+                let mut hasher = Blake2b512::new();
+                for slice in slices {
+                    hasher.update(slice);
+                }
+                let hash = hasher.finalize();
+                let mut out = [0u8; 64];
+                out.copy_from_slice(hash.as_ref());
+                HashEncoded::Blake2b512(out)
+            }
+            HashAlgorithm::None => HashEncoded::None,
+        }
+    }
+
     /// Return the output size in bytes for the hash algorithm.
     ///
     /// # Returns
@@ -220,6 +276,28 @@ mod tests {
         let hash = HashAlgorithm::None.hash_encode(data);
         let hash = hash.as_ref();
         assert_eq!(hash.len(), 0);
+    }
+
+    #[test]
+    fn hash_encode_slices_matches_contiguous_for_all_algorithms() {
+        let data = b"fragmented bitrot hash input";
+        let slices = [&data[..3], &data[3..11], &data[11..], &[]];
+
+        for algo in [
+            HashAlgorithm::Md5,
+            HashAlgorithm::SHA256,
+            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::HighwayHash256S,
+            HashAlgorithm::HighwayHash256SLegacy,
+            HashAlgorithm::BLAKE2b512,
+            HashAlgorithm::None,
+        ] {
+            assert_eq!(
+                algo.hash_encode_slices(slices).as_ref(),
+                algo.hash_encode(data).as_ref(),
+                "fragmented hash must match contiguous hash for {algo:?}"
+            );
+        }
     }
 
     #[test]

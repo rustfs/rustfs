@@ -21,8 +21,39 @@ mod strong;
 use migration::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
-pub(super) use strong::StrongTableCatalogSnapshot;
-pub(crate) use strong::StrongTableCatalogStore;
+pub(super) use strong::{
+    STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
+    StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,
+    table_catalog_bucket_snapshot_fingerprint,
+};
+pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
+
+fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("table bucket", entry.version)?;
+    if entry.table_bucket.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("table bucket name cannot be empty".to_string()));
+    }
+    if entry.catalog_type != TABLE_BUCKET_CATALOG_TYPE {
+        return Err(TableCatalogStoreError::Invalid("unsupported table bucket catalog type".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_table_entry_version_and_id(entry: &TableEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("table", entry.version)?;
+    if entry.table_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("table id cannot be empty".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_view_entry_version_and_id(entry: &ViewEntry) -> TableCatalogStoreResult<()> {
+    validate_catalog_entry_version("view", entry.version)?;
+    if entry.view_id.is_empty() {
+        return Err(TableCatalogStoreError::Invalid("view id cannot be empty".to_string()));
+    }
+    Ok(())
+}
 
 fn validate_namespace_entry_identity(entry: &NamespaceEntry) -> TableCatalogStoreResult<Namespace> {
     validate_catalog_entry_version("namespace", entry.version)?;
@@ -133,6 +164,10 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         ))
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn list_namespaces_page(
         &self,
         table_bucket: &str,
@@ -162,9 +197,23 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()>;
 
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
 
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()>;
+
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()>;
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>>;
 
@@ -187,6 +236,20 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>>;
 
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let _ = (table_bucket, source_namespace, source_table, destination_namespace, destination_table);
+        Err(TableCatalogStoreError::Unsupported(
+            "table rename is not supported by this catalog store".to_string(),
+        ))
+    }
+
     async fn resolve_table_data_plane_resource(
         &self,
         table_bucket: &str,
@@ -199,11 +262,44 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     ///
     /// Callers publishing client-supplied Iceberg metadata must validate its logical shape and the physical graph of
     /// newly introduced or changed snapshots before invoking this persistence boundary.
+    #[allow(
+        dead_code,
+        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
+    )]
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
+
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult>;
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()>;
+
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        publication
+            .prepare(&entry.table_bucket, &entry.namespace, &entry.view)
+            .await?;
+        if !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view creation requires a view publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.create_view(entry).await
+    }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>>;
 
@@ -226,6 +322,32 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult>;
 
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
+        if table_bucket_fence_required {
+            publication.begin_table_bucket(&request.table_bucket).await?;
+            if !publication.holds_table_bucket(&request.table_bucket) {
+                return Err(TableCatalogStoreError::Internal(
+                    "view replacement requires a table-bucket publication fence".to_string(),
+                ));
+            }
+        }
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.view)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view) {
+            return Err(TableCatalogStoreError::Internal(
+                "view replacement requires a view publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.replace_view(request).await
+    }
+
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()>;
 
     async fn get_commit_by_id(
@@ -243,6 +365,133 @@ pub(crate) trait TableCatalogStore: Send + Sync {
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>>;
 }
 
+#[async_trait::async_trait]
+pub(crate) trait TableCommitPublication: Send + Sync {
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()>;
+
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool;
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
+
+    fn complete(&self);
+}
+
+pub(crate) struct TableCommitPublicationCompletion<'a> {
+    publication: &'a (dyn TableCommitPublication + Sync),
+}
+
+impl<'a> TableCommitPublicationCompletion<'a> {
+    pub(crate) fn new(publication: &'a (dyn TableCommitPublication + Sync)) -> Self {
+        Self { publication }
+    }
+}
+
+impl Drop for TableCommitPublicationCompletion<'_> {
+    fn drop(&mut self) {
+        self.publication.complete();
+    }
+}
+
+struct TableCommitLockPublication<'a, B> {
+    backend: &'a B,
+    state: parking_lot::Mutex<TableCommitLockPublicationState>,
+}
+
+#[derive(Default)]
+struct TableCommitLockPublicationState {
+    table_bucket: Option<String>,
+    table: Option<(String, String, String)>,
+    guards: Vec<TableCatalogLockGuard>,
+}
+
+impl<'a, B> TableCommitLockPublication<'a, B> {
+    fn new(backend: &'a B) -> Self {
+        Self {
+            backend,
+            state: parking_lot::Mutex::new(TableCommitLockPublicationState::default()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a, B> TableCommitPublication for TableCommitLockPublication<'a, B>
+where
+    B: TableCatalogObjectBackend,
+{
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        {
+            let mut state = self.state.lock();
+            if state.table_bucket.as_deref() == Some(table_bucket) {
+                return Ok(());
+            }
+            if state.table_bucket.is_some() || state.table.is_some() {
+                return Err(TableCatalogStoreError::Internal(
+                    "table-bucket publication lock is already held for another table bucket".to_string(),
+                ));
+            }
+            state.table_bucket = Some(table_bucket.to_string());
+        }
+        let publication_lock = default_table_bucket_publication_lock_path();
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.state.lock().table_bucket = None;
+                return Err(err);
+            }
+        };
+        self.state.lock().guards.push(guard);
+        Ok(())
+    }
+
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_key = (table_bucket.to_string(), namespace.public_name(), table.as_str().to_string());
+        {
+            let mut state = self.state.lock();
+            if state.table.as_ref() == Some(&table_key) {
+                return Ok(());
+            }
+            if state.table.is_some() {
+                return Err(TableCatalogStoreError::Internal(
+                    "table publication lock is already held for another table".to_string(),
+                ));
+            }
+            state.table = Some(table_key);
+        }
+        let publication_lock = default_table_publication_lock_path(&namespace, &table);
+        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.state.lock().table = None;
+                return Err(err);
+            }
+        };
+        self.state.lock().guards.push(guard);
+        Ok(())
+    }
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool {
+        let state = self.state.lock();
+        state.table_bucket.as_deref() == Some(table_bucket) && state.guards.iter().all(|guard| !guard.is_lock_lost())
+    }
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
+        let state = self.state.lock();
+        state
+            .table
+            .as_ref()
+            .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
+            && state.guards.iter().all(|guard| !guard.is_lock_lost())
+    }
+
+    fn complete(&self) {
+        *self.state.lock() = TableCommitLockPublicationState::default();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableCatalogObject {
     pub data: Vec<u8>,
@@ -254,6 +503,36 @@ pub(crate) struct TableCatalogObject {
 pub(crate) struct TableCatalogObjectMetadata {
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
+}
+
+pub(crate) struct TableCatalogLockGuard {
+    _guard: Box<dyn Send>,
+    lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+}
+
+impl TableCatalogLockGuard {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
+    pub(crate) fn stable(guard: impl Send + 'static) -> Self {
+        Self {
+            _guard: Box::new(guard),
+            lock_lost: None,
+        }
+    }
+
+    fn namespace(guard: rustfs_lock::NamespaceLockGuard) -> Self {
+        let lock_lost = guard.lock_lost_signal();
+        Self {
+            _guard: Box::new(guard),
+            lock_lost,
+        }
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.lock_lost.as_ref().is_some_and(|signal| signal.is_lost())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,8 +548,31 @@ pub(crate) enum TableCatalogPutPrecondition {
     IfMatch(String),
 }
 
+pub(in crate::table_catalog) fn catalog_list_next_continuation(
+    seen: &mut BTreeSet<String>,
+    is_truncated: bool,
+    next: Option<String>,
+) -> TableCatalogStoreResult<Option<String>> {
+    if !is_truncated {
+        return Ok(None);
+    }
+    let next = next.filter(|next| !next.is_empty()).ok_or_else(|| {
+        TableCatalogStoreError::Internal("truncated catalog object listing has no continuation token".to_string())
+    })?;
+    if !seen.insert(next.clone()) {
+        return Err(TableCatalogStoreError::Internal(
+            "catalog object listing continuation token did not advance".to_string(),
+        ));
+    }
+    Ok(Some(next))
+}
+
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
+    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
+        None
+    }
+
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 
     async fn read_object_limited(
@@ -317,7 +619,29 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             }))
     }
 
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        Ok(self
+            .read_object_unlocked(bucket, object)
+            .await?
+            .map(|object| TableCatalogObjectMetadata {
+                etag: object.etag,
+                mod_time: object.mod_time,
+            }))
+    }
+
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool>;
+
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
+    async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
+        self.object_exists(bucket, object).await
+    }
 
     async fn put_object(
         &self,
@@ -365,11 +689,60 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         Ok(TableCatalogObjectListPage { objects, is_truncated })
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         self.acquire_write_lock(bucket, object).await
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>>;
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard>;
+
+    async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    fn table_bucket_commit_publication_is_held(&self, _table_bucket: &str) -> bool {
+        false
+    }
+
+    async fn prepare_table_commit_publication(
+        &self,
+        _table_bucket: &str,
+        _namespace: &str,
+        _table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
+    fn table_commit_publication_is_held(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> bool {
+        false
+    }
+
+    fn complete_table_commit_publication(&self) {}
+}
+
+#[async_trait::async_trait]
+impl<B> TableCommitPublication for B
+where
+    B: TableCatalogObjectBackend,
+{
+    async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        self.begin_table_bucket_commit_publication(table_bucket).await
+    }
+
+    async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        self.prepare_table_commit_publication(table_bucket, namespace, table).await
+    }
+
+    fn holds_table_bucket(&self, table_bucket: &str) -> bool {
+        self.table_bucket_commit_publication_is_held(table_bucket)
+    }
+
+    fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
+        self.table_commit_publication_is_held(table_bucket, namespace, table)
+    }
+
+    fn complete(&self) {
+        self.complete_table_commit_publication();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -577,6 +950,10 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn warehouse_index_entries_prefix(&self, table_bucket: &str) -> String {
+        format!("{}{}/", self.table_bucket_root_prefix(table_bucket), WAREHOUSE_INDEX_ROOT)
+    }
+
     pub fn warehouse_index_entry_path(&self, table_bucket: &str, warehouse_object_prefix: &str) -> String {
         format!(
             "{}{}/{}.json",
@@ -637,16 +1014,26 @@ where
     B: TableCatalogObjectBackend,
 {
     pub(crate) fn from_env(backend: B) -> TableCatalogStoreResult<Self> {
-        Ok(Self::new(backend, TableCatalogBackingMode::from_env()?))
+        Ok(match TableCatalogBackingMode::from_env()? {
+            TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
+            TableCatalogBackingMode::DurableStrong => {
+                Self::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
+            }
+        })
     }
 
-    pub(crate) fn new(backend: B, mode: TableCatalogBackingMode) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(backend: B, mode: TableCatalogBackingMode) -> Self {
         match mode {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
             TableCatalogBackingMode::DurableStrong => Self::DurableStrong(StrongTableCatalogStore::new(backend)),
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) fn backing_mode(&self) -> TableCatalogBackingMode {
         match self {
             Self::ObjectBacked(_) => TableCatalogBackingMode::ObjectBacked,
@@ -779,6 +1166,17 @@ where
         }
     }
 
+    async fn register_table_with_publication(
+        &self,
+        entry: TableEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.register_table_with_publication(entry, publication).await,
+            Self::DurableStrong(store) => store.register_table_with_publication(entry, publication).await,
+        }
+    }
+
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
@@ -813,6 +1211,26 @@ where
         }
     }
 
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
+                "table rename requires durable-strong catalog backing".to_string(),
+            )),
+            Self::DurableStrong(store) => {
+                store
+                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
+                    .await
+            }
+        }
+    }
+
     async fn resolve_table_data_plane_resource(
         &self,
         table_bucket: &str,
@@ -831,6 +1249,17 @@ where
         }
     }
 
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => store.commit_table_with_publication(request, publication).await,
+            Self::DurableStrong(store) => store.commit_table_with_publication(request, publication).await,
+        }
+    }
+
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_table(table_bucket, namespace, table).await,
@@ -842,6 +1271,17 @@ where
         match self {
             Self::ObjectBacked(store) => store.create_view(entry).await,
             Self::DurableStrong(store) => store.create_view(entry).await,
+        }
+    }
+
+    async fn create_view_with_publication(
+        &self,
+        entry: ViewEntry,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.create_view_with_publication(entry, publication).await,
+            Self::DurableStrong(store) => store.create_view_with_publication(entry, publication).await,
         }
     }
 
@@ -876,6 +1316,26 @@ where
         match self {
             Self::ObjectBacked(store) => store.replace_view(request).await,
             Self::DurableStrong(store) => store.replace_view(request).await,
+        }
+    }
+
+    async fn replace_view_with_publication(
+        &self,
+        request: ViewCommitRequest,
+        table_bucket_fence_required: bool,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<ViewCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
+                    .await
+            }
+            Self::DurableStrong(store) => {
+                store
+                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
+                    .await
+            }
         }
     }
 
@@ -1097,6 +1557,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn get_external_catalog_bridge(
         &self,
         table_bucket: &str,
@@ -1109,6 +1573,10 @@ where
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn put_external_catalog_bridge(
         &self,
         entry: ExternalCatalogBridgeEntry,
@@ -1122,12 +1590,14 @@ where
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
+    strong_runtime: StrongTableCatalogRuntime,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            strong_runtime: self.strong_runtime.clone(),
         }
     }
 }
@@ -1136,8 +1606,8 @@ impl<S> EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+    pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
+        Self { store, strong_runtime }
     }
 }
 
@@ -1148,6 +1618,10 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
+        Some(self.strong_runtime.clone())
+    }
+
     async fn read_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
         self.read_object_with_options(bucket, object, ObjectOptions::default(), None)
             .await
@@ -1205,8 +1679,53 @@ where
         }
     }
 
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        match self
+            .store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(info) => Ok(Some(TableCatalogObjectMetadata {
+                etag: info.etag,
+                mod_time: info.mod_time,
+            })),
+            Err(err) if is_missing_storage_error(&err) => Ok(None),
+            Err(err) => Err(storage_error_to_catalog("stat catalog object", err)),
+        }
+    }
+
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
+            Ok(_) => Ok(true),
+            Err(err) if is_missing_storage_error(&err) => Ok(false),
+            Err(err) => Err(storage_error_to_catalog("check catalog object", err)),
+        }
+    }
+
+    async fn object_exists_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
+        match self
+            .store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
             Ok(_) => Ok(true),
             Err(err) if is_missing_storage_error(&err) => Ok(false),
             Err(err) => Err(storage_error_to_catalog("check catalog object", err)),
@@ -1262,6 +1781,7 @@ where
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
         let mut continuation = None;
+        let mut seen_continuations = BTreeSet::new();
         let mut objects = BTreeSet::new();
         let max_keys = i32::try_from(TABLE_CATALOG_LIST_MAX_KEYS)
             .map_err(|_| TableCatalogStoreError::Internal("catalog list limit exceeds storage API range".to_string()))?;
@@ -1278,14 +1798,10 @@ where
                 objects.insert(object.name);
             }
 
-            if !result.is_truncated {
-                break;
-            }
-
-            let Some(next) = result.next_continuation_token else {
-                break;
+            match catalog_list_next_continuation(&mut seen_continuations, result.is_truncated, result.next_continuation_token)? {
+                Some(next) => continuation = Some(next),
+                None => break,
             };
-            continuation = Some(next);
         }
 
         Ok(objects.into_iter().collect())
@@ -1314,7 +1830,7 @@ where
         })
     }
 
-    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -1324,10 +1840,10 @@ where
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog table lock: {err}")))?;
-        Ok(Box::new(guard))
+        Ok(TableCatalogLockGuard::namespace(guard))
     }
 
-    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+    async fn acquire_read_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock = self
             .store
             .new_ns_lock(bucket, object)
@@ -1337,7 +1853,7 @@ where
             .get_read_lock(get_lock_acquire_timeout())
             .await
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog migration lock: {err}")))?;
-        Ok(Box::new(guard))
+        Ok(TableCatalogLockGuard::namespace(guard))
     }
 }
 
@@ -1352,20 +1868,6 @@ where
         opts: ObjectOptions,
         max_size: Option<usize>,
     ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
-        let info = match self.store.get_object_info(bucket, object, &opts).await {
-            Ok(info) => info,
-            Err(err) if is_missing_storage_error(&err) => return Ok(None),
-            Err(err) => return Err(storage_error_to_catalog("read catalog object info", err)),
-        };
-        if let Some(max_size) = max_size {
-            let object_size = usize::try_from(info.size)
-                .map_err(|_| TableCatalogStoreError::Invalid(format!("catalog object {bucket}/{object} has an invalid size")))?;
-            if object_size > max_size {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
-                )));
-            }
-        }
         let mut reader = match self
             .store
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
@@ -1375,6 +1877,17 @@ where
             Err(err) if is_missing_storage_error(&err) => return Ok(None),
             Err(err) => return Err(storage_error_to_catalog("read catalog object", err)),
         };
+        if let Some(max_size) = max_size {
+            let object_size = usize::try_from(reader.object_info.size)
+                .map_err(|_| TableCatalogStoreError::Invalid(format!("catalog object {bucket}/{object} has an invalid size")))?;
+            if object_size > max_size {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "catalog object {bucket}/{object} exceeds the maximum size of {max_size} bytes"
+                )));
+            }
+        }
+        let etag = reader.object_info.etag.clone();
+        let mod_time = reader.object_info.mod_time;
         let mut data = Vec::new();
         if let Some(max_size) = max_size {
             let read_limit = u64::try_from(max_size.saturating_add(1)).unwrap_or(u64::MAX);
@@ -1391,11 +1904,7 @@ where
                 TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}"))
             })?;
         }
-        Ok(Some(TableCatalogObject {
-            data,
-            etag: info.etag,
-            mod_time: info.mod_time,
-        }))
+        Ok(Some(TableCatalogObject { data, etag, mod_time }))
     }
 
     async fn put_object_with_options(

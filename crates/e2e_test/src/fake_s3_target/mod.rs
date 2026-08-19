@@ -30,9 +30,11 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::SimpleAuth;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteObjectInput, DeleteObjectOutput, ETag,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob, Timestamp, TimestampFormat,
+    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput, DeleteObjectOutput,
+    DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectInput, GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput,
+    HeadObjectInput, HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ObjectVersionId, PutObjectInput,
+    PutObjectOutput, PutObjectTaggingInput, PutObjectTaggingOutput, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat,
     UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
@@ -76,6 +78,25 @@ const SOURCE_MTIME_HEADERS: [&str; 2] = ["x-rustfs-source-mtime", "x-minio-sourc
 const SOURCE_REPLICATION_REQUEST_HEADERS: [&str; 2] =
     ["x-rustfs-source-replication-request", "x-minio-source-replication-request"];
 const SOURCE_ETAG_HEADERS: [&str; 2] = ["x-rustfs-source-etag", "x-minio-source-etag"];
+const SOURCE_TAGGING_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-tagging-timestamp",
+    "x-minio-source-replication-tagging-timestamp",
+];
+const SOURCE_RETENTION_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-retention-timestamp",
+    "x-minio-source-replication-retention-timestamp",
+];
+const SOURCE_LEGALHOLD_TIMESTAMP_HEADERS: [&str; 2] = [
+    "x-rustfs-source-replication-legalhold-timestamp",
+    "x-minio-source-replication-legalhold-timestamp",
+];
+/// Wire prefix of the SSE-C passthrough replication transport headers
+/// (`X-Rustfs-Replication-*`). In the default mode the fake stores them like a
+/// RustFS target and echoes SSE-C evidence back on HEAD/GET; with
+/// [`FakeS3Target::drop_unlisted_replication_headers`] it models MinIO /
+/// generic S3, which silently discard unknown x-* headers.
+const REPLICATION_SSE_TRANSPORT_PREFIX: &str = "x-rustfs-replication-";
+const REPLICATION_SSEC_ALGORITHM_TRANSPORT_HEADER: &str = "x-rustfs-replication-ssec-algorithm";
 const RESERVED_BUCKET_PREFIXES: [&str; 3] = ["xn--", "sthree-", "amzn-s3-demo-"];
 const RESERVED_BUCKET_SUFFIXES: [&str; 6] = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3", "-an"];
 
@@ -91,6 +112,10 @@ pub enum Operation {
     GetObject,
     HeadObject,
     DeleteObject,
+    GetObjectTagging,
+    PutObjectTagging,
+    DeleteObjectTagging,
+    ListObjectVersions,
     CreateMultipartUpload,
     UploadPart,
     CompleteMultipartUpload,
@@ -109,10 +134,67 @@ pub enum FaultAction {
     /// already have buffered the rest of the current frame; the journal reports
     /// the threshold, and the backend never receives or stores the request.
     DisconnectAfterBytes(usize),
+    /// Apply the request, then close the connection before returning its response.
+    DisconnectAfterResponse,
     /// Drain a request body in fixed-size slices, sleeping after every slice.
     SlowDrain { chunk_bytes: usize, delay: Duration },
     /// Store the request normally but replace the response ETag.
     WrongEtag,
+}
+
+/// Replication LWW timestamp headers observed on a request, journaled so
+/// sender-side tests can assert what a real target would receive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationTimestampHeaders {
+    pub tagging: Option<String>,
+    pub retention: Option<String>,
+    pub legalhold: Option<String>,
+}
+
+impl ReplicationTimestampHeaders {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            tagging: header_value(headers, &SOURCE_TAGGING_TIMESTAMP_HEADERS).map(bounded_journal_value),
+            retention: header_value(headers, &SOURCE_RETENTION_TIMESTAMP_HEADERS).map(bounded_journal_value),
+            legalhold: header_value(headers, &SOURCE_LEGALHOLD_TIMESTAMP_HEADERS).map(bounded_journal_value),
+        }
+    }
+}
+
+/// Read-proxy related headers observed on a request, journaled so proxy
+/// tests can assert the exact wire contract: the anti-loop marker present,
+/// the replication-check exemption absent, and the client SSE-C key family
+/// forwarded verbatim. The SSE-C key value itself is never retained — only
+/// its presence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyHeaderSnapshot {
+    pub source_proxy_request: Option<String>,
+    pub replication_check: Option<String>,
+    pub ssec_algorithm: Option<String>,
+    pub ssec_key_present: bool,
+    pub ssec_key_md5: Option<String>,
+    /// Whether the request carried any `X-Rustfs-Replication-*` SSE-C
+    /// passthrough transport header, so fail-closed tests can assert the
+    /// sender really shipped the material a dropping target discarded.
+    pub ssec_transport_present: bool,
+}
+
+impl ProxyHeaderSnapshot {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            source_proxy_request: header_value(headers, &["x-rustfs-source-proxy-request", "x-minio-source-proxy-request"])
+                .map(bounded_journal_value),
+            replication_check: header_value(headers, &["x-rustfs-source-replication-check", "x-minio-source-replication-check"])
+                .map(bounded_journal_value),
+            ssec_algorithm: header_value(headers, &["x-amz-server-side-encryption-customer-algorithm"])
+                .map(bounded_journal_value),
+            ssec_key_present: headers.contains_key("x-amz-server-side-encryption-customer-key"),
+            ssec_key_md5: header_value(headers, &["x-amz-server-side-encryption-customer-key-md5"]).map(bounded_journal_value),
+            ssec_transport_present: headers
+                .keys()
+                .any(|name| name.as_str().starts_with(REPLICATION_SSE_TRANSPORT_PREFIX)),
+        }
+    }
 }
 
 /// Credential-free request metadata retained for deterministic assertions.
@@ -128,6 +210,8 @@ pub struct RequestRecord {
     pub part_number: Option<i32>,
     pub content_length: Option<u64>,
     pub consumed_bytes: Option<usize>,
+    pub replication_timestamps: ReplicationTimestampHeaders,
+    pub proxy_headers: ProxyHeaderSnapshot,
     pub fault: Option<FaultAction>,
 }
 
@@ -141,6 +225,12 @@ struct ControlState {
 
 #[derive(Default)]
 struct StoreState {
+    assign_own_version_ids: bool,
+    assign_own_multipart_version_ids: bool,
+    /// MinIO-like mode: silently discard non-whitelisted replication
+    /// transport headers instead of storing them (see
+    /// [`REPLICATION_SSE_TRANSPORT_PREFIX`]).
+    drop_unlisted_replication_headers: bool,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
     total_bytes: usize,
@@ -162,6 +252,12 @@ struct ObjectVersion {
     delete_marker: bool,
     content_type: Option<String>,
     metadata: Option<HashMap<String, String>>,
+    /// Object tags as ordered key/value pairs (PutObjectTagging replaces the
+    /// whole set, DeleteObjectTagging clears it).
+    tags: Vec<(String, String)>,
+    /// SSE-C passthrough transport headers stored with the version (RustFS
+    /// target behavior); empty when the drop mode discarded them.
+    replication_sse_headers: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -171,6 +267,7 @@ struct MultipartState {
     version_id: String,
     content_type: Option<String>,
     metadata: Option<HashMap<String, String>>,
+    replication_sse_headers: Vec<(String, String)>,
     parts: BTreeMap<i32, MultipartPart>,
 }
 
@@ -383,6 +480,31 @@ impl FakeS3Target {
             .is_some_and(|version| !version.delete_marker)
     }
 
+    /// Make the target mint its own version ids instead of mirroring the
+    /// forwarded source version id — models a generic S3 service.
+    pub fn assign_own_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_version_ids = enabled;
+    }
+
+    /// Mint own version ids for the multipart path only — models a target
+    /// that adopts PutObject version ids but not CreateMultipartUpload ones.
+    /// MinIO-like mode: silently drop every `X-Rustfs-Replication-*` SSE-C
+    /// passthrough transport header instead of storing it. The default (off)
+    /// models a RustFS target, which preserves the headers and echoes SSE-C
+    /// evidence (`x-amz-server-side-encryption-customer-algorithm`) on
+    /// HEAD/GET of the replica.
+    pub fn drop_unlisted_replication_headers(&self, enabled: bool) {
+        lock(&self.backend.store).drop_unlisted_replication_headers = enabled;
+    }
+
+    pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
+        lock(&self.backend.store).assign_own_multipart_version_ids = enabled;
+    }
+
+    pub fn active_multipart_upload_count(&self) -> usize {
+        lock(&self.backend.store).uploads.len()
+    }
+
     /// Queue `times` copies of a fault for one operation.
     pub fn inject(&self, operation: Operation, action: FaultAction, times: usize) {
         if times == 0 {
@@ -431,6 +553,25 @@ impl FakeS3Target {
 
     pub fn take_requests(&self) -> Vec<RequestRecord> {
         lock(&self.control).requests.drain(..).collect()
+    }
+
+    /// Stored versions for one key as `(version_id, is_delete_marker)`, oldest
+    /// first. Empty when the bucket or key does not exist. Lets purge tests
+    /// assert on the target's actual state instead of inferring it from the
+    /// request journal (a versioned DELETE is a silent no-op for missing ids).
+    pub fn stored_versions(&self, bucket: &str, key: &str) -> Vec<(String, bool)> {
+        let state = lock(&self.backend.store);
+        state
+            .buckets
+            .get(bucket)
+            .and_then(|bucket_state| bucket_state.objects.get(key))
+            .map(|versions| {
+                versions
+                    .iter()
+                    .map(|version| (version.version_id.clone(), version.delete_marker))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn shutdown(mut self) {
@@ -496,7 +637,17 @@ impl S3Access for FaultAccess {
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
-        let fault = record_request(&self.control, operation, context.method().clone(), parsed, content_length);
+        let replication_timestamps = ReplicationTimestampHeaders::from_headers(context.headers());
+        let proxy_headers = ProxyHeaderSnapshot::from_headers(context.headers());
+        let fault = record_request(
+            &self.control,
+            operation,
+            context.method().clone(),
+            parsed,
+            content_length,
+            replication_timestamps,
+            proxy_headers,
+        );
         if let Some(RequestFault {
             action: FaultAction::Status(status),
             ..
@@ -535,6 +686,9 @@ fn operation_from_s3_name(name: &str) -> Operation {
         "GetObject" => Operation::GetObject,
         "HeadObject" => Operation::HeadObject,
         "DeleteObject" => Operation::DeleteObject,
+        "GetObjectTagging" => Operation::GetObjectTagging,
+        "PutObjectTagging" => Operation::PutObjectTagging,
+        "DeleteObjectTagging" => Operation::DeleteObjectTagging,
         "CreateMultipartUpload" => Operation::CreateMultipartUpload,
         "UploadPart" => Operation::UploadPart,
         "CompleteMultipartUpload" => Operation::CompleteMultipartUpload,
@@ -549,6 +703,8 @@ fn record_request(
     method: Method,
     parsed: ParsedRequest,
     content_length: Option<u64>,
+    replication_timestamps: ReplicationTimestampHeaders,
+    proxy_headers: ProxyHeaderSnapshot,
 ) -> Option<RequestFault> {
     let mut state = lock(control);
     let action = parsed
@@ -573,6 +729,8 @@ fn record_request(
         part_number: parsed.part_number,
         content_length,
         consumed_bytes: None,
+        replication_timestamps,
+        proxy_headers,
         fault: action.clone(),
     });
     action.map(|action| RequestFault { sequence, action })
@@ -633,11 +791,21 @@ fn parse_request(method: &Method, uri: &Uri) -> ParsedRequest {
     let operation = match (method, key.is_some()) {
         (&Method::HEAD, false) => Operation::HeadBucket,
         (&Method::GET, false) if query.contains_key("versioning") => Operation::GetBucketVersioning,
+        (&Method::GET, false) if query.contains_key("versions") => Operation::ListObjectVersions,
         (&Method::PUT, true) if upload_id.is_some() && part_number.is_some() => Operation::UploadPart,
         (&Method::PUT, true) if upload_id.is_some() || query.contains_key("partNumber") => Operation::Unknown,
         (&Method::POST, true) if query.contains_key("uploads") => Operation::CreateMultipartUpload,
         (&Method::POST, true) if upload_id.is_some() => Operation::CompleteMultipartUpload,
         (&Method::DELETE, true) if upload_id.is_some() => Operation::AbortMultipartUpload,
+        (&Method::GET, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::GetObjectTagging
+        }
+        (&Method::PUT, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::PutObjectTagging
+        }
+        (&Method::DELETE, true) if query.contains_key("tagging") && only_query_keys(&["tagging", "versionId"]) => {
+            Operation::DeleteObjectTagging
+        }
         // A replication PUT addresses the source version via `?versionId=`.
         (&Method::PUT, true) if only_query_keys(&["versionId"]) => Operation::PutObject,
         (&Method::GET, true) if only_query_keys(&["versionId"]) => Operation::GetObject,
@@ -689,13 +857,43 @@ fn validate_retained_identifier(value: String, field: &str) -> S3Result<String> 
     }
 }
 
-fn new_version_id(headers: &HeaderMap) -> S3Result<String> {
+/// `assign_own` models a target that mints its own version ids (a generic S3
+/// service): the forwarded source-version-id header is validated but NOT
+/// mirrored into the stored version.
+fn new_version_id(headers: &HeaderMap, assign_own: bool) -> S3Result<String> {
     let Some(value) = header_value(headers, &SOURCE_VERSION_ID_HEADERS) else {
         return Ok(Uuid::new_v4().to_string());
     };
+    if assign_own {
+        validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
+        return Ok(Uuid::new_v4().to_string());
+    }
     let value = validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
     let version_id = Uuid::parse_str(&value).map_err(|_| s3s::s3_error!(InvalidArgument, "source version ID must be a UUID"))?;
     Ok(version_id.to_string())
+}
+
+/// Capture the SSE-C passthrough transport headers a replication PUT carried.
+/// Returns an empty set in the MinIO-like drop mode.
+fn captured_replication_sse_headers(headers: &HeaderMap, drop_unlisted: bool) -> Vec<(String, String)> {
+    if drop_unlisted {
+        return Vec::new();
+    }
+    headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with(REPLICATION_SSE_TRANSPORT_PREFIX))
+        .filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string())))
+        .collect()
+}
+
+/// SSE-C evidence a RustFS-like target echoes for a stored passthrough
+/// replica: the customer algorithm restored from the transport headers.
+fn stored_sse_customer_algorithm(version: &ObjectVersion) -> Option<String> {
+    version
+        .replication_sse_headers
+        .iter()
+        .find(|(name, _)| name == REPLICATION_SSEC_ALGORITHM_TRANSPORT_HEADER)
+        .map(|(_, value)| value.clone())
 }
 
 fn source_etag(headers: &HeaderMap) -> S3Result<Option<String>> {
@@ -777,7 +975,10 @@ async fn apply_non_body_fault(fault: Option<&RequestFault>, control: &Mutex<Cont
             update_consumed(control, fault.expect("matched fault").sequence, 0);
             Err(scripted_disconnect_error())
         }
-        Some(FaultAction::SlowDrain { .. }) | Some(FaultAction::WrongEtag) | None => Ok(()),
+        Some(FaultAction::SlowDrain { .. })
+        | Some(FaultAction::WrongEtag)
+        | Some(FaultAction::DisconnectAfterResponse)
+        | None => Ok(()),
     }
 }
 
@@ -818,7 +1019,7 @@ async fn collect_stream(
             Some(FaultAction::SlowDrain { chunk_bytes, delay }) => {
                 return collect_stream_slow(body, capacity, *chunk_bytes, *delay).await;
             }
-            Some(FaultAction::WrongEtag) | None => {}
+            Some(FaultAction::WrongEtag) | Some(FaultAction::DisconnectAfterResponse) | None => {}
         }
 
         let mut output = BytesMut::with_capacity(capacity);
@@ -879,6 +1080,9 @@ fn maybe_wrong_etag(fault: Option<&RequestFault>, e_tag: String) -> String {
 fn apply_response_fault<T>(mut response: S3Response<T>, fault: Option<&RequestFault>) -> S3Response<T> {
     if fault.is_some_and(|fault| fault.action == FaultAction::WrongEtag) {
         response.headers.insert(ETAG, HeaderValue::from_static(WRONG_ETAG));
+    }
+    if fault.is_some_and(|fault| fault.action == FaultAction::DisconnectAfterResponse) {
+        response.headers.insert(DISCONNECT_HEADER, HeaderValue::from_static("true"));
     }
     response
 }
@@ -1039,6 +1243,33 @@ fn find_version(state: &StoreState, bucket: &str, key: &str, version_id: Option<
     Ok(version.clone())
 }
 
+/// Replace (or clear, with an empty vec) the tag set of the addressed
+/// version, returning its version id. Mirrors `find_version` addressing:
+/// explicit version id or the latest version, delete markers rejected.
+fn set_version_tags(
+    state: &mut StoreState,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    tags: Vec<(String, String)>,
+) -> S3Result<String> {
+    // Resolve first (immutable) so the error paths match find_version.
+    let resolved = find_version(state, bucket, key, version_id)?.version_id;
+    let versions = state
+        .buckets
+        .get_mut(bucket)
+        .expect("bucket existence checked by find_version")
+        .objects
+        .get_mut(key)
+        .expect("key existence checked by find_version");
+    let version = versions
+        .iter_mut()
+        .find(|version| version.version_id == resolved)
+        .expect("version existence checked by find_version");
+    version.tags = tags;
+    Ok(resolved)
+}
+
 #[async_trait]
 impl S3 for FakeBackend {
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
@@ -1068,6 +1299,63 @@ impl S3 for FakeBackend {
         ))
     }
 
+    /// Prefix + max-keys subset only — enough for the replication-check probe
+    /// key allocation. No pagination markers or delimiter folding.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let state = lock(&self.store);
+        let Some(bucket_state) = state.buckets.get(&req.input.bucket) else {
+            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
+        };
+        let prefix = req.input.prefix.as_deref().unwrap_or_default();
+        let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
+
+        let mut keys: Vec<&String> = bucket_state.objects.keys().filter(|key| key.starts_with(prefix)).collect();
+        keys.sort();
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        'keys: for key in keys {
+            for version in bucket_state.objects[key].iter().rev() {
+                if versions.len() + delete_markers.len() >= max_keys {
+                    break 'keys;
+                }
+                if version.delete_marker {
+                    delete_markers.push(DeleteMarkerEntry {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        ..Default::default()
+                    });
+                } else {
+                    versions.push(s3s::dto::ObjectVersion {
+                        key: Some(key.clone()),
+                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
+                        last_modified: Some(version.last_modified.clone()),
+                        e_tag: Some(ETag::Strong(version.e_tag.clone())),
+                        size: Some(version.body.len() as i64),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        drop(state);
+
+        Ok(apply_response_fault(
+            S3Response::new(ListObjectVersionsOutput {
+                name: Some(req.input.bucket),
+                versions: Some(versions),
+                delete_markers: Some(delete_markers),
+                ..Default::default()
+            }),
+            fault.as_ref(),
+        ))
+    }
+
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let fault = request_fault(&req);
         let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
@@ -1078,7 +1366,11 @@ impl S3 for FakeBackend {
         let input = req.input;
         let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control).await?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
-        let version_id = new_version_id(&headers)?;
+        let (assign_own, drop_unlisted) = {
+            let state = lock(&self.store);
+            (state.assign_own_version_ids, state.drop_unlisted_replication_headers)
+        };
+        let version_id = new_version_id(&headers, assign_own)?;
         let e_tag = match source_etag(&headers)? {
             Some(value) => value,
             None => {
@@ -1094,6 +1386,8 @@ impl S3 for FakeBackend {
             delete_marker: false,
             content_type: input.content_type,
             metadata: input.metadata,
+            tags: Vec::new(),
+            replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
         };
         upsert_version(&mut lock(&self.store), &input.bucket, input.key, version)?;
         Ok(apply_response_fault(
@@ -1114,6 +1408,7 @@ impl S3 for FakeBackend {
             let state = lock(&self.store);
             find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?
         };
+        let sse_customer_algorithm = stored_sse_customer_algorithm(&version);
         Ok(apply_response_fault(
             S3Response::new(GetObjectOutput {
                 body: Some(StreamingBlob::new(Body::from(version.body.clone()))),
@@ -1121,8 +1416,9 @@ impl S3 for FakeBackend {
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
+                sse_customer_algorithm,
                 ..Default::default()
             }),
             fault.as_ref(),
@@ -1137,15 +1433,83 @@ impl S3 for FakeBackend {
             let state = lock(&self.store);
             find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?
         };
+        let sse_customer_algorithm = stored_sse_customer_algorithm(&version);
         Ok(apply_response_fault(
             S3Response::new(HeadObjectOutput {
                 content_length: Some(version.body.len() as i64),
                 content_type: version.content_type,
                 metadata: version.metadata,
                 e_tag: Some(ETag::Strong(version.e_tag)),
-                last_modified: Some(version.last_modified),
+                last_modified: Some(version.last_modified.clone()),
                 version_id: Some(version.version_id),
+                sse_customer_algorithm,
                 ..Default::default()
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version = {
+            let state = lock(&self.store);
+            find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?
+        };
+        let tag_set: TagSet = version
+            .tags
+            .into_iter()
+            .map(|(key, value)| Tag {
+                key: Some(key),
+                value: Some(value),
+            })
+            .collect();
+        Ok(apply_response_fault(
+            S3Response::new(GetObjectTaggingOutput {
+                tag_set,
+                version_id: Some(ObjectVersionId::from(version.version_id)),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let tags = input
+            .tagging
+            .tag_set
+            .into_iter()
+            .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+            .collect();
+        let version_id = {
+            let mut state = lock(&self.store);
+            set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), tags)?
+        };
+        Ok(apply_response_fault(
+            S3Response::new(PutObjectTaggingOutput {
+                version_id: Some(ObjectVersionId::from(version_id)),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let input = req.input;
+        let version_id = {
+            let mut state = lock(&self.store);
+            set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), Vec::new())?
+        };
+        Ok(apply_response_fault(
+            S3Response::new(DeleteObjectTaggingOutput {
+                version_id: Some(ObjectVersionId::from(version_id)),
             }),
             fault.as_ref(),
         ))
@@ -1212,7 +1576,9 @@ impl S3 for FakeBackend {
             ));
         }
 
-        let version_id = new_version_id(&headers)?;
+        // `state` is the live store guard: read the flag from it. Re-locking
+        // would self-deadlock (the store mutex is not reentrant).
+        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
         upsert_version(
             &mut state,
             &input.bucket,
@@ -1225,6 +1591,8 @@ impl S3 for FakeBackend {
                 delete_marker: true,
                 content_type: None,
                 metadata: None,
+                tags: Vec::new(),
+                replication_sse_headers: Vec::new(),
             },
         )?;
         Ok(apply_response_fault(
@@ -1252,14 +1620,20 @@ impl S3 for FakeBackend {
         ensure_upload_budget(&state)?;
         validate_stored_metadata(&input.content_type, &input.metadata)?;
         let upload_id = Uuid::new_v4().to_string();
+        // Read the flags before the mutable borrow of `state.uploads` below
+        // (and never re-lock the store: the mutex is not reentrant).
+        let mint_own = state.assign_own_version_ids || state.assign_own_multipart_version_ids;
+        let drop_unlisted = state.drop_unlisted_replication_headers;
+        let version_id = new_version_id(&headers, mint_own)?;
         state.uploads.insert(
             upload_id.clone(),
             MultipartState {
                 bucket: input.bucket.clone(),
                 key: input.key.clone(),
-                version_id: new_version_id(&headers)?,
+                version_id,
                 content_type: input.content_type,
                 metadata: input.metadata,
+                replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
                 parts: BTreeMap::new(),
             },
         );
@@ -1397,6 +1771,7 @@ impl S3 for FakeBackend {
                     version_id: upload.version_id.clone(),
                     content_type: upload.content_type.clone(),
                     metadata: upload.metadata.clone(),
+                    replication_sse_headers: upload.replication_sse_headers.clone(),
                     parts: BTreeMap::new(),
                 },
                 selected,
@@ -1423,6 +1798,8 @@ impl S3 for FakeBackend {
             delete_marker: false,
             content_type: upload.content_type,
             metadata: upload.metadata,
+            tags: Vec::new(),
+            replication_sse_headers: upload.replication_sse_headers,
         };
         let mut state = lock(&self.store);
         let current = state
@@ -1579,6 +1956,111 @@ mod tests {
             })
             .send()
             .await?)
+    }
+
+    #[tokio::test]
+    async fn journals_replication_timestamp_headers() -> Result<(), BoxError> {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("target-bucket");
+        let client = client(&target);
+
+        client
+            .put_object()
+            .bucket("target-bucket")
+            .key("plain")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await?;
+        client
+            .put_object()
+            .bucket("target-bucket")
+            .key("stamped")
+            .body(ByteStream::from_static(b"stamped"))
+            .customize()
+            .map_request(move |mut request| {
+                let headers = request.headers_mut();
+                headers.insert("x-rustfs-source-replication-tagging-timestamp", "2026-01-02T03:04:05Z");
+                headers.insert("x-minio-source-replication-retention-timestamp", "2026-01-02T03:04:06Z");
+                headers.insert("x-rustfs-source-replication-legalhold-timestamp", "2026-01-02T03:04:07Z");
+                Ok::<_, std::convert::Infallible>(request)
+            })
+            .send()
+            .await?;
+
+        let requests = target.requests();
+        let plain = requests
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("plain"))
+            .expect("plain PUT must be journaled");
+        assert_eq!(plain.replication_timestamps, ReplicationTimestampHeaders::default());
+
+        let stamped = requests
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("stamped"))
+            .expect("stamped PUT must be journaled");
+        assert_eq!(stamped.replication_timestamps.tagging.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(stamped.replication_timestamps.retention.as_deref(), Some("2026-01-02T03:04:06Z"));
+        assert_eq!(stamped.replication_timestamps.legalhold.as_deref(), Some("2026-01-02T03:04:07Z"));
+        Ok(())
+    }
+
+    /// Default mode is RustFS-like: SSE-C passthrough transport headers are
+    /// stored and the customer algorithm is echoed on HEAD/GET. Drop mode is
+    /// MinIO-like: the headers are silently discarded, so no evidence comes
+    /// back — the exact difference the N2 fail-closed audit keys on. Both
+    /// modes journal that the sender shipped the transport headers.
+    #[tokio::test]
+    async fn ssec_passthrough_headers_echo_and_drop_modes() -> Result<(), BoxError> {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("target-bucket");
+        let client = client(&target);
+
+        let put_with_transport_headers = |key: &'static str| {
+            client
+                .put_object()
+                .bucket("target-bucket")
+                .key(key)
+                .body(ByteStream::from_static(b"ciphertext"))
+                .customize()
+                .map_request(move |mut request| {
+                    let headers = request.headers_mut();
+                    headers.insert("x-rustfs-replication-ssec-algorithm", "AES256");
+                    headers.insert("x-rustfs-replication-ssec-key-md5", "AAAAAAAAAAAAAAAAAAAAAA==");
+                    Ok::<_, std::convert::Infallible>(request)
+                })
+                .send()
+        };
+
+        put_with_transport_headers("kept").await?;
+        let head = client.head_object().bucket("target-bucket").key("kept").send().await?;
+        assert_eq!(head.sse_customer_algorithm(), Some("AES256"));
+        let get = client.get_object().bucket("target-bucket").key("kept").send().await?;
+        assert_eq!(get.sse_customer_algorithm(), Some("AES256"));
+
+        target.drop_unlisted_replication_headers(true);
+        put_with_transport_headers("dropped").await?;
+        let head = client.head_object().bucket("target-bucket").key("dropped").send().await?;
+        assert_eq!(head.sse_customer_algorithm(), None, "drop mode must discard SSE-C evidence");
+
+        let requests = target.requests();
+        for key in ["kept", "dropped"] {
+            let record = requests
+                .iter()
+                .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some(key))
+                .expect("PUT must be journaled");
+            assert!(
+                record.proxy_headers.ssec_transport_present,
+                "the journal must prove the sender shipped the transport headers for {key}"
+            );
+        }
+        let plain_head = requests
+            .iter()
+            .find(|record| record.operation == Operation::HeadObject)
+            .expect("HEAD must be journaled");
+        assert!(!plain_head.proxy_headers.ssec_transport_present);
+
+        target.shutdown().await;
+        Ok(())
     }
 
     macro_rules! assert_sdk_error {
@@ -2846,6 +3328,7 @@ mod tests {
                         version_id: index.to_string(),
                         content_type: None,
                         metadata: None,
+                        replication_sse_headers: Vec::new(),
                         parts: BTreeMap::new(),
                     },
                 );
@@ -2867,6 +3350,8 @@ mod tests {
                         part_number: None,
                     },
                     Some(0),
+                    ReplicationTimestampHeaders::default(),
+                    ProxyHeaderSnapshot::default(),
                 );
             }
             let records = lock(&control).requests.clone();
@@ -2888,6 +3373,8 @@ mod tests {
                     part_number: None,
                 },
                 None,
+                ReplicationTimestampHeaders::default(),
+                ProxyHeaderSnapshot::default(),
             );
             {
                 let bounded_records = lock(&bounded_control);

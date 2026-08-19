@@ -46,21 +46,49 @@ pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_MULTIPART: &str = "multipart";
 pub(crate) const GET_STAGE_DECODE: &str = "decode";
 pub(crate) const GET_STAGE_EMIT: &str = "emit";
 pub(crate) const GET_STAGE_FILL: &str = "fill";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_FIRST_BYTE: &str = "first_byte";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_FIRST_METADATA_RESPONSE: &str = "first_metadata_response";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_FIRST_VALID_METADATA_RESPONSE: &str = "first_valid_metadata_response";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_FIRST_SHARD_READ: &str = "first_shard_read";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_FULL_BODY: &str = "full_body";
 pub(crate) const GET_STAGE_INLINE_PREPARE: &str = "inline_prepare";
 pub(crate) const GET_STAGE_LOCK_ACQUIRE: &str = "lock_acquire";
 pub(crate) const GET_STAGE_METADATA: &str = "metadata";
 pub(crate) const GET_STAGE_METADATA_CACHE_LOOKUP: &str = "metadata_cache_lookup";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_METADATA_FANOUT: &str = "metadata_fanout";
 pub(crate) const GET_STAGE_METADATA_RESOLVE: &str = "metadata_resolve";
 pub(crate) const GET_STAGE_OBJECT_INFO: &str = "object_info";
 pub(crate) const GET_STAGE_OUTPUT_LOCK_WAIT: &str = "output_lock_wait";
 pub(crate) const GET_STAGE_OUTPUT_POLL: &str = "output_poll";
 pub(crate) const GET_STAGE_PATH_DECISION: &str = "path_decision";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_QUORUM_REACHED: &str = "quorum_reached";
 pub(crate) const GET_STAGE_RANGE: &str = "range";
 pub(crate) const GET_STAGE_READER_SETUP: &str = "reader_setup";
@@ -84,12 +112,28 @@ pub(crate) const GET_STAGE_READER_STREAM_FIRST_READ: &str = "reader_stream_first
 pub(crate) const GET_STAGE_READER_TASK_BITROT_READER_INIT: &str = "reader_task_bitrot_reader_init";
 pub(crate) const GET_STAGE_READER_TASK_FILE_OPEN: &str = "reader_task_file_open";
 pub(crate) const GET_STAGE_READER_TASK_READER_CONSTRUCTION: &str = "reader_task_reader_construction";
+pub(crate) const GET_STAGE_READ_VERSION_DECODE: &str = "read_version_decode";
+pub(crate) const GET_STAGE_READ_VERSION_PATH_CHECK: &str = "read_version_path_check";
+pub(crate) const GET_STAGE_READ_VERSION_PATH_RESOLVE: &str = "read_version_path_resolve";
+pub(crate) const GET_STAGE_READ_VERSION_XLMETA_READ: &str = "read_version_xlmeta_read";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_RESPONSE_HANDOFF: &str = "response_handoff";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_SLOWEST_METADATA_RESPONSE: &str = "slowest_metadata_response";
 pub(crate) const GET_STAGE_STRIPE_READ: &str = "stripe_read";
 pub(crate) const GET_STAGE_STRIPE_READ_FIRST_SHARD: &str = "stripe_read_first_shard";
 pub(crate) const GET_STAGE_STRIPE_READ_QUORUM: &str = "stripe_read_quorum";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const GET_STAGE_BITROT_VERIFY: &str = "bitrot_verify";
 
 pub(crate) const GET_READER_BUFFER_OUTPUT: &str = "output";
@@ -137,6 +181,7 @@ pub(crate) const GET_METADATA_CACHE_REASON_NO_LOCK: &str = "no_lock";
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED: &str = "not_found_or_expired";
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_READ_DATA: &str = "not_read_data";
 pub(crate) const GET_METADATA_CACHE_REASON_PART_NUMBER: &str = "part_number";
+pub(crate) const GET_METADATA_CACHE_REASON_PART_CHECKSUMS: &str = "part_checksums";
 pub(crate) const GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ: &str = "raw_data_movement_read";
 pub(crate) const GET_METADATA_CACHE_REASON_STALE_PUBLICATION: &str = "stale_publication";
 pub(crate) const GET_METADATA_CACHE_REASON_USABLE: &str = "usable";
@@ -145,6 +190,17 @@ pub(crate) const GET_METADATA_CACHE_REASON_VERSION_SUSPENDED: &str = "version_su
 pub(crate) const GET_METADATA_CACHE_REASON_VERSIONED: &str = "versioned";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA: &str = "conflicting_metadata";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER: &str = "delete_marker";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY: &str = "data_read_inline_body_verify";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED: &str = "data_read_inline_deleted";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY: &str = "data_read_inline_geometry";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH: &str = "data_read_inline_identity_mismatch";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD: &str = "data_read_inline_missing_payload";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD: &str = "data_read_inline_missing_shard";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE: &str = "data_read_inline_not_inline";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE: &str = "data_read_inline_part_shape";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE: &str = "data_read_inline_remote";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE: &str = "data_read_inline_size";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED: &str = "data_read_inline_transformed";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_ERROR: &str = "error";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM: &str = "insufficient_quorum";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_NOT_FOUND: &str = "not_found";
@@ -154,8 +210,20 @@ pub(crate) const GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND: &str = "versi
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM: &str = "version_match_quorum";
 
 /// Early-stop active state labels
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const EARLY_STOP_ACTIVE_HIT: &str = "hit";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const EARLY_STOP_ACTIVE_MISS: &str = "miss";
+#[allow(
+    dead_code,
+    reason = "GET stage vocabulary; value pinned by this file's tests, no writer yet (backlog#1823)"
+)]
 pub(crate) const EARLY_STOP_ACTIVE_DISABLED: &str = "disabled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,6 +509,10 @@ mod tests {
         assert_eq!(GET_STAGE_QUORUM_REACHED, "quorum_reached");
         assert_eq!(GET_STAGE_RANGE, "range");
         assert_eq!(GET_STAGE_READER_SETUP, "reader_setup");
+        assert_eq!(GET_STAGE_READ_VERSION_DECODE, "read_version_decode");
+        assert_eq!(GET_STAGE_READ_VERSION_PATH_CHECK, "read_version_path_check");
+        assert_eq!(GET_STAGE_READ_VERSION_PATH_RESOLVE, "read_version_path_resolve");
+        assert_eq!(GET_STAGE_READ_VERSION_XLMETA_READ, "read_version_xlmeta_read");
         assert_eq!(GET_STAGE_RECONSTRUCT, "reconstruct");
         assert_eq!(GET_STAGE_RESPONSE_HANDOFF, "response_handoff");
         assert_eq!(GET_STAGE_SLOWEST_METADATA_RESPONSE, "slowest_metadata_response");
@@ -480,6 +552,7 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_NO_LOCK, "no_lock");
         assert_eq!(GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED, "not_found_or_expired");
         assert_eq!(GET_METADATA_CACHE_REASON_NOT_READ_DATA, "not_read_data");
+        assert_eq!(GET_METADATA_CACHE_REASON_PART_CHECKSUMS, "part_checksums");
         assert_eq!(GET_METADATA_CACHE_REASON_PART_NUMBER, "part_number");
         assert_eq!(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, "raw_data_movement_read");
         assert_eq!(GET_METADATA_CACHE_REASON_STALE_PUBLICATION, "stale_publication");
@@ -489,6 +562,32 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_VERSIONED, "versioned");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, "conflicting_metadata");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, "delete_marker");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY,
+            "data_read_inline_body_verify"
+        );
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_DELETED, "data_read_inline_deleted");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY, "data_read_inline_geometry");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_IDENTITY_MISMATCH,
+            "data_read_inline_identity_mismatch"
+        );
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_PAYLOAD,
+            "data_read_inline_missing_payload"
+        );
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD,
+            "data_read_inline_missing_shard"
+        );
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE, "data_read_inline_not_inline");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE, "data_read_inline_part_shape");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_REMOTE, "data_read_inline_remote");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE, "data_read_inline_size");
+        assert_eq!(
+            GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_TRANSFORMED,
+            "data_read_inline_transformed"
+        );
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_ERROR, "error");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, "insufficient_quorum");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, "not_found");

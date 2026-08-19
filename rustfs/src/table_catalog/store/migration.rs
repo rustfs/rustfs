@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use super::object::{
-    ObjectTableCatalogStore, validate_namespace_entry_object, validate_table_entry_object, validate_view_entry_object,
+    ObjectTableCatalogStore, validate_commit_idempotency_entry_object, validate_commit_log_entry_object,
+    validate_namespace_entry_object, validate_table_bucket_entry_object, validate_table_entry_object, validate_view_entry_object,
 };
 use super::strong::{
     StrongCommitSnapshotRecord, StrongTableCatalogBucketSnapshot, StrongTableCatalogState, TableCatalogBackingMigrationFence,
-    TableCatalogBackingMigrationFenceStatus, TableCatalogBackingMigrationGlobalFence, table_catalog_bucket_snapshot_fingerprint,
+    TableCatalogBackingMigrationFenceStatus, TableCatalogBackingMigrationGlobalFence,
+    TableCatalogBackingMigrationTargetSnapshotState, table_catalog_bucket_snapshot_fingerprint,
 };
 use super::*;
 
@@ -82,14 +84,14 @@ pub(super) fn table_catalog_backing_manifest(
         },
         migration: TableCatalogBackingMigrationPlan {
             source_kind: TableCatalogBackingKind::ObjectBacked,
-            target_kind: TableCatalogBackingKind::StrongKvWal,
+            target_kind: TableCatalogBackingKind::DurableStrongSnapshot,
             status: migration_status,
             required_steps: vec![
                 TableCatalogBackingMigrationStep::SnapshotCatalogExport,
                 TableCatalogBackingMigrationStep::ReplayCommitLog,
                 TableCatalogBackingMigrationStep::VerifyCurrentPointer,
                 TableCatalogBackingMigrationStep::EnableSingleWriterFencing,
-                TableCatalogBackingMigrationStep::CutOverLinearizableReads,
+                TableCatalogBackingMigrationStep::CutOverDurableSnapshotReads,
             ],
             blockers,
         },
@@ -118,15 +120,103 @@ impl<B> ObjectTableCatalogStore<B>
 where
     B: TableCatalogObjectBackend,
 {
+    fn migration_target_snapshot_state(
+        fence: &TableCatalogBackingMigrationFence,
+    ) -> TableCatalogBackingMigrationTargetSnapshotState {
+        // RUSTFS_COMPAT_TODO(table-catalog-migration-fence-v1): Version 1 PREPARING fences have no durable baseline. Remove after all supported upgrade sources write version 2 fences and all version 1 migrations are completed or cancelled.
+        if fence.version < TABLE_CATALOG_MIGRATION_VERSION {
+            TableCatalogBackingMigrationTargetSnapshotState::Unknown
+        } else if fence.target_snapshot_etag.is_some() {
+            TableCatalogBackingMigrationTargetSnapshotState::Present
+        } else {
+            TableCatalogBackingMigrationTargetSnapshotState::Absent
+        }
+    }
+
+    fn validate_backing_migration_fence(
+        table_bucket: &str,
+        fence: &TableCatalogBackingMigrationFence,
+    ) -> TableCatalogStoreResult<()> {
+        if !(TABLE_CATALOG_MIGRATION_MIN_READ_VERSION..=TABLE_CATALOG_MIGRATION_VERSION).contains(&fence.version)
+            || fence.table_bucket != table_bucket
+            || fence.migration_id.is_empty()
+        {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "invalid durable strong migration fence for table bucket {table_bucket}"
+            )));
+        }
+        let target_snapshot_state = Self::migration_target_snapshot_state(fence);
+        if fence.target_bucket_existed && target_snapshot_state == TableCatalogBackingMigrationTargetSnapshotState::Absent {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "durable strong migration fence for table bucket {table_bucket} has an inconsistent target snapshot baseline"
+            )));
+        }
+        match fence.status {
+            TableCatalogBackingMigrationFenceStatus::Preparing if fence.source_fingerprint.is_some() => {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "preparing durable strong migration fence for table bucket {table_bucket} has materialized state"
+                )));
+            }
+            TableCatalogBackingMigrationFenceStatus::Materialized
+                if fence.source_fingerprint.is_none() || fence.target_snapshot_etag.is_none() =>
+            {
+                return Err(TableCatalogStoreError::Invalid(format!(
+                    "materialized durable strong migration fence for table bucket {table_bucket} is incomplete"
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_global_backing_migration_fence(fence: &TableCatalogBackingMigrationGlobalFence) -> TableCatalogStoreResult<()> {
+        if !(TABLE_CATALOG_MIGRATION_MIN_READ_VERSION..=TABLE_CATALOG_MIGRATION_VERSION).contains(&fence.version)
+            || fence.migration_id.is_empty()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "invalid durable strong global migration fence".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn observe_durable_strong_migration_target(
+        strong_store: &StrongTableCatalogStore<B>,
+        table_bucket: &str,
+        fence: Option<&TableCatalogBackingMigrationFence>,
+    ) -> TableCatalogStoreResult<(Option<String>, Option<String>)> {
+        let target_snapshot_state = fence.map(Self::migration_target_snapshot_state);
+        let permits_absent_snapshot = fence.is_some_and(|fence| {
+            fence.status == TableCatalogBackingMigrationFenceStatus::Preparing
+                && !fence.target_bucket_existed
+                && target_snapshot_state == Some(TableCatalogBackingMigrationTargetSnapshotState::Absent)
+        });
+        if permits_absent_snapshot {
+            strong_store.restore_absent_migration_snapshot_baseline().await?;
+        }
+        let observation = strong_store.bucket_snapshot_observation(table_bucket).await?;
+        if fence.is_some() && observation.1.is_none() && !permits_absent_snapshot {
+            return Err(TableCatalogStoreError::Conflict(
+                "durable strong catalog snapshot is missing for an in-progress backing migration".to_string(),
+            ));
+        }
+        Ok(observation)
+    }
+
     async fn read_backing_migration_fence(
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<(TableCatalogBackingMigrationFence, Option<String>)>> {
-        self.read_entry(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
-            .await
+        let fence = self
+            .read_entry(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
+            .await?;
+        if let Some((fence, _)) = fence.as_ref() {
+            Self::validate_backing_migration_fence(table_bucket, fence)?;
+        }
+        Ok(fence)
     }
 
-    pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<Box<dyn Send>> {
+    pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let fence_path = self.paths.backing_migration_global_fence_path();
         let lock_path = self.paths.backing_migration_global_fence_lock_path();
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
@@ -145,7 +235,7 @@ where
     pub(super) async fn acquire_object_backed_catalog_write_permit(
         &self,
         table_bucket: &str,
-    ) -> TableCatalogStoreResult<Box<dyn Send>> {
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let guard = self.backend.acquire_read_lock(self.catalog_bucket(), &lock_path).await?;
         if self.read_backing_migration_fence(table_bucket).await?.is_some() {
@@ -164,11 +254,7 @@ where
             .read_entry::<TableCatalogBackingMigrationGlobalFence>(self.catalog_bucket(), fence_path)
             .await?
         {
-            if fence.version != TABLE_CATALOG_MIGRATION_VERSION {
-                return Err(TableCatalogStoreError::Invalid(
-                    "invalid durable strong global migration fence".to_string(),
-                ));
-            }
+            Self::validate_global_backing_migration_fence(&fence)?;
             return Ok(fence);
         }
         let fence = TableCatalogBackingMigrationGlobalFence {
@@ -181,6 +267,13 @@ where
     }
 
     async fn clear_global_backing_migration_fence_if_unused(&self, fence_path: &str) -> TableCatalogStoreResult<()> {
+        let Some((fence, _)) = self
+            .read_entry::<TableCatalogBackingMigrationGlobalFence>(self.catalog_bucket(), fence_path)
+            .await?
+        else {
+            return Ok(());
+        };
+        Self::validate_global_backing_migration_fence(&fence)?;
         let bucket_objects = self
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.table_bucket_entries_prefix())
@@ -194,23 +287,10 @@ where
         self.backend.delete_object(self.catalog_bucket(), fence_path).await
     }
 
-    pub(super) async fn ensure_object_backed_writes_allowed(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
-        if self
-            .backend
-            .object_exists(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
-            .await?
-        {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
-            )));
-        }
-        Ok(())
-    }
-
     async fn collect_bucket_snapshot_with_locks(
         &self,
         table_bucket: &str,
-        guards: &mut Vec<Box<dyn Send>>,
+        guards: &mut Vec<TableCatalogLockGuard>,
     ) -> TableCatalogStoreResult<StrongTableCatalogBucketSnapshot> {
         let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
         guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?);
@@ -220,11 +300,7 @@ where
         else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
         };
-        if table_bucket_entry.table_bucket != table_bucket {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "table bucket entry does not match migration target {table_bucket}"
-            )));
-        }
+        validate_table_bucket_entry_object(&self.paths, &bucket_path, &table_bucket_entry)?;
 
         let mut namespaces = Vec::new();
         let mut tables = Vec::new();
@@ -286,6 +362,7 @@ where
                         "commit log changed while preparing durable strong snapshot: {commit_object}"
                     )));
                 };
+                validate_commit_log_entry_object(&self.paths, &commit_object, table_bucket, &table_entry.table_id, &commit)?;
                 commits.push(StrongCommitSnapshotRecord {
                     table_bucket: table_bucket.to_string(),
                     table_id: table_entry.table_id.clone(),
@@ -313,6 +390,13 @@ where
                         "idempotency index changed while preparing durable strong snapshot: {idempotency_object}"
                     )));
                 };
+                validate_commit_idempotency_entry_object(
+                    &self.paths,
+                    &idempotency_object,
+                    table_bucket,
+                    &table_entry.table_id,
+                    &commit,
+                )?;
                 let lookup_key = commit.idempotency_key.clone().ok_or_else(|| {
                     TableCatalogStoreError::Invalid(format!("idempotency index {idempotency_object} has no idempotency key"))
                 })?;
@@ -360,6 +444,22 @@ where
 
     fn validate_bucket_snapshot_for_migration(&self, snapshot: &StrongTableCatalogBucketSnapshot) -> TableCatalogStoreResult<()> {
         let table_bucket = &snapshot.table_bucket.table_bucket;
+        let active_table_identifiers = snapshot
+            .tables
+            .iter()
+            .filter(|table| table.state == TableCatalogEntryState::Active)
+            .map(|table| (&table.namespace, &table.table))
+            .collect::<BTreeSet<_>>();
+        if snapshot
+            .views
+            .iter()
+            .filter(|view| view.state == TableCatalogEntryState::Active)
+            .any(|view| active_table_identifiers.contains(&(&view.namespace, &view.view)))
+        {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "table bucket {table_bucket} contains an active table/view identifier collision"
+            )));
+        }
         let tables_by_id = snapshot
             .tables
             .iter()
@@ -390,6 +490,23 @@ where
                 "migration snapshot contains duplicate idempotency lookup keys".to_string(),
             ));
         }
+        let mut commit_logs_by_table = BTreeMap::<&str, Vec<&CommitLogEntry>>::new();
+        for record in &snapshot.commits {
+            commit_logs_by_table
+                .entry(record.table_id.as_str())
+                .or_default()
+                .push(&record.commit);
+        }
+        let history_by_table = tables_by_id
+            .iter()
+            .map(|(table_id, table)| {
+                let commits = commit_logs_by_table
+                    .get(table_id)
+                    .into_iter()
+                    .flat_map(|commits| commits.iter().copied());
+                (*table_id, TableCommitHistoryIndex::new(table, commits))
+            })
+            .collect::<BTreeMap<_, _>>();
         for record in &snapshot.commits {
             let table = tables_by_id.get(record.table_id.as_str()).ok_or_else(|| {
                 TableCatalogStoreError::Invalid(format!("commit {} has no table in migration snapshot", record.commit.commit_id))
@@ -408,7 +525,14 @@ where
                 .idempotency_key
                 .as_deref()
                 .and_then(|idempotency_key| idempotency_by_key.get(&(record.table_id.as_str(), idempotency_key)).copied());
-            let recovery = table_commit_recovery_entry(table, &record.commit, indexed);
+            let recovery = table_commit_recovery_entry(
+                table,
+                &record.commit,
+                indexed,
+                history_by_table
+                    .get(record.table_id.as_str())
+                    .is_some_and(|history| history.proves_committed(&record.commit)),
+            );
             if recovery.recovery_state != TableCommitRecoveryState::Committed {
                 return Err(TableCatalogStoreError::Conflict(format!(
                     "commit {} requires catalog recovery before durable strong migration",
@@ -474,6 +598,15 @@ where
         if self.get_table_bucket(table_bucket).await?.is_none() {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
         }
+        if let Some((global_fence, _)) = self
+            .read_entry::<TableCatalogBackingMigrationGlobalFence>(
+                self.catalog_bucket(),
+                &self.paths.backing_migration_global_fence_path(),
+            )
+            .await?
+        {
+            Self::validate_global_backing_migration_fence(&global_fence)?;
+        }
 
         let namespace_objects = self
             .backend
@@ -487,6 +620,10 @@ where
         let mut recovery_required_count: usize = 0;
         let mut manual_review_count: usize = 0;
         let mut warehouse_prefix_owners = BTreeMap::<String, usize>::new();
+        let mut table_ids = BTreeSet::<String>::new();
+        let mut duplicate_table_identity = false;
+        let mut active_table_identifiers = BTreeSet::<(String, String)>::new();
+        let mut active_view_identifiers = BTreeSet::<(String, String)>::new();
 
         for object in namespace_objects {
             if object.ends_with(NAMESPACE_ENTRY_FILE) {
@@ -502,6 +639,9 @@ where
                     continue;
                 };
                 validate_view_entry_object(&self.paths, &object, &entry)?;
+                if entry.state == TableCatalogEntryState::Active {
+                    active_view_identifiers.insert((entry.namespace.clone(), entry.view.clone()));
+                }
                 view_count = view_count.saturating_add(1);
                 continue;
             }
@@ -514,7 +654,11 @@ where
             };
             validate_table_entry_object(&self.paths, &object, &table)?;
             table_count = table_count.saturating_add(1);
+            if !table_ids.insert(table.table_id.clone()) {
+                duplicate_table_identity = true;
+            }
             if table.state == TableCatalogEntryState::Active {
+                active_table_identifiers.insert((table.namespace.clone(), table.table.clone()));
                 let warehouse_prefix = table_warehouse_object_prefix(&table)?;
                 warehouse_prefix_owners
                     .entry(warehouse_prefix)
@@ -524,17 +668,31 @@ where
 
             let recovery = self.table_commit_recovery_report_for_entry(&table, 0).await?;
             commit_log_count = commit_log_count.saturating_add(recovery.commits.len());
-            idempotency_index_count = idempotency_index_count.saturating_add(
-                self.backend
-                    .list_objects(
-                        self.catalog_bucket(),
-                        &self.paths.commit_idempotency_entries_prefix(table_bucket, &table.table_id),
-                    )
+            for idempotency_object in self
+                .backend
+                .list_objects(
+                    self.catalog_bucket(),
+                    &self.paths.commit_idempotency_entries_prefix(table_bucket, &table.table_id),
+                )
+                .await?
+                .into_iter()
+                .filter(|object| object.ends_with(".json"))
+            {
+                let Some((commit, _)) = self
+                    .read_entry::<CommitLogEntry>(self.catalog_bucket(), &idempotency_object)
                     .await?
-                    .into_iter()
-                    .filter(|object| object.ends_with(".json"))
-                    .count(),
-            );
+                else {
+                    continue;
+                };
+                validate_commit_idempotency_entry_object(
+                    &self.paths,
+                    &idempotency_object,
+                    table_bucket,
+                    &table.table_id,
+                    &commit,
+                )?;
+                idempotency_index_count = idempotency_index_count.saturating_add(1);
+            }
             recovery_required_count = recovery_required_count
                 .saturating_add(recovery.staged_before_table_update_count)
                 .saturating_add(recovery.finalization_required_count)
@@ -544,6 +702,13 @@ where
 
         let warehouse_index_ready = self.warehouse_index_ready(table_bucket).await?;
         let duplicate_warehouse_prefix_count = warehouse_prefix_owners.values().filter(|count| **count > 1).count();
+        let overlapping_warehouse_prefix = warehouse_prefix_owners
+            .keys()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|window| warehouse_object_prefixes_overlap(window[0], window[1]));
+        let conflicting_warehouse_prefix = duplicate_warehouse_prefix_count > 0 || overlapping_warehouse_prefix;
+        let table_view_identifier_collision_count = active_table_identifiers.intersection(&active_view_identifiers).count();
         let mut blockers = Vec::new();
         let mut recommended_actions = Vec::new();
         if recovery_required_count > 0 {
@@ -559,12 +724,24 @@ where
             blockers.push(TableCatalogBackingMigrationBlocker::WarehouseIndexBackfillRequired);
             recommended_actions.push(TableCatalogBackingMigrationAction::BackfillWarehouseIndex);
         }
-        if duplicate_warehouse_prefix_count > 0 {
+        if conflicting_warehouse_prefix {
             blockers.push(TableCatalogBackingMigrationBlocker::DuplicateWarehousePrefix);
             recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDuplicateWarehousePrefixes);
         }
+        if duplicate_table_identity {
+            blockers.push(TableCatalogBackingMigrationBlocker::DuplicateTableIdentity);
+            recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDuplicateTableIdentities);
+        }
+        if table_view_identifier_collision_count > 0 {
+            blockers.push(TableCatalogBackingMigrationBlocker::TableViewIdentifierCollision);
+            recommended_actions.push(TableCatalogBackingMigrationAction::ReviewTableViewIdentifierCollisions);
+        }
 
-        let mut status = if manual_review_count > 0 || duplicate_warehouse_prefix_count > 0 {
+        let mut status = if manual_review_count > 0
+            || conflicting_warehouse_prefix
+            || duplicate_table_identity
+            || table_view_identifier_collision_count > 0
+        {
             TableCatalogBackingMigrationStatus::ManualReviewRequired
         } else if recovery_required_count > 0 || !warehouse_index_ready {
             TableCatalogBackingMigrationStatus::RecoveryRequired
@@ -573,6 +750,14 @@ where
         };
 
         let strong_store = StrongTableCatalogStore::new(self.backend.clone());
+        let source_table_buckets = self.object_backed_table_buckets().await?;
+        let source_table_bucket_names = source_table_buckets.keys().cloned().collect::<BTreeSet<_>>();
+        let target_table_buckets = strong_store.table_bucket_names().await?;
+        if !target_table_buckets.is_subset(&source_table_bucket_names) {
+            status = TableCatalogBackingMigrationStatus::ManualReviewRequired;
+            blockers.push(TableCatalogBackingMigrationBlocker::DurableStrongSnapshotChanged);
+            recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDurableStrongSnapshot);
+        }
         let migration_fence = self.read_backing_migration_fence(table_bucket).await?.map(|(fence, _)| fence);
         let object_backed_writes_fenced = migration_fence.is_some();
         if status == TableCatalogBackingMigrationStatus::ReadyToSnapshot
@@ -609,7 +794,7 @@ where
         Ok(TableCatalogBackingMigrationDryRunReport {
             table_bucket: table_bucket.to_string(),
             source_kind: TableCatalogBackingKind::ObjectBacked,
-            target_kind: TableCatalogBackingKind::StrongKvWal,
+            target_kind: TableCatalogBackingKind::DurableStrongSnapshot,
             status,
             namespace_count,
             table_count,
@@ -660,11 +845,17 @@ where
         let existing_fence = self.read_backing_migration_fence(table_bucket).await?;
         let strong_store = StrongTableCatalogStore::new(self.backend.clone());
         if let Some((fence, _)) = existing_fence.as_ref()
-            && (fence.version != TABLE_CATALOG_MIGRATION_VERSION || fence.table_bucket != table_bucket)
+            && fence.status == TableCatalogBackingMigrationFenceStatus::Preparing
+            && !fence.target_bucket_existed
+            && Self::migration_target_snapshot_state(fence) == TableCatalogBackingMigrationTargetSnapshotState::Absent
         {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "invalid durable strong migration fence for table bucket {table_bucket}"
-            )));
+            strong_store.restore_absent_migration_snapshot_baseline().await?;
+        }
+        let source_table_bucket_names = self.object_backed_table_buckets().await?.into_keys().collect::<BTreeSet<_>>();
+        if !strong_store.table_bucket_names().await?.is_subset(&source_table_bucket_names) {
+            return Err(TableCatalogStoreError::Conflict(
+                "durable strong snapshot contains table buckets outside the object-backed catalog inventory".to_string(),
+            ));
         }
 
         if !self.warehouse_index_ready(table_bucket).await? {
@@ -688,10 +879,16 @@ where
         }
 
         self.ensure_global_backing_migration_fence(&global_fence_path).await?;
+        let (target_fingerprint, target_snapshot_etag) = Self::observe_durable_strong_migration_target(
+            &strong_store,
+            table_bucket,
+            existing_fence.as_ref().map(|(fence, _)| fence),
+        )
+        .await?;
         let (migration_id, target_bucket_existed) = if let Some((fence, _)) = existing_fence.as_ref() {
             (fence.migration_id.clone(), fence.target_bucket_existed)
         } else {
-            let target_bucket_existed = strong_store.bucket_snapshot_fingerprint(table_bucket).await?.is_some();
+            let target_bucket_existed = target_fingerprint.is_some();
             let fence = TableCatalogBackingMigrationFence {
                 version: TABLE_CATALOG_MIGRATION_VERSION,
                 table_bucket: table_bucket.to_string(),
@@ -699,7 +896,7 @@ where
                 status: TableCatalogBackingMigrationFenceStatus::Preparing,
                 target_bucket_existed,
                 source_fingerprint: None,
-                target_snapshot_etag: None,
+                target_snapshot_etag,
             };
             self.write_entry(self.catalog_bucket(), &fence_path, &fence, TableCatalogPutPrecondition::IfAbsent)
                 .await?;
@@ -725,7 +922,7 @@ where
         Ok(TableCatalogBackingMigrationExecutionReport {
             table_bucket: table_bucket.to_string(),
             source_kind: TableCatalogBackingKind::ObjectBacked,
-            target_kind: TableCatalogBackingKind::StrongKvWal,
+            target_kind: TableCatalogBackingKind::DurableStrongSnapshot,
             status: if created {
                 TableCatalogBackingMigrationExecutionStatus::SnapshotMaterialized
             } else {
@@ -769,11 +966,6 @@ where
             });
         };
         self.ensure_global_backing_migration_fence(&global_fence_path).await?;
-        if fence.version != TABLE_CATALOG_MIGRATION_VERSION || fence.table_bucket != table_bucket {
-            return Err(TableCatalogStoreError::Invalid(format!(
-                "invalid durable strong migration fence for table bucket {table_bucket}"
-            )));
-        }
 
         let mut source_guards = Vec::new();
         let source = self
@@ -789,12 +981,21 @@ where
         }
 
         let strong_store = StrongTableCatalogStore::new(self.backend.clone());
-        if fence.status == TableCatalogBackingMigrationFenceStatus::Materialized
-            && strong_store.bucket_snapshot_fingerprint(table_bucket).await?.as_deref() != Some(&source_fingerprint)
-        {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "durable strong catalog state changed after materializing table bucket {table_bucket}"
-            )));
+        let (target_fingerprint, target_snapshot_etag) =
+            Self::observe_durable_strong_migration_target(&strong_store, table_bucket, Some(&fence)).await?;
+        if fence.status == TableCatalogBackingMigrationFenceStatus::Materialized {
+            let target_matches_source = target_fingerprint.as_deref() == Some(&source_fingerprint);
+            let target_was_already_removed = !fence.target_bucket_existed && target_fingerprint.is_none();
+            if !target_matches_source && !target_was_already_removed {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "durable strong catalog state changed after materializing table bucket {table_bucket}"
+                )));
+            }
+            if target_matches_source && target_snapshot_etag != fence.target_snapshot_etag {
+                return Err(TableCatalogStoreError::Conflict(
+                    "durable strong catalog snapshot advanced after materialization".to_string(),
+                ));
+            }
         }
         if !fence.target_bucket_existed {
             strong_store
@@ -812,30 +1013,19 @@ where
     }
 
     async fn all_table_buckets_materialized(&self, strong_store: &StrongTableCatalogStore<B>) -> TableCatalogStoreResult<bool> {
-        if self
+        let Some((global_fence, _)) = self
             .read_entry::<TableCatalogBackingMigrationGlobalFence>(
                 self.catalog_bucket(),
                 &self.paths.backing_migration_global_fence_path(),
             )
             .await?
-            .is_none()
-        {
+        else {
             return Ok(false);
-        }
-        let table_bucket_objects = self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.table_bucket_entries_prefix())
-            .await?;
-        for table_bucket_object in table_bucket_objects
-            .iter()
-            .filter(|object| object.ends_with(TABLE_BUCKET_ENTRY_FILE))
-        {
-            let Some((entry, _)) = self
-                .read_entry::<TableBucketEntry>(self.catalog_bucket(), table_bucket_object)
-                .await?
-            else {
-                return Ok(false);
-            };
+        };
+        Self::validate_global_backing_migration_fence(&global_fence)?;
+        let source_table_buckets = self.object_backed_table_buckets().await?;
+        let source_table_bucket_names = source_table_buckets.keys().cloned().collect::<BTreeSet<_>>();
+        for entry in source_table_buckets.values() {
             let Some((fence, _)) = self.read_backing_migration_fence(&entry.table_bucket).await? else {
                 return Ok(false);
             };
@@ -854,6 +1044,26 @@ where
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(strong_store.table_bucket_names().await? == source_table_bucket_names)
+    }
+
+    async fn object_backed_table_buckets(&self) -> TableCatalogStoreResult<BTreeMap<String, TableBucketEntry>> {
+        let mut table_buckets = BTreeMap::new();
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.table_bucket_entries_prefix())
+            .await?
+            .into_iter()
+            .filter(|object| object.ends_with(TABLE_BUCKET_ENTRY_FILE))
+        {
+            let Some((entry, _)) = self.read_entry::<TableBucketEntry>(self.catalog_bucket(), &object).await? else {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table bucket changed while reading durable strong migration inventory: {object}"
+                )));
+            };
+            validate_table_bucket_entry_object(&self.paths, &object, &entry)?;
+            table_buckets.insert(entry.table_bucket.clone(), entry);
+        }
+        Ok(table_buckets)
     }
 }

@@ -842,6 +842,34 @@ for file in "${disk_logging_files[@]}"; do
   fi
 done
 
+# `set_disks` expands every Disk through Debug, including raw format bytes and
+# the full per-operation metrics ring. Keep it out of the INFO scanner span.
+scanner_disk_skip_pattern='#\[(tracing::)?instrument\([^]]*skip\([^)]*\bset_disks\b[^)]*\)[^]]*\)\][[:space:]]*async fn nsscanner_disk\b'
+if ! rg -U "$scanner_disk_skip_pattern" crates/scanner/src/scanner_io.rs >/dev/null; then
+  echo "❌ logging guardrail violation: nsscanner_disk must skip set_disks in its tracing instrumentation" >&2
+  exit 1
+fi
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks))]\nasync fn nsscanner_disk('; do
+  if ! printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: safe nsscanner_disk span was rejected" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
+for fixture in \
+  $'#[tracing::instrument(skip(self, budget, updates, cache))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache), fields(set_disks = set_disks.len()))]\nasync fn nsscanner_disk(' \
+  $'#[tracing::instrument(skip(self, budget, updates, cache, set_disks_count))]\nasync fn nsscanner_disk('; do
+  if printf '%s\n' "$fixture" | rg -U "$scanner_disk_skip_pattern" >/dev/null; then
+    echo "❌ logging guardrail self-test failed: unsafe nsscanner_disk span was accepted" >&2
+    echo "$fixture" >&2
+    exit 1
+  fi
+done
+
 # `forbidden_patterns` above only retires log lines that already shipped, so a
 # newly written sentence-style log passes every check in this script — which is
 # how one reaches review in the first place (PR #5822 added
@@ -956,10 +984,13 @@ trace_hot_spans=(
   "crates/ecstore/src/store/object.rs:handle_get_object_info"
   "crates/ecstore/src/set_disk/ops/object.rs:get_object_info"
   "crates/ecstore/src/store/mod.rs:list_objects_v2"
-  "crates/ecstore/src/store/list.rs:handle_list_objects_v2"
+  # The ECStore handle_list_objects_v2 forwarder was folded into the trait impl
+  # above, so store/mod.rs now carries this hot path's TRACE requirement
+  # directly (backlog#1821).
   "crates/ecstore/src/core/sets.rs:list_objects_v2"
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
+  "rustfs/src/app/object_usecase.rs:execute_get_object"
 )
 
 for hot_span in "${trace_hot_spans[@]}"; do

@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::auth::get_condition_values;
+use crate::server::RemoteAddr;
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
-use s3s::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Result, s3_error};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -188,6 +189,25 @@ pub async fn validate_admin_request_with_bucket_object(
     evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
 }
 
+pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<S: Store>(
+    iam_store: Arc<IamSys<S>>,
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    action: Action,
+    remote_addr: Option<std::net::SocketAddr>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<()> {
+    let ctx = AuthContext {
+        headers,
+        cred,
+        is_owner,
+        deny_only: false,
+        remote_addr,
+    };
+    evaluate_admin_actions(iam_store, &ctx, &[action], resource.bucket, resource.object).await
+}
+
 /// Admin gate for KMS endpoints that act on one key.
 ///
 /// `key_id` is the identifier as requested (before any alias resolution), so a
@@ -271,6 +291,25 @@ pub async fn authenticate_request(
     }
 
     result
+}
+
+/// Full admin gate over an `S3Request`: extract the request credentials,
+/// authenticate them ([`authenticate_request`]), then authorize the caller for
+/// `actions` ([`validate_admin_request`], allowing on the first permitted
+/// action). Returns the authenticated credentials for handlers that need the
+/// caller identity. `deny_only` stays `false`: every caller performs a full
+/// allow check.
+pub async fn authorize_admin_request(req: &S3Request<Body>, actions: Vec<Action>) -> S3Result<Credentials> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(InvalidRequest, "get cred failed"));
+    };
+
+    let (cred, owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
+
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    validate_admin_request(&req.headers, &cred, owner, false, actions, remote_addr).await?;
+
+    Ok(cred)
 }
 
 #[cfg(test)]
@@ -549,6 +588,30 @@ mod tests {
 
         let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
         assert_access_denied(res);
+    }
+
+    /// The shared admin gate rejects a request carrying no credentials before
+    /// authentication or IAM is consulted, with the exact error the folded
+    /// per-handler wrappers produced (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn authorize_admin_request_without_credentials_is_rejected() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: http::Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v3/list-jobs"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize_admin_request(&req, vec![admin_action()])
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("get cred failed"));
     }
 
     /// KMS scoping rides the object slot with an empty bucket, matching the

@@ -61,17 +61,17 @@ catalog extension.
 
 | Area | Status | Covered behavior |
 |---|---|---|
-| Catalog config | Supported | `GET /v1/config` advertises RustFS catalog defaults and route capabilities. |
+| Catalog config | Supported | `GET /v1/config` advertises RustFS catalog defaults and only the supported OpenAPI REST paths in `endpoints`. RustFS administration, maintenance, migration, diagnostics, refs, and metadata-location extensions remain available but are not presented as standard Iceberg REST endpoints. |
 | Table bucket discovery | Supported | `PUT` and `GET /v1/buckets/{warehouse}` enable and inspect table bucket state. |
 | Namespaces | Supported | Create, list, load, existence check, and drop namespace routes are registered on both catalog prefixes. List responses support Iceberg REST `pageSize`/`pageToken` pagination with context-bound tokens and bounded catalog-store reads. Namespace identifiers are limited to 512 ASCII characters so persisted paths and stateless continuation tokens remain bounded. |
-| Tables | Supported | Create, register, list, load, existence check, commit, metadata-location get/update, and drop table routes are registered on both catalog prefixes. Table and view listings support Iceberg REST `pageSize`/`pageToken` pagination with context-bound tokens and bounded catalog-store reads. |
-| Commit CAS | Supported | Single-table commits validate base metadata, expected version token, referenced object existence, warehouse scope, and Iceberg commit requirements before advancing the current metadata pointer. |
+| Tables | Supported | Create, register, list, load, existence check, commit, metadata-location get/update, and drop table routes are registered on both catalog prefixes. Table and view listings support Iceberg REST `pageSize`/`pageToken` pagination with context-bound tokens and bounded catalog-store reads. Commit identifiers must match the URL resource; unknown requirements, updates, and snapshot operations fail as bad requests; staged create, register overwrite, purge-on-drop, and v3-only encryption-key updates return an explicit unsupported-operation response. Standard statistics, partition statistics, and schema/spec cleanup updates are accepted. |
+| Commit CAS | Supported | Single-table commits validate base metadata, expected version token, referenced object existence, warehouse scope, and Iceberg commit requirements before advancing the current metadata pointer. Externally supplied metadata transitions preserve monotonic column, partition, and sequence assignment watermarks and immutable definitions for retained schemas, partition specs, sort orders, and snapshots. Standard commits preserve the normal commit-token file name and use an immutable-table-scoped fallback when rename followed by source-name reuse would otherwise collide at the same generation and commit ID. The catalog does not advertise `idempotency-key-lifetime`; clients must treat standard mutation-wide `Idempotency-Key` semantics as unsupported. |
 | Commit recovery | Supported | Commit log, idempotency lookup, diagnostics, and recovery routes expose staged/finalization gaps and repair safe idempotency gaps without moving the table pointer. |
 | Snapshot refs | Supported | Refs can be listed, created or replaced, and deleted through catalog commits. `main` is protected and refs with explicit retention require forced delete. |
-| Iceberg views | Supported | Basic create, list, load, replace, existence check, and drop routes persist view metadata with view-scoped authorization. |
-| Table credentials endpoint | Supported | Returns an empty `storage-credentials` list by default. Returns table-scoped temporary credentials only when credential vending is enabled. |
+| Iceberg views | Supported | Basic create, list, load, replace, existence check, and drop routes persist view metadata with view-scoped authorization. Replace identifiers must match the URL resource, `schema-id: -1` resolves to the last added schema, one commit timestamp is used consistently, and only Iceberg view format version 1 is accepted. |
+| Table credentials endpoint | Supported | Returns an empty `storage-credentials` list by default. Returns table-scoped temporary credentials only when credential vending is enabled. Credential responses set `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Expires: 0`. |
 | Catalog diagnostics and export | Supported | Exposes recovery state, consistency state, backing manifest, recoverable commit-log WAL state, strong backing migration target, single-active-writer policy, and scale validation matrix. |
-| Catalog import and rollback | Supported | Import/register and rollback use catalog validation and commit paths rather than direct pointer mutation. |
+| Catalog import and rollback | Supported | Import/register and online rollback use catalog validation and commit paths rather than direct pointer mutation. Online rollback accepts only a forward-safe metadata target that preserves assignment watermarks and retained definitions. Restoring an older target that lowers those watermarks is an offline disaster-recovery operation and requires every writer to be stopped. |
 | External catalog bridge | Supported operator path | Operator-supplied metadata pointer sync/import is supported for external catalog identity boundaries. Online vendor SDK polling and policy mirroring are not claimed. |
 | Multi-table transactions | Not claimed | RustFS currently claims single-table commit atomicity only. |
 
@@ -92,6 +92,7 @@ catalog extension.
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the table pointer. |
 | Metadata cleanup delete | Supported | Deletes only candidates that pass the safety window and current-pointer checks. |
+| Ordinary bucket lifecycle expiry | Disabled for table buckets | Table bucket objects are excluded from ordinary lifecycle expiration, including already queued expiry work. Snapshot expiration and orphan cleanup remain catalog maintenance operations so referenced Iceberg files cannot be deleted outside publication fencing. |
 | Snapshot expiration planning | Supported | Produces expiration plans with retained and candidate snapshots. |
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
@@ -112,14 +113,16 @@ catalog extension.
 |---|---|---|
 | Single-table CAS | Supported | The table pointer advances only through expected-token and expected-metadata-location validation. |
 | Idempotent retry | Supported | Repeated commit IDs can return the already finalized result or surface recoverable finalization gaps. |
+| Commit publication fencing | Supported with rolling-upgrade gate | Existing deployments retain exact object guards so older writers cannot mutate referenced files during publication. Set `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` only after every serving node supports table and table-bucket publication fences. In scalable mode, active table warehouse prefixes must not overlap, ordinary lifecycle expiry remains disabled for table buckets, and first enablement, first publication, drop, and warehouse relocation are serialized by the table-bucket fence. |
 | Post-CAS finalization recovery | Supported | Diagnostics and recovery can repair stale or missing idempotency indexes without changing the current table pointer. |
 | Catalog export | Supported | Exposes table state, commit recovery state, and backing migration information for operator inspection. |
-| Strong backing state transfer | Supported | Object-backed table bucket, namespace, table, view, commit-log, and idempotency state can be materialized into the durable strong snapshot. The transfer is deterministic, ETag-CAS protected, idempotent after an interrupted finalization, and fails closed when a table or view has no owning namespace entry. |
-| Durable backing migration preflight | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, recovery blockers, warehouse prefix index readiness, persistent write-fence state, target snapshot agreement, and whether every table bucket is ready for cutover. |
-| Durable backing migration execution | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/migration` fences table-bucket registry changes, acquires a persistent per-bucket write fence, drains in-flight catalog mutations, materializes the target snapshot, and reports `ready_to_enable_durable_strong`. `DELETE` safely releases the bucket fence only while its target state has not advanced, and releases the registry fence after the last bucket is cancelled. Both mutations require `admin:MigrateTableCatalog`. |
+| Strong backing state transfer | Supported | Object-backed table bucket, namespace, table, view, commit-log, and idempotency state can be materialized into the durable strong snapshot. The transfer is deterministic, ETag-CAS protected, idempotent after an interrupted finalization, validates candidate state through the restart decoder before publication, preserves resource-backed implicit namespaces, and fails closed when an inactive explicit namespace conflicts with active descendants or resources. Snapshot hydration requires a stable non-empty ETag, caps the encoded snapshot at 64 MiB, shares state and reload serialization across requests in one server context, and rejects disappearance or format-version rollback after observation. Configured durable-strong mode rejects a missing snapshot on its first catalog access after startup; only object-backed migration may initialize an empty target. |
+| Durable backing migration preflight | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, recovery blockers, warehouse prefix index readiness, active table/view identifier collisions, persistent write-fence state, target snapshot agreement, and whether every table bucket is ready for cutover. |
+| Durable backing migration execution | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/migration` fences table-bucket registry changes, acquires a persistent per-bucket write fence, records whether a global strong snapshot existed before publication, drains in-flight catalog mutations, materializes the target snapshot, and reports `ready_to_enable_durable_strong`. Retries and `DELETE` may restore a known-absent initial target after an ambiguous first write, but fail closed if a previously existing or materialized global snapshot disappears. `DELETE` releases the bucket fence only while its target state has not advanced, and releases the registry fence after the last bucket is cancelled. Both mutations require `admin:MigrateTableCatalog`. |
+| Strong snapshot rolling compatibility | Supported | Durable strong control-plane reads snapshot versions 1 and 2, writes version 1 by default, and writes version 2 only after both the requested and fleet-confirmed gates are enabled. A running process rejects any lower-format snapshot after observing a higher format. Once version 2 is fleet-confirmed, table data-plane resolution fails closed until the persisted snapshot is version 2; a missing table-bucket entry also fails closed instead of bypassing table-aware authorization. |
 | Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal` generates an operator runbook covering catalog export, diagnostics, safe recovery repair, rollback/import, durable backing migration dry-run, post-recovery loadTable, and table data-plane policy probes. |
 | Scale and fault rehearsal | Manual/live harness | `failure_coverage.py --print-scale-fault-rehearsal` generates an opt-in runbook for concurrent writer stress, maintenance scheduler lease recovery, durable backing cutover preflight, recovery/rollback/import under load, and post-run evidence capture. |
-| Strong KV/WAL backing cutover | Preview / controlled | Operators can select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` only after every table bucket reports `SNAPSHOT_MATERIALIZED` and `ready_to_enable_durable_strong: true`. Object-only advanced operations fail closed in durable strong mode. |
+| Durable strong snapshot backing cutover | Preview / controlled | Operators can select the ETag-CAS snapshot backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` only after every table bucket reports `SNAPSHOT_MATERIALIZED` and `ready_to_enable_durable_strong: true`. This mode does not claim a separate external KV/WAL service, and object-only advanced operations fail closed. Version 1 backing manifests retain the legacy `STRONG_KV_WAL` and `CUT_OVER_LINEARIZABLE_READS` wire labels for client compatibility; those labels do not expand the implementation claim. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple active regions. |
 
@@ -134,23 +137,60 @@ warehouse:
    `GetTableCatalogAction` on each table bucket. Treat every `blockers` entry as
    fail-closed; repair commit recovery state and backfill the warehouse prefix
    index before continuing.
-3. Run `POST /iceberg/v1/{warehouse}/catalog/migration` with
-   `admin:MigrateTableCatalog`. This persists the source write fence before it
-   drains in-flight mutations and copies the catalog state.
-4. Repeat the preflight and materialization for every table bucket. Do not set
+3. Before the migration `POST`, drain every catalog writer that predates the
+   durable-backing migration fence and restart it on a fence-aware release. An
+   older writer does not recognize the persisted fence and can otherwise
+   mutate the object-backed source after the snapshot inventory is captured.
+   Keep all catalog writers on the fence-aware release until cutover completes.
+4. Inventory object-only advanced operations, including maintenance workers,
+   catalog recovery, export, diagnostics, and external catalog bridge writes.
+   Quiesce mutating operations before cutover and confirm that each required
+   operation is supported by durable-strong mode; unsupported operations fail
+   closed after cutover rather than continuing against object-backed state.
+5. Run `POST /iceberg/v1/{warehouse}/catalog/migration` with
+   `admin:MigrateTableCatalog`. This acquires the exclusive migration fence to
+   drain in-flight fence-aware mutations, persists the source fence while
+   exclusivity is held, and then copies the catalog state.
+6. Repeat the preflight and materialization for every table bucket. Do not set
    `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` until the preflight reports
    `SNAPSHOT_MATERIALIZED`, no blockers, and
    `ready_to_enable_durable_strong: true`.
-5. Restart with durable strong backing enabled, then verify catalog config,
+7. Restart with durable strong backing enabled, then verify catalog config,
    table and view loads, commit idempotency, and table data-plane policy
    resolution before admitting writers.
-6. Before restarting into durable-strong mode, `DELETE` on the migration
+8. Before restarting into durable-strong mode, `DELETE` on the migration
    endpoint can remove a migration-created target bucket snapshot and release
    the source fence. After the durable-strong state advances, cancellation
    fails closed; recovery requires an operator-selected restore or reverse
    migration instead of restarting against the stale object-backed pointer.
-7. Preserve the object-backed catalog backup until durable strong backing has
+9. Preserve the object-backed catalog backup until durable strong backing has
    passed the operator's retention window.
+10. Keep strong snapshot writes on version 1 during a rolling binary upgrade.
+   After every catalog writer can read version 2, set both
+   `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2=true` and
+   `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED=true`, then restart
+   the catalog writers. Perform a controlled catalog write or migration
+   materialization and confirm that the persisted snapshot is version 2 before
+   serving table data-plane traffic. Setting only one gate does not change the
+   write format.
+11. After any version 2 snapshot is persisted, do not roll catalog writers back
+   to a binary that only reads version 1. Current binaries preserve version 2
+   even when the gates are later disabled. A running process rejects restored
+   version 1 content after observing version 2, but cannot distinguish an older
+   snapshot with the same format version from a deliberate restore. The format
+   high-water mark is process-local: restoring any older snapshot and restarting
+   every writer is a privileged disaster-recovery rollback that cannot be
+   inferred from the restored object alone. Recovery must restore a compatible
+   binary and a snapshot selected through the operator recovery procedure.
+12. Migration preflight rejects an active table/view identifier collision before
+    it writes a migration fence. A pre-existing version 1 strong snapshot with
+    such a collision is loaded in cleanup-only quarantine. Ambiguous reads fail
+    closed; each cleanup mutation must reduce the collision set, and unrelated
+    writes remain blocked until all collisions are removed. Drain catalog
+    writers that predate cleanup quarantine before starting this repair, and
+    complete cleanup before the first version 2 write. Restoring any version 1
+    snapshot after a writer has observed version 2 fails closed instead of
+    replacing the in-process catalog state.
 
 ## Production Failure Coverage
 

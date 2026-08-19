@@ -53,16 +53,4 @@ mod tests {
 
         assert!(!token.is_empty());
     }
-
-    // #[test]
-    // fn test_extract_claims() {
-    //     let claims = Claims {
-    //         sub: "user1".to_string(),
-    //         company: "example".to_string(),
-    //     };
-    //     let secret = "my_secret";
-    //     let token = generate_jwt(&claims, secret).unwrap();
-    //     let decoded_claims = extract_claims::<Claims>(&token, secret).unwrap();
-    //     assert_eq!(decoded_claims.claims, claims);
-    // }
 }

@@ -21,6 +21,8 @@
 //! These drive the REAL `ECStoreHealStorage` + `ECStore` against real disks.
 //! Every test is `#[serial]`; under `cargo nextest` each runs in its own process.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::storage::{
@@ -164,7 +166,7 @@ async fn enumerate_b5(heal_storage: &Arc<ECStoreHealStorage>, bucket: &str) -> V
     let mut token: Option<String> = None;
     loop {
         let (page, next, truncated) = heal_storage
-            .list_objects_for_heal_page(bucket, "", token.as_deref())
+            .list_objects_for_heal_page(bucket, "", token.as_deref(), false)
             .await
             .expect("b5 list page failed");
         items.extend(page);
@@ -185,7 +187,7 @@ async fn enumerate_disk_walk(heal_storage: &Arc<ECStoreHealStorage>, bucket: &st
     let mut token: Option<String> = None;
     loop {
         let (page, next, truncated) = heal_storage
-            .list_versions_for_heal_page_disk_walk(SET_DISK_ID, bucket, "", token.as_deref())
+            .list_versions_for_heal_page_disk_walk(SET_DISK_ID, bucket, "", token.as_deref(), false)
             .await
             .expect("disk-walk list page failed");
         items.extend(page);
@@ -416,7 +418,7 @@ mod serial_tests {
         let mut pages = 0usize;
         loop {
             let (versions, next_forward, truncated) = ecstore
-                .heal_walk_versions_page(0, 0, bucket, "", forward.as_deref(), 2, 100_000)
+                .heal_walk_versions_page(0, 0, bucket, "", forward.as_deref(), 2, 100_000, false)
                 .await
                 .expect("heal_walk_versions_page failed");
             pages += 1;

@@ -144,7 +144,6 @@ impl ContainerMapper {
     /// - S3 bucket name compatible (only uses [a-z0-9-])
     /// - Deterministic mapping (same input always produces same bucket name)
     /// - Fixed-length prefix (16 hex chars = 8 bytes)
-    #[allow(dead_code)] // Used in: create/delete container operations
     pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
         if self.config.tenant_prefix_enabled {
             let hash = self.hash_project_id(project_id);
@@ -216,7 +215,6 @@ pub fn bucket_info_to_container(info: &BucketInfo, mapper: &ContainerMapper, pro
 /// 2. Lists all S3 buckets
 /// 3. Filters to buckets belonging to this tenant (using tenant prefix)
 /// 4. Converts BucketInfo to Swift Container format
-#[allow(dead_code)] // Used by handler: list containers
 pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftResult<Vec<Container>> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -279,7 +277,6 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
 /// - Returns 201 Created on success
 /// - Returns 202 Accepted if container already exists
 /// - Returns 400 Bad Request for invalid container names
-#[allow(dead_code)] // Used by handler
 pub async fn create_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<bool> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -348,7 +345,6 @@ fn validate_container_name(container: &str) -> SwiftResult<()> {
 }
 
 /// Container metadata for HEAD response
-#[allow(dead_code)] // TODO: Remove once Swift API integration is complete
 #[derive(Debug, Clone)]
 pub struct ContainerMetadata {
     /// Number of objects in container
@@ -411,7 +407,6 @@ pub(crate) async fn get_container_custom_metadata(
 /// - HEAD /v1/{account}/{container} returns container metadata
 /// - Returns 204 No Content on success with headers
 /// - Returns 404 Not Found if container doesn't exist
-#[allow(dead_code)] // Used by handler
 pub async fn get_container_metadata(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<ContainerMetadata> {
     let (bucket_name, bucket_info, custom_metadata) = get_container_metadata_base(account, container, credentials).await?;
 
@@ -448,7 +443,6 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
 /// - The update is additive: items the request does not name keep their stored
 ///   value, and removal is explicit, via `X-Remove-Container-Meta-{name}` or an
 ///   empty value
-#[allow(dead_code)] // Used by handler
 pub async fn update_container_metadata(
     account: &str,
     container: &str,
@@ -520,7 +514,6 @@ pub async fn update_container_metadata(
 /// - Returns 204 No Content on success
 /// - Returns 404 Not Found if container doesn't exist
 /// - Returns 409 Conflict if container is not empty
-#[allow(dead_code)] // Used by handler
 pub async fn delete_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -603,7 +596,6 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
 /// - Account validation fails
 /// - Container doesn't exist
 /// - Storage layer errors occur
-#[allow(dead_code)] // Handler integration: GET container
 pub async fn list_objects(
     account: &str,
     container: &str,
@@ -706,7 +698,6 @@ pub async fn list_objects(
 /// Versioning configuration is stored as an S3 bucket tag:
 /// - Tag key: `swift-versions-location`
 /// - Tag value: archive container name
-#[allow(dead_code)] // Used by handler
 pub async fn enable_versioning(
     account: &str,
     container: &str,
@@ -795,7 +786,6 @@ pub async fn enable_versioning(
 /// * `account` - Account identifier
 /// * `container` - Container name to disable versioning on
 /// * `credentials` - Keystone credentials
-#[allow(dead_code)] // Used by handler
 pub async fn disable_versioning(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Validate account access
     let project_id = validate_account_access(account, credentials)?;
@@ -855,7 +845,6 @@ pub async fn disable_versioning(account: &str, container: &str, credentials: &Cr
 /// # Returns
 /// - Some(archive_container_name) if versioning is enabled
 /// - None if versioning is not enabled
-#[allow(dead_code)] // Used by handler and object.rs
 pub async fn get_versions_location(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<Option<String>> {
     // Validate account access
     let project_id = validate_account_access(account, credentials)?;
@@ -918,7 +907,6 @@ pub async fn get_versions_location(account: &str, container: &str, credentials: 
 ///     &credentials
 /// ).await?;
 /// ```
-#[allow(dead_code)] // Used by handler
 pub async fn set_container_acl(
     account: &str,
     container: &str,
@@ -1022,7 +1010,6 @@ pub async fn set_container_acl(
 ///     println!("Container is publicly readable");
 /// }
 /// ```
-#[allow(dead_code)] // Used by handler
 pub async fn get_container_acl(
     account: &str,
     container: &str,
@@ -1083,7 +1070,6 @@ pub async fn get_container_acl(
 ///
 /// # Returns
 /// Ok(()) if ACLs were deleted successfully
-#[allow(dead_code)] // Used by handler
 pub async fn delete_container_acl(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Setting both ACLs to None removes them
     set_container_acl(account, container, None, None, credentials).await

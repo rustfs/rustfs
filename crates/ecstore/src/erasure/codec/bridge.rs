@@ -26,6 +26,7 @@ pub(crate) const GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE: &str = "skip_data_c
 pub(crate) const GET_RECONSTRUCT_OUTCOME_SKIP_EMPTY_PAYLOAD: &str = "skip_empty_payload";
 
 pub(crate) trait DecodeWorkspace: Send + Sync + 'static {
+    #[allow(dead_code, reason = "workspace width asserted by decode_reader tests (backlog#1823)")]
     fn shard_len(&self) -> usize;
 }
 
@@ -33,11 +34,14 @@ pub(crate) trait ErasureDecodeEngine: Send + Sync + 'static {
     type Workspace: DecodeWorkspace;
 
     fn data_shards(&self) -> usize;
+    #[allow(dead_code, reason = "engine trait facet asserted by decode_reader tests (backlog#1823)")]
     fn parity_shards(&self) -> usize;
     fn block_size(&self) -> usize;
     fn engine_name(&self) -> &'static str;
 
+    #[allow(dead_code, reason = "engine trait facet asserted by decode_reader tests (backlog#1823)")]
     fn supports_progressive_decode(&self) -> bool;
+    #[allow(dead_code, reason = "engine trait facet asserted by decode_reader tests (backlog#1823)")]
     fn supports_aligned_shards(&self) -> bool;
 
     fn prepare_workspace(&self, shard_len: usize) -> io::Result<Self::Workspace>;

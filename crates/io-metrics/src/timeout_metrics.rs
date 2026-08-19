@@ -114,39 +114,46 @@ impl TimeoutMetricsSummary {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
     #[test]
-    fn test_record_timeout_event() {
-        record_timeout_event("get_object");
-        record_timeout_event("put_object");
-    }
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_timeout_event("get_object");
+            record_timeout_event("put_object");
+            record_operation_duration("get_object", Duration::from_millis(100));
+            record_operation_duration("put_object", Duration::from_millis(500));
+            record_dynamic_timeout(1024 * 1024, Duration::from_secs(10));
+            record_dynamic_timeout(100 * 1024 * 1024, Duration::from_secs(30));
+            record_operation_progress("get_object", 50.0);
+            record_operation_progress("get_object", 100.0);
+            record_stalled_operation("get_object");
+            record_operation_completion("get_object", true);
+            record_operation_completion("get_object", false);
+        });
 
-    #[test]
-    fn test_record_operation_duration() {
-        record_operation_duration("get_object", Duration::from_millis(100));
-        record_operation_duration("put_object", Duration::from_millis(500));
-    }
-
-    #[test]
-    fn test_record_dynamic_timeout() {
-        record_dynamic_timeout(1024 * 1024, Duration::from_secs(10));
-        record_dynamic_timeout(100 * 1024 * 1024, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn test_record_operation_progress() {
-        record_operation_progress("get_object", 50.0);
-        record_operation_progress("get_object", 100.0);
-    }
-
-    #[test]
-    fn test_record_stalled_operation() {
-        record_stalled_operation("get_object");
-    }
-
-    #[test]
-    fn test_record_operation_completion() {
-        record_operation_completion("get_object", true);
-        record_operation_completion("get_object", false);
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_io_timeout_events_total",
+            "rustfs_io_operation_duration_seconds",
+            "rustfs_timeout_dynamic_size",
+            "rustfs_timeout_dynamic_secs",
+            "rustfs_timeout_dynamic_size_histogram",
+            "rustfs_operation_progress",
+            "rustfs_operation_stalled",
+            "rustfs_operation_completions",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
     }
 
     #[test]

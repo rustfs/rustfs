@@ -224,6 +224,13 @@ pub struct HealOpts {
 pub enum HealAdmissionDropReason {
     QueueFull,
     PolicyDropped,
+    /// HS-06: an admin heal start overlaps (same bucket with mutually
+    /// containing prefixes, or the same erasure set) an already running or
+    /// queued task. Only produced when RUSTFS_HEAL_OVERLAP_POLICY=minio_error.
+    AlreadyRunning,
+    /// HS-06: same as [`Self::AlreadyRunning`] but for paths that merely
+    /// contain (or are contained by) the active task's path.
+    OverlappingPaths,
 }
 
 impl HealAdmissionDropReason {
@@ -231,6 +238,8 @@ impl HealAdmissionDropReason {
         match self {
             Self::QueueFull => "queue_full",
             Self::PolicyDropped => "policy_dropped",
+            Self::AlreadyRunning => "already_running",
+            Self::OverlappingPaths => "overlapping_paths",
         }
     }
 }
@@ -287,6 +296,9 @@ pub enum HealRequestSource {
     Scanner,
     AutoHeal,
     ReadRepair,
+    /// Mission Repair Feed: intents delivered by error paths and replayed
+    /// from the durable MRF journal.
+    Mrf,
 }
 
 impl HealRequestSource {
@@ -297,6 +309,7 @@ impl HealRequestSource {
             Self::Scanner => "scanner",
             Self::AutoHeal => "auto_heal",
             Self::ReadRepair => "read_repair",
+            Self::Mrf => "mrf",
         }
     }
 }
@@ -313,6 +326,9 @@ pub enum HealChannelCommand {
     Query {
         heal_path: String,
         client_token: String,
+        /// Incremental result cursor (HS-06): only items with a sequence
+        /// greater than this are returned; `None` keeps the full snapshot.
+        since_seq: Option<u64>,
         response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
     },
     /// Cancel heal task
@@ -518,10 +534,21 @@ async fn receive_heal_channel_response(
 
 /// Send heal query request
 pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    query_heal_status_since(heal_path, client_token, None).await
+}
+
+/// Incremental heal query (HS-06): pass the client's last seen sequence
+/// number to receive only newer result items.
+pub async fn query_heal_status_since(
+    heal_path: String,
+    client_token: String,
+    since_seq: Option<u64>,
+) -> Result<HealChannelResponse, String> {
     let (response_tx, response_rx) = oneshot::channel();
     send_heal_command(HealChannelCommand::Query {
         heal_path,
         client_token,
+        since_seq,
         response_tx,
     })
     .await?;

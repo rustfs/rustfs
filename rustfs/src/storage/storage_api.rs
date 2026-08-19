@@ -109,15 +109,15 @@ pub(crate) use super::sse::{
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header, load_bucket_generation_from_store,
-        log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, recursive_force_delete_is_authorized,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+        recursive_force_delete_is_authorized, replication_request_authorized, req_info_mut, req_info_ref,
     };
 }
 
 pub(crate) mod concurrency_consumer {
     pub(crate) use super::super::concurrency::{
-        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard,
+        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectAdmission, PutObjectGuard,
         get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
@@ -185,8 +185,9 @@ pub(crate) mod options_consumer {
         copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
         extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
         get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
-        namespace_reserved_user_metadata, normalize_content_encoding_for_storage, parse_copy_source_range,
-        preserve_unclassified_user_metadata, put_opts_with_replication_authorization, validate_archive_content_encoding,
+        has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        parse_copy_source_range, preserve_unclassified_user_metadata, put_opts_with_replication_authorization,
+        validate_archive_content_encoding,
     };
 
     pub(crate) mod contract {
@@ -203,7 +204,9 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod request_context_consumer {
-    pub(crate) use super::super::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
+    pub(crate) use super::super::request_context::{
+        RequestContext, extract_request_id_from_headers, spawn_traced, spawn_traced_join,
+    };
 }
 
 pub(crate) mod rpc_consumer {
@@ -407,7 +410,9 @@ pub(crate) mod ecstore_client {
 }
 
 pub(crate) mod ecstore_compression {
-    pub(crate) use rustfs_ecstore::api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub(crate) use rustfs_ecstore::api::compression::{
+        MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_multipart_disk_compression_enabled,
+    };
 }
 
 pub(crate) mod ecstore_cluster {
@@ -428,14 +433,15 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_data_usage_from_backend, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+        load_data_usage_from_backend, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
         record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached, store_data_usage_in_backend,
+        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached,
+        seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 }
 
@@ -484,8 +490,12 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
-        NotificationSys, get_global_notification_sys, new_global_notification_sys, start_remote_version_state_fleet_probe,
+        CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
     };
 }
 
@@ -543,6 +553,11 @@ pub(crate) mod ecstore_test_support {
 }
 
 pub(crate) mod ecstore_set_disk {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+        fail_next_quota_ledger_save_for_test,
+    };
     pub(crate) use rustfs_ecstore::api::set_disk::{
         DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,
     };
@@ -553,6 +568,10 @@ pub(crate) mod ecstore_set_disk {
 pub(crate) mod ecstore_erasure {
     pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
 }
+
+/// Startup bitrot algorithm self-test (rustfs/backlog#1873), re-exported for
+/// the root facade's background-startup section.
+pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
@@ -790,6 +809,10 @@ impl StorageReplicationStatsHandle {
             proxy_head_failed: metrics.proxied.head_failed,
             proxy_put_tag_total: metrics.proxied.put_tag_total,
             proxy_put_tag_failed: metrics.proxied.put_tag_failed,
+            proxy_get_tag_total: metrics.proxied.get_tag_total,
+            proxy_get_tag_failed: metrics.proxied.get_tag_failed,
+            proxy_delete_tag_total: metrics.proxied.delete_tag_total,
+            proxy_delete_tag_failed: metrics.proxied.delete_tag_failed,
             replica_size: metrics.replica_size,
             replica_count: metrics.replica_count,
         }
@@ -826,6 +849,10 @@ pub(crate) struct ReplicationSiteMetricsSnapshot {
     pub(crate) proxy_head_failed: i64,
     pub(crate) proxy_put_tag_total: i64,
     pub(crate) proxy_put_tag_failed: i64,
+    pub(crate) proxy_get_tag_total: i64,
+    pub(crate) proxy_get_tag_failed: i64,
+    pub(crate) proxy_delete_tag_total: i64,
+    pub(crate) proxy_delete_tag_failed: i64,
     pub(crate) replica_size: i64,
     pub(crate) replica_count: i64,
 }
@@ -1034,6 +1061,10 @@ pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec
     ecstore_config::com::save_config_no_lock(api, file, data).await
 }
 
+pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<()> {
+    ecstore_config::com::delete_config_no_lock(api, file).await
+}
+
 pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -1123,7 +1154,9 @@ pub(crate) trait StorageDiskRpcExt {
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo>;
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
@@ -1132,7 +1165,7 @@ pub(crate) trait StorageDiskRpcExt {
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
@@ -1251,8 +1284,16 @@ where
         ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
     }
 
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::acquire_snapshot_lease(self, volume, path).await
+    }
+
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()> {
         ecstore_disk::DiskAPI::release_snapshot_lease(self, volume, path, token).await
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken> {
+        ecstore_disk::DiskAPI::renew_snapshot_lease(self, volume, path, token).await
     }
 
     async fn stat_volume(&self, volume: &str) -> DiskResult<VolumeInfo> {
@@ -1275,11 +1316,11 @@ where
         &self,
         src_volume: &str,
         src_path: &str,
-        file_info: rustfs_filemeta::FileInfo,
+        file_info: &rustfs_filemeta::FileInfo,
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info, dst_volume, dst_path).await
+        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
@@ -1444,10 +1485,6 @@ pub(crate) async fn get_bucket_accelerate_config(
     ecstore_bucket::metadata_sys::get_accelerate_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_policy_raw(bucket: &str) -> Result<(String, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_bucket_policy_raw(bucket).await
-}
-
 pub(crate) async fn get_bucket_cors_config(bucket: &str) -> Result<(s3s::dto::CORSConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_cors_config(bucket).await
 }
@@ -1460,18 +1497,6 @@ pub(crate) async fn get_bucket_object_lock_config(
     bucket: &str,
 ) -> Result<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
     ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
-}
-
-pub(crate) async fn get_public_access_block_config(
-    bucket: &str,
-) -> Result<(s3s::dto::PublicAccessBlockConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_public_access_block_config(bucket).await
-}
-
-pub(crate) async fn get_bucket_replication_config(
-    bucket: &str,
-) -> Result<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_replication_config(bucket).await
 }
 
 pub(crate) async fn persist_force_delete_intent(
@@ -1817,18 +1842,6 @@ pub(crate) async fn all_local_disk_path() -> Vec<String> {
 
 pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     ecstore_storage::find_local_disk_by_ref(disk_ref).await
-}
-
-pub(crate) trait StorageReplicationConfigExt {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
-}
-
-impl StorageReplicationConfigExt for s3s::dto::ReplicationConfiguration {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_active_rules(
-            self, prefix, recursive,
-        )
-    }
 }
 
 pub(crate) trait StorageVersioningConfigExt {

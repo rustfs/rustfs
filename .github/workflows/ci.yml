@@ -152,6 +152,9 @@ jobs:
       - name: Check s3s footprint ratchet
         run: ./scripts/check_s3s_footprint.sh
 
+      - name: Check cryptographic capability wording
+        run: ./scripts/check_fips_wording.sh
+
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
 
@@ -533,7 +536,12 @@ jobs:
 
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
+    # default build, so this full-suite lane runs only on the weekly schedule
+    # and manual dispatch. Per-PR cfg-seam coverage stays with
+    # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
+    # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 30
@@ -824,6 +832,9 @@ jobs:
 
   e2e-tests-rio-v2:
     name: End-to-End Tests (rio-v2)
+    # Inherits the schedule/dispatch-only gate through needs: on every other
+    # event build-rustfs-debug-binary-rio-v2 is skipped, so this job skips
+    # with it (see the dormant-variant comment on that job).
     needs: [ build-rustfs-debug-binary-rio-v2 ]
     runs-on: sm-standard-2
     timeout-minutes: 30

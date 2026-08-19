@@ -331,6 +331,10 @@ where
     persist_tier_delete_journal_entry(api, &committed).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn abort_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
     S: ObjectOperations<

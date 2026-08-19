@@ -69,6 +69,7 @@ fn build_non_inline_writers(config: &BenchConfig) -> Vec<Option<BitrotWriterWrap
 fn bench_single_block_non_inline_fast_path(c: &mut Criterion) {
     let configs = vec![
         BenchConfig::new(4 * 1024, 4, 2, 128 * 1024),
+        BenchConfig::new(16 * 1024, 4, 2, 128 * 1024),
         BenchConfig::new(64 * 1024, 4, 2, 128 * 1024),
         BenchConfig::new(128 * 1024, 4, 2, 128 * 1024),
     ];
@@ -112,7 +113,12 @@ fn bench_single_block_non_inline_fast_path(c: &mut Criterion) {
                 rt.block_on(async {
                     erasure
                         .clone()
-                        .encode_single_block_non_inline(reader, &mut writers, config.data_shards)
+                        .encode_single_block_non_inline_with_size_hint(
+                            reader,
+                            &mut writers,
+                            config.data_shards,
+                            config.payload_size,
+                        )
                         .await
                         .expect("single block candidate benchmark");
                 });

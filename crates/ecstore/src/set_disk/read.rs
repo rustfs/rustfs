@@ -19,7 +19,7 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
-    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
+    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
     GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
     GET_METADATA_CACHE_REASON_VERSIONED, GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA,
@@ -30,12 +30,12 @@ use crate::diagnostics::get::{
     GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
     GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
     GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
-    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_SETUP_DROP_PENDING,
-    GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM, GET_STAGE_READER_TASK_BITROT_READER_INIT,
-    GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
-    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
+    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, mark_get_object_downstream_closed,
+    record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
@@ -116,9 +116,10 @@ impl SetDisks {
             .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
-    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<Arc<GetObjectMetadataCacheEntry>> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
-            MetadataCacheLookup::Hit(entry) => Some((*entry).clone()),
+            MetadataCacheLookup::Hit(entry) => Some(entry),
             MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
         }
     }
@@ -221,10 +222,10 @@ impl SetDisks {
         let disks = self.disks.read().await.clone();
         let required_reads = self.default_read_quorum();
 
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let version_id = version_id.to_string();
-        let opts = opts.clone();
+        let bucket: Arc<str> = Arc::from(bucket);
+        let object: Arc<str> = Arc::from(object);
+        let version_id: Arc<str> = Arc::from(version_id);
+        let opts = *opts;
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -235,9 +236,9 @@ impl SetDisks {
                     let bucket = bucket.clone();
                     let object = object.clone();
                     let version_id = version_id.clone();
-                    let opts = opts.clone();
+                    let task_opts = opts;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &opts).await }
+                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
                 })
             })
             .collect();
@@ -257,7 +258,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         caller_allows_early_stop: bool,
-    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+    ) -> Result<GetObjectFileInfo> {
         self.get_object_fileinfo_gated(bucket, object, opts, read_data, caller_allows_early_stop)
             .await
     }
@@ -274,7 +275,7 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         allow_early_stop: bool,
-    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+    ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
@@ -300,7 +301,7 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok((cached.fi.clone(), cached.parts_metadata.clone(), cached.online_disks.clone()));
+                    return Ok(GetObjectFileInfo::shared(cached));
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -336,7 +337,7 @@ impl SetDisks {
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
         // core/io_primitives.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
+        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
             &disks,
             "",
             bucket,
@@ -349,7 +350,12 @@ impl SetDisks {
             self.default_parity_count,
         )
         .await?;
-        metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
+            GET_OBJECT_PATH_INTERNAL_META
+        } else {
+            GET_OBJECT_PATH_LEGACY_DUPLEX
+        };
+        metadata_fanout_diagnostics.record(metadata_metrics_path);
         let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
@@ -385,9 +391,18 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (op_online_disks, fi, fileinfo_selection_quorum) =
+        let (op_online_disks, mut fi, fileinfo_selection_quorum) =
             Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)?;
-        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, fileinfo_selection_quorum);
+        let include_part_checksums =
+            opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
+        if include_part_checksums {
+            Self::hydrate_selected_fileinfo_part_checksums(&mut fi)?;
+        } else {
+            for metadata in std::iter::once(&mut fi).chain(parts_metadata.iter_mut()) {
+                rustfs_utils::http::remove_str(&mut metadata.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+            }
+        }
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
         if errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
@@ -418,7 +433,7 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        Ok((fi, parts_metadata, op_online_disks))
+        Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -428,14 +443,15 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, usize, Option<StorageError>) {
-        let fi = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
-            Ok((fi, _, _)) => fi,
+        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
+            Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), 0, Some(e)),
         };
+        let fi = snapshot.fi();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
@@ -467,6 +483,7 @@ impl SetDisks {
     pub(super) async fn try_get_object_direct_data_shards_with_fileinfo(
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
@@ -487,13 +504,7 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
+        let erasure = erasure_cache.get_for_file_info(fi)?;
 
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -621,6 +632,7 @@ impl SetDisks {
         // &self,
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         offset: usize,
         length: i64,
         writer: &mut W,
@@ -715,13 +727,7 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
+        let erasure = erasure_cache.get_for_file_info(&fi)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1071,6 +1077,15 @@ impl SetDisks {
                             "Recoverable decode error triggered read repair"
                         );
                         let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                        // MRF journal intent: keeps a durable Urgent ECDecode
+                        // request alive across restarts even when the in-memory
+                        // read-repair request is dropped or lost (HS-01).
+                        rustfs_common::mrf_channel::try_send_mrf_intent(
+                            rustfs_common::mrf_channel::MrfKind::DecodeFailure,
+                            bucket,
+                            object,
+                            fi.version_id,
+                        );
                         submit_read_repair_heal(
                             bucket,
                             object,
@@ -1155,6 +1170,7 @@ impl SetDisks {
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
+        erasure_cache: Arc<ErasureCache>,
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
@@ -1165,14 +1181,7 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let erasure = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        )
-        .map_err(Error::from)?;
-
+        let erasure = erasure_cache.get_for_file_info(fi)?;
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         if fi.parts.len() == 1 {
@@ -1559,7 +1568,7 @@ struct LazyCodecPartContext {
     fi: FileInfo,
     files: Vec<FileInfo>,
     disks: Vec<Option<DiskStore>>,
-    erasure: coding::Erasure,
+    erasure: Arc<coding::Erasure>,
     skip_verify_bitrot: bool,
     metrics_object_class: &'static str,
     metrics_size_bucket: &'static str,
@@ -1813,6 +1822,9 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
     if opts.part_number.is_some() {
         return Some(GET_METADATA_CACHE_REASON_PART_NUMBER);
     }
+    if opts.include_part_checksums {
+        return Some(GET_METADATA_CACHE_REASON_PART_CHECKSUMS);
+    }
     if opts.data_movement {
         return Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT);
     }
@@ -1824,6 +1836,7 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
         .then_some(GET_METADATA_CACHE_REASON_META_BUCKET)
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
     get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
 }
@@ -2040,6 +2053,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             "bucket",
             "object",
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -2070,6 +2084,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             2,
             1,
             &mut output,
@@ -2093,6 +2108,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             usize::MAX,
             1,
             &mut output,
@@ -2114,6 +2130,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             1,
             1,
             &mut output,
@@ -2137,6 +2154,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -2174,6 +2192,7 @@ mod metadata_cache_tests {
         SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             0,
             &mut output,
@@ -2206,6 +2225,7 @@ mod metadata_cache_tests {
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
+            Arc::new(ErasureCache::new()),
             0,
             1,
             &mut output,
@@ -2485,6 +2505,16 @@ mod metadata_cache_tests {
         );
 
         opts = ObjectOptions {
+            include_part_checksums: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_PART_CHECKSUMS)
+        );
+
+        opts = ObjectOptions {
             data_movement: true,
             ..Default::default()
         };
@@ -2675,6 +2705,31 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    async fn get_object_fileinfo_cache_hit_shares_cached_metadata() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let parts_metadata = vec![fi.clone()];
+        let online_disks = Vec::new();
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
+            .await;
+        let cached = set
+            .cached_get_object_fileinfo("bucket", "object")
+            .await
+            .expect("fresh cache entry should be returned");
+
+        let returned = set
+            .get_object_fileinfo("bucket", "object", &ObjectOptions::default(), true, false)
+            .await
+            .expect("cache-backed metadata lookup should succeed");
+
+        assert!(
+            returned.shared_entry().is_some_and(|value| Arc::ptr_eq(value, &cached)),
+            "cache hits must share the complete metadata snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
         let set = new_metadata_cache_test_set().await;
 
@@ -2729,9 +2784,6 @@ mod metadata_cache_tests {
 
     #[tokio::test]
     async fn get_object_metadata_cache_rejects_stale_entries() {
-        // moka handles TTL expiry automatically via time_to_live(250ms).
-        // This test verifies that entries inserted with the cache API are retrievable
-        // while fresh, and that the cache API works correctly.
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
@@ -2743,6 +2795,14 @@ mod metadata_cache_tests {
             set.cached_get_object_fileinfo("bucket", "object").await.is_some(),
             "freshly inserted entry should be returned"
         );
+
+        tokio::time::timeout(GET_OBJECT_METADATA_CACHE_TTL + Duration::from_secs(1), async {
+            while set.cached_get_object_fileinfo("bucket", "object").await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metadata cache entry should expire after its TTL");
     }
 
     #[tokio::test]
@@ -2804,9 +2864,12 @@ mod metadata_cache_tests {
         barrier.wait_until_paused().await;
         set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
-        read.await
+        let snapshot = read
+            .await
             .expect("metadata read task should not panic")
             .expect("metadata fanout should still return its selected FileInfo");
+        assert!(snapshot.owned.is_some());
+        assert!(snapshot.has_valid_representation());
 
         assert!(
             set.get_object_metadata_cache
@@ -3415,7 +3478,7 @@ mod tests {
         );
         assert_eq!(diagnostics.total_responses(), 9);
         assert_eq!(diagnostics.valid_responses(), 1);
-        assert_eq!(diagnostics.error_responses(), 8);
+        assert_eq!(diagnostics.non_valid_responses(), 8);
     }
 
     #[test]
@@ -3430,7 +3493,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.ignored_responses(), 2);
-        assert_eq!(diagnostics.error_responses(), 3);
+        assert_eq!(diagnostics.non_valid_responses(), 3);
         assert_eq!(diagnostics.observations[0].outcome, GET_METADATA_RESPONSE_DISK_NOT_FOUND);
         assert_eq!(diagnostics.observations[1].outcome, GET_METADATA_RESPONSE_IGNORED);
         assert_eq!(diagnostics.observations[2].outcome, GET_METADATA_RESPONSE_NOT_FOUND);
@@ -3498,7 +3561,7 @@ mod tests {
 
         assert_eq!(diagnostics.total_responses(), 3);
         assert_eq!(diagnostics.valid_responses(), 3);
-        assert_eq!(diagnostics.error_responses(), 0);
+        assert_eq!(diagnostics.non_valid_responses(), 0);
         assert!(
             diagnostics
                 .observations
@@ -3834,25 +3897,26 @@ mod tests {
                 assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
                 // observe=false (non-observed fanout) also disables early-stop.
                 assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
-                // Data reads require their own explicit rollout gate.
-                assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
+                // Whole/latest data-read metadata is now allowed by default;
+                // the inline verifier still decides whether it can stop early.
+                assert!(metadata_early_stop_permitted(true, true, true, "", false, false));
             },
         );
     }
 
     #[test]
-    fn metadata_early_stop_requires_explicit_data_read_opt_in() {
+    fn metadata_early_stop_allows_safe_data_reads_by_default() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
-                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, None),
                 (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
             ],
             || {
-                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(should_allow_metadata_early_stop(true, "", false, false));
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
-                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+                assert!(!should_allow_metadata_early_stop(false, "version-id", false, false));
             },
         );
         temp_env::with_vars(
@@ -3864,6 +3928,47 @@ mod tests {
             || {
                 assert!(should_allow_metadata_early_stop(true, "", false, false));
                 assert!(should_allow_metadata_early_stop(true, "version-id", false, false));
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
+                assert!(should_allow_metadata_early_stop(false, "", false, false));
+                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_early_stop_bounded_fanout_defaults_to_enabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, None),
+            ],
+            || {
+                assert!(is_get_metadata_data_read_early_stop_enabled());
+                assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
+            },
+        );
+        temp_env::with_vars([(ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false"))], || {
+            assert!(!is_get_metadata_early_stop_bounded_fanout_enabled());
+        });
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+            ],
+            || {
+                assert!(!is_get_metadata_data_read_early_stop_enabled());
+                assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
             },
         );
     }
@@ -4016,8 +4121,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             None,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4034,8 +4139,8 @@ mod tests {
         get_codec_streaming_reader_gate(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
-            range,
             part_number,
+            classify_get_codec_streaming_object_class(range, object_info, fi),
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4055,6 +4160,7 @@ mod tests {
         let result = SetDisks::get_object_decode_reader_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             &fi,
             &[],
             &[],
@@ -4077,6 +4183,7 @@ mod tests {
         let invalid_size = SetDisks::get_object_decode_reader_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             &single_part,
             &[],
             &[],
@@ -4097,6 +4204,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &multipart,
                 &[],
                 &[],
@@ -4121,6 +4229,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &multipart,
                 &[],
                 &[],
@@ -4149,6 +4258,7 @@ mod tests {
                 SetDisks::get_object_decode_reader_with_fileinfo(
                     CODEC_STREAMING_TEST_BUCKET,
                     CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
                     &multipart,
                     &[],
                     &[],
@@ -4202,6 +4312,7 @@ mod tests {
                 SetDisks::get_object_decode_reader_with_fileinfo(
                     CODEC_STREAMING_TEST_BUCKET,
                     CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
                     &fi,
                     &files,
                     &disks,
@@ -4255,6 +4366,7 @@ mod tests {
             SetDisks::get_object_decode_reader_with_fileinfo(
                 CODEC_STREAMING_TEST_BUCKET,
                 CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
                 &fi,
                 &files,
                 &disks,
@@ -4299,6 +4411,7 @@ mod tests {
         SetDisks::get_object_with_fileinfo(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
             0,
             part_data.len() as i64,
             &mut output,
@@ -4759,6 +4872,114 @@ mod tests {
             .await
         })
         .await
+    }
+
+    async fn encoded_inline_blocks(blocks: &[&[u8]], shard_size: usize, hash_algo: HashAlgorithm) -> Bytes {
+        let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo);
+        for block in blocks {
+            writer.write(block).await.expect("test block should be encoded");
+        }
+        Bytes::from(writer.into_inner().into_inner())
+    }
+
+    fn assert_reader_shares_inline_allocation(reader: &ObjectBitrotReader, source: &Bytes) {
+        let reader_bytes = reader
+            .inner_ref()
+            .inline_bytes()
+            .expect("inline scheduler should retain an in-memory Bytes source");
+        assert_eq!(
+            reader_bytes.as_ptr(),
+            source.as_ptr(),
+            "the scheduler must clone Bytes ownership instead of copying the inline shard payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_range_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let first = [b'a'; SHARD_SIZE];
+        let second = [b'b'; SHARD_SIZE];
+        let mut source = encoded_inline_blocks(&[&first, &second], SHARD_SIZE, hash_algo.clone()).await;
+        let second_payload = hash_algo.size() * 2 + SHARD_SIZE;
+        source = {
+            let mut corrupt = source.to_vec();
+            corrupt[second_payload] ^= 0xff;
+            Bytes::from(corrupt)
+        };
+        let files = vec![encoded_reader_setup_fileinfo(Some(source.to_vec()))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_with_preference(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            1,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("range reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt ranged inline block must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn inline_part_scheduler_shares_bytes_and_rejects_bitrot_mismatch() {
+        const SHARD_SIZE: usize = 16;
+        let hash_algo = HashAlgorithm::HighwayHash256S;
+        let block = [b'p'; SHARD_SIZE];
+        let encoded = encoded_inline_blocks(&[&block], SHARD_SIZE, hash_algo.clone()).await;
+        let mut corrupt = encoded.to_vec();
+        corrupt[hash_algo.size()] ^= 0xff;
+        let files = vec![encoded_reader_setup_fileinfo(Some(corrupt))];
+        let source = files[0].data.clone().expect("inline shard should exist");
+        let disks = vec![None];
+
+        let mut setup = create_bitrot_readers_until_quorum_all_shards(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            7,
+            0,
+            SHARD_SIZE,
+            SHARD_SIZE,
+            hash_algo,
+            false,
+            false,
+            1,
+            0,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            None,
+            None,
+        )
+        .await;
+        let mut reader = setup.readers[0].take().expect("part reader should be ready");
+        assert_reader_shares_inline_allocation(&reader, &source);
+
+        let err = reader
+            .read(&mut [0; SHARD_SIZE])
+            .await
+            .expect_err("corrupt inline part must fail bitrot verification");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     async fn decode_codec_data_blocks_first_setup(
@@ -5462,33 +5683,93 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_codec_streaming_uses_conservative_default_min_size() {
+    fn codec_streaming_config_cache_loads_once() {
+        use std::cell::Cell;
+
+        let loads = Cell::new(0);
+        let expected = GetCodecStreamingConfig {
+            enabled: true,
+            rollout: GetCodecStreamingRollout::Off,
+            rollout_pct: 100,
+            body_compat_confirmed: true,
+            header_compat_confirmed: true,
+            engine: GetCodecStreamingEngine::Legacy,
+            min_size: DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+        };
+
+        for _ in 0..3 {
+            assert_eq!(
+                get_codec_streaming_config_cached_core(|| {
+                    loads.set(loads.get() + 1);
+                    expected
+                }),
+                expected
+            );
+        }
+        assert_eq!(loads.get(), 1, "production config cache must not reload env per GET");
+    }
+
+    #[test]
+    fn codec_streaming_config_loader_preserves_all_gate_env_overrides() {
         temp_env::with_vars(
             [
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("production")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("37")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("false")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, Some("262144")),
             ],
             || {
-                let below_threshold_fi = codec_streaming_test_fileinfo(512 * 1024, 1);
-                let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
                 assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
-                );
-
-                let threshold_fi = codec_streaming_test_fileinfo(1_048_576, 1);
-                let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
-                assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
-                    GetCodecStreamingDecision::Use
+                    load_get_codec_streaming_config(),
+                    GetCodecStreamingConfig {
+                        enabled: false,
+                        rollout: GetCodecStreamingRollout::On,
+                        rollout_pct: 37,
+                        body_compat_confirmed: false,
+                        header_compat_confirmed: false,
+                        engine: GetCodecStreamingEngine::Rustfs,
+                        min_size: 262144,
+                    }
                 );
             },
         );
+    }
+
+    #[test]
+    fn codec_streaming_default_min_size_meets_direct_memory_ceiling() {
+        for engine in [None, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, engine),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE, None::<&str>),
+                ],
+                || {
+                    let below_threshold_fi = codec_streaming_test_fileinfo(128 * 1024 - 1, 1);
+                    let below_threshold_object_info = codec_streaming_test_object_info(&below_threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &below_threshold_object_info, &below_threshold_fi, true)
+                            .decision,
+                        GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                    );
+
+                    let threshold_fi = codec_streaming_test_fileinfo(128 * 1024, 1);
+                    let threshold_object_info = codec_streaming_test_object_info(&threshold_fi);
+                    assert_eq!(
+                        codec_streaming_reader_gate_for_test(&None, &threshold_object_info, &threshold_fi, true).decision,
+                        GetCodecStreamingDecision::Use
+                    );
+                },
+            );
+        }
     }
 
     #[test]
@@ -5786,10 +6067,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5810,10 +6091,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5831,10 +6112,10 @@ mod tests {
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5914,10 +6195,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("0")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
@@ -5934,10 +6215,10 @@ mod tests {
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("100")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
-                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, None::<&str>),
             ],
             || {
-                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let fi = codec_streaming_test_fileinfo(128 * 1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(

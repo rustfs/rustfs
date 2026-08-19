@@ -27,10 +27,15 @@ use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
+use aws_sdk_s3::operation::delete_object_tagging::{DeleteObjectTaggingError, DeleteObjectTaggingOutput};
+use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
+use aws_sdk_s3::operation::get_object_tagging::{GetObjectTaggingError, GetObjectTaggingOutput};
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
 };
@@ -57,8 +62,10 @@ use rustfs_utils::http::{
     is_rustfs_header, is_standard_header, is_storageclass_header,
 };
 use rustfs_utils::http::{
-    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
+    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
+    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
+    insert_header,
 };
 use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
@@ -80,7 +87,6 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
@@ -293,9 +299,41 @@ struct TargetClientBuildProbe {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// SSE-C passthrough capability verdicts (see the enum's own docs in
+/// `rustfs-replication`) are cached here per target ARN: entries follow the
+/// `arn_remotes_map` lifecycle (rebuilding or removing a target resets its
+/// capability to `Unknown`) and additionally expire after
+/// [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], after which the next attempt
+/// re-audits. Re-exported so existing `bucket_target_sys` consumers keep
+/// their import path while the verdict vocabulary lives with the
+/// replication decision logic.
+pub use crate::bucket::replication::SsecPassthroughCapability;
+
+/// How long an audited SSE-C passthrough verdict stays authoritative.
+///
+/// Trade-off: without a TTL a verdict is sticky for the process lifetime —
+/// an `Unsupported` target that gets upgraded (or re-probed only via
+/// replication-check) would keep failing SSE-C replication forever, and the
+/// fail-open twin: a `Supported` verdict would outlive a backend swapped
+/// behind the same endpoint/ARN. With the TTL, a bad target costs at most
+/// one wasted PUT+HEAD audit per TTL window, and a changed backend is
+/// re-discovered within the same window.
+pub const SSEC_PASSTHROUGH_CAPABILITY_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// A recorded SSE-C passthrough verdict plus when it was recorded, so reads
+/// can report staleness against [`SSEC_PASSTHROUGH_CAPABILITY_TTL`].
+#[derive(Debug, Clone, Copy)]
+struct SsecPassthroughRecord {
+    capability: SsecPassthroughCapability,
+    recorded_at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct BucketTargetSys {
     pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
+    /// SSE-C passthrough capability verdicts keyed by target ARN. See
+    /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
+    ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
     target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
@@ -316,6 +354,7 @@ impl BucketTargetSys {
     fn new() -> Self {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
+            ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
@@ -579,16 +618,56 @@ impl BucketTargetSys {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
+        // then ssec_passthrough_map (always last; also taken standalone by the
+        // capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
 
         if let Some(targets) = targets_map.remove(bucket) {
+            let mut ssec_map = self.ssec_passthrough_map.write().await;
             for target in targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
+                ssec_map.remove(&target.arn);
             }
+        }
+    }
+
+    /// Cached SSE-C passthrough capability for a target ARN, plus whether the
+    /// verdict is older than [`SSEC_PASSTHROUGH_CAPABILITY_TTL`]. `(Unknown,
+    /// false)` when no verdict has been recorded since the target was built.
+    /// Staleness is computed here so the gate policy stays a pure function.
+    pub async fn ssec_passthrough_capability(&self, arn: &str) -> (SsecPassthroughCapability, bool) {
+        match self.ssec_passthrough_map.read().await.get(arn) {
+            Some(record) => (record.capability, record.recorded_at.elapsed() >= SSEC_PASSTHROUGH_CAPABILITY_TTL),
+            None => (SsecPassthroughCapability::Unknown, false),
+        }
+    }
+
+    /// Record an audited SSE-C passthrough verdict for a target ARN. Written by
+    /// the replication worker's HEAD-back audit and by the replication-check
+    /// SsecPassthrough probe phase.
+    pub async fn record_ssec_passthrough_capability(&self, arn: &str, capability: SsecPassthroughCapability) {
+        self.ssec_passthrough_map.write().await.insert(
+            arn.to_string(),
+            SsecPassthroughRecord {
+                capability,
+                recorded_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Test hook: age an existing verdict so TTL expiry is observable without
+    /// waiting out the real window.
+    #[cfg(test)]
+    pub(crate) async fn backdate_ssec_passthrough_capability(&self, arn: &str, age: Duration) {
+        let backdated = Instant::now()
+            .checked_sub(age)
+            .expect("system uptime must exceed the backdate age");
+        if let Some(record) = self.ssec_passthrough_map.write().await.get_mut(arn) {
+            record.recorded_at = backdated;
         }
     }
 
@@ -947,15 +1026,21 @@ impl BucketTargetSys {
             }
         }
 
-        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex.
+        // Lock order: targets_map, then arn_remotes_map, then target_h_mutex,
+        // then ssec_passthrough_map (always last; also taken standalone by the
+        // capability accessors).
         let mut targets_map = self.targets_map.write().await;
         let mut arn_remotes_map = self.arn_remotes_map.write().await;
         let mut health_map = self.target_h_mutex.write().await;
         // Remove existing targets
         if let Some(existing_targets) = targets_map.remove(bucket) {
+            let mut ssec_map = self.ssec_passthrough_map.write().await;
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
                 health_map.remove(&target.arn);
+                // A rebuilt/edited target may point at a different service:
+                // the SSE-C passthrough verdict must be re-audited from Unknown.
+                ssec_map.remove(&target.arn);
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
@@ -1445,12 +1530,49 @@ fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
     }
 }
 
+/// Resolve the S3 `versionId` for a proxied read against a remote target.
+/// RustFS represents the null version internally as the nil UUID while the S3
+/// API addresses it as the literal "null" (same mapping as
+/// [`resolve_put_api_version_id`]); empty means "no version requested".
+pub(crate) fn resolve_read_api_version_id(version_id: Option<String>) -> Option<String> {
+    let version_id = version_id?;
+    let trimmed = version_id.trim();
+    if trimmed.is_empty() {
+        None
+    } else if Uuid::parse_str(trimmed).is_ok_and(|uuid| uuid.is_nil()) {
+        Some(rustfs_filemeta::NULL_VERSION_ID.to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Outbound header set for a proxied read: the caller-provided passthrough
+/// headers (client SSE-C key family, conditional headers) plus the anti-loop
+/// `source-proxy-request` marker in both the x-rustfs- and x-minio- prefixes
+/// (a MinIO target only understands the latter). Never adds
+/// `source-replication-check`: that exemption channel belongs exclusively to
+/// the replication worker's HEAD.
+fn proxy_outbound_headers(mut extra_headers: HeaderMap) -> HeaderMap {
+    insert_header(&mut extra_headers, SUFFIX_SOURCE_PROXY_REQUEST, "true");
+    extra_headers
+}
+
+/// Copy `headers` onto an SDK request inside `customize().map_request` (runs
+/// before signing, so the headers join the SigV4 canonical request).
+fn apply_extra_headers(mut req: HttpRequest, headers: &HeaderMap) -> Result<HttpRequest, std::convert::Infallible> {
+    for (k, v) in headers.iter() {
+        req.headers_mut()
+            .insert(k.as_str().to_string(), v.to_str().unwrap_or("").to_string());
+    }
+    Ok(req)
+}
+
 /// Append `versionId=<id>` to an already-built request URI. aws-sdk-s3's
 /// `PutObjectInput` / `CreateMultipartUploadInput` expose no version id
 /// member, so the query is spliced in via `map_request`, which runs at
 /// `modify_before_signing`: the parameter becomes part of the SigV4 canonical
 /// request.
-fn append_version_id_query(uri: &str, version_id: &str) -> String {
+pub fn append_version_id_query(uri: &str, version_id: &str) -> String {
     let separator = if uri.contains('?') { '&' } else { '?' };
     format!("{uri}{separator}versionId={}", urlencoding::encode(version_id))
 }
@@ -1476,9 +1598,12 @@ impl Default for AdvancedPutOptions {
             replication_status: ReplicationStatusType::Pending,
             source_mtime: OffsetDateTime::now_utc(),
             replication_request: false,
-            retention_timestamp: OffsetDateTime::now_utc(),
-            tagging_timestamp: OffsetDateTime::now_utc(),
-            legalhold_timestamp: OffsetDateTime::now_utc(),
+            // UNIX_EPOCH means "never modified": header() must not emit a
+            // timestamp header for it, otherwise a receiver would treat an
+            // unset category as a modification made right now.
+            retention_timestamp: OffsetDateTime::UNIX_EPOCH,
+            tagging_timestamp: OffsetDateTime::UNIX_EPOCH,
+            legalhold_timestamp: OffsetDateTime::UNIX_EPOCH,
             replication_validity_check: false,
         }
     }
@@ -1545,8 +1670,8 @@ impl Default for PutObjectOptions {
     }
 }
 
-#[allow(dead_code)]
 impl PutObjectOptions {
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1557,6 +1682,7 @@ impl PutObjectOptions {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn set_match_etag_except(&mut self, etag: &str) {
         if etag == "*" {
             self.custom_header
@@ -1675,6 +1801,16 @@ impl PutObjectOptions {
             );
         }
 
+        for (suffix, timestamp) in [
+            (SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, self.internal.tagging_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, self.internal.retention_timestamp),
+            (SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, self.internal.legalhold_timestamp),
+        ] {
+            if timestamp.unix_timestamp() != 0 {
+                insert_header(&mut header, suffix, timestamp.format(&Rfc3339).unwrap_or_default());
+            }
+        }
+
         if self.internal.replication_request {
             insert_header(&mut header, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
@@ -1682,6 +1818,7 @@ impl PutObjectOptions {
         header
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn validate(&self, _c: Arc<TargetClient>) -> Result<(), std::io::Error> {
         //if self.checksum.is_set() {
         /*if !self.trailing_header_support {
@@ -1837,6 +1974,13 @@ impl TargetClient {
         // worker cannot hold; otherwise SSE-C replicas never converge on HEAD.
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
+        // `source-proxy-request: false` (MinIO `ProxyHeaderSet` semantics):
+        // the header's mere presence tells the receiver to answer LOCALLY
+        // instead of proxying the miss back to us. Without it, a not-found on
+        // the target gets read-proxied back to this source, echoes the source
+        // object with an identical ETag, and the worker concludes the object
+        // already converged — so it never actually replicates it.
+        insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "false");
         match self
             .client
             .head_object()
@@ -1861,6 +2005,132 @@ impl TargetClient {
         }
     }
 
+    /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
+    /// replicated locally, MinIO `proxyHeadToRepTarget`).
+    ///
+    /// Deliberately different from [`TargetClient::head_object`]: it must NOT
+    /// send `source-replication-check` — that header is the replication
+    /// worker's SSE-C metadata exemption channel. A proxied client request
+    /// instead forwards the client's own SSE-C headers (`extra_headers`) so
+    /// the target performs the real SSE-C validation/decryption. The
+    /// `source-proxy-request` marker is always added so the target does not
+    /// proxy the request onward (anti-loop).
+    pub async fn head_object_for_proxy(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        range: Option<String>,
+        part_number: Option<i32>,
+        extra_headers: HeaderMap,
+    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+        let headers = proxy_outbound_headers(extra_headers);
+        self.client
+            .head_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .set_range(range)
+            .set_part_number(part_number)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// GET used by the read-proxy path (MinIO `proxyGetToReplicationTarget`).
+    /// Returns the streaming SDK output; callers must forward the body without
+    /// buffering it. Same header contract as [`Self::head_object_for_proxy`]:
+    /// anti-loop marker on, replication-check never sent, client SSE-C /
+    /// conditional headers forwarded verbatim via `extra_headers`.
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        range: Option<String>,
+        part_number: Option<i32>,
+        extra_headers: HeaderMap,
+    ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
+        let headers = proxy_outbound_headers(extra_headers);
+        self.client
+            .get_object()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .set_range(range)
+            .set_part_number(part_number)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// GetObjectTagging for the tagging read-proxy path
+    /// (MinIO `proxyGetTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn get_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+    ) -> Result<GetObjectTaggingOutput, SdkError<GetObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// PutObjectTagging for the tagging proxy path
+    /// (MinIO `proxyTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn put_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+        tagging: SdkTagging,
+    ) -> Result<PutObjectTaggingOutput, SdkError<PutObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .tagging(tagging)
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// DeleteObjectTagging for the tagging proxy path
+    /// (MinIO `proxyTaggingToRepTarget`). Anti-loop marker always added.
+    pub async fn delete_object_tagging(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<String>,
+    ) -> Result<DeleteObjectTaggingOutput, SdkError<DeleteObjectTaggingError>> {
+        let headers = proxy_outbound_headers(HeaderMap::new());
+        self.client
+            .delete_object_tagging()
+            .bucket(bucket)
+            .key(object)
+            .set_version_id(resolve_read_api_version_id(version_id))
+            .customize()
+            .map_request(move |req| apply_extra_headers(req, &headers))
+            .send()
+            .await
+    }
+
+    /// On success returns the version id the target assigned (from
+    /// `x-amz-version-id`), letting callers audit the version-identity
+    /// contract — a target that adopts the source version echoes it back.
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -1868,7 +2138,7 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<(), S3ClientError> {
+    ) -> Result<Option<String>, S3ClientError> {
         let mut headers = opts.header();
 
         let builder = self.client.put_object();
@@ -1903,7 +2173,7 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(output) => Ok(output.version_id().map(ToOwned::to_owned)),
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
@@ -2487,6 +2757,57 @@ mod tests {
         assert_eq!(health.last_online, Some(now));
     }
 
+    /// N2 TTL contract, both flip directions: a recorded verdict is fresh
+    /// until [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], then reads as expired; a
+    /// re-audit that records the OPPOSITE verdict replaces it as fresh. The
+    /// worker gate maps expired verdicts to ProceedWithAudit (pinned in
+    /// `replication_target_boundary`), so together this proves an Unsupported
+    /// target recovers to Supported through the audit once its verdict ages
+    /// out — and a stale Supported one is re-proven rather than trusted.
+    #[tokio::test]
+    async fn ssec_passthrough_capability_ttl_expires_and_reaudit_flips_verdict() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:ssec-ttl";
+        let expired_age = SSEC_PASSTHROUGH_CAPABILITY_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unknown, false),
+            "an unrecorded target must read Unknown and never expired"
+        );
+
+        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Unsupported)
+            .await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unsupported, false)
+        );
+
+        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Unsupported, true),
+            "an aged-out Unsupported verdict must read expired so the gate re-audits"
+        );
+
+        // The re-audit against an upgraded target records Supported afresh.
+        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Supported)
+            .await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Supported, false),
+            "a fresh Supported verdict replaces the expired Unsupported one"
+        );
+
+        // And the fail-open twin: Supported also ages out.
+        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        assert_eq!(
+            sys.ssec_passthrough_capability(arn).await,
+            (SsecPassthroughCapability::Supported, true),
+            "an aged-out Supported verdict must read expired so the gate re-proves it"
+        );
+    }
+
     #[tokio::test]
     async fn list_targets_applies_health_stats_by_arn_and_preserves_endpoint_port() {
         let sys = BucketTargetSys::default();
@@ -2837,6 +3158,57 @@ mod tests {
             Some("etag-1"),
             "replication targets need the source etag for idempotency checks"
         );
+    }
+
+    #[test]
+    fn put_object_headers_carry_replication_timestamp_headers() {
+        // MinIO receivers resolve concurrent tag/retention/legal-hold edits by
+        // last-writer-wins on these headers (object-api-options.go parses them
+        // as RFC3339); a replica without them loses every conflict resolution.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        let tagging = OffsetDateTime::from_unix_timestamp(1_700_000_001).expect("valid timestamp");
+        let retention = OffsetDateTime::from_unix_timestamp(1_700_000_002).expect("valid timestamp");
+        let legalhold = OffsetDateTime::from_unix_timestamp(1_700_000_003).expect("valid timestamp");
+        opts.internal.tagging_timestamp = tagging;
+        opts.internal.retention_timestamp = retention;
+        opts.internal.legalhold_timestamp = legalhold;
+
+        let header = opts.header();
+        for (suffix, expected) in [
+            ("source-replication-tagging-timestamp", tagging),
+            ("source-replication-retention-timestamp", retention),
+            ("source-replication-legalhold-timestamp", legalhold),
+        ] {
+            assert_eq!(
+                rustfs_utils::http::get_header(&header, suffix).as_deref(),
+                Some(expected.format(&Rfc3339).expect("RFC3339 timestamp").as_str()),
+                "replication put requests must carry the {suffix} header"
+            );
+        }
+    }
+
+    #[test]
+    fn put_object_headers_omit_unset_replication_timestamps() {
+        // UNIX_EPOCH means "never modified on the source"; sending it would
+        // make the receiver treat an unset category as a fresh modification.
+        let mut opts = PutObjectOptions::default();
+        opts.internal.replication_request = true;
+        opts.internal.tagging_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.retention_timestamp = OffsetDateTime::UNIX_EPOCH;
+        opts.internal.legalhold_timestamp = OffsetDateTime::UNIX_EPOCH;
+
+        let header = opts.header();
+        for suffix in [
+            "source-replication-tagging-timestamp",
+            "source-replication-retention-timestamp",
+            "source-replication-legalhold-timestamp",
+        ] {
+            assert!(
+                rustfs_utils::http::get_header(&header, suffix).is_none(),
+                "unset {suffix} must not be sent to replication targets"
+            );
+        }
     }
 
     #[tokio::test]

@@ -449,9 +449,15 @@ impl Operation for ValidateOidcConfigHandler {
             request.provider_id.trim().to_string()
         };
         let provider_config = build_provider_config_from_validate(request, &provider_id)?;
-        let validation = rustfs_iam::oidc::validate_oidc_provider_config(&provider_config)
+        let oidc_extra_root_ca = crate::startup_auth::current_oidc_extra_root_ca_material()
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("validation failed: {e}")))?;
+        let validation = rustfs_iam::oidc::validate_oidc_provider_config_with_extra_root_ca(
+            &provider_config,
+            oidc_extra_root_ca.root_ca_pem.as_deref(),
+        )
+        .await
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("validation failed: {e}")))?;
 
         json_response(
             StatusCode::OK,

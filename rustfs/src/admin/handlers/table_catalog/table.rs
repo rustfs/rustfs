@@ -23,10 +23,50 @@ impl Operation for RestListTablesHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = list_tables_response(&store, &warehouse, &namespace, &req.uri).await?;
         build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestRenameTableHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestRenameTableHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let principal = table_catalog_request_principal(&req).await?;
+        let request = read_bounded_json_body::<RenameTableRequest>(
+            &req.headers,
+            std::mem::take(&mut req.input),
+            RENAME_TABLE_BODY_MAX_SIZE,
+            RENAME_TABLE_BODY_TIMEOUT,
+            "rename table",
+        )
+        .await?;
+        let (source_namespace, source_table) = table_identifier_from_request(request.source)?;
+        let (destination_namespace, destination_table) = table_identifier_from_request(request.destination)?;
+
+        let source_resource = TableCatalogResource::table(&warehouse, &source_namespace, source_table.as_str());
+        authorize_table_catalog_resource_for_principal(&req, &principal, &source_resource, AdminAction::SetTableAction).await?;
+        let destination_resource = TableCatalogResource::table(&warehouse, &destination_namespace, destination_table.as_str());
+        authorize_table_catalog_resource_for_principal(&req, &principal, &destination_resource, AdminAction::SetTableAction)
+            .await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        store
+            .rename_table(
+                &warehouse,
+                &source_namespace.public_name(),
+                source_table.as_str(),
+                &destination_namespace.public_name(),
+                destination_table.as_str(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
 
@@ -40,11 +80,12 @@ impl Operation for RestCreateTableHandler {
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
         let request = read_json_body::<CreateTableRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let commit_backend = TableCommitObjectBackend::preauthorized(metadata_backend);
         let response =
-            create_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
+            create_table_response(&store, &commit_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -53,17 +94,20 @@ pub struct RestRegisterTableHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestRegisterTableHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        let request = read_json_body::<RegisterTableRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<RegisterTableRequest>(std::mem::take(&mut req.input)).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
-        let response =
-            register_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result =
+            register_table_response(&store, &commit_backend, &warehouse, &namespace, request, table_bucket_enabled).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -78,10 +122,12 @@ impl Operation for RestLoadTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let metadata_backend = table_catalog_backend()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        let snapshot_selection = rest_table_snapshot_selection_from_query(&req.uri)?;
+        let mut response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -96,8 +142,8 @@ impl Operation for RestTableExistsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         Ok(empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
     }
 }
@@ -106,17 +152,20 @@ pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestCommitTableHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_rest_commit_table_request(std::mem::take(&mut req.input)).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = commit_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result = commit_table_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -131,8 +180,16 @@ impl Operation for RestDropTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        let purge_requested = rest_purge_requested_from_query(&req.uri)?;
+        if purge_requested {
+            return Err(iceberg_rest_error(
+                ICEBERG_ERROR_UNSUPPORTED_OPERATION,
+                StatusCode::NOT_ACCEPTABLE,
+                "purgeRequested=true is not supported",
+            ));
+        }
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
@@ -148,8 +205,8 @@ impl Operation for GetTableMetadataLocationHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataLocationAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response = get_table_metadata_location_response(&store, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -159,18 +216,22 @@ pub struct UpdateTableMetadataLocationHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UpdateTableMetadataLocationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let request = read_json_body::<UpdateTableMetadataLocationRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let principal =
+            authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body::<UpdateTableMetadataLocationRequest>(std::mem::take(&mut req.input)).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response =
-            update_table_metadata_location_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result =
+            update_table_metadata_location_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -185,8 +246,8 @@ impl Operation for ExportTableCatalogHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
             .export_table_catalog_entry(&warehouse, &namespace.public_name(), &table)
@@ -202,19 +263,21 @@ pub struct ImportTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ImportTableCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
-        let request = read_json_body::<CatalogImportRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<CatalogImportRequest>(std::mem::take(&mut req.input)).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
-        let response =
-            catalog_import_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, table_bucket_enabled)
-                .await?;
+        let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result =
+            catalog_import_response(&store, &commit_backend, &warehouse, &namespace, &table, request, table_bucket_enabled).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -229,8 +292,8 @@ impl Operation for GetTableCatalogDiagnosticsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let config = store
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
             .await
@@ -263,8 +326,8 @@ impl Operation for RecoverTableCatalogHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
             .recover_table_commits(&warehouse, &namespace.public_name(), &table)
@@ -280,17 +343,20 @@ pub struct RollbackTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RollbackTableCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
-        ensure_table_bucket_enabled(&warehouse).await?;
-        let request = read_json_body::<RollbackTableRequest>(req.input).await?;
-        let metadata_backend = table_catalog_backend()?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body::<RollbackTableRequest>(std::mem::take(&mut req.input)).await?;
+        let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
-        let response = rollback_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
+        let result = rollback_table_response(&store, &commit_backend, &warehouse, &namespace, &table, request).await;
+        let response = commit_backend.finish(result).await?;
         build_json_response(StatusCode::OK, &response)
     }
 }

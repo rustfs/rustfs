@@ -369,7 +369,7 @@ async fn run_concurrent_downloads(settings: DownloadSettings) -> Result<Download
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "manual performance tool: requires a running RustFS server configured via env vars"]
 async fn concurrent_download_tool() -> Result<()> {
     let settings = DownloadSettings::from_env()?;
     let summary = run_concurrent_downloads(settings).await?;

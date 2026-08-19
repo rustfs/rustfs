@@ -153,9 +153,7 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-// RUSTFS_COMPAT_TODO(cross-pool-fence-v1): advertise unsupported during predeployment. Remove after composite acquisition,
-// activation fencing, fleet proof, commit-time proof revalidation, and fail-closed revocation ship together.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 0;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -573,8 +571,12 @@ async fn execute_heal_control_envelope_with_manager(
                 admission: receipt.result.into(),
             }
         }
-        rustfs_protos::heal_control::ExecutableCommand::Query { heal_path, client_token } => {
-            let response = timeout(remaining, processor.execute_query_request(heal_path, client_token))
+        rustfs_protos::heal_control::ExecutableCommand::Query {
+            heal_path,
+            client_token,
+            since_seq,
+        } => {
+            let response = timeout(remaining, processor.execute_query_request_since(heal_path, client_token, since_seq))
                 .await
                 .map_err(|_| Status::deadline_exceeded("heal control query expired before execution"))?
                 .map_err(|_| Status::internal("heal control query failed"))?;
@@ -2422,6 +2424,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -2518,6 +2521,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token.clone(),
+            None,
         )
         .unwrap();
         let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
@@ -2556,6 +2560,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token,
+            None,
         )
         .unwrap();
         let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))
@@ -2945,7 +2950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed() {
+    async fn snapshot_lease_acquire_and_renew_handlers_fail_closed_for_missing_disk() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
 
@@ -2962,7 +2967,7 @@ mod tests {
         let acquire = service
             .acquire_snapshot_lease(acquire)
             .await
-            .expect("disabled acquire should return a protocol response")
+            .expect("missing-disk acquire should return a protocol response")
             .into_inner();
 
         let mut renew = Request::new(SnapshotLeaseRenewRequest {
@@ -2979,14 +2984,14 @@ mod tests {
         let renew = service
             .renew_snapshot_lease(renew)
             .await
-            .expect("disabled renew should return a protocol response")
+            .expect("missing-disk renew should return a protocol response")
             .into_inner();
 
         for response in [acquire, renew] {
             assert!(!response.success);
             assert!(response.token.is_empty());
             assert_eq!(response.protocol_version, 1);
-            assert_eq!(response.error, Some(DiskError::UnsupportedDisk.into()));
+            assert_eq!(response.error, Some(DiskError::other("cannot find disk").into()));
         }
     }
 
@@ -3342,7 +3347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_unsupported_rollout_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3407,7 +3412,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &0_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &1_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");
@@ -4492,9 +4497,27 @@ mod tests {
         assert!(refresh_response.error_info.is_some());
     }
 
+    /// Premise guard for the no-object-layer RPC tests (backlog#1830): they
+    /// assert the error surface returned while the global object layer is
+    /// absent. Under nextest — the authoritative runner — every test owns its
+    /// process, so the premise always holds and the assertion always runs.
+    /// Under the documented shared-process `cargo test` fallback a sibling test
+    /// may have initialized the store first; the premise is then unattainable,
+    /// so the test skips instead of asserting against a scenario it does not
+    /// describe.
+    fn no_object_layer_premise_holds() -> bool {
+        if crate::runtime_sources::current_object_store_handle().is_some() {
+            eprintln!("skipping no-object-layer assertion: a sibling test already initialized the global object layer");
+            return false;
+        }
+        true
+    }
+
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_local_storage_info() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LocalStorageInfoRequest { metrics: false });
@@ -4799,8 +4822,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_pool_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadPoolMetaRequest {});
@@ -4815,8 +4840,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_stop_rebalance() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(StopRebalanceRequest {
@@ -4833,8 +4860,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_rebalance_meta() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadRebalanceMetaRequest { start_rebalance: false });
@@ -4929,8 +4958,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(LoadBucketMetadataRequest {
@@ -4948,8 +4979,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_load_transition_tier_config_no_object_layer() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let response = service
@@ -5169,8 +5202,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_site_replication_config() {
+        if !no_object_layer_premise_holds() {
+            return;
+        }
         let service = create_test_node_service();
 
         let request = Request::new(ReloadSiteReplicationConfigRequest {});
@@ -5630,7 +5665,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_refresh_config_requires_object_layer() {
         let service = create_test_node_service();
@@ -5652,7 +5686,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
     async fn test_signal_service_reload_dynamic_requires_object_layer() {
         let service = create_test_node_service();

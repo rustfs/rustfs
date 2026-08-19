@@ -16,6 +16,7 @@ use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
+        LifecycleExpiryConfigs,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
@@ -226,6 +227,7 @@ fn ensure_decommission_start_rebalance_meta_allowed(meta: Option<&RebalanceMeta>
     ensure_decommission_not_rebalancing(meta.is_some_and(is_rebalance_conflicting_with_decommission))
 }
 
+#[allow(dead_code, reason = "leader precondition asserted by this file's tests (backlog#1823)")]
 fn ensure_local_decommission_pool_leaders(endpoints: &EndpointServerPools, indices: &[usize]) -> Result<()> {
     for idx in indices {
         ensure_local_decommission_pool_leader(endpoints, *idx)?;
@@ -1058,11 +1060,19 @@ fn should_cleanup_decommission_source_entry(decommissioned: usize, total_version
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "terminal-state classification asserted by this file's tests (backlog#1823)"
+)]
 enum DecommissionTerminalState {
     Completed,
     Failed,
 }
 
+#[allow(
+    dead_code,
+    reason = "terminal-state classification asserted by this file's tests (backlog#1823)"
+)]
 fn classify_decommission_terminal_state(failed_items_present: bool) -> DecommissionTerminalState {
     if failed_items_present {
         DecommissionTerminalState::Failed
@@ -1987,11 +1997,11 @@ impl PoolMeta {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self, pools: Vec<Arc<Sets>>) -> Result<bool> {
         struct PoolInfo {
             position: usize,
             completed: bool,
+            #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
             decom_started: bool,
         }
 
@@ -2266,15 +2276,19 @@ fn decommission_delete_marker_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
     src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
 ) -> ObjectOptions {
+    let version_suspended = version.version_id.is_none() && version_id.is_none();
     ObjectOptions {
-        versioned: true,
-        version_id,
+        versioned: !version_suspended,
+        version_suspended,
+        version_id: version_id.or_else(|| version_suspended.then(|| uuid::Uuid::nil().to_string())),
         mod_time: version.mod_time,
         src_pool_idx,
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
+        expected_bucket_incarnation_id,
         delete_replication: version
             .replication_state_internal
             .as_ref()
@@ -2299,6 +2313,7 @@ fn decommission_remote_tiered_opts(
     version: &rustfs_filemeta::FileInfo,
     version_id: Option<String>,
     src_pool_idx: usize,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
 ) -> ObjectOptions {
     ObjectOptions {
         versioned: version_id.is_some(),
@@ -2307,6 +2322,9 @@ fn decommission_remote_tiered_opts(
         user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
+        include_part_checksums: true,
+        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        expected_bucket_incarnation_id,
         ..Default::default()
     }
 }
@@ -2316,6 +2334,10 @@ fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
         action,
         IlmAction::DeleteVersionAction | IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction
     )
+}
+
+fn lifecycle_action_skips_heal_version(action: IlmAction) -> bool {
+    action.delete()
 }
 
 fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
@@ -2368,7 +2390,80 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     }
 }
 
+pub struct HealLifecycleExpiryContext {
+    configs: LifecycleExpiryConfigs,
+}
+
 impl ECStore {
+    pub async fn load_heal_lifecycle_expiry_context(&self, bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        if bucket == RUSTFS_META_BUCKET {
+            return Ok(None);
+        }
+
+        let configs = get_expiry_configs(self, bucket).await?;
+        if configs.lifecycle.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(HealLifecycleExpiryContext { configs }))
+    }
+
+    pub async fn enqueue_heal_lifecycle_expiry(
+        self: &Arc<Self>,
+        context: &HealLifecycleExpiryContext,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        object_info: Option<&crate::object_api::ObjectInfo>,
+    ) -> Result<bool> {
+        let Some(lifecycle_config) = context.configs.lifecycle.as_ref() else {
+            return Ok(false);
+        };
+
+        let object_info = if let Some(object_info) = object_info {
+            if object_info.bucket != bucket || object_info.name != object {
+                return Ok(false);
+            }
+            let snapshot_version_id = object_info
+                .version_id
+                .filter(|version_id| !version_id.is_nil())
+                .map(|version_id| version_id.to_string());
+            if snapshot_version_id.as_deref() != version_id {
+                return Ok(false);
+            }
+            object_info.clone()
+        } else {
+            match self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: version_id.map(str::to_string),
+                        versioned: version_id.is_some(),
+                        expected_bucket_incarnation_id: Some(context.configs.bucket_incarnation_id),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(object_info) => object_info,
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        };
+
+        let event = eval_action_from_lifecycle(lifecycle_config, context.configs.object_lock.as_deref(), &object_info).await;
+        if !lifecycle_action_skips_heal_version(event.action) {
+            return Ok(false);
+        }
+
+        if lifecycle_delete_all_versions_blocked_by_replication(self.clone(), bucket, &object_info.name, event.action).await? {
+            return Ok(false);
+        }
+
+        Ok(apply_expiry_rule_in(self.clone(), &event, &LcEventSrc::Scanner, &object_info).await)
+    }
+
     async fn save_current_pool_meta(&self) -> Result<()> {
         let _save_guard = self.pool_meta_save_gate.lock().await;
         let snapshot = {
@@ -2805,6 +2900,7 @@ impl ECStore {
         lifecycle_config: Option<BucketLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
     ) -> Result<()> {
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
@@ -2833,6 +2929,11 @@ impl ECStore {
             rx.cancel();
         }
         decommission_cancel_signal_result(rx.is_cancelled())?;
+
+        let bucket_incarnation_fence = match expected_bucket_incarnation_id {
+            Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
+            None => None,
+        };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
 
@@ -2894,7 +2995,7 @@ impl ECStore {
                     .delete_object(
                         bucket.as_str(),
                         &version.name,
-                        decommission_delete_marker_opts(version, version_id.clone(), idx),
+                        decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
                     )
                     .await
                 {
@@ -2984,7 +3085,7 @@ impl ECStore {
                             bucket.as_str(),
                             &version.name,
                             version,
-                            &decommission_remote_tiered_opts(version, version_id.clone(), idx),
+                            &decommission_remote_tiered_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
                         )
                         .await
                     {
@@ -3056,7 +3157,11 @@ impl ECStore {
                 )
                 .await?;
 
-                if let Err(err) = self.clone().decommission_object(idx, bucket, rd).await {
+                if let Err(err) = self
+                    .clone()
+                    .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id)
+                    .await
+                {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
                         cleanup_ignored = true;
@@ -3133,6 +3238,9 @@ impl ECStore {
         }
 
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+            if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                return Err(Error::other("decommission bucket incarnation fence was lost before source cleanup"));
+            }
             decommission_cancel_signal_result(rx.is_cancelled())?;
 
             self.save_decommission_entry_progress_stage(
@@ -3157,6 +3265,12 @@ impl ECStore {
                 entry.name.as_str(),
                 &fivs,
                 &cleanup_preflight_allowed_missing,
+                data_movement::SourceCleanupBucketFence {
+                    expected_incarnation_id: expected_bucket_incarnation_id,
+                    lifecycle_guard: bucket_incarnation_fence
+                        .as_ref()
+                        .and_then(|guard| guard.namespace_lock_guard()),
+                },
                 "decommission",
             )
             .await
@@ -3268,6 +3382,11 @@ impl ECStore {
         let mut lifecycle_config = None;
         let mut object_lock_config = None;
         let mut replication_config = None;
+        let expected_bucket_incarnation_id = if bi.name == RUSTFS_META_BUCKET {
+            None
+        } else {
+            Some(self.bucket_incarnation_id_from_disk(&bi.name).await?)
+        };
 
         if bi.name != RUSTFS_META_BUCKET {
             let _ = resolve_decommission_optional_bucket_config_result(
@@ -3321,6 +3440,7 @@ impl ECStore {
                     let lifecycle_config = lifecycle_config.clone();
                     let object_lock_config = object_lock_config.clone();
                     let replication_config = replication_config.clone();
+                    let expected_bucket_incarnation_id = expected_bucket_incarnation_id;
                     let entry_error = entry_error.clone();
                     let callback_rx = callback_rx.clone();
 
@@ -3383,6 +3503,7 @@ impl ECStore {
                                 lifecycle_config,
                                 object_lock_config,
                                 replication_config,
+                                expected_bucket_incarnation_id,
                             )
                             .await
                         {
@@ -4168,10 +4289,24 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rd))]
-    async fn decommission_object(self: Arc<Self>, pool_idx: usize, bucket: String, rd: GetObjectReader) -> Result<()> {
+    async fn decommission_object(
+        self: Arc<Self>,
+        pool_idx: usize,
+        bucket: String,
+        rd: GetObjectReader,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+    ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
-        let result = data_movement::migrate_object(self, pool_idx, bucket.clone(), rd, "decommission_object").await;
+        let result = data_movement::migrate_object(
+            self,
+            pool_idx,
+            bucket.clone(),
+            rd,
+            expected_bucket_incarnation_id,
+            "decommission_object",
+        )
+        .await;
         if result.is_ok() {
             warn!("decommission_object: migrated {} {}", &bucket, &object_name);
         }
@@ -4228,6 +4363,19 @@ mod tests {
         assert!(lifecycle_action_removes_data_movement_version(
             IlmAction::DelMarkerDeleteAllVersionsAction
         ));
+    }
+
+    #[test]
+    fn lifecycle_action_skips_heal_version_for_every_delete_action() {
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAllVersionsAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DelMarkerDeleteAllVersionsAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionVersionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::NoneAction));
     }
 
     #[test]
@@ -4347,7 +4495,8 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = decommission_delete_marker_opts(&version, Some("version-id".to_string()), 7);
+        let incarnation = uuid::Uuid::new_v4();
+        let opts = decommission_delete_marker_opts(&version, Some("version-id".to_string()), 7, Some(incarnation));
         let replication = opts.delete_replication.expect("replication state should be preserved");
 
         assert!(opts.versioned);
@@ -4357,9 +4506,23 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 7);
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
         assert_eq!(replication.replica_status, ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
+    }
+
+    #[test]
+    fn decommission_delete_marker_opts_preserves_suspended_null_version() {
+        let version = rustfs_filemeta::FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+        let opts = decommission_delete_marker_opts(&version, None, 7, None);
+
+        assert!(!opts.versioned);
+        assert!(opts.version_suspended);
+        assert_eq!(opts.version_id.as_deref(), Some(uuid::Uuid::nil().to_string().as_str()));
     }
 
     #[test]
@@ -4383,7 +4546,8 @@ mod tests {
             ..Default::default()
         };
 
-        let opts = decommission_remote_tiered_opts(&version, Some("version-id".to_string()), 9);
+        let incarnation = uuid::Uuid::new_v4();
+        let opts = decommission_remote_tiered_opts(&version, Some("version-id".to_string()), 9, Some(incarnation));
 
         assert!(opts.versioned);
         assert!(opts.data_movement);
@@ -4391,6 +4555,9 @@ mod tests {
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));
         assert_eq!(opts.user_defined.get("x-amz-meta-key").map(String::as_str), Some("value"));
+        assert!(opts.include_part_checksums);
+        assert!(opts.http_preconditions.is_some());
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
     }
 
     #[test]
@@ -4882,13 +5049,19 @@ fn is_disk_online_state(state: &str) -> bool {
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_total_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_total_capacity_dedup(disks)
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_free_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_free_capacity_dedup(disks)
 }

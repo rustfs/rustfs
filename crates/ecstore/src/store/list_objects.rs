@@ -309,9 +309,17 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+// The chaos machinery below is compiled only for tests and the opt-in
+// `list-chaos` feature (backlog#1832): a production binary without the
+// feature carries no chaos symbols, so the two env vars cannot silently
+// rewrite a bucket's namespace-journal state.
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE";
+#[cfg(any(test, feature = "list-chaos"))]
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
@@ -552,7 +560,9 @@ static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SCANNER_NAMESPACE_MUTATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG: OnceCell<Option<NamespaceMutationJournalChaosConfig>> = OnceCell::const_new();
+#[cfg(any(test, feature = "list-chaos"))]
 static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
@@ -579,6 +589,7 @@ async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<Ha
         .await
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_config() -> Option<&'static NamespaceMutationJournalChaosConfig> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG
         .get_or_init(|| async { namespace_mutation_journal_chaos_config_from_env() })
@@ -586,6 +597,7 @@ async fn list_objects_namespace_journal_chaos_config() -> Option<&'static Namesp
         .as_ref()
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 async fn list_objects_namespace_journal_chaos_applied() -> &'static RwLock<HashSet<String>> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED
         .get_or_init(|| async { RwLock::new(HashSet::new()) })
@@ -629,7 +641,7 @@ pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
 }
 
-pub(super) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
+pub(crate) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
     observe_list_objects_mutations(store, bucket, 1).await.unwrap_or_default()
 }
 
@@ -681,6 +693,7 @@ enum NamespaceMutationJournalStatus {
 }
 
 impl NamespaceMutationJournalStatus {
+    #[cfg(any(test, feature = "list-chaos"))]
     fn from_env_value(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY) {
             Some(Self::Healthy)
@@ -691,6 +704,7 @@ impl NamespaceMutationJournalStatus {
         }
     }
 
+    #[cfg(any(test, feature = "list-chaos"))]
     fn env_value(self) -> &'static str {
         match self {
             Self::Healthy => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY,
@@ -712,6 +726,7 @@ struct NamespaceMutationJournalSnapshot {
     degraded: bool,
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceMutationJournalChaosConfig {
     bucket: String,
@@ -795,30 +810,35 @@ fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_enabled_from_env() -> bool {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_bucket_from_env() -> Option<String> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET)
         .ok()
         .filter(|bucket| !bucket.is_empty())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_sequence_from_env() -> Option<u64> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_status_from_env() -> Option<NamespaceMutationJournalStatus> {
     std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS)
         .ok()
         .and_then(|value| NamespaceMutationJournalStatus::from_env_value(&value))
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutationJournalChaosConfig> {
     if !namespace_mutation_journal_chaos_enabled_from_env() {
         return None;
@@ -846,6 +866,7 @@ fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutatio
     })
 }
 
+#[cfg(any(test, feature = "list-chaos"))]
 fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceMutationJournalStatus) -> String {
     let mut key = String::with_capacity(bucket.len() + 1 + status.env_value().len());
     key.push_str(bucket);
@@ -854,6 +875,13 @@ fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceM
     key
 }
 
+/// Production no-op twin of the chaos injector: without `list-chaos` the
+/// injection point compiles to nothing (backlog#1832).
+#[cfg(not(any(test, feature = "list-chaos")))]
+#[inline]
+async fn maybe_apply_system_namespace_mutation_journal_chaos(_store: &ECStore, _bucket: &str, _default_sequence: u64) {}
+
+#[cfg(any(test, feature = "list-chaos"))]
 async fn maybe_apply_system_namespace_mutation_journal_chaos(store: &ECStore, bucket: &str, default_sequence: u64) {
     let Some(config) = list_objects_namespace_journal_chaos_config().await else {
         return;
@@ -3817,7 +3845,7 @@ impl ECStore {
         .await
     }
 
-    pub(crate) async fn inner_list_object_versions_for_lifecycle(
+    pub(crate) async fn list_object_versions_for_lifecycle(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,
@@ -9528,294 +9556,6 @@ mod test {
         walk_result_from_set_errors(&[None, Some(StorageError::DiskNotFound)])
             .expect("a partial outage with a healthy set must not fail the walk");
     }
-
-    // use std::sync::Arc;
-
-    // use crate::cache_value::metacache_set::list_path_raw;
-    // use crate::cache_value::metacache_set::ListPathRawOptions;
-    // use crate::disk::endpoint::Endpoint;
-    // use crate::disk::error::is_err_eof;
-    // use crate::disk::format::FormatV3;
-    // use crate::disk::new_disk;
-    // use crate::disk::DiskAPI;
-    // use crate::disk::DiskOption;
-    // use crate::disk::MetaCacheEntries;
-    // use crate::disk::MetaCacheEntry;
-    // use crate::disk::WalkDirOptions;
-    // use crate::layout::endpoints::EndpointServerPools;
-    // use crate::error::Error;
-    // use crate::metacache::writer::MetacacheReader;
-    // use crate::set_disk::SetDisks;
-    // use crate::store::list_objects::ListPathOptions;
-    // use crate::store::list_objects::WalkOptions;
-    // use crate::store::list_objects::WalkVersionsSortOrder;
-    // use futures::future::join_all;
-    // use rustfs_lock::namespace_lock::NsLockMap;
-    // use tokio::sync::broadcast;
-    // use tokio::sync::mpsc;
-    // use tokio::sync::RwLock;
-    // use uuid::Uuid;
-
-    // #[tokio::test]
-    // async fn test_walk_dir() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
-
-    //     let (rd, mut wr) = tokio::io::duplex(64);
-
-    //     let job = tokio::spawn(async move {
-    //         let opts = WalkDirOptions {
-    //             bucket: "dada".to_owned(),
-    //             base_dir: "".to_owned(),
-    //             recursive: true,
-    //             ..Default::default()
-    //         };
-
-    //         println!("walk opts {:?}", opts);
-    //         if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-    //             println!("walk_dir err {:?}", err);
-    //         }
-    //     });
-
-    //     let job2 = tokio::spawn(async move {
-    //         let mut mrd = MetacacheReader::new(rd);
-
-    //         loop {
-    //             match mrd.peek().await {
-    //                 Ok(res) => {
-    //                     if let Some(info) = res {
-    //                         println!("info {:?}", info.name)
-    //                     } else {
-    //                         break;
-    //                     }
-    //                 }
-    //                 Err(err) => {
-    //                     if is_err_eof(&err) {
-    //                         break;
-    //                     }
-
-    //                     println!("get err {:?}", err);
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     });
-    //     join_all(vec![job, job2]).await;
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_path_raw() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-
-    //     // let disk = match LocalDisk::new(&ep, false).await {
-    //     //     Ok(res) => res,
-    //     //     Err(err) => {
-    //     //         println!("LocalDisk::new err {:?}", err);
-    //     //         return;
-    //     //     }
-    //     // };
-
-    //     let (_, rx) = broadcast::channel(1);
-    //     let bucket = "dada".to_owned();
-    //     let forward_to = None;
-    //     let disks = vec![Some(disk)];
-    //     let fallback_disks = Vec::new();
-
-    //     list_path_raw(
-    //         rx,
-    //         ListPathRawOptions {
-    //             disks,
-    //             fallback_disks,
-    //             bucket,
-    //             path: "".to_owned(),
-    //             recursice: true,
-    //             forward_to,
-    //             min_disks: 1,
-    //             report_not_found: false,
-    //             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
-    //                 Box::pin(async move { println!("get entry: {}", entry.name) })
-    //             })),
-    //             partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<Error>]| {
-    //                 Box::pin(async move { println!("get entries: {:?}", entries) })
-    //             })),
-    //             finished: None,
-    //             ..Default::default()
-    //         },
-    //     )
-    //     .await
-    //     .unwrap();
-    // }
-
-    // #[tokio::test]
-    // async fn test_set_list_path() {
-    //     let mut ep = Endpoint::try_from("/Users/weisd/project/weisd/s3-rustfs/target/volume/test").unwrap();
-    //     ep.pool_idx = 0;
-    //     ep.set_idx = 0;
-    //     ep.disk_idx = 0;
-    //     ep.is_local = true;
-
-    //     let disk = new_disk(&ep, &DiskOption::default()).await.expect("init disk fail");
-    //     let _ = disk.set_disk_id(Some(Uuid::new_v4())).await;
-
-    //     let set = SetDisks {
-    //         lockers: Vec::new(),
-    //         locker_owner: String::new(),
-    //         ns_mutex: Arc::new(RwLock::new(NsLockMap::new(false))),
-    //         disks: RwLock::new(vec![Some(disk)]),
-    //         set_endpoints: Vec::new(),
-    //         set_drive_count: 1,
-    //         default_parity_count: 0,
-    //         set_index: 0,
-    //         pool_index: 0,
-    //         format: FormatV3::new(1, 1),
-    //     };
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = "dada".to_owned();
-
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     set.list_path(rx, opts, sender).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
-
-    // #[tokio::test]
-    //walk() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         ..Default::default()
-    //     };
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     store.list_merged(rx, opts, sender).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry.name)
-    //     }
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_path() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let bucket = "dada".to_owned();
-    //     let opts = ListPathOptions {
-    //         bucket,
-    //         recursive: true,
-    //         limit: 100,
-
-    //         ..Default::default()
-    //     };
-
-    //     let ret = store.list_path(&opts).await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
-
-    // #[tokio::test]
-    // async fn test_list_objects_v2() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     let ret = store.list_objects_v2("data", "", "", "", 100, false, "").await.unwrap();
-    //     println!("ret {:?}", ret);
-    // }
-
-    // #[tokio::test]
-    // async fn test_walk() {
-    //     let server_address = "localhost:9000";
-
-    //     let (endpoint_pools, _setup_type) = EndpointServerPools::from_volumes(
-    //         server_address,
-    //         vec!["/Users/weisd/project/weisd/s3-rustfs/target/volume/test".to_string()],
-    //     )
-    //     .unwrap();
-
-    //     let store = ECStore::new(server_address.to_string(), endpoint_pools.clone())
-    //         .await
-    //         .unwrap();
-
-    //     ECStore::init(store.clone()).await.unwrap();
-
-    //     let (_tx, rx) = broadcast::channel(1);
-
-    //     let bucket = ".rustfs.sys";
-    //     let prefix = "config/iam/sts/";
-
-    //     let (sender, mut recv) = mpsc::channel(10);
-
-    //     let opts = WalkOptions::default();
-
-    //     store.walk(rx, bucket, prefix, sender, opts).await.unwrap();
-
-    //     while let Some(entry) = recv.recv().await {
-    //         println!("get entry {:?}", entry)
-    //     }
-    // }
 
     #[tokio::test]
     async fn merge_entry_channels_produces_sorted_unique_output_from_two_channels() {

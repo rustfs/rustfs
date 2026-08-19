@@ -22,6 +22,8 @@
 //! bucket-metadata-sys OnceCell) — under `cargo nextest` each test runs
 //! in its own process so the OnceCell never collides.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::{
@@ -174,7 +176,7 @@ async fn enumerate_all_versions(heal_storage: &Arc<ECStoreHealStorage>, bucket: 
     let mut token: Option<String> = None;
     loop {
         let (page, next, truncated) = heal_storage
-            .list_objects_for_heal_page(bucket, "", token.as_deref())
+            .list_objects_for_heal_page(bucket, "", token.as_deref(), false)
             .await
             .expect("list_objects_for_heal_page failed");
         items.extend(page);
