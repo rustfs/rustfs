@@ -28,6 +28,7 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_DURABILITY_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
+use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -126,13 +127,14 @@ async fn authenticate_admin(req: &S3Request<Body>) -> S3Result<()> {
 
     let (cred, owner) = check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     validate_admin_request(
         &req.headers,
         &cred,
         owner,
         false,
         vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)],
-        None,
+        remote_addr,
     )
     .await?;
 
