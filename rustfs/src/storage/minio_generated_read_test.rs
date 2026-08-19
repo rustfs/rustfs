@@ -260,6 +260,57 @@ async fn reads_minio_generated_sse_kms_multipart_fixture() {
     assert_fixture_round_trip("sse-kms-multipart-8m", 8 * 1024 * 1024).await;
 }
 
+/// Read an SSE-C fixture, supplying the customer key the way a client does.
+///
+/// SSE-C needs no KMS at all — the key arrives on the request — so this path
+/// shares nothing with the managed-SSE reads above beyond the fixture loader.
+async fn read_ssec_fixture_plaintext(
+    encrypted: Vec<u8>,
+    object_info: ObjectInfo,
+    customer_key_b64: &str,
+    customer_key_md5_b64: &str,
+) -> Result<Vec<u8>, String> {
+    let object_size = object_info.size;
+    reset_sse_dek_provider();
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm"),
+        http::HeaderValue::from_static("AES256"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
+        http::HeaderValue::from_str(customer_key_b64).expect("fixture customer key is a header value"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+        http::HeaderValue::from_str(customer_key_md5_b64).expect("fixture customer key md5 is a header value"),
+    );
+
+    let resolver = SseObjectEncryptionResolver;
+    let (mut reader, offset, length) = GetObjectReader::new_with_resolver(
+        Box::new(Cursor::new(encrypted)),
+        None,
+        &object_info,
+        &ObjectOptions::default(),
+        &headers,
+        Some(&resolver),
+    )
+    .await
+    .map_err(|err| format!("construct GetObjectReader from MinIO SSE-C fixture: {err:?}"))?;
+
+    if offset != 0 || length != object_size {
+        return Err(format!("unexpected fixture range offset={offset} length={length} size={object_size}"));
+    }
+
+    let mut plaintext = Vec::new();
+    reader
+        .read_to_end(&mut plaintext)
+        .await
+        .map_err(|err| format!("read plaintext from MinIO SSE-C fixture: {err}"))?;
+    Ok(plaintext)
+}
+
 /// The interop claim must hold on the production key entry point, not only on
 /// the test-only injection channel every other case here uses.
 #[tokio::test]
@@ -272,6 +323,53 @@ async fn reads_minio_generated_sse_s3_fixture_through_production_master_key_env(
         .expect("fixture must restore through RUSTFS_SSE_S3_MASTER_KEY");
 
     assert_eq!(sha256_hex(&plaintext), expected_sha256);
+}
+
+/// SSE-C is the one managed shape needing no KMS: the customer supplies the key
+/// on every request, so this measures the read path alone.
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data"]
+async fn reads_minio_generated_sse_c_multipart_fixture() {
+    // The fixture lab's fixed SSE-C key; recorded in the case's request.json.
+    const SSEC_KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const SSEC_KEY_MD5_B64: &str = "tP/LI3N87DFaSk0aoqYgzg==";
+
+    let (object_info, encrypted, expected_sha256) = load_fixture_reader_input("sse-c-multipart-8m").await;
+
+    let plaintext = read_ssec_fixture_plaintext(encrypted, object_info, SSEC_KEY_B64, SSEC_KEY_MD5_B64)
+        .await
+        .expect("MinIO SSE-C fixture must restore with the customer key");
+
+    assert_eq!(sha256_hex(&plaintext), expected_sha256);
+}
+
+/// The read path skips the stored-MD5 comparison for MinIO SSE-C objects,
+/// which store no MD5. This holds the line that made that safe: the customer
+/// key is still proven by the object-key unseal, so a wrong key must fail even
+/// with nothing to compare it against.
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data"]
+async fn sse_c_wrong_customer_key_still_fails_without_a_stored_md5() {
+    // A well-formed 32-byte key that is not the one the fixture was sealed
+    // with, sent with its own correct MD5 so the request itself is valid.
+    const WRONG_KEY_B64: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const WRONG_KEY_MD5_B64: &str = "0YB4bMPPCf9SNlqiKmM0uQ==";
+
+    let (object_info, encrypted, expected_sha256) = load_fixture_reader_input("sse-c-multipart-8m").await;
+
+    let result = read_ssec_fixture_plaintext(encrypted, object_info, WRONG_KEY_B64, WRONG_KEY_MD5_B64).await;
+
+    match result {
+        Err(_) => {}
+        // Never reached today, and asserted rather than assumed: if a future
+        // change let a wrong key through, returning the real plaintext would be
+        // the worst possible outcome.
+        Ok(plaintext) => assert_ne!(
+            sha256_hex(&plaintext),
+            expected_sha256,
+            "a wrong SSE-C customer key must never restore the original plaintext"
+        ),
+    }
 }
 
 #[tokio::test]

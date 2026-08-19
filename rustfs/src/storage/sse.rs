@@ -2061,10 +2061,20 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
-    // Check for SSE-C encryption
+    // Check for SSE-C encryption.
+    //
+    // The stored customer-algorithm marker is what RustFS writes, but a
+    // MinIO-written object has only the internal sealed-key slot: MinIO keeps
+    // the customer algorithm on the request and synthesizes it back onto the
+    // response, never persisting it. Recognizing that slot as well is what lets
+    // a migrated SSE-C object be read at all; the customer key still has to be
+    // supplied, and is still checked against the stored MD5 below.
     if request
         .metadata
         .contains_key("x-amz-server-side-encryption-customer-algorithm")
+        || request
+            .metadata
+            .contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
     {
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
             (Some(k), Some(md5)) => (k, md5),
@@ -2078,7 +2088,21 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 
         // Verify that the provided key MD5 matches the stored MD5 for security
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
-        verify_ssec_key_match(key_md5, stored_md5)?;
+        // MinIO stores no customer-key MD5 — it keeps that header on the request
+        // and returns it on the response — so requiring one would make every
+        // migrated SSE-C object unreadable. Skipping the comparison when there is
+        // nothing to compare against does not weaken the check it performs: the
+        // stored MD5 is an early, friendlier rejection, while the key itself is
+        // proven by the object-key unseal below, whose AEAD fails on a wrong key.
+        // `sse_c_wrong_customer_key_still_fails_without_a_stored_md5` holds that
+        // line. Objects that *do* carry a stored MD5 are unaffected.
+        let minio_ssec_without_stored_md5 = stored_md5.is_none()
+            && request
+                .metadata
+                .contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER);
+        if !minio_ssec_without_stored_md5 {
+            verify_ssec_key_match(key_md5, stored_md5)?;
+        }
 
         let mut material = apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5).await?;
         material.customer_key_md5 = Some(key_md5.clone());
@@ -4739,6 +4763,43 @@ mod tests {
     }
 
     #[cfg(feature = "rio-v2")]
+    /// A stored customer-key MD5 must still be compared against the one the
+    /// request presents.
+    ///
+    /// The read path skips that comparison for MinIO SSE-C objects, which store
+    /// no MD5. Nothing pinned the check for objects that *do* store one —
+    /// disabling it outright left this file's 115 tests green — so a later
+    /// widening of that skip would have gone unnoticed. The mismatch has to be
+    /// refused here, at the request boundary, rather than surfacing later as a
+    /// decryption failure.
+    #[tokio::test]
+    async fn ssec_stored_md5_mismatch_is_refused_when_an_md5_is_stored() {
+        let key = SSECustomerKey::from(BASE64_STANDARD.encode([0x11u8; 32]));
+        let provided_md5 = SSECustomerKeyMD5::from(md5_base64(&[0x11u8; 32]));
+
+        let metadata = HashMap::from([
+            (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+            // A stored MD5 that belongs to a different key.
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), md5_base64(&[0x22u8; 32])),
+        ]);
+
+        let error = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&key),
+            sse_customer_key_md5: Some(&provided_md5),
+            principal: None,
+        })
+        .await
+        .expect_err("a stored MD5 that does not match the request must be refused");
+
+        assert!(
+            format!("{error:?}").contains("did not match"),
+            "expected the parameter-mismatch refusal, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_sse_kms_roundtrip_persists_and_uses_minio_context() {
         use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
