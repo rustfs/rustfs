@@ -471,8 +471,60 @@ fn resolve_data_movement_abort_result(
     ))
 }
 
-fn data_movement_stage_error(op_label: &str, stage: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
-    Error::other(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"))
+/// A data-movement stage failure that keeps the error it wrapped.
+///
+/// The rendered message is byte-identical to the `format!` this replaced, so
+/// logs and any message-matching callers are unaffected. What changes is that
+/// the original error stays reachable through `source()`, which is what lets
+/// the decommission loop classify by type instead of by substring
+/// (backlog#1827 T2).
+#[derive(Debug)]
+struct DataMovementStageError {
+    rendered: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for DataMovementStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.rendered)
+    }
+}
+
+impl std::error::Error for DataMovementStageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, object: &str, err: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object}: {err}");
+    Error::other(DataMovementStageError {
+        rendered,
+        source: Box::new(err),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn data_movement_stage_error_for_test(op_label: &str, stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+    data_movement_stage_error(op_label, stage, bucket, object, err)
+}
+
+/// Recover the error a [`data_movement_stage_error`] wrapped, if this is one.
+///
+/// `Error::other` boxes through `std::io::Error`, so the chain is
+/// `StorageError::Io` -> `DataMovementStageError` -> the original error.
+pub(crate) fn data_movement_stage_source(err: &Error) -> Option<&Error> {
+    let Error::Io(io_err) = err else {
+        return None;
+    };
+    io_err
+        .get_ref()?
+        .downcast_ref::<DataMovementStageError>()?
+        .source
+        .downcast_ref::<Error>()
 }
 
 fn schedule_data_movement_multipart_abort_cleanup(
@@ -1863,6 +1915,40 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("rebalance_object: put_object failed for bucket-a/object-a"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+    }
+
+    #[test]
+    fn stage_error_renders_exactly_as_the_format_it_replaced() {
+        // The wrapper gained a source; its message must not have moved, or log
+        // scrapers and any message-matching caller would break (backlog#1827 T2).
+        // `Error::other` renders through `StorageError::Io`, which prefixes
+        // "Io error: " — that was true of the `format!` this replaced too, so
+        // the full string is what must stay stable.
+        let err = data_movement_stage_error("rebalance_object", "put_object", "bucket-a", "object-a", Error::SlowDown);
+        assert_eq!(
+            err.to_string(),
+            format!("Io error: rebalance_object: put_object failed for bucket-a/object-a: {}", Error::SlowDown)
+        );
+        assert_eq!(
+            err.to_string(),
+            Error::other(format!("rebalance_object: put_object failed for bucket-a/object-a: {}", Error::SlowDown)).to_string()
+        );
+    }
+
+    #[test]
+    fn stage_error_keeps_the_wrapped_error_recoverable() {
+        for original in [Error::DiskFull, Error::StorageFull, Error::FileNotFound, Error::SlowDown] {
+            let wrapped =
+                data_movement_stage_error("decommission_object", "put_object", "bucket-a", "object-a", original.clone());
+            let recovered = data_movement_stage_source(&wrapped).expect("the wrapped error must be recoverable");
+            assert_eq!(recovered.to_string(), original.to_string());
+        }
+    }
+
+    #[test]
+    fn stage_source_ignores_errors_it_did_not_wrap() {
+        assert!(data_movement_stage_source(&Error::DiskFull).is_none());
+        assert!(data_movement_stage_source(&Error::other("plain io error")).is_none());
     }
 
     #[test]
