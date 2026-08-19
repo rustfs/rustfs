@@ -48,6 +48,11 @@ mod replacement_privileged_e2e_test;
 #[cfg(test)]
 mod degraded_read_eof_regression_test;
 
+// rustfs#4784: a mid-stream GET failure must be reportable from the source
+// server's log alone — naming the object, at the default log level.
+#[cfg(test)]
+mod get_stream_failure_observability_test;
+
 // backlog#1183: GET codec-streaming fast path must be byte/header identical to
 // the legacy duplex path before its rollout gates can be flipped on by default.
 #[cfg(test)]

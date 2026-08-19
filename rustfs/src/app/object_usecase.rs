@@ -1056,7 +1056,20 @@ pin_project! {
         remaining: usize,
         emitted: usize,
         expected: usize,
+        // Diagnostic-only identity for the body this stream is serving. Unset in
+        // unit tests that drive the stream over a bare reader; every production
+        // body carries it via `with_diagnostics`.
+        diagnostics: GetObjectReaderStreamDiagnostics,
     }
+}
+
+/// Object identity carried alongside a streaming GET body purely so a
+/// mid-stream failure names the object it happened on.
+#[derive(Clone, Default)]
+struct GetObjectReaderStreamDiagnostics {
+    bucket: String,
+    object: String,
+    request_id: String,
 }
 
 impl MemoryTrackedBytesStream {
@@ -1107,7 +1120,18 @@ where
             remaining,
             emitted: 0,
             expected: remaining,
+            diagnostics: GetObjectReaderStreamDiagnostics::default(),
         }
+    }
+
+    /// Attach the object identity a failed body should be reported against.
+    fn with_diagnostics(mut self, bucket: &str, object: &str, request_id: &str) -> Self {
+        self.diagnostics = GetObjectReaderStreamDiagnostics {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            request_id: request_id.to_string(),
+        };
+        self
     }
 }
 
@@ -1569,12 +1593,29 @@ where
                     *this.emitted,
                     *this.remaining,
                 );
-                #[cfg(feature = "tracing-chunk-debug")]
-                tracing::error!(
-                    emitted = *this.emitted,
+                // The inner GetObjectStreamingReader is what normally reports a
+                // short body, so reaching this arm means the reader signalled a
+                // clean EOF while this layer still owed bytes against an
+                // already-committed Content-Length. That disagreement is a data
+                // plane fault, not chunk noise: log it unconditionally so the
+                // truncated object is named in the operator's log rather than
+                // only in a metric counter (issue #4784).
+                error!(
+                    event = EVENT_GET_OBJECT_STREAM_BODY,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    bucket = %this.diagnostics.bucket,
+                    object = %this.diagnostics.object,
+                    request_id = %this.diagnostics.request_id,
+                    size_bucket = get_object_stream_size_bucket(*this.expected),
                     expected = *this.expected,
+                    emitted = *this.emitted,
+                    remaining = *this.remaining,
+                    strategy = this.strategy,
+                    buffer_source = this.buffer_source,
+                    state = "reader_stream_short_eof",
                     error = %err,
-                    "GetObject ReaderStream ended before expected length"
+                    "GetObject reader stream ended before the committed content length"
                 );
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
@@ -1590,10 +1631,17 @@ where
                     *this.emitted,
                     *this.remaining,
                 );
+                // Deliberately not logged at warn here: every production body
+                // wraps a GetObjectStreamingReader, and that layer already
+                // reports this same error once with `state = "read_failed"` and
+                // the object identity. A second unconditional line per failed
+                // GET would read as two distinct faults. The chunk-debug build
+                // still gets this layer's view of the same error.
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
                     expected = *this.expected,
+                    error_class = error_class,
                     error = %err,
                     "GetObject ReaderStream returned error"
                 );
@@ -1646,8 +1694,12 @@ where
 
 struct GetObjectStreamingReader<R> {
     inner: Option<R>,
-    // request_id + optional content_range are only used for diagnostic correlation and
-    // failure bucketing; they do not alter stream behavior.
+    // bucket/object + request_id + optional content_range are only used for diagnostic
+    // correlation and failure bucketing; they do not alter stream behavior. The object
+    // identity is what turns a mid-stream failure into an actionable report: a request_id
+    // alone cannot tell an operator which object reads short (issue #4784).
+    bucket: String,
+    object: String,
     request_id: String,
     content_range: Option<String>,
     expected: usize,
@@ -1666,8 +1718,8 @@ impl<R> GetObjectStreamingReader<R> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         inner: R,
-        _bucket: &str,
-        _key: &str,
+        bucket: &str,
+        key: &str,
         request_id: &str,
         content_range: Option<String>,
         expected: usize,
@@ -1677,6 +1729,8 @@ impl<R> GetObjectStreamingReader<R> {
     ) -> Self {
         Self {
             inner: Some(inner),
+            bucket: bucket.to_string(),
+            object: key.to_string(),
             request_id: request_id.to_string(),
             content_range,
             expected,
@@ -1817,6 +1871,8 @@ impl<R> GetObjectStreamingReader<R> {
                 event = EVENT_GET_OBJECT_STREAM_BODY,
                 component = LOG_COMPONENT_APP,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
+                bucket = %self.bucket,
+                object = %self.object,
                 request_id = %self.request_id,
                 range = %self.content_range.as_deref().unwrap_or("full"),
                 size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1853,6 +1909,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1871,10 +1929,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         self.timer = None;
                         let failure_reason = Self::classify_read_error(&error);
                         self.finish_err();
-                        warn!(
+                        error!(
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1916,6 +1976,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                                         event = EVENT_GET_OBJECT_STREAM_BODY,
                                         component = LOG_COMPONENT_APP,
                                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                                        bucket = %self.bucket,
+                                        object = %self.object,
                                         request_id = %self.request_id,
                                         range = %self.content_range.as_deref().unwrap_or("full"),
                                         size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1956,10 +2018,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             self.begin_resume(error);
                             continue;
                         }
-                        warn!(
+                        error!(
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1990,10 +2054,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     let failure_reason = Self::classify_read_error(&err);
                     self.timer = None;
                     self.finish_err();
-                    warn!(
+                    error!(
                         event = EVENT_GET_OBJECT_STREAM_BODY,
                         component = LOG_COMPONENT_APP,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                        bucket = %self.bucket,
+                        object = %self.object,
                         request_id = %self.request_id,
                         range = %self.content_range.as_deref().unwrap_or("full"),
                         size_bucket = get_object_stream_size_bucket(self.expected),
@@ -2029,6 +2095,8 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
+            bucket = %self.bucket,
+            object = %self.object,
             request_id = %self.request_id,
             range = %self.content_range.as_deref().unwrap_or("full"),
             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -4303,7 +4371,8 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
-        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
+        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
+            .with_diagnostics(bucket, key, request_id);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -16326,7 +16395,12 @@ mod tests {
         assert_eq!(body, vec![b'a'; 65]);
     }
 
+    // Serial with the capture test below: both drive the same short-EOF log
+    // callsite, and `tracing` caches callsite interest process-wide. Running
+    // this one concurrently on a thread with no subscriber re-caches that
+    // callsite as "never interested" and blinds the capture.
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_object_reader_stream_errors_on_short_eof() {
         let stream = GetObjectReaderStream::new(
             std::io::Cursor::new(b"he".to_vec()),
@@ -16347,6 +16421,134 @@ mod tests {
             err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
             Some(std::io::ErrorKind::UnexpectedEof)
         );
+    }
+
+    /// Collects the structured fields of every event emitted while installed,
+    /// so a test can assert what an operator would actually read in the log
+    /// rather than only that an error value was returned.
+    type CapturedFieldMap = std::collections::HashMap<String, String>;
+    type CapturedEventLog = Arc<Mutex<Vec<CapturedFieldMap>>>;
+
+    struct CapturedEvents(CapturedEventLog);
+
+    struct CapturedFields(CapturedFieldMap);
+
+    impl tracing::field::Visit for CapturedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let mut fields = CapturedFields(CapturedFieldMap::new());
+            event.record(&mut fields);
+            self.0.lock().expect("captured events should not poison").push(fields.0);
+        }
+    }
+
+    fn capture_events() -> (CapturedEventLog, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::{Registry, prelude::*};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(CapturedEvents(Arc::clone(&captured)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // `tracing` caches per-callsite interest process-wide, so a subscriber
+        // installed by a test running in parallel can leave the log sites below
+        // cached as "never interested" and this capture would silently see
+        // nothing. Force the callsites to re-ask the subscriber we just
+        // installed.
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard)
+    }
+
+    fn find_stream_body_event(captured: &CapturedEventLog, state: &str) -> CapturedFieldMap {
+        let events = captured.lock().expect("captured events should not poison");
+        events
+            .iter()
+            .find(|fields| fields.get("state").is_some_and(|value| value == state))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a `{state}` streaming body failure must be logged, not only counted in a metric. \
+                     Captured {} event(s): {:?}",
+                    events.len(),
+                    events
+                )
+            })
+            .clone()
+    }
+
+    /// rustfs#4784: a GET body that ends short of its committed Content-Length
+    /// is the fault that breaks every downstream copier (replication, site
+    /// replication, `rclone sync`), yet this layer only fed a metric counter —
+    /// its log line was compiled out unless the `tracing-chunk-debug` feature
+    /// was on, so operators saw nothing on the source side.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_reader_stream_short_eof_names_the_object() {
+        let (captured, _guard) = capture_events();
+
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(b"he".to_vec()),
+            64,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        )
+        .with_diagnostics("restic-paperless", "index/41b5a4c2344edb90", "req-reader-stream-short-eof");
+
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("short reader should fail the streaming body");
+
+        let event = find_stream_body_event(&captured, "reader_stream_short_eof");
+        assert_eq!(event.get("bucket").map(String::as_str), Some("restic-paperless"));
+        assert_eq!(event.get("object").map(String::as_str), Some("index/41b5a4c2344edb90"));
+        assert_eq!(event.get("request_id").map(String::as_str), Some("req-reader-stream-short-eof"));
+        assert_eq!(event.get("expected").map(String::as_str), Some("5"));
+        assert_eq!(event.get("emitted").map(String::as_str), Some("2"));
+        assert_eq!(event.get("remaining").map(String::as_str), Some("3"));
+    }
+
+    /// The inner reader already logged mid-stream failures, but only under a
+    /// request_id — which cannot be resolved back to an object once the request
+    /// is gone. Without the identity the report in #4784 was unactionable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_streaming_reader_short_eof_names_the_object() {
+        use tokio::io::AsyncReadExt;
+
+        let (captured, _guard) = capture_events();
+
+        let mut reader = GetObjectStreamingReader::new(
+            std::io::Cursor::new(b"short".to_vec()),
+            "restic-paperless",
+            "index/41b5a4c2344edb90",
+            "req-streaming-short-eof",
+            None,
+            10,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::tracked(GetObjectGuard::new()),
+            None,
+        );
+
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("short body under a larger Content-Length must fail the stream");
+
+        let event = find_stream_body_event(&captured, "short_eof");
+        assert_eq!(event.get("bucket").map(String::as_str), Some("restic-paperless"));
+        assert_eq!(event.get("object").map(String::as_str), Some("index/41b5a4c2344edb90"));
+        assert_eq!(event.get("request_id").map(String::as_str), Some("req-streaming-short-eof"));
     }
 
     #[test]
