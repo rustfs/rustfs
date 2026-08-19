@@ -90,6 +90,8 @@ pub struct LockLeaseInfo {
     pub owner: String,
     /// Original acquisition time. Refreshes do not change this value.
     pub acquired_at: SystemTime,
+    /// Opaque guard identity used to reject stale diagnostic snapshots.
+    pub guard_id: Option<u64>,
     /// Remaining lease duration derived from the monotonic lease deadline.
     pub remaining_ttl: Duration,
 }

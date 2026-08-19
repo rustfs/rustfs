@@ -45,7 +45,6 @@ pub struct VersionInfo {
 }
 
 /// Update check result
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCheckResult {
     /// Whether update is available
@@ -91,7 +90,6 @@ impl VersionChecker {
     }
 
     /// Create version checker with custom configuration
-    #[allow(dead_code)]
     pub fn with_config(url: String, timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -175,7 +173,6 @@ pub async fn check_updates() -> Result<UpdateCheckResult, UpdateCheckError> {
 }
 
 /// Update check with custom URL
-#[allow(dead_code)]
 pub async fn check_updates_with_url(url: String) -> Result<UpdateCheckResult, UpdateCheckError> {
     let checker = VersionChecker::with_config(url, Duration::from_secs(10));
     checker.check_for_updates().await
