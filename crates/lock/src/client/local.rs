@@ -48,6 +48,7 @@ pub struct LocalClient {
 struct LocalGuardEntry {
     guard: FastLockGuard,
     acquired_at: SystemTime,
+    last_refreshed: SystemTime,
     expires_at: SystemTime,
     deadline: Instant,
     ttl: Duration,
@@ -60,6 +61,7 @@ impl LocalGuardEntry {
         Self {
             guard,
             acquired_at,
+            last_refreshed: acquired_at,
             expires_at: acquired_at.checked_add(ttl).unwrap_or(acquired_at),
             deadline: monotonic_now.checked_add(ttl).unwrap_or(monotonic_now),
             ttl,
@@ -74,6 +76,7 @@ impl LocalGuardEntry {
         let now = SystemTime::now();
         let monotonic_now = Instant::now();
         self.expires_at = now.checked_add(self.ttl).unwrap_or(now);
+        self.last_refreshed = now;
         self.deadline = monotonic_now.checked_add(self.ttl).unwrap_or(monotonic_now);
     }
 }
@@ -347,7 +350,7 @@ impl LockClient for LocalClient {
                 owner: entry.guard.owner().to_string(),
                 acquired_at: entry.acquired_at,
                 expires_at: entry.expires_at,
-                last_refreshed: SystemTime::now(),
+                last_refreshed: entry.last_refreshed,
                 metadata: LockMetadata::default(),
                 priority: LockPriority::Normal,
                 wait_start_time: None,
@@ -371,6 +374,7 @@ impl LockClient for LocalClient {
                 owner: entry.guard.owner().to_string(),
                 acquired_at: entry.acquired_at,
                 remaining_ttl: entry.deadline.saturating_duration_since(Instant::now()),
+                guard_id: (!entry.guard.is_disabled()).then(|| entry.guard.guard_id()),
             }));
         }
         leases
@@ -484,6 +488,12 @@ mod tests {
                 .success
         );
         let initial = client.list_lock_leases().await.pop().expect("acquired lock should be listed");
+        let initial_status = client
+            .check_status(&lock_id)
+            .await
+            .expect("initial lock status should be readable")
+            .expect("newly acquired lock should remain held");
+        assert_eq!(initial_status.last_refreshed, initial_status.acquired_at);
 
         tokio::time::advance(Duration::from_secs(20)).await;
         let aging = client
@@ -492,6 +502,13 @@ mod tests {
             .pop()
             .expect("held lock should remain listed before refresh");
         assert_eq!(aging.remaining_ttl, Duration::from_secs(10));
+        let aging_status = client
+            .check_status(&lock_id)
+            .await
+            .expect("aging lock status should be readable")
+            .expect("aging lock should remain held");
+        assert_eq!(aging_status.last_refreshed, initial_status.last_refreshed);
+
         assert!(client.refresh(&lock_id).await.expect("refresh should return a result"));
 
         let refreshed = client
@@ -506,7 +523,9 @@ mod tests {
             .expect("refreshed lock should remain held");
 
         assert_eq!(refreshed.acquired_at, initial.acquired_at);
+        assert_eq!(refreshed.guard_id, initial.guard_id);
         assert_eq!(status.acquired_at, initial.acquired_at);
+        assert!(status.last_refreshed > initial_status.last_refreshed);
         assert_eq!(refreshed.remaining_ttl, Duration::from_secs(30));
 
         tokio::time::advance(Duration::from_secs(30)).await;
