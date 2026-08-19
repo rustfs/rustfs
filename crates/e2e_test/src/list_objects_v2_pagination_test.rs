@@ -30,7 +30,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::collections::HashSet;
     use tracing::info;
 
@@ -61,7 +60,6 @@ mod tests {
     /// Test for Issue #2775: continuation forwarding must not
     /// skip a child directory when the prefix component repeats in the key.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_repeated_prefix_continuation() {
         init_logging();
         info!("Starting test: ListObjectsV2 repeated-prefix continuation");
@@ -187,7 +185,6 @@ mod tests {
     /// This is the core bug from issue #1596: the server was returning
     /// IsTruncated=true even when all objects fit within the requested max_keys.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_not_truncated_when_all_objects_returned() {
         init_logging();
         info!("Starting test: ListObjectsV2 should not be truncated when all objects fit within max_keys");
@@ -252,7 +249,6 @@ mod tests {
     /// 2. NextContinuationToken is returned (not NextMarker)
     /// 3. Using ContinuationToken fetches the remaining objects
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_pagination_with_continuation_token() {
         init_logging();
         info!("Starting test: ListObjectsV2 pagination with continuation token");
@@ -394,7 +390,6 @@ mod tests {
     /// Edge case: when max_keys exactly equals the number of objects,
     /// IsTruncated should be false.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_max_keys_equals_object_count() {
         init_logging();
         info!("Starting test: ListObjectsV2 with max_keys equal to object count");
@@ -455,7 +450,6 @@ mod tests {
     ///
     /// Edge case: IsTruncated should be false for empty bucket.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_empty_bucket() {
         init_logging();
         info!("Starting test: ListObjectsV2 with empty bucket");
@@ -495,7 +489,6 @@ mod tests {
 
     /// Test ListObjectsV2 caps max_keys above the service limit and still paginates.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_max_keys_above_limit_returns_token() {
         init_logging();
         info!("Starting test: ListObjectsV2 with max_keys above limit");
@@ -563,7 +556,6 @@ mod tests {
     /// S3 semantics: when max_keys is 0, the response should include no objects
     /// and IsTruncated should be false.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_max_keys_zero() {
         init_logging();
         info!("Starting test: ListObjectsV2 with max_keys=0");
@@ -620,7 +612,6 @@ mod tests {
     /// With max_keys=1000, all 5 visible results (3 prefixes + 2 objects) fit in one
     /// page, so IsTruncated must be false even though raw entry count is much larger.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_delimiter_collapsed_prefix_no_false_truncation() {
         init_logging();
         info!("Starting test: ListObjectsV2 delimiter collapsed-prefix no false truncation");
@@ -744,7 +735,6 @@ mod tests {
     /// Each page returns up to 50 CommonPrefixes. The server must correctly set
     /// IsTruncated and provide a valid continuation token across all pages.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_delimiter_small_page_traverses_all() {
         init_logging();
         info!("Starting test: ListObjectsV2 delimiter small page traverses all keys");
@@ -867,7 +857,6 @@ mod tests {
     /// but after delimiter collapse only 10 CommonPrefixes are visible (10 < 1000).
     /// IsTruncated must be false since there are no additional visible results.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_raw_exceeds_maxkeys_but_visible_below() {
         init_logging();
         info!("Starting test: ListObjectsV2 raw > MaxKeys but visible < MaxKeys after collapse");
@@ -970,7 +959,6 @@ mod tests {
     /// This complements test_list_objects_v2_max_keys_above_limit_returns_token which
     /// tests the non-delimiter case.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_maxkeys_above_limit_with_delimiter() {
         init_logging();
         info!("Starting test: ListObjectsV2 MaxKeys above limit with delimiter");
@@ -1041,7 +1029,6 @@ mod tests {
     /// the next page: with keys `a`, `a.txt`, `zz` and max_keys=1, page 2
     /// returned `zz` and `a.txt` was never listed.
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_continuation_keeps_keys_after_marker_stem() {
         init_logging();
         info!("Starting test: continuation must not skip keys sorting below the cursor tag");
