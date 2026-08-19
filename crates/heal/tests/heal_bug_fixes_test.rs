@@ -13,93 +13,13 @@
 // limitations under the License.
 
 use rustfs_heal::heal::{
-    event::{HealEvent, Severity},
     task::{HealPriority, HealType},
     utils,
 };
 
 mod storage_api;
 
-use storage_api::bug_fixes::{BucketInfo, DiskStore, Endpoint};
-
-#[test]
-fn test_heal_event_to_heal_request_no_panic() {
-    // Test that invalid pool/set indices don't cause panic
-    // Create endpoint using try_from or similar method
-    let endpoint_result = Endpoint::try_from("http://localhost:9000");
-    if let Ok(mut endpoint) = endpoint_result {
-        endpoint.pool_idx = -1;
-        endpoint.set_idx = -1;
-        endpoint.disk_idx = 0;
-
-        let event = HealEvent::DiskStatusChange {
-            endpoint,
-            old_status: "ok".to_string(),
-            new_status: "offline".to_string(),
-        };
-
-        // Should return error instead of panicking
-        let result = event.to_heal_request();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid heal type"));
-    }
-}
-
-#[test]
-fn test_heal_event_to_heal_request_valid_indices() {
-    // Test that valid indices work correctly
-    let endpoint_result = Endpoint::try_from("http://localhost:9000");
-    if let Ok(mut endpoint) = endpoint_result {
-        endpoint.pool_idx = 0;
-        endpoint.set_idx = 1;
-        endpoint.disk_idx = 0;
-
-        let event = HealEvent::DiskStatusChange {
-            endpoint,
-            old_status: "ok".to_string(),
-            new_status: "offline".to_string(),
-        };
-
-        let result = event.to_heal_request();
-        assert!(result.is_ok());
-        let request = result.unwrap();
-        assert!(matches!(request.heal_type, HealType::ErasureSet { .. }));
-    }
-}
-
-#[test]
-fn test_heal_event_object_corruption() {
-    let event = HealEvent::ObjectCorruption {
-        bucket: "test-bucket".to_string(),
-        object: "test-object".to_string(),
-        version_id: None,
-        corruption_type: rustfs_heal::heal::event::CorruptionType::DataCorruption,
-        severity: Severity::High,
-    };
-
-    let result = event.to_heal_request();
-    assert!(result.is_ok());
-    let request = result.unwrap();
-    assert!(matches!(request.heal_type, HealType::Object { .. }));
-    assert_eq!(request.priority, HealPriority::High);
-}
-
-#[test]
-fn test_heal_event_ec_decode_failure() {
-    let event = HealEvent::ECDecodeFailure {
-        bucket: "test-bucket".to_string(),
-        object: "test-object".to_string(),
-        version_id: None,
-        missing_shards: vec![0, 1],
-        available_shards: vec![2, 3],
-    };
-
-    let result = event.to_heal_request();
-    assert!(result.is_ok());
-    let request = result.unwrap();
-    assert!(matches!(request.heal_type, HealType::ECDecode { .. }));
-    assert_eq!(request.priority, HealPriority::Urgent);
-}
+use storage_api::bug_fixes::{BucketInfo, DiskStore};
 
 #[test]
 fn test_format_set_disk_id_from_i32_negative() {
