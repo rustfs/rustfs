@@ -916,7 +916,7 @@ fn cluster_peer_health_keys() -> Vec<String> {
 mod tests {
     use super::*;
     use metrics::with_local_recorder;
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -1308,11 +1308,47 @@ mod tests {
     }
 
     #[test]
-    fn msgpack_json_fallback_counter_records_without_panicking() {
-        // Smoke test: the counter accepts both directions and a static message label.
+    fn msgpack_json_fallback_counter_separates_the_two_directions() {
+        // Previously a smoke test that asserted nothing; the counter carries no
+        // in-struct total, so the emission itself is what has to be checked
+        // (rustfs/backlog#1836).
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
         let metrics = InternodeMetrics::default();
-        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
-        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+        });
+
+        let observed: Vec<(String, String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL)
+            .map(|(composite, _, _, value)| {
+                let labels: HashMap<String, String> = composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                let count = match value {
+                    DebugValue::Counter(count) => count,
+                    other => panic!("fallback total must be a counter, got {other:?}"),
+                };
+                (
+                    labels.get(DIRECTION_LABEL).cloned().unwrap_or_default(),
+                    labels.get(MESSAGE_LABEL).cloned().unwrap_or_default(),
+                    count,
+                )
+            })
+            .collect();
+
+        // Each direction/message pair is its own series, so a regression that
+        // dropped a label would collapse these into one row.
+        assert_eq!(observed.len(), 2, "each direction must land in its own series: {observed:?}");
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_REQUEST.to_string(), "FileInfo".to_string(), 1)));
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_RESPONSE.to_string(), "RawFileInfo".to_string(), 1)));
     }
 
     #[test]
