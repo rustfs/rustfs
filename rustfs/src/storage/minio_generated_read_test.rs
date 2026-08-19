@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use super::sse::SseObjectEncryptionResolver;
+use super::sse::{SseObjectEncryptionResolver, reset_sse_dek_provider};
 use super::storage_api::ecstore_test_support::{
     DiskAPI as _, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
 };
@@ -130,6 +130,13 @@ async fn load_fixture_reader_input(case_id: &str) -> (ObjectInfo, Vec<u8>, Strin
 
 async fn read_fixture_plaintext(encrypted: Vec<u8>, object_info: ObjectInfo, kms_key_b64: String) -> Result<Vec<u8>, String> {
     let object_size = object_info.size;
+
+    // The DEK provider is cached process-wide once built, so without this reset
+    // a case that ran earlier in the same binary keeps serving its master key to
+    // every later case — which silently turned the wrong-key negative below into
+    // a test that could not fail. Reset before each read so the provider is
+    // built from the key this case actually configured.
+    reset_sse_dek_provider();
 
     async_with_vars(
         [
