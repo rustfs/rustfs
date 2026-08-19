@@ -400,6 +400,13 @@ pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
     names
 }
 
+/// Test-only cache reset; the production cache has no invalidation hook
+/// because the TTL is its only refresh path.
+#[cfg(test)]
+fn reset_tier_name_cache_for_test() {
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = None;
+}
+
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
     ecstore_expiry_state_handle().write().await.enqueue_free_version(oi);
 }
@@ -593,6 +600,20 @@ impl ScannerConfigObjectDelete for ECStore {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn runtime_tier_names_serves_cached_arc_within_ttl() {
+        reset_tier_name_cache_for_test();
+        // The tier config manager is unconfigured in unit tests, so the
+        // first call populates the cache from an empty tier list...
+        let first = runtime_tier_names().await;
+        assert!(first.is_empty());
+        // ...and a second call within the TTL must return the cached Arc
+        // (pointer-equal) without re-reading the manager.
+        let second = runtime_tier_names().await;
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 
     #[test]
     #[serial]
