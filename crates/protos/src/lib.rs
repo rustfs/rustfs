@@ -2433,7 +2433,7 @@ mod tests {
                 json_field: "opts",
                 bin_field: "opts_bin",
             },
-            json_encoder: "let opts_str = compat_json(opts)?;",
+            json_encoder: "let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));",
             policy: RequestJsonPolicy::MsgpackOnlyEligible,
         },
         RequestCompatSendSite {
