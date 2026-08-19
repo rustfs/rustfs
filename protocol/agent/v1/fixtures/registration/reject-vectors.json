@@ -1,0 +1,814 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "registration",
+    "fixture": "reject-vectors",
+    "description": "Every rejection the registration transcript exists to produce. Except where a vector says otherwise, each one is the first accept vector with exactly one input substituted, so the field that changed is the field that caused the rejection. stage names the frozen check that refuses it. verifiesMathematically is what a lenient verifier gets: one that accepts either base64 alphabet with or without padding, takes DER or fixed-width r||s, and asks its ECDSA library whether the numbers work out over serverTranscript under the key inside the presented certificate request. A vector that is rejected while verifiesMathematically is true is a vector the library alone would have accepted, and is the reason the rule and not the library decides. null means there was no usable key to ask with.",
+    "vectors": [
+        {
+            "name": "protocol major version the exchange does not support",
+            "stage": "protocolVersion",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The bytes are the accepted exchange untouched. protocol/agent/v1/authentication.md already owns this rejection and it happens before anything here is parsed, which is why the proof still verifies.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v2",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "UNSUPPORTED_PROTOCOL",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "malleated high-S proof over the accepted transcript",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The pair (r, n - s) of the accepted proof. Every ECDSA library verifies it, so the encoding rule and not the library has to refuse it.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-vCuYrhTSEzwQbRldM3mXMgun6ghSOPBl1P9zBV6GPKnA"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_NOT_CANONICAL",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "DER encoded proof",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The same r and s in ASN.1. This surface has exactly one signature encoding.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "MEUCIQCJQtZ-rcHMlDaYioWRmiY8cBdqFaNtQ_URM7woEhGv6wIgPUZ1HbLezD_5LmosyGaM3wJoWiiDiJgno8KabRP_WrU"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_MALFORMED",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "padded base64url proof",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The same 64 octets with = padding. Two spellings of one proof would make the proof useless as an exchange identity.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ=="
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_MALFORMED",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "standard base64 alphabet proof",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Unpadded, right length, wrong alphabet. Whether it is even distinguishable from base64url depends on the bytes, which is exactly why the alphabet is fixed rather than sniffed.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr+s9RnUdst7MP/kuaizIZozfAmhaKIOImCejwpptE/9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_MALFORMED",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "truncated proof",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Sixty octets. Left-padding it back to 64 would change r, so a verifier rejects rather than repairs.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwppt"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_MALFORMED",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof whose r and s are both zero",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Well formed in length and alphabet, out of range in value.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "SIGNATURE_MALFORMED",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof declaring ES384",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The value is the accepted proof. algorithm is a closed enumeration, so an unrecognised value is refused rather than ignored in favour of what the bytes look like.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES384",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "UNSUPPORTED_ALGORITHM",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "proof declaring none",
+            "stage": "encoding",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The JWS \"none\" downgrade, refused before any key is loaded.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "none",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "UNSUPPORTED_ALGORITHM",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "certificate request carrying a P-384 key",
+            "stage": "certificateRequest",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "A structurally valid, correctly self-signed PKCS#10 whose key is on the wrong curve. ADR 0008 fixes P-256 for the device identity and this surface may not widen it.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBhDCCAQoCAQAwLzEtMCsGA1UEAwwkMDE5OGY0YjAtOGIwMC03ZDgwLTk0OTEtOWZhMGIxYzJkM2U3MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEK8Kel2qfLdRNZi5vrCirhsFMQXe89k2TE4gwd4oQ0EOdGEQNZTbesxTdxDmNJ47urHFS9+uw4WwGfgV5yn8jtSX2ciwSpOVW7KlZryHkvsDG5yjk81iUuBasjQlirXxsoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNoADBlAjEA8xjrA4XsOUjpmohfjygdkYBo6pqFQGDYGc9h3RBGRwgGiDkECS1B/WYEAZ43GOheAjB4YnNDjfRtDyRGG2xOnXvFO+KmNWeA97lO7mr3FiHiTsIE2B3+8OnXQ3mGl9X7gak=",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:buDezBlPJr91rBBKJQ7QiTC7uHeOhqO0ye0u03jPD_Q\n",
+            "serverTranscriptSha256": "a7af29202bf52b96b4f2dd208a670fdd411e801c8c15ab89aac88ad54d0b6a6a",
+            "expected": {
+                "accepted": false,
+                "reason": "DEVICE_KEY_UNSUPPORTED",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "certificate request whose self-signature was altered",
+            "stage": "certificateRequest",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "One octet of the PKCS#10 signature flipped. The structure parses and the key is intact, so only actually checking the self-signature catches it.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXN",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:9hgfdYlj31WfxakroWSOLY5A2aW3VmsCj2DQPzo9GC4\n",
+            "serverTranscriptSha256": "212d742af9dc4846d2b29513e740a111d879da232034c767d7af73f9b15d6312",
+            "expected": {
+                "accepted": false,
+                "reason": "CERTIFICATE_REQUEST_MALFORMED",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "certificate request that is not DER at all",
+            "stage": "certificateRequest",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Arbitrary octets. They still have a SHA-256 and therefore still produce a transcript, which is why the certificate request is checked before the proof rather than after it.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "dGhpcyBpcyBub3QgYSBQS0NTIzEwIGNlcnRpZmljYXRlIHJlcXVlc3Q=",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:vrub5r3pd54hnKvH9kBvkfWy2OR6nT5GhNSVfG2D6s4\n",
+            "serverTranscriptSha256": "9e9abfa9bdbca21c754065f1a9a3a129305cba692df4beaaaf3f996677e569a1",
+            "expected": {
+                "accepted": false,
+                "reason": "CERTIFICATE_REQUEST_MALFORMED",
+                "verifiesMathematically": null
+            }
+        },
+        {
+            "name": "replay of an accepted exchange against the token it already spent",
+            "stage": "registrationToken",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Byte-identical to the accepted exchange, replayed after the token was consumed. The proof still verifies and must: replay is a state decision the token row owns, not a signature failure.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "CONSUMED"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_TOKEN_UNUSABLE",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "accepted exchange presented after its token expired",
+            "stage": "registrationToken",
+            "evaluatedAt": "2026-08-20T12:20:00Z",
+            "note": "The same octets five minutes after expiresUnix. Freshness is evaluated against the Connect clock and the stored row; the proof itself never goes stale, which is why an expiry lives in the transcript and a window does not.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_TOKEN_UNUSABLE",
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "proof produced by a key other than the one in the certificate request",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "A real ES256 signature over the correct transcript, by the wrong key. The verifying key is only ever the one inside the presented certificate request.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "v5kin4DflqIdg9brBFQv1iqzz9Tk-gt8MBWjcm4XYZMNuAzeaOMLxW5hAPpYUibUn2zE0RxB-hmCvqllQ0GCXQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof presented against a different token of the same cluster",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The token uid, the challenge nonce, and the expiry all come from the other row, so the rebuilt transcript differs in three fields at once.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "5c7e9a0b1d2f3041526374859607b8c9dae0f1023456789abcdef0123456789a",
+                "expiresUnix": 1787229000,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:5c7e9a0b1d2f3041526374859607b8c9dae0f1023456789abcdef0123456789a\n10:1787229000\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "804816033a4525444ef4277ffe5b1f547a74b54b3e488377108e5ee587dab8fa",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof presented against another cluster of the same organization",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Only clusterUid differs. A device enrolled by an operator of one cluster can never land in another, even inside the tenant it belongs to.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2ad4639edb25e97e7f056a702afed2ac1c4c5c13f8361bf86e63d5d37273ac55",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof presented against a cluster of another organization",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The cross-tenant case. organizationUid is in the transcript so that a proof is unusable outside the tenant that issued its token even if every other value were somehow reproduced.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-4d00-7f40-9051-5b6c7d8e9fa3",
+                "clusterUid": "0198f4b0-5e00-7a50-8161-6c7d8e9fa0b4",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-4d00-7f40-9051-5b6c7d8e9fa3\n36:0198f4b0-5e00-7a50-8161-6c7d8e9fa0b4\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "cb050ac257fdcd258eb24a9395c87ffc61113b4c2b3bcbf5d9ed2dccac2968a0",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof moved onto a different requestId",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "A captured body resubmitted under a fresh idempotency key. Binding requestId is what keeps a captured exchange replayable only as itself.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "7c4d2e10-9f83-4a5b-b6c7-d8e9f0a1b2c3",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:7c4d2e10-9f83-4a5b-b6c7-d8e9f0a1b2c3\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "561bda4be56f6334379c9832b73c74eca7d01a7cef95ef6ab0c5c13499bbb90c",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof against a row whose challenge nonce differs",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Everything a console reader can see is unchanged; only the value delivered once with the secret differs. A proof cannot be precomputed from public token metadata.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "ffeeddccbbaa99887766554433221100ffeeddccbbaa998877665544332211ff",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:ffeeddccbbaa99887766554433221100ffeeddccbbaa998877665544332211ff\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "d2d678baf0f396b5d9bef9acea01498020ae45fd479a41b1e49d8ec1ed2ae117",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof against a row whose expiry was extended",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "One hour added to expiresUnix. A window that is widened after the fact invalidates every proof produced for the old one instead of quietly resurrecting them.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787231700,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787231700\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "bf31d8f89414ba4fe9c4984844c33da79114ef77833f6401bc02485dca779ef1",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "accepted proof presented with a substituted certificate request",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "A perfectly valid, correctly self-signed certificate request for an attacker key. This is the vector that a verifier checking only the PKCS#10 self-signature would accept, and it would issue a device certificate for the attacker.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRzCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARTzytYBF/PPAE2u2p2FYzUiVVwCnvUM/Mr27XLI9NIIP4vQlQ85RY4wSD70xXbUvOXqMwsMNBhp0edNfJ98Dw7oFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNJADBGAiEA/DI2AaTqO+JSj6xWLHHsyULX3s2P5cB3gFzrQ3gA1E4CIQDS5g7SkVicYc7IvJwszDjs7XluJTGB8bN0+MComIntAg==",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:0quILEdbHQp-KF4fBFc7vrrE5-M4fErrGoyT3vPnxIM\n",
+            "serverTranscriptSha256": "673b6ccbb55c9e0ce7e645955ec0ab8a9d97c29da3b776c57a6047a557c55624",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof over a transcript whose expiry carries a leading zero",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "A real signature over a transcript whose sixth field reads 11:01787228100 instead of 10:1787228100. The length prefix moves with the value, so a variant spelling of one integer is a different transcript and not an equivalent one. A verifier normalising the number instead of refusing the proof would give one exchange two valid transcripts.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "E2Re4CCZK5AXtug_Q2So2W38x5QdNBT-sj3qMMZKpDRjbtj6gsJzjtvHcnJJ9qCwFn3vOCoHIfoecPj3HEJc_g"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof over a transcript separated by 0x00 instead of 0x0a",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The separator ADR 0009 uses for a signed document, applied to a transcript that fixes 0x0a. Two separator conventions must not produce one accepted proof.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "0raUrZjLCZqadBmJZHmV9IEd4Y0E0FwIYl_ODzN5OtYgPQtdM3GALzeUddkqUSkbp1fkJ4EFYVqtVAQyfiPS9Q"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof over a transcript whose domain is lowercased",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The domain is compared as octets. Case folding it would let a producer pick either spelling and give one exchange two identities.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "aZPdYJtL-SoyTpkUCFKbLNtYZLNRm57uoA2Q75-l8VgvwE84TzC3yM-mkQXqr6ffflJ-vz2zwF4gLUQBSpe7Zw"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        },
+        {
+            "name": "proof over a JSON serialisation of the same field values",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The transcript is not a document and is never JSON. A JSON signature input would make key order, escaping, and number formatting part of the contract.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "zMxwclr9Zrk4lxtPDkbrJs8LHwIStmDg7XONYNpa2As9PEXHqtHMSQPLUP4d4YB_Kcr5UdG3BU64UlwxLrYIrg"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": false,
+                "reason": "REGISTRATION_PROOF_INVALID",
+                "verifiesMathematically": false
+            }
+        }
+    ]
+}

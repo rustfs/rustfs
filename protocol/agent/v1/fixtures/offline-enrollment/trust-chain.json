@@ -1,0 +1,125 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "offline-enrollment",
+    "fixture": "trust-chain",
+    "description": "The golden trust chain. bytes fields are standard padded base64 (RFC 4648 section 4) of the exact raw octets of the signed document; signature.value is unpadded base64url (RFC 4648 section 5) of the 64 octet r||s. No private key appears here or anywhere else in this repository: the vectors are for verification conformance, and a producer proves itself with the encoding rules rather than by reproducing these bytes.",
+    "pinnedRoot": {
+        "keyId": "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+        "publicKey": "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s",
+        "source": "compiled into official RustFS builds"
+    },
+    "chain": [
+        {
+            "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS50cnVzdExpbmsvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJzZXJpYWwiOiAiYzI1OGE2ZGRjOThiYjVhNWU5NDRmNjJlMDY3OWE3NGUiLAogICAgInJvbGUiOiAiaW50ZXJtZWRpYXRlIiwKICAgICJpc3N1ZXJLZXlJZCI6ICJkZjIyZTI4MDYxMTJkZWJiZTk1MzY3MmFhZmExODZkNjk5YWYwZTk3ZGQzZmQyYjA5ZmE4MzU5MDA1ZmUzNDhmIiwKICAgICJzdWJqZWN0S2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAic3ViamVjdFB1YmxpY0tleSI6ICJCRHg1VnNXSVpKV3pDS2FUMDhfeFNIaGdhLWlzOTVhWU9oMG1kQTU0N2YyQWxGVExmeWVaajAxemVOaWtNdWRjQWZMVHg0REhYRGFHc3FQRFRZdFZ6RG8iLAogICAgIm5vdEJlZm9yZSI6ICIyMDI2LTAxLTAxVDAwOjAwOjAwWiIsCiAgICAibm90QWZ0ZXIiOiAiMjAyNy0wMS0wMVQwMDowMDowMFoiCn0K",
+            "signature": {
+                "algorithm": "ES256",
+                "keyId": "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+                "value": "lXIxDmkvRX2CKL_NSMJ_ym-HJY48qoUz4h3bPPx33IFEv0E1gnSOWd1M2XprmIVRCvx8xN5CfYJ0L7wzsDA_FQ"
+            }
+        },
+        {
+            "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS50cnVzdExpbmsvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJzZXJpYWwiOiAiN2JmZmNmMDc4ZDc2NDg5OWE3MGZkYjFhZjliYmNkNjIiLAogICAgInJvbGUiOiAic2lnbmluZyIsCiAgICAiaXNzdWVyS2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAic3ViamVjdEtleUlkIjogIjA4ZTcyOTVjOGY5ZDA0M2UyMmIyYjgwZmRiMTQ4MGIwYmVjMDYwZGFjYmNlN2RlOWRkMmUzZDU4M2Y5M2Q3ZTgiLAogICAgInN1YmplY3RQdWJsaWNLZXkiOiAiQkdWSVU3eTVSaWgyaEk4LVBfaWwtR3VIVnRkUUxGeTJEaFFlRlU3cWh5YmJ0MjkxelNCa191eFlKSk5hQkRkZDl3TUM0RGZsWTVRQlBUOG1SNjdFZ2NBIiwKICAgICJub3RCZWZvcmUiOiAiMjAyNi0wOC0wMVQwMDowMDowMFoiLAogICAgIm5vdEFmdGVyIjogIjIwMjYtMDgtMzFUMDA6MDA6MDBaIgp9Cg==",
+            "signature": {
+                "algorithm": "ES256",
+                "keyId": "04ebc74d30020f727988c96c2ffb22821883ee6b2e4c117f6e959dbd63f33d87",
+                "value": "jhkdZ3yjn8-NwBqZ6cEKYVSla_UnUfTRVVcqk6IJwTMlwKVrYO1XFRU05m0VsEM18X3Zi8OzllhIP2R9qYC0kA"
+            }
+        }
+    ],
+    "keys": [
+        {
+            "role": "enrollment-root",
+            "name": "root",
+            "keyId": "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+            "publicKey": "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s"
+        },
+        {
+            "role": "intermediate",
+            "name": "intermediate",
+            "keyId": "04ebc74d30020f727988c96c2ffb22821883ee6b2e4c117f6e959dbd63f33d87",
+            "publicKey": "BDx5VsWIZJWzCKaT08_xSHhga-is95aYOh0mdA547f2AlFTLfyeZj01zeNikMudcAfLTx4DHXDaGsqPDTYtVzDo"
+        },
+        {
+            "role": "signing",
+            "name": "signing",
+            "keyId": "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8",
+            "publicKey": "BGVIU7y5Rih2hI8-P_il-GuHVtdQLFy2DhQeFU7qhybbt291zSBk_uxYJJNaBDdd9wMC4DflY5QBPT8mR67EgcA"
+        },
+        {
+            "role": "unchained",
+            "name": "stray",
+            "keyId": "f6fbe050defded18b50477ace38c9515fb61b8157e57b2f0e7e8ca69c862b6ca",
+            "publicKey": "BMDdRSCtFB2w1c3buqktv-eGgMJeck5-rYvnTlvvfTuqg2NybM5gZLrnJCasieiR48JF-Sik-4UI_HCQM12ogsA"
+        },
+        {
+            "role": "unpinned-root",
+            "name": "rogueRoot",
+            "keyId": "5ff37910aa4d69949e2c488f98d6072f10a3c3e73d776698963872582644f731",
+            "publicKey": "BB4ldUQqSkfBQhYa10Otr2q43Yaka53dNLVD8nDThP_fVxFH_s04p_gIds6MDef11ukjZAhdgqQu_A8JLW3SzVk"
+        },
+        {
+            "role": "unpinned-signing",
+            "name": "rogueSigning",
+            "keyId": "90f38a0dc2c5f948f47887a010ea3cb9e425d0409edb2a4014c7f7539bc22471",
+            "publicKey": "BIGNnsOqMBI4LPD8JySg77E3vChI78R4AHgolxFcJNt9Z9GsMoVKIe9ZOdJOE38sFZt3oF5crU0HqdziGfiEp9U"
+        },
+        {
+            "role": "device",
+            "name": "device",
+            "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+            "publicKey": "BOTuyJzFHjW42hRlrCY3bmMBK1gftT3aNLiTgCsJ1_eNSdr1GM9aY8w39popVLoedwoeAGABgp61hEawkEKqIP0"
+        },
+        {
+            "role": "device",
+            "name": "foreignDevice",
+            "keyId": "63d8184f2b2ec6895bb71b999c90192d7718694ba042bad86364b27628f9cb50",
+            "publicKey": "BMwdwp6a50zSVsIa3NluDPaszxyIm2EeIbdukH38O3etEhoAlHXJrRblAltumHYlku6EBa_S3IBen8T8JOrr6Nk"
+        },
+        {
+            "role": "device",
+            "name": "revokedDevice",
+            "keyId": "1f6a0c684716862c2507b48e72de25fbcb7db5c7aa629ff0c17e20b8a387d7ad",
+            "publicKey": "BA9MuDkIi4fZSw98wCnbuEZUxqheO5Uks4rVTZa477kg30lb-aLAk5b8xM3kgnEq6PNCkSc28x_JaBPwPkBmwYk"
+        }
+    ],
+    "alternateChains": [
+        {
+            "name": "chain rooted at an unpinned key",
+            "chain": [
+                {
+                    "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS50cnVzdExpbmsvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJzZXJpYWwiOiAiMTNjZGI3NDhiMThjMDNiMjA0NzBjZjY2YTJkYjZhZjgiLAogICAgInJvbGUiOiAic2lnbmluZyIsCiAgICAiaXNzdWVyS2V5SWQiOiAiNWZmMzc5MTBhYTRkNjk5NDllMmM0ODhmOThkNjA3MmYxMGEzYzNlNzNkNzc2Njk4OTYzODcyNTgyNjQ0ZjczMSIsCiAgICAic3ViamVjdEtleUlkIjogIjkwZjM4YTBkYzJjNWY5NDhmNDc4ODdhMDEwZWEzY2I5ZTQyNWQwNDA5ZWRiMmE0MDE0YzdmNzUzOWJjMjI0NzEiLAogICAgInN1YmplY3RQdWJsaWNLZXkiOiAiQklHTm5zT3FNQkk0TFBEOEp5U2c3N0UzdkNoSTc4UjRBSGdvbHhGY0pOdDlaOUdzTW9WS0llOVpPZEpPRTM4c0ZadDNvRjVjclUwSHFkemlHZmlFcDlVIiwKICAgICJub3RCZWZvcmUiOiAiMjAyNi0wOC0wMVQwMDowMDowMFoiLAogICAgIm5vdEFmdGVyIjogIjIwMjYtMDgtMzFUMDA6MDA6MDBaIgp9Cg==",
+                    "signature": {
+                        "algorithm": "ES256",
+                        "keyId": "5ff37910aa4d69949e2c488f98d6072f10a3c3e73d776698963872582644f731",
+                        "value": "suxUbZ9Is1liQlhjfwXQoTeze4me9f7Qddr3299lmzpn-8VzH2kgTA5YvM9Bi-b4ATeHNLPBmkFDhaVoxX64Lw"
+                    }
+                }
+            ],
+            "reason": "ENROLLMENT_ROOT_UNKNOWN",
+            "note": "Internally consistent and correctly signed. It fails only because its root is not pinned, which is exactly what trust on first use would have accepted."
+        },
+        {
+            "name": "signing link already expired when the challenge was issued",
+            "chain": [
+                {
+                    "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS50cnVzdExpbmsvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJzZXJpYWwiOiAiYzI1OGE2ZGRjOThiYjVhNWU5NDRmNjJlMDY3OWE3NGUiLAogICAgInJvbGUiOiAiaW50ZXJtZWRpYXRlIiwKICAgICJpc3N1ZXJLZXlJZCI6ICJkZjIyZTI4MDYxMTJkZWJiZTk1MzY3MmFhZmExODZkNjk5YWYwZTk3ZGQzZmQyYjA5ZmE4MzU5MDA1ZmUzNDhmIiwKICAgICJzdWJqZWN0S2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAic3ViamVjdFB1YmxpY0tleSI6ICJCRHg1VnNXSVpKV3pDS2FUMDhfeFNIaGdhLWlzOTVhWU9oMG1kQTU0N2YyQWxGVExmeWVaajAxemVOaWtNdWRjQWZMVHg0REhYRGFHc3FQRFRZdFZ6RG8iLAogICAgIm5vdEJlZm9yZSI6ICIyMDI2LTAxLTAxVDAwOjAwOjAwWiIsCiAgICAibm90QWZ0ZXIiOiAiMjAyNy0wMS0wMVQwMDowMDowMFoiCn0K",
+                    "signature": {
+                        "algorithm": "ES256",
+                        "keyId": "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+                        "value": "lXIxDmkvRX2CKL_NSMJ_ym-HJY48qoUz4h3bPPx33IFEv0E1gnSOWd1M2XprmIVRCvx8xN5CfYJ0L7wzsDA_FQ"
+                    }
+                },
+                {
+                    "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS50cnVzdExpbmsvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJzZXJpYWwiOiAiY2EwOWYzZTVhZDkxOTEwNmQxMjZjODRlZGRjNDViZTgiLAogICAgInJvbGUiOiAic2lnbmluZyIsCiAgICAiaXNzdWVyS2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAic3ViamVjdEtleUlkIjogIjA4ZTcyOTVjOGY5ZDA0M2UyMmIyYjgwZmRiMTQ4MGIwYmVjMDYwZGFjYmNlN2RlOWRkMmUzZDU4M2Y5M2Q3ZTgiLAogICAgInN1YmplY3RQdWJsaWNLZXkiOiAiQkdWSVU3eTVSaWgyaEk4LVBfaWwtR3VIVnRkUUxGeTJEaFFlRlU3cWh5YmJ0MjkxelNCa191eFlKSk5hQkRkZDl3TUM0RGZsWTVRQlBUOG1SNjdFZ2NBIiwKICAgICJub3RCZWZvcmUiOiAiMjAyNi0wNi0wMVQwMDowMDowMFoiLAogICAgIm5vdEFmdGVyIjogIjIwMjYtMDctMDFUMDA6MDA6MDBaIgp9Cg==",
+                    "signature": {
+                        "algorithm": "ES256",
+                        "keyId": "04ebc74d30020f727988c96c2ffb22821883ee6b2e4c117f6e959dbd63f33d87",
+                        "value": "SX75WdOVLvphRMcce0xq7W5-Er0HSVhBcsUng1Uv8RAPR23prCH5oJOF06A_h7xHAj9XL7YeuxRStPs_pkTNrA"
+                    }
+                }
+            ],
+            "reason": "TRUST_CHAIN_INVALID",
+            "note": "notAfter is 2026-07-01T00:00:00Z and the challenge issuedAt is 2026-08-17T00:00:00Z."
+        }
+    ]
+}

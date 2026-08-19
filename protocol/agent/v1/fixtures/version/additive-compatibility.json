@@ -1,0 +1,104 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "version",
+  "fixture": "additive-compatibility",
+  "description": "Release skew in both directions. v1 grows by optional fields only, so an unknown field is discarded and an absent one takes its documented default.",
+  "vectors": [
+    {
+      "name": "new agent sends a v1 field this Connect does not know",
+      "direction": "new-agent-to-old-connect",
+      "payload": {
+        "protocolVersion": "v1",
+        "agentVersion": "1.9.0",
+        "capabilities": ["heartbeat"],
+        "telemetryProfile": "extended"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "retained": ["protocolVersion", "agentVersion", "capabilities"],
+        "discarded": ["telemetryProfile"],
+        "defaultsApplied": {},
+        "echoedBack": [],
+        "stored": []
+      }
+    },
+    {
+      "name": "new agent sends several unknown optional fields at once",
+      "direction": "new-agent-to-old-connect",
+      "payload": {
+        "protocolVersion": "v1",
+        "capabilities": ["heartbeat", "inventory", "bundle.upload"],
+        "telemetryProfile": "extended",
+        "regionHint": "eu-west",
+        "experimentalFlags": {
+          "fastHeartbeat": true
+        }
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "retained": ["protocolVersion", "capabilities"],
+        "discarded": ["telemetryProfile", "regionHint", "experimentalFlags"],
+        "defaultsApplied": {
+          "agentVersion": null
+        },
+        "echoedBack": [],
+        "stored": []
+      }
+    },
+    {
+      "name": "old agent omits every optional field",
+      "direction": "old-agent-to-new-connect",
+      "payload": {
+        "protocolVersion": "v1"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "retained": ["protocolVersion"],
+        "discarded": [],
+        "defaultsApplied": {
+          "agentVersion": null,
+          "capabilities": []
+        },
+        "echoedBack": [],
+        "stored": []
+      }
+    },
+    {
+      "name": "old agent reports no capabilities but names itself",
+      "direction": "old-agent-to-new-connect",
+      "payload": {
+        "protocolVersion": "v1",
+        "agentVersion": "1.0.0"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "retained": ["protocolVersion", "agentVersion"],
+        "discarded": [],
+        "defaultsApplied": {
+          "capabilities": []
+        },
+        "echoedBack": [],
+        "stored": []
+      }
+    },
+    {
+      "name": "unknown fields do not rescue an unsupported major version",
+      "direction": "new-agent-to-old-connect",
+      "payload": {
+        "protocolVersion": "v2",
+        "agentVersion": "2.0.0",
+        "compatibilityShim": "v1"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "echoedBack": [],
+        "stored": []
+      }
+    }
+  ]
+}

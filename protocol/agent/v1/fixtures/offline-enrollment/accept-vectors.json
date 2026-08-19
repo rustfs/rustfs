@@ -1,0 +1,129 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "offline-enrollment",
+    "fixture": "accept-vectors",
+    "description": "Offline enrollment artifacts that verify. evaluationTime is the verifier clock the vector is evaluated at; the artifact bytes are frozen, so a window is a property of the evaluation and not of the bytes.",
+    "vectors": [
+        {
+            "name": "challenge signed by a chained signing key under the pinned root",
+            "artifact": "challenge",
+            "signerKey": "signing",
+            "evaluationTime": "2026-08-20T12:00:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS5lbnJvbGxtZW50Q2hhbGxlbmdlLzEiLAogICAgInByb3RvY29sVmVyc2lvbiI6ICJ2MSIsCiAgICAiY2hhbGxlbmdlSWQiOiAiMDE5OGYzYTEtN2YwMC03ZDQwLWJlNTEtM2Y0YTViNmM3ZDgzIiwKICAgICJvcmdhbml6YXRpb25OYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwIiwKICAgICJjbHVzdGVyTmFtZSI6ICJvcmdhbml6YXRpb25zLzAxOThmM2ExLTRjMDAtN2ExMC04YjIxLTBjMWQyZTNmNGE1MC9jbHVzdGVycy8wMTk4ZjNhMS01ZDAwLTdiMjAtOWMzMS0xZDJlM2Y0YTViNjEiLAogICAgIm5vbmNlIjogIlRWeDRqS2FQZ1dQbGRUU203X1N6S1BsSDVIZmhrcHFxcjlieWVDalhkSFUiLAogICAgImlzc3VlZEF0IjogIjIwMjYtMDgtMTdUMDA6MDA6MDBaIiwKICAgICJleHBpcmVzQXQiOiAiMjAyNi0wOC0yNFQwMDowMDowMFoiLAogICAgImNvbm5lY3RLZXlJZCI6ICIwOGU3Mjk1YzhmOWQwNDNlMjJiMmI4MGZkYjE0ODBiMGJlYzA2MGRhY2JjZTdkZTlkZDJlM2Q1ODNmOTNkN2U4IiwKICAgICJ0cnVzdENoYWluIjogWwogICAgICAgIHsKICAgICAgICAgICAgImJ5dGVzIjogImV3b2dJQ0FnSW1admNtMWhkRlpsY25OcGIyNGlPaUFpY25WemRHWnpMbU52Ym01bFkzUXViMlptYkdsdVpTNTBjblZ6ZEV4cGJtc3ZNU0lzQ2lBZ0lDQWljSEp2ZEc5amIyeFdaWEp6YVc5dUlqb2dJbll4SWl3S0lDQWdJQ0p6WlhKcFlXd2lPaUFpWXpJMU9HRTJaR1JqT1RoaVlqVmhOV1U1TkRSbU5qSmxNRFkzT1dFM05HVWlMQW9nSUNBZ0luSnZiR1VpT2lBaWFXNTBaWEp0WldScFlYUmxJaXdLSUNBZ0lDSnBjM04xWlhKTFpYbEpaQ0k2SUNKa1pqSXlaVEk0TURZeE1USmtaV0ppWlRrMU16WTNNbUZoWm1FeE9EWmtOams1WVdZd1pUazNaR1F6Wm1ReVlqQTVabUU0TXpVNU1EQTFabVV6TkRobUlpd0tJQ0FnSUNKemRXSnFaV04wUzJWNVNXUWlPaUFpTURSbFltTTNOR1F6TURBeU1HWTNNamM1T0Roak9UWmpNbVptWWpJeU9ESXhPRGd6WldVMllqSmxOR014TVRkbU5tVTVOVGxrWW1RMk0yWXpNMlE0TnlJc0NpQWdJQ0FpYzNWaWFtVmpkRkIxWW14cFkwdGxlU0k2SUNKQ1JIZzFWbk5YU1ZwS1YzcERTMkZVTURoZmVGTklhR2RoTFdsek9UVmhXVTlvTUcxa1FUVTBOMll5UVd4R1ZFeG1lV1ZhYWpBeGVtVk9hV3ROZFdSalFXWk1WSGcwUkVoWVJHRkhjM0ZRUkZSWmRGWjZSRzhpTEFvZ0lDQWdJbTV2ZEVKbFptOXlaU0k2SUNJeU1ESTJMVEF4TFRBeFZEQXdPakF3T2pBd1dpSXNDaUFnSUNBaWJtOTBRV1owWlhJaU9pQWlNakF5Tnkwd01TMHdNVlF3TURvd01Eb3dNRm9pQ24wSyIsCiAgICAgICAgICAgICJzaWduYXR1cmUiOiB7CiAgICAgICAgICAgICAgICAiYWxnb3JpdGhtIjogIkVTMjU2IiwKICAgICAgICAgICAgICAgICJrZXlJZCI6ICJkZjIyZTI4MDYxMTJkZWJiZTk1MzY3MmFhZmExODZkNjk5YWYwZTk3ZGQzZmQyYjA5ZmE4MzU5MDA1ZmUzNDhmIiwKICAgICAgICAgICAgICAgICJ2YWx1ZSI6ICJsWEl4RG1rdlJYMkNLTF9OU01KX3ltLUhKWTQ4cW9VejRoM2JQUHgzM0lGRXYwRTFnblNPV2QxTTJYcHJtSVZSQ3Z4OHhONUNmWUowTDd3enNEQV9GUSIKICAgICAgICAgICAgfQogICAgICAgIH0sCiAgICAgICAgewogICAgICAgICAgICAiYnl0ZXMiOiAiZXdvZ0lDQWdJbVp2Y20xaGRGWmxjbk5wYjI0aU9pQWljblZ6ZEdaekxtTnZibTVsWTNRdWIyWm1iR2x1WlM1MGNuVnpkRXhwYm1zdk1TSXNDaUFnSUNBaWNISnZkRzlqYjJ4V1pYSnphVzl1SWpvZ0luWXhJaXdLSUNBZ0lDSnpaWEpwWVd3aU9pQWlOMkptWm1ObU1EYzRaRGMyTkRnNU9XRTNNR1prWWpGaFpqbGlZbU5rTmpJaUxBb2dJQ0FnSW5KdmJHVWlPaUFpYzJsbmJtbHVaeUlzQ2lBZ0lDQWlhWE56ZFdWeVMyVjVTV1FpT2lBaU1EUmxZbU0zTkdRek1EQXlNR1kzTWpjNU9EaGpPVFpqTW1abVlqSXlPREl4T0RnelpXVTJZakpsTkdNeE1UZG1ObVU1TlRsa1ltUTJNMll6TTJRNE55SXNDaUFnSUNBaWMzVmlhbVZqZEV0bGVVbGtJam9nSWpBNFpUY3lPVFZqT0dZNVpEQTBNMlV5TW1JeVlqZ3dabVJpTVRRNE1HSXdZbVZqTURZd1pHRmpZbU5sTjJSbE9XUmtNbVV6WkRVNE0yWTVNMlEzWlRnaUxBb2dJQ0FnSW5OMVltcGxZM1JRZFdKc2FXTkxaWGtpT2lBaVFrZFdTVlUzZVRWU2FXZ3lhRWs0TFZCZmFXd3RSM1ZJVm5Sa1VVeEdlVEpFYUZGbFJsVTNjV2g1WW1KME1qa3hlbE5DYTE5MWVGbEtTazVoUWtSa1pEbDNUVU0wUkdac1dUVlJRbEJVT0cxU05qZEZaMk5CSWl3S0lDQWdJQ0p1YjNSQ1pXWnZjbVVpT2lBaU1qQXlOaTB3T0Mwd01WUXdNRG93TURvd01Gb2lMQW9nSUNBZ0ltNXZkRUZtZEdWeUlqb2dJakl3TWpZdE1EZ3RNekZVTURBNk1EQTZNREJhSWdwOUNnPT0iLAogICAgICAgICAgICAic2lnbmF0dXJlIjogewogICAgICAgICAgICAgICAgImFsZ29yaXRobSI6ICJFUzI1NiIsCiAgICAgICAgICAgICAgICAia2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAgICAgICAgICAgICAidmFsdWUiOiAiamhrZFozeWpuOC1Od0JxWjZjRUtZVlNsYV9VblVmVFJWVmNxazZJSndUTWx3S1ZyWU8xWEZSVTA1bTBWc0VNMThYM1ppOE96bGxoSVAyUjlxWUMwa0EiCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICBdCn0K",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8",
+                    "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpkSw0WnTdAjuVH1wqRMeUEYkZLDTu7fB5YJRvBN2wrUtA"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "chainVerifies": true,
+                "rootPinned": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "challenge evaluated 120 seconds before its issuedAt is inside the skew tolerance",
+            "artifact": "challenge",
+            "signerKey": "signing",
+            "evaluationTime": "2026-08-16T23:58:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS5lbnJvbGxtZW50Q2hhbGxlbmdlLzEiLAogICAgInByb3RvY29sVmVyc2lvbiI6ICJ2MSIsCiAgICAiY2hhbGxlbmdlSWQiOiAiMDE5OGYzYTEtN2YwMC03ZDQwLWJlNTEtM2Y0YTViNmM3ZDgzIiwKICAgICJvcmdhbml6YXRpb25OYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwIiwKICAgICJjbHVzdGVyTmFtZSI6ICJvcmdhbml6YXRpb25zLzAxOThmM2ExLTRjMDAtN2ExMC04YjIxLTBjMWQyZTNmNGE1MC9jbHVzdGVycy8wMTk4ZjNhMS01ZDAwLTdiMjAtOWMzMS0xZDJlM2Y0YTViNjEiLAogICAgIm5vbmNlIjogIlRWeDRqS2FQZ1dQbGRUU203X1N6S1BsSDVIZmhrcHFxcjlieWVDalhkSFUiLAogICAgImlzc3VlZEF0IjogIjIwMjYtMDgtMTdUMDA6MDA6MDBaIiwKICAgICJleHBpcmVzQXQiOiAiMjAyNi0wOC0yNFQwMDowMDowMFoiLAogICAgImNvbm5lY3RLZXlJZCI6ICIwOGU3Mjk1YzhmOWQwNDNlMjJiMmI4MGZkYjE0ODBiMGJlYzA2MGRhY2JjZTdkZTlkZDJlM2Q1ODNmOTNkN2U4IiwKICAgICJ0cnVzdENoYWluIjogWwogICAgICAgIHsKICAgICAgICAgICAgImJ5dGVzIjogImV3b2dJQ0FnSW1admNtMWhkRlpsY25OcGIyNGlPaUFpY25WemRHWnpMbU52Ym01bFkzUXViMlptYkdsdVpTNTBjblZ6ZEV4cGJtc3ZNU0lzQ2lBZ0lDQWljSEp2ZEc5amIyeFdaWEp6YVc5dUlqb2dJbll4SWl3S0lDQWdJQ0p6WlhKcFlXd2lPaUFpWXpJMU9HRTJaR1JqT1RoaVlqVmhOV1U1TkRSbU5qSmxNRFkzT1dFM05HVWlMQW9nSUNBZ0luSnZiR1VpT2lBaWFXNTBaWEp0WldScFlYUmxJaXdLSUNBZ0lDSnBjM04xWlhKTFpYbEpaQ0k2SUNKa1pqSXlaVEk0TURZeE1USmtaV0ppWlRrMU16WTNNbUZoWm1FeE9EWmtOams1WVdZd1pUazNaR1F6Wm1ReVlqQTVabUU0TXpVNU1EQTFabVV6TkRobUlpd0tJQ0FnSUNKemRXSnFaV04wUzJWNVNXUWlPaUFpTURSbFltTTNOR1F6TURBeU1HWTNNamM1T0Roak9UWmpNbVptWWpJeU9ESXhPRGd6WldVMllqSmxOR014TVRkbU5tVTVOVGxrWW1RMk0yWXpNMlE0TnlJc0NpQWdJQ0FpYzNWaWFtVmpkRkIxWW14cFkwdGxlU0k2SUNKQ1JIZzFWbk5YU1ZwS1YzcERTMkZVTURoZmVGTklhR2RoTFdsek9UVmhXVTlvTUcxa1FUVTBOMll5UVd4R1ZFeG1lV1ZhYWpBeGVtVk9hV3ROZFdSalFXWk1WSGcwUkVoWVJHRkhjM0ZRUkZSWmRGWjZSRzhpTEFvZ0lDQWdJbTV2ZEVKbFptOXlaU0k2SUNJeU1ESTJMVEF4TFRBeFZEQXdPakF3T2pBd1dpSXNDaUFnSUNBaWJtOTBRV1owWlhJaU9pQWlNakF5Tnkwd01TMHdNVlF3TURvd01Eb3dNRm9pQ24wSyIsCiAgICAgICAgICAgICJzaWduYXR1cmUiOiB7CiAgICAgICAgICAgICAgICAiYWxnb3JpdGhtIjogIkVTMjU2IiwKICAgICAgICAgICAgICAgICJrZXlJZCI6ICJkZjIyZTI4MDYxMTJkZWJiZTk1MzY3MmFhZmExODZkNjk5YWYwZTk3ZGQzZmQyYjA5ZmE4MzU5MDA1ZmUzNDhmIiwKICAgICAgICAgICAgICAgICJ2YWx1ZSI6ICJsWEl4RG1rdlJYMkNLTF9OU01KX3ltLUhKWTQ4cW9VejRoM2JQUHgzM0lGRXYwRTFnblNPV2QxTTJYcHJtSVZSQ3Z4OHhONUNmWUowTDd3enNEQV9GUSIKICAgICAgICAgICAgfQogICAgICAgIH0sCiAgICAgICAgewogICAgICAgICAgICAiYnl0ZXMiOiAiZXdvZ0lDQWdJbVp2Y20xaGRGWmxjbk5wYjI0aU9pQWljblZ6ZEdaekxtTnZibTVsWTNRdWIyWm1iR2x1WlM1MGNuVnpkRXhwYm1zdk1TSXNDaUFnSUNBaWNISnZkRzlqYjJ4V1pYSnphVzl1SWpvZ0luWXhJaXdLSUNBZ0lDSnpaWEpwWVd3aU9pQWlOMkptWm1ObU1EYzRaRGMyTkRnNU9XRTNNR1prWWpGaFpqbGlZbU5rTmpJaUxBb2dJQ0FnSW5KdmJHVWlPaUFpYzJsbmJtbHVaeUlzQ2lBZ0lDQWlhWE56ZFdWeVMyVjVTV1FpT2lBaU1EUmxZbU0zTkdRek1EQXlNR1kzTWpjNU9EaGpPVFpqTW1abVlqSXlPREl4T0RnelpXVTJZakpsTkdNeE1UZG1ObVU1TlRsa1ltUTJNMll6TTJRNE55SXNDaUFnSUNBaWMzVmlhbVZqZEV0bGVVbGtJam9nSWpBNFpUY3lPVFZqT0dZNVpEQTBNMlV5TW1JeVlqZ3dabVJpTVRRNE1HSXdZbVZqTURZd1pHRmpZbU5sTjJSbE9XUmtNbVV6WkRVNE0yWTVNMlEzWlRnaUxBb2dJQ0FnSW5OMVltcGxZM1JRZFdKc2FXTkxaWGtpT2lBaVFrZFdTVlUzZVRWU2FXZ3lhRWs0TFZCZmFXd3RSM1ZJVm5Sa1VVeEdlVEpFYUZGbFJsVTNjV2g1WW1KME1qa3hlbE5DYTE5MWVGbEtTazVoUWtSa1pEbDNUVU0wUkdac1dUVlJRbEJVT0cxU05qZEZaMk5CSWl3S0lDQWdJQ0p1YjNSQ1pXWnZjbVVpT2lBaU1qQXlOaTB3T0Mwd01WUXdNRG93TURvd01Gb2lMQW9nSUNBZ0ltNXZkRUZtZEdWeUlqb2dJakl3TWpZdE1EZ3RNekZVTURBNk1EQTZNREJhSWdwOUNnPT0iLAogICAgICAgICAgICAic2lnbmF0dXJlIjogewogICAgICAgICAgICAgICAgImFsZ29yaXRobSI6ICJFUzI1NiIsCiAgICAgICAgICAgICAgICAia2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAgICAgICAgICAgICAidmFsdWUiOiAiamhrZFozeWpuOC1Od0JxWjZjRUtZVlNsYV9VblVmVFJWVmNxazZJSndUTWx3S1ZyWU8xWEZSVTA1bTBWc0VNMThYM1ppOE96bGxoSVAyUjlxWUMwa0EiCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICBdCn0K",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8",
+                    "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpkSw0WnTdAjuVH1wqRMeUEYkZLDTu7fB5YJRvBN2wrUtA"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "chainVerifies": true,
+                "rootPinned": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "challenge evaluated 300 seconds after its expiresAt is still inside the skew tolerance",
+            "artifact": "challenge",
+            "signerKey": "signing",
+            "evaluationTime": "2026-08-24T00:05:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS5lbnJvbGxtZW50Q2hhbGxlbmdlLzEiLAogICAgInByb3RvY29sVmVyc2lvbiI6ICJ2MSIsCiAgICAiY2hhbGxlbmdlSWQiOiAiMDE5OGYzYTEtN2YwMC03ZDQwLWJlNTEtM2Y0YTViNmM3ZDgzIiwKICAgICJvcmdhbml6YXRpb25OYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwIiwKICAgICJjbHVzdGVyTmFtZSI6ICJvcmdhbml6YXRpb25zLzAxOThmM2ExLTRjMDAtN2ExMC04YjIxLTBjMWQyZTNmNGE1MC9jbHVzdGVycy8wMTk4ZjNhMS01ZDAwLTdiMjAtOWMzMS0xZDJlM2Y0YTViNjEiLAogICAgIm5vbmNlIjogIlRWeDRqS2FQZ1dQbGRUU203X1N6S1BsSDVIZmhrcHFxcjlieWVDalhkSFUiLAogICAgImlzc3VlZEF0IjogIjIwMjYtMDgtMTdUMDA6MDA6MDBaIiwKICAgICJleHBpcmVzQXQiOiAiMjAyNi0wOC0yNFQwMDowMDowMFoiLAogICAgImNvbm5lY3RLZXlJZCI6ICIwOGU3Mjk1YzhmOWQwNDNlMjJiMmI4MGZkYjE0ODBiMGJlYzA2MGRhY2JjZTdkZTlkZDJlM2Q1ODNmOTNkN2U4IiwKICAgICJ0cnVzdENoYWluIjogWwogICAgICAgIHsKICAgICAgICAgICAgImJ5dGVzIjogImV3b2dJQ0FnSW1admNtMWhkRlpsY25OcGIyNGlPaUFpY25WemRHWnpMbU52Ym01bFkzUXViMlptYkdsdVpTNTBjblZ6ZEV4cGJtc3ZNU0lzQ2lBZ0lDQWljSEp2ZEc5amIyeFdaWEp6YVc5dUlqb2dJbll4SWl3S0lDQWdJQ0p6WlhKcFlXd2lPaUFpWXpJMU9HRTJaR1JqT1RoaVlqVmhOV1U1TkRSbU5qSmxNRFkzT1dFM05HVWlMQW9nSUNBZ0luSnZiR1VpT2lBaWFXNTBaWEp0WldScFlYUmxJaXdLSUNBZ0lDSnBjM04xWlhKTFpYbEpaQ0k2SUNKa1pqSXlaVEk0TURZeE1USmtaV0ppWlRrMU16WTNNbUZoWm1FeE9EWmtOams1WVdZd1pUazNaR1F6Wm1ReVlqQTVabUU0TXpVNU1EQTFabVV6TkRobUlpd0tJQ0FnSUNKemRXSnFaV04wUzJWNVNXUWlPaUFpTURSbFltTTNOR1F6TURBeU1HWTNNamM1T0Roak9UWmpNbVptWWpJeU9ESXhPRGd6WldVMllqSmxOR014TVRkbU5tVTVOVGxrWW1RMk0yWXpNMlE0TnlJc0NpQWdJQ0FpYzNWaWFtVmpkRkIxWW14cFkwdGxlU0k2SUNKQ1JIZzFWbk5YU1ZwS1YzcERTMkZVTURoZmVGTklhR2RoTFdsek9UVmhXVTlvTUcxa1FUVTBOMll5UVd4R1ZFeG1lV1ZhYWpBeGVtVk9hV3ROZFdSalFXWk1WSGcwUkVoWVJHRkhjM0ZRUkZSWmRGWjZSRzhpTEFvZ0lDQWdJbTV2ZEVKbFptOXlaU0k2SUNJeU1ESTJMVEF4TFRBeFZEQXdPakF3T2pBd1dpSXNDaUFnSUNBaWJtOTBRV1owWlhJaU9pQWlNakF5Tnkwd01TMHdNVlF3TURvd01Eb3dNRm9pQ24wSyIsCiAgICAgICAgICAgICJzaWduYXR1cmUiOiB7CiAgICAgICAgICAgICAgICAiYWxnb3JpdGhtIjogIkVTMjU2IiwKICAgICAgICAgICAgICAgICJrZXlJZCI6ICJkZjIyZTI4MDYxMTJkZWJiZTk1MzY3MmFhZmExODZkNjk5YWYwZTk3ZGQzZmQyYjA5ZmE4MzU5MDA1ZmUzNDhmIiwKICAgICAgICAgICAgICAgICJ2YWx1ZSI6ICJsWEl4RG1rdlJYMkNLTF9OU01KX3ltLUhKWTQ4cW9VejRoM2JQUHgzM0lGRXYwRTFnblNPV2QxTTJYcHJtSVZSQ3Z4OHhONUNmWUowTDd3enNEQV9GUSIKICAgICAgICAgICAgfQogICAgICAgIH0sCiAgICAgICAgewogICAgICAgICAgICAiYnl0ZXMiOiAiZXdvZ0lDQWdJbVp2Y20xaGRGWmxjbk5wYjI0aU9pQWljblZ6ZEdaekxtTnZibTVsWTNRdWIyWm1iR2x1WlM1MGNuVnpkRXhwYm1zdk1TSXNDaUFnSUNBaWNISnZkRzlqYjJ4V1pYSnphVzl1SWpvZ0luWXhJaXdLSUNBZ0lDSnpaWEpwWVd3aU9pQWlOMkptWm1ObU1EYzRaRGMyTkRnNU9XRTNNR1prWWpGaFpqbGlZbU5rTmpJaUxBb2dJQ0FnSW5KdmJHVWlPaUFpYzJsbmJtbHVaeUlzQ2lBZ0lDQWlhWE56ZFdWeVMyVjVTV1FpT2lBaU1EUmxZbU0zTkdRek1EQXlNR1kzTWpjNU9EaGpPVFpqTW1abVlqSXlPREl4T0RnelpXVTJZakpsTkdNeE1UZG1ObVU1TlRsa1ltUTJNMll6TTJRNE55SXNDaUFnSUNBaWMzVmlhbVZqZEV0bGVVbGtJam9nSWpBNFpUY3lPVFZqT0dZNVpEQTBNMlV5TW1JeVlqZ3dabVJpTVRRNE1HSXdZbVZqTURZd1pHRmpZbU5sTjJSbE9XUmtNbVV6WkRVNE0yWTVNMlEzWlRnaUxBb2dJQ0FnSW5OMVltcGxZM1JRZFdKc2FXTkxaWGtpT2lBaVFrZFdTVlUzZVRWU2FXZ3lhRWs0TFZCZmFXd3RSM1ZJVm5Sa1VVeEdlVEpFYUZGbFJsVTNjV2g1WW1KME1qa3hlbE5DYTE5MWVGbEtTazVoUWtSa1pEbDNUVU0wUkdac1dUVlJRbEJVT0cxU05qZEZaMk5CSWl3S0lDQWdJQ0p1YjNSQ1pXWnZjbVVpT2lBaU1qQXlOaTB3T0Mwd01WUXdNRG93TURvd01Gb2lMQW9nSUNBZ0ltNXZkRUZtZEdWeUlqb2dJakl3TWpZdE1EZ3RNekZVTURBNk1EQTZNREJhSWdwOUNnPT0iLAogICAgICAgICAgICAic2lnbmF0dXJlIjogewogICAgICAgICAgICAgICAgImFsZ29yaXRobSI6ICJFUzI1NiIsCiAgICAgICAgICAgICAgICAia2V5SWQiOiAiMDRlYmM3NGQzMDAyMGY3Mjc5ODhjOTZjMmZmYjIyODIxODgzZWU2YjJlNGMxMTdmNmU5NTlkYmQ2M2YzM2Q4NyIsCiAgICAgICAgICAgICAgICAidmFsdWUiOiAiamhrZFozeWpuOC1Od0JxWjZjRUtZVlNsYV9VblVmVFJWVmNxazZJSndUTWx3S1ZyWU8xWEZSVTA1bTBWc0VNMThYM1ppOE96bGxoSVAyUjlxWUMwa0EiCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICBdCn0K",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "08e7295c8f9d043e22b2b80fdb1480b0bec060dacbce7de9dd2e3d583f93d7e8",
+                    "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpkSw0WnTdAjuVH1wqRMeUEYkZLDTu7fB5YJRvBN2wrUtA"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "chainVerifies": true,
+                "rootPinned": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "response binding the device public key and the challenge proof",
+            "artifact": "response",
+            "answersChallenge": "challenge signed by a chained signing key under the pinned root",
+            "signerKey": "device",
+            "evaluationTime": "2026-08-20T12:00:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS5lbnJvbGxtZW50UmVzcG9uc2UvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJjaGFsbGVuZ2VJZCI6ICIwMTk4ZjNhMS03ZjAwLTdkNDAtYmU1MS0zZjRhNWI2YzdkODMiLAogICAgIm9yZ2FuaXphdGlvbk5hbWUiOiAib3JnYW5pemF0aW9ucy8wMTk4ZjNhMS00YzAwLTdhMTAtOGIyMS0wYzFkMmUzZjRhNTAiLAogICAgImNsdXN0ZXJOYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwL2NsdXN0ZXJzLzAxOThmM2ExLTVkMDAtN2IyMC05YzMxLTFkMmUzZjRhNWI2MSIsCiAgICAiY2hhbGxlbmdlTm9uY2UiOiAiVFZ4NGpLYVBnV1BsZFRTbTdfU3pLUGxINUhmaGtwcXFyOWJ5ZUNqWGRIVSIsCiAgICAiY2hhbGxlbmdlUHJvb2YiOiAiamlEVjRXeTgxV3dxUXdseFZxRjBlRlRoOWpFTW5EM21rVVdCNVhxR21wa1N3MFduVGRBanVWSDF3cVJNZVVFWWtaTERUdTdmQjVZSlJ2Qk4yd3JVdEEiLAogICAgImRldmljZUtleUlkIjogIjM5Y2EyNGM4YjAyYTU1OWZkOWJlYjJiMWY1ZDE4Y2VkMjBjNGJiMjQ2NTc3YjkyOTE0YWU2ODE0YzNmNzBhY2YiLAogICAgImRldmljZVB1YmxpY0tleSI6ICJCT1R1eUp6RkhqVzQyaFJsckNZM2JtTUJLMWdmdFQzYU5MaVRnQ3NKMV9lTlNkcjFHTTlhWTh3Mzlwb3BWTG9lZHdvZUFHQUJncDYxaEVhd2tFS3FJUDAiLAogICAgImRldmljZU5vbmNlIjogInB3bUwxVW9jSG5NYVUwa2w2ZVc0M3BfcllOakxBOGtJaUN2TDlibktwUGMiLAogICAgInByb2R1Y2VkQXQiOiAiMjAyNi0wOC0yMFQxMjowMDowMFoiCn0K",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+                    "value": "n4joB8c1KbYvw7MSjeGs1BEYeYe8dFpy47Me_iD7MO1gUSKDpGl6MyCxuZ8KWmjzNMUWz1sgREEW8HsgpNlsIQ"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "devicePublicKeyIsTheVerifyingKey": true,
+                "challengeProofMatches": true,
+                "organizationMatches": true,
+                "clusterMatches": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "response carrying an unknown optional field is accepted and the field is discarded",
+            "artifact": "response",
+            "answersChallenge": "challenge signed by a chained signing key under the pinned root",
+            "signerKey": "device",
+            "evaluationTime": "2026-08-20T12:00:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Qub2ZmbGluZS5lbnJvbGxtZW50UmVzcG9uc2UvMSIsCiAgICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwKICAgICJjaGFsbGVuZ2VJZCI6ICIwMTk4ZjNhMS03ZjAwLTdkNDAtYmU1MS0zZjRhNWI2YzdkODMiLAogICAgIm9yZ2FuaXphdGlvbk5hbWUiOiAib3JnYW5pemF0aW9ucy8wMTk4ZjNhMS00YzAwLTdhMTAtOGIyMS0wYzFkMmUzZjRhNTAiLAogICAgImNsdXN0ZXJOYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwL2NsdXN0ZXJzLzAxOThmM2ExLTVkMDAtN2IyMC05YzMxLTFkMmUzZjRhNWI2MSIsCiAgICAiY2hhbGxlbmdlTm9uY2UiOiAiVFZ4NGpLYVBnV1BsZFRTbTdfU3pLUGxINUhmaGtwcXFyOWJ5ZUNqWGRIVSIsCiAgICAiY2hhbGxlbmdlUHJvb2YiOiAiamlEVjRXeTgxV3dxUXdseFZxRjBlRlRoOWpFTW5EM21rVVdCNVhxR21wa1N3MFduVGRBanVWSDF3cVJNZVVFWWtaTERUdTdmQjVZSlJ2Qk4yd3JVdEEiLAogICAgImRldmljZUtleUlkIjogIjM5Y2EyNGM4YjAyYTU1OWZkOWJlYjJiMWY1ZDE4Y2VkMjBjNGJiMjQ2NTc3YjkyOTE0YWU2ODE0YzNmNzBhY2YiLAogICAgImRldmljZVB1YmxpY0tleSI6ICJCT1R1eUp6RkhqVzQyaFJsckNZM2JtTUJLMWdmdFQzYU5MaVRnQ3NKMV9lTlNkcjFHTTlhWTh3Mzlwb3BWTG9lZHdvZUFHQUJncDYxaEVhd2tFS3FJUDAiLAogICAgImRldmljZU5vbmNlIjogIm5fYWVJb0ZkeldyRnppWjZ4b1BManBobnhaZVB5US1YaTdQSzRYUFhDNUEiLAogICAgInByb2R1Y2VkQXQiOiAiMjAyNi0wOC0yMFQxMjowMDowMFoiLAogICAgInRlbGVtZXRyeUhpbnQiOiAiaWdub3JlZCIKfQo=",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+                    "value": "tdMIDSpMk2kcZKT1FC8e3TDxNwujk8CVCgw7c3Np3ols8nUMx5Hx-TuznC57lqEq0Yo08H4r4AaztSktISHbXQ"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "devicePublicKeyIsTheVerifyingKey": true,
+                "challengeProofMatches": true,
+                "organizationMatches": true,
+                "clusterMatches": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null,
+                "discardedFields": [
+                    "telemetryHint"
+                ],
+                "echoedBack": [],
+                "stored": []
+            }
+        }
+    ]
+}

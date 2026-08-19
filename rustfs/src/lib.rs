@@ -80,6 +80,7 @@ pub(crate) mod bitrot_selftest;
 pub mod capacity;
 pub mod cluster_snapshot;
 pub mod config;
+pub mod connect;
 pub mod delete_tail_activity;
 pub mod diagnose;
 pub mod embedded;

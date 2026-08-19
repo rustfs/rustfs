@@ -1,0 +1,253 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "old-agent-vectors",
+  "description": "Release skew in both directions, plus the version gate. The version rule is not restated here: it is the one frozen in protocol/agent/v1/fixtures/version/field-registry.json, and the inventory field registry repeats its pattern and supported majors so the two can be compared. An unsupported major fails closed before any inventory member is read, so nothing is normalized, validated, hashed, stored, or echoed.",
+  "versionRule": {
+    "inheritedFrom": "protocol/agent/v1/fixtures/version/field-registry.json",
+    "protocolVersionPattern": "^v[1-9][0-9]{0,3}$",
+    "supportedMajorVersions": [1],
+    "reason": "UNSUPPORTED_PROTOCOL",
+    "httpStatus": 400
+  },
+  "baseContentHash": "1d6f2b1d767df63fbf72d6f7abcc98d5c47ed6783739e449f898ea5898e5e356",
+  "vectors": [
+    {
+      "name": "old agent omits every optional member",
+      "category": "old-agent",
+      "direction": "old-agent-to-new-connect",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes"
+        ],
+        "discarded": [],
+        "defaultsApplied": { "osVersion": null, "coarseFlags": [] },
+        "canonicalJson": "{\"capacityTotalBytes\":549755813888,\"capacityUsedBytes\":137438953472,\"coarseFlags\":[],\"driveCount\":16,\"nodeCount\":4,\"osVersion\":null,\"rustfsVersion\":\"1.0.0\"}",
+        "contentHash": "1d6f2b1d767df63fbf72d6f7abcc98d5c47ed6783739e449f898ea5898e5e356",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "newer agent sends the documented defaults explicitly",
+      "category": "old-agent",
+      "direction": "new-agent-to-old-connect",
+      "sameContentHashAs": "old agent omits every optional member",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.0.0",
+        "osVersion": null,
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472,
+        "coarseFlags": []
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":549755813888,\"capacityUsedBytes\":137438953472,\"coarseFlags\":[],\"driveCount\":16,\"nodeCount\":4,\"osVersion\":null,\"rustfsVersion\":\"1.0.0\"}",
+        "contentHash": "1d6f2b1d767df63fbf72d6f7abcc98d5c47ed6783739e449f898ea5898e5e356",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "newer agent adds a member this Connect does not know",
+      "category": "old-agent",
+      "direction": "new-agent-to-old-connect",
+      "sameContentHashAs": "old agent omits every optional member",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472,
+        "poolCount": 2
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes"
+        ],
+        "discarded": ["poolCount"],
+        "defaultsApplied": { "osVersion": null, "coarseFlags": [] },
+        "canonicalJson": "{\"capacityTotalBytes\":549755813888,\"capacityUsedBytes\":137438953472,\"coarseFlags\":[],\"driveCount\":16,\"nodeCount\":4,\"osVersion\":null,\"rustfsVersion\":\"1.0.0\"}",
+        "contentHash": "1d6f2b1d767df63fbf72d6f7abcc98d5c47ed6783739e449f898ea5898e5e356",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "next major version from a future agent",
+      "category": "old-agent",
+      "direction": "new-agent-to-old-connect",
+      "input": {
+        "protocolVersion": "v2",
+        "rustfsVersion": "2.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": null,
+        "contentHash": null,
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "far future major version",
+      "category": "old-agent",
+      "direction": "new-agent-to-old-connect",
+      "input": {
+        "protocolVersion": "v9999",
+        "rustfsVersion": "9999.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": null,
+        "contentHash": null,
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "a secret-like unknown member does not rescue an unsupported major version",
+      "category": "old-agent",
+      "direction": "new-agent-to-old-connect",
+      "input": {
+        "protocolVersion": "v2",
+        "compatibilityShim": "v1",
+        "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "rustfsVersion": "2.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": null,
+        "contentHash": null,
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "an agent that omits the protocol version",
+      "category": "old-agent",
+      "direction": "old-agent-to-new-connect",
+      "input": {
+        "rustfsVersion": "1.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": null,
+        "contentHash": null,
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "a dotted protocol version is not a major version",
+      "category": "old-agent",
+      "direction": "old-agent-to-new-connect",
+      "input": {
+        "protocolVersion": "v1.2",
+        "rustfsVersion": "1.0.0",
+        "nodeCount": 4,
+        "driveCount": 16,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 137438953472
+      },
+      "expected": {
+        "decision": "REJECT",
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400,
+        "retained": [],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": null,
+        "contentHash": null,
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    }
+  ]
+}

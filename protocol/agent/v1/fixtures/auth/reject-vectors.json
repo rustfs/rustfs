@@ -1,0 +1,195 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "reject-vectors",
+  "description": "Presented certificates that must not authenticate. A credential that is known but unusable still resolves, so the rejection can be audited against a device instead of being reported as an unknown certificate.",
+  "vectors": [
+    {
+      "name": "revoked credential",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": "revoke"
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CREDENTIAL_REVOKED"
+      }
+    },
+    {
+      "name": "compromised credential",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": "markCompromised"
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CREDENTIAL_COMPROMISED"
+      }
+    },
+    {
+      "name": "credential whose validity window has closed",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -86460,
+        "validUntilOffsetSeconds": -60,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CREDENTIAL_EXPIRED"
+      }
+    },
+    {
+      "name": "credential whose validity window has not opened",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": 3600,
+        "validUntilOffsetSeconds": 90000,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CREDENTIAL_NOT_YET_VALID"
+      }
+    },
+    {
+      "name": "intact credential on a disabled cluster",
+      "clusterState": "DISABLED",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CLUSTER_DISABLED"
+      }
+    },
+    {
+      "name": "intact credential on a deleted cluster",
+      "clusterState": "DELETED",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": false,
+        "reason": "CLUSTER_DELETED"
+      }
+    },
+    {
+      "name": "certificate Connect never issued",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "unrelated",
+        "certificateFingerprint": "unrelated"
+      },
+      "expected": {
+        "credentialResolved": false,
+        "authenticationEffective": false,
+        "reason": "CLIENT_CERTIFICATE_UNKNOWN"
+      }
+    },
+    {
+      "name": "issued serial presented with a substituted certificate",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "unrelated"
+      },
+      "expected": {
+        "credentialResolved": false,
+        "authenticationEffective": false,
+        "reason": "CLIENT_CERTIFICATE_UNKNOWN"
+      }
+    },
+    {
+      "name": "issued certificate presented under a substituted serial",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "unrelated",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": false,
+        "authenticationEffective": false,
+        "reason": "CLIENT_CERTIFICATE_UNKNOWN"
+      }
+    }
+  ],
+  "tenantVector": {
+    "name": "authenticated device reaching a resource owned by another organization",
+    "description": "The certificate is valid and its credential is effective. Only the stored organization decides what the device may reach, and the certificate carries no organization identifier to contradict it.",
+    "clusterState": "ACTIVE",
+    "credential": {
+      "validFromOffsetSeconds": -3600,
+      "validUntilOffsetSeconds": 82800,
+      "transition": null
+    },
+    "expected": {
+      "credentialResolved": true,
+      "authenticationEffective": true,
+      "resolvedIdentityBelongsToForeignOrganization": false,
+      "reason": "TENANT_MISMATCH"
+    }
+  }
+}

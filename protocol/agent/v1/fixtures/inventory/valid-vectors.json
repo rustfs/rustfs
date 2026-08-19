@@ -1,0 +1,198 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "valid-vectors",
+  "description": "Accepted L0 inventory snapshots with their normalized form, canonical hash input, and content hash. canonicalJson is the exact byte string that is hashed after the domain prefix, so an independent implementation can diff its serialization before it ever compares a digest.",
+  "vectors": [
+    {
+      "name": "fully populated snapshot",
+      "category": "valid",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["cluster.degraded", "drive.offline"]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "unsorted duplicated and unknown coarse flags normalize to the same snapshot",
+      "category": "valid",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["drive.offline", "cluster.degraded", "drive.offline", "cluster.on.fire"]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": ["coarseFlags[cluster.on.fire]"],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "every limit at its maximum",
+      "category": "valid",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "9999.9999.9999",
+        "osVersion": { "family": "other", "major": 9999, "minor": 9999 },
+        "nodeCount": 4096,
+        "driveCount": 1048576,
+        "capacityTotalBytes": 9007199254740991,
+        "capacityUsedBytes": 9007199254740991,
+        "coarseFlags": [
+          "capacity.critical",
+          "capacity.warning",
+          "clock.skew",
+          "cluster.degraded",
+          "cluster.healing",
+          "cluster.readonly",
+          "drive.offline",
+          "node.offline"
+        ]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":9007199254740991,\"capacityUsedBytes\":9007199254740991,\"coarseFlags\":[\"capacity.critical\",\"capacity.warning\",\"clock.skew\",\"cluster.degraded\",\"cluster.healing\",\"cluster.readonly\",\"drive.offline\",\"node.offline\"],\"driveCount\":1048576,\"nodeCount\":4096,\"osVersion\":{\"family\":\"other\",\"major\":9999,\"minor\":9999},\"rustfsVersion\":\"9999.9999.9999\"}",
+        "contentHash": "b69d51f898a53562a7057faa5bda1e21699ee6615517cd8b1455096f9171bce4",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "every limit at its minimum",
+      "category": "valid",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "0.0.0",
+        "osVersion": null,
+        "nodeCount": 1,
+        "driveCount": 0,
+        "capacityTotalBytes": 0,
+        "capacityUsedBytes": 0,
+        "coarseFlags": []
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":0,\"capacityUsedBytes\":0,\"coarseFlags\":[],\"driveCount\":0,\"nodeCount\":1,\"osVersion\":null,\"rustfsVersion\":\"0.0.0\"}",
+        "contentHash": "08ebc03ee906c05d686ef32c0998154213f2811a2d07408a9ef7d0b205cc701b",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "a full cluster reports used equal to total",
+      "category": "valid",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "freebsd", "major": 14, "minor": 1 },
+        "nodeCount": 4,
+        "driveCount": 32,
+        "capacityTotalBytes": 549755813888,
+        "capacityUsedBytes": 549755813888,
+        "coarseFlags": ["capacity.critical", "cluster.readonly"]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":549755813888,\"capacityUsedBytes\":549755813888,\"coarseFlags\":[\"capacity.critical\",\"cluster.readonly\"],\"driveCount\":32,\"nodeCount\":4,\"osVersion\":{\"family\":\"freebsd\",\"major\":14,\"minor\":1},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "0ab2308e84d2a9660650526edcd07795fe08a0fea047f16718846ce883a150b3",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    }
+  ]
+}

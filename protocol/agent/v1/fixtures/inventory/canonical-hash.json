@@ -1,0 +1,63 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "canonical-hash",
+  "description": "The canonical content hash of an L0 inventory snapshot, defined precisely enough that an independent implementation reproduces it byte for byte. The prose form is docs/data-collection/inventory-l0.md; this file is the machine-checkable copy.",
+  "algorithm": "SHA-256",
+  "output": {
+    "encoding": "lowercase hexadecimal",
+    "length": 64,
+    "pattern": "^[0-9a-f]{64}$"
+  },
+  "hashedBytes": "domainPrefix followed immediately by canonicalJson encoded as UTF-8, with nothing between them and nothing after",
+  "domainPrefix": {
+    "ascii": "rustfs-connect/agent/v1/inventory-snapshot\n",
+    "hex": "7275737466732d636f6e6e6563742f6167656e742f76312f696e76656e746f72792d736e617073686f740a",
+    "byteLength": 43,
+    "reason": "Domain separation. An inventory hash can never equal a heartbeat, bundle, or job hash computed over the same member values."
+  },
+  "input": {
+    "startsFrom": "the normalized document, after the version gate, after unknown members and unknown coarse flag tokens have been discarded, and after schema and cross-field validation succeeded",
+    "excludedMembers": ["protocolVersion"],
+    "excludedMembersReason": "protocolVersion is negotiation input, not content. Excluding it means the same cluster state hashes identically across protocol versions, and it is why an unknown member can never change the hash.",
+    "materializedDefaults": {
+      "osVersion": null,
+      "coarseFlags": []
+    },
+    "materializedDefaultsReason": "Absent optional members take their documented default and the default is serialized, so the canonical object always carries exactly the same seven member names. An old agent that omits an optional member and a new agent that sends its default explicitly produce the same hash."
+  },
+  "serialization": {
+    "form": "one line of UTF-8 with no insignificant whitespace: no space after a colon or comma, no newline, no trailing newline",
+    "objects": "{ then member,member,... then }, where a member is \"name\":value; an empty object is {}",
+    "arrays": "[ then value,value,... then ]; an empty array is []",
+    "memberOrder": "ascending by the UTF-8 bytes of the member name, compared as unsigned bytes; no locale, no case folding, no UTF-16 code unit order",
+    "arrayOrder": "the normalized order, which for coarseFlags is de-duplicated and sorted ascending by the same unsigned-byte comparison",
+    "null": "the four bytes null",
+    "integers": "base ten, no plus sign, no leading zero except the single digit 0, no decimal point, no exponent; every v1 value is in 0..9007199254740991 so no implementation needs arbitrary precision",
+    "strings": "opened and closed by a double quote with the value's bytes between them",
+    "stringEscaping": "none is ever emitted. Every string value the canonical input can hold matches ^[a-z0-9.]{1,32}$ and every member name matches ^[a-zA-Z]{1,32}$, so no character requiring a JSON escape can reach the hash. A value outside those classes is a schema violation and is rejected before hashing.",
+    "canonicalValueCharacterClass": "^[a-z0-9.]{1,32}$",
+    "canonicalMemberNameCharacterClass": "^[a-zA-Z]{1,32}$",
+    "absentTypes": "the canonical input contains no boolean, no floating point number, and no nested array of objects. Adding a member of one of those types requires extending these rules in a reviewed protocol change."
+  },
+  "examples": [
+    {
+      "name": "fully populated snapshot",
+      "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+      "canonicalJsonByteLength": 225,
+      "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f"
+    },
+    {
+      "name": "every limit at its maximum",
+      "canonicalJson": "{\"capacityTotalBytes\":9007199254740991,\"capacityUsedBytes\":9007199254740991,\"coarseFlags\":[\"capacity.critical\",\"capacity.warning\",\"clock.skew\",\"cluster.degraded\",\"cluster.healing\",\"cluster.readonly\",\"drive.offline\",\"node.offline\"],\"driveCount\":1048576,\"nodeCount\":4096,\"osVersion\":{\"family\":\"other\",\"major\":9999,\"minor\":9999},\"rustfsVersion\":\"9999.9999.9999\"}",
+      "canonicalJsonByteLength": 359,
+      "contentHash": "b69d51f898a53562a7057faa5bda1e21699ee6615517cd8b1455096f9171bce4"
+    },
+    {
+      "name": "every limit at its minimum",
+      "canonicalJson": "{\"capacityTotalBytes\":0,\"capacityUsedBytes\":0,\"coarseFlags\":[],\"driveCount\":0,\"nodeCount\":1,\"osVersion\":null,\"rustfsVersion\":\"0.0.0\"}",
+      "canonicalJsonByteLength": 133,
+      "contentHash": "08ebc03ee906c05d686ef32c0998154213f2811a2d07408a9ef7d0b205cc701b"
+    }
+  ]
+}

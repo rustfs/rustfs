@@ -1,0 +1,34 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "version",
+  "fixture": "field-registry",
+  "description": "The frozen v1 negotiation envelope. Registration and heartbeat both carry it. Any top-level field not listed here is unknown and is discarded after acceptance.",
+  "envelope": "AgentProtocolNegotiation",
+  "supportedMajorVersions": [1],
+  "protocolVersionPattern": "^v[1-9][0-9]{0,3}$",
+  "unknownFieldPolicy": "accept-and-discard",
+  "unknownCapabilityPolicy": "discard",
+  "fields": [
+    {
+      "name": "protocolVersion",
+      "requiredness": "required",
+      "type": "string",
+      "default": null,
+      "note": "Major version only. The minor and patch level of an agent is not negotiated."
+    },
+    {
+      "name": "agentVersion",
+      "requiredness": "optional",
+      "type": "string",
+      "default": null,
+      "note": "Informational. Connect never compares it for equality with its own version and never gates behavior on it."
+    },
+    {
+      "name": "capabilities",
+      "requiredness": "optional",
+      "type": "array",
+      "default": [],
+      "note": "Unordered token set. A capability an operation requires but the device did not report fails that operation with a structured result, not the connection."
+    }
+  ]
+}

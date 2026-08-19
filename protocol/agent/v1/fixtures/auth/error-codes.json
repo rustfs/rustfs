@@ -1,0 +1,86 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "error-codes",
+  "description": "Frozen ErrorInfo reasons for agent authentication and negotiation. Clients branch on status and reason, never on message.",
+  "domain": "rustfs.connect",
+  "detailType": "type.googleapis.com/google.rpc.ErrorInfo",
+  "disclosureRules": [
+    "A rejection never reveals whether an unknown certificate belongs to another tenant.",
+    "A rejection never contains certificate bytes, key material, or a fingerprint."
+  ],
+  "reasons": [
+    {
+      "reason": "UNSUPPORTED_PROTOCOL",
+      "httpStatus": 400,
+      "status": "INVALID_ARGUMENT",
+      "meaning": "The requested protocol major version is missing, malformed, or not supported."
+    },
+    {
+      "reason": "CLIENT_CERTIFICATE_MISSING",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The request reached an authenticated agent operation without a Client-Cert header from trusted ingress."
+    },
+    {
+      "reason": "CLIENT_CERTIFICATE_MALFORMED",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The Client-Cert header is not a valid RFC 9440 byte sequence, or the certificate violates the frozen profile."
+    },
+    {
+      "reason": "CLIENT_CERTIFICATE_UNKNOWN",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "No device credential matches the presented certificate serial and fingerprint together."
+    },
+    {
+      "reason": "CREDENTIAL_NOT_YET_VALID",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The matched credential's validity window has not opened yet."
+    },
+    {
+      "reason": "CREDENTIAL_EXPIRED",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The matched credential's validity window has closed, ending any rotation overlap."
+    },
+    {
+      "reason": "CREDENTIAL_REVOKED",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The matched credential is REVOKED. Revocation takes effect immediately."
+    },
+    {
+      "reason": "CREDENTIAL_COMPROMISED",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The matched credential is COMPROMISED, for example after a clone was observed."
+    },
+    {
+      "reason": "CLUSTER_DISABLED",
+      "httpStatus": 403,
+      "status": "PERMISSION_DENIED",
+      "meaning": "The credential is intact but its cluster is DISABLED, so no agent activity is accepted."
+    },
+    {
+      "reason": "CLUSTER_DELETED",
+      "httpStatus": 403,
+      "status": "PERMISSION_DENIED",
+      "meaning": "The credential is intact but its cluster is DELETED."
+    },
+    {
+      "reason": "TENANT_MISMATCH",
+      "httpStatus": 403,
+      "status": "PERMISSION_DENIED",
+      "meaning": "The authenticated device belongs to a different organization than the resource named by the request."
+    },
+    {
+      "reason": "SESSION_CREDENTIAL_NOT_ACCEPTED",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "A browser session cookie was presented to an authenticated agent operation. The agent surface never accepts it."
+    }
+  ]
+}

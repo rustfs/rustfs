@@ -1,0 +1,104 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "redaction",
+  "fixture": "allowed-vectors",
+  "description": "Ordinary collected documents. Every vector must survive with redactedCount 0: versions, counts, capacities, flags, and single-case digests are exactly what the L0 and L1 registry exists to collect, and over-redaction would make a support bundle useless.",
+  "vectors": [
+    {
+      "name": "a complete heartbeat payload",
+      "source": "heartbeat",
+      "document": {
+        "protocolVersion": 1,
+        "agentVersion": "rustfs-agent/1.19.4",
+        "capabilities": [
+          "inventory",
+          "events",
+          "jobs"
+        ],
+        "sequence": 8421,
+        "clientTime": "2026-08-17T04:05:06Z",
+        "coarseNodeSummary": {
+          "total": 8,
+          "healthy": 7,
+          "degraded": 1
+        }
+      },
+      "expectedCanonicalJson": "{\"agentVersion\":\"rustfs-agent/1.19.4\",\"capabilities\":[\"inventory\",\"events\",\"jobs\"],\"clientTime\":\"2026-08-17T04:05:06Z\",\"coarseNodeSummary\":{\"degraded\":1,\"healthy\":7,\"total\":8},\"protocolVersion\":1,\"sequence\":8421}"
+    },
+    {
+      "name": "a complete inventory snapshot",
+      "source": "inventory",
+      "document": {
+        "rustfsVersion": "1.19.4",
+        "osVersion": "Ubuntu 22.04.5 LTS",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityUsedBytes": 412316860416,
+        "capacityTotalBytes": 1099511627776,
+        "coarseFlags": {
+          "degraded": false,
+          "readOnly": false,
+          "rebalancing": true
+        }
+      },
+      "expectedCanonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":{\"degraded\":false,\"readOnly\":false,\"rebalancing\":true},\"driveCount\":96,\"nodeCount\":8,\"osVersion\":\"Ubuntu 22.04.5 LTS\",\"rustfsVersion\":\"1.19.4\"}"
+    },
+    {
+      "name": "a complete offline diagnostic covering L0 and L1",
+      "source": "offline-diagnostic",
+      "document": {
+        "rustfsVersion": "1.19.4",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityUsedBytes": 412316860416,
+        "capacityTotalBytes": 1099511627776,
+        "coarseHealthFlags": {
+          "degraded": false
+        },
+        "osSummary": "Ubuntu 22.04.5 LTS",
+        "kernelSummary": "6.8.0-51-generic",
+        "cpuSummary": {
+          "architecture": "aarch64",
+          "cores": 64
+        },
+        "memorySummary": {
+          "totalBytes": 274877906944,
+          "underPressure": false
+        },
+        "filesystemSummary": [
+          "xfs",
+          "ext4"
+        ],
+        "networkSummary": {
+          "interfaceCount": 4,
+          "bondCount": 2
+        }
+      },
+      "expectedCanonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseHealthFlags\":{\"degraded\":false},\"cpuSummary\":{\"architecture\":\"aarch64\",\"cores\":64},\"driveCount\":96,\"filesystemSummary\":[\"xfs\",\"ext4\"],\"kernelSummary\":\"6.8.0-51-generic\",\"memorySummary\":{\"totalBytes\":274877906944,\"underPressure\":false},\"networkSummary\":{\"bondCount\":2,\"interfaceCount\":4},\"nodeCount\":8,\"osSummary\":\"Ubuntu 22.04.5 LTS\",\"rustfsVersion\":\"1.19.4\"}"
+    },
+    {
+      "name": "single-case digests and long identifiers are not mistaken for key material",
+      "source": "inventory",
+      "document": {
+        "rustfsVersion": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        "osVersion": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+      },
+      "expectedCanonicalJson": "{\"osVersion\":\"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855\",\"rustfsVersion\":\"da39a3ee5e6b4b0d3255bfef95601890afd80709\"}"
+    },
+    {
+      "name": "extreme but ordinary capacity and count values survive unchanged",
+      "source": "inventory",
+      "document": {
+        "nodeCount": 0,
+        "driveCount": 1024,
+        "capacityUsedBytes": 0,
+        "capacityTotalBytes": 9223372036854775807,
+        "coarseFlags": {
+          "degraded": null,
+          "utilisation": 0.9375
+        }
+      },
+      "expectedCanonicalJson": "{\"capacityTotalBytes\":9223372036854775807,\"capacityUsedBytes\":0,\"coarseFlags\":{\"degraded\":null,\"utilisation\":0.9375},\"driveCount\":1024,\"nodeCount\":0}"
+    }
+  ]
+}
