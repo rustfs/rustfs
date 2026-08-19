@@ -645,6 +645,32 @@ enum GetSizeFailureAction {
     HealMetadata { object: String },
 }
 
+/// How the corrupt-metadata branch records the repair after attempting an
+/// MRF intent (backlog#1894 axis A).
+#[derive(Debug, PartialEq, Eq)]
+enum CorruptMetadataRecording {
+    /// Intent accepted: the MRF consumer owns the repair (High Metadata
+    /// heal, durable after the journal's group-commit flush), so the
+    /// immediate heal request is skipped — the manager would otherwise book
+    /// two tasks for one target. A pending-ledger entry stays behind as the
+    /// backstop for what the journal cannot cover on its own (a crash inside
+    /// the flush window, or the consumer exhausting its admission attempts);
+    /// the repaired-notice fanout (axis B) drops the entry once the repair
+    /// lands.
+    LedgerOnly,
+    /// Intent rejected (feature disabled, channel uninitialized, or full):
+    /// the historical immediate heal request plus the ledger entry.
+    ImmediateAndLedger,
+}
+
+fn corrupt_metadata_recording(mrf_accepted: bool) -> CorruptMetadataRecording {
+    if mrf_accepted {
+        CorruptMetadataRecording::LedgerOnly
+    } else {
+        CorruptMetadataRecording::ImmediateAndLedger
+    }
+}
+
 fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> HealChannelRequest {
     HealChannelRequest {
         bucket,
@@ -2478,29 +2504,46 @@ impl FolderScanner {
                         }
 
                         if let GetSizeFailureAction::HealMetadata { object } = failure_action {
-                            // MRF journal intent: durable High-priority Metadata
-                            // heal across restarts (HS-01); the scanner heal
-                            // request below stays as the immediate path.
-                            rustfs_common::mrf_channel::try_send_mrf_intent(
+                            // Single-flight (backlog#1894 axis A) — the
+                            // recording mode and its guarantees are pinned by
+                            // corrupt_metadata_recording below.
+                            let mrf_accepted = rustfs_common::mrf_channel::try_send_mrf_intent(
                                 rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
                                 &item.bucket,
                                 &object,
                                 None,
                             );
-                            self.send_required_scanner_heal_request(
-                                PendingScannerHealKind::Object,
-                                item.bucket.clone(),
-                                Some(object.clone()),
-                                None,
-                                build_object_heal_request(
-                                    item.bucket.clone(),
-                                    object.clone(),
-                                    None,
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                ),
-                            )
-                            .await?;
+                            match corrupt_metadata_recording(mrf_accepted) {
+                                CorruptMetadataRecording::LedgerOnly => {
+                                    // Recorded as Full (retry-later): admission
+                                    // for this target happens in the MRF
+                                    // consumer, not in the manager's queue here.
+                                    self.update_pending_scanner_heal_after_admission(
+                                        PendingScannerHealKind::Object,
+                                        &item.bucket,
+                                        Some(&object),
+                                        None,
+                                        self.scan_mode,
+                                        HealAdmissionResult::Full,
+                                    );
+                                }
+                                CorruptMetadataRecording::ImmediateAndLedger => {
+                                    self.send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        item.bucket.clone(),
+                                        Some(object.clone()),
+                                        None,
+                                        build_object_heal_request(
+                                            item.bucket.clone(),
+                                            object.clone(),
+                                            None,
+                                            self.scan_mode,
+                                            HealChannelPriority::High,
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
 
                         timer.sleep().await;
@@ -3393,6 +3436,17 @@ mod tests {
         assert_eq!(EVENT_SCANNER_MANY_VERSIONS, EventName::ScannerManyVersions.to_string());
         assert_eq!(EVENT_SCANNER_LARGE_VERSIONS, EventName::ScannerLargeVersions.to_string());
         assert_eq!(EVENT_SCANNER_BIG_PREFIX, EventName::ScannerBigPrefix.to_string());
+    }
+
+    /// Single-flight decision for the corrupt-metadata branch (backlog#1894
+    /// axis A): an accepted MRF intent must drop the immediate heal request
+    /// (the consumer files one; the manager would double-book) while a
+    /// rejected one must keep it — in both cases a ledger entry remains, so
+    /// the backstop survives regardless of delivery.
+    #[test]
+    fn corrupt_metadata_recording_maps_delivery_to_backstop() {
+        assert_eq!(corrupt_metadata_recording(true), CorruptMetadataRecording::LedgerOnly);
+        assert_eq!(corrupt_metadata_recording(false), CorruptMetadataRecording::ImmediateAndLedger);
     }
 
     fn cooldown_map_len() -> usize {
