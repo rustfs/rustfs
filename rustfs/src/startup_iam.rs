@@ -352,17 +352,6 @@ fn should_fail_test_init_attempt() -> bool {
         false
     }
 }
-
-/// Reset the test failure counter so the next `should_fail_test_init_attempt`
-/// call re-reads the environment variable by restoring the sentinel value.
-/// Intended for use in integration tests that share a process.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) fn reset_test_failure_counter() {
-    use std::sync::atomic::Ordering;
-    TEST_REMAINING_FAILURES.store(u64::MAX, Ordering::SeqCst);
-}
-
 async fn attempt_init_iam_sys(
     store: Arc<ECStore>,
 ) -> std::result::Result<Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>, std::io::Error> {

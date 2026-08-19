@@ -738,7 +738,7 @@ struct GetObjectPreparedRead {
 }
 
 struct GetObjectStrategyContext {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
     enable_readahead: bool,

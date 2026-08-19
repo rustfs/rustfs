@@ -254,7 +254,10 @@ pub(crate) fn apply_bucket_default_lock_retention(
 /// );
 /// ```
 ///
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "exercised by ecfs_test; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
     let config = match profile {
         Some(p) => RustFSBufferConfig::new(p),
@@ -798,26 +801,10 @@ fn cache_remove(bucket: &str) {
         map.remove(bucket);
     }
 }
-
-/// Clear all entries in the cache.
-#[allow(dead_code)]
-fn cache_clear() {
-    if let Ok(mut map) = small_cache().write() {
-        map.clear();
-    }
-}
-
 /// Invalidate the validation cache for a specific bucket.
 pub fn invalidate_bucket_validation_cache(bucket: &str) {
     cache_remove(bucket);
 }
-
-/// Invalidate all bucket validation cache entries.
-#[allow(dead_code)]
-pub fn invalidate_all_bucket_validation_cache() {
-    cache_clear();
-}
-
 /// Helper function to get store and validate bucket exists.
 ///
 /// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
