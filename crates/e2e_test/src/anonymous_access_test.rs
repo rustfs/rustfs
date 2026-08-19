@@ -18,7 +18,6 @@
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::types::PublicAccessBlockConfiguration;
-use serial_test::serial;
 use tracing::info;
 
 async fn setup_public_bucket(
@@ -73,7 +72,6 @@ async fn anonymous_get_object(
 /// Issue #2036: Anonymous GetObject should succeed when bucket policy allows it
 /// and no PublicAccessBlock configuration exists (ConfigNotFound).
 #[tokio::test]
-#[serial]
 async fn test_anonymous_access_allowed_when_public_access_block_missing() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 {
     init_logging();
@@ -100,7 +98,6 @@ async fn test_anonymous_access_allowed_when_public_access_block_missing() -> Res
 
 /// Anonymous GetObject should be denied when RestrictPublicBuckets is true.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_access_denied_when_restrict_public_buckets_enabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -137,7 +134,6 @@ async fn test_anonymous_access_denied_when_restrict_public_buckets_enabled()
 /// Anonymous GetObject should succeed when PublicAccessBlock exists but
 /// RestrictPublicBuckets is explicitly false.
 #[tokio::test]
-#[serial]
 async fn test_anonymous_access_allowed_when_restrict_public_buckets_disabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -176,7 +172,6 @@ async fn test_anonymous_access_allowed_when_restrict_public_buckets_disabled()
 /// reaches authorization through a fallback branch, and that branch has to apply the
 /// same public-access gate as a direct grant.
 #[tokio::test]
-#[serial]
 async fn ghsa_x298_anonymous_list_object_versions_denied_when_restrict_public_buckets_enabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();

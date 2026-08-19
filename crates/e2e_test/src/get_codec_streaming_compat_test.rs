@@ -66,7 +66,6 @@ mod tests {
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::error::Error;
@@ -277,7 +276,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn codec_streaming_matches_legacy_duplex_body_and_headers() -> TestResult {
         init_logging();
 

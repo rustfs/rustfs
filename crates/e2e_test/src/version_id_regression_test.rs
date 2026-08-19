@@ -27,7 +27,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
-    use serial_test::serial;
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -86,7 +85,6 @@ mod tests {
     /// Test 1: PutObject should return version_id when versioning is enabled
     /// This directly addresses the Veeam issue from #1066
     #[tokio::test]
-    #[serial]
     async fn test_put_object_returns_version_id_with_versioning() {
         init_logging();
         info!("🧪 TEST: PutObject returns version_id with versioning enabled");
@@ -130,7 +128,6 @@ mod tests {
 
     /// Test 2: CopyObject should return version_id when versioning is enabled
     #[tokio::test]
-    #[serial]
     async fn test_copy_object_returns_version_id_with_versioning() {
         init_logging();
         info!("🧪 TEST: CopyObject returns version_id with versioning enabled");
@@ -185,7 +182,6 @@ mod tests {
 
     /// Test 3: CompleteMultipartUpload should return version_id when versioning is enabled
     #[tokio::test]
-    #[serial]
     async fn test_multipart_upload_returns_version_id_with_versioning() {
         init_logging();
         info!("🧪 TEST: CompleteMultipartUpload returns version_id with versioning enabled");
@@ -260,7 +256,6 @@ mod tests {
     /// Test 4: PutObject should NOT return version_id when versioning is NOT enabled
     /// This ensures we didn't break non-versioned buckets
     #[tokio::test]
-    #[serial]
     async fn test_put_object_without_versioning() {
         init_logging();
         info!("🧪 TEST: PutObject behavior without versioning (no regression)");
@@ -296,7 +291,6 @@ mod tests {
 
     /// Test 5: Basic S3 operations still work correctly (no regression)
     #[tokio::test]
-    #[serial]
     async fn test_basic_s3_operations_no_regression() {
         init_logging();
         info!("🧪 TEST: Basic S3 operations work correctly (no regression)");
@@ -363,7 +357,6 @@ mod tests {
     /// Test 6: Veeam-specific scenario simulation
     /// Simulates the exact workflow that Veeam uses when backing up data
     #[tokio::test]
-    #[serial]
     async fn test_veeam_backup_workflow_simulation() {
         init_logging();
         info!("🧪 TEST: Veeam VBR backup workflow simulation (Issue #1066)");
@@ -413,7 +406,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_terraform_put_after_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
 
@@ -456,7 +448,6 @@ mod tests {
 
     /// Test 7: PutObject should omit version_id when versioning is Suspended
     #[tokio::test]
-    #[serial]
     async fn test_put_object_omits_version_id_with_suspended_versioning() {
         init_logging();
         info!("🧪 TEST: PutObject omits version_id with versioning suspended");
@@ -500,7 +491,6 @@ mod tests {
 
     /// Test 8: CopyObject should omit version_id when versioning is Suspended
     #[tokio::test]
-    #[serial]
     async fn test_copy_object_omits_version_id_with_suspended_versioning() {
         init_logging();
         info!("🧪 TEST: CopyObject omits version_id with versioning suspended");
@@ -551,7 +541,6 @@ mod tests {
 
     /// Test 9: CompleteMultipartUpload should omit version_id when versioning is Suspended
     #[tokio::test]
-    #[serial]
     async fn test_multipart_upload_omits_version_id_with_suspended_versioning() {
         init_logging();
         info!("🧪 TEST: CompleteMultipartUpload omits version_id with versioning suspended");

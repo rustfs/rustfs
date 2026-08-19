@@ -33,7 +33,6 @@
 //!     serve the unauthenticated console endpoints at all.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
-use serial_test::serial;
 use std::error::Error;
 use tokio::time::{Duration, sleep};
 
@@ -58,7 +57,6 @@ async fn wait_for_console_ready(console_base: &str) -> Result<reqwest::Response,
 }
 
 #[tokio::test]
-#[serial]
 async fn test_console_over_the_wire_smoke() -> TestResult {
     init_logging();
 

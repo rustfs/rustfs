@@ -20,7 +20,6 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::{pre_sign_v4, sign_v4};
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use s3s::Body;
-use serial_test::serial;
 use std::collections::HashMap;
 use std::error::Error;
 use time::OffsetDateTime;
@@ -548,7 +547,6 @@ async fn read_listen_notification_event(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_notification_target_persists_across_restart_and_delete() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -608,7 +606,6 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
 }
 
 #[tokio::test]
-#[serial]
 async fn test_notification_target_with_path_is_online_via_transport_probe() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -641,7 +638,6 @@ async fn test_notification_target_with_path_is_online_via_transport_probe() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -682,7 +678,6 @@ async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<d
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -722,7 +717,6 @@ async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(),
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -790,7 +784,6 @@ async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), B
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -850,7 +843,6 @@ async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> R
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_success_response_without_auth_headers() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -896,7 +888,6 @@ async fn test_get_object_lambda_rejects_success_response_without_auth_headers() 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_headers() -> Result<(), Box<dyn Error + Send + Sync>>
 {
     init_logging();
@@ -943,7 +934,6 @@ async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_he
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -980,7 +970,6 @@ async fn test_get_object_lambda_rejects_unsupported_target_type() -> Result<(), 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1017,7 +1006,6 @@ async fn test_get_object_lambda_rejects_unconfigured_target() -> Result<(), Box<
 }
 
 #[tokio::test]
-#[serial]
 async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1063,7 +1051,6 @@ async fn test_get_object_lambda_rejects_disabled_target() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1106,7 +1093,6 @@ async fn test_configure_object_lambda_target_rejects_invalid_endpoint() -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_configure_object_lambda_notify_webhook_rejects_response_header_timeout_key()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -1140,7 +1126,6 @@ async fn test_configure_object_lambda_notify_webhook_rejects_response_header_tim
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1184,7 +1169,6 @@ async fn test_listen_notification_emits_after_put_object() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -1219,7 +1203,6 @@ async fn test_listen_notification_emits_on_empty_bucket_when_notify_disabled() -
 }
 
 #[tokio::test]
-#[serial]
 async fn test_listen_notification_fans_in_remote_node_events() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 

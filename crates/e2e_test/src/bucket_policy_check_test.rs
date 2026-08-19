@@ -18,7 +18,6 @@
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
-use serial_test::serial;
 use tracing::info;
 
 async fn create_user(
@@ -51,7 +50,6 @@ fn create_user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key:
 }
 
 #[tokio::test]
-#[serial]
 async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !crate::common::awscurl_available() {

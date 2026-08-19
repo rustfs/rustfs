@@ -522,10 +522,16 @@ jobs:
             for f in "$DEB_FILE" "$RPM_FILE"; do
               if [[ -n "$f" && -f "$f" ]]; then
                 base="$(basename "$f")"
-                # Remove any stale entry, then append the fresh digest
+                # GitHub stores release asset names with '~' normalized to '.'
+                # (e.g. rustfs_1.0.0~rc.2_amd64.deb is stored as
+                # rustfs_1.0.0.rc.2_amd64.deb), so checksum entries must
+                # reference the name as stored on the release.
+                github_base="${base//\~/.}"
+                # Remove any stale entry (both naming variants), then append
                 grep -Fv -- "$base" "$checksum_file" > "${checksum_file}.tmp" || true
-                mv "${checksum_file}.tmp" "$checksum_file"
-                (cd "$(dirname "$f")" && "$checksum_cmd" -- "$base") >> "$checksum_file"
+                grep -Fv -- "$github_base" "${checksum_file}.tmp" > "${checksum_file}.tmp2" || true
+                mv "${checksum_file}.tmp2" "$checksum_file"
+                (cd "$(dirname "$f")" && "$checksum_cmd" -- "$github_base") >> "$checksum_file"
               fi
             done
 

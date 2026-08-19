@@ -155,6 +155,9 @@ jobs:
       - name: Check cryptographic capability wording
         run: ./scripts/check_fips_wording.sh
 
+      - name: Check no embedded secret material
+        run: ./scripts/check_embedded_secrets.sh
+
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
 

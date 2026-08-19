@@ -24,13 +24,11 @@ use super::common::{
     test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tokio::time::{Duration, sleep};
 use tracing::info;
 
 /// Comprehensive test: Full KMS workflow with all encryption types
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🏁 Start the KMS full-featured synthesis test");
@@ -99,7 +97,6 @@ async fn test_mixed_encryption_workload(
 
 /// Comprehensive stress test: Large dataset with multiple encryption types
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("💪 Start the KMS stress test");
@@ -134,7 +131,6 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 
 /// Test encryption key isolation and security
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🔐 Begin the comprehensive test of encryption key isolation");
@@ -206,7 +202,6 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
 
 /// Test concurrent encryption operations
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("⚡ Started comprehensive testing of concurrent encryption operations");
@@ -252,7 +247,6 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
 
 /// Test encryption/decryption performance with different file sizes
 #[tokio::test]
-#[serial]
 async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("📊 Start KMS performance benchmarking");

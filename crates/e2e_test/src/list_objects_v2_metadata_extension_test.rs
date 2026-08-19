@@ -23,7 +23,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -53,7 +52,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_list_objects_v2_metadata_extension_returns_metadata_tags_and_internal()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
