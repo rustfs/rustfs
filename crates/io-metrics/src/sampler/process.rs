@@ -188,18 +188,40 @@ mod tests {
     }
 
     #[test]
-    fn process_snapshots_are_collectable() {
-        let _ = snapshot_process_resource();
-        let _ = snapshot_process_system();
-        let _ = snapshot_process_resource_and_system();
+    fn combined_snapshot_agrees_with_the_individual_ones_on_per_process_facts() {
+        // Previously three discarded calls that asserted nothing. The values that
+        // move (cpu, memory) cannot be compared across calls, but the facts that
+        // identify the process must not differ by which entry point produced them
+        // (rustfs/backlog#1836).
+        let system = snapshot_process_system();
+        let (_, combined_system) = snapshot_process_resource_and_system();
+
+        assert_eq!(
+            system.start_time_seconds, combined_system.start_time_seconds,
+            "both entry points describe this process, so its start time cannot differ"
+        );
+        assert_eq!(
+            system.file_descriptor_limit_total, combined_system.file_descriptor_limit_total,
+            "the descriptor limit is a property of the process, not of the call"
+        );
+        assert_eq!(
+            system.status_value, combined_system.status_value,
+            "the status enum and its numeric projection must stay in step"
+        );
+        assert_eq!(combined_system.status_value, combined_system.status as i64);
     }
 
     #[test]
-    fn independent_samplers_are_collectable() {
+    fn independent_samplers_observe_the_same_process() {
         let mut sampler_a = ProcessSampler::new();
         let mut sampler_b = ProcessSampler::new();
 
-        let _ = snapshot_process_resource_and_system_with(&mut sampler_a);
-        let _ = snapshot_process_resource_and_system_with(&mut sampler_b);
+        let (_, system_a) = snapshot_process_resource_and_system_with(&mut sampler_a);
+        let (_, system_b) = snapshot_process_resource_and_system_with(&mut sampler_b);
+
+        // Two samplers hold separate sysinfo state; they must still agree on the
+        // process they are both looking at rather than each inventing a value.
+        assert_eq!(system_a.start_time_seconds, system_b.start_time_seconds);
+        assert_eq!(system_a.file_descriptor_limit_total, system_b.file_descriptor_limit_total);
     }
 }
