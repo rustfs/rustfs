@@ -3354,7 +3354,6 @@ async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiErro
 /// Clears GLOBAL_SSE_DEK_PROVIDER (local/test providers) and
 /// GLOBAL_KMS_DEK_PROVIDER (test-injected KMS providers).
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn reset_sse_dek_provider() {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = None;
@@ -3365,7 +3364,6 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = Some(provider.clone());
