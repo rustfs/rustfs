@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display},
@@ -631,104 +630,6 @@ pub fn create_heal_response(
         data,
         error,
     }
-}
-
-fn lc_get_prefix(rule: &LifecycleRule) -> String {
-    if let Some(p) = &rule.prefix {
-        return p.to_string();
-    } else if let Some(filter) = &rule.filter {
-        if let Some(p) = &filter.prefix {
-            return p.to_string();
-        } else if let Some(and) = &filter.and
-            && let Some(p) = &and.prefix
-        {
-            return p.to_string();
-        }
-    }
-
-    "".into()
-}
-
-pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) -> bool {
-    if config.rules.is_empty() {
-        return false;
-    }
-
-    for rule in config.rules.iter() {
-        if rule.status == ExpirationStatus::from_static(ExpirationStatus::DISABLED) {
-            continue;
-        }
-        let rule_prefix = lc_get_prefix(rule);
-        if !prefix.is_empty() && !rule_prefix.is_empty() && !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix)
-        {
-            continue;
-        }
-
-        if let Some(e) = &rule.noncurrent_version_expiration {
-            if e.noncurrent_days.is_some() {
-                return true;
-            }
-            if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
-                return true;
-            }
-        }
-
-        if rule.noncurrent_version_transitions.is_some() {
-            return true;
-        }
-        if let Some(true) = rule.expiration.as_ref().map(|e| e.date.is_some()) {
-            return true;
-        }
-
-        if let Some(true) = rule.expiration.as_ref().map(|e| e.days.is_some()) {
-            return true;
-        }
-
-        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker) {
-            return true;
-        }
-
-        if let Some(true) = rule.transitions.as_ref().map(|t| !t.is_empty()) {
-            return true;
-        }
-
-        if rule.transitions.is_some() {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
-    if config.rules.is_empty() {
-        return false;
-    }
-
-    for rule in config.rules.iter() {
-        if rule
-            .status
-            .eq(&ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED))
-        {
-            continue;
-        }
-        if !prefix.is_empty()
-            && let Some(filter) = &rule.filter
-            && let Some(r_prefix) = &filter.prefix
-            && !r_prefix.is_empty()
-        {
-            // incoming prefix must be in rule prefix
-            if !recursive && !prefix.starts_with(r_prefix) {
-                continue;
-            }
-            // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
-            // does not match
-            if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
-                continue;
-            }
-        }
-        return true;
-    }
-    false
 }
 
 pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {
