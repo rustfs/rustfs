@@ -92,6 +92,37 @@ fn object_xl_meta_path(case_dir: &Path, manifest: &ManifestRecord) -> PathBuf {
     case_dir.join("backend").join(relative)
 }
 
+/// Metadata as each disk stored it, indexed by disk position.
+///
+/// The object's primary `FileInfo` is read from one disk, but inline shard data
+/// and bitrot checksums are per disk, so both have to come from the disk they
+/// belong to.
+fn load_per_disk_file_info(case_dir: &Path, manifest: &ManifestRecord, disk_count: usize) -> Vec<Option<FileInfo>> {
+    (0..disk_count)
+        .map(|idx| {
+            let path = case_dir
+                .join("backend")
+                .join(format!("disk{}", idx + 1))
+                .join(&manifest.bucket)
+                .join(&manifest.object)
+                .join("xl.meta");
+            let bytes = fs::read(&path).ok()?;
+            get_file_info(
+                &bytes,
+                &manifest.bucket,
+                &manifest.object,
+                "",
+                FileInfoOpts {
+                    data: true,
+                    include_free_versions: true,
+                    include_part_checksums: false,
+                },
+            )
+            .ok()
+        })
+        .collect()
+}
+
 fn load_file_info(case_dir: &Path, manifest: &ManifestRecord) -> FileInfo {
     let xl_meta_path = object_xl_meta_path(case_dir, manifest);
     let xl_meta = fs::read(&xl_meta_path).unwrap_or_else(|err| panic!("read {}: {err}", xl_meta_path.display()));
@@ -194,10 +225,20 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
         .unwrap_or_else(|err| panic!("open fixture disk {disk_number}: {err}"));
         disks.push(disk);
     }
+    // Pair each disk with the metadata that disk stored, then place both at the
+    // erasure block slot that metadata claims — the shuffle the read path does
+    // before it reads anything (`shuffle_disks_and_parts_metadata_by_index`).
+    // The harness needs the per-disk metadata, not just the per-disk disk: below
+    // the small-file threshold an object has no part file and each disk carries
+    // its shard inline in its own xl.meta, and the bitrot checksums are per disk
+    // too.
+    let per_disk_meta = load_per_disk_file_info(case_dir, manifest, disks.len());
     let mut disk_order = vec![None; disks.len()];
+    let mut meta_order: Vec<Option<FileInfo>> = vec![None; disks.len()];
     for (idx, disk) in disks.iter().enumerate() {
         let block_index = file_info.erasure.distribution[idx];
         disk_order[block_index - 1] = Some(disk);
+        meta_order[block_index - 1] = per_disk_meta.get(idx).cloned().flatten();
     }
     let data_dir = file_info
         .data_dir
@@ -206,13 +247,21 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
 
     let mut encrypted = Vec::new();
     for part in &file_info.parts {
-        let checksum_info = file_info.erasure.get_checksum_info(part.number);
+        let primary_checksum_info = file_info.erasure.get_checksum_info(part.number);
         let path = format!("{}/{}/part.{}", manifest.object, data_dir, part.number);
         let shard_read_len = file_info.erasure.shard_file_size(part.size as i64);
         let mut readers = Vec::with_capacity(disks.len());
         for (idx, disk) in disk_order.iter().enumerate() {
+            // Below MinIO's small-file threshold there is no part file at all:
+            // each disk keeps its erasure shard inline in its own xl.meta, with
+            // the same bitrot framing the reader expects from a file.
+            let disk_meta = meta_order[idx].as_ref();
+            let inline_shard = disk_meta.and_then(|meta| meta.data.as_deref());
+            let checksum_info = disk_meta
+                .map(|meta| meta.erasure.get_checksum_info(part.number))
+                .unwrap_or_else(|| primary_checksum_info.clone());
             let reader = create_bitrot_reader(
-                None,
+                inline_shard,
                 *disk,
                 &manifest.bucket,
                 &path,
