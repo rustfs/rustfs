@@ -148,6 +148,62 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A repair the MRF consumer landed, fanned out so retry ledgers can drop
+/// entries the journal no longer tracks (backlog#1894 axis B). The payload
+/// mirrors the intent identity so consumers match without re-parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MrfRepairedEvent {
+    pub bucket: Arc<str>,
+    pub object: Arc<str>,
+    pub version_id: Option<[u8; 16]>,
+}
+
+/// Bound on the repaired-event backlog. Notices are best-effort hints; when
+/// the ring is full the oldest are dropped and the affected ledger entries
+/// simply expire through their own attempts/age limits.
+const MRF_REPAIRED_EVENT_CAP: usize = 4096;
+
+static MRF_REPAIRED_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfRepairedEvent>>> = OnceLock::new();
+
+/// Record that the MRF consumer landed a repair. Never blocks: the critical
+/// section is a deque push under a std mutex.
+pub fn note_mrf_repaired(bucket: &str, object: &str, version_id: Option<[u8; 16]>) {
+    let registry = MRF_REPAIRED_EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let Ok(mut events) = registry.lock() else {
+        return;
+    };
+    if events.len() >= MRF_REPAIRED_EVENT_CAP {
+        events.pop_front();
+    }
+    events.push_back(MrfRepairedEvent {
+        bucket: Arc::from(bucket),
+        object: Arc::from(object),
+        version_id,
+    });
+}
+
+/// Take the repair notices recorded for `bucket`, leaving other buckets'
+/// notices in place for their own scanners.
+pub fn take_mrf_repaired_events_for(bucket: &str) -> Vec<MrfRepairedEvent> {
+    let Some(registry) = MRF_REPAIRED_EVENTS.get() else {
+        return Vec::new();
+    };
+    let Ok(mut events) = registry.lock() else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    let mut retained = std::collections::VecDeque::with_capacity(events.len());
+    while let Some(event) = events.pop_front() {
+        if event.bucket.as_ref() == bucket {
+            taken.push(event);
+        } else {
+            retained.push_back(event);
+        }
+    }
+    *events = retained;
+    taken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +255,33 @@ mod tests {
         set_mrf_delivery_enabled(false);
         assert!(!try_send_mrf_intent(MrfKind::MetadataCorruption, "b", "o", None));
         set_mrf_delivery_enabled(true);
+    }
+
+    #[test]
+    fn repaired_events_take_is_bucket_scoped_and_cap_bounded() {
+        // Distinct buckets keep their notices until their own scanner takes
+        // them; a take for one bucket leaves the others' notices in place.
+        note_mrf_repaired("bucket-a", "object-1", None);
+        note_mrf_repaired("bucket-b", "object-2", None);
+        note_mrf_repaired("bucket-a", "object-3", None);
+
+        let taken_a = take_mrf_repaired_events_for("bucket-a");
+        assert_eq!(taken_a.len(), 2);
+        assert_eq!(taken_a[0].object.as_ref(), "object-1");
+        assert_eq!(taken_a[1].object.as_ref(), "object-3");
+        assert!(take_mrf_repaired_events_for("bucket-a").is_empty(), "take is destructive per bucket");
+
+        let taken_b = take_mrf_repaired_events_for("bucket-b");
+        assert_eq!(taken_b.len(), 1);
+        assert_eq!(taken_b[0].object.as_ref(), "object-2");
+
+        // Cap bound: flooding the ring drops the oldest notices rather than
+        // growing unbounded.
+        for i in 0..=(MRF_REPAIRED_EVENT_CAP + 8) {
+            note_mrf_repaired("flood-bucket", &format!("object-{i}"), None);
+        }
+        let flooded = take_mrf_repaired_events_for("flood-bucket");
+        assert_eq!(flooded.len(), MRF_REPAIRED_EVENT_CAP);
+        assert_eq!(flooded[0].object.as_ref(), "object-9", "the oldest notices past the cap are dropped");
     }
 }

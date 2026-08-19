@@ -700,6 +700,16 @@ fn pending_scanner_heal_identity(entry: &PendingScannerHeal) -> (u8, &str, Optio
     (kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref())
 }
 
+/// Decode an MRF repaired-notice version id for ledger matching. A nil UUID
+/// means "no value" per the repo-wide defensive-UUID invariant, so it maps
+/// to `None` and matches unversioned ledger entries only.
+fn mrf_repaired_version_id(version_id: Option<[u8; 16]>) -> Option<String> {
+    version_id
+        .map(uuid::Uuid::from_bytes)
+        .filter(|uuid| !uuid.is_nil())
+        .map(|uuid| uuid.to_string())
+}
+
 fn sort_pending_scanner_heals_for_retry(entries: &mut [PendingScannerHeal]) {
     entries.sort_by(|a, b| {
         a.last_attempt
@@ -1632,6 +1642,32 @@ impl FolderScanner {
         }
     }
 
+    /// Batched variant of [`Self::clear_pending_scanner_heal`] for repaired
+    /// notices (backlog#1894 axis B): one retain pass and one ledger sync
+    /// for the whole notice set, so a mass-recovery first sweep cannot turn
+    /// into thousands of full-table clones on the scan task. Only Object
+    /// entries match — bucket-level heals are never the MRF consumer's work.
+    fn clear_pending_scanner_heals_for_repaired(&mut self, events: &[rustfs_common::mrf_channel::MrfRepairedEvent]) {
+        // Pre-resolve the notice version strings once; each ledger entry then
+        // compares against plain Option<&str>.
+        let targets: Vec<(&str, &str, Option<String>)> = events
+            .iter()
+            .map(|event| (event.bucket.as_ref(), event.object.as_ref(), mrf_repaired_version_id(event.version_id)))
+            .collect();
+        let before = self.new_cache.info.pending_heals.len();
+        self.new_cache.info.pending_heals.retain(|entry| {
+            entry.kind != PendingScannerHealKind::Object
+                || !targets.iter().any(|(bucket, object, version)| {
+                    entry.bucket.as_str() == *bucket
+                        && entry.object.as_deref() == Some(*object)
+                        && entry.version_id.as_deref() == version.as_deref()
+                })
+        });
+        if self.new_cache.info.pending_heals.len() != before {
+            self.sync_pending_heals();
+        }
+    }
+
     fn record_pending_scanner_heal(
         &mut self,
         kind: PendingScannerHealKind,
@@ -1970,6 +2006,14 @@ impl FolderScanner {
         }
 
         let bucket = self.new_cache.info.name.clone();
+        // Backlog#1894 axis B: repairs the MRF consumer landed hand the
+        // manager the heal task, so the matching pending-ledger entries are
+        // retried nowhere — drop them here. Best-effort: a lost notice just
+        // leaves the entry to expire through its own attempts/age limits.
+        let repaired = rustfs_common::mrf_channel::take_mrf_repaired_events_for(&bucket);
+        if !repaired.is_empty() {
+            self.clear_pending_scanner_heals_for_repaired(&repaired);
+        }
         for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
             if !self.should_heal().await {
                 break;
@@ -4322,6 +4366,86 @@ mod tests {
             last_admission_result: "full".to_string(),
             last_admission_reason: "none".to_string(),
         }
+    }
+
+    /// The nil-UUID branch of the defensive-UUID invariant: a nil version in
+    /// a repaired notice means "no value" and must match unversioned ledger
+    /// entries only.
+    #[test]
+    fn test_mrf_repaired_version_id_maps_nil_to_none() {
+        assert_eq!(mrf_repaired_version_id(None), None);
+        assert_eq!(mrf_repaired_version_id(Some([0u8; 16])), None);
+        let uuid = Uuid::new_v4();
+        assert_eq!(mrf_repaired_version_id(Some(*uuid.as_bytes())), Some(uuid.to_string()));
+    }
+
+    /// Full wiring of backlog#1894 axis B: notes taken for the scanned bucket
+    /// clear exactly the matching Object ledger entries — bucket-level
+    /// entries, other buckets' entries, and version-mismatched entries
+    /// survive; a real (non-nil) version matches only the same version.
+    #[tokio::test]
+    async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
+        use rustfs_common::mrf_channel::note_mrf_repaired;
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.heal_object_select = 1;
+
+        let version = Uuid::new_v4().to_string();
+        scanner.new_cache.info.pending_heals = vec![
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-a"), None, 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-b"), Some(&version), 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-c"), None, 1, 1),
+            pending_heal(
+                PendingScannerHealKind::Object,
+                "bucket",
+                Some("object-c"),
+                Some("00000000-0000-0000-0000-000000000001"),
+                1,
+                1,
+            ),
+            pending_heal(PendingScannerHealKind::Bucket, "bucket", None, None, 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "other-bucket", Some("object-a"), None, 1, 1),
+        ];
+
+        note_mrf_repaired("bucket", "object-a", None);
+        note_mrf_repaired("bucket", "object-b", Some(*Uuid::parse_str(&version).unwrap().as_bytes()));
+        // A nil-UUID notice for object-c means "no value": it clears the
+        // unversioned entry but must not touch the versioned one.
+        note_mrf_repaired("bucket", "object-c", Some([0u8; 16]));
+        // A notice for a target the ledger does not track must be a no-op.
+        note_mrf_repaired("bucket", "object-untracked", None);
+
+        scanner
+            .retry_pending_scanner_heals()
+            .await
+            .expect("retry pass should succeed");
+
+        let survivors: Vec<(PendingScannerHealKind, &str, Option<&str>, Option<&str>)> = scanner
+            .new_cache
+            .info
+            .pending_heals
+            .iter()
+            .map(|entry| (entry.kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref()))
+            .collect();
+        // Cleared: object-a (no version), object-b (exact version match), and
+        // object-c's unversioned entry (the nil branch matched no-version
+        // only — the versioned object-c entry survives).
+        assert_eq!(
+            survivors,
+            vec![
+                (
+                    PendingScannerHealKind::Object,
+                    "bucket",
+                    Some("object-c"),
+                    Some("00000000-0000-0000-0000-000000000001")
+                ),
+                (PendingScannerHealKind::Bucket, "bucket", None, None),
+                (PendingScannerHealKind::Object, "other-bucket", Some("object-a"), None),
+            ]
+        );
     }
 
     #[test]
