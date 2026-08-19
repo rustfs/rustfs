@@ -26,6 +26,8 @@ use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
     ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys, EcstoreDisk,
@@ -33,7 +35,7 @@ use storage_api::owner::{
     EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc, EcstoreLifecycle,
     EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
     EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
-    EcstoreTierConfig, EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
+    EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
     ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
     ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
     ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
@@ -363,8 +365,39 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
     config_get_global_server_config()
 }
 
-pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
-    ecstore_get_global_tier_config_mgr().read().await.list_tiers()
+/// How long the scanner caches the runtime tier-name list before re-reading
+/// the tier configuration manager.
+const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Process-wide TTL cache of runtime tier names.
+///
+/// The scan hot path only needs tier *names* to seed `SizeSummary::tier_stats`
+/// per object, but every `list_tiers()` call clones each full `TierConfig`
+/// (endpoints, credentials, prefixes) from the global manager. Caching just
+/// the names keeps the per-object cost at an `Arc` clone.
+///
+/// Staleness bounds: a newly added tier starts showing up in scans at most
+/// `TIER_NAME_CACHE_TTL` later; a removed tier can leave an all-zero
+/// `TierStats` seed behind for one cache generation, which merges harmlessly
+/// by key in per-object accounting and disappears on the next refresh.
+static TIER_NAME_CACHE: RwLock<Option<(Instant, Arc<[String]>)>> = RwLock::new(None);
+
+/// Tier names currently registered in the tier configuration, cached for
+/// `TIER_NAME_CACHE_TTL`.
+pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, names)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return names;
+        }
+    }
+
+    let tiers = ecstore_get_global_tier_config_mgr().read().await.list_tiers();
+    let names: Arc<[String]> = tiers.iter().map(|tier| tier.name.clone()).collect::<Vec<_>>().into();
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), Arc::clone(&names)));
+    names
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {

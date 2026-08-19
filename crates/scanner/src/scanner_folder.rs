@@ -45,7 +45,7 @@ use rustfs_common::metrics::{
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -53,10 +53,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::{
-    BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE,
-    ScannerDiskExt as _, ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule,
-    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts, ReplicationConfig,
+    ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
+    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
     path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
     scanner_replication_config_for_lifecycle_eval,
 };
@@ -934,6 +934,7 @@ impl ScannerItem {
         &mut self,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
+        versioning_config: VersioningConfiguration,
         size_summary: &mut SizeSummary,
     ) {
         if object_infos.is_empty() {
@@ -958,21 +959,8 @@ impl ScannerItem {
             "Scanner lifecycle evaluation started"
         );
 
-        let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
-            Ok(versioning_config) => versioning_config,
-            Err(_) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    bucket = %self.bucket,
-                    state = "versioning_lookup_failed_defaulting",
-                    "Scanner lifecycle action falling back to default bucket versioning"
-                );
-                Default::default()
-            }
-        };
+        // `versioning_config` is resolved once per object by the caller
+        // (`get_size`) and handed in; only `prefix_enabled` is consulted here.
 
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             let mut cumulative_size = 0;
@@ -1402,6 +1390,11 @@ impl ScannerItem {
     fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
+        // Threshold check first so healthy objects never pay for the
+        // object-path allocation below.
+        if !too_many_versions && !too_large_versions {
+            return;
+        }
         let object_path = self.object_path();
         if too_many_versions {
             global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
