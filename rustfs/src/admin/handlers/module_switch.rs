@@ -17,14 +17,13 @@ use crate::admin::service::config::{
     preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context,
 };
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     handlers::supervise_admin_mutation,
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
     ADMIN_PREFIX, MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
-    RemoteAddr, apply_audit_module_switch_for_context, current_module_switch_snapshot, mark_event_notifier_reconciled,
+    apply_audit_module_switch_for_context, current_module_switch_snapshot, mark_event_notifier_reconciled,
     mark_event_notifier_unreconciled, refresh_audit_module_enabled, refresh_notify_module_enabled,
     refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store, save_persisted_module_switches_to,
     validate_module_switch_update,
@@ -114,23 +113,15 @@ fn build_response<T: Serialize>(
     Ok(S3Response::with_headers((status, Body::from(data)), header))
 }
 
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_module_switch_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(action)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 async fn refresh_module_switch_snapshot() -> S3Result<ModuleSwitchSnapshot> {
@@ -268,6 +259,30 @@ impl Operation for UpdateModuleSwitchesHandler {
 #[cfg(test)]
 mod tests {
     use super::{ModuleSwitchDiscovery, ModuleSwitchSource, ModuleSwitchesResponse};
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn module_switch_gate_keeps_its_missing_credentials_message() {
+        let req = s3s::S3Request {
+            input: s3s::Body::from(String::new()),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v3/module-switches"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = super::authorize_module_switch_request(&req, rustfs_policy::policy::action::AdminAction::ServerInfoAdminAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
 
     #[test]
     fn module_switch_handlers_require_admin_authorization_contract() {

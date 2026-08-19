@@ -18,12 +18,10 @@
 //! keeping the response format explicitly NDJSON. It is not a Prometheus text
 //! exposition endpoint.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::Operation;
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -182,24 +180,15 @@ impl ByteStream for MetricsStream {}
 
 pub struct MetricsHandler {}
 
+/// The pre-check keeps this endpoint's historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
 async fn authorize_metrics_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::GetMetricsAction)],
-        remote_addr,
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetMetricsAction)]).await?;
+    Ok(())
 }
 
 #[async_trait::async_trait]

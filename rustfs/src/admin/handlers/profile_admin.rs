@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use super::profile::{authorize_profile_request, profile_not_implemented_response};
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue};
@@ -89,14 +88,14 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 }
 
 /// Authorize a request against a single admin action (profiling or trace).
+/// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
 async fn authorize_action(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 pub struct ProfileHandler {}
@@ -530,7 +529,7 @@ fn trace_value_string(value: &TraceVal) -> String {
 mod tests {
     use super::{
         ProfileControlHandler, ProfileHandler, ProfileStatusHandler, ProfilingDownloadHandler, ProfilingStartHandler,
-        TraceHandler, TraceKindFilter, TraceStreamFilter, TraceWireRecord,
+        TraceHandler, TraceKindFilter, TraceStreamFilter, TraceWireRecord, authorize_action,
     };
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
@@ -539,6 +538,7 @@ mod tests {
     use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind};
     use rustfs_madmin::service_commands::ServiceTraceOpts;
     use rustfs_madmin::trace::TraceType;
+    use rustfs_policy::policy::action::AdminAction;
     use s3s::{Body, S3ErrorCode, S3Request, S3Result};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -561,6 +561,22 @@ mod tests {
         let mut opts = ServiceTraceOpts::default();
         opts.parse_params(&uri).expect("test trace params should parse");
         TraceStreamFilter::from_request(&uri, &opts)
+    }
+
+    /// The profiling/trace endpoints authorize through the shared admin gate, which
+    /// rejects a credential-less request with `InvalidRequest` "get cred failed". The
+    /// pre-check keeps the `AccessDenied` response they have always returned
+    /// (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn profile_admin_gate_keeps_its_missing_credentials_response() {
+        let err = authorize_action(
+            &build_profile_request("/rustfs/admin/v3/profiling/start"),
+            AdminAction::ProfilingAdminAction,
+        )
+        .await
+        .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 
     #[tokio::test]

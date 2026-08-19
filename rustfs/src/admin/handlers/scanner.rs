@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_scanner_metrics_report;
-use crate::auth::{check_key_valid, get_session_token};
 use crate::module_switches::{ENV_SCANNER_ENABLED, scanner_enabled_from_env};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use chrono::Utc;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -154,29 +153,14 @@ pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
     Ok(())
 }
 
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn validate_scanner_status_request(req: &S3Request<Body>) -> S3Result<Credentials> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "missing credentials"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0));
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-        remote_addr,
-    )
-    .await?;
-
-    Ok(cred)
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await
 }
 
 fn json_response(body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -228,6 +212,30 @@ impl Operation for IlmExpiryStatusHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn scanner_status_gate_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v3/scanner/status"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = validate_scanner_status_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("missing credentials"));
+    }
 
     #[test]
     fn scanner_disabled_reason_reports_startup_env_key() {

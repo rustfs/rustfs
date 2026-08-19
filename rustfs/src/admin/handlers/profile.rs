@@ -12,33 +12,22 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::admin::{auth::validate_admin_request, router::Operation};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
+use crate::admin::{auth::authorize_admin_request, router::Operation};
 use http::StatusCode;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::info;
 
+/// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
 pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ProfilingAdminAction)],
-        remote_addr,
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
+    Ok(())
 }
 
 pub(super) fn profile_not_implemented_response(message: String) -> S3Response<(StatusCode, Body)> {
