@@ -15,7 +15,6 @@
 use std::io::IsTerminal;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, util::SubscriberInitExt};
 
-#[allow(dead_code)]
 fn main() {
     init_logger(LogLevel::Info);
     tracing::info!("Tracing logger initialized with Info level");

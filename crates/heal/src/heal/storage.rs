@@ -42,7 +42,10 @@ pub struct HealLifecycleExpiryContext {
 
 enum HealLifecycleExpiryContextInner {
     Ecstore(EcstoreHealLifecycleExpiryContext),
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "constructed by the #[cfg(test)] `test()` helper; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     Test,
 }
 
