@@ -32,7 +32,9 @@ use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
 use rustfs_filemeta::FileMeta;
 use rustfs_lock::{LockError, NamespaceLockGuard};
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration};
+use s3s::dto::{
+    BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -55,7 +57,7 @@ use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_runtime_free_version,
-    get_lifecycle_config, get_object_lock_config, get_replication_config, list_runtime_tiers, storageclass,
+    get_lifecycle_config, get_object_lock_config, get_replication_config, runtime_tier_names, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -63,6 +65,11 @@ pub(crate) const SCANNER_METADATA_CORRUPT_ERROR: &str = "scanner metadata corrup
 pub(crate) const SCANNER_METADATA_TRANSIENT_ERROR: &str = "scanner metadata transient";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_IO: &str = "io";
+// Mirrors `scanner_folder.rs` so the versioning-lookup fallback warn keeps its
+// historical `rustfs::scanner::folder` lifecycle event identity after the
+// lookup moved into `get_size`.
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_DISK_BUCKET_STATE: &str = "scanner_disk_bucket_state";
 const EVENT_SCANNER_DATA_USAGE_STREAM: &str = "scanner_data_usage_stream";
 const EVENT_SCANNER_CACHE_PERSIST_STATE: &str = "scanner_cache_persist_state";
@@ -3822,6 +3829,24 @@ impl ScannerIOCache for SetDisks {
     }
 }
 
+/// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
+///
+/// Preserves the original seeding semantics: with no tiers configured the map
+/// stays completely empty (STANDARD/RRS are not seeded either); otherwise the
+/// standard storage classes are seeded alongside every configured tier so
+/// per-object accounting always finds its tier key.
+fn tier_stats_template(tier_names: &[String]) -> HashMap<String, TierStats> {
+    let mut tier_stats = HashMap::with_capacity(tier_names.len() + 2);
+    for tier_name in tier_names {
+        tier_stats.insert(tier_name.clone(), TierStats::default());
+    }
+    if !tier_stats.is_empty() {
+        tier_stats.insert(storageclass::STANDARD.to_string(), TierStats::default());
+        tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
+    }
+    tier_stats
+}
+
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
@@ -3861,10 +3886,26 @@ impl ScannerIODisk for Disk {
             }
         };
 
-        let versioned = BucketVersioningSys::get(&item.bucket)
-            .await
-            .map(|v| v.versioned(&item.object_path()))
-            .unwrap_or(false);
+        // Single versioning lookup per object, shared with `apply_actions`
+        // (which used to query it a second time). On failure keep the
+        // historical fallback: default configuration (versioned = false) plus
+        // the warn that `apply_actions` used to emit.
+        let versioning_config = match BucketVersioningSys::get(&item.bucket).await {
+            Ok(versioning_config) => versioning_config,
+            Err(_) => {
+                warn!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %item.bucket,
+                    state = "versioning_lookup_failed_defaulting",
+                    "Scanner lifecycle action falling back to default bucket versioning"
+                );
+                VersioningConfiguration::default()
+            }
+        };
+        let versioned = versioning_config.versioned(&item.object_path());
 
         let object_infos = fivs
             .versions
@@ -3879,19 +3920,10 @@ impl ScannerIODisk for Disk {
 
         let mut size_summary = SizeSummary::default();
 
-        let tiers = list_runtime_tiers().await;
-
-        for tier in tiers.iter() {
-            size_summary.tier_stats.insert(tier.name.clone(), TierStats::default());
-        }
-        if !size_summary.tier_stats.is_empty() {
-            size_summary
-                .tier_stats
-                .insert(storageclass::STANDARD.to_string(), TierStats::default());
-            size_summary
-                .tier_stats
-                .insert(storageclass::RRS.to_string(), TierStats::default());
-        }
+        // Tier names come from the process-wide TTL cache; seeding from them
+        // replaces the per-object clone of every full TierConfig.
+        let tier_names = runtime_tier_names().await;
+        size_summary.tier_stats = tier_stats_template(&tier_names);
 
         let lock_config = object_lock_config_for_scanner_item(&item).await;
 
@@ -3901,7 +3933,8 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
-        item.apply_actions(object_infos, lock_config, &mut size_summary).await;
+        item.apply_actions(object_infos, lock_config, versioning_config, &mut size_summary)
+            .await;
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
@@ -4966,6 +4999,23 @@ mod tests {
     #[test]
     fn is_xl_meta_path_accepts_forward_separator() {
         assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
+    }
+
+    #[test]
+    fn tier_stats_template_seeds_tiers_and_standard_classes() {
+        let template = tier_stats_template(&["WARM".to_string(), "COLD".to_string()]);
+
+        assert_eq!(template.len(), 4);
+        for tier in ["WARM", "COLD", storageclass::STANDARD, storageclass::RRS] {
+            assert_eq!(template.get(tier), Some(&TierStats::default()), "missing seed for tier {tier}");
+        }
+    }
+
+    #[test]
+    fn tier_stats_template_stays_empty_without_tiers() {
+        let template = tier_stats_template(&[]);
+
+        assert!(template.is_empty());
     }
 
     #[tokio::test]
