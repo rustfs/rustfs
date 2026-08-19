@@ -227,11 +227,11 @@ impl ForegroundPressure {
 struct CompletedHealStatus {
     heal_type: HealType,
     status: HealTaskStatus,
-    result_items: Vec<HealResultItem>,
     result_items_truncated: bool,
     completed_at: SystemTime,
     /// Sequence-stamped retained window, archived with the completion so
     /// incremental consumers keep their cursor across the transition (HS-06).
+    /// The un-stamped legacy view is derived from it on demand.
     seqed_items: Vec<(u64, HealResultItem)>,
     next_seq: u64,
     min_seq: u64,
@@ -293,7 +293,7 @@ fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
 fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) -> HealTaskReport {
     let mut lagged = false;
     let result_items = match since {
-        None => completed.result_items.clone(),
+        None => completed.seqed_items.iter().map(|(_, item)| item.clone()).collect(),
         Some(cursor) => {
             if cursor + 1 < completed.min_seq {
                 lagged = true;
@@ -1027,8 +1027,10 @@ pub struct HealManager {
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     /// Heal queue (priority-based)
     heal_queue: Arc<Mutex<PriorityHealQueue>>,
-    /// Recently completed heal statuses retained for status queries.
-    completed_heals: Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
+    /// Recently completed heal statuses retained for status queries. Values
+    /// are shared so the lookup helper can hand a completed entry to a
+    /// caller without cloning the retained result window.
+    completed_heals: Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     /// Client tokens merged into an existing task id.
     task_aliases: Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     /// Heal tasks waiting for a retry backoff to expire.
@@ -1051,10 +1053,21 @@ pub struct HealManager {
     workload_provider: Option<WorkloadSnapshotProviderRef>,
 }
 
+/// Where a task-id lookup resolved. The variants carry the resolved state
+/// so both the status and the report adapters can consume one shared
+/// cascade without re-locking.
+enum TaskStateLookup {
+    Active(Arc<HealTask>),
+    Retrying(HealTaskStatus),
+    Completed(Arc<CompletedHealStatus>),
+    Queued,
+    NotFound,
+}
+
 struct HealQueueContext<'a> {
     heal_queue: &'a Arc<Mutex<PriorityHealQueue>>,
     active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
-    completed_heals: &'a Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
+    completed_heals: &'a Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
     replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     config: &'a Arc<RwLock<HealConfig>>,
@@ -2160,47 +2173,79 @@ impl HealManager {
     }
 
     /// Get task status
-    pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
-        let canonical_task_id = self.canonical_task_id(task_id).await;
+    /// Ordered task-state lookup shared by every status/report query. The
+    /// map precedence mirrors the historical per-method cascades exactly:
+    /// active, then retrying, then completed — where a completed entry in a
+    /// retrying state outranks the queue so a retrying task reports
+    /// Retrying, never Pending — then the queue, and finally a terminal
+    /// completed entry. `heal_path` additionally constrains the map matches
+    /// the way the `*_for_path` variants always have.
+    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> TaskStateLookup {
+        let matches_path = |heal_type: &HealType| heal_path.is_none_or(|path| heal_type_matches_path(heal_type, path));
+
         {
             let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id) {
-                return Ok(task.get_status().await);
+            if let Some(task) = active_heals
+                .get(canonical_task_id)
+                .filter(|task| matches_path(&task.heal_type))
+            {
+                return TaskStateLookup::Active(Arc::clone(task));
             }
         }
 
         {
             let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
-                return Ok(retrying.status());
+            if let Some(retrying) = retrying_heals
+                .get(canonical_task_id)
+                .filter(|retrying| matches_path(&retrying.request.heal_type))
+            {
+                return TaskStateLookup::Retrying(retrying.status());
+            }
+        }
+
+        // One completed-map pass (single lock + prune): a retrying completion
+        // returns immediately; a terminal completion is held back until the
+        // queue has been checked, so queued work outranks it.
+        let mut terminal_completed: Option<Arc<CompletedHealStatus>> = None;
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(canonical_task_id).filter(|c| matches_path(&c.heal_type)) {
+                if completed_status_is_retrying(&completed.status) {
+                    return TaskStateLookup::Completed(Arc::clone(completed));
+                }
+                terminal_completed = Some(Arc::clone(completed));
             }
         }
 
         {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed.status.clone());
+            let queue = self.heal_queue.lock().await;
+            let queued = match heal_path {
+                Some(path) => queue.contains_request_id_matching_path(canonical_task_id, path),
+                None => queue.contains_request_id(canonical_task_id),
+            };
+            if queued {
+                return TaskStateLookup::Queued;
             }
         }
 
-        let queue = self.heal_queue.lock().await;
-        if queue.contains_request_id(&canonical_task_id) {
-            return Ok(HealTaskStatus::Pending);
+        match terminal_completed {
+            Some(completed) => TaskStateLookup::Completed(completed),
+            None => TaskStateLookup::NotFound,
         }
-        drop(queue);
+    }
 
-        let mut completed_heals = self.completed_heals.lock().await;
-        prune_completed_heal_statuses(&mut completed_heals);
-        if let Some(completed) = completed_heals.get(&canonical_task_id) {
-            return Ok(completed.status.clone());
+    pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
+        let canonical_task_id = self.canonical_task_id(task_id).await;
+        match self.lookup_task_state(&canonical_task_id, None).await {
+            TaskStateLookup::Active(task) => Ok(task.get_status().await),
+            TaskStateLookup::Retrying(status) => Ok(status),
+            TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
+            TaskStateLookup::Queued => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::NotFound => Err(Error::TaskNotFound {
+                task_id: task_id.to_string(),
+            }),
         }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     pub async fn get_task_report(&self, task_id: &str) -> Result<HealTaskReport> {
@@ -2212,46 +2257,15 @@ impl HealManager {
     /// full-snapshot semantics.
     pub async fn get_task_report_since(&self, task_id: &str, since: Option<u64>) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id) {
-                return Ok(active_task_report(task, since).await);
-            }
+        match self.lookup_task_state(&canonical_task_id, None).await {
+            TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
+            TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
+            TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
+            TaskStateLookup::Queued => Ok(empty_task_report(HealTaskStatus::Pending)),
+            TaskStateLookup::NotFound => Err(Error::TaskNotFound {
+                task_id: task_id.to_string(),
+            }),
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
-                return Ok(empty_task_report(retrying.status()));
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed_task_report(completed, since));
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id(&canonical_task_id) {
-                return Ok(empty_task_report(HealTaskStatus::Pending));
-            }
-        }
-
-        let mut completed_heals = self.completed_heals.lock().await;
-        prune_completed_heal_statuses(&mut completed_heals);
-        if let Some(completed) = completed_heals.get(&canonical_task_id) {
-            return Ok(completed_task_report(completed, since));
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
@@ -2266,59 +2280,20 @@ impl HealManager {
         since: Option<u64>,
     ) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&task.heal_type, heal_path)
-            {
-                return Ok(active_task_report(task, since).await);
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+            TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
+            TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
+            TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
+            TaskStateLookup::Queued => Ok(empty_task_report(HealTaskStatus::Pending)),
+            TaskStateLookup::NotFound => {
+                if self.path_has_task(heal_path).await {
+                    return Err(Error::InvalidClientToken);
+                }
+                Err(Error::TaskNotFound {
+                    task_id: task_id.to_string(),
+                })
             }
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&retrying.request.heal_type, heal_path)
-            {
-                return Ok(empty_task_report(retrying.status()));
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed_task_report(completed, since));
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id_matching_path(&canonical_task_id, heal_path) {
-                return Ok(empty_task_report(HealTaskStatus::Pending));
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-            {
-                return Ok(completed_task_report(completed, since));
-            }
-        }
-
-        if self.path_has_task(heal_path).await {
-            return Err(Error::InvalidClientToken);
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     /// Get task status for a path-bound client token.
@@ -2328,59 +2303,20 @@ impl HealManager {
     /// recently completed task, a different token is invalid for that path.
     pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&task.heal_type, heal_path)
-            {
-                return Ok(task.get_status().await);
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+            TaskStateLookup::Active(task) => Ok(task.get_status().await),
+            TaskStateLookup::Retrying(status) => Ok(status),
+            TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
+            TaskStateLookup::Queued => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::NotFound => {
+                if self.path_has_task(heal_path).await {
+                    return Err(Error::InvalidClientToken);
+                }
+                Err(Error::TaskNotFound {
+                    task_id: task_id.to_string(),
+                })
             }
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&retrying.request.heal_type, heal_path)
-            {
-                return Ok(retrying.status());
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed.status.clone());
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id_matching_path(&canonical_task_id, heal_path) {
-                return Ok(HealTaskStatus::Pending);
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-            {
-                return Ok(completed.status.clone());
-            }
-        }
-
-        if self.path_has_task(heal_path).await {
-            return Err(Error::InvalidClientToken);
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     async fn path_has_task(&self, heal_path: &str) -> bool {
@@ -3503,20 +3439,23 @@ impl HealManager {
                             completed_task.get_status().await
                         };
                         let completed_progress = completed_task.get_progress().await;
-                        let final_window = completed_task.get_result_items_since(None).await;
+                        // Single snapshot of the retained window: the task is
+                        // finished and already off the active map, so there is
+                        // no concurrent writer to race with.
+                        let seqed_items = completed_task.get_seqed_result_items().await;
+                        let (next_seq, min_seq) = completed_task.result_seq_cursors();
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
-                            result_items: final_window.items.clone(),
                             result_items_truncated: completed_task.result_items_truncated(),
                             completed_at: SystemTime::now(),
-                            seqed_items: completed_task.get_seqed_result_items().await,
-                            next_seq: final_window.next_seq,
-                            min_seq: final_window.min_seq,
+                            seqed_items,
+                            next_seq,
+                            min_seq,
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
                         prune_completed_heal_statuses(&mut completed_heals_guard);
-                        completed_heals_guard.insert(task_id.clone(), completed_status_entry);
+                        completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -3808,7 +3747,7 @@ fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
     }
 }
 
-fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, CompletedHealStatus>) {
+fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, Arc<CompletedHealStatus>>) {
     let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
         return;
     };
@@ -5275,19 +5214,18 @@ mod tests {
         );
         manager.completed_heals.lock().await.insert(
             task_id,
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: request.heal_type,
                 status: HealTaskStatus::Retrying {
                     error: "Lock acquisition timeout".to_string(),
                     retry_attempt: request.retry_attempts,
                 },
-                result_items: Vec::new(),
                 result_items_truncated: false,
                 seqed_items: Vec::new(),
                 next_seq: 0,
                 min_seq: 0,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
         cancel_token
     }
@@ -5986,24 +5924,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        // A completed entry recorded in a Retrying state for a task whose
+        // request is also (still) queued under the same id: the retrying
+        // completion must win the lookup, or the task would read back as
+        // Pending while it is actually waiting out a retry backoff.
+        let request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        let task_id = request.id.clone();
+        manager.completed_heals.lock().await.insert(
+            task_id.clone(),
+            Arc::new(CompletedHealStatus {
+                heal_type: request.heal_type.clone(),
+                status: HealTaskStatus::Retrying {
+                    error: "transient disk failure".to_string(),
+                    retry_attempt: 1,
+                },
+                result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
+                completed_at: SystemTime::now(),
+            }),
+        );
+        manager.heal_queue.lock().await.push(HealRequest {
+            id: task_id.clone(),
+            heal_type: request.heal_type,
+            ..request
+        });
+
+        assert_eq!(
+            manager.get_task_status(&task_id).await.expect("task must resolve"),
+            HealTaskStatus::Retrying {
+                error: "transient disk failure".to_string(),
+                retry_attempt: 1
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_task_status_reads_recent_completed_status() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let manager = HealManager::new(storage, None);
 
         manager.completed_heals.lock().await.insert(
             "completed-token".to_string(),
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: HealType::Bucket {
                     bucket: "bucket".to_string(),
                 },
                 status: HealTaskStatus::Completed,
-                result_items: Vec::new(),
                 result_items_truncated: false,
                 seqed_items: Vec::new(),
                 next_seq: 0,
                 min_seq: 0,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
 
         assert_eq!(
@@ -6022,25 +6000,27 @@ mod tests {
 
         manager.completed_heals.lock().await.insert(
             "completed-token".to_string(),
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: HealType::Object {
                     bucket: "bucket".to_string(),
                     object: "object".to_string(),
                     version_id: None,
                 },
                 status: HealTaskStatus::Completed,
-                result_items: vec![HealResultItem {
-                    bucket: "bucket".to_string(),
-                    object: "object".to_string(),
-                    object_size: 1024,
-                    ..Default::default()
-                }],
                 result_items_truncated: true,
-                seqed_items: Vec::new(),
-                next_seq: 0,
-                min_seq: 0,
+                seqed_items: vec![(
+                    1,
+                    HealResultItem {
+                        bucket: "bucket".to_string(),
+                        object: "object".to_string(),
+                        object_size: 1024,
+                        ..Default::default()
+                    },
+                )],
+                next_seq: 2,
+                min_seq: 1,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
 
         let report = manager
@@ -6052,6 +6032,10 @@ mod tests {
         assert_eq!(report.status, HealTaskStatus::Completed);
         assert_eq!(report.result_items.len(), 1);
         assert_eq!(report.result_items[0].object_size, 1024);
+        // The archived cursors pass through to the report so an incremental
+        // consumer can resume against the next expected sequence.
+        assert_eq!(report.next_seq, 2);
+        assert_eq!(report.min_seq, 1);
     }
 
     #[tokio::test]
