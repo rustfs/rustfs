@@ -120,6 +120,14 @@ pub const PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC: &str = "set_disk_rename_ba
 pub const PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC: &str = "set_disk_rename_ancestor_dir_fsync";
 pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rename_syscall";
 
+pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
+pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
+pub const PUT_RENAME_QUORUM_FANOUT_STATE_SCHEDULED: &str = "scheduled";
+pub const PUT_RENAME_QUORUM_FANOUT_STATE_WRITE_QUORUM: &str = "write_quorum";
+pub const PUT_RENAME_QUORUM_FANOUT_STATE_SUCCESS: &str = "success";
+pub const PUT_RENAME_QUORUM_FANOUT_STATE_ERROR: &str = "error";
+pub const PUT_RENAME_QUORUM_FANOUT_STATE_PANIC: &str = "panic";
+
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
     GET_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
@@ -2042,6 +2050,44 @@ pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Op
     }
 }
 
+#[inline(always)]
+fn put_stage_count_value(value: usize) -> f64 {
+    match u32::try_from(value) {
+        Ok(value) => f64::from(value),
+        Err(_) => f64::from(u32::MAX),
+    }
+}
+
+#[inline(always)]
+pub fn record_put_rename_fdatasync_batch(mode: &'static str, files: usize) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_rename_fdatasync_batch_files", "mode" => mode).record(put_stage_count_value(files));
+}
+
+#[inline(always)]
+pub fn record_put_rename_quorum_wait_fanout(
+    scheduled: usize,
+    write_quorum: usize,
+    success: usize,
+    error: usize,
+    panicked: usize,
+) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    for (state, count) in [
+        (PUT_RENAME_QUORUM_FANOUT_STATE_SCHEDULED, scheduled),
+        (PUT_RENAME_QUORUM_FANOUT_STATE_WRITE_QUORUM, write_quorum),
+        (PUT_RENAME_QUORUM_FANOUT_STATE_SUCCESS, success),
+        (PUT_RENAME_QUORUM_FANOUT_STATE_ERROR, error),
+        (PUT_RENAME_QUORUM_FANOUT_STATE_PANIC, panicked),
+    ] {
+        histogram!("rustfs_s3_put_object_rename_quorum_wait_fanout_disks", "state" => state).record(put_stage_count_value(count));
+    }
+}
+
 /// Record generic internal operation stage duration (non-PUT paths).
 /// Use this for metacache walks, listing, lifecycle, and other background
 /// operations that are NOT part of the PUT object hot path.
@@ -3120,6 +3166,70 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(recorded.len(), stages.len());
         assert!(stages.iter().all(|stage| recorded.contains(*stage)));
+    }
+
+    #[test]
+    fn put_rename_code_level_metrics_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, 2);
+            record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
+
+            set_put_stage_metrics_enabled(true);
+            record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
+            record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_batch_files"), vec![9.0]);
+        let batch_modes = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == "rustfs_s3_put_object_rename_fdatasync_batch_files"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "mode")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(batch_modes, HashSet::from([PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL.to_string()]));
+
+        let quorum_samples = histogram_samples(&rows, "rustfs_s3_put_object_rename_quorum_wait_fanout_disks");
+        assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);
+        let quorum_states = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == "rustfs_s3_put_object_rename_quorum_wait_fanout_disks"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "state")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            quorum_states,
+            HashSet::from([
+                PUT_RENAME_QUORUM_FANOUT_STATE_SCHEDULED.to_string(),
+                PUT_RENAME_QUORUM_FANOUT_STATE_WRITE_QUORUM.to_string(),
+                PUT_RENAME_QUORUM_FANOUT_STATE_SUCCESS.to_string(),
+                PUT_RENAME_QUORUM_FANOUT_STATE_ERROR.to_string(),
+                PUT_RENAME_QUORUM_FANOUT_STATE_PANIC.to_string(),
+            ])
+        );
     }
 
     #[test]
