@@ -909,10 +909,6 @@ pub(crate) mod contract {
         };
     }
 
-    pub(crate) mod heal {
-        pub(crate) use super::super::storage_contracts::HealOperations;
-    }
-
     pub(crate) mod list {
         pub(crate) use super::super::storage_contracts::ListOperations;
     }

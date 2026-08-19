@@ -117,13 +117,16 @@ fn test_format_set_disk_id_from_i32_valid() {
     assert_eq!(result.unwrap(), "pool_0_set_1");
 }
 
+/// A wall-clock lower bound for "the timestamp was actually read from the
+/// clock": 2020-01-01. `unwrap_or_default()` on a pre-epoch clock yields 0, and
+/// the old versions of these tests bound the fields to `_` and so could not tell
+/// that apart from a real reading (rustfs/backlog#1836).
+const SANE_EPOCH_SECS: u64 = 1_577_836_800;
+
 #[test]
 fn test_resume_state_timestamp_handling() {
     use rustfs_heal::heal::resume::ResumeState;
 
-    // Test that ResumeState creation doesn't panic even if system time is before epoch
-    // This is a theoretical test - in practice, system time should never be before epoch
-    // But we want to ensure unwrap_or_default handles edge cases
     let state = ResumeState::new(
         "test-task".to_string(),
         "test-type".to_string(),
@@ -131,22 +134,30 @@ fn test_resume_state_timestamp_handling() {
         vec!["bucket1".to_string()],
     );
 
-    // Verify fields are initialized (u64 is always >= 0)
-    // The important thing is that unwrap_or_default prevents panic
-    let _ = state.start_time;
-    let _ = state.last_update;
+    assert!(
+        state.start_time > SANE_EPOCH_SECS,
+        "start_time fell back to the default instead of reading the clock: {}",
+        state.start_time
+    );
+    assert!(
+        state.last_update >= state.start_time,
+        "last_update {} must not predate start_time {}",
+        state.last_update,
+        state.start_time
+    );
 }
 
 #[test]
 fn test_resume_checkpoint_timestamp_handling() {
     use rustfs_heal::heal::resume::ResumeCheckpoint;
 
-    // Test that ResumeCheckpoint creation doesn't panic
     let checkpoint = ResumeCheckpoint::new("test-task".to_string());
 
-    // Verify field is initialized (u64 is always >= 0)
-    // The important thing is that unwrap_or_default prevents panic
-    let _ = checkpoint.checkpoint_time;
+    assert!(
+        checkpoint.checkpoint_time > SANE_EPOCH_SECS,
+        "checkpoint_time fell back to the default instead of reading the clock: {}",
+        checkpoint.checkpoint_time
+    );
 }
 
 #[test]
@@ -173,44 +184,17 @@ fn test_heal_task_status_atomic_update() {
         async fn get_object_meta(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
-            Ok(true)
-        }
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
-            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
-        }
-        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
-        }
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
-            Ok(())
         }
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
             Ok(false)
-        }
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
-            Ok(None)
-        }
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
-            Ok(None)
         }
         async fn heal_object(
             &self,
@@ -233,9 +217,6 @@ fn test_heal_task_status_atomic_update() {
             _dry_run: bool,
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
-        }
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<HealListItem>> {
-            Ok(vec![])
         }
         async fn list_objects_for_heal_page(
             &self,
@@ -278,7 +259,7 @@ fn test_heal_task_status_atomic_update() {
 
 #[tokio::test]
 async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
-    use rustfs_heal::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
+    use rustfs_heal::heal::storage::{HealListItem, HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType};
     use std::sync::{
         Arc,
@@ -296,40 +277,12 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<DiskStatus> {
-            Ok(DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
@@ -341,14 +294,6 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Err(rustfs_heal::Error::transient_skip(
                 "Skipped object existence check for bucket/object: simulated quorum failure",
             ))
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -375,10 +320,6 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             _dry_run: bool,
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
-        }
-
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<HealListItem>> {
-            Ok(Vec::new())
         }
 
         async fn list_objects_for_heal_page(

@@ -253,8 +253,6 @@ pub(crate) mod rpc_consumer {
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
         #[cfg(test)]
-        pub(crate) type HealEndpoint = super::super::ecstore_disk::endpoint::Endpoint;
-        #[cfg(test)]
         pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
 
         pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;

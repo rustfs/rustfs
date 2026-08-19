@@ -119,6 +119,10 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct Config {
     #[serde(skip)]
+    #[allow(
+        dead_code,
+        reason = "reachable only from this file's tests: no route registers config_handler (backlog#1823)"
+    )]
     port: u16,
     api: Api,
     s3: S3,
@@ -176,11 +180,14 @@ impl Config {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "reachable only from this file's tests: no route registers config_handler (backlog#1823)"
+    )]
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn version_info(&self) -> String {
         format!(
             "RELEASE.{}@{} (rust {} {})",
@@ -189,21 +196,6 @@ impl Config {
             build::RUST_VERSION,
             build::BUILD_TARGET
         )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn version(&self) -> String {
-        self.release.version.clone()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn license(&self) -> String {
-        format!("{} {}", self.license.name.clone(), self.license.url.clone())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn doc(&self) -> String {
-        self.doc.clone()
     }
 }
 
@@ -353,7 +345,10 @@ async fn version_handler() -> impl IntoResponse {
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
 #[instrument(fields(uri))]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "reachable only from this file's tests: no route registers it (backlog#1823)"
+)]
 async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers

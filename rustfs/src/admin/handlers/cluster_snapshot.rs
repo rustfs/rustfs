@@ -14,7 +14,7 @@
 
 use crate::admin::storage_api::cluster::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     router::{AdminOperation, Operation, S3Router},
     runtime_sources::default_admin_usecase,
     storage_api::cluster::{
@@ -24,11 +24,10 @@ use crate::admin::{
     },
     system,
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
 };
-use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, ReadinessDegradedReason};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -66,23 +65,15 @@ pub(crate) struct ClusterSnapshotDiscoveryResponse {
     pub components: Option<ClusterComponentStatusView>,
 }
 
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_cluster_snapshot_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    Ok(())
 }
 
 fn build_json_response(
@@ -951,6 +942,30 @@ mod tests {
             auth_block.contains("AdminAction::ServerInfoAdminAction"),
             "cluster snapshot should require server info admin permission"
         );
+    }
+
+    /// This endpoint authorizes through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message it has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn cluster_snapshot_gate_keeps_its_missing_credentials_message() {
+        let req = s3s::S3Request {
+            input: s3s::Body::from(String::new()),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v4/cluster/snapshot"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = super::authorize_cluster_snapshot_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
     }
 
     #[test]
