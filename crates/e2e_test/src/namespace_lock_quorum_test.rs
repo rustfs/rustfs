@@ -16,7 +16,6 @@ use crate::common::RustFSTestClusterEnvironment;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use bytes::Bytes;
-use serial_test::serial;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use tracing::{info, warn};
@@ -51,7 +50,6 @@ fn format_s3_error(err: SdkError<aws_sdk_s3::operation::put_object::PutObjectErr
 }
 
 #[tokio::test]
-#[serial]
 async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() -> TestResult {
     crate::common::init_logging();
     info!("Starting namespace lock quorum regression test with auto cluster");
@@ -128,7 +126,6 @@ async fn test_concurrent_cluster_overwrites_do_not_fail_namespace_lock_quorum() 
 /// `StorageError::other(...)` → `StorageError::Io(...)`, which fell through to
 /// `S3ErrorCode::InternalError` (500) in the error mapping.
 #[tokio::test]
-#[serial]
 async fn test_concurrent_put_same_key_never_returns_500() -> TestResult {
     crate::common::init_logging();
     info!("Starting concurrent PUT 500 regression test");

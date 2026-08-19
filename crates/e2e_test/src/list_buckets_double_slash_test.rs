@@ -27,7 +27,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
 
     /// Sends a SigV4-signed `GET` where the signature is computed over `sign_path`
@@ -67,7 +66,6 @@ mod tests {
 
     /// `GET /` (path-style service call) returns `ListBuckets`.
     #[tokio::test]
-    #[serial]
     async fn test_list_buckets_single_slash() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -86,7 +84,6 @@ mod tests {
     /// compat layer rewrites `//` to `/` before `s3s` parses/verifies the request,
     /// so both routing and signature verification operate on `/`.
     #[tokio::test]
-    #[serial]
     async fn test_list_buckets_double_slash_browser_compat() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -105,7 +102,6 @@ mod tests {
     /// (`GET //bucket`) must be left untouched by the compat layer — it is not a
     /// `ListBuckets` request and s3s continues to reject the empty bucket name.
     #[tokio::test]
-    #[serial]
     async fn test_double_slash_rewrite_is_narrowly_scoped() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;

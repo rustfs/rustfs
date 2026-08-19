@@ -15,7 +15,6 @@
 use crate::common::{RustFSTestEnvironment, admin_request, awscurl_delete, awscurl_get, awscurl_post, awscurl_put, init_logging};
 use aws_sdk_s3::Client;
 use http::{Method, StatusCode};
-use serial_test::serial;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, info};
 
@@ -255,7 +254,6 @@ mod integration_tests {
     use aws_sdk_s3::error::ProvideErrorMetadata;
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_basic_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -300,7 +298,6 @@ mod integration_tests {
     /// with 400 UnexpectedContent, and an over-quota aws-chunked PUT must still get the quota
     /// rejection.
     #[tokio::test]
-    #[serial]
     async fn test_quota_admission_aws_chunked_declared_encoding() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -352,7 +349,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_update_and_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -388,7 +384,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_delete_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -425,7 +420,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_usage_tracking() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -464,7 +458,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_statistics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -498,7 +491,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_check_api() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -539,7 +531,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_multiple_buckets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -580,7 +571,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_error_handling() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -616,7 +606,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_http_endpoints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -682,7 +671,6 @@ mod integration_tests {
 
     /// Test that a normal user with `readwrite` policy can read quota but cannot set/clear quota.
     #[tokio::test]
-    #[serial]
     async fn test_quota_normal_user_permissions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -738,7 +726,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_copy_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -784,7 +771,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_batch_delete() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {
@@ -843,7 +829,6 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_quota_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         if skip_without_awscurl() {

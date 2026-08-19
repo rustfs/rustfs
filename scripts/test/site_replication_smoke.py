@@ -27,6 +27,7 @@ Usage:
     ./scripts/test/site_replication_smoke.py            # up: start both + pair
     ./scripts/test/site_replication_smoke.py status     # process + pair status
     ./scripts/test/site_replication_smoke.py smoke      # bidirectional object check
+    ./scripts/test/site_replication_smoke.py diverge    # rustfs/rustfs#5963 regression
     ./scripts/test/site_replication_smoke.py logs       # tail both server logs
     ./scripts/test/site_replication_smoke.py down       # stop both processes
     ./scripts/test/site_replication_smoke.py clean      # down + wipe site data
@@ -337,11 +338,12 @@ def ensure_pair(site_a: Site, site_b: Site) -> None:
     print(f"[ok] site replication configured: {result.get('status', '')}")
 
 
-def remove_pair(site: Site) -> None:
+def remove_pair(site: Site) -> dict:
     status, body = admin(site, "PUT", "site-replication/remove", payload={"all": True})
     if status != 200:
         raise SystemExit(f"[fail] site-replication remove: HTTP {status} {body.decode(errors='replace')}")
     print(f"[ok] site replication removed: {body.decode(errors='replace')}")
+    return json.loads(body)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +397,112 @@ def smoke(site_a: Site, site_b: Site, timeout: float) -> None:
     wait_object(site_a, bucket, "from-b.txt", payload_b_to_a, timeout)
 
     print(f"[ok] bidirectional replication verified via bucket {bucket}")
+
+
+# ---------------------------------------------------------------------------
+# Divergence regression (rustfs/rustfs#5963)
+# ---------------------------------------------------------------------------
+
+
+def wait_for(description: str, probe, timeout: float):
+    """Poll `probe` until it returns a truthy value; return it. SystemExit on timeout."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            result = probe()
+        except (urllib.error.URLError, OSError, TimeoutError, SystemExit) as err:
+            last = err
+            result = None
+        if result:
+            return result
+        time.sleep(1.0)
+    raise SystemExit(f"[fail] {description} within {timeout:.0f}s (last: {last})")
+
+
+def diverge(site_a: Site, site_b: Site, binary: Path, console: bool, timeout: float) -> None:
+    """Reproduce rustfs/rustfs#5963 end to end and assert the cluster recovers.
+
+    Before the fix, step 7 left site-b rejecting every peer bucket-op forever:
+    `pending_remove` gates `SRPeerBucketOpsHandler` ahead of `enabled()`, and a
+    join never cleared it — so a *successful* re-add produced a cluster that
+    reported Enabled/2-sites on both sides while replication stayed dead.
+    """
+    ensure_pair(site_a, site_b)
+
+    # 1. Take site-a down so it cannot be told about the removal.
+    print("[..] step 1: stopping site-a so it cannot be notified")
+    stop_site(site_a)
+
+    # 2. Remove from site-b. The local teardown commits either way, but the
+    #    response must NOT claim unqualified success (P2-5).
+    print("[..] step 2: removing site replication from site-b while site-a is down")
+    status = remove_pair(site_b)
+    if not status.get("errorDetail"):
+        raise SystemExit(f"[fail] remove hid the unreachable peer; expected errorDetail: {json.dumps(status)}")
+    if status.get("status") == "Requested site(s) were removed from cluster replication successfully.":
+        raise SystemExit(f"[fail] remove reported unqualified success despite an unnotified peer: {json.dumps(status)}")
+    print(f"[ok] remove reported a partial result: status={status.get('status')!r}")
+
+    # 3. The wedged removal must be visible on `info`, not just in status --json (P1-4).
+    info_b = pair_state(site_b)
+    pending = info_b.get("pendingOperation")
+    if not pending or pending.get("operation") != "remove":
+        raise SystemExit(f"[fail] site-b hides the wedged removal in `info`: {json.dumps(info_b, indent=2)}")
+    print(f"[ok] site-b reports the wedged removal: pendingPeers={pending.get('pendingPeers')}")
+
+    # 4. Bring site-a back. It still believes in a healthy 2-site cluster.
+    print("[..] step 4: restarting site-a")
+    start_site(site_a, binary, console)
+    wait_ready([site_a], timeout)
+    info_a = pair_state(site_a)
+    if not info_a.get("enabled"):
+        raise SystemExit(f"[fail] site-a lost its own state: {json.dumps(info_a, indent=2)}")
+    print("[ok] site-a still reports an enabled cluster (the divergence)")
+
+    # 5. A bucket created on site-a cannot reach site-b. The failure must become
+    #    visible on the SOURCE, which used to report a perfectly healthy cluster.
+    bucket = f"sr-diverge-{uuid.uuid4().hex[:8]}"
+    sig_status, body = signed_request(site_a, "PUT", f"/{bucket}")
+    if sig_status != 200:
+        raise SystemExit(f"[fail] create bucket {bucket} on site-a: HTTP {sig_status} {body.decode(errors='replace')}")
+    print(f"[ok] created {bucket} on site-a (locally succeeds, peer push is rejected)")
+
+    stats = wait_for(
+        "site-a did not surface the failing peer deliveries in `info`",
+        lambda: pair_state(site_a).get("retryStats"),
+        timeout,
+    )
+    print(f"[ok] site-a reports failing deliveries: pending={stats.get('pending')} failed={stats.get('failed')} "
+          f"lastError={stats.get('lastError')!r}")
+
+    # 6. Re-add. This is the operator's natural recovery move.
+    print("[..] step 6: re-adding the pair from site-a")
+    peers = [
+        {"name": s.name, "endpoints": s.endpoint, "accessKey": s.access_key, "secretKey": s.secret_key}
+        for s in (site_a, site_b)
+    ]
+    add_status, add_body = admin(site_a, "PUT", "site-replication/add", "replicateILMExpiry=false", peers)
+    if add_status != 200:
+        raise SystemExit(f"[fail] re-add: HTTP {add_status} {add_body.decode(errors='replace')}")
+    print(f"[ok] re-add accepted: {add_body.decode(errors='replace')}")
+
+    # 7. The join must have cleared site-b's pending_remove (P0-1). Without the
+    #    fix this assertion is exactly what fails while everything above passes.
+    info_b = pair_state(site_b)
+    if info_b.get("pendingOperation"):
+        raise SystemExit(
+            "[fail] the join did not clear site-b's wedged removal; peer bucket-ops stay rejected forever: "
+            f"{json.dumps(info_b, indent=2)}"
+        )
+    if not info_b.get("enabled"):
+        raise SystemExit(f"[fail] site-b did not rejoin: {json.dumps(info_b, indent=2)}")
+    print("[ok] site-b cleared the wedged removal and rejoined")
+
+    # 8. The symptom the issue actually reported: replication works again.
+    print("[..] step 8: verifying replication actually flows again")
+    smoke(site_a, site_b, timeout)
+    print("[ok] rustfs/rustfs#5963 regression passed")
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +572,7 @@ def main() -> None:
         "command",
         nargs="?",
         default="up",
-        choices=["up", "down", "restart", "status", "logs", "smoke", "info", "remove", "clean"],
+        choices=["up", "down", "restart", "status", "logs", "smoke", "diverge", "info", "remove", "clean"],
     )
     parser.add_argument("--port-a", type=int, default=9000, help="site A S3 port (default: %(default)s)")
     parser.add_argument("--port-b", type=int, default=9020, help="site B S3 port (default: %(default)s)")
@@ -495,6 +603,8 @@ def main() -> None:
         cmd_logs(sites, args.lines)
     elif args.command == "smoke":
         smoke(site_a, site_b, args.timeout)
+    elif args.command == "diverge":
+        diverge(site_a, site_b, args.binary, args.console, args.timeout)
     elif args.command == "info":
         print(json.dumps(pair_state(site_a), indent=2, ensure_ascii=False))
     elif args.command == "remove":

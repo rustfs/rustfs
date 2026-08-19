@@ -23,7 +23,6 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, Tag, Tagging};
 use aws_sdk_s3::{Client, Config};
-use serial_test::serial;
 use tracing::info;
 use uuid::Uuid;
 
@@ -174,7 +173,6 @@ async fn cleanup_bucket_and_object(admin: &Client, bucket: &str, key: &str) {
 
 /// IAM identity policy: GetObject allowed only when `s3:ExistingObjectTag/security` == `public`.
 #[tokio::test]
-#[serial]
 async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !awscurl_available() {
@@ -233,7 +231,6 @@ async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<
 
 /// Bucket policy: same `ExistingObjectTag` condition; user has no canned IAM policy attached.
 #[tokio::test]
-#[serial]
 async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !awscurl_available() {
@@ -295,7 +292,6 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
 
 /// STS `AssumeRole` with inline `Policy` (session policy): GetObject only when `ExistingObjectTag/security` is `public`.
 #[tokio::test]
-#[serial]
 async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !awscurl_available() {
@@ -372,7 +368,6 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
 
 /// STS inline session policy: DeleteObjects must evaluate `s3:DeleteObject` per requested object key.
 #[tokio::test]
-#[serial]
 async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !awscurl_available() {

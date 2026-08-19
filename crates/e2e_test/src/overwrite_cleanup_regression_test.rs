@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use aws_sdk_s3::primitives::ByteStream;
-use serial_test::serial;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -24,7 +23,6 @@ const TEST_OBJECT: &str = "large-object.bin";
 const PAYLOAD_SIZE: usize = 512 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn unversioned_overwrite_removes_previous_physical_data_dir() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 

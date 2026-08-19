@@ -19,7 +19,6 @@
 //! filtering, and comprehensive reporting capabilities.
 
 use crate::common::init_logging;
-use serial_test::serial;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
@@ -458,7 +457,6 @@ impl KMSTestSuite {
 
 /// Quick test suite for critical tests only
 #[tokio::test]
-#[serial]
 async fn test_kms_critical_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = TestSuiteConfig {
         categories: vec![TestCategory::CoreFunctionality, TestCategory::MultipartEncryption],
@@ -481,7 +479,6 @@ async fn test_kms_critical_suite() -> Result<(), Box<dyn std::error::Error + Sen
 
 /// Full comprehensive test suite
 #[tokio::test]
-#[serial]
 async fn test_kms_full_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let suite = KMSTestSuite::new();
     let results = suite.run_test_suite().await;

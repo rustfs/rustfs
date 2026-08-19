@@ -24,7 +24,6 @@
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
 use aws_sdk_s3::types::ServerSideEncryption;
-use serial_test::serial;
 use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -32,7 +31,6 @@ use tracing::{info, warn};
 
 /// Test KMS behavior when key directory is temporarily unavailable
 #[tokio::test]
-#[serial]
 async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with unavailable key directory");
@@ -123,7 +121,6 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
 /// Test handling of corrupted key files
 #[tokio::test]
-#[serial]
 async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior with corrupted key files");
@@ -215,7 +212,6 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
 
 /// Test multipart upload interruption and recovery
 #[tokio::test]
-#[serial]
 async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS multipart upload interruption and recovery");
@@ -399,7 +395,6 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
 
 /// Test KMS resilience to temporary resource constraints
 #[tokio::test]
-#[serial]
 async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("🧪 Testing KMS behavior under resource constraints");

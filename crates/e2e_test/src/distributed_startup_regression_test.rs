@@ -32,7 +32,6 @@
 mod tests {
     use crate::common::{RustFSTestClusterEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::error::Error;
     use tokio::time::{Duration, sleep};
     use tracing::info;
@@ -50,7 +49,6 @@ mod tests {
     /// 3. Verify all nodes report healthy
     /// 4. Verify S3 operations work through any node
     #[tokio::test]
-    #[serial]
     async fn test_four_node_cluster_startup_and_health() -> TestResult {
         init_logging();
         info!("RT-10: 4-node cluster startup and health");
@@ -103,7 +101,6 @@ mod tests {
     /// Regression pattern: after a node restart, it cannot rejoin the cluster
     /// or enters a faulty state (rustfs#2601).
     #[tokio::test]
-    #[serial]
     async fn test_cluster_survives_node_restart() -> TestResult {
         init_logging();
         info!("RT-10b: cluster survives node restart");
@@ -168,7 +165,6 @@ mod tests {
     /// Regression pattern: bucket metadata is not replicated to all nodes,
     /// causing NoSuchBucket errors on some nodes (rustfs#3191).
     #[tokio::test]
-    #[serial]
     async fn test_bucket_visible_from_all_nodes() -> TestResult {
         init_logging();
         info!("RT-10c: bucket visible from all nodes");
