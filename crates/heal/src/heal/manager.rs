@@ -143,6 +143,16 @@ async fn pause_duplicate_admission_after_active_lock(request_id: &str) {
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 
+/// Per-key bookkeeping for the queued-request dedup index: how many queued
+/// requests hold the key, and the id of the first request that opened it —
+/// the O(1) stand-in for the former heap scan when a merge receipt needs to
+/// name a queued representative.
+#[derive(Debug)]
+struct DedupKeyEntry {
+    refcount: usize,
+    representative_request_id: String,
+}
+
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
 #[derive(Debug)]
@@ -151,8 +161,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Deduplication key reference counts for queued requests
-    dedup_keys: HashMap<String, usize>,
+    /// Deduplication index for queued requests
+    dedup_keys: HashMap<String, DedupKeyEntry>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -402,8 +412,16 @@ impl PriorityHealQueue {
             return QueuePushOutcome::Merged;
         }
         // Track dedup keys for both normal and forced requests so queued forced work
-        // also reserves the dedup key for later non-forced duplicates.
-        *self.dedup_keys.entry(key).or_insert(0) += 1;
+        // also reserves the dedup key for later non-forced duplicates. The first
+        // request that opens the key becomes the named representative for merge
+        // receipts (taken before `request` moves into the heap).
+        self.dedup_keys
+            .entry(key)
+            .or_insert_with(|| DedupKeyEntry {
+                refcount: 0,
+                representative_request_id: request.id.clone(),
+            })
+            .refcount += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -447,6 +465,7 @@ impl PriorityHealQueue {
         let displaced = displaced.map(|item| {
             let key = Self::make_dedup_key(&item.request);
             Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            self.refresh_dedup_representative(&key);
             item.request
         });
 
@@ -569,12 +588,12 @@ impl PriorityHealQueue {
         }
     }
 
-    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
-        if let Some(count) = dedup_keys.get_mut(key) {
-            if *count <= 1 {
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, key: &str) {
+        if let Some(entry) = dedup_keys.get_mut(key) {
+            if entry.refcount <= 1 {
                 dedup_keys.remove(key);
             } else {
-                *count -= 1;
+                entry.refcount -= 1;
             }
         }
     }
@@ -607,10 +626,32 @@ impl PriorityHealQueue {
             .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
     }
 
-    fn request_for_dedup_key(&self, key: &str) -> Option<&HealRequest> {
-        self.heap
+    fn queued_request_id_for_dedup_key(&self, key: &str) -> Option<&str> {
+        self.dedup_keys.get(key).map(|entry| entry.representative_request_id.as_str())
+    }
+
+    /// Re-elect the representative for `key` from the queue entries holding
+    /// it. Needed after a holder leaves the queue *without* becoming active
+    /// (canceled by id, or displaced): the former opener may be the request
+    /// that just left, and a merge receipt must never name an id that
+    /// resolves nowhere. The scheduler pop path does not need this — the
+    /// popped request surfaces in `active_heals` under the same id and the
+    /// duplicate pre-check consults active heals before the queue. No-op for
+    /// released keys; the survivor scan only runs when a key still has
+    /// holders, which under forced duplicates is the rare admin path.
+    fn refresh_dedup_representative(&mut self, key: &str) {
+        if !self.dedup_keys.contains_key(key) {
+            return;
+        }
+        if let Some(id) = self
+            .heap
             .iter()
-            .find_map(|item| (Self::make_dedup_key(&item.request) == key).then_some(&item.request))
+            .find(|item| Self::make_dedup_key(&item.request) == key)
+            .map(|item| item.request.id.clone())
+            && let Some(entry) = self.dedup_keys.get_mut(key)
+        {
+            entry.representative_request_id = id;
+        }
     }
 
     fn contains_matching<F>(&self, mut matches: F) -> bool
@@ -635,6 +676,9 @@ impl PriorityHealQueue {
         }
 
         self.heap = retained;
+        if let Some(removed) = removed.as_ref() {
+            self.refresh_dedup_representative(&Self::make_dedup_key(removed));
+        }
         removed
     }
 
@@ -644,11 +688,13 @@ impl PriorityHealQueue {
     {
         let mut retained = BinaryHeap::new();
         let mut removed = Vec::new();
+        let mut affected_keys = Vec::new();
 
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
                 let key = Self::make_dedup_key(&item.request);
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                affected_keys.push(key);
                 removed.push(item.request);
             } else {
                 retained.push(item);
@@ -656,6 +702,9 @@ impl PriorityHealQueue {
         }
 
         self.heap = retained;
+        for key in &affected_keys {
+            self.refresh_dedup_representative(key);
+        }
         removed
     }
 }
@@ -1967,8 +2016,8 @@ impl HealManager {
                 .map(|(task_id, _)| (task_id, "active"))
                 .or_else(|| {
                     queue
-                        .request_for_dedup_key(&dedup_key)
-                        .map(|queued| (queued.id.clone(), "queued"))
+                        .queued_request_id_for_dedup_key(&dedup_key)
+                        .map(|queued_id| (queued_id.to_string(), "queued"))
                 })
                 .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
         });
@@ -2086,9 +2135,9 @@ impl HealManager {
         let mut task_id = request.id.clone();
         let admission = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
         if admission == HealAdmissionResult::Merged
-            && let Some(queued) = queue.request_for_dedup_key(&dedup_key)
+            && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
         {
-            task_id.clone_from(&queued.id);
+            task_id = queued_id.to_owned();
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
         drop(retrying_heals);
@@ -4094,6 +4143,46 @@ mod tests {
         assert_eq!(admitted.priority, HealPriority::High);
         assert_eq!(admitted.id, high_id);
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn queued_request_id_for_dedup_key_tracks_the_representative() {
+        let mut queue = PriorityHealQueue::new();
+
+        let first = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        let first_id = first.id.clone();
+        let first_key = PriorityHealQueue::make_dedup_key(&first);
+        assert_eq!(queue.push(first), QueuePushOutcome::Accepted);
+
+        // A forced duplicate of the same target opens a second entry under
+        // the same key; the representative stays the request that opened it.
+        let mut second = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        second.force_start = true;
+        let second_id = second.id.clone();
+        assert_eq!(queue.push(second), QueuePushOutcome::Accepted);
+
+        let representative = queue
+            .queued_request_id_for_dedup_key(&first_key)
+            .expect("key must be reserved while either request is queued");
+        assert_eq!(representative, first_id);
+
+        // A holder leaving WITHOUT becoming active (canceled by id) must
+        // re-elect the representative to the surviving queued request, or a
+        // later merge receipt would name an id that resolves nowhere. The
+        // scheduler pop path needs no re-election: the popped request
+        // surfaces in active_heals under the same id and the duplicate
+        // pre-check consults active heals before the queue.
+        queue.remove_request_id(&first_id);
+        assert_eq!(
+            queue.queued_request_id_for_dedup_key(&first_key),
+            Some(second_id.as_str()),
+            "canceling the opener must re-elect the surviving queued holder"
+        );
+
+        // Pop the last holder: the key is released entirely.
+        let last = queue.pop_next().expect("second request must be queued");
+        assert_eq!(last.id, second_id);
+        assert!(queue.queued_request_id_for_dedup_key(&first_key).is_none());
     }
 
     #[test]
