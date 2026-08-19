@@ -647,7 +647,6 @@ async fn test_multipart_upload_with_sse_c(
 }
 
 /// Test large multipart upload to verify streaming encryption works correctly
-#[allow(dead_code)]
 async fn test_large_multipart_upload(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,

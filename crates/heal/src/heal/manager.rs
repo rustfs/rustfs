@@ -581,14 +581,6 @@ impl PriorityHealQueue {
             }
         }
     }
-
-    /// Check if a request with the same key already exists in the queue
-    #[allow(dead_code)]
-    fn contains_key(&self, request: &HealRequest) -> bool {
-        let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains_key(&key)
-    }
-
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");

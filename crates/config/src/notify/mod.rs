@@ -92,15 +92,11 @@ pub const NOTIFY_SUB_SYSTEMS: &[&str] = &[
 pub const NOTIFY_KAFKA_SUB_SYS: &str = "notify_kafka";
 pub const NOTIFY_MQTT_SUB_SYS: &str = "notify_mqtt";
 pub const NOTIFY_MYSQL_SUB_SYS: &str = "notify_mysql";
-#[allow(dead_code)]
 pub const NOTIFY_NATS_SUB_SYS: &str = "notify_nats";
-#[allow(dead_code)]
 pub const NOTIFY_NSQ_SUB_SYS: &str = "notify_nsq";
-#[allow(dead_code)]
 pub const NOTIFY_ES_SUB_SYS: &str = "notify_elasticsearch";
 pub const NOTIFY_AMQP_SUB_SYS: &str = "notify_amqp";
 pub const NOTIFY_POSTGRES_SUB_SYS: &str = "notify_postgres";
-#[allow(dead_code)]
 pub const NOTIFY_REDIS_SUB_SYS: &str = "notify_redis";
 pub const NOTIFY_REDIS_DEFAULT_CHANNEL: &str = "rustfs_notify_channel";
 pub const NOTIFY_PULSAR_SUB_SYS: &str = "notify_pulsar";

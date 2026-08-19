@@ -19,7 +19,6 @@ use hyper::Uri;
 use crate::{trace::TraceType, utils::parse_duration};
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct ServiceTraceOpts {
     s3: bool,
     internal: bool,
@@ -41,7 +40,6 @@ pub struct ServiceTraceOpts {
     threshold: Duration,
 }
 
-#[allow(dead_code)]
 impl ServiceTraceOpts {
     pub fn trace_types(&self) -> TraceType {
         let mut tt = TraceType::default();

@@ -35,7 +35,6 @@ impl TestCategory {}
 #[derive(Debug, Clone)]
 pub struct TestDefinition {
     pub name: String,
-    #[allow(dead_code)]
     pub category: TestCategory,
     pub is_critical: bool,
 }

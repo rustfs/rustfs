@@ -36,21 +36,9 @@ pub struct DefaultPhysicalPlanner {
     ext_physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
 }
 
-impl DefaultPhysicalPlanner {
-    #[allow(dead_code)]
-    fn with_physical_transform_rules(mut self, rules: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>) -> Self {
-        self.ext_physical_transform_rules = rules;
-        self
-    }
-}
+impl DefaultPhysicalPlanner {}
 
-impl DefaultPhysicalPlanner {
-    #[allow(dead_code)]
-    fn with_optimizer_rules(mut self, rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>) -> Self {
-        self.ext_physical_optimizer_rules = rules;
-        self
-    }
-}
+impl DefaultPhysicalPlanner {}
 
 impl Default for DefaultPhysicalPlanner {
     fn default() -> Self {
