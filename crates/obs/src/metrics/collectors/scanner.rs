@@ -465,6 +465,57 @@ fn bool_metric_value(enabled: bool) -> f64 {
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use metrics_util::debugging::DebuggingRecorder;
+    use rustfs_common::metrics::{Metric, Metrics};
+
+    fn prometheus_counter_name(name: &str) -> String {
+        if name.ends_with("_total") {
+            name.to_string()
+        } else {
+            format!("{name}_total")
+        }
+    }
+
+    #[test]
+    fn scanner_lifetime_counters_have_one_prometheus_producer() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let scanner_metrics = collect_scanner_metrics(&ScannerStats {
+            directories_scanned: 3,
+            objects_scanned: 7,
+            ..Default::default()
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::time(Metric::ScanObject)();
+            Metrics::time(Metric::ScanFolder)();
+            report_metrics(&scanner_metrics);
+        });
+
+        let normalized_counter_names: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _, _, value)| {
+                matches!(value, metrics_util::debugging::DebugValue::Counter(_))
+                    .then(|| prometheus_counter_name(composite.key().name()))
+            })
+            .collect();
+
+        for name in [
+            "rustfs_scanner_objects_scanned_total",
+            "rustfs_scanner_directories_scanned_total",
+        ] {
+            assert_eq!(
+                normalized_counter_names
+                    .iter()
+                    .filter(|candidate| candidate.as_str() == name)
+                    .count(),
+                1,
+                "scanner lifetime counter must have exactly one producer after Prometheus name normalization"
+            );
+        }
+    }
 
     #[test]
     fn test_collect_scanner_metrics() {
