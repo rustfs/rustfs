@@ -1041,12 +1041,25 @@ fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: boo
 fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
     // DataMovementOverwriteErr only means source and destination pool resolved to
     // the same pool. Without a target equivalence check it is not cleanup-safe.
-    is_err_object_not_found(err) || is_err_version_not_found(err)
+    if is_err_object_not_found(err) || is_err_version_not_found(err) {
+        return true;
+    }
+
+    // A not-found surfacing from inside a data-movement stage is the same
+    // condition once the wrapper is unwrapped (backlog#1827 T2).
+    crate::data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
 }
 
 fn is_decommission_target_capacity_error(err: &Error) -> bool {
     if matches!(err, Error::DiskFull | Error::StorageFull) {
         return true;
+    }
+
+    // A stage failure keeps the error it wrapped, so classify by type rather
+    // than by the rendered message (backlog#1827 T2). The substring fallback
+    // stays for errors that reached here through some other wrapper.
+    if let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+        return is_decommission_target_capacity_error(source);
     }
 
     let message = err.to_string();
@@ -4425,6 +4438,36 @@ mod tests {
     fn decommission_target_capacity_error_accepts_direct_capacity_errors() {
         assert!(is_decommission_target_capacity_error(&Error::DiskFull));
         assert!(is_decommission_target_capacity_error(&Error::StorageFull));
+    }
+
+    /// The decommission loop classifies errors that came back through a
+    /// data-movement stage wrapper. Before backlog#1827 T2 the wrapper flattened
+    /// everything into `Error::other(String)`, so these two classifiers had to
+    /// match on rendered text; now the wrapped error is recoverable by type.
+    #[test]
+    fn decommission_classifiers_see_through_a_stage_wrapper() {
+        let wrap = |inner: Error| {
+            crate::data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                "put_object",
+                "bucket-a",
+                "object-a",
+                inner,
+            )
+        };
+
+        // Capacity: the target pool filling up must still stop the loop.
+        assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+        assert!(is_decommission_target_capacity_error(&wrap(Error::StorageFull)));
+        assert!(!is_decommission_target_capacity_error(&wrap(Error::SlowDown)));
+
+        // Cleanup safety: a not-found surfacing from inside a stage is the same
+        // condition as one surfacing directly, so the source entry stays
+        // eligible for cleanup.
+        let not_found = Error::ObjectNotFound("bucket-a".to_string(), "object-a".to_string());
+        assert!(is_decommission_copy_cleanup_safe_error(&not_found));
+        assert!(is_decommission_copy_cleanup_safe_error(&wrap(not_found)));
+        assert!(!is_decommission_copy_cleanup_safe_error(&wrap(Error::SlowDown)));
     }
 
     #[test]
