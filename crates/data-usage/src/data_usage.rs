@@ -317,15 +317,15 @@ pub struct SizeSummary {
     /// Number of delete markers
     pub delete_markers: usize,
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Replica size
-    pub replica_size: usize,
+    pub replica_size: i64,
     /// Replica count
     pub replica_count: usize,
     /// Pending count
@@ -334,19 +334,21 @@ pub struct SizeSummary {
     pub failed_count: usize,
     /// Replication target stats
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
+    /// Per-tier accounting, keyed by storage class or remote tier name
+    pub tier_stats: HashMap<String, TierStats>,
 }
 
 /// Replication target size summary
 #[derive(Debug, Default, Clone)]
 pub struct ReplTargetSizeSummary {
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Pending count
     pub pending_count: usize,
     /// Failed count
@@ -708,28 +710,6 @@ impl DataUsageEntry {
             return;
         }
         self.children.insert(hash.key());
-    }
-
-    pub fn add_sizes(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size;
-        self.versions += summary.versions;
-        self.delete_markers += summary.delete_markers;
-        self.obj_sizes.add(summary.total_size as u64);
-        self.obj_versions.add(summary.versions as u64);
-
-        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-        replication_stats.replica_size += summary.replica_size as u64;
-        replication_stats.replica_count += summary.replica_count as u64;
-
-        for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
-            tgt_stat.pending_size += st.pending_size as u64;
-            tgt_stat.failed_size += st.failed_size as u64;
-            tgt_stat.replicated_size += st.replicated_size as u64;
-            tgt_stat.replicated_count += st.replicated_count as u64;
-            tgt_stat.failed_count += st.failed_count as u64;
-            tgt_stat.pending_count += st.pending_count as u64;
-        }
     }
 
     pub fn merge(&mut self, other: &DataUsageEntry) {
@@ -1722,14 +1702,6 @@ impl BucketUsageInfo {
     }
 
     /// Add size summary to this bucket usage
-    pub fn add_size_summary(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size as u64;
-        self.versions_count += summary.versions as u64;
-        self.delete_markers_count += summary.delete_markers as u64;
-        self.replica_size += summary.replica_size as u64;
-        self.replica_count += summary.replica_count as u64;
-    }
-
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
         self.size += other.size;
@@ -1775,29 +1747,32 @@ impl SizeSummary {
         Self::default()
     }
 
-    /// Add another SizeSummary to this one
+    /// Add another SizeSummary to this one.
+    ///
+    /// Saturating throughout: a scan that overflows a counter should report the
+    /// ceiling rather than panic in a debug build or wrap in a release one.
     pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size += other.total_size;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.replicated_size += other.replicated_size;
-        self.replicated_count += other.replicated_count;
-        self.pending_size += other.pending_size;
-        self.failed_size += other.failed_size;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-        self.pending_count += other.pending_count;
-        self.failed_count += other.failed_count;
+        self.total_size = self.total_size.saturating_add(other.total_size);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+        self.replicated_size = self.replicated_size.saturating_add(other.replicated_size);
+        self.replicated_count = self.replicated_count.saturating_add(other.replicated_count);
+        self.pending_size = self.pending_size.saturating_add(other.pending_size);
+        self.failed_size = self.failed_size.saturating_add(other.failed_size);
+        self.replica_size = self.replica_size.saturating_add(other.replica_size);
+        self.replica_count = self.replica_count.saturating_add(other.replica_count);
+        self.pending_count = self.pending_count.saturating_add(other.pending_count);
+        self.failed_count = self.failed_count.saturating_add(other.failed_count);
 
         // Merge replication target stats
         for (target, stats) in &other.repl_target_stats {
             let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size += stats.replicated_size;
-            entry.replicated_count += stats.replicated_count;
-            entry.pending_size += stats.pending_size;
-            entry.failed_size += stats.failed_size;
-            entry.pending_count += stats.pending_count;
-            entry.failed_count += stats.failed_count;
+            entry.replicated_size = entry.replicated_size.saturating_add(stats.replicated_size);
+            entry.replicated_count = entry.replicated_count.saturating_add(stats.replicated_count);
+            entry.pending_size = entry.pending_size.saturating_add(stats.pending_size);
+            entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
+            entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
+            entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
         }
     }
 }
@@ -2341,6 +2316,64 @@ mod tests {
         assert_eq!(usage1.size, 300);
         assert_eq!(usage1.objects_count, 30);
         assert_eq!(usage1.versions_count, 15);
+    }
+
+    #[test]
+    fn size_summary_add_saturates_instead_of_overflowing() {
+        // The scanner folds one summary per object into a per-prefix total, so a
+        // counter at its ceiling must stay there rather than panic in a debug
+        // build or wrap in a release one (backlog#1828).
+        let mut summary = SizeSummary {
+            total_size: usize::MAX,
+            versions: usize::MAX,
+            replicated_size: i64::MAX,
+            pending_size: i64::MAX,
+            failed_size: i64::MAX,
+            replica_size: i64::MAX,
+            ..Default::default()
+        };
+        summary.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: i64::MAX,
+                pending_size: i64::MAX,
+                failed_size: i64::MAX,
+                ..Default::default()
+            },
+        );
+
+        let mut increment = SizeSummary {
+            total_size: 1,
+            versions: 1,
+            replicated_size: 1,
+            pending_size: 1,
+            failed_size: 1,
+            replica_size: 1,
+            ..Default::default()
+        };
+        increment.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: 1,
+                pending_size: 1,
+                failed_size: 1,
+                ..Default::default()
+            },
+        );
+
+        summary.add(&increment);
+
+        assert_eq!(summary.total_size, usize::MAX);
+        assert_eq!(summary.versions, usize::MAX);
+        assert_eq!(summary.replicated_size, i64::MAX);
+        assert_eq!(summary.pending_size, i64::MAX);
+        assert_eq!(summary.failed_size, i64::MAX);
+        assert_eq!(summary.replica_size, i64::MAX);
+
+        let target = summary.repl_target_stats.get("arn").expect("target survives the merge");
+        assert_eq!(target.replicated_size, i64::MAX);
+        assert_eq!(target.pending_size, i64::MAX);
+        assert_eq!(target.failed_size, i64::MAX);
     }
 
     #[test]
