@@ -84,11 +84,11 @@ const TCP_STATE_RADIX: u32 = 16;
 /// and the SftpDriver, registered weakly into the SessionRegistry so an
 /// outside observer can enumerate live sessions without holding their
 /// lifetime.
-#[allow(dead_code)]
 pub struct SessionDiag {
     pub session_id: u64,
     pub local: SocketAddr,
     pub peer: SocketAddr,
+    #[allow(dead_code, reason = "written at accept time but never read back (backlog#1823)")]
     pub accepted_at: Instant,
     pub last_activity_ms: AtomicU64,
 }
