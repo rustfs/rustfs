@@ -9933,6 +9933,7 @@ dependencies = [
  "libc",
  "log",
  "metrics",
+ "metrics-util",
  "num_cpus",
  "nvml-wrapper",
  "opentelemetry",

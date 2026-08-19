@@ -163,4 +163,5 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 temp-env = { workspace = true }
-log = "0.4"
+log.workspace = true
+metrics-util = { workspace = true, features = ["debugging"] }
