@@ -370,22 +370,6 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>, Error> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<(), Error> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<(), Error> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool, Error> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>, Error> {
             Ok(Vec::new())
         }
@@ -394,16 +378,8 @@ mod tests {
             Ok(DiskStatus::Ok)
         }
 
-        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<(), Error> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>, Error> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<(), Error> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Error> {
@@ -412,14 +388,6 @@ mod tests {
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool, Error> {
             Ok(false)
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>, Error> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>, Error> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -438,10 +406,6 @@ mod tests {
 
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>), Error> {
             Ok((HealResultItem::default(), None))
-        }
-
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>, Error> {
-            Ok(Vec::new())
         }
 
         async fn list_objects_for_heal_page(

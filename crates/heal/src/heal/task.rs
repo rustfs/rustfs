@@ -3354,7 +3354,6 @@ mod tests {
         object_exists_by_name: Mutex<HashMap<String, MockObjectExists>>,
         heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
         heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
-        deleted_objects: Mutex<Vec<String>>,
         format_no_heal_required: Mutex<bool>,
         global_format_calls: Mutex<u32>,
         replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
@@ -3547,33 +3546,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, object: &str) -> Result<()> {
-            self.deleted_objects.lock().unwrap().push(object.to_string());
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
         async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<DiskStatus> {
             Ok(DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
-            Ok(())
         }
 
         async fn get_bucket_info(&self, bucket: &str) -> Result<Option<BucketInfo>> {
@@ -3588,10 +3566,6 @@ mod tests {
                 return Err(Error::Other("usage baseline unavailable".to_string()));
             }
             Ok(*self.usage_baseline.lock().unwrap())
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -3619,14 +3593,6 @@ mod tests {
                 };
             }
             Ok(self.object_exists.lock().unwrap().unwrap_or(true))
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -3762,10 +3728,6 @@ mod tests {
 
         async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
             Ok(*self.replacement_targets_ready.lock().unwrap())
-        }
-
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>> {
-            Ok(vec![heal_item("object-a"), heal_item("object-b")])
         }
 
         async fn list_objects_for_heal_page(
@@ -4858,7 +4820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_heal_failure_with_remove_corrupted_does_not_delete_object() {
+    async fn test_heal_failure_with_remove_corrupted_propagates_remove_flag() {
         let storage = Arc::new(MockStorage {
             object_exists: Mutex::new(Some(true)),
             heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError(
@@ -4884,7 +4846,6 @@ mod tests {
         let err = task.execute().await.expect_err("heal failure should still be reported");
 
         assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-        assert!(storage.deleted_objects.lock().unwrap().is_empty());
         assert!(storage.object_heal_opts.lock().unwrap()[0].remove);
     }
 

@@ -776,44 +776,20 @@ mod tests {
         async fn get_object_meta(&self, _bucket: &str, _object: &str) -> crate::Result<Option<HealObjectInfo>> {
             Ok(None)
         }
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> crate::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> crate::Result<()> {
-            Ok(())
-        }
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
-            Ok(true)
-        }
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> crate::Result<Vec<u8>> {
             Ok(vec![])
         }
         async fn get_disk_status(&self, _endpoint: &Endpoint) -> crate::Result<crate::heal::storage::DiskStatus> {
             Ok(crate::heal::storage::DiskStatus::Ok)
         }
-        async fn format_disk(&self, _endpoint: &Endpoint) -> crate::Result<()> {
-            Ok(())
-        }
         async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<crate::heal::storage_api::status::BucketInfo>> {
             Ok(None)
-        }
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {
-            Ok(())
         }
         async fn list_buckets(&self) -> crate::Result<Vec<crate::heal::storage_api::status::BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
             Ok(false)
-        }
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> crate::Result<Option<u64>> {
-            Ok(None)
-        }
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> crate::Result<Option<String>> {
-            Ok(None)
         }
         async fn heal_object(
             &self,
@@ -836,13 +812,6 @@ mod tests {
             _dry_run: bool,
         ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
-        }
-        async fn list_objects_for_heal(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-        ) -> crate::Result<Vec<crate::heal::storage::HealListItem>> {
-            Ok(vec![])
         }
         async fn list_objects_for_heal_page(
             &self,
