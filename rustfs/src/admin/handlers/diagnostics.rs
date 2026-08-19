@@ -1385,7 +1385,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     2,
-                    Some(vec![13]),
+                    None,
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
