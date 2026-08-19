@@ -276,20 +276,26 @@ async fn read_journal() -> Option<Vec<u8>> {
     None
 }
 
-async fn write_journal(data: &[u8]) {
+/// Write the snapshot to every local disk; returns true when at least one
+/// disk accepted it, so a total write failure keeps the runtime dirty and
+/// the next tick retries the persist.
+async fn write_journal(data: &[u8]) -> bool {
     let payload = bytes::Bytes::copy_from_slice(data);
+    let mut any_persisted = false;
     for disk in journal_disks().await {
-        if let Err(err) = disk
+        match disk
             .write_all(super::RUSTFS_META_BUCKET, MRF_JOURNAL_PATH, payload.clone())
             .await
         {
-            warn_mrf_journal_write(&err);
+            Ok(()) => any_persisted = true,
+            Err(err) => warn_mrf_journal_write(&err),
         }
     }
     if !data.is_empty() {
         counter!("rustfs_heal_mrf_journal_fsync_total").increment(1);
     }
     gauge!("rustfs_heal_mrf_journal_bytes").set(data.len() as f64);
+    any_persisted
 }
 
 async fn delete_journal() {
@@ -351,6 +357,12 @@ struct MrfRuntime {
     queue: MrfQueue,
     config: MrfConsumerConfig,
     new_since_flush: usize,
+    /// True while the in-memory pending set has changed since the last
+    /// journal flush (push, pop, or an attempts bump that alters the encoded
+    /// bytes). Only a dirty state rewrites the snapshot: a steady backlog
+    /// waiting out an admission backoff must not re-fsync every local disk
+    /// twice a second.
+    dirty: bool,
     /// True while a journal snapshot exists on disk that no longer reflects
     /// an all-consumed pending set; the next idle tick removes it (MinIO
     /// deletes its `list.bin` after replay for the same reason).
@@ -369,8 +381,14 @@ impl MrfRuntime {
     }
 
     async fn flush(&mut self) {
-        write_journal(&self.snapshot()).await;
+        let persisted = write_journal(&self.snapshot()).await;
         self.new_since_flush = 0;
+        // Keep the dirty flag when every disk write failed: a clean backlog
+        // would otherwise never rewrite, losing the periodic persist retry a
+        // non-empty queue used to provide.
+        if persisted {
+            self.dirty = false;
+        }
         self.journal_on_disk = true;
     }
 
@@ -384,6 +402,10 @@ impl MrfRuntime {
             self.backoff_until = None;
         }
         while let Some(mut intent) = self.queue.pop_front() {
+            // Leaving the pending set (consumed or re-queued with a bumped
+            // attempts counter) changes the encoded snapshot; mark it dirty
+            // either way.
+            self.dirty = true;
             let request = build_heal_request(&intent);
             match manager.submit_heal_request(request).await {
                 // Accepted intents leave the pending set; the next flush persists the
@@ -516,6 +538,7 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
         queue: MrfQueue::new(config.queue_capacity, config.journal_max_bytes),
         config: config.clone(),
         new_since_flush: 0,
+        dirty: false,
         journal_on_disk: false,
         backoff_until: None,
     };
@@ -523,6 +546,10 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
     // Replay: read the journal, re-arm intents (duplicates are merged by the
     // manager's dedup key), then drop the file so the next flush starts clean.
     replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
+    // The replay deleted the journal file; anything still pending (e.g. the
+    // manager was full and backoff armed) must be re-persisted by the next
+    // flush or a crash before it would lose those intents.
+    runtime.dirty = runtime.queue.depth() > 0;
 
     let mut flush_tick = tokio::time::interval(runtime.config.flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -532,8 +559,13 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
         tokio::select! {
             received = receiver.recv_many(&mut batch, runtime.config.replay_batch) => {
                 if received == 0 {
-                    // Channel closed: flush once more and stop.
-                    runtime.flush().await;
+                    // Channel closed: flush once more unless the snapshot is
+                    // provably current AND idle (a dirty or pending state
+                    // gets one last persist attempt, matching the shutdown
+                    // retry the unconditional flush used to provide).
+                    if runtime.dirty || runtime.queue.depth() > 0 {
+                        runtime.flush().await;
+                    }
                     tracing::info!(
                         target: "rustfs::heal::mrf",
                         "MRF channel closed; consumer stopped after final flush"
@@ -541,8 +573,10 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                     return;
                 }
                 for intent in batch.drain(..) {
-                    runtime.queue.try_push(intent);
-                    runtime.new_since_flush += 1;
+                    if runtime.queue.try_push(intent) {
+                        runtime.new_since_flush += 1;
+                        runtime.dirty = true;
+                    }
                 }
                 runtime.dispatch(manager.as_ref()).await;
                 if runtime.new_since_flush >= runtime.config.flush_threshold {
@@ -550,19 +584,57 @@ async fn run_mrf_consumer(manager: Arc<HealManager>, mut receiver: mpsc::Receive
                 }
             }
             _ = flush_tick.tick() => {
-                if runtime.new_since_flush > 0 || runtime.queue.depth() > 0 {
-                    runtime.flush().await;
-                    runtime.dispatch(manager.as_ref()).await;
-                } else if runtime.journal_on_disk {
-                    // All intents consumed: remove the journal so a restart
-                    // replays nothing (mirrors MinIO's post-replay unlink).
-                    delete_journal().await;
-                    runtime.journal_on_disk = false;
-                    gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
+                match tick_action(runtime.dirty, runtime.queue.depth(), runtime.journal_on_disk) {
+                    TickAction::Flush => {
+                        runtime.flush().await;
+                        runtime.dispatch(manager.as_ref()).await;
+                    }
+                    TickAction::Retry => {
+                        // Pending set unchanged since the last flush (a
+                        // backlog waiting out an admission backoff): skip the
+                        // rewrite but keep dispatching so the retry fires on
+                        // time.
+                        runtime.dispatch(manager.as_ref()).await;
+                    }
+                    TickAction::DeleteJournal => {
+                        // All intents consumed: remove the journal so a restart
+                        // replays nothing (mirrors MinIO's post-replay unlink).
+                        delete_journal().await;
+                        runtime.journal_on_disk = false;
+                        gauge!("rustfs_heal_mrf_journal_bytes").set(0.0);
+                    }
+                    TickAction::Idle => {}
                 }
                 gauge!("rustfs_heal_mrf_queue_depth").set(runtime.queue.depth() as f64);
             }
         }
+    }
+}
+
+/// What the periodic tick should do, as a pure function of the runtime state
+/// so the decision table is unit-testable.
+enum TickAction {
+    /// The pending set changed since the last snapshot: rewrite it, then
+    /// drain.
+    Flush,
+    /// Pending intents exist but the snapshot is current: only drain (an
+    /// admission backoff may have expired).
+    Retry,
+    /// Nothing pending and a stale journal file remains: remove it.
+    DeleteJournal,
+    /// Quiescent: nothing to do.
+    Idle,
+}
+
+fn tick_action(dirty: bool, depth: usize, journal_on_disk: bool) -> TickAction {
+    if dirty {
+        TickAction::Flush
+    } else if depth > 0 {
+        TickAction::Retry
+    } else if journal_on_disk {
+        TickAction::DeleteJournal
+    } else {
+        TickAction::Idle
     }
 }
 
@@ -581,6 +653,27 @@ mod tests {
             enqueued_at_ms: 1_700_000_000_000,
             attempts,
         }
+    }
+
+    #[test]
+    fn tick_action_table() {
+        use TickAction::*;
+
+        // Dirty dominates: a changed pending set flushes even when idle
+        // otherwise.
+        assert!(matches!(tick_action(true, 0, false), Flush));
+        assert!(matches!(tick_action(true, 3, true), Flush));
+
+        // Clean backlog: no rewrite, but keep draining so an expired
+        // admission backoff retries on time.
+        assert!(matches!(tick_action(false, 1, false), Retry));
+        assert!(matches!(tick_action(false, 2, true), Retry));
+
+        // Quiescent with a stale journal file on disk: remove it.
+        assert!(matches!(tick_action(false, 0, true), DeleteJournal));
+
+        // Fully quiescent: nothing to do.
+        assert!(matches!(tick_action(false, 0, false), Idle));
     }
 
     #[test]
