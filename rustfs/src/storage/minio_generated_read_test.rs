@@ -374,6 +374,21 @@ async fn reads_minio_generated_sse_s3_fixture_through_production_master_key_env(
     assert_eq!(sha256_hex(&plaintext), expected_sha256);
 }
 
+/// Objects small enough that MinIO inlined them into xl.meta instead of writing
+/// a part file — the ordinary shape for everyday small objects, and the one
+/// whose encrypted ETag misleads the multipart heuristic.
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn reads_minio_generated_sse_s3_singlepart_fixture() {
+    assert_fixture_round_trip("sse-s3-singlepart-64k", 64 * 1024).await;
+}
+
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn reads_minio_generated_sse_kms_singlepart_fixture() {
+    assert_fixture_round_trip("sse-kms-singlepart-64k", 64 * 1024).await;
+}
+
 /// SSE-C is the one managed shape needing no KMS: the customer supplies the key
 /// on every request, so this measures the read path alone.
 #[tokio::test]

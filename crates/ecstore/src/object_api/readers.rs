@@ -630,7 +630,7 @@ impl ReadPlan {
             let material = resolved;
             #[cfg(feature = "rio-v2")]
             let uses_legacy_encryption = matches!(material.mode, ReadEncryptionMode::Direct { .. });
-            let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
+            let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref(), &oi.user_defined);
             let recorded_plaintext_size = oi.encryption_original_size()?;
             let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed, recorded_plaintext_size)?;
             let full_plaintext_size =
@@ -1285,12 +1285,57 @@ fn encrypted_plaintext_size(
             .unwrap_or(oi.size));
     }
 
-    Ok(recorded_plaintext_size.unwrap_or(oi.size))
+    if let Some(recorded) = recorded_plaintext_size {
+        return Ok(recorded);
+    }
+
+    // A MinIO single-part object records no plaintext size: MinIO writes
+    // `X-Minio-Internal-actual-size` only for multipart uploads and otherwise
+    // derives the size from the DARE stream itself. Falling back to `oi.size`
+    // hands back the *physical* size, so the reader waits for the encoding
+    // overhead as if it were payload and the body ends short by exactly that
+    // much (rustfs/backlog#1638).
+    if rustfs_utils::http::has_minio_internal_sse_metadata(&oi.user_defined)
+        && let Some(plaintext) = rustfs_utils::http::dare_v2_decrypted_size(oi.size)
+    {
+        return Ok(plaintext);
+    }
+
+    Ok(oi.size)
 }
 
-fn is_multipart_encrypted_object(parts: &[ObjectPartInfo], etag: Option<&str>) -> bool {
+/// MinIO's explicit multipart marker, and the internal SSE prefix that
+/// identifies an object as MinIO-written in the first place.
+const MINIO_INTERNAL_ENCRYPTED_MULTIPART_KEY: &str = "X-Minio-Internal-Encrypted-Multipart";
+const MINIO_INTERNAL_SSE_PREFIX: &str = "X-Minio-Internal-Server-Side-Encryption-";
+
+/// Whether an encrypted object's stream is keyed per part.
+///
+/// `user_defined` is consulted before the ETag because MinIO records the answer
+/// outright, in `X-Minio-Internal-Encrypted-Multipart`. The ETag heuristic
+/// cannot stand in for it: MinIO stores an *encrypted* ETag for SSE objects —
+/// 96 characters for a single-part upload, not the 32 of a plain MD5 — so the
+/// length test reads such an object as multipart and derives a per-part key for
+/// a stream that was sealed with the object key itself, which then fails
+/// authentication (rustfs/backlog#1638).
+fn is_multipart_encrypted_object(parts: &[ObjectPartInfo], etag: Option<&str>, user_defined: &HashMap<String, String>) -> bool {
     if parts.len() > 1 {
         return true;
+    }
+
+    if user_defined
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(MINIO_INTERNAL_ENCRYPTED_MULTIPART_KEY))
+    {
+        return true;
+    }
+    // On a MinIO-written object the marker's absence is as informative as its
+    // presence, so the ETag is not consulted at all.
+    if user_defined
+        .keys()
+        .any(|key| rustfs_utils::http::starts_with_ignore_ascii_case(key, MINIO_INTERNAL_SSE_PREFIX))
+    {
+        return false;
     }
 
     etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)

@@ -614,7 +614,20 @@ impl ObjectInfo {
     }
 
     pub fn decrypted_size(&self) -> std::io::Result<i64> {
-        Ok(self.encryption_original_size()?.unwrap_or(self.size))
+        if let Some(recorded) = self.encryption_original_size()? {
+            return Ok(recorded);
+        }
+        // A MinIO single-part object records no plaintext size — MinIO writes one
+        // only for multipart uploads — so `self.size` here is the *physical*
+        // size, encoding overhead included. Reporting that as the object's
+        // length overstates it by exactly that overhead, which is what a client
+        // sees as Content-Length (rustfs/backlog#1638).
+        if rustfs_utils::http::has_minio_internal_sse_metadata(&self.user_defined)
+            && let Some(plaintext) = rustfs_utils::http::dare_v2_decrypted_size(self.size)
+        {
+            return Ok(plaintext);
+        }
+        Ok(self.size)
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {

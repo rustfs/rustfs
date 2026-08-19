@@ -53,6 +53,50 @@ pub const MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER: &str = "X-Minio-Internal-
 pub const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key";
 pub const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
 
+/// Plaintext length of a DARE v2 stream of `ciphertext_size` bytes.
+///
+/// The stream is a sequence of packages, each a 16-byte header, up to 64 KiB of
+/// payload, and a 16-byte tag; only the last may be short. This is the same
+/// arithmetic as MinIO's `sio.DecryptedSize`, and it is the only way to size a
+/// MinIO single-part object: MinIO writes an explicit plaintext size only for
+/// multipart uploads and otherwise derives it from the stream.
+///
+/// Returns `None` for a size no DARE stream can have — a final package carrying
+/// overhead but no payload — so a malformed object is not silently assigned a
+/// plausible length.
+pub fn dare_v2_decrypted_size(ciphertext_size: i64) -> Option<i64> {
+    const HEADER_LEN: i64 = 16;
+    const TAG_LEN: i64 = 16;
+    const MAX_PAYLOAD: i64 = 64 * 1024;
+    const PACKAGE_LEN: i64 = HEADER_LEN + MAX_PAYLOAD + TAG_LEN;
+
+    if ciphertext_size < 0 {
+        return None;
+    }
+    if ciphertext_size == 0 {
+        return Some(0);
+    }
+
+    let full_packages = ciphertext_size / PACKAGE_LEN;
+    let remainder = ciphertext_size % PACKAGE_LEN;
+    if remainder == 0 {
+        return Some(full_packages * MAX_PAYLOAD);
+    }
+    if remainder <= HEADER_LEN + TAG_LEN {
+        return None;
+    }
+    Some(full_packages * MAX_PAYLOAD + remainder - HEADER_LEN - TAG_LEN)
+}
+
+/// True when the metadata was written by MinIO's SSE path.
+pub fn has_minio_internal_sse_metadata<S: std::hash::BuildHasher>(
+    metadata: &std::collections::HashMap<String, String, S>,
+) -> bool {
+    metadata
+        .keys()
+        .any(|key| super::starts_with_ignore_ascii_case(key, "x-minio-internal-server-side-encryption-"))
+}
+
 /// Reserved RustFS-branded twin of the MinIO-internal SSE key family.
 ///
 /// No RustFS writer emits these keys today — the SSE writer persists the
@@ -321,6 +365,31 @@ mod tests {
         assert!(projected.values().all(http::HeaderValue::is_sensitive));
         assert!(projected.get(http::header::AUTHORIZATION).is_none());
         assert!(!format!("{projected:?}").contains("secret-key"));
+    }
+
+    #[test]
+    fn dare_v2_size_inverts_the_package_layout() {
+        const PACKAGE: i64 = 16 + 64 * 1024 + 16;
+
+        // Exactly one full package, and exactly two.
+        assert_eq!(dare_v2_decrypted_size(PACKAGE), Some(64 * 1024));
+        assert_eq!(dare_v2_decrypted_size(2 * PACKAGE), Some(128 * 1024));
+
+        // The shape that motivated this: a 64 KiB object stored as 65568 bytes.
+        assert_eq!(dare_v2_decrypted_size(65568), Some(65536));
+
+        // A short trailing package carries its own header and tag.
+        assert_eq!(dare_v2_decrypted_size(PACKAGE + 16 + 1 + 16), Some(64 * 1024 + 1));
+        assert_eq!(dare_v2_decrypted_size(16 + 1 + 16), Some(1));
+
+        assert_eq!(dare_v2_decrypted_size(0), Some(0));
+
+        // Sizes no DARE stream can have: overhead with no payload behind it.
+        // Refused rather than rounded into a plausible length.
+        assert_eq!(dare_v2_decrypted_size(1), None);
+        assert_eq!(dare_v2_decrypted_size(32), None);
+        assert_eq!(dare_v2_decrypted_size(PACKAGE + 32), None);
+        assert_eq!(dare_v2_decrypted_size(-1), None);
     }
 
     #[test]
