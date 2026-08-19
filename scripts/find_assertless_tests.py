@@ -53,13 +53,36 @@ VERIFY_SIGNALS = re.compile(
     r"unreachable!|matches!\(|insta::|proptest!|\.await\?|\)\?|\?;|should_panic"
 )
 DELEGATION = re.compile(
-    r"\b(?:assert|verify|check|expect|ensure|run)_[a-z0-9_]*\s*\(|"
-    r"\b[a-z0-9_]+_(?:case|cases|harness|roundtrip|round_trip)\s*\("
+    r"\b(?:assert|verify|check|expect|ensure|run)_[a-z0-9_]*(?:::<[^>]*>)?\s*\(|"
+    r"\b[a-z0-9_]+_(?:case|cases|harness|roundtrip|round_trip)(?:::<[^>]*>)?\s*\("
 )
+
+# A body whose whole content is one call delegates by construction, whatever the
+# callee is named: `run(DurabilityMode::Strict).await` and
+# `aborting_encode_drops_blocked_producer(EncodePipeline::Vec).await` both hand
+# every assertion to a shared harness.
+SINGLE_CALL_BODY = re.compile(
+    r"\A\s*[a-zA-Z_][a-zA-Z0-9_:]*(?:::<[^>]*>)?\s*\([^;]*\)\s*(?:\.await\s*)?;?\s*\Z",
+    re.S,
+)
+
+# A nested `fn` that is only bound and discarded is a signature guard: the type
+# system is the assertion, exactly like the `fn _name()` form below.
+SIGNATURE_GUARD = re.compile(r"\bfn\s+[a-zA-Z0-9_]+\s*(?:<[^>]*>)?\s*\([^;]*\)[^;]*\{", re.S)
+DISCARDED_BINDING = re.compile(r"\blet\s+_\s*=\s*[a-zA-Z_][a-zA-Z0-9_]*\s*;")
 COMPILE_TIME_CHECK = re.compile(r"\bfn\s+_[a-zA-Z0-9_]*\s*(?:<[^>]*>)?\s*\(")
 TEST_ATTR = re.compile(r"#\[(?:tokio::)?test[\](]")
 TEST_CASE_ATTR = re.compile(r"#\[test_case")
 FN_LINE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)")
+
+
+def extract_body(text: str) -> str:
+    """Return what is between the outermost braces of a scanned function."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return text
+    return text[start + 1 : end]
 
 
 def scan_file(path: Path):
@@ -105,7 +128,16 @@ def scan_file(path: Path):
                 break
             k += 1
         text = "\n".join(body)
-        if not VERIFY_SIGNALS.search(text) and not DELEGATION.search(text) and not COMPILE_TIME_CHECK.search(text):
+        # The attribute block carries verification too: `#[should_panic(expected
+        # = "...")]` makes the panic message the assertion.
+        attr_text = "\n".join(attrs)
+        inner = extract_body(text)
+        delegates = (
+            DELEGATION.search(text)
+            or SINGLE_CALL_BODY.match(inner)
+            or (SIGNATURE_GUARD.search(inner) and DISCARDED_BINDING.search(inner))
+        )
+        if not VERIFY_SIGNALS.search(text) and not VERIFY_SIGNALS.search(attr_text) and not delegates and not COMPILE_TIME_CHECK.search(text):
             print(f"{path}:{j + 1}: {name}")
         i = k + 1
 
