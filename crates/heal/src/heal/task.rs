@@ -945,6 +945,13 @@ impl HealTask {
         self.result_items.read().await.iter().cloned().collect::<Vec<_>>()
     }
 
+    /// Sequence cursors of the retained window (next to assign, oldest
+    /// retained) — the same pair `get_result_items_since` reports, without
+    /// copying the items. Used when archiving a finished task.
+    pub fn result_seq_cursors(&self) -> (u64, u64) {
+        (self.next_item_seq.load(Ordering::Relaxed), self.min_available_seq.load(Ordering::Relaxed))
+    }
+
     /// Incremental result window (HS-06): `since = None` returns the full
     /// retained window (legacy snapshot semantics); `since = Some(seq)`
     /// returns only items stamped with a sequence greater than `seq`.

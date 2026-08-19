@@ -217,11 +217,11 @@ impl ForegroundPressure {
 struct CompletedHealStatus {
     heal_type: HealType,
     status: HealTaskStatus,
-    result_items: Vec<HealResultItem>,
     result_items_truncated: bool,
     completed_at: SystemTime,
     /// Sequence-stamped retained window, archived with the completion so
     /// incremental consumers keep their cursor across the transition (HS-06).
+    /// The un-stamped legacy view is derived from it on demand.
     seqed_items: Vec<(u64, HealResultItem)>,
     next_seq: u64,
     min_seq: u64,
@@ -283,7 +283,7 @@ fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
 fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) -> HealTaskReport {
     let mut lagged = false;
     let result_items = match since {
-        None => completed.result_items.clone(),
+        None => completed.seqed_items.iter().map(|(_, item)| item.clone()).collect(),
         Some(cursor) => {
             if cursor + 1 < completed.min_seq {
                 lagged = true;
@@ -3461,16 +3461,19 @@ impl HealManager {
                             completed_task.get_status().await
                         };
                         let completed_progress = completed_task.get_progress().await;
-                        let final_window = completed_task.get_result_items_since(None).await;
+                        // Single snapshot of the retained window: the task is
+                        // finished and already off the active map, so there is
+                        // no concurrent writer to race with.
+                        let seqed_items = completed_task.get_seqed_result_items().await;
+                        let (next_seq, min_seq) = completed_task.result_seq_cursors();
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
-                            result_items: final_window.items.clone(),
                             result_items_truncated: completed_task.result_items_truncated(),
                             completed_at: SystemTime::now(),
-                            seqed_items: completed_task.get_seqed_result_items().await,
-                            next_seq: final_window.next_seq,
-                            min_seq: final_window.min_seq,
+                            seqed_items,
+                            next_seq,
+                            min_seq,
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
                         prune_completed_heal_statuses(&mut completed_heals_guard);
@@ -5200,7 +5203,6 @@ mod tests {
                     error: "Lock acquisition timeout".to_string(),
                     retry_attempt: request.retry_attempts,
                 },
-                result_items: Vec::new(),
                 result_items_truncated: false,
                 seqed_items: Vec::new(),
                 next_seq: 0,
@@ -5916,7 +5918,6 @@ mod tests {
                     bucket: "bucket".to_string(),
                 },
                 status: HealTaskStatus::Completed,
-                result_items: Vec::new(),
                 result_items_truncated: false,
                 seqed_items: Vec::new(),
                 next_seq: 0,
@@ -5948,16 +5949,18 @@ mod tests {
                     version_id: None,
                 },
                 status: HealTaskStatus::Completed,
-                result_items: vec![HealResultItem {
-                    bucket: "bucket".to_string(),
-                    object: "object".to_string(),
-                    object_size: 1024,
-                    ..Default::default()
-                }],
                 result_items_truncated: true,
-                seqed_items: Vec::new(),
-                next_seq: 0,
-                min_seq: 0,
+                seqed_items: vec![(
+                    1,
+                    HealResultItem {
+                        bucket: "bucket".to_string(),
+                        object: "object".to_string(),
+                        object_size: 1024,
+                        ..Default::default()
+                    },
+                )],
+                next_seq: 2,
+                min_seq: 1,
                 completed_at: SystemTime::now(),
             },
         );
@@ -5971,6 +5974,10 @@ mod tests {
         assert_eq!(report.status, HealTaskStatus::Completed);
         assert_eq!(report.result_items.len(), 1);
         assert_eq!(report.result_items[0].object_size, 1024);
+        // The archived cursors pass through to the report so an incremental
+        // consumer can resume against the next expected sequence.
+        assert_eq!(report.next_seq, 2);
+        assert_eq!(report.min_seq, 1);
     }
 
     #[tokio::test]
