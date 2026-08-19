@@ -2032,13 +2032,7 @@ fn is_data_usage_cache_absent(err: &Error) -> bool {
 
 async fn read_data_usage_cache_object<S>(store: &S, key: &str) -> crate::error::Result<DataUsageCacheRead>
 where
-    S: rustfs_storage_api::ObjectIO<
-            Error = Error,
-            RangeSpec = rustfs_storage_api::HTTPRangeSpec,
-            HeaderMap = http::HeaderMap,
-            ObjectOptions = crate::object_api::ObjectOptions,
-            GetObjectReader = crate::object_api::GetObjectReader,
-        >,
+    S: EcstoreObjectIO,
 {
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::object_api::ObjectOptions;
@@ -2074,15 +2068,9 @@ where
 /// A cache that is absent under both keys yields an empty cache; a transient
 /// read failure is retried with capped, jittered backoff and surfaces as an
 /// error once the attempts are exhausted.
-pub async fn load_data_usage_cache<S>(store: &S, name: &str) -> crate::error::Result<DataUsageCache>
+pub(crate) async fn load_data_usage_cache<S>(store: &S, name: &str) -> crate::error::Result<DataUsageCache>
 where
-    S: rustfs_storage_api::ObjectIO<
-            Error = Error,
-            RangeSpec = rustfs_storage_api::HTTPRangeSpec,
-            HeaderMap = http::HeaderMap,
-            ObjectOptions = crate::object_api::ObjectOptions,
-            GetObjectReader = crate::object_api::GetObjectReader,
-        >,
+    S: EcstoreObjectIO,
 {
     use crate::disk::BUCKET_META_PREFIX;
     use std::path::Path;
