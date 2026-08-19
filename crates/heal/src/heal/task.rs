@@ -29,6 +29,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     future::Future,
     sync::{
         Arc,
@@ -391,7 +392,7 @@ pub struct HealTask {
     /// monotonically increasing sequence number for incremental consumption
     /// (the client passes the last seen seq back and receives only newer
     /// items; see `get_result_items_since`).
-    pub result_items: Arc<RwLock<Vec<(u64, HealResultItem)>>>,
+    pub result_items: Arc<RwLock<VecDeque<(u64, HealResultItem)>>>,
     /// Next sequence number to assign; starts at 1.
     next_item_seq: Arc<AtomicU64>,
     /// Sequence number of the oldest item still inside the retention window;
@@ -447,7 +448,7 @@ impl HealTask {
             replacement_resume_endpoint: None,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
-            result_items: Arc::new(RwLock::new(Vec::new())),
+            result_items: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_HEAL_RESULT_ITEMS))),
             next_item_seq: Arc::new(AtomicU64::new(1)),
             min_available_seq: Arc::new(AtomicU64::new(1)),
             result_items_truncated: Arc::new(AtomicBool::new(false)),
@@ -941,7 +942,7 @@ impl HealTask {
     /// Sequence-stamped retained window, used when archiving a completed
     /// task so incremental cursors survive the transition (HS-06).
     pub async fn get_seqed_result_items(&self) -> Vec<(u64, HealResultItem)> {
-        self.result_items.read().await.clone()
+        self.result_items.read().await.iter().cloned().collect::<Vec<_>>()
     }
 
     /// Incremental result window (HS-06): `since = None` returns the full
@@ -984,14 +985,14 @@ impl HealTask {
         let seq = self.next_item_seq.fetch_add(1, Ordering::Relaxed);
         let mut result_items = self.result_items.write().await;
         if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {
-            result_items.push((seq, result));
+            result_items.push_back((seq, result));
         } else {
             // Slide the window: the oldest item leaves and the cursor for the
             // oldest still-available item moves forward with it.
-            result_items.remove(0);
+            result_items.pop_front();
             self.min_available_seq
-                .store(result_items.first().map_or(seq, |(oldest, _)| *oldest), Ordering::Relaxed);
-            result_items.push((seq, result));
+                .store(result_items.front().map_or(seq, |(oldest, _)| *oldest), Ordering::Relaxed);
+            result_items.push_back((seq, result));
             self.result_items_truncated.store(true, Ordering::Relaxed);
         }
     }
