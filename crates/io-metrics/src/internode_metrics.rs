@@ -47,6 +47,13 @@ pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
 pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
 pub const INTERNODE_MSGPACK_CODEC_MSGPACK: &str = "msgpack";
 pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE: &str = "read_version_request_encode";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE: &str = "read_version_request_decode";
+pub const INTERNODE_STAGE_READ_VERSION_DISK_READ: &str = "read_version_disk_read";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "read_version_response_json_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP: &str = "read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE: &str = "read_version_response_decode";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -67,6 +74,7 @@ const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
 const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
+const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
 const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
@@ -105,6 +113,7 @@ const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OP
 const SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS: &[&str] =
     &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL];
 const SERVER_OPERATION_BACKEND_RPC_PATH_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL];
+const SERVER_OPERATION_BACKEND_STAGE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL];
 const SERVER_LABELS: &[&str] = &[SERVER_LABEL];
 const SERVER_REASON_LABELS: &[&str] = &[SERVER_LABEL, REASON_LABEL];
 const SERVER_QUORUM_FAILURE_LABELS: &[&str] = &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL];
@@ -133,6 +142,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_DURATION_MS,
         labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_STAGE_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_STAGE_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
@@ -390,6 +403,24 @@ impl InternodeMetrics {
             SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend
+        )
+        .record(duration_ms);
+    }
+
+    pub fn record_stage_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        stage: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            STAGE_LABEL => stage
         )
         .record(duration_ms);
     }
@@ -989,41 +1020,89 @@ mod tests {
     }
 
     #[test]
+    fn operation_stage_duration_records_low_cardinality_stage_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_stage_duration_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
+                Duration::from_micros(125),
+            );
+        });
+
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_OPERATION_STAGE_DURATION_MS)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(STAGE_LABEL).map(String::as_str),
+            Some(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP)
+        );
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+        match &entries[0].3 {
+            DebugValue::Histogram(samples) => assert_eq!(samples.iter().map(|sample| sample.0).collect::<Vec<_>>(), vec![0.125]),
+            other => panic!("{INTERNODE_OPERATION_STAGE_DURATION_MS} must be a histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 21);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 22);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
-        for metric in &INTERNODE_OPERATION_METRICS[6..9] {
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[6].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[7..10] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
         assert_eq!(
-            INTERNODE_OPERATION_METRICS[9].labels,
+            INTERNODE_OPERATION_METRICS[10].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
         );
-        for metric in &INTERNODE_OPERATION_METRICS[10..12] {
+        for metric in &INTERNODE_OPERATION_METRICS[11..13] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
         assert_eq!(
-            INTERNODE_OPERATION_METRICS[12].labels,
-            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL]
-        );
-        assert_eq!(
             INTERNODE_OPERATION_METRICS[13].labels,
-            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL]
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[14].labels,
             &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
         );
-        for metric in &INTERNODE_OPERATION_METRICS[15..17] {
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[15].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[16..18] {
             assert_eq!(metric.labels, &[SERVER_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[17].labels, &[SERVER_LABEL, REASON_LABEL]);
-        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, REASON_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
         // Payload histogram + large-payload counter carry operation+backend labels.
-        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[21].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -1054,62 +1133,66 @@ mod tests {
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[6].name,
-            "rustfs_system_network_internode_operation_classified_errors_total"
+            "rustfs_system_network_internode_operation_stage_duration_ms"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[7].name,
-            "rustfs_system_network_internode_operation_retries_total"
+            "rustfs_system_network_internode_operation_classified_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[8].name,
-            "rustfs_system_network_internode_operation_retry_successes_total"
+            "rustfs_system_network_internode_operation_retries_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[9].name,
-            "rustfs_system_network_internode_operation_http_versions_total"
+            "rustfs_system_network_internode_operation_retry_successes_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[10].name,
-            "rustfs_system_network_internode_operation_stall_timeouts_total"
+            "rustfs_system_network_internode_operation_http_versions_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[11].name,
-            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
+            "rustfs_system_network_internode_operation_stall_timeouts_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[12].name,
-            "rustfs_system_network_internode_rpc_auth_failures_total"
+            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[13].name,
-            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
+            "rustfs_system_network_internode_rpc_auth_failures_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[14].name,
-            "rustfs_system_network_internode_replay_cache_records_total"
+            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[15].name,
-            "rustfs_system_network_internode_replay_cache_entries"
+            "rustfs_system_network_internode_replay_cache_records_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[16].name,
-            "rustfs_system_network_internode_replay_cache_capacity"
+            "rustfs_system_network_internode_replay_cache_entries"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[17].name,
-            "rustfs_system_network_internode_replay_cache_evictions_total"
+            "rustfs_system_network_internode_replay_cache_capacity"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[18].name,
-            "rustfs_system_storage_erasure_write_quorum_failures_total"
+            "rustfs_system_network_internode_replay_cache_evictions_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[19].name,
-            "rustfs_system_network_internode_operation_payload_bytes"
+            "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[20].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[21].name,
             "rustfs_system_network_internode_operation_large_payloads_total"
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
@@ -1129,6 +1212,16 @@ mod tests {
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
         assert_eq!(INTERNODE_MSGPACK_CODEC_MSGPACK, "msgpack");
         assert_eq!(INTERNODE_MSGPACK_CODEC_JSON, "json");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, "read_version_request_encode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, "read_version_request_decode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_DISK_READ, "read_version_disk_read");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, "read_version_response_json_encode");
+        assert_eq!(
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+            "read_version_response_msgpack_encode"
+        );
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, "read_version_rpc_roundtrip");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, "read_version_response_decode");
         assert_eq!(
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"

@@ -23,12 +23,15 @@ use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_STAGE_READ_VERSION_DISK_READ, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
 use std::io::Cursor;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
@@ -199,6 +202,21 @@ fn encode_read_multiple_response_payloads(
     }
 
     Ok((read_multiple_resps_json, read_multiple_resps_bin))
+}
+
+fn internode_stage_timer(attribution_enabled: bool) -> Option<Instant> {
+    attribution_enabled.then(Instant::now)
+}
+
+fn record_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        global_internode_metrics().record_stage_duration_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_READ_VERSION,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            stage,
+            started_at.elapsed(),
+        );
+    }
 }
 
 fn encode_batch_read_version_response_payloads(
@@ -685,11 +703,42 @@ impl NodeService {
         request: Request<ReadVersionRequest>,
     ) -> Result<Response<ReadVersionResponse>, Status> {
         let request = request.into_inner();
+        let metrics = global_internode_metrics();
+        let read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        if read_version_attribution_enabled {
+            metrics.record_incoming_request_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                request
+                    .disk
+                    .len()
+                    .saturating_add(request.volume.len())
+                    .saturating_add(request.path.len())
+                    .saturating_add(request.version_id.len())
+                    .saturating_add(request.opts.len())
+                    .saturating_add(request.opts_bin.len()),
+            );
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
             let request_had_msgpack_payload = !request.opts_bin.is_empty();
+            let decode_started = internode_stage_timer(read_version_attribution_enabled);
             let opts = match decode_msgpack_or_json::<ReadOptions>(&request.opts_bin, &request.opts, "ReadOptions") {
-                Ok(options) => options,
+                Ok(options) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, decode_started);
+                    options
+                }
                 Err(err) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, decode_started);
+                    if read_version_attribution_enabled {
+                        metrics.record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_VERSION,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                    }
                     return Ok(Response::new(ReadVersionResponse {
                         success: false,
                         file_info: String::new(),
@@ -698,42 +747,88 @@ impl NodeService {
                     }));
                 }
             };
+            let disk_read_started = internode_stage_timer(read_version_attribution_enabled);
             match disk
                 .read_version("", &request.volume, &request.path, &request.version_id, &opts)
                 .await
             {
                 Ok(file_info) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_DISK_READ, disk_read_started);
+                    let json_encode_started = internode_stage_timer(read_version_attribution_enabled);
                     let file_info_json = compat_response_json(&file_info, request_had_msgpack_payload);
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, json_encode_started);
+                    let msgpack_encode_started = internode_stage_timer(read_version_attribution_enabled);
                     let file_info_bin = encode_file_info_msgpack(&file_info);
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, msgpack_encode_started);
                     match (file_info_json, file_info_bin) {
-                        (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
-                            success: true,
-                            file_info,
-                            file_info_bin: file_info_bin.into(),
-                            error: None,
-                        })),
-                        (Err(err), _) => Ok(Response::new(ReadVersionResponse {
-                            success: false,
-                            file_info: String::new(),
-                            file_info_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
-                        (_, Err(err)) => Ok(Response::new(ReadVersionResponse {
-                            success: false,
-                            file_info: String::new(),
-                            file_info_bin: Vec::new().into(),
-                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                        })),
+                        (Ok(file_info), Ok(file_info_bin)) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_sent_bytes_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                    file_info.len().saturating_add(file_info_bin.len()),
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: true,
+                                file_info,
+                                file_info_bin: file_info_bin.into(),
+                                error: None,
+                            }))
+                        }
+                        (Err(err), _) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_error_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: false,
+                                file_info: String::new(),
+                                file_info_bin: Vec::new().into(),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            }))
+                        }
+                        (_, Err(err)) => {
+                            if read_version_attribution_enabled {
+                                metrics.record_error_for_operation_and_backend(
+                                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                                );
+                            }
+                            Ok(Response::new(ReadVersionResponse {
+                                success: false,
+                                file_info: String::new(),
+                                file_info_bin: Vec::new().into(),
+                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                            }))
+                        }
                     }
                 }
-                Err(err) => Ok(Response::new(ReadVersionResponse {
-                    success: false,
-                    file_info: String::new(),
-                    file_info_bin: Vec::new().into(),
-                    error: Some(err.into()),
-                })),
+                Err(err) => {
+                    record_read_version_stage(INTERNODE_STAGE_READ_VERSION_DISK_READ, disk_read_started);
+                    if read_version_attribution_enabled {
+                        metrics.record_error_for_operation_and_backend(
+                            INTERNODE_OPERATION_GRPC_READ_VERSION,
+                            INTERNODE_TRANSPORT_BACKEND_GRPC,
+                        );
+                    }
+                    Ok(Response::new(ReadVersionResponse {
+                        success: false,
+                        file_info: String::new(),
+                        file_info_bin: Vec::new().into(),
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
+            if read_version_attribution_enabled {
+                metrics.record_error_for_operation_and_backend(
+                    INTERNODE_OPERATION_GRPC_READ_VERSION,
+                    INTERNODE_TRANSPORT_BACKEND_GRPC,
+                );
+            }
             Ok(Response::new(ReadVersionResponse {
                 success: false,
                 file_info: String::new(),
@@ -1520,17 +1615,51 @@ mod tests {
         encode_batch_read_version_response_payloads, encode_file_info_msgpack, encode_msgpack, encode_msgpack_named,
         encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
+    use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::RenameDataResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
     use rustfs_filemeta::FileInfo;
     use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use rustfs_protos::proto_gen::node_service::ReadVersionRequest;
     use serde::{Deserialize, Serialize};
+    use serial_test::serial;
+    use tonic::Request;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_read_version_records_attribution_for_missing_disk() {
+        let metrics = global_internode_metrics();
+        let previous_stage_metrics = rustfs_io_metrics::get_stage_metrics_enabled();
+        metrics.reset_for_test();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let response = make_server()
+            .handle_read_version(Request::new(ReadVersionRequest {
+                disk: "missing-disk".to_string(),
+                volume: "bucket".to_string(),
+                path: "object".to_string(),
+                version_id: String::new(),
+                opts: String::new(),
+                opts_bin: Vec::new().into(),
+            }))
+            .await
+            .expect("ReadVersion handler should return a response")
+            .into_inner();
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_stage_metrics);
+        let snapshot = metrics.snapshot();
+        assert!(!response.success);
+        assert_eq!(snapshot.incoming_requests_total, 1);
+        assert_eq!(snapshot.errors_total, 1);
+        assert!(snapshot.recv_bytes_total > 0);
+        metrics.reset_for_test();
     }
 
     #[test]
