@@ -409,8 +409,13 @@ impl MrfRuntime {
             let request = build_heal_request(&intent);
             match manager.submit_heal_request(request).await {
                 // Accepted intents leave the pending set; the next flush persists the
-                // smaller snapshot, which is the journal's compaction.
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
+                // smaller snapshot, which is the journal's compaction. Fan out a
+                // best-effort repaired notice so retry ledgers (the scanner's
+                // pending-heal oracle) can drop entries whose repair the manager
+                // now owns (backlog#1894 axis B).
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
+                    rustfs_common::mrf_channel::note_mrf_repaired(&intent.bucket, &intent.object, intent.version_id);
+                }
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts >= MRF_MAX_ATTEMPTS {
@@ -514,7 +519,9 @@ async fn replay_into(
         while let Some(mut intent) = queue.pop_front() {
             let request = build_heal_request(&intent);
             match manager.submit_heal_request(request).await {
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
+                    rustfs_common::mrf_channel::note_mrf_repaired(&intent.bucket, &intent.object, intent.version_id);
+                }
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts < MRF_MAX_ATTEMPTS {
