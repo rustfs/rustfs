@@ -21,7 +21,6 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde::Deserialize;
-use serial_test::serial;
 use std::error::Error;
 use std::process::Command;
 use tokio::time::{Duration, sleep, timeout};
@@ -100,7 +99,6 @@ fn offline_server_count(info: &InfoMessage) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn test_single_admin_timeout_does_not_immediately_mark_peer_offline() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 

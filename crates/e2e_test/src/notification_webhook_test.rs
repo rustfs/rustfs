@@ -47,7 +47,6 @@ use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
 use s3s::Body;
 use serde_json::Value;
-use serial_test::serial;
 use std::error::Error;
 use std::io::Cursor;
 use std::path::Path;
@@ -625,7 +624,6 @@ fn assert_generated_request_id_correlation(record: &Value, request_id: &str) {
 /// RUSTFS_NOTIFY_ENABLE, an HTTPS webhook using a configured CA must become
 /// online and receive a real S3 event POST.
 #[tokio::test]
-#[serial]
 async fn test_https_webhook_target_delivers_event_with_notify_env_enabled() -> TestResult {
     init_logging();
 
@@ -680,7 +678,6 @@ async fn test_https_webhook_target_delivers_event_with_notify_env_enabled() -> T
 /// PUT / multipart-complete / DELETE each deliver one event with correct fields,
 /// and the prefix/suffix filter drops non-matching keys.
 #[tokio::test]
-#[serial]
 async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     init_logging();
 
@@ -900,7 +897,6 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
 /// An event queued while the target endpoint rejects delivery survives on the
 /// durable store and is redelivered once the endpoint comes back.
 #[tokio::test]
-#[serial]
 async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     init_logging();
 

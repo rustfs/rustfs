@@ -36,7 +36,6 @@ mod tests {
         BucketLifecycleConfiguration, BucketVersioningStatus, ExpirationStatus, LifecycleExpiration, LifecycleRule,
         LifecycleRuleFilter, NoncurrentVersionExpiration, VersioningConfiguration,
     };
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -80,7 +79,6 @@ mod tests {
     ///
     /// This tests the rule persistence path (rustfs#4963: 3 days → 0 days).
     #[tokio::test]
-    #[serial]
     async fn test_lifecycle_expiration_rule_persists_correctly() -> TestResult {
         init_logging();
         info!("RT-03: lifecycle expiration rule persists correctly");
@@ -148,7 +146,6 @@ mod tests {
     /// Covers the pattern where noncurrent version expiration rules are
     /// accepted but old versions are never cleaned up.
     #[tokio::test]
-    #[serial]
     async fn test_lifecycle_noncurrent_version_expiration_rule_persists() -> TestResult {
         init_logging();
         info!("RT-03b: noncurrent version expiration rule persists");
@@ -233,7 +230,6 @@ mod tests {
     /// after restart. Transition rules require a configured remote tier
     /// (tested in reliant/tiering.rs), so this test uses expiration only.
     #[tokio::test]
-    #[serial]
     async fn test_lifecycle_prefix_rule_persists() -> TestResult {
         init_logging();
         info!("RT-04: lifecycle prefix rule persists");
@@ -294,7 +290,6 @@ mod tests {
     /// Regression pattern: DELETE on a versioned object fails or does not
     /// create a delete marker, or the delete marker is not visible in LIST.
     #[tokio::test]
-    #[serial]
     async fn test_delete_marker_creation_and_visibility() -> TestResult {
         init_logging();
         info!("RT-05b: delete marker creation and visibility");
