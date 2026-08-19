@@ -368,9 +368,10 @@ impl AdminClient {
         }
     }
 
-    /// Cluster-aggregated background heal status.
+    /// Cluster-aggregated background heal status. The route is registered
+    /// POST-only on the server, so this must not go out as a GET.
     pub async fn background_heal_status(&self) -> Result<BackgroundHealStatus, AdminClientError> {
-        self.get_json("/v3/background-heal/status").await
+        self.post_json("/v3/background-heal/status", &[], Vec::new()).await
     }
 
     /// Data scanner status (enabled state, freshness, runtime config).
@@ -696,6 +697,21 @@ mod tests {
         let request = server.recorded();
         assert!(request.query.contains("forceStop=true"));
         assert!(!request.query.contains("clientToken"));
+    }
+
+    #[tokio::test]
+    async fn background_heal_status_posts_to_the_registered_route() {
+        let body = r#"{"state":"idle","healQueueLength":0,"healActiveTasks":0,"clusterStatusComplete":true}"#;
+        let server = TestServer::spawn(body, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+
+        let status = client.background_heal_status().await.expect("status decodes");
+        assert_eq!(status.state, "idle");
+        let request = server.recorded();
+        // The server registers this route POST-only; a GET here answers 405.
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/background-heal/status");
+        assert_eq!(request.query, "");
     }
 
     #[tokio::test]
