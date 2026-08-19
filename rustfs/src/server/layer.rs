@@ -747,11 +747,12 @@ pub struct S3ErrorMessageCompatService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for S3ErrorMessageCompatService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for S3ErrorMessageCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -764,28 +765,27 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let is_sts_query =
             req.method() == Method::POST && req.uri().path() == "/" && req.extensions().get::<StsQueryRequest>().is_some();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if is_sts_query || response.status() != StatusCode::FORBIDDEN || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_fix = !is_sts_query && parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
-                    if !should_fix {
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    } else {
-                        let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
-                        let mut parts = parts;
-                        if changed {
-                            parts.headers.remove(http::header::CONTENT_LENGTH);
-                        }
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
+                    let mut parts = parts;
+                    if changed {
+                        parts.headers.remove(http::header::CONTENT_LENGTH);
                     }
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
@@ -886,11 +886,12 @@ pub struct IcebergRestErrorCompatService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for IcebergRestErrorCompatService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for IcebergRestErrorCompatService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -903,18 +904,21 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let catalog_path =
             (req.method() != Method::HEAD && is_table_catalog_path(req.uri().path())).then(|| req.uri().path().to_string());
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if catalog_path.is_none() || response.status().is_success() || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_convert = catalog_path.is_some() && !parts.status.is_success() && is_xml_response(&parts.headers);
 
             let response = match body {
-                HybridBody::Rest { rest_body } if should_convert => {
+                HybridBody::Rest { rest_body } => {
                     let (rest_body, converted_status) = convert_iceberg_error_in_xml(
                         rest_body,
                         parts.status,
@@ -932,7 +936,6 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Rest { rest_body } => Response::from_parts(parts, HybridBody::Rest { rest_body }),
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
 
@@ -1045,11 +1048,12 @@ pub struct ObjectAttributesEtagFixService<S> {
     inner: S,
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for ObjectAttributesEtagFixService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for ObjectAttributesEtagFixService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
     RestBody::Error: Into<S::Error> + Send + 'static,
     GrpcBody: Send + 'static,
@@ -1062,27 +1066,26 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let is_target = is_object_attributes_request(&req);
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
+            if !is_target || !response.status().is_success() || !is_xml_response(response.headers()) {
+                return Ok(response);
+            }
+
             let (parts, body) = response.into_parts();
-            let should_fix = is_target && parts.status.is_success() && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
-                    if !should_fix {
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    } else {
-                        let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
+                    let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
 
-                        let mut parts = parts;
-                        parts.headers.remove(http::header::CONTENT_LENGTH);
+                    let mut parts = parts;
+                    parts.headers.remove(http::header::CONTENT_LENGTH);
 
-                        Response::from_parts(parts, HybridBody::Rest { rest_body })
-                    }
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
                 HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
             };
@@ -1144,12 +1147,11 @@ where
 
         Box::pin(async move {
             let response = inner.call(req).await?;
-            let (mut parts, body) = response.into_parts();
-
-            if !is_bodyless_status(parts.status) {
-                return Ok(Response::from_parts(parts, body));
+            if !is_bodyless_status(response.status()) {
+                return Ok(response);
             }
 
+            let (mut parts, body) = response.into_parts();
             let response = match body {
                 HybridBody::Rest { .. } => {
                     parts.headers.remove(http::header::CONTENT_LENGTH);
@@ -1802,7 +1804,7 @@ fn strip_quotes_from_first_etag(xml: String) -> String {
     fixed
 }
 
-fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
+fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
     if req.method() != Method::GET {
         return false;
     }
@@ -1967,11 +1969,12 @@ fn apply_bucket_cors_result(response_headers: &mut HeaderMap, bucket_cors_header
     }
 }
 
-impl<S, ResBody> Service<HttpRequest<Incoming>> for ConditionalCorsService<S>
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ConditionalCorsService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     ResBody: Default + Send + 'static,
 {
     type Response = Response<ResBody>;
@@ -1982,7 +1985,14 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+        let is_options = req.method() == Method::OPTIONS;
+        let has_origin = req.headers().contains_key(cors::standard::ORIGIN);
+        if !is_options && !has_origin {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+        }
+
         let path = req.uri().path().to_string();
         let method = req.method().clone();
         let request_headers = req.headers().clone();
@@ -1990,7 +2000,7 @@ where
         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
         let is_root = path == "/";
 
-        if method == Method::OPTIONS {
+        if is_options {
             let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
 
             if is_root {
@@ -2192,6 +2202,7 @@ mod tests {
     use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
+    use http_body_util::Empty;
     use http_body_util::Full;
     use opentelemetry::global;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -3784,6 +3795,188 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct FixedHybridResponse {
+        status: StatusCode,
+        body: Bytes,
+        content_type: &'static str,
+    }
+
+    impl<B: Send + 'static> Service<Request<B>> for FixedHybridResponse {
+        type Response = Response<HybridBody<Full<Bytes>, Empty<Bytes>>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            let body = self.body.clone();
+            ready(Ok(Response::builder()
+                .status(self.status)
+                .header(http::header::CONTENT_TYPE, self.content_type)
+                .header(http::header::CONTENT_LENGTH, body.len().to_string())
+                .body(HybridBody::Rest {
+                    rest_body: Full::from(body),
+                })
+                .expect("fixed hybrid response")))
+        }
+    }
+
+    async fn collect_hybrid_response(
+        response: Response<HybridBody<Full<Bytes>, Empty<Bytes>>>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .expect("collect hybrid body")
+            .to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8(body.to_vec()).expect("hybrid response body should be UTF-8"),
+        )
+    }
+
+    #[tokio::test]
+    async fn s3_error_message_compat_fixes_regular_forbidden_xml() {
+        let body = Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>");
+        let mut service = S3ErrorMessageCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::FORBIDDEN,
+            body,
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("<Message>"));
+    }
+
+    #[tokio::test]
+    async fn s3_error_message_compat_leaves_sts_query_response_unchanged() {
+        let input = Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>");
+        let mut service = S3ErrorMessageCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::FORBIDDEN,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let mut request = Request::builder().method(Method::POST).uri("/").body(()).expect("request");
+        request.extensions_mut().insert(StsQueryRequest);
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        let expected_len = input.len().to_string();
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
+        );
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_compat_converts_catalog_xml_errors() {
+        let mut service = IcebergRestErrorCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::from_static(b"<Error><Code>NoSuchTableException</Code><Message>missing</Message></Error>"),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/iceberg/v1/warehouse/namespaces/ns/tables/events")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("\"type\":\"NoSuchTableException\""));
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_compat_leaves_non_catalog_errors_unchanged() {
+        let input = Bytes::from_static(b"<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>");
+        let mut service = IcebergRestErrorCompatLayer.layer(FixedHybridResponse {
+            status: StatusCode::NOT_FOUND,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (status, headers, body) = collect_hybrid_response(response).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers.get(http::header::CONTENT_TYPE).unwrap(), "application/xml");
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[tokio::test]
+    async fn object_attributes_etag_fix_rewrites_target_response() {
+        let mut service = ObjectAttributesEtagFixLayer.layer(FixedHybridResponse {
+            status: StatusCode::OK,
+            body: Bytes::from_static(b"<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>"),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object?attributes")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert!(body.contains("<ETag>abc</ETag>"));
+    }
+
+    #[tokio::test]
+    async fn object_attributes_etag_fix_leaves_regular_get_unchanged() {
+        let input = Bytes::from_static(b"<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>");
+        let mut service = ObjectAttributesEtagFixLayer.layer(FixedHybridResponse {
+            status: StatusCode::OK,
+            body: input.clone(),
+            content_type: "application/xml",
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("service response");
+        let (_status, headers, body) = collect_hybrid_response(response).await;
+
+        let expected_len = input.len().to_string();
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
+        );
+        assert_eq!(body.as_bytes(), input.as_ref());
+    }
+
+    #[derive(Clone)]
     struct FixedStsResponse {
         status: StatusCode,
         body: Bytes,
@@ -4268,6 +4461,63 @@ mod tests {
             let cors = ConditionalCorsLayer::new();
             assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
         });
+    }
+
+    #[derive(Clone)]
+    struct CorsOkService;
+
+    impl<B> Service<Request<B>> for CorsOkService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            ready(Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(Empty::new())
+                .expect("response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_passthrough_without_origin() {
+        let layer = ConditionalCorsLayer {
+            cors_origins: Some("*".to_string()),
+        };
+        let mut service = layer.layer(CorsOkService);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_applies_origin_headers() {
+        let layer = ConditionalCorsLayer {
+            cors_origins: Some("*".to_string()),
+        };
+        let mut service = layer.layer(CorsOkService);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/bucket/object")
+            .header(cors::standard::ORIGIN, "https://example.com")
+            .body(())
+            .expect("request");
+
+        let response = service.call(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
     }
 
     #[test]
