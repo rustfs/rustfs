@@ -100,7 +100,7 @@ impl FastObjectLockManager {
             Ok(()) => {
                 let guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
                 // Register guard to prevent premature cleanup
-                shard.register_guard(guard.guard_id());
+                shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
                 Ok(guard)
             }
             Err(err) => Err(err),
@@ -223,7 +223,7 @@ impl FastObjectLockManager {
 
                 if acquired {
                     let guard = FastLockGuard::new(key.clone(), mode, owner.clone(), shard.clone());
-                    shard.register_guard(guard.guard_id());
+                    shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
                     all_successful.push(key);
                     guards.push(guard);
                 }
@@ -252,7 +252,7 @@ impl FastObjectLockManager {
                 match shard.acquire_lock(request).await {
                     Ok(()) => {
                         let guard = FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone());
-                        shard.register_guard(guard.guard_id());
+                        shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
                         acquired_guards.push(guard);
                     }
                     Err(err) => {
@@ -306,6 +306,15 @@ impl FastObjectLockManager {
         let mut infos = Vec::new();
         for shard in &self.shards {
             infos.extend(shard.list_locks_with_holder_counts());
+        }
+        infos
+    }
+
+    /// Enumerate held locks with holder counts and stable holder identities.
+    pub fn list_locks_with_holder_generations(&self) -> Vec<(crate::fast_lock::types::ObjectLockInfo, u32, Option<Vec<u64>>)> {
+        let mut infos = Vec::new();
+        for shard in &self.shards {
+            infos.extend(shard.list_locks_with_holder_generations());
         }
         infos
     }
@@ -556,15 +565,15 @@ mod tests {
         let write_key = ObjectKey::new("bucket", "write-object");
         let read_key = ObjectKey::new("bucket", "read-object");
 
-        let _write_guard = manager
+        let write_guard = manager
             .acquire_write_lock(write_key.clone(), "writer")
             .await
             .expect("write lock should acquire");
-        let _read_guard = manager
+        let read_guard = manager
             .acquire_read_lock(read_key.clone(), "reader")
             .await
             .expect("read lock should acquire");
-        let _second_read_guard = manager
+        let second_read_guard = manager
             .acquire_read_lock(read_key.clone(), "reader")
             .await
             .expect("second read lock should acquire");
@@ -592,6 +601,30 @@ mod tests {
             .find(|(info, _)| info.key == write_key)
             .expect("write holder count listed");
         assert_eq!(*write_holder_count, 1);
+
+        let generations = manager.list_locks_with_holder_generations();
+        let (_, _, read_generations) = generations
+            .iter()
+            .find(|(info, _, _)| info.key == read_key)
+            .expect("read holder generations listed");
+        let mut expected_read_generations = vec![read_guard.guard_id(), second_read_guard.guard_id()];
+        expected_read_generations.sort_unstable();
+        assert_eq!(read_generations.as_ref(), Some(&expected_read_generations));
+
+        let (_, _, write_generations) = generations
+            .iter()
+            .find(|(info, _, _)| info.key == write_key)
+            .expect("write holder generation listed");
+        assert_eq!(write_generations.as_ref(), Some(&vec![write_guard.guard_id()]));
+
+        drop(read_guard);
+        let remaining = manager.list_locks_with_holder_generations();
+        let (_, remaining_count, remaining_generations) = remaining
+            .iter()
+            .find(|(info, _, _)| info.key == read_key)
+            .expect("remaining read holder generation listed");
+        assert_eq!(*remaining_count, 1);
+        assert_eq!(remaining_generations.as_ref(), Some(&vec![second_read_guard.guard_id()]));
 
         manager.shutdown().await;
     }
