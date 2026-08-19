@@ -41,6 +41,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError,
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
@@ -246,13 +247,14 @@ struct LeaseHolderState {
     acquired_at: SystemTime,
     ttl_secs: u64,
     holder_count: u32,
+    guard_ids: Option<Vec<u64>>,
 }
 
 fn build_top_locks_response(
     limit: usize,
     now: SystemTime,
     lease_infos: Vec<LockLeaseInfo>,
-    fast_infos: Vec<(rustfs_lock::ObjectLockInfo, u32)>,
+    fast_infos: Vec<(rustfs_lock::ObjectLockInfo, u32, Option<Vec<u64>>)>,
 ) -> TopLocksResponse {
     let mut lease_holders = HashMap::with_capacity(lease_infos.len());
 
@@ -275,17 +277,27 @@ fn build_top_locks_response(
                 }
                 state.ttl_secs = state.ttl_secs.max(ttl_secs);
                 state.holder_count = state.holder_count.saturating_add(1);
+                match (state.guard_ids.as_mut(), info.guard_id) {
+                    (Some(guard_ids), Some(guard_id)) => guard_ids.push(guard_id),
+                    _ => state.guard_ids = None,
+                }
             })
             .or_insert(LeaseHolderState {
                 acquired_at: info.acquired_at,
                 ttl_secs,
                 holder_count: 1,
+                guard_ids: info.guard_id.map(|guard_id| vec![guard_id]),
             });
+    }
+    for state in lease_holders.values_mut() {
+        if let Some(guard_ids) = &mut state.guard_ids {
+            guard_ids.sort_unstable();
+        }
     }
 
     let mut infos: Vec<_> = fast_infos
         .into_iter()
-        .map(|(info, holder_count)| {
+        .map(|(info, holder_count, guard_ids)| {
             let mode = match info.mode {
                 LockMode::Shared => TopLockMode::Read,
                 LockMode::Exclusive => TopLockMode::Write,
@@ -296,11 +308,10 @@ fn build_top_locks_response(
                 owner: info.owner.to_string(),
             };
             let priority = lock_priority_label(info.priority);
-            // Shared-owner timestamps do not roll back when a newer sibling releases, so only their count is stable.
+            // Match the complete holder cohort so replacements cannot reuse stale lease data.
             let state = match lease_holders.remove(&key) {
                 Some(lease)
-                    if lease.holder_count == holder_count
-                        && (mode == TopLockMode::Read || info.acquired_at <= lease.acquired_at) =>
+                    if lease.holder_count == holder_count && lease.guard_ids.is_some() && lease.guard_ids == guard_ids =>
                 {
                     TopLockState {
                         acquired_at: lease.acquired_at,
@@ -347,8 +358,11 @@ fn build_top_locks_response(
     }
 }
 
-async fn collect_top_locks(limit: usize) -> TopLocksResponse {
-    let manager = get_global_lock_manager();
+async fn collect_top_locks_with_clients(
+    limit: usize,
+    manager: Arc<rustfs_lock::GlobalLockManager>,
+    clients: Vec<Arc<dyn rustfs_lock::client::LockClient>>,
+) -> TopLocksResponse {
     let Some(fast) = manager.as_fast_lock_manager() else {
         return TopLocksResponse {
             total: 0,
@@ -360,19 +374,27 @@ async fn collect_top_locks(limit: usize) -> TopLocksResponse {
         };
     };
 
-    let lease_infos = if let Some(clients) = get_global_lock_clients() {
-        join_all(clients.values().map(|client| client.list_lock_leases()))
+    let lease_infos = if clients.is_empty() {
+        Vec::new()
+    } else {
+        join_all(clients.iter().map(|client| client.list_lock_leases()))
             .await
             .into_iter()
             .flatten()
             .collect()
-    } else {
-        Vec::new()
     };
     // Capture holders last so released or replaced lease guards fail the merge checks.
-    let fast_infos = fast.list_locks_with_holder_counts();
+    let fast_infos = fast.list_locks_with_holder_generations();
 
     build_top_locks_response(limit, SystemTime::now(), lease_infos, fast_infos)
+}
+
+async fn collect_top_locks(limit: usize) -> TopLocksResponse {
+    let manager = get_global_lock_manager();
+    let clients = get_global_lock_clients()
+        .map(|clients| clients.values().cloned().collect())
+        .unwrap_or_default();
+    collect_top_locks_with_clients(limit, manager, clients).await
 }
 
 fn parse_top_locks_limit(uri: &Uri) -> usize {
@@ -1243,6 +1265,7 @@ mod tests {
         let mixed_resource = ObjectKey::new("bucket", "mixed-object");
         let replaced_resource = ObjectKey::new("bucket", "replaced-object");
         let remaining_shared_resource = ObjectKey::new("bucket", "remaining-shared-object");
+        let opaque_resource = ObjectKey::new("bucket", "opaque-object");
 
         let response = build_top_locks_response(
             TOP_LOCKS_DEFAULT_LIMIT,
@@ -1253,6 +1276,7 @@ mod tests {
                     lock_type: LockType::Shared,
                     owner: "owner-a".to_string(),
                     acquired_at: now - Duration::from_secs(50),
+                    guard_id: Some(11),
                     remaining_ttl: Duration::from_secs(5),
                 },
                 LockLeaseInfo {
@@ -1260,6 +1284,7 @@ mod tests {
                     lock_type: LockType::Shared,
                     owner: "owner-a".to_string(),
                     acquired_at: now - Duration::from_secs(40),
+                    guard_id: Some(18),
                     remaining_ttl: Duration::from_secs(20),
                 },
                 LockLeaseInfo {
@@ -1267,6 +1292,7 @@ mod tests {
                     lock_type: LockType::Shared,
                     owner: "owner-c".to_string(),
                     acquired_at: now - Duration::from_secs(30),
+                    guard_id: Some(13),
                     remaining_ttl: Duration::from_secs(25),
                 },
                 LockLeaseInfo {
@@ -1274,6 +1300,7 @@ mod tests {
                     lock_type: LockType::Exclusive,
                     owner: "owner-d".to_string(),
                     acquired_at: now - Duration::from_secs(15),
+                    guard_id: Some(12),
                     remaining_ttl: Duration::from_secs(18),
                 },
                 LockLeaseInfo {
@@ -1281,6 +1308,7 @@ mod tests {
                     lock_type: LockType::Exclusive,
                     owner: "owner-e".to_string(),
                     acquired_at: now - Duration::from_secs(30),
+                    guard_id: Some(14),
                     remaining_ttl: Duration::from_secs(25),
                 },
                 LockLeaseInfo {
@@ -1288,7 +1316,16 @@ mod tests {
                     lock_type: LockType::Shared,
                     owner: "owner-f".to_string(),
                     acquired_at: now - Duration::from_secs(30),
+                    guard_id: Some(16),
                     remaining_ttl: Duration::from_secs(22),
+                },
+                LockLeaseInfo {
+                    resource: opaque_resource.clone(),
+                    lock_type: LockType::Exclusive,
+                    owner: "owner-g".to_string(),
+                    acquired_at: now - Duration::from_secs(30),
+                    guard_id: None,
+                    remaining_ttl: Duration::from_secs(30),
                 },
             ],
             vec![
@@ -1302,6 +1339,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     1,
+                    Some(vec![15]),
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
@@ -1313,6 +1351,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     1,
+                    Some(vec![16]),
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
@@ -1324,6 +1363,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     1,
+                    Some(vec![12]),
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
@@ -1335,6 +1375,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     2,
+                    Some(vec![11, 18]),
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
@@ -1346,6 +1387,7 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     1,
+                    Some(vec![17]),
                 ),
                 (
                     rustfs_lock::ObjectLockInfo {
@@ -1357,11 +1399,24 @@ mod tests {
                         priority: rustfs_lock::fast_lock::LockPriority::Normal,
                     },
                     2,
+                    None,
+                ),
+                (
+                    rustfs_lock::ObjectLockInfo {
+                        key: opaque_resource,
+                        mode: LockMode::Exclusive,
+                        owner: "owner-g".into(),
+                        acquired_at: now - Duration::from_secs(4),
+                        expires_at: now + Duration::from_secs(6),
+                        priority: rustfs_lock::fast_lock::LockPriority::Normal,
+                    },
+                    1,
+                    None,
                 ),
             ],
         );
 
-        assert_eq!(response.total, 6);
+        assert_eq!(response.total, 7);
         let leased = response
             .locks
             .iter()
@@ -1406,6 +1461,47 @@ mod tests {
             .find(|entry| entry.object == "remaining-shared-object")
             .expect("an older surviving shared lease should remain lease-backed");
         assert_eq!(remaining_shared.ttl_secs, 22);
+
+        let opaque = response
+            .locks
+            .iter()
+            .find(|entry| entry.object == "opaque-object")
+            .expect("generation-less holder should remain visible");
+        assert_eq!(opaque.ttl_secs, 6);
+    }
+
+    #[test]
+    fn top_locks_rejects_replaced_shared_generation() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let resource = ObjectKey::new("bucket", "replaced-shared-object");
+        let response = build_top_locks_response(
+            TOP_LOCKS_DEFAULT_LIMIT,
+            now,
+            vec![LockLeaseInfo {
+                resource: resource.clone(),
+                lock_type: LockType::Shared,
+                owner: "owner-a".to_string(),
+                acquired_at: now - Duration::from_secs(30),
+                guard_id: Some(1),
+                remaining_ttl: Duration::from_secs(20),
+            }],
+            vec![(
+                rustfs_lock::ObjectLockInfo {
+                    key: resource,
+                    mode: LockMode::Shared,
+                    owner: "owner-a".into(),
+                    acquired_at: now - Duration::from_secs(2),
+                    expires_at: now + Duration::from_secs(4),
+                    priority: rustfs_lock::fast_lock::LockPriority::Normal,
+                },
+                1,
+                Some(vec![2]),
+            )],
+        );
+
+        let entry = response.locks.first().expect("replacement remains visible");
+        assert_eq!(entry.ttl_secs, 4);
+        assert_eq!(entry.elapsed_secs, 2);
     }
 
     #[tokio::test]
@@ -1444,5 +1540,37 @@ mod tests {
         assert_eq!(entry.owner, "diag-owner");
 
         drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_top_locks_uses_refreshed_local_lease() {
+        use rustfs_lock::{FastObjectLockManager, GlobalLockManager, LocalClient, LockClient, LockRequest};
+
+        let manager = Arc::new(GlobalLockManager::Enabled(Arc::new(FastObjectLockManager::new())));
+        let client = Arc::new(LocalClient::with_manager(manager.clone()));
+        let request = LockRequest::new(ObjectKey::new("diag-bucket", "renewed-object"), LockType::Exclusive, "diag-owner")
+            .with_ttl(Duration::from_secs(30));
+        let lock_id = request.lock_id.clone();
+        assert!(
+            client
+                .acquire_lock(&request)
+                .await
+                .expect("local lock acquisition should succeed")
+                .success
+        );
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(client.refresh(&lock_id).await.expect("local lease refresh should succeed"));
+
+        let clients: Vec<Arc<dyn rustfs_lock::client::LockClient>> = vec![client.clone()];
+        let response = collect_top_locks_with_clients(TOP_LOCKS_DEFAULT_LIMIT, manager, clients).await;
+        let entry = response
+            .locks
+            .iter()
+            .find(|entry| entry.bucket == "diag-bucket" && entry.object == "renewed-object")
+            .expect("refreshed local lock should be listed");
+        assert!(entry.ttl_secs >= 29, "collector must use the refreshed lease deadline");
+
+        assert!(client.release(&lock_id).await.expect("local lock release should succeed"));
     }
 }

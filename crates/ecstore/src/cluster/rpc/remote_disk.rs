@@ -41,6 +41,10 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE,
+    INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
+};
 use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -64,7 +68,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time;
 use tokio::{
@@ -1790,6 +1794,16 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_
     }
 }
 
+fn read_version_stage_timer(attribution_enabled: bool) -> Option<Instant> {
+    attribution_enabled.then(Instant::now)
+}
+
+fn record_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_stage(stage, started_at.elapsed());
+    }
+}
+
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
 /// and falling back to the JSON compatibility strings. Used to size the RPC for the payload
 /// histogram / large-payload alerting (grpc-optimization P0 instrumentation).
@@ -2705,8 +2719,11 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let opts_str = compat_json(opts)?;
-        let opts_bin = encode_msgpack(opts)?;
+        let read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let encode_started = read_version_stage_timer(read_version_attribution_enabled);
+        let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));
+        record_read_version_stage(INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, encode_started);
+        let (opts_str, opts_bin) = encoded_opts?;
 
         // Idempotent version read: eligible for the bounded transient-network retry so a single
         // reset-by-peer during the read-after-write window does not erode the metadata read
@@ -2722,6 +2739,14 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request_payload_bytes = read_version_attribution_enabled.then(|| {
+                    disk.len()
+                        .saturating_add(volume.len())
+                        .saturating_add(path.len())
+                        .saturating_add(version_id.len())
+                        .saturating_add(opts_str.len())
+                        .saturating_add(opts_bin.len())
+                });
                 let request = Request::new(ReadVersionRequest {
                     disk,
                     volume: volume.to_string(),
@@ -2731,14 +2756,47 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
 
-                let response = client.read_version(request).await?.into_inner();
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request();
+                if let Some(request_payload_bytes) = request_payload_bytes {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_sent_bytes(request_payload_bytes);
+                }
+                let rpc_started = read_version_stage_timer(read_version_attribution_enabled);
+                let response = match client.read_version(request).await {
+                    Ok(response) => {
+                        record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
+                        response.into_inner()
+                    }
+                    Err(err) => {
+                        record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        return Err(err.into());
+                    }
+                };
 
                 if !response.success {
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info, "FileInfo")?;
-                validate_decoded_file_info(&file_info)?;
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_recv_bytes(
+                    response.file_info.len().saturating_add(response.file_info_bin.len()),
+                );
+                let decode_started = read_version_stage_timer(read_version_attribution_enabled);
+                let file_info = match decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info, "FileInfo")
+                    .and_then(|file_info| {
+                        validate_decoded_file_info(&file_info)?;
+                        Ok(file_info)
+                    }) {
+                    Ok(file_info) => {
+                        record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, decode_started);
+                        file_info
+                    }
+                    Err(err) => {
+                        record_read_version_stage(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, decode_started);
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_error();
+                        return Err(err);
+                    }
+                };
 
                 Ok(file_info)
             },
@@ -7931,12 +7989,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn read_version_uses_the_metadata_timeout_on_a_stalled_peer() {
         runtime_sources::ensure_test_rpc_secret();
         let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
             return;
         };
         let remote_disk = remote_disk_for_addr(&base_addr).await;
+        let metrics = rustfs_io_metrics::internode_metrics::global_internode_metrics();
+        let previous_stage_metrics = rustfs_io_metrics::get_stage_metrics_enabled();
+        metrics.reset_for_test();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
         temp_env::async_with_vars(
             [
@@ -7959,6 +8022,18 @@ mod tests {
             },
         )
         .await;
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_stage_metrics);
+        let snapshot = metrics.snapshot();
+        assert!(
+            snapshot.outgoing_requests_total >= 1,
+            "ReadVersion call site should record outgoing attempts when attribution is enabled"
+        );
+        assert!(
+            snapshot.sent_bytes_total > 0,
+            "ReadVersion call site should record request payload bytes when attribution is enabled"
+        );
+        metrics.reset_for_test();
 
         remote_disk.cancel_token.cancel();
         accept_task.abort();

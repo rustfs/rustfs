@@ -50,7 +50,7 @@ pub struct ConcurrencyManager {
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     priority_queue: Arc<IoPriorityQueue<()>>,
     /// Bytes pool for buffer allocation and reuse
     bytes_pool: Arc<BytesPool>,
@@ -131,7 +131,6 @@ pub enum PutObjectAdmission {
     Rejected,
 }
 
-#[allow(dead_code)]
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///

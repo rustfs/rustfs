@@ -394,7 +394,6 @@ impl Operation for ExportBucketMetadata {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ImportBucketMetadataQuery {
-    #[allow(dead_code)]
     pub bucket: String,
 }
 
