@@ -24,11 +24,13 @@ Support is stated per shape below because that is how far it has been *measured*
 | --- | --- | --- |
 | SSE-S3, multipart | **Yes** | `reads_minio_generated_sse_s3_multipart_fixture` |
 | SSE-KMS, multipart | **Yes** | `reads_minio_generated_sse_kms_multipart_fixture` |
-| SSE-S3 / SSE-KMS, single-part | **Unverified** | No fixture coverage — see below |
-| SSE-C | **Unverified** | No fixture coverage |
+| SSE-C, multipart | **Yes** | `reads_minio_generated_sse_c_multipart_fixture` |
+| SSE-S3 / SSE-KMS / SSE-C, single-part | **Unverified** | No fixture coverage — see below |
 | Sealed by KES, a KMS plugin, or MinKMS | **No**, and not planned | Re-encrypt at the source before migrating |
 
-Reading a supported object requires RustFS to hold the same master key MinIO used, supplied through `RUSTFS_SSE_S3_MASTER_KEY` (the production entry point, exercised by `reads_minio_generated_sse_s3_fixture_through_production_master_key_env`). MinIO's builtin KMS derives a per-ciphertext sealing key from that master secret, so the *same* secret is required — not merely an equivalently configured backend.
+SSE-C needs no KMS at all: the customer supplies the key on each request, exactly as against MinIO. Note that a MinIO SSE-C object stores no customer-key MD5, so the usual early "these parameters do not match" rejection cannot fire for it — a wrong key is refused by the decryption itself instead, which is a different error but the same outcome.
+
+Reading a supported *managed* object (SSE-S3, SSE-KMS) requires RustFS to hold the same master key MinIO used, supplied through `RUSTFS_SSE_S3_MASTER_KEY` (the production entry point, exercised by `reads_minio_generated_sse_s3_fixture_through_production_master_key_env`). MinIO's builtin KMS derives a per-ciphertext sealing key from that master secret, so the *same* secret is required — not merely an equivalently configured backend.
 
 **"Unverified" means unknown, not broken.** Single-part objects below MinIO's small-file threshold carry their data inline in `xl.meta`, sharded across disks, and the interop fixture harness cannot yet load that shape — so those objects have never been read in a test either way. Do not read the table's "Yes" rows as covering them.
 
