@@ -86,7 +86,7 @@ fn unblock_replacement_recovery_sets_after_validation(
     }
 }
 
-// Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
+// Admission/scheduler outcomes for per-object requests (Object/Metadata/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
 // recovery loops submit those per object, so a full queue or a retry storm
 // would otherwise emit one warn! per object (rustfs/rustfs#5716). The
@@ -559,9 +559,6 @@ impl PriorityHealQueue {
             HealType::Metadata { bucket, object } => {
                 format!("metadata:{bucket}:{object}")
             }
-            HealType::MRF { meta_path } => {
-                format!("mrf:{meta_path}")
-            }
             HealType::ECDecode {
                 bucket,
                 object,
@@ -686,7 +683,6 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
         HealType::Bucket { bucket } => heal_path == bucket,
         HealType::Prefix { bucket, prefix } => heal_path_matches_bucket_child(heal_path, bucket, prefix),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
-        HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
 }
 
@@ -781,9 +777,6 @@ fn heal_type_path_view(heal_type: &HealType) -> (Option<&str>, &str) {
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
         | HealType::ECDecode { bucket, object, .. } => (Some(bucket), object),
-        // MRF/MetaPath heal keys on a meta path; treat the whole set of
-        // buckets as one namespace so it only overlaps itself exactly.
-        HealType::MRF { meta_path } => (Some("\u{0}mrf"), meta_path),
         // Erasure-set heal: the set id is the overlap dimension.
         HealType::ErasureSet { set_disk_id, .. } => (Some("\u{0}set"), set_disk_id),
     }
@@ -3712,7 +3705,6 @@ fn heal_request_type_label(request: &HealRequest) -> &'static str {
         HealType::Prefix { .. } => "prefix",
         HealType::ErasureSet { .. } => "erasure_set",
         HealType::Metadata { .. } => "metadata",
-        HealType::MRF { .. } => "mrf",
         HealType::ECDecode { .. } => "ec_decode",
     }
 }

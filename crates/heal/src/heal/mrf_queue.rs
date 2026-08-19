@@ -360,11 +360,6 @@ struct MrfRuntime {
 }
 
 impl MrfRuntime {
-    fn record_accept(&mut self) {
-        // Accepted intents leave the pending set; the next flush persists the
-        // smaller snapshot, which is the journal's compaction.
-    }
-
     fn snapshot(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for intent in self.queue.intents() {
@@ -391,7 +386,9 @@ impl MrfRuntime {
         while let Some(mut intent) = self.queue.pop_front() {
             let request = build_heal_request(&intent);
             match manager.submit_heal_request(request).await {
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => self.record_accept(),
+                // Accepted intents leave the pending set; the next flush persists the
+                // smaller snapshot, which is the journal's compaction.
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts >= MRF_MAX_ATTEMPTS {
