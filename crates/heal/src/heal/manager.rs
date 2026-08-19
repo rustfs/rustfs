@@ -3882,40 +3882,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<crate::heal::storage::DiskStatus> {
-            Ok(crate::heal::storage::DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -3927,14 +3899,6 @@ mod tests {
 
         async fn object_exists(&self, bucket: &str, _object: &str) -> Result<bool> {
             Ok(bucket == "retry-transition")
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -3996,10 +3960,6 @@ mod tests {
                     .expect("manager recovery replacement format call lock should not poison") += 1;
             }
             Ok((HealResultItem::default(), None))
-        }
-
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<crate::heal::storage::HealListItem>> {
-            Ok(Vec::new())
         }
 
         async fn list_objects_for_heal_page(
