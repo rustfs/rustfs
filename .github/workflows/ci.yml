@@ -118,7 +118,9 @@ jobs:
           persist-credentials: false
 
       - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: ripgrep@15.2.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

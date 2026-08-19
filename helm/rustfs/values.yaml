@@ -361,7 +361,7 @@ ingress:
 
 gatewayApi:
   enabled: false
-  gatewayClass: traefik # Only support for traefik and contour gatewayClass at the moment.
+  gatewayClass: traefik # Supported gatewayClass: traefik, contour, istio.
   listeners: # Specify which listeners to create on the Gateway.
     http:
       name: web
