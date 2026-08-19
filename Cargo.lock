@@ -9278,7 +9278,6 @@ dependencies = [
  "jiff",
  "metrics",
  "rmp-serde",
- "s3s",
  "serde",
  "serde_json",
  "smallvec",
