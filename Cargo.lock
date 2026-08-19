@@ -9142,6 +9142,7 @@ dependencies = [
  "mime_guess",
  "opentelemetry",
  "opentelemetry_sdk",
+ "p256 0.13.2",
  "parking_lot",
  "percent-encoding",
  "pin-project-lite",

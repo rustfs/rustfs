@@ -1,0 +1,329 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "reject-vectors",
+  "description": "Snapshots the frozen schema and its cross-field invariant refuse. Every vector is rejected after normalization, so nothing here is stored, echoed, or hashed. violation names the member and the schema keyword that must fire; a rejection that fires on a different member is as much a regression as one that does not fire at all. The negative category covers malformed, missing, negative, and mistyped values; the overflow category covers values above a frozen maximum.",
+  "reason": "INVENTORY_FIELD_INVALID",
+  "status": "INVALID_ARGUMENT",
+  "httpStatus": 400,
+  "vectors": [
+    {
+      "name": "a node count of zero",
+      "category": "negative",
+      "violation": { "member": "nodeCount", "rule": "minimum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 0,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a negative node count",
+      "category": "negative",
+      "violation": { "member": "nodeCount", "rule": "minimum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": -1,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a negative drive count",
+      "category": "negative",
+      "violation": { "member": "driveCount", "rule": "minimum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": -1,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a negative used capacity",
+      "category": "negative",
+      "violation": { "member": "capacityUsedBytes", "rule": "minimum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": -1
+      }
+    },
+    {
+      "name": "a negative capacity on both members",
+      "category": "negative",
+      "violation": { "member": "capacityTotalBytes", "rule": "minimum" },
+      "note": "A negative total with a non-negative used member would break the cross-field invariant as well, which would make it ambiguous which rule fired. Both members are negative so the minimum keyword is the only thing this vector can trip.",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": -1,
+        "capacityUsedBytes": -1
+      }
+    },
+    {
+      "name": "a negative operating system major version",
+      "category": "negative",
+      "violation": { "member": "osVersion.major", "rule": "minimum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": -1, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a missing RustFS version",
+      "category": "negative",
+      "violation": { "member": "rustfsVersion", "rule": "required" },
+      "input": {
+        "protocolVersion": "v1",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a missing used capacity",
+      "category": "negative",
+      "violation": { "member": "capacityUsedBytes", "rule": "required" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776
+      }
+    },
+    {
+      "name": "a two component RustFS version",
+      "category": "negative",
+      "violation": { "member": "rustfsVersion", "rule": "pattern" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a RustFS version carrying pre-release and build metadata",
+      "category": "negative",
+      "violation": { "member": "rustfsVersion", "rule": "pattern" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2-rc.1+9f2c1a",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a RustFS version component with a leading zero",
+      "category": "negative",
+      "violation": { "member": "rustfsVersion", "rule": "pattern" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "01.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "an operating system family outside the closed vocabulary",
+      "category": "negative",
+      "violation": { "member": "osVersion.family", "rule": "enum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "ubuntu", "major": 24, "minor": 4 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "an operating system version missing its minor component",
+      "category": "negative",
+      "violation": { "member": "osVersion.minor", "rule": "required" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "used capacity above total capacity",
+      "category": "negative",
+      "violation": { "member": "capacityUsedBytes", "rule": "usedNeverExceedsTotal" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 1099511627777
+      }
+    },
+    {
+      "name": "a node count sent as a string",
+      "category": "negative",
+      "violation": { "member": "nodeCount", "rule": "type" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": "8",
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a fractional capacity",
+      "category": "negative",
+      "violation": { "member": "capacityTotalBytes", "rule": "type" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776.5,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "coarse flags sent as a string",
+      "category": "negative",
+      "violation": { "member": "coarseFlags", "rule": "type" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": "cluster.degraded"
+      }
+    },
+    {
+      "name": "an operating system version sent as a string",
+      "category": "negative",
+      "violation": { "member": "osVersion", "rule": "type" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": "linux 6.8",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a node count above the frozen maximum",
+      "category": "overflow",
+      "violation": { "member": "nodeCount", "rule": "maximum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 4097,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a drive count above the frozen maximum",
+      "category": "overflow",
+      "violation": { "member": "driveCount", "rule": "maximum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 1048577,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "a total capacity one byte above the exactly representable maximum",
+      "category": "overflow",
+      "violation": { "member": "capacityTotalBytes", "rule": "maximum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 9007199254740992,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "both capacities one byte above the exactly representable maximum",
+      "category": "overflow",
+      "violation": { "member": "capacityUsedBytes", "rule": "maximum" },
+      "note": "The used member carries the same cap as the total member. Used capacity can only exceed the cap when total capacity does too, so this vector raises both and asserts the used member is bounded in its own right.",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 9007199254740992,
+        "capacityUsedBytes": 9007199254740992
+      }
+    },
+    {
+      "name": "a RustFS version component above the frozen maximum",
+      "category": "overflow",
+      "violation": { "member": "rustfsVersion", "rule": "pattern" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "10000.0.0",
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    },
+    {
+      "name": "an operating system major version above the frozen maximum",
+      "category": "overflow",
+      "violation": { "member": "osVersion.major", "rule": "maximum" },
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 10000, "minor": 0 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416
+      }
+    }
+  ]
+}

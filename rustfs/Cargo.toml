@@ -244,6 +244,10 @@ rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
 
+# Connect device identity: P-256 keys, PKCS#10 certificate requests, ES256 proofs.
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+rcgen = { workspace = true }
+
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true

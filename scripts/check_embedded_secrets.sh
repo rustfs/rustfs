@@ -98,12 +98,28 @@ PATTERNS=(
 #      key across signer, IAM, madmin, and auth tests, plus the deliberate
 #      one-character variant rustfs/src/auth.rs uses to prove key comparison
 #      distinguishes near-identical ids.
+# 5-7: the Connect agent protocol fixtures under protocol/agent/v1/fixtures,
+#      which this repository carries as a byte-identical mirror of the Connect
+#      tree (rustfs/tests/agent_protocol_fixtures.rs pins every set against its
+#      MANIFEST.sha256, so the vectors cannot be reworded on this side). Their
+#      subject *is* key material that the inventory schema must be unable to
+#      carry and the redaction ruleset must replace, so the header has to appear
+#      in the input. Entry 5 carries the closing quote, so it excuses only a
+#      JSON string that ends at the header and can therefore hold no key body;
+#      a header followed by one still fires. Entries 6-7 carry their bodies,
+#      both unusable: 6 is a PKCS#8 wrapper whose OCTET STRING declares 32
+#      bytes and holds the 7 ASCII bytes "example", and 7 spells out in the
+#      body that it is not a real key.
 AWS_EXAMPLE_STEM="AKIAIOSFODNN7EXAMPL"
+AGENT_FIXTURE_RSA_BODY="MIIEowIBAAKCAQEAxEXAMPLEKEYBODYnotarealkey0000000000000000000000"
 NON_SECRET_LITERALS=(
     "-----${BEGIN_MARK} PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----"
     "-----${BEGIN_MARK} RSA PRIVATE KEY-----\\nsecret\\n-----END RSA PRIVATE KEY-----"
     "${AWS_EXAMPLE_STEM}E"
     "${AWS_EXAMPLE_STEM}F"
+    "\"-----${BEGIN_MARK} PRIVATE KEY-----\""
+    "-----${BEGIN_MARK} PRIVATE KEY-----\\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBleGFtcGxl\\n-----END PRIVATE KEY-----"
+    "-----${BEGIN_MARK} RSA PRIVATE KEY-----\\n${AGENT_FIXTURE_RSA_BODY}\\nEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE=\\n-----END RSA PRIVATE KEY-----"
 )
 
 run_scan() {

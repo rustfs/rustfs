@@ -1,0 +1,266 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "bundle",
+    "fixture": "manifest-signing",
+    "description": "How a support bundle manifest is signed and what it must contain. The signature input is the single detail R07 and every verifier must get exactly right, so it is stated first and proved by the non-canonical vector in accept-vectors.json.",
+    "signatureInput": {
+        "definition": "rustfs-support-bundle-v1 || 0x00 || the exact raw octets of manifest.json as stored in the archive",
+        "domainSeparationTag": "rustfs-support-bundle-v1",
+        "separatorByte": "0x00",
+        "signedOver": "the received manifest octets, byte for byte",
+        "reserialisationPermitted": false,
+        "canonicalJsonPermitted": false,
+        "prohibited": [
+            "Serialising a parsed manifest back to JSON and signing or verifying that.",
+            "Sorting keys, changing indentation, changing solidus escaping, or trimming whitespace before hashing.",
+            "Hashing a manifest read through a JSON library that does not preserve the original octets.",
+            "Verifying a manifest against a copy re-encoded by an HTTP client, a database column, or a template."
+        ],
+        "note": "A verifier must hold the received octets, prepend the tag and the separator, and verify. Only after that may it parse. The producer may format the manifest however it likes: correctness comes from the bytes travelling unchanged, not from agreeing on a canonical form."
+    },
+    "signatureEncoding": {
+        "signatureAlgorithm": "ES256",
+        "curve": "P-256",
+        "hash": "SHA-256",
+        "signatureEncoding": "fixed-width-r-s",
+        "signatureLengthBytes": 64,
+        "signatureTransferEncoding": "base64url-unpadded",
+        "signatureValuePattern": "^[A-Za-z0-9_-]{86}$",
+        "lowSRequired": true,
+        "groupOrder": "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        "maxS": "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8",
+        "publicKeyEncoding": "sec1-uncompressed",
+        "publicKeyLengthBytes": 65,
+        "publicKeyTransferEncoding": "base64url-unpadded",
+        "subjectPublicKeyInfoDerPrefix": "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+        "keyIdAlgorithm": "SHA-256",
+        "keyIdOver": "DER SubjectPublicKeyInfo",
+        "keyIdEncoding": "lowercase-hex",
+        "keyIdPattern": "^[0-9a-f]{64}$",
+        "documentTransferEncoding": "base64-padded"
+    },
+    "archiveLayout": {
+        "manifestPath": "manifest.json",
+        "signaturePath": "manifest.sig",
+        "signatureDocument": {
+            "fields": [
+                "algorithm",
+                "keyId",
+                "value",
+                "signedFile",
+                "domainSeparationTag"
+            ],
+            "signed": false,
+            "note": "The detached signature document carries no security claim of its own. keyId is a lookup hint; a verifier accepts the key only if it is the effective device key for the bundle, never because the document named it."
+        },
+        "entryPathPattern": "^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$",
+        "entryPathMaxLength": 256,
+        "entryPathRules": [
+            "Relative to the archive root, never absolute.",
+            "No . or .. segment, no empty segment, no backslash, no drive letter, no symlink target.",
+            "Unique across the manifest; a duplicate path is a rejection.",
+            "manifest.json and manifest.sig are not manifest entries and must not appear in entries."
+        ],
+        "entriesCoverArchive": "Every archive member other than manifest.json and manifest.sig must appear exactly once in entries, and every entry must exist in the archive."
+    },
+    "declaredVersusActual": {
+        "manifestCovers": "the per-entry path, type, size, digest, and classification of the archive members",
+        "manifestDoesNotCover": "the digest or size of the archive itself, which cannot be inside the archive it describes",
+        "archiveDigestDeclaredBy": "support_bundles.declared_sha256 and support_bundles.declared_size_bytes, committed before the upload starts",
+        "archiveDigestMeasuredInto": "support_bundles.actual_sha256 and support_bundles.actual_size_bytes",
+        "order": [
+            "Measure the quarantined object and record actual_sha256 and actual_size_bytes.",
+            "Reject unless the measured archive equals what the device declared.",
+            "Read manifest.json and manifest.sig without extracting anything else.",
+            "Verify the manifest signature over the raw manifest octets.",
+            "Parse the manifest only after the signature verified.",
+            "Check tenancy, freshness, replay, redaction version, classifications, and entry types.",
+            "Verify every entry digest and size against the archive members.",
+            "Only then promote the bundle to READY."
+        ],
+        "note": "READY is already unreachable in PostgreSQL unless actual_sha256 = declared_sha256 and actual_size_bytes = declared_size_bytes, so the archive-level check is enforced by the database and this contract adds the manifest-level checks above it."
+    },
+    "fields": [
+        {
+            "name": "formatVersion",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "Exactly rustfs.connect.support.bundleManifest/1."
+        },
+        {
+            "name": "protocolVersion",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "Exactly v1 in this release; the rule is the one frozen in protocol/agent/v1/authentication.md."
+        },
+        {
+            "name": "bundleUid",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "Lowercase canonical UUIDv7, the uid of the support_bundles row."
+        },
+        {
+            "name": "organizationName",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "organizations/{organizationUid}. An untrusted locator; Connect compares it against the bundle it authorised and never derives a tenant from it."
+        },
+        {
+            "name": "clusterName",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "organizations/{organizationUid}/clusters/{clusterUid}."
+        },
+        {
+            "name": "deviceName",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "organizations/{organizationUid}/clusters/{clusterUid}/clusterDevices/{clusterDeviceUid}."
+        },
+        {
+            "name": "deviceKeyId",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "Lowercase SHA-256 hex of the DER SubjectPublicKeyInfo of the signing device key."
+        },
+        {
+            "name": "nonce",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "32 random octets as unpadded base64url. Unique per organization, cluster, and device for at least the manifest max age."
+        },
+        {
+            "name": "producedAt",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "RFC 3339 UTC with a Z offset and second precision. Advisory device clock, bounded by the frozen freshness window."
+        },
+        {
+            "name": "redactionVersion",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "The opaque identifier of the deterministic redaction ruleset applied before packaging, frozen by protocol/agent/v1/fixtures/redaction/ruleset.json. Compared for equality only, never ordered."
+        },
+        {
+            "name": "rulesetHash",
+            "requiredness": "required",
+            "type": "string",
+            "default": null,
+            "note": "Lowercase SHA-256 hex of the canonical form of the ruleset named by redactionVersion. Together the pair proves which rules produced the redacted documents in this archive."
+        },
+        {
+            "name": "classificationRegistryVersion",
+            "requiredness": "required",
+            "type": "integer",
+            "default": null,
+            "note": "The schemaVersion of protocol/data-collection-fields.json the producer collected against."
+        },
+        {
+            "name": "entries",
+            "requiredness": "required",
+            "type": "array",
+            "default": null,
+            "note": "One object per archive member other than manifest.json and manifest.sig."
+        }
+    ],
+    "entryFields": [
+        {
+            "name": "path",
+            "requiredness": "required",
+            "type": "string",
+            "default": null
+        },
+        {
+            "name": "type",
+            "requiredness": "required",
+            "type": "string",
+            "default": null
+        },
+        {
+            "name": "sizeBytes",
+            "requiredness": "required",
+            "type": "integer",
+            "default": null
+        },
+        {
+            "name": "sha256",
+            "requiredness": "required",
+            "type": "string",
+            "default": null
+        },
+        {
+            "name": "classification",
+            "requiredness": "required",
+            "type": "string",
+            "default": null
+        }
+    ],
+    "closedEnumerations": {
+        "entryTypes": [
+            "offline-diagnostic",
+            "redaction-report"
+        ],
+        "classifications": [
+            "L0",
+            "L1"
+        ],
+        "forbiddenClassifications": [
+            "L2",
+            "L3"
+        ],
+        "note": "docs/data-classification.md defers L2 and L3 for the first release, so a manifest that declares one is rejected rather than quietly accepted and filtered. Adding an entry type or admitting a classification level is a protocol change with its own ADR and security review, not an additive field."
+    },
+    "redaction": {
+        "meaning": "redactionVersion identifies the deterministic redaction ruleset the producer applied. It is a claim about what was already removed; it is never a request for Connect to redact. rulesetHash pins the exact rules behind that identifier.",
+        "identifierIsOpaque": true,
+        "comparison": "equality",
+        "orderingPermitted": false,
+        "supportedVersions": [
+            "rustfs.connect.redaction.v1"
+        ],
+        "versionFormat": "^rustfs\\.connect\\.redaction\\.v[1-9][0-9]*$",
+        "rulesetHashAlgorithm": "sha256",
+        "rulesetHashPattern": "^[0-9a-f]{64}$",
+        "knownRulesetHashes": {
+            "rustfs.connect.redaction.v1": "b37436d8e72515394a122d633865b1dc028d4ece349352a0a3a23f52ca4285f3"
+        },
+        "unknownVersionPolicy": "reject with REDACTION_VERSION_UNKNOWN",
+        "rulesetHashMismatchPolicy": "reject with REDACTION_RULESET_MISMATCH",
+        "definedBy": "protocol/agent/v1/fixtures/redaction/ruleset.json, implemented by api/app/Modules/Diagnostics/Domain/Redaction and frozen by its own issue",
+        "classificationRegistry": "protocol/data-collection-fields.json, described by docs/data-classification.md",
+        "classificationRegistrySchemaVersion": 1,
+        "note": "This fixture cites the redaction and classification registries; it does not define them. A bundle whose redactionVersion Connect does not implement is rejected, because Connect cannot otherwise know what the producer believed it had removed. A known identifier carrying a foreign rulesetHash is rejected for the same reason: the identifier alone would then be a name for two different treatments."
+    },
+    "freshness": {
+        "maxAgeSeconds": 2592000,
+        "maxFutureSkewSeconds": 300,
+        "evaluatedAgainst": "the Connect receive time",
+        "note": "ADR 0003 already makes device clocks advisory. An air-gapped bundle may be couriered for weeks, so the window is generous in the past and tight in the future."
+    },
+    "supportBundleRejectionCodeMapping": {
+        "note": "Every protocol reason below maps into the closed six code set that support_bundles.rejected_reason_code accepts. The detailed reason stays in the verifier and is never persisted, exactly as SupportBundleRejectionReason documents.",
+        "codes": [
+            "ARCHIVE_INVALID",
+            "HASH_MISMATCH",
+            "MANIFEST_INVALID",
+            "SECRET_DETECTED",
+            "SIZE_LIMIT_EXCEEDED",
+            "SIZE_MISMATCH"
+        ],
+        "notCoveredByThisContract": {
+            "ARCHIVE_INVALID": "archive structure, entry paths, entry types, and compression ratio, validated before the manifest is read",
+            "SECRET_DETECTED": "redaction review, owned by the redaction issue",
+            "SIZE_LIMIT_EXCEEDED": "the archive size ceiling, owned by the upload authorization issue"
+        }
+    }
+}

@@ -1,0 +1,111 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "offline-enrollment",
+    "fixture": "error-codes",
+    "description": "Frozen ErrorInfo reasons for offline enrollment. Clients branch on status and reason, never on message.",
+    "domain": "rustfs.connect",
+    "detailType": "type.googleapis.com/google.rpc.ErrorInfo",
+    "disclosureRules": [
+        "A rejection never reveals whether a presented key or challenge belongs to another tenant.",
+        "A rejection never contains key material, signature octets, nonces, or document bytes.",
+        "A rejection never reports which of several failed checks failed first beyond the single frozen reason."
+    ],
+    "reasons": [
+        {
+            "reason": "UNSUPPORTED_PROTOCOL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The protocolVersion is missing, malformed, or names an unsupported major version. Identical to the rule frozen in protocol/agent/v1/authentication.md."
+        },
+        {
+            "reason": "UNSUPPORTED_FORMAT",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The formatVersion is not one of the frozen supported format versions."
+        },
+        {
+            "reason": "SIGNATURE_MALFORMED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The signature is not 64 octets of fixed-width r||s in unpadded base64url, or r or s is out of range."
+        },
+        {
+            "reason": "SIGNATURE_NOT_CANONICAL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The signature is well formed and verifies, but its s exceeds half the group order. Only the low-S form is accepted."
+        },
+        {
+            "reason": "SIGNATURE_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "ECDSA verification over the received octets failed. The document was altered, or it was signed by another key."
+        },
+        {
+            "reason": "ENROLLMENT_ROOT_UNKNOWN",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The first trust link is issued by a key that is not pinned in this build. There is no path from this to acceptance: the root is never learned."
+        },
+        {
+            "reason": "TRUST_CHAIN_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "A trust link failed its own signature check, named the wrong issuer, carried an unknown role, or was outside its validity at the challenge issuedAt."
+        },
+        {
+            "reason": "CONNECT_KEY_UNCHAINED",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The challenge connectKeyId is not the subject of the last trust link, so nothing under the pinned root vouches for the signing key."
+        },
+        {
+            "reason": "CHALLENGE_UNKNOWN",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "Connect has no issued challenge with this challengeId."
+        },
+        {
+            "reason": "CHALLENGE_NOT_YET_VALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The evaluation time is more than the skew tolerance before issuedAt."
+        },
+        {
+            "reason": "CHALLENGE_EXPIRED",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The evaluation time is more than the skew tolerance after expiresAt."
+        },
+        {
+            "reason": "CHALLENGE_PROOF_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The response nonce or challengeProof is not the one Connect issued for this challenge."
+        },
+        {
+            "reason": "DEVICE_PROOF_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The response signature does not verify under the devicePublicKey it presents, or deviceKeyId is not that key fingerprint. Proof of possession failed."
+        },
+        {
+            "reason": "ENROLLMENT_REPLAYED",
+            "httpStatus": 409,
+            "status": "ABORTED",
+            "meaning": "The challenge was already consumed. A challenge is single use even when the replayed response is byte identical."
+        },
+        {
+            "reason": "ORGANIZATION_MISMATCH",
+            "httpStatus": 403,
+            "status": "PERMISSION_DENIED",
+            "meaning": "The response names a different organization than the challenge it answers."
+        },
+        {
+            "reason": "CLUSTER_MISMATCH",
+            "httpStatus": 403,
+            "status": "PERMISSION_DENIED",
+            "meaning": "The response names a different cluster than the challenge it answers."
+        }
+    ]
+}

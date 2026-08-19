@@ -1,0 +1,107 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "redaction",
+  "fixture": "rejection-vectors",
+  "description": "The input budget. A document the engine cannot scan inside its budget is refused whole rather than partially redacted, and every refusal message is built from a literal and an integer so no part of the input reaches the message or the stack trace.",
+  "builders": {
+    "literal": "Use document as it stands.",
+    "nestedDepth": "{field: {nested: {... depth times ...: {leaf: 1}}}}.",
+    "listNodes": "{field: [1 repeated count times]}.",
+    "bulkStrings": "{field: {f0..f(entries-1): 'a' repeated valueBytes times}}.",
+    "unrepresentable": "{field: NaN}, a float no JSON encoder can represent."
+  },
+  "vectors": [
+    {
+      "name": "a surface that is not a registered collection surface",
+      "source": "support-bundle",
+      "build": {
+        "kind": "literal",
+        "document": {
+          "rustfsVersion": "1.19.4"
+        }
+      },
+      "expected": {
+        "refused": true,
+        "message": "Redaction refused the document: it names no registered collection surface."
+      }
+    },
+    {
+      "name": "a document larger than the input budget",
+      "source": "inventory",
+      "build": {
+        "kind": "bulkStrings",
+        "field": "coarseFlags",
+        "entries": 100,
+        "valueBytes": 4000
+      },
+      "expected": {
+        "refused": true,
+        "message": "Redaction refused the document: its size in bytes exceeds the frozen budget of 262144."
+      }
+    },
+    {
+      "name": "a document nested past the depth budget",
+      "source": "heartbeat",
+      "build": {
+        "kind": "nestedDepth",
+        "field": "coarseNodeSummary",
+        "depth": 8
+      },
+      "expected": {
+        "refused": true,
+        "message": "Redaction refused the document: its nesting depth exceeds the frozen budget of 8."
+      }
+    },
+    {
+      "name": "a document with more nodes than the node budget",
+      "source": "heartbeat",
+      "build": {
+        "kind": "listNodes",
+        "field": "capabilities",
+        "count": 4096
+      },
+      "expected": {
+        "refused": true,
+        "message": "Redaction refused the document: its node count exceeds the frozen budget of 4096."
+      }
+    },
+    {
+      "name": "a value no JSON encoder can represent",
+      "source": "inventory",
+      "build": {
+        "kind": "unrepresentable",
+        "field": "capacityUsedBytes"
+      },
+      "expected": {
+        "refused": true,
+        "message": "Redaction refused the document: it is not representable as JSON."
+      }
+    },
+    {
+      "name": "the deepest document the depth budget still accepts",
+      "source": "heartbeat",
+      "build": {
+        "kind": "nestedDepth",
+        "field": "coarseNodeSummary",
+        "depth": 7
+      },
+      "expected": {
+        "refused": false,
+        "redactedCount": 0
+      }
+    },
+    {
+      "name": "the largest node count the node budget still accepts",
+      "source": "heartbeat",
+      "build": {
+        "kind": "listNodes",
+        "field": "capabilities",
+        "count": 4095
+      },
+      "expected": {
+        "refused": false,
+        "redactedCount": 0
+      }
+    }
+  ]
+}

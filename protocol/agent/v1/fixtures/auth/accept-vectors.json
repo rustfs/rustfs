@@ -1,0 +1,84 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "accept-vectors",
+  "description": "Presented certificates that authenticate. Time offsets are seconds relative to the moment the request is evaluated.",
+  "vectors": [
+    {
+      "name": "current credential on an active cluster",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": true,
+        "reason": null
+      }
+    },
+    {
+      "name": "first device authenticates while its cluster is still pending",
+      "clusterState": "PENDING",
+      "credential": {
+        "validFromOffsetSeconds": -60,
+        "validUntilOffsetSeconds": 86340,
+        "transition": null
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": true,
+        "reason": null
+      }
+    },
+    {
+      "name": "outgoing credential inside the bounded rotation overlap",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": "rotate"
+      },
+      "presented": {
+        "credential": "outgoing",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": true,
+        "reason": null
+      }
+    },
+    {
+      "name": "incoming credential immediately after rotation",
+      "clusterState": "ACTIVE",
+      "credential": {
+        "validFromOffsetSeconds": -3600,
+        "validUntilOffsetSeconds": 82800,
+        "transition": "rotate"
+      },
+      "presented": {
+        "credential": "current",
+        "serial": "matching",
+        "certificateFingerprint": "matching"
+      },
+      "expected": {
+        "credentialResolved": true,
+        "authenticationEffective": true,
+        "reason": null
+      }
+    }
+  ]
+}
