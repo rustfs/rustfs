@@ -2026,8 +2026,17 @@ enum DataUsageCacheRead {
 
 /// True when the error means the cache object does not exist, as opposed to a
 /// transient failure that is worth another attempt.
+///
+/// `SetDisks::get_object_reader` runs its failures through `to_object_err`,
+/// which rewrites `FileNotFound` to `ObjectNotFound` and `VolumeNotFound` to
+/// `BucketNotFound`, so those are the variants that actually arrive here. The
+/// raw pair is matched too because callers reading through a different layer
+/// can still surface it.
 fn is_data_usage_cache_absent(err: &Error) -> bool {
-    matches!(err, Error::FileNotFound | Error::VolumeNotFound)
+    matches!(
+        err,
+        Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(..) | Error::BucketNotFound(..)
+    )
 }
 
 async fn read_data_usage_cache_object<S>(store: &S, key: &str) -> crate::error::Result<DataUsageCacheRead>
@@ -2511,7 +2520,10 @@ mod tests {
                 *remaining -= 1;
                 return Err(Error::other("transient read failure"));
             }
-            Err(Error::FileNotFound)
+            // `SetDisks::get_object_reader` reports a missing object through
+            // `to_object_err`, so the absence that reaches the caller is
+            // `ObjectNotFound`, not the raw `FileNotFound`.
+            Err(Error::ObjectNotFound(RUSTFS_META_BUCKET.to_string(), object.to_string()))
         }
 
         async fn put_object(
@@ -2531,6 +2543,23 @@ mod tests {
             .to_str()
             .expect("utf-8 path")
             .to_string()
+    }
+
+    #[test]
+    fn data_usage_cache_absence_covers_the_variants_that_actually_arrive() {
+        // `to_object_err` rewrites the raw storage variants before they reach
+        // `load_data_usage_cache`; classifying only the raw pair would treat a
+        // missing cache as a transient failure and retry it.
+        assert!(is_data_usage_cache_absent(&Error::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string()
+        )));
+        assert!(is_data_usage_cache_absent(&Error::BucketNotFound("bucket".to_string())));
+        assert!(is_data_usage_cache_absent(&Error::FileNotFound));
+        assert!(is_data_usage_cache_absent(&Error::VolumeNotFound));
+
+        assert!(!is_data_usage_cache_absent(&Error::other("transient read failure")));
+        assert!(!is_data_usage_cache_absent(&Error::DiskNotFound));
     }
 
     #[tokio::test]
