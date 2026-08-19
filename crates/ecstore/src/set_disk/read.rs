@@ -1077,23 +1077,23 @@ impl SetDisks {
                             "Recoverable decode error triggered read repair"
                         );
                         let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                        // MRF journal intent: keeps a durable Urgent ECDecode
-                        // request alive across restarts even when the in-memory
-                        // read-repair request is dropped or lost (HS-01).
-                        rustfs_common::mrf_channel::try_send_mrf_intent(
-                            rustfs_common::mrf_channel::MrfKind::DecodeFailure,
-                            bucket,
-                            object,
-                            fi.version_id,
-                        );
-                        submit_read_repair_heal(
-                            bucket,
-                            object,
-                            version_id.as_deref(),
-                            pool_index,
-                            set_index,
-                            Some(part_number),
-                            "decode_error",
+                        // Single-flight (backlog#1894 axis A): the durable
+                        // MRF intent (Urgent ECDecode across restarts, HS-01)
+                        // is bound to the read-repair reservation, so only the
+                        // first sighting within the dedup TTL books a journal
+                        // record instead of one per retried read.
+                        submit_read_repair_heal_with_submitter(
+                            ReadRepairHealSubmission {
+                                bucket,
+                                object,
+                                version_id: version_id.as_deref(),
+                                pool_index,
+                                set_index,
+                                part_number: Some(part_number),
+                                reason: "decode_error",
+                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
+                            },
+                            send_read_repair_heal_request,
                         )
                         .await;
                         has_err = false;
@@ -2577,6 +2577,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             slow_read_repair_submitter,
         )
@@ -2611,6 +2612,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             dropped_read_repair_submitter,
         )
@@ -2647,6 +2649,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             capture_read_repair_submitter,
         )

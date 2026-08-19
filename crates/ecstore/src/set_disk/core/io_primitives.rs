@@ -1095,6 +1095,14 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) set_index: usize,
     pub(in crate::set_disk) part_number: Option<usize>,
     pub(in crate::set_disk) reason: &'static str,
+    /// Durable MRF journal intent to file alongside the read-repair request
+    /// (backlog#1894 axis A): the intent kind plus its native `Uuid`
+    /// version id (the submission's string form stays display-only). Bound
+    /// to the reservation — the intent is only delivered when this sighting
+    /// wins the dedup TTL, so a burst of reads failing on the same object
+    /// books exactly one journal record instead of one per retry. `None`
+    /// keeps the historical no-intent behavior.
+    pub(in crate::set_disk) mrf_intent: Option<(rustfs_common::mrf_channel::MrfKind, Option<uuid::Uuid>)>,
 }
 
 pub(in crate::set_disk) fn send_read_repair_heal_request(
@@ -1126,6 +1134,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal(
             set_index,
             part_number,
             reason,
+            mrf_intent: None,
         },
         send_read_repair_heal_request,
     )
@@ -1144,6 +1153,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         set_index,
         part_number,
         reason,
+        mrf_intent,
     } = submission;
 
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
@@ -1154,6 +1164,12 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         );
         return;
     };
+
+    // Reservation won: this sighting owns the repair records for the object,
+    // including the durable journal intent when the caller asked for one.
+    if let Some((kind, version_uuid)) = mrf_intent {
+        rustfs_common::mrf_channel::try_send_mrf_intent(kind, bucket, object, version_uuid);
+    }
 
     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -8711,6 +8727,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn mrf_intent_is_filed_once_per_read_repair_reservation() {
+        // Serial: owns the process-global MRF channel for this test binary
+        // (same key as the other channel-owning tests above).
+        let bucket = format!("mrf-intent-bucket-{}", Uuid::new_v4());
+        let object = format!("object-{}", Uuid::new_v4());
+        let mut receiver = rustfs_common::mrf_channel::init_mrf_channel().expect("first channel init in this binary");
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(true);
+
+        fn intent_submission<'a>(bucket: &'a str, object: &'a str) -> ReadRepairHealSubmission<'a> {
+            ReadRepairHealSubmission {
+                bucket,
+                object,
+                version_id: None,
+                pool_index: 9,
+                set_index: 9,
+                part_number: Some(1),
+                reason: "decode_error",
+                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, None)),
+            }
+        }
+
+        // First sighting wins the reservation: the journal intent is filed
+        // synchronously before the admission task is spawned.
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
+        let first = receiver.try_recv().expect("first sighting must file exactly one MRF intent");
+        assert_eq!(*first.bucket, bucket);
+        assert_eq!(*first.object, object);
+
+        // Second sighting within the dedup TTL is a duplicate: no request, no
+        // second journal record.
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err(), "duplicate sighting must not file another MRF intent");
+    }
+
+    #[tokio::test]
     async fn reserve_read_repair_heal_dedupes_by_object_version_and_set() {
         let object = format!("object-{}", Uuid::new_v4());
         let key = reserve_read_repair_heal("bucket", &object, Some("version-1"), 1, 2)
@@ -8818,6 +8870,7 @@ mod tests {
                 set_index: 2,
                 part_number: Some(1),
                 reason: "test",
+                mrf_intent: None,
             },
             failed_read_repair_submitter,
         )
@@ -8846,6 +8899,7 @@ mod tests {
                 set_index: 3,
                 part_number: Some(2),
                 reason: "test",
+                mrf_intent: None,
             },
             dropped_read_repair_submitter,
         )
@@ -8874,6 +8928,7 @@ mod tests {
                 set_index: 4,
                 part_number: None,
                 reason: "test",
+                mrf_intent: None,
             },
             accepted_read_repair_submitter,
         )

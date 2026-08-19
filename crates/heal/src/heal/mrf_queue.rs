@@ -25,9 +25,12 @@
 //! set, rewritten on a group-commit cadence (every flush interval or flush
 //! threshold new intents). A rewrite is atomic at the record level only — a
 //! torn tail simply truncates during replay because every record carries its
-//! own CRC32. Losing the last flush window (≤500 ms) is acceptable: replayed
-//! duplicates are merged by the manager's dedup key, and read-repair remains
-//! the safety net.
+//! own CRC32. Losing the last flush window (≤500 ms) is acceptable because
+//! every producer keeps its own safety net: read-repair re-detects on the
+//! next failing read, and the scanner's corrupt-metadata branch leaves a
+//! pending-ledger entry behind even when its MRF intent is accepted
+//! (backlog#1894 axis A), so a lost intent is retried by the ledger rather
+//! than waiting for the failed-object TTL to re-scan the path.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::HealManager;
