@@ -19,31 +19,17 @@ use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
-/// Core test categories
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TestCategory {
-    SingleValue,
-    MultiValue,
-    Concatenation,
-    Nested,
-    DenyScenarios,
-}
-
-impl TestCategory {}
-
 /// Test case definition
 #[derive(Debug, Clone)]
 pub struct TestDefinition {
     pub name: String,
-    pub category: TestCategory,
     pub is_critical: bool,
 }
 
 impl TestDefinition {
-    pub fn new(name: impl Into<String>, category: TestCategory, is_critical: bool) -> Self {
+    pub fn new(name: impl Into<String>, is_critical: bool) -> Self {
         Self {
             name: name.into(),
-            category,
             is_critical,
         }
     }
@@ -91,12 +77,12 @@ impl PolicyTestSuite {
     /// Create default test suite
     pub fn new() -> Self {
         let tests = vec![
-            TestDefinition::new("test_aws_policy_variables_single_value", TestCategory::SingleValue, true),
-            TestDefinition::new("test_aws_policy_variables_multi_value", TestCategory::MultiValue, true),
-            TestDefinition::new("test_aws_policy_variables_concatenation", TestCategory::Concatenation, true),
-            TestDefinition::new("test_aws_policy_variables_nested", TestCategory::Nested, true),
-            TestDefinition::new("test_aws_policy_variables_deny", TestCategory::DenyScenarios, true),
-            TestDefinition::new("test_aws_policy_variables_sts", TestCategory::SingleValue, true),
+            TestDefinition::new("test_aws_policy_variables_single_value", true),
+            TestDefinition::new("test_aws_policy_variables_multi_value", true),
+            TestDefinition::new("test_aws_policy_variables_concatenation", true),
+            TestDefinition::new("test_aws_policy_variables_nested", true),
+            TestDefinition::new("test_aws_policy_variables_deny", true),
+            TestDefinition::new("test_aws_policy_variables_sts", true),
         ];
 
         Self {
