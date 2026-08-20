@@ -1017,9 +1017,11 @@ if rg -n -F 'target: "rustfs::server::http"' rustfs/src/server/layer.rs >/dev/nu
   exit 1
 fi
 
-demoted_admission_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/manager.rs || echo 0)"
+# manager.rs and its manager/ child modules are one logical module tree since
+# the queue/scheduler split; count the demoted sites across the whole tree.
+demoted_admission_sites="$(cat crates/heal/src/heal/manager.rs crates/heal/src/heal/manager/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
 if [[ "$demoted_admission_sites" -lt 6 ]]; then
-  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 sites in crates/heal/src/heal/manager.rs, found $demoted_admission_sites)" >&2
+  echo "❌ logging guardrail violation: heal queue admission/scheduler warns for per-object requests must stay level-split via demote_to_debug_when! (expected >= 6 total sites in the manager module tree, found $demoted_admission_sites)" >&2
   exit 1
 fi
 
