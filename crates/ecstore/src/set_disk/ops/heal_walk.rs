@@ -124,14 +124,7 @@ impl HealWalkCollector {
         for fi in fiv.versions.iter().chain(fiv.free_versions.iter()) {
             let version_uuid = fi.version_id.filter(|version_id| !version_id.is_nil());
             let lifecycle_object_info = if self.include_lifecycle_object_info {
-                let mut lifecycle_fi = fi.clone();
-                lifecycle_fi.version_id = version_uuid;
-                Some(ObjectInfo::from_file_info(
-                    &lifecycle_fi,
-                    &self.bucket,
-                    &entry.name,
-                    version_uuid.is_some(),
-                ))
+                Some(ObjectInfo::from_file_info_with_version_id(fi, &self.bucket, &entry.name, version_uuid))
             } else {
                 None
             };
@@ -198,14 +191,7 @@ impl HealWalkCollector {
                 let vid = version_uuid.map(|u| u.to_string());
                 if seen.insert(vid.clone()) {
                     let lifecycle_object_info = if self.include_lifecycle_object_info {
-                        let mut lifecycle_fi = fi.clone();
-                        lifecycle_fi.version_id = version_uuid;
-                        Some(ObjectInfo::from_file_info(
-                            &lifecycle_fi,
-                            &self.bucket,
-                            &entry.name,
-                            version_uuid.is_some(),
-                        ))
+                        Some(ObjectInfo::from_file_info_with_version_id(fi, &self.bucket, &entry.name, version_uuid))
                     } else {
                         None
                     };
