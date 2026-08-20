@@ -200,11 +200,19 @@ async fn add_rustfs_tier(hot: &RustFSTestEnvironment, cold: &RustFSTestEnvironme
 
 async fn remove_rustfs_tier_force(hot: &RustFSTestEnvironment) -> TestResult {
     let path = format!("/rustfs/admin/v3/tier/{TIER_NAME}?force=true");
-    let (status, resp) = signed_admin_request(&hot.url, Method::DELETE, &path, None, &hot.access_key, &hot.secret_key).await?;
-    if !status.is_success() {
-        return Err(format!("RemoveTier(RustFS) failed: status={status}, body={resp}").into());
+    let deadline = Instant::now() + StdDuration::from_secs(30);
+    loop {
+        let (status, resp) =
+            signed_admin_request(&hot.url, Method::DELETE, &path, None, &hot.access_key, &hot.secret_key).await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if !resp.contains("TierNameBackendInUse") || Instant::now() >= deadline {
+            return Err(format!("RemoveTier(RustFS) failed: status={status}, body={resp}").into());
+        }
+        // AddTier cleanup is asynchronous; wait until its committed mutation fence clears.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 /// A current-version `Transition Days=0` rule scoped to the object's prefix.
@@ -1477,15 +1485,6 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
     add_rustfs_tier(&hot, &cold).await?;
 
     hot_client.create_bucket().bucket(MANUAL_TIER_FAILURE_BUCKET).send().await?;
-    let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
-    put_backdated_single_part_object(
-        &hot_client,
-        MANUAL_TIER_FAILURE_BUCKET,
-        MANUAL_TIER_FAILURE_KEY,
-        b"manual tier failure object",
-        due_mtime,
-    )
-    .await?;
     put_lifecycle_transition_rule(
         &hot_client,
         MANUAL_TIER_FAILURE_BUCKET,
@@ -1496,6 +1495,15 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
     .await?;
     remove_rustfs_tier_force(&hot).await?;
 
+    let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
+    put_backdated_single_part_object(
+        &hot_client,
+        MANUAL_TIER_FAILURE_BUCKET,
+        MANUAL_TIER_FAILURE_KEY,
+        b"manual tier failure object",
+        due_mtime,
+    )
+    .await?;
     let before_remote_count = cold_tier_object_count(&cold_client).await?;
     let accepted = manual_transition_async_run(&hot, MANUAL_TIER_FAILURE_BUCKET, MANUAL_TIER_FAILURE_PREFIX, false, 10).await?;
     assert_eq!(accepted.state, "accepted");
