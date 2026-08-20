@@ -309,6 +309,31 @@ pub fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bo
     }
 }
 
+pub fn resync_status_duration(
+    status: ResyncStatusType,
+    start_time: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<std::time::Duration> {
+    if !matches!(
+        status,
+        ResyncStatusType::ResyncCompleted | ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncCanceled
+    ) {
+        return None;
+    }
+
+    let millis = (now - start_time?).whole_milliseconds();
+    if millis < 0 {
+        return None;
+    }
+
+    let millis = if millis > i128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        u64::try_from(millis).ok()?
+    };
+    Some(std::time::Duration::from_millis(millis))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BucketReplicationResyncStatus {
     pub version: u16,
@@ -710,6 +735,22 @@ mod tests {
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
+    }
+
+    #[test]
+    fn test_resync_status_duration_only_tracks_terminal_status() {
+        let start = match OffsetDateTime::from_unix_timestamp(1_700_000_000) {
+            Ok(start) => start,
+            Err(err) => panic!("valid test timestamp: {err}"),
+        };
+        let end = start + time::Duration::seconds(2);
+
+        assert_eq!(
+            resync_status_duration(ResyncStatusType::ResyncCompleted, Some(start), end),
+            Some(std::time::Duration::from_millis(2000))
+        );
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncStarted, Some(start), end), None);
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncFailed, None, end), None);
     }
 
     #[test]

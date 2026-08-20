@@ -267,12 +267,16 @@ uer. `ClusterIssuer` or `Issuer`. |
 | topologySpreadConstraints.enabled | bool | `false` | Enable custom topology spread constraints on distributed-mode StatefulSet pods. |
 | topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
-| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
+| gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation (traefik, contour, istio). |
 | gatewayApi.httpToHttpsRedirect | bool | `true` | To enable/disable the redirect httproute. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
 | gatewayApi.listeners.http.port| int | `8000` | Gateway API http listener port. |
 | gatewayApi.listeners.https.name | string | `websecure` | Gateway API https listener name. |
 | gatewayApi.listeners.https.port| int | `8443` | Gateway API https listener port. |
+| gatewayApi.listeners.tls.enabled | bool | `false` | Enable a TLS passthrough listener and generate a TLSRoute. |
+| gatewayApi.listeners.tls.name | string | `tls` | Gateway API TLS passthrough listener name. |
+| gatewayApi.listeners.tls.port | int | `443` | Gateway API TLS passthrough listener port. |
+| gatewayApi.listeners.tls.backendPort | int | `null` | Backend service port that terminates TLS; defaults to the console port. |
 | gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
@@ -433,7 +437,7 @@ helm install rustfs rustfs/rustfs -n rustfs --set tls.enabled=true,--set-file tl
 
 # Gateway API support (alpha)
 
-Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS only supports traefik as gateway class, more and more gateway class support will be added in the future after those classes are tested. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
+Due to [ingress nginx retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) in March 2026, so RustFS adds support for [gateway api](https://gateway-api.sigs.k8s.io/). Currently, RustFS supports traefik, contour, and istio as gateway classes. If you want to enable gateway api, specify `gatewayApi.enabled` to `true` while specify `ingress.enabled` to `false`. After installation, you can find the `Gateway` and `HttpRoute` resources,
 
 ```
 $ kubectl -n rustfs get gateway
@@ -446,6 +450,8 @@ rustfs-route   ["example.rustfs.com"]   172m
 ```
 
 Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
+
+For end-to-end encryption, set `gatewayApi.listeners.tls.enabled` to `true`. The chart then adds a `TLS` listener with `tls.mode: Passthrough` to the `Gateway` and generates a `TLSRoute` that forwards the encrypted stream to the RustFS service, where TLS is terminated on the backend side. Note that backend TLS termination must be configured on RustFS itself (for example `RUSTFS_TLS_PATH` pointing to server certificates), and the installed Gateway API CRDs must include `TLSRoute`.
 
 # Uninstall
 

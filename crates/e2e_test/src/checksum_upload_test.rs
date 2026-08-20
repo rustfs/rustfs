@@ -26,7 +26,6 @@ mod tests {
     use base64::Engine;
     use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
-    use serial_test::serial;
     use sha2::Sha256;
     use tracing::info;
 
@@ -90,7 +89,6 @@ mod tests {
 
     /// PutObject with Content-MD5: upload succeeds and GetObject returns same content.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_content_md5() {
         init_logging();
         info!("TEST: PutObject with Content-MD5");
@@ -126,7 +124,6 @@ mod tests {
 
     /// PutObject with x-amz-checksum-sha256: upload succeeds and GetObject returns same content.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_checksum_sha256() {
         init_logging();
         info!("TEST: PutObject with x-amz-checksum-sha256");
@@ -164,7 +161,6 @@ mod tests {
     /// PutObject with a SHA256 checksum that does NOT match the body must be
     /// rejected (BadDigest / checksum mismatch), NOT accepted with HTTP 200.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_rejects_mismatched_sha256() {
         init_logging();
         info!("TEST: PutObject rejects mismatched x-amz-checksum-sha256 (issue #4341)");
@@ -212,7 +208,6 @@ mod tests {
     /// After PutObject with a correct SHA256 checksum, HeadObject with
     /// ChecksumMode=ENABLED must return that stored base64 SHA256 digest.
     #[tokio::test]
-    #[serial]
     async fn test_head_object_returns_stored_sha256() {
         init_logging();
         info!("TEST: HeadObject returns stored SHA256 with ChecksumMode=ENABLED (issue #4341)");
@@ -258,7 +253,6 @@ mod tests {
     /// Multipart upload with checksum: CreateMultipartUpload, UploadPart(s) with checksum_sha256, CompleteMultipartUpload; then GetObject verifies content.
     /// Uses part size >= 5MB (server minimum) for two parts.
     #[tokio::test]
-    #[serial]
     async fn test_multipart_upload_with_checksum() {
         init_logging();
         info!("TEST: MultipartUpload with checksum (checksum_sha256 on parts)");
@@ -356,7 +350,6 @@ mod tests {
     /// Regression test for issue #2282:
     /// CRC64NVME full-object checksum should match between direct PutObject and multipart upload.
     #[tokio::test]
-    #[serial]
     async fn test_crc64nvme_matches_between_put_object_and_multipart_upload() {
         init_logging();
         info!("TEST: CRC64NVME matches between direct PutObject and multipart upload");
@@ -492,7 +485,6 @@ mod tests {
     /// value is rejected with BadDigest and nothing is stored. Full HEAD/GET header
     /// echo round-trip is additionally exercised by the boto3+awscrt e2e.
     #[tokio::test]
-    #[serial]
     async fn test_additional_checksums_verify_on_write() {
         init_logging();
         info!("TEST: additional checksums (XXHash3/64/128, SHA-512, MD5) verify-on-write");

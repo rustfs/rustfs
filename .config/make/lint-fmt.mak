@@ -66,9 +66,14 @@ s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	./scripts/check_s3s_footprint.sh
 
 .PHONY: fips-wording-check
-fips-wording-check: ## Check outward docs do not make unsupported FIPS claims
-	@echo "📣 Checking FIPS wording guard..."
+fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
+	@echo "📣 Checking cryptographic capability wording guard..."
 	./scripts/check_fips_wording.sh
+
+.PHONY: embedded-secrets-check
+embedded-secrets-check: ## Check no private key material or credential literal is committed
+	@echo "🔑 Checking embedded secret material guard..."
+	./scripts/check_embedded_secrets.sh
 
 .PHONY: log-analyzer-rules-check
 log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source

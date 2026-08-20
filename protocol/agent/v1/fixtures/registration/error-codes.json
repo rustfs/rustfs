@@ -1,0 +1,80 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "registration",
+    "fixture": "error-codes",
+    "description": "Frozen ErrorInfo reasons for the registration token exchange and its proof of possession. Clients branch on status and reason, never on message. Two of the reasons a rejected exchange can carry are defined elsewhere and are cited here rather than restated, so this surface can never come to mean something different by them.",
+    "domain": "rustfs.connect",
+    "detailType": "type.googleapis.com/google.rpc.ErrorInfo",
+    "disclosureRules": [
+        "A rejection never says which of the seven transcript bindings disagreed. Every binding failure is REGISTRATION_PROOF_INVALID.",
+        "A rejection never says whether a registration token uid exists, whether the presented secret was right, whether the token was already spent, expired, or revoked, or whether another request holds its reservation. Every one of those is REGISTRATION_TOKEN_UNUSABLE.",
+        "A rejection never contains a registration token secret, a challenge nonce, certificate request octets, or key material.",
+        "A rejection never reveals the organization or cluster a token belongs to."
+    ],
+    "reasons": [
+        {
+            "reason": "UNSUPPORTED_PROTOCOL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The requested protocol major version is missing, malformed, or not supported.",
+            "definedBy": "protocol/agent/v1/authentication.md",
+            "note": "Cited, not redefined. The exchange applies the rule already frozen for every agent operation: nothing is partially processed, stored, or echoed."
+        },
+        {
+            "reason": "UNSUPPORTED_ALGORITHM",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "proof.algorithm is a value other than ES256.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "The enumeration is closed. An unrecognised algorithm is refused rather than discarded, because a discarded algorithm would leave the proof to be interpreted by whatever its bytes happen to look like."
+        },
+        {
+            "reason": "SIGNATURE_MALFORMED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "proof.value is not 86 unpadded base64url characters decoding to 64 octets whose r and s both lie in [1, n).",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "DER, padded base64url, the standard base64 alphabet, a truncated value, and an out-of-range value all land here. The encoding is checked before any key is loaded."
+        },
+        {
+            "reason": "SIGNATURE_NOT_CANONICAL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "proof.value is well formed but its s exceeds half the group order.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "Such a proof verifies mathematically. Only the encoding rule refuses it, which is what makes the 64 octet value a canonical identity for one exchange rather than one of two equally valid spellings."
+        },
+        {
+            "reason": "CERTIFICATE_REQUEST_MALFORMED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "certificateRequest is not exactly one well-formed PKCS#10 DER structure, or its ES256 self-signature does not verify under the key it presents.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "Trailing octets after the outer SEQUENCE are malformed, not ignored: two readers that disagree about where a certificate request ends would disagree about its digest."
+        },
+        {
+            "reason": "DEVICE_KEY_UNSUPPORTED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "meaning": "The SubjectPublicKeyInfo of the certificate request is not an ECDSA key on NIST P-256.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "Separate from CERTIFICATE_REQUEST_MALFORMED because the request is structurally fine and the refusal is a policy one: ADR 0008 fixes the device key and this surface may not widen it."
+        },
+        {
+            "reason": "REGISTRATION_TOKEN_UNUSABLE",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "No usable registration token matches the presented uid and secret at this instant.",
+            "definedBy": "App\\Modules\\Clusters\\Application\\Contracts\\RegistrationTokenPort",
+            "note": "Cited, not redefined. The port already answers conditionally for every reason a caller does not own an exchange, and this single reason is the whole of what the surface may say about why."
+        },
+        {
+            "reason": "REGISTRATION_PROOF_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "meaning": "The proof does not verify over the transcript Connect rebuilt, under the key inside the presented certificate request.",
+            "definedBy": "protocol/agent/v1/registration-proof.md",
+            "note": "One reason for every substitution: another token, another cluster, another organization, another requestId, another nonce, a changed expiry, a substituted certificate request, a variant transcript encoding, or a proof by another key. Naming which one failed would turn the exchange into an oracle for the contents of a token row."
+        }
+    ]
+}

@@ -350,6 +350,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_operation_matches_unconfigured_host_fallbacks() {
+        let host = MultiDomain::new(["s3.example.com", "s3.example.com:9000"]).expect("valid test host domain");
+
+        let mut path_style_headers = HeaderMap::new();
+        path_style_headers.insert(HOST, "localhost:9000".parse().expect("valid host header"));
+        let path_style = metadata_operation(
+            &Method::GET,
+            &uri("/path-bucket?list-type=2&metadata=true"),
+            &path_style_headers,
+            Some(&host),
+        )
+        .expect("unmatched host with a port should use path-style routing");
+        assert_eq!(path_style.operation, MetadataOperation::ListObjectsV2);
+        assert_eq!(path_style.bucket, "path-bucket");
+
+        let mut cname_headers = HeaderMap::new();
+        cname_headers.insert(HOST, "cdn.example.org".parse().expect("valid host header"));
+        let cname = metadata_operation(&Method::GET, &uri("/?list-type=2&metadata=true"), &cname_headers, Some(&host))
+            .expect("unmatched valid bucket host should use CNAME routing");
+        assert_eq!(cname.operation, MetadataOperation::ListObjectsV2);
+        assert_eq!(cname.bucket, "cdn.example.org");
+    }
+
+    #[test]
     fn list_objects_v2_input_parses_query_headers_and_decodes_bucket() {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-expected-bucket-owner", "123456789012".parse().expect("valid header"));

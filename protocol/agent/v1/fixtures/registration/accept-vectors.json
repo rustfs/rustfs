@@ -1,0 +1,101 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "registration",
+    "fixture": "accept-vectors",
+    "description": "Registration proof-of-possession exchanges that verify. Each vector carries the token row Connect rebuilds the transcript from, the request body the device sent, and the exact transcript octets that rebuild produces. evaluatedAt is the Connect clock the vector is evaluated at; the bytes are frozen, so a window is a property of the evaluation and not of them. No vector carries a registration token secret or any private key.",
+    "vectors": [
+        {
+            "name": "device proof over the frozen transcript",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "The reference exchange. Every reject vector below is this one with exactly one input substituted.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+            "expected": {
+                "accepted": true,
+                "reason": null,
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "the same certificate request under a second requestId carries its own proof",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "requestId is inside the transcript, so a device that starts a second attempt signs again. It cannot move a proof it already produced onto a new idempotency key.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+                "expiresUnix": 1787228100,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "7c4d2e10-9f83-4a5b-b6c7-d8e9f0a1b2c3",
+                "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARYqHoZ46cBcslpM7HxBgZFVJgNYIu0kOUlTDJ7f7bUSJKwiFd/WkKhjzTi+BtUcB2S/4hw7AO/AzEH6bAoKu8MoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiBFV0TbGna4C83UtAaLF4Ar7E0ofknbqY0ZUDXlsB9n8gIhAKBuWIviE8mhzvzCY5kjRgAgSChxfAZ9kFSQoMHZTkXM",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "f0YRwKo8HTMuvCBlh0v3OjqCVplGPVfXqfTgxO4slepy1XdL6bYROjXYwKfn7ZZtkXH5PdOfrC37qITLT4cirQ"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:7c4d2e10-9f83-4a5b-b6c7-d8e9f0a1b2c3\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+            "serverTranscriptSha256": "561bda4be56f6334379c9832b73c74eca7d01a7cef95ef6ab0c5c13499bbb90c",
+            "expected": {
+                "accepted": true,
+                "reason": null,
+                "verifiesMathematically": true
+            }
+        },
+        {
+            "name": "a second device registering against a second token of the same cluster",
+            "stage": "proof",
+            "evaluatedAt": "2026-08-20T12:00:00Z",
+            "note": "Nothing in the transcript is global: a second key, a second token, and a second nonce produce an unrelated transcript under the same cluster.",
+            "tokenRecord": {
+                "registrationTokenUid": "0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6",
+                "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+                "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+                "challengeNonce": "5c7e9a0b1d2f3041526374859607b8c9dae0f1023456789abcdef0123456789a",
+                "expiresUnix": 1787229000,
+                "state": "ACTIVE"
+            },
+            "request": {
+                "protocolVersion": "v1",
+                "requestId": "5e1b7a36-2c4d-48ef-90ab-1c2d3e4f5061",
+                "registrationTokenUid": "0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6",
+                "certificateRequest": "MIIBRjCB7QIBADAvMS0wKwYDVQQDDCQwMTk4ZjRiMC04YjAwLTdkODAtOTQ5MS05ZmEwYjFjMmQzZTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATSvBqHsbWVSUjYckACjTRW7wm+lGHKffqZazn/RBmkdkcSeuERS/160K4N2EdiwQWNU/g0LD+9kzrhI6M7TXrgoFwwWgYJKoZIhvcNAQkOMU0wSzBJBgNVHREEQjBAhj51cm46cnVzdGZzOmNvbm5lY3Q6ZGV2aWNlOjAxOThmNGIwLThiMDAtN2Q4MC05NDkxLTlmYTBiMWMyZDNlNzAKBggqhkjOPQQDAgNIADBFAiEAxZXtloz/p6atQT/sqMxjlcHHN7sq/2f2YeND2oGJCYUCIBH+jf269LueLR4dAZIO7AygdPBf3NxW1PgBu3U4UElH",
+                "proof": {
+                    "algorithm": "ES256",
+                    "value": "gPExu0WlRxfLeDC388xb15VL8yuMEGnbdkz-CapNBscx4JX8bP0JVbkumMQyddX4BpRAldeeQZ_GJjuxrUVn8w"
+                }
+            },
+            "serverTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-7a00-7c70-8381-8e9fa0b1c2d6\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:5e1b7a36-2c4d-48ef-90ab-1c2d3e4f5061\n64:5c7e9a0b1d2f3041526374859607b8c9dae0f1023456789abcdef0123456789a\n10:1787229000\n43:srwagTJq3yDJm_u_cO-u9KLQWyLeJAouFWiFuNLNSMQ\n",
+            "serverTranscriptSha256": "6873d380ebf6634c3e36b402ab74f3c46471d7f725b747dda1843d14a3a7b655",
+            "expected": {
+                "accepted": true,
+                "reason": null,
+                "verifiesMathematically": true
+            }
+        }
+    ]
+}

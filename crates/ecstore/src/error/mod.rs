@@ -1116,6 +1116,14 @@ mod tests {
         assert!(encoder_source.is::<reed_solomon_erasure::Error>());
     }
 
+    // The lifecycle transition worker relies on this arm alone to suppress the
+    // closed-connection noise (`bucket_lifecycle_ops.rs`); dropping it here would
+    // silently turn shutdown races back into `error!` log spam.
+    #[test]
+    fn is_network_or_host_down_covers_closed_network_connection() {
+        assert!(is_network_or_host_down("transition failed: use of closed network connection", false));
+    }
+
     // Regression for #952 (ECA-11): an all-`DiskNotFound` slice (every drive in
     // every set unreachable) must NOT be classified as "all not found",
     // otherwise ListObjects silently returns an empty listing and masks a full

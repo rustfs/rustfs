@@ -3,7 +3,6 @@
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use serial_test::serial;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -102,7 +101,6 @@ async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Resul
 }
 
 #[tokio::test]
-#[serial]
 async fn test_compression_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting compression roundtrip test");
@@ -230,7 +228,6 @@ async fn fetch_range(
 /// (rustfs/rustfs#5957: multipart uploads previously bypassed disk compression
 /// entirely).
 #[tokio::test]
-#[serial]
 async fn test_compression_multipart_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting multipart compression roundtrip test");
@@ -349,7 +346,6 @@ const MPU_HIGH_RATIO_BUCKET: &str = "compression-mpu-high-ratio-bucket";
 /// reproduced the mid-payload Pending truncation (rustfs/rustfs#5957). Every GET shape must return
 /// the exact original bytes, and the stored size must show the data really was compressed.
 #[tokio::test]
-#[serial]
 async fn test_compression_multipart_high_ratio_binary_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting multipart high-ratio binary compression roundtrip test");
@@ -446,7 +442,6 @@ const MPU_COPY_RANGE_LEN: usize = 5 * 1024 * 1024;
 /// range must be decompressed on read and re-compressed into the destination part, so the final
 /// object has to match "source prefix + uploaded tail" byte for byte.
 #[tokio::test]
-#[serial]
 async fn test_compression_multipart_upload_part_copy_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting multipart upload-part-copy compression roundtrip test");
@@ -570,7 +565,6 @@ const MPU_THREE_PARTS_TAIL_SIZE: usize = 512 * 1024;
 /// Three-part upload with uneven part sizes: each partNumber GET must map back to exactly one
 /// compressed part stream, and a suffix range must resolve inside the trailing part.
 #[tokio::test]
-#[serial]
 async fn test_compression_multipart_three_parts_part_number_gets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting three-part multipart compression partNumber test");
@@ -689,7 +683,6 @@ async fn start_rustfs_with_compression_and_sse(
 /// shape must still return the original plaintext bytes. Physical size must shrink because the
 /// compression runs before encryption.
 #[tokio::test]
-#[serial]
 async fn test_compression_multipart_sse_s3_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use aws_sdk_s3::types::ServerSideEncryption;
 

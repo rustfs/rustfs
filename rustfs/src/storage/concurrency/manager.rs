@@ -50,7 +50,7 @@ pub struct ConcurrencyManager {
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     priority_queue: Arc<IoPriorityQueue<()>>,
     /// Bytes pool for buffer allocation and reuse
     bytes_pool: Arc<BytesPool>,
@@ -65,6 +65,11 @@ pub struct ConcurrencyManager {
     bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
     /// Metrics collector for I/O latency tracking (P50, P95, P99)
     metrics_collector: Arc<MetricsCollector>,
+    /// Experimental fixed-count foreground PutObject admission gate.
+    put_admission_semaphore: Arc<Semaphore>,
+    put_admission_enabled: bool,
+    put_admission_limit: usize,
+    put_admission_wait_timeout: Duration,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -114,7 +119,18 @@ pub enum DiskReadAdmission {
     Rejected,
 }
 
-#[allow(dead_code)]
+/// Outcome of foreground PutObject request admission.
+#[derive(Debug)]
+pub enum PutObjectAdmission {
+    /// Foreground PUT admission is disabled; proceed on the legacy path.
+    Disabled,
+    /// Request is admitted and must hold the permit until the store write
+    /// returns or the request fails before mutation.
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    /// The fixed-count gate stayed full until the configured wait timeout.
+    Rejected,
+}
+
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
@@ -161,6 +177,18 @@ impl ConcurrencyManager {
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
         let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics, 1000));
+        let put_admission_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE,
+            rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE,
+        );
+        let put_admission_limit = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_LIMIT,
+            rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_LIMIT,
+        );
+        let put_admission_wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+        ));
 
         // Build queue config directly from scheduler config.
         let queue_config = IoPriorityQueueConfig::from_scheduler_config(&scheduler_config);
@@ -176,6 +204,10 @@ impl ConcurrencyManager {
             pattern_detector,
             bandwidth_monitor,
             metrics_collector,
+            put_admission_semaphore: Arc::new(Semaphore::new(if put_admission_enabled { put_admission_limit } else { 0 })),
+            put_admission_enabled,
+            put_admission_limit,
+            put_admission_wait_timeout,
         }
     }
 
@@ -197,6 +229,16 @@ impl ConcurrencyManager {
     pub(crate) fn close_disk_read_admission_for_test(&self) {
         self.disk_read_semaphore.close();
         self.degraded_read_semaphore.close();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_put_admission_for_test(enabled: bool, limit: usize, wait_timeout: Duration) -> Self {
+        let mut manager = Self::new();
+        manager.put_admission_semaphore = Arc::new(Semaphore::new(if enabled { limit } else { 0 }));
+        manager.put_admission_enabled = enabled;
+        manager.put_admission_limit = limit;
+        manager.put_admission_wait_timeout = wait_timeout;
+        manager
     }
 
     /// Track a GetObject request
@@ -281,6 +323,32 @@ impl ConcurrencyManager {
                     Err(_) => Ok(DiskReadAdmission::Rejected),
                 }
             }
+        }
+    }
+
+    /// Admit a foreground PutObject request under the experimental fixed-count gate.
+    ///
+    /// The default-off path returns [`PutObjectAdmission::Disabled`] without
+    /// touching the semaphore, preserving legacy behavior. When enabled, the
+    /// permit must be acquired before body ingest and held until the store write
+    /// returns, so saturated foreground writes can fail with `SlowDown` before
+    /// creating visible side effects.
+    pub async fn admit_put_object(&self) -> Result<PutObjectAdmission, tokio::sync::AcquireError> {
+        if !self.put_admission_enabled || self.put_admission_limit == 0 {
+            return Ok(PutObjectAdmission::Disabled);
+        }
+
+        if self.put_admission_wait_timeout.is_zero() {
+            return Ok(match self.put_admission_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => PutObjectAdmission::Admitted(permit),
+                Err(tokio::sync::TryAcquireError::NoPermits) => PutObjectAdmission::Rejected,
+                Err(tokio::sync::TryAcquireError::Closed) => PutObjectAdmission::Rejected,
+            });
+        }
+
+        match tokio::time::timeout(self.put_admission_wait_timeout, self.put_admission_semaphore.clone().acquire_owned()).await {
+            Ok(permit) => Ok(PutObjectAdmission::Admitted(permit?)),
+            Err(_) => Ok(PutObjectAdmission::Rejected),
         }
     }
 
@@ -692,8 +760,16 @@ impl ConcurrencyManager {
 
     /// Get a read-only workload admission snapshot for foreground writes.
     pub fn put_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
-        let active = PutObjectGuard::concurrent_count();
-        let limit = self.scheduler_config.max_concurrent_reads;
+        let (active, limit, hard_gate_enabled) = if self.put_admission_enabled && self.put_admission_limit > 0 {
+            (
+                self.put_admission_limit
+                    .saturating_sub(self.put_admission_semaphore.available_permits()),
+                self.put_admission_limit,
+                true,
+            )
+        } else {
+            (PutObjectGuard::concurrent_count(), self.scheduler_config.max_concurrent_reads, false)
+        };
         let state = if limit == 0 {
             AdmissionState::Disabled
         } else if active >= limit {
@@ -706,7 +782,10 @@ impl ConcurrencyManager {
             WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), None, Some(limit));
 
         match state {
-            AdmissionState::Disabled => admission.with_reason("foreground write pressure tracking disabled"),
+            AdmissionState::Disabled => admission.with_reason("foreground write admission disabled"),
+            AdmissionState::Saturated if hard_gate_enabled => {
+                admission.with_reason("foreground write admission permits exhausted")
+            }
             AdmissionState::Saturated => admission.with_reason("foreground write concurrency reached local pressure limit"),
             _ => admission,
         }
@@ -783,7 +862,7 @@ impl Default for ConcurrencyManager {
 mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
     use super::super::request_guard::GetObjectGuard;
-    use super::ConcurrencyManager;
+    use super::{ConcurrencyManager, PutObjectAdmission};
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
     use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
@@ -878,6 +957,71 @@ mod integration_tests {
         assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
         drop(guard);
         crate::storage::concurrency::reset_active_put_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_disabled_does_not_touch_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(false, 1, Duration::ZERO);
+
+        let admission = manager
+            .admit_put_object()
+            .await
+            .expect("disabled put admission must not close");
+
+        assert!(matches!(admission, PutObjectAdmission::Disabled));
+        assert_eq!(manager.put_admission_semaphore.available_permits(), 0);
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Open);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_rejects_when_limit_full() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager.admit_put_object().await.expect("first put admission should acquire");
+        assert!(matches!(first, PutObjectAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Saturated);
+
+        let second = manager
+            .admit_put_object()
+            .await
+            .expect("full put admission gate should reject, not close");
+        assert!(matches!(second, PutObjectAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_reuses_released_permit() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager.admit_put_object().await.expect("first put admission should acquire");
+        drop(first);
+
+        let second = manager
+            .admit_put_object()
+            .await
+            .expect("released put admission permit should be reusable");
+        assert!(matches!(second, PutObjectAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_wait_timeout_rejects() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(5));
+        let held = manager.admit_put_object().await.expect("first put admission should acquire");
+        let waiter_manager = manager.clone();
+
+        let waiter = tokio::spawn(async move { waiter_manager.admit_put_object().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let admission = waiter
+            .await
+            .expect("put admission waiter task must not panic")
+            .expect("put admission gate must stay open");
+        assert!(matches!(admission, PutObjectAdmission::Rejected));
+        drop(held);
     }
 
     #[tokio::test]

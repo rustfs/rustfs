@@ -19,10 +19,7 @@ use super::{
 use crate::runtime_sources::AppContext;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
-
-static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
     runtime_sources::current_server_config()
@@ -37,13 +34,11 @@ fn server_config_for_context(context: Option<&AppContext>) -> Option<rustfs_conf
 
 pub fn refresh_audit_module_enabled() -> bool {
     let enabled = resolve_audit_module_state().enabled;
-    AUDIT_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    crate::module_switches::set_audit_module_enabled(enabled);
     enabled
 }
 
-pub fn is_audit_module_enabled() -> bool {
-    AUDIT_MODULE_ENABLED.load(Ordering::Relaxed)
-}
+pub use crate::module_switches::is_audit_module_enabled;
 
 fn has_any_persisted_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
     for &subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {

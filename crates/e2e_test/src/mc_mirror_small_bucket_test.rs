@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::common::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RustFSTestEnvironment};
-use serial_test::serial;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -73,7 +72,6 @@ fn count_files(root: &Path) -> usize {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_mc_mirror_small_bucket_completes_without_list_timeout() -> TestResult {
     crate::common::init_logging();
     info!("Starting issue #3107 mc mirror regression test");

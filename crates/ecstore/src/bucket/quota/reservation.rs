@@ -899,6 +899,7 @@ async fn save_ledger_locked(
 }
 
 #[cfg(any(test, feature = "test-util"))]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn fail_next_quota_ledger_save_for_test() {
     FAIL_NEXT_LEDGER_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
 }

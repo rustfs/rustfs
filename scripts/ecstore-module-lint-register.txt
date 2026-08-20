@@ -1,0 +1,113 @@
+# ecstore module-level lint blanket register (backlog#1823 step 9)
+#
+# Each line is `path|lint` for a `#![allow(<lint>)]` at the top of an ecstore
+# source file. These blankets disable the lint for a whole module, so a real
+# defect introduced anywhere in the file goes unreported.
+#
+# The guard in scripts/check_architecture_migration_rules.sh compares this file
+# against the tree and fails on ANY difference, in either direction:
+#
+#   * a blanket not listed here      -> new suppression, justify it in the PR
+#   * a line here with no blanket    -> delete the line in the same PR
+#
+# Exact match is deliberate. A "no new entries" rule would let the register rot
+# into an amnesty list, which is the failure mode backlog#1834 found in the
+# layer-dependency baseline. Removing a blanket must cost one line here, so the
+# register can only shrink.
+#
+# `#![allow(dead_code)]` is NOT listed: ecstore carries zero of those after the
+# step 2 burn-down, and the guard asserts that count stays at zero.
+crates/ecstore/src/bucket/lifecycle/tier_last_day_stats.rs|clippy::all
+crates/ecstore/src/bucket/lifecycle/tier_last_day_stats.rs|unused_must_use
+crates/ecstore/src/bucket/lifecycle/tier_last_day_stats.rs|unused_variables
+crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs|clippy::all
+crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs|unused_must_use
+crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs|unused_variables
+crates/ecstore/src/client/api_error_response.rs|clippy::all
+crates/ecstore/src/client/api_error_response.rs|unused_must_use
+crates/ecstore/src/client/api_error_response.rs|unused_variables
+crates/ecstore/src/client/api_get_object.rs|clippy::all
+crates/ecstore/src/client/api_get_object.rs|unused_must_use
+crates/ecstore/src/client/api_get_object.rs|unused_variables
+crates/ecstore/src/client/api_get_options.rs|clippy::all
+crates/ecstore/src/client/api_get_options.rs|unused_must_use
+crates/ecstore/src/client/api_get_options.rs|unused_variables
+crates/ecstore/src/client/api_list.rs|clippy::all
+crates/ecstore/src/client/api_list.rs|unused_must_use
+crates/ecstore/src/client/api_list.rs|unused_variables
+crates/ecstore/src/client/api_put_object.rs|clippy::all
+crates/ecstore/src/client/api_put_object.rs|unused_must_use
+crates/ecstore/src/client/api_put_object.rs|unused_variables
+crates/ecstore/src/client/api_put_object_common.rs|clippy::all
+crates/ecstore/src/client/api_put_object_common.rs|unused_must_use
+crates/ecstore/src/client/api_put_object_common.rs|unused_variables
+crates/ecstore/src/client/api_put_object_multipart.rs|clippy::all
+crates/ecstore/src/client/api_put_object_multipart.rs|unused_must_use
+crates/ecstore/src/client/api_put_object_multipart.rs|unused_variables
+crates/ecstore/src/client/api_put_object_streaming.rs|clippy::all
+crates/ecstore/src/client/api_put_object_streaming.rs|unused_must_use
+crates/ecstore/src/client/api_put_object_streaming.rs|unused_variables
+crates/ecstore/src/client/api_remove.rs|clippy::all
+crates/ecstore/src/client/api_remove.rs|unused_must_use
+crates/ecstore/src/client/api_remove.rs|unused_variables
+crates/ecstore/src/client/api_s3_datatypes.rs|clippy::all
+crates/ecstore/src/client/api_s3_datatypes.rs|unused_must_use
+crates/ecstore/src/client/api_s3_datatypes.rs|unused_variables
+crates/ecstore/src/client/api_stat.rs|clippy::all
+crates/ecstore/src/client/api_stat.rs|unused_must_use
+crates/ecstore/src/client/api_stat.rs|unused_variables
+crates/ecstore/src/client/bucket_cache.rs|clippy::all
+crates/ecstore/src/client/bucket_cache.rs|unused_must_use
+crates/ecstore/src/client/bucket_cache.rs|unused_variables
+crates/ecstore/src/client/checksum.rs|clippy::all
+crates/ecstore/src/client/checksum.rs|unused_must_use
+crates/ecstore/src/client/checksum.rs|unused_variables
+crates/ecstore/src/client/constants.rs|unused_must_use
+crates/ecstore/src/client/constants.rs|unused_variables
+crates/ecstore/src/client/credentials.rs|clippy::all
+crates/ecstore/src/client/credentials.rs|unused_must_use
+crates/ecstore/src/client/credentials.rs|unused_variables
+crates/ecstore/src/client/object_api_utils.rs|clippy::all
+crates/ecstore/src/client/object_api_utils.rs|unused_must_use
+crates/ecstore/src/client/object_api_utils.rs|unused_variables
+crates/ecstore/src/client/transition_api.rs|clippy::all
+crates/ecstore/src/client/transition_api.rs|unused_must_use
+crates/ecstore/src/client/transition_api.rs|unused_variables
+crates/ecstore/src/services/event_notification.rs|unused_variables
+crates/ecstore/src/services/tier/tier.rs|clippy::all
+crates/ecstore/src/services/tier/tier.rs|unused_must_use
+crates/ecstore/src/services/tier/tier.rs|unused_variables
+crates/ecstore/src/services/tier/tier_admin.rs|clippy::all
+crates/ecstore/src/services/tier/tier_admin.rs|unused_must_use
+crates/ecstore/src/services/tier/tier_admin.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_aliyun.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_aliyun.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_aliyun.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_azure.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_azure.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_azure.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_gcs.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_gcs.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_gcs.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_huaweicloud.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_huaweicloud.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_huaweicloud.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_minio.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_minio.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_minio.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_r2.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_r2.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_r2.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_rustfs.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_rustfs.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_rustfs.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_s3.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_variables
+crates/ecstore/src/services/tier/warm_backend_tencent.rs|clippy::all
+crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_must_use
+crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_variables
+crates/ecstore/src/set_disk/mod.rs|unused_variables

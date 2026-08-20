@@ -48,6 +48,7 @@ pub fn to_volume_error(io_err: std::io::Error) -> std::io::Error {
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn to_disk_error(io_err: std::io::Error) -> std::io::Error {
     match io_err.kind() {
         std::io::ErrorKind::NotFound => DiskError::DiskNotFound.into(),

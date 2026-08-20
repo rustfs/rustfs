@@ -31,7 +31,10 @@ pub struct KeystoneClient {
     admin_password: Option<String>,
     admin_project: Option<String>,
     admin_domain: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "TLS verification flag parsed from config; the reqwest client is built before it is consulted, so nothing reads it back (backlog#1823)"
+    )]
     verify_ssl: bool,
     /// Request timeout applied to the underlying HTTP client.
     timeout: std::time::Duration,

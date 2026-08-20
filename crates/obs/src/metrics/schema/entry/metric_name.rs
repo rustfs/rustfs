@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// The metric name is the individual name of the metric
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
     // The generic metric name
@@ -443,7 +442,6 @@ pub enum MetricName {
 }
 
 impl MetricName {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         match self {
             Self::AuthTotal => "auth_total".to_string(),

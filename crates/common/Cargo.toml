@@ -42,8 +42,8 @@ chrono = { workspace = true, features = ["serde"] }
 jiff = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
 rmp-serde = { workspace = true }
-s3s = { workspace = true, features = ["minio"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

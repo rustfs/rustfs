@@ -1,0 +1,148 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "bundle",
+    "fixture": "error-codes",
+    "description": "Frozen ErrorInfo reasons for support bundle manifest validation, and the closed persisted code each one collapses into.",
+    "domain": "rustfs.connect",
+    "detailType": "type.googleapis.com/google.rpc.ErrorInfo",
+    "disclosureRules": [
+        "A rejection never reveals whether a bundle, key, or device belongs to another tenant.",
+        "A rejection never contains manifest bytes, entry paths, key material, or digests.",
+        "Only supportBundleRejectionCode is persisted. The protocol reason stays in the verifier."
+    ],
+    "reasons": [
+        {
+            "reason": "UNSUPPORTED_PROTOCOL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The protocolVersion is missing, malformed, or names an unsupported major version."
+        },
+        {
+            "reason": "UNSUPPORTED_FORMAT",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The formatVersion is not rustfs.connect.support.bundleManifest/1."
+        },
+        {
+            "reason": "SIGNATURE_MALFORMED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The signature is not 64 octets of fixed-width r||s in unpadded base64url, or r or s is out of range."
+        },
+        {
+            "reason": "SIGNATURE_NOT_CANONICAL",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The signature verifies but its s exceeds half the group order."
+        },
+        {
+            "reason": "SIGNATURE_INVALID",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "ECDSA verification over the received manifest octets failed. Tampering and re-serialisation both land here."
+        },
+        {
+            "reason": "DEVICE_KEY_UNKNOWN",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "No enrolled device key matches deviceKeyId for this bundle."
+        },
+        {
+            "reason": "DEVICE_KEY_REVOKED",
+            "httpStatus": 401,
+            "status": "UNAUTHENTICATED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The device key is known but revoked. Revocation is not a validity window and is not retroactively forgiven."
+        },
+        {
+            "reason": "ORGANIZATION_MISMATCH",
+            "httpStatus": 403,
+            "status": "PERMISSION_DENIED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The manifest names a different organization than the bundle Connect authorised."
+        },
+        {
+            "reason": "CLUSTER_MISMATCH",
+            "httpStatus": 403,
+            "status": "PERMISSION_DENIED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The manifest names a different cluster than the bundle Connect authorised."
+        },
+        {
+            "reason": "DEVICE_MISMATCH",
+            "httpStatus": 403,
+            "status": "PERMISSION_DENIED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The manifest names a different device than the bundle Connect authorised."
+        },
+        {
+            "reason": "MANIFEST_NOT_YET_VALID",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "producedAt is further in the future than the skew tolerance."
+        },
+        {
+            "reason": "MANIFEST_EXPIRED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "producedAt is older than the freshness window."
+        },
+        {
+            "reason": "CLASSIFICATION_NOT_PERMITTED",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "An entry declares a classification level that is not collected in this release."
+        },
+        {
+            "reason": "ENTRY_TYPE_UNKNOWN",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "An entry declares a type outside the closed set."
+        },
+        {
+            "reason": "REDACTION_VERSION_UNKNOWN",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "redactionVersion is not an identifier Connect implements. The identifier is opaque, so a newer looking one is never treated as a superset of an older one."
+        },
+        {
+            "reason": "REDACTION_RULESET_MISMATCH",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "redactionVersion is known but rulesetHash is not the hash of the rules that identifier names, so the identifier would stand for two different treatments."
+        },
+        {
+            "reason": "ENTRY_DIGEST_MISMATCH",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "HASH_MISMATCH",
+            "meaning": "An archive member does not hash to the digest its manifest entry declares."
+        },
+        {
+            "reason": "ENTRY_SIZE_MISMATCH",
+            "httpStatus": 400,
+            "status": "INVALID_ARGUMENT",
+            "supportBundleRejectionCode": "SIZE_MISMATCH",
+            "meaning": "An archive member is not the size its manifest entry declares."
+        },
+        {
+            "reason": "BUNDLE_REPLAYED",
+            "httpStatus": 409,
+            "status": "ABORTED",
+            "supportBundleRejectionCode": "MANIFEST_INVALID",
+            "meaning": "The manifest nonce was already accepted for this organization, cluster, and device."
+        }
+    ]
+}

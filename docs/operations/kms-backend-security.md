@@ -2,7 +2,7 @@
 
 RustFS ships several KMS backends. They differ not only in deployment effort but in **where master key material lives and who can read it**. Pick a backend based on the confidentiality boundary you need, not on the name alone.
 
-For how the Vault backends authenticate (static token, AppRole, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md). For what may be claimed about the cryptographic implementations themselves, see [Cryptographic compliance positioning](kms-cryptographic-compliance.md). For which RustFS identities may manage or use a given key, see [Per-key KMS authorization](kms-per-key-authorization.md). If you are migrating from MinIO, read [Migrating from MinIO: encrypted objects do not carry over](#migrating-from-minio-encrypted-objects-do-not-carry-over) first.
+For how the Vault backends authenticate (static token, AppRole, Kubernetes, Vault Agent token file) and how credential refresh and the fail-closed window behave, see the [Vault KMS authentication runbook](vault-kms-authentication.md). For what may be claimed about the cryptographic implementations themselves, see [Cryptographic compliance positioning](kms-cryptographic-compliance.md). For which RustFS identities may manage or use a given key, see [Per-key KMS authorization](kms-per-key-authorization.md). If you are migrating from MinIO, read [Migrating from MinIO: encrypted objects do not carry over](#migrating-from-minio-encrypted-objects-do-not-carry-over) first.
 
 ## Backend comparison
 

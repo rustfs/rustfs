@@ -257,7 +257,7 @@ impl std::fmt::Display for ObjectKey {
 }
 
 /// Lock type for object operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LockMode {
     /// Shared lock for read operations
     Shared,

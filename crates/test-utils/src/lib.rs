@@ -92,6 +92,13 @@ pub struct TestECStoreEnv {
     /// `init_local_disks` + `ECStore::new` on `127.0.0.1:0` (random port keeps
     /// nextest's process-per-test parallelism safe).
     pub ecstore: Arc<ECStore>,
+    /// The single-pool, single-set topology the store was built from.
+    ///
+    /// The bootstrap does **not** publish it on the instance context (server
+    /// startup is what calls `set_endpoints`, and that write is once-only), so
+    /// a test that needs `get_global_endpoints` to resolve — admin server-info
+    /// and other topology readers — publishes this value itself.
+    pub endpoint_pools: EndpointServerPools,
 }
 
 impl TestECStoreEnv {
@@ -234,7 +241,7 @@ impl TestECStoreEnvBuilder {
         // Port 0 keeps ECStore-backed integration binaries parallel-safe under
         // nextest: no fixed peer port is ever shared between test processes.
         let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse test addr");
-        let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
+        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
             .await
             .expect("build test ECStore");
 
@@ -254,6 +261,7 @@ impl TestECStoreEnvBuilder {
             temp_root,
             disk_paths,
             ecstore,
+            endpoint_pools,
         }
     }
 }

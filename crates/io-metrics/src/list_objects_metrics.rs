@@ -403,73 +403,132 @@ pub fn record_list_objects_local_read_dir(observation: ListObjectsLocalReadDirOb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::set_get_stage_metrics_enabled;
+    use crate::tests::{METRICS_FLAG_LOCK, counter_total, emitted_names, histogram_samples};
+    use metrics_util::debugging::DebuggingRecorder;
 
-    #[test]
-    fn record_gather_observation_handles_empty_page() {
-        init_list_objects_metrics();
-        record_list_objects_gather(ListObjectsGatherObservation {
-            source: LIST_OBJECTS_SOURCE_WALKER,
-            outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
-            limit: 1001,
-            scanned_entries: 42,
-            returned_entries: 0,
-            duration_ms: 3.5,
-            has_prefix: true,
-            has_delimiter: false,
-            has_marker: true,
+    /// Run `body` against a local recorder with stage metrics on, and return the
+    /// snapshot rows.
+    ///
+    /// Enabling the flag is the point: every `record_*` here returns early when
+    /// `get_stage_metrics_enabled()` is false, which defaults to false. The
+    /// previous versions of these tests never set it, so they exercised nothing
+    /// but the early return (rustfs/backlog#1836).
+    fn recorded(body: impl FnOnce()) -> Vec<crate::tests::MetricRow> {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            init_list_objects_metrics();
+            set_get_stage_metrics_enabled(true);
+            body();
+            set_get_stage_metrics_enabled(false);
         });
+        snapshotter.snapshot().into_vec()
     }
 
     #[test]
-    fn record_merge_observation_accepts_zero_quorum() {
-        init_list_objects_metrics();
-        record_list_objects_merge(LIST_OBJECTS_SOURCE_WALKER, 4, 0);
+    fn gather_scan_amplification_falls_back_to_the_scan_count_on_an_empty_page() {
+        let rows = recorded(|| {
+            record_list_objects_gather(ListObjectsGatherObservation {
+                source: LIST_OBJECTS_SOURCE_WALKER,
+                outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
+                limit: 1001,
+                scanned_entries: 42,
+                returned_entries: 0,
+                duration_ms: 3.5,
+                has_prefix: true,
+                has_delimiter: false,
+                has_marker: true,
+            })
+        });
+
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_GATHER_TOTAL), Some(1));
+        // Zero returned entries must not divide: the amplification reports the
+        // scan count itself rather than an infinity or a NaN.
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_SCAN_AMPLIFICATION), vec![42.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_FILTERED_ENTRIES), vec![42.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_RETURNED_ENTRIES), vec![0.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_GATHER_DURATION_MS), vec![3.5]);
     }
 
     #[test]
-    fn record_index_fallback_observation_accepts_reason() {
-        init_list_objects_metrics();
-        record_list_objects_index_fallback("index_key_only", "unsupported_request");
+    fn merge_records_a_zero_read_quorum_rather_than_skipping_it() {
+        let rows = recorded(|| record_list_objects_merge(LIST_OBJECTS_SOURCE_WALKER, 4, 0));
+
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_MERGE_FAN_IN), vec![4.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_MERGE_READ_QUORUM), vec![0.0]);
     }
 
     #[test]
-    fn record_index_attempt_and_served_observations_accept_counts() {
-        init_list_objects_metrics();
-        record_list_objects_index_attempt("index_key_only", "walker_key_only", true, true, false);
-        record_list_objects_index_served(ListObjectsIndexPageObservation {
-            source: "index_key_only",
-            provider: "walker_key_only",
-            candidate_keys: 1000,
-            live_verify_attempts: 700,
-            live_verify_hits: 650,
-            live_verify_misses: 50,
-            returned_objects: 600,
-            returned_prefixes: 10,
-            is_truncated: true,
+    fn index_fallback_counts_once_per_reason() {
+        let rows = recorded(|| {
+            record_list_objects_index_fallback("index_key_only", "unsupported_request");
+            record_list_objects_index_fallback("index_key_only", "unsupported_request");
         });
-        record_list_objects_index_live_verify_failure("index_key_only", "read_error");
+
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_INDEX_FALLBACK_TOTAL), Some(2));
     }
 
     #[test]
-    fn record_local_read_dir_observation_accepts_whole_directory_counts() {
-        init_list_objects_metrics();
-        record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
-            outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK,
-            requested_count: -1,
-            returned_entries: 4096,
-            duration_ms: 12.5,
-            is_root: true,
-            has_filter_prefix: false,
-            has_forward: false,
+    fn index_serving_reports_verification_amplification_against_returned_objects() {
+        let rows = recorded(|| {
+            record_list_objects_index_attempt("index_key_only", "walker_key_only", true, true, false);
+            record_list_objects_index_served(ListObjectsIndexPageObservation {
+                source: "index_key_only",
+                provider: "walker_key_only",
+                candidate_keys: 1000,
+                live_verify_attempts: 700,
+                live_verify_hits: 650,
+                live_verify_misses: 50,
+                returned_objects: 600,
+                returned_prefixes: 10,
+                is_truncated: true,
+            });
+            record_list_objects_index_live_verify_failure("index_key_only", "read_error");
         });
-        record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
-            outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR,
-            requested_count: -1,
-            returned_entries: 0,
-            duration_ms: 5000.0,
-            is_root: true,
-            has_filter_prefix: false,
-            has_forward: true,
+
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_INDEX_ATTEMPT_TOTAL), Some(1));
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_INDEX_SERVED_TOTAL), Some(1));
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_INDEX_LIVE_VERIFY_FAILURE_TOTAL), Some(1));
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_INDEX_CANDIDATE_KEYS), vec![1000.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_INDEX_LIVE_VERIFY_HITS), vec![650.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_INDEX_LIVE_VERIFY_MISSES), vec![50.0]);
+        assert_eq!(
+            histogram_samples(&rows, LIST_OBJECTS_INDEX_VERIFICATION_IO_AMPLIFICATION),
+            vec![700.0 / 600.0]
+        );
+    }
+
+    #[test]
+    fn local_read_dir_passes_the_whole_directory_sentinel_through_as_the_limit() {
+        let rows = recorded(|| {
+            record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
+                outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK,
+                requested_count: -1,
+                returned_entries: 4096,
+                duration_ms: 12.5,
+                is_root: true,
+                has_filter_prefix: false,
+                has_forward: false,
+            });
+            record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
+                outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR,
+                requested_count: -1,
+                returned_entries: 0,
+                duration_ms: 5000.0,
+                is_root: true,
+                has_filter_prefix: false,
+                has_forward: true,
+            });
         });
+
+        assert_eq!(counter_total(&rows, LIST_OBJECTS_LOCAL_READ_DIR_TOTAL), Some(2));
+        // `-1` is the "read the whole directory" sentinel and must reach the
+        // limit histogram unchanged rather than being clamped to zero.
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_LOCAL_READ_DIR_LIMIT), vec![-1.0, -1.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_LOCAL_READ_DIR_ENTRIES), vec![0.0, 4096.0]);
+        assert_eq!(histogram_samples(&rows, LIST_OBJECTS_LOCAL_READ_DIR_DURATION_MS), vec![12.5, 5000.0]);
+        assert!(emitted_names(&rows).contains(LIST_OBJECTS_LOCAL_READ_DIR_TOTAL));
     }
 }

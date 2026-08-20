@@ -20,7 +20,10 @@ use tracing::{debug, info};
 
 /// Maps Keystone identities to RustFS concepts
 pub struct KeystoneIdentityMapper {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "keeps the Keystone client alive for the mapper's lifetime; the mapping paths do not call through it yet (backlog#1823)"
+    )]
     client: Arc<KeystoneClient>,
     role_policy_map: HashMap<String, String>,
     enable_tenant_prefix: bool,

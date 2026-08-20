@@ -25,11 +25,9 @@ use super::common::{LocalKMSTestEnvironment, create_key_with_specific_id};
 use crate::common::init_logging;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, ServerSideEncryption, VersioningConfiguration};
-use serial_test::serial;
 use tracing::info;
 
 #[tokio::test]
-#[serial]
 async fn test_self_copy_of_historical_sse_s3_version_is_readable() {
     init_logging();
     info!("Issue #4238 (SSE): restoring an encrypted historical version must stay decryptable");

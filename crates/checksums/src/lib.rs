@@ -476,13 +476,19 @@ impl Checksum for Xxhash64 {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Content-MD5 is not a ChecksumAlgorithm variant and has no arm in into_impl: S3 carries it as its own header, separate from the x-amz-checksum-* family. This impl exists so the two paths share the Checksum trait, and is asserted by this crate's tests (backlog#1823)"
+)]
 struct Md5 {
     hasher: md5::Md5,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Content-MD5 is not a ChecksumAlgorithm variant and has no arm in into_impl: S3 carries it as its own header, separate from the x-amz-checksum-* family. This impl exists so the two paths share the Checksum trait, and is asserted by this crate's tests (backlog#1823)"
+)]
 impl Md5 {
     fn update(&mut self, bytes: &[u8]) {
         use md5::Digest;

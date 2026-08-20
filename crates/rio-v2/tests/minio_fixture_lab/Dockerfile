@@ -6,9 +6,18 @@
 #
 # The MinIO release is pinned so the captured fixture format is reproducible;
 # this is the release the interop tests were validated against.
-FROM minio/minio:RELEASE.2025-09-07T16-13-09Z AS minio
+#
+# Both base images are build args so a network that cannot reach Docker Hub can
+# point them at a mirror carrying the same content — quay.io publishes the MinIO
+# releases, and public.ecr.aws mirrors the official Python images. CI keeps the
+# Docker Hub defaults. Override with:
+#   --build-arg MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
+#   --build-arg PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+ARG MINIO_IMAGE=minio/minio:RELEASE.2025-09-07T16-13-09Z
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${MINIO_IMAGE} AS minio
 
-FROM python:3.12-slim
+FROM ${PYTHON_IMAGE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl ca-certificates \
     && rm -rf /var/lib/apt/lists/*

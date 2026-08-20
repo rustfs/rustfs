@@ -24,7 +24,6 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use bytes::Bytes;
-use serial_test::serial;
 use std::error::Error;
 use tracing::info;
 
@@ -70,7 +69,6 @@ async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_get_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -144,7 +142,6 @@ async fn test_get_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std::
 
 /// Test that HeadObject on a deleted object also returns NoSuchKey
 #[tokio::test]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_head_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
@@ -196,7 +193,6 @@ async fn test_head_deleted_object_returns_nosuchkey() -> Result<(), Box<dyn std:
 
 /// Test GetObject with non-existent key (never existed)
 #[tokio::test]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_get_nonexistent_object_returns_nosuchkey() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
@@ -233,7 +229,6 @@ async fn test_get_nonexistent_object_returns_nosuchkey() -> Result<(), Box<dyn s
 /// Test multiple consecutive GetObject calls on deleted object
 /// This ensures the fix is stable and doesn't have race conditions
 #[tokio::test]
-#[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
 async fn test_multiple_gets_deleted_object() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()

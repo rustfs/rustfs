@@ -427,7 +427,6 @@ pub enum DataSource {
     /// Write triggered
     WriteTriggered,
     /// Fallback value
-    #[allow(dead_code)]
     Fallback,
 }
 
@@ -603,7 +602,6 @@ impl WriteRecord {
 
 /// Hybrid strategy configuration
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HybridStrategyConfig {
     /// Scheduled update interval
     pub scheduled_update_interval: Duration,
@@ -998,14 +996,12 @@ impl HybridCapacityManager {
     }
 
     /// Get cache age
-    #[allow(dead_code)]
     pub async fn get_cache_age(&self) -> Option<Duration> {
         let cache = self.cache.read().await;
         cache.as_ref().map(|c| c.last_update.elapsed())
     }
 
     /// Get write frequency (writes/minute)
-    #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = &self.write_record;
         record.recent_write_count(record.monotonic_second())
@@ -1300,7 +1296,6 @@ pub fn get_capacity_manager() -> Arc<HybridCapacityManager> {
 ///     .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
 ///     .await;
 /// ```
-#[allow(dead_code)]
 pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapacityManager> {
     Arc::new(HybridCapacityManager::new(config))
 }

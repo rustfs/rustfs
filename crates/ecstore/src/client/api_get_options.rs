@@ -20,6 +20,7 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderName, HeaderValue};
+use rustfs_utils::http::headers::AMZ_CHECKSUM_MODE;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
@@ -27,7 +28,6 @@ use tracing::warn;
 use crate::client::api_error_response::err_invalid_argument;
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct AdvancedGetOptions {
     pub replication_delete_marker: bool,
     pub is_replication_ready_for_delete_marker: bool,
@@ -77,7 +77,7 @@ impl GetObjectOptions {
             }
         }
         if self.checksum {
-            headers.insert(HeaderName::from_static("x-amz-checksum-mode"), HeaderValue::from_static("ENABLED"));
+            headers.insert(HeaderName::from_static(AMZ_CHECKSUM_MODE), HeaderValue::from_static("ENABLED"));
         }
         headers
     }

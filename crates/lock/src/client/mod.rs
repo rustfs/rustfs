@@ -15,7 +15,7 @@
 pub mod local;
 // pub mod remote;
 
-use crate::{LockId, LockInfo, LockRequest, LockResponse, LockStats, Result};
+use crate::{LockId, LockInfo, LockLeaseInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
@@ -53,6 +53,13 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
 
     /// Check lock status
     async fn check_status(&self, lock_id: &LockId) -> Result<Option<LockInfo>>;
+
+    /// Return authoritative lease information when this client owns lease state.
+    ///
+    /// Clients that do not manage renewable leases return an empty snapshot.
+    async fn list_lock_leases(&self) -> Vec<LockLeaseInfo> {
+        Vec::new()
+    }
 
     /// Get statistics
     async fn get_stats(&self) -> Result<LockStats>;

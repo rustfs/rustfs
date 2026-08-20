@@ -304,30 +304,37 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
     Ok(kms_config)
 }
 
+/// Collect the Vault settings the command line owns.
+///
+/// Everything else — auth method, namespace, TLS, KV mount and metadata paths —
+/// is resolved from the environment by the KMS crate, so this path and
+/// [`rustfs_kms::config::KmsConfig::from_env`] cannot drift apart. The address
+/// stays required here so a missing one is still named instead of silently
+/// falling back to the crate's localhost default.
+fn vault_cli_overrides<'a>(
+    cfg: &'a config::Config,
+    backend_name: &str,
+) -> std::io::Result<rustfs_kms::config::VaultCliOverrides<'a>> {
+    let address = cfg
+        .kms_vault_address
+        .as_deref()
+        .ok_or_else(|| Error::other(format!("Vault address is required for {backend_name} backend")))?;
+
+    Ok(rustfs_kms::config::VaultCliOverrides {
+        address: Some(address),
+        token: cfg.kms_vault_token.as_deref(),
+        mount_path: cfg.kms_vault_mount_path.as_deref(),
+    })
+}
+
 /// Build KMS configuration for Vault backend
 fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
-    let vault_address = cfg
-        .kms_vault_address
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
-    let vault_token = cfg
-        .kms_vault_token
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+    let backend_config = rustfs_kms::config::vault_kv2_config_from_env(vault_cli_overrides(cfg, "vault")?)
+        .map_err(|e| Error::other(format!("Vault KMS configuration failed: {e}")))?;
 
     let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultKv2,
-        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(rustfs_kms::config::VaultConfig {
-            address: vault_address.clone(),
-            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                token: vault_token.clone(),
-            },
-            namespace: None,
-            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
-            kv_mount: "secret".to_string(),
-            key_path_prefix: "rustfs/kms/keys".to_string(),
-            tls: None,
-        })),
+        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(backend_config)),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
         allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
@@ -344,26 +351,12 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
 
 /// Build KMS configuration for Vault Transit backend
 fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
-    let vault_address = cfg
-        .kms_vault_address
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault address is required for vault-transit backend"))?;
-    let vault_token = cfg
-        .kms_vault_token
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault token is required for vault-transit backend"))?;
+    let backend_config = rustfs_kms::config::vault_transit_config_from_env(vault_cli_overrides(cfg, "vault-transit")?)
+        .map_err(|e| Error::other(format!("Vault Transit KMS configuration failed: {e}")))?;
 
     let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultTransit,
-        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(rustfs_kms::config::VaultTransitConfig {
-            address: vault_address.clone(),
-            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                token: vault_token.clone(),
-            },
-            namespace: None,
-            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
-            ..rustfs_kms::config::VaultTransitConfig::default()
-        })),
+        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(backend_config)),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
         allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
@@ -772,7 +765,6 @@ fn resolve_buffer_profile_config(
 
 /// Parse and normalize server address for FTP/FTPS
 /// Forces IPv4 binding to avoid libunftp IPv6 compatibility issues
-#[allow(dead_code)]
 async fn parse_and_normalize_server_address(
     address_str: &str,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -788,45 +780,6 @@ async fn parse_and_normalize_server_address(
 
     Ok(normalized_addr)
 }
-
-/// Start FTP/FTPS server in background with shutdown support
-/// # Arguments
-/// * `server` - The FTP/FTPS server instance
-/// * `protocol_name` - Name of the protocol (e.g., "FTP", "FTPS")
-#[allow(dead_code)]
-fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
-where
-    S: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
-{
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-
-    tokio::spawn(async move {
-        if let Err(e) = server.await {
-            error!(
-                target: "rustfs::init",
-                event = "protocol_server_state",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_PROTOCOL,
-                protocol = protocol_name,
-                state = "runtime_failed",
-                error = %e,
-                "Protocol server failed"
-            );
-        }
-        info!(
-            target: "rustfs::init",
-            event = "protocol_server_state",
-            component = LOG_COMPONENT_INIT,
-            subsystem = LOG_SUBSYSTEM_PROTOCOL,
-            protocol = protocol_name,
-            state = "stopped",
-            "Protocol server stopped"
-        );
-    });
-
-    shutdown_tx
-}
-
 /// Starts the auto-tuner for performance optimization if enabled via environment variable.
 ///
 /// The auto-tuner reads `RUSTFS_AUTOTUNER_ENABLED` to decide whether to run.
@@ -1405,7 +1358,10 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
 
 #[cfg(test)]
 mod tests {
-    use super::{build_aws_kms_config, notification_config_to_event_rules, resolve_buffer_profile_config};
+    use super::{
+        build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config, notification_config_to_event_rules,
+        resolve_buffer_profile_config,
+    };
     use crate::config::{BufferConfig, WorkloadProfile};
     use rustfs_config::KI_B;
     use rustfs_s3_types::EventName;
@@ -1497,6 +1453,151 @@ mod tests {
         let err = notification_config_to_event_rules(&cfg).expect_err("invalid ARN partition must fail");
 
         assert!(err.to_string().contains("Invalid ARN"), "unexpected error: {err}");
+    }
+
+    fn vault_kms_test_config(backend: &str) -> crate::config::Config {
+        let mut config = crate::config::Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-vault-kms".to_string()]);
+        config.kms_enable = true;
+        config.kms_backend = backend.to_string();
+        config.kms_vault_address = Some("https://vault.example.com:8200".to_string());
+        config
+    }
+
+    /// The Vault auth method and the settings the CLI has no flag for come from
+    /// the environment, so startup and `KmsConfig::from_env` cannot disagree.
+    /// Regression: startup used to hardcode token auth and require a token,
+    /// which made every non-token method unreachable through `RUSTFS_KMS_ENABLE`.
+    #[test]
+    fn build_vault_transit_kms_config_resolves_auth_and_mounts_from_env() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", Some("env-role-id")),
+                ("RUSTFS_KMS_VAULT_APPROLE_SECRET_ID", Some("env-secret-id")),
+                ("RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE", None),
+                ("RUSTFS_KMS_VAULT_NAMESPACE", Some("team-a")),
+                ("RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT", Some("rustfs-kv")),
+            ],
+            || {
+                build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                    .expect("vault transit KMS configuration should build")
+            },
+        );
+
+        let vault = config.vault_transit_config().expect("vault transit backend config");
+        let rustfs_kms::config::VaultAuthMethod::AppRole { role_id, secret_id, .. } = &vault.auth_method else {
+            panic!("approle in the environment must select AppRole auth, got {:?}", vault.auth_method);
+        };
+        assert_eq!(role_id, "env-role-id");
+        assert_eq!(secret_id, "env-secret-id");
+        assert_eq!(vault.namespace.as_deref(), Some("team-a"));
+        assert_eq!(vault.metadata_kv_mount, "rustfs-kv");
+    }
+
+    /// Kubernetes auth needs no credential in the environment at all: the role
+    /// selects it and the pod's projected ServiceAccount token supplies the rest.
+    #[test]
+    fn build_vault_transit_kms_config_selects_kubernetes_auth() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", Some("rustfs")),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_MOUNT", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_JWT_PATH", None),
+            ],
+            || {
+                build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                    .expect("vault transit KMS configuration should build")
+            },
+        );
+
+        let vault = config.vault_transit_config().expect("vault transit backend config");
+        let rustfs_kms::config::VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } = &vault.auth_method
+        else {
+            panic!(
+                "a kubernetes role in the environment must select Kubernetes auth, got {:?}",
+                vault.auth_method
+            );
+        };
+        assert_eq!(role, "rustfs");
+        assert_eq!(mount, rustfs_kms::config::DEFAULT_VAULT_KUBERNETES_MOUNT);
+        assert_eq!(jwt_path, std::path::Path::new(rustfs_kms::config::DEFAULT_VAULT_KUBERNETES_JWT_PATH));
+    }
+
+    /// Two credential sources leave the effective identity ambiguous, so
+    /// startup refuses rather than picking one.
+    #[test]
+    fn build_vault_kms_config_refuses_two_auth_methods() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", Some("/run/vault-agent/token")),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", Some("rustfs")),
+            ],
+            || {
+                let error = build_vault_kms_config(&vault_kms_test_config("vault"))
+                    .expect_err("two Vault auth methods must not start the server");
+                assert!(error.to_string().contains("exactly one"), "unexpected error: {error}");
+            },
+        );
+    }
+
+    /// The KV2 backend has its own builder, so the key-location settings have
+    /// to be proven separately from the Transit one: pointing at the wrong KV
+    /// mount or prefix makes existing keys look absent.
+    #[test]
+    fn build_vault_kms_config_resolves_kv_mount_and_prefix_from_env() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("a-real-token")),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+                ("RUSTFS_KMS_VAULT_KV_MOUNT", Some("rustfs-kv")),
+                ("RUSTFS_KMS_VAULT_KEY_PREFIX", Some("tenant/keys")),
+            ],
+            || build_vault_kms_config(&vault_kms_test_config("vault")).expect("vault KV2 KMS configuration should build"),
+        );
+
+        let vault = config.vault_config().expect("vault kv2 backend config");
+        assert_eq!(vault.kv_mount, "rustfs-kv");
+        assert_eq!(vault.key_path_prefix, "tenant/keys");
+    }
+
+    /// Skipping TLS verification was silently dropped on this path before, so
+    /// an operator who asked for it still got a verified connection. Now that it
+    /// is honoured it must fail closed without the development opt-in, rather
+    /// than quietly downgrading the Vault connection.
+    #[test]
+    fn build_vault_transit_kms_config_refuses_skip_tls_verify_without_opt_in() {
+        let vars = [
+            ("RUSTFS_KMS_VAULT_TOKEN", Some("a-real-token")),
+            ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+            ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+            ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+            ("RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY", Some("true")),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let error = build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                .expect_err("skipping TLS verification must not start the server");
+            assert!(error.to_string().contains("TLS"), "unexpected error: {error}");
+        });
+
+        temp_env::with_vars(vars, || {
+            let mut cfg = vault_kms_test_config("vault-transit");
+            cfg.kms_allow_insecure_dev_defaults = true;
+            let config = build_vault_transit_kms_config(&cfg).expect("the development opt-in should accept skip-verify");
+            let vault = config.vault_transit_config().expect("vault transit backend config");
+            assert!(vault.tls.as_ref().is_some_and(|tls| tls.skip_verify));
+        });
     }
 
     fn aws_kms_test_config() -> crate::config::Config {

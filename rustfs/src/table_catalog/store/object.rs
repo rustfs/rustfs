@@ -387,6 +387,7 @@ where
 
     async fn has_active_namespace_descendant(&self, table_bucket: &str, namespace: &Namespace) -> TableCatalogStoreResult<bool> {
         let parent = namespace.public_name();
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, namespace);
         let descendant_prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), namespace.storage_id());
         let scan_limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
             .ok_or_else(|| TableCatalogStoreError::Internal("catalog object scan limit must be positive".to_string()))?;
@@ -398,6 +399,9 @@ where
                 .await?;
             let last_scanned = page.objects.last().cloned();
             for object in page.objects {
+                if object == namespace_path {
+                    continue;
+                }
                 if self
                     .read_active_namespace_evidence(&object)
                     .await?
@@ -1270,6 +1274,10 @@ where
         Ok(Some((entry, etag)))
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     async fn write_table_entry(
         &self,
         entry: TableEntry,
@@ -1690,6 +1698,10 @@ where
         Ok(config)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn put_table_bucket_maintenance_config(
         &self,
         table_bucket: &str,
@@ -1806,7 +1818,6 @@ where
         &self,
         report: &TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<()> {
-        let report = table_maintenance_report_with_recommended_actions(report.clone());
         let namespace = parse_namespace_for_store(&report.job.namespace)?;
         let table = parse_table_for_store(&report.job.table)?;
         let Some((entry, _)) = self
@@ -1820,20 +1831,27 @@ where
                 table.as_str()
             )));
         };
-        validate_table_maintenance_report_owner(&report, &report.job.table_bucket, &namespace, &table, &entry.table_id)?;
-        let job_path = self.paths.table_maintenance_job_path(
-            &report.job.table_bucket,
-            &namespace,
-            &table,
-            &report.job.table_id,
-            &report.job.job_id,
-        );
+        self.put_table_metadata_maintenance_report_for_entry(report, &entry).await
+    }
+
+    async fn put_table_metadata_maintenance_report_for_entry(
+        &self,
+        report: &TableMetadataMaintenanceReport,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<()> {
+        let report = table_maintenance_report_with_recommended_actions(report.clone());
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        validate_table_maintenance_report_owner(&report, &entry.table_bucket, &namespace, &table, &entry.table_id)?;
+        let job_path =
+            self.paths
+                .table_maintenance_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id, &report.job.job_id);
         let latest_job_path =
             self.paths
-                .table_maintenance_latest_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
+                .table_maintenance_latest_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id);
         let current_job_path =
             self.paths
-                .table_maintenance_current_job_path(&report.job.table_bucket, &namespace, &table, &report.job.table_id);
+                .table_maintenance_current_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id);
         self.write_entry(self.catalog_bucket(), &job_path, &report, TableCatalogPutPrecondition::Any)
             .await?;
         self.write_entry(self.catalog_bucket(), &latest_job_path, &report, TableCatalogPutPrecondition::Any)
@@ -2149,7 +2167,7 @@ where
                         before_status,
                         before_quarantined_object_count,
                     );
-                    self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+                    self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
                     report
                 }
                 TableMaintenanceSchedulerPreflight::Complete(report) => *report,
@@ -2262,7 +2280,7 @@ where
                 before_status,
                 before_quarantined_object_count,
             );
-            self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+            self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
             report
         };
 
@@ -2373,6 +2391,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance worker lease expired",
                     TableMaintenanceAuditAction::WorkerLeaseExpired,
@@ -2384,6 +2403,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance scheduler lease expired",
                     TableMaintenanceAuditAction::SchedulerLeaseExpired,
@@ -2547,7 +2567,7 @@ where
                 before_status,
                 before_quarantined_object_count,
             );
-            self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+            self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
 
             let delete = matches!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
             (report, effective, delete)
@@ -2613,6 +2633,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance worker lease expired",
                     TableMaintenanceAuditAction::WorkerLeaseExpired,
@@ -2627,6 +2648,7 @@ where
                 }
                 self.expire_table_maintenance_job(
                     current,
+                    context.entry,
                     now,
                     "maintenance scheduler lease expired",
                     TableMaintenanceAuditAction::SchedulerLeaseExpired,
@@ -2729,13 +2751,14 @@ where
             Some(TableMetadataMaintenanceJobStatus::Running),
             before_quarantined_object_count,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
         Ok(report)
     }
 
     async fn expire_table_maintenance_job(
         &self,
         mut report: TableMetadataMaintenanceReport,
+        entry: &TableEntry,
         now: OffsetDateTime,
         reason: &str,
         action: TableMaintenanceAuditAction,
@@ -2755,7 +2778,7 @@ where
             before_status,
             before_quarantined_object_count,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, entry).await?;
         Ok(report)
     }
 
@@ -2832,7 +2855,8 @@ where
             None,
             None,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, control.entry)
+            .await?;
         Ok(report)
     }
 
@@ -2909,7 +2933,8 @@ where
             None,
             None,
         );
-        self.put_table_metadata_maintenance_report_unfenced(&report).await?;
+        self.put_table_metadata_maintenance_report_for_entry(&report, control.entry)
+            .await?;
         Ok(report)
     }
 
@@ -3006,6 +3031,10 @@ where
         table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn commit_table_compaction(
         &self,
         table_bucket: &str,
@@ -3559,6 +3588,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
         &self,
         table_bucket: &str,
@@ -3573,6 +3606,10 @@ where
             .await
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(crate) async fn run_table_metadata_maintenance(
         &self,
         table_bucket: &str,
@@ -3754,6 +3791,10 @@ where
         Ok(report)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub(in crate::table_catalog) async fn delete_table_metadata_maintenance_report(
         &self,
         table_bucket: &str,

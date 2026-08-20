@@ -317,15 +317,15 @@ pub struct SizeSummary {
     /// Number of delete markers
     pub delete_markers: usize,
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Replica size
-    pub replica_size: usize,
+    pub replica_size: i64,
     /// Replica count
     pub replica_count: usize,
     /// Pending count
@@ -334,19 +334,21 @@ pub struct SizeSummary {
     pub failed_count: usize,
     /// Replication target stats
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
+    /// Per-tier accounting, keyed by storage class or remote tier name
+    pub tier_stats: HashMap<String, TierStats>,
 }
 
 /// Replication target size summary
 #[derive(Debug, Default, Clone)]
 pub struct ReplTargetSizeSummary {
     /// Replicated size
-    pub replicated_size: usize,
+    pub replicated_size: i64,
     /// Replicated count
     pub replicated_count: usize,
     /// Pending size
-    pub pending_size: usize,
+    pub pending_size: i64,
     /// Failed size
-    pub failed_size: usize,
+    pub failed_size: i64,
     /// Pending count
     pub pending_count: usize,
     /// Failed count
@@ -710,28 +712,6 @@ impl DataUsageEntry {
         self.children.insert(hash.key());
     }
 
-    pub fn add_sizes(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size;
-        self.versions += summary.versions;
-        self.delete_markers += summary.delete_markers;
-        self.obj_sizes.add(summary.total_size as u64);
-        self.obj_versions.add(summary.versions as u64);
-
-        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-        replication_stats.replica_size += summary.replica_size as u64;
-        replication_stats.replica_count += summary.replica_count as u64;
-
-        for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
-            tgt_stat.pending_size += st.pending_size as u64;
-            tgt_stat.failed_size += st.failed_size as u64;
-            tgt_stat.replicated_size += st.replicated_size as u64;
-            tgt_stat.replicated_count += st.replicated_count as u64;
-            tgt_stat.failed_count += st.failed_count as u64;
-            tgt_stat.pending_count += st.pending_count as u64;
-        }
-    }
-
     pub fn merge(&mut self, other: &DataUsageEntry) {
         self.objects += other.objects;
         self.versions += other.versions;
@@ -870,6 +850,157 @@ pub struct DataUsageCacheInfo {
     pub snapshot_complete: bool,
 }
 
+/// Prefix-level usage over a raw entry map — the shared core behind
+/// [`DataUsageCache::prefix_usage`], usable by any cache-shaped reader (the
+/// scanner's writer-side cache has the same map type).
+///
+/// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+/// names come straight off the child keys — no reverse mapping exists or is
+/// needed. A compacted prefix carries its aggregate but no children, which
+/// the `compacted` flag reports so callers can say why the breakdown is
+/// empty. `truncated` is set when the breakdown exceeded `max_entries` and
+/// was cut (largest first).
+pub fn prefix_usage_in_cache(
+    cache: &HashMap<String, DataUsageEntry>,
+    bucket: &str,
+    prefix: &str,
+    max_entries: usize,
+) -> Option<PrefixUsageQuery> {
+    let prefix = prefix.trim_matches('/');
+    let root = if prefix.is_empty() {
+        bucket.to_string()
+    } else {
+        format!("{bucket}/{prefix}")
+    };
+    let entry = cache.get(&hash_path(&root).key())?.clone();
+
+    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
+
+    let child_prefix = format!("{root}/");
+    let mut sub_prefixes: Vec<PrefixUsageEntry> = entry
+        .children
+        .iter()
+        .filter_map(|child_key| {
+            let child = cache.get(child_key)?;
+            let child_flat = flatten_entry(cache, child, 1)?;
+            // Child keys are literal `bucket/pre/name` paths; a trailing
+            // slash marks a directory object and is display-only here.
+            let name = child_key
+                .strip_prefix(child_prefix.as_str())
+                .unwrap_or(child_key.as_str())
+                .trim_end_matches('/')
+                .to_string();
+            Some(PrefixUsageEntry {
+                prefix: name,
+                usage: PrefixUsageSummary::from_entry(&child_flat),
+            })
+        })
+        .collect();
+    sub_prefixes.sort_by(|left, right| {
+        right
+            .usage
+            .size
+            .cmp(&left.usage.size)
+            .then_with(|| left.prefix.cmp(&right.prefix))
+    });
+    let truncated = sub_prefixes.len() > max_entries;
+    sub_prefixes.truncate(max_entries);
+
+    Some(PrefixUsageQuery {
+        usage,
+        compacted: entry.compacted,
+        truncated,
+        sub_prefixes,
+    })
+}
+
+/// Maximum subtree depth [`flatten_entry`] will walk before declaring the
+/// cache corrupt — the same bound the scanner's checked flatten uses.
+const PREFIX_USAGE_MAX_DEPTH: usize = 1024;
+
+/// Flatten one entry's subtree into an aggregate: the free-function twin of
+/// [`DataUsageCache::flatten`], carrying the scanner checked-flatten
+/// hardening so a corrupt cache (cycles, over-deep trees, overflowing
+/// counters) yields `None` instead of unbounded recursion or wrapped totals.
+fn flatten_entry(cache: &HashMap<String, DataUsageEntry>, root: &DataUsageEntry, depth: usize) -> Option<DataUsageEntry> {
+    if depth > PREFIX_USAGE_MAX_DEPTH {
+        return None;
+    }
+    let mut flattened = DataUsageEntry::default();
+    if !flattened.checked_merge(root) {
+        return None;
+    }
+    flattened.compacted = root.compacted;
+    // The root itself is not pre-seeded: it is merged above, and a corrupt
+    // child edge pointing back at the root's own key is still terminated by
+    // the visited set on first encounter.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<(&String, usize)> = root.children.iter().map(|child| (child, depth + 1)).collect();
+    while let Some((key, child_depth)) = pending.pop() {
+        if child_depth > PREFIX_USAGE_MAX_DEPTH || !visited.insert(key.as_str()) {
+            return None;
+        }
+        let entry = cache.get(key)?;
+        if !flattened.checked_merge(entry) {
+            return None;
+        }
+        pending.extend(entry.children.iter().map(|child| (child, child_depth + 1)));
+    }
+    flattened.children.clear();
+    Some(flattened)
+}
+
+/// Flattened counters of one prefix subtree, as returned by
+/// [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageSummary {
+    pub size: u64,
+    pub objects: u64,
+    pub versions: u64,
+    pub delete_markers: u64,
+}
+
+impl PrefixUsageSummary {
+    fn from_entry(entry: &DataUsageEntry) -> Self {
+        Self {
+            size: entry.size as u64,
+            objects: entry.objects as u64,
+            versions: entry.versions as u64,
+            delete_markers: entry.delete_markers as u64,
+        }
+    }
+
+    /// Add another set's counters into this one (entries are partitioned by
+    /// set, so per-set results sum).
+    pub fn merge(&mut self, other: &Self) {
+        self.size = self.size.saturating_add(other.size);
+        self.objects = self.objects.saturating_add(other.objects);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+    }
+}
+
+/// One first-level sub-prefix row of a [`PrefixUsageQuery`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PrefixUsageEntry {
+    pub prefix: String,
+    pub usage: PrefixUsageSummary,
+}
+
+/// Result of [`DataUsageCache::prefix_usage`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefixUsageQuery {
+    pub usage: PrefixUsageSummary,
+    /// The prefix entry was compacted by the scanner: its aggregate is valid
+    /// but no sub-prefix breakdown exists on disk.
+    pub compacted: bool,
+    /// The breakdown had more entries than `max_entries`; the largest remain.
+    pub truncated: bool,
+    pub sub_prefixes: Vec<PrefixUsageEntry>,
+}
+
 /// Read-only projection of a scanner-written `.usage-cache.bin` file.
 ///
 /// The scanner-side `DataUsageCache` (`crates/scanner/src/data_usage_define.rs`)
@@ -995,6 +1126,21 @@ impl DataUsageCache {
             Some(due) => due.compacted,
             None => false,
         }
+    }
+
+    /// Prefix-level usage for one bucket subtree, plus the one-level
+    /// breakdown below it (rustfs/backlog#1872, MinIO
+    /// `loadPrefixUsageFromBackend` parity and beyond: arbitrary prefixes and
+    /// full counters instead of first-level sizes only).
+    ///
+    /// Cache keys are cleaned literal paths (`bucket/pre/fix`), so sub-prefix
+    /// names come straight off the child keys — no reverse mapping exists or
+    /// is needed. A compacted prefix carries its aggregate but no children,
+    /// which the `compacted` flag reports so callers can say why the
+    /// breakdown is empty. `truncated` is set when the breakdown exceeded
+    /// `max_entries` and was cut (largest first).
+    pub fn prefix_usage(&self, bucket: &str, prefix: &str, max_entries: usize) -> Option<PrefixUsageQuery> {
+        prefix_usage_in_cache(&self.cache, bucket, prefix, max_entries)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
@@ -1556,14 +1702,6 @@ impl BucketUsageInfo {
     }
 
     /// Add size summary to this bucket usage
-    pub fn add_size_summary(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size as u64;
-        self.versions_count += summary.versions as u64;
-        self.delete_markers_count += summary.delete_markers as u64;
-        self.replica_size += summary.replica_size as u64;
-        self.replica_count += summary.replica_count as u64;
-    }
-
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
         self.size += other.size;
@@ -1609,29 +1747,32 @@ impl SizeSummary {
         Self::default()
     }
 
-    /// Add another SizeSummary to this one
+    /// Add another SizeSummary to this one.
+    ///
+    /// Saturating throughout: a scan that overflows a counter should report the
+    /// ceiling rather than panic in a debug build or wrap in a release one.
     pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size += other.total_size;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.replicated_size += other.replicated_size;
-        self.replicated_count += other.replicated_count;
-        self.pending_size += other.pending_size;
-        self.failed_size += other.failed_size;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-        self.pending_count += other.pending_count;
-        self.failed_count += other.failed_count;
+        self.total_size = self.total_size.saturating_add(other.total_size);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+        self.replicated_size = self.replicated_size.saturating_add(other.replicated_size);
+        self.replicated_count = self.replicated_count.saturating_add(other.replicated_count);
+        self.pending_size = self.pending_size.saturating_add(other.pending_size);
+        self.failed_size = self.failed_size.saturating_add(other.failed_size);
+        self.replica_size = self.replica_size.saturating_add(other.replica_size);
+        self.replica_count = self.replica_count.saturating_add(other.replica_count);
+        self.pending_count = self.pending_count.saturating_add(other.pending_count);
+        self.failed_count = self.failed_count.saturating_add(other.failed_count);
 
         // Merge replication target stats
         for (target, stats) in &other.repl_target_stats {
             let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size += stats.replicated_size;
-            entry.replicated_count += stats.replicated_count;
-            entry.pending_size += stats.pending_size;
-            entry.failed_size += stats.failed_size;
-            entry.pending_count += stats.pending_count;
-            entry.failed_count += stats.failed_count;
+            entry.replicated_size = entry.replicated_size.saturating_add(stats.replicated_size);
+            entry.replicated_count = entry.replicated_count.saturating_add(stats.replicated_count);
+            entry.pending_size = entry.pending_size.saturating_add(stats.pending_size);
+            entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
+            entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
+            entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
         }
     }
 }
@@ -1898,6 +2039,126 @@ mod tests {
         );
     }
 
+    /// Build a cache shaped like `bucket/{a,b/{c,d}},bucket/loose` with
+    /// distinct counters so aggregation is observable.
+    fn prefix_usage_fixture_cache() -> DataUsageCache {
+        let mut cache = DataUsageCache::default();
+        let mut insert = |path: &str, parent: &str, size: usize, objects: usize, versions: usize, delete_markers: usize| {
+            cache.replace(
+                path,
+                parent,
+                DataUsageEntry {
+                    size,
+                    objects,
+                    versions,
+                    delete_markers,
+                    ..Default::default()
+                },
+            );
+        };
+        insert("bucket", "", 0, 0, 0, 0);
+        insert("bucket/a", "bucket", 100, 1, 1, 0);
+        insert("bucket/b", "bucket", 0, 0, 0, 0);
+        insert("bucket/b/c", "bucket/b", 200, 2, 2, 1);
+        insert("bucket/b/d", "bucket/b", 40, 1, 3, 0);
+        insert("bucket/loose", "bucket", 10, 1, 1, 1);
+        cache
+    }
+
+    #[test]
+    fn prefix_usage_aggregates_bucket_root_and_one_level_below() {
+        let cache = prefix_usage_fixture_cache();
+
+        let root = cache
+            .prefix_usage("bucket", "", 100)
+            .expect("root query must find the bucket entry");
+        assert_eq!(root.usage.size, 350, "root aggregate flattens the whole subtree");
+        assert_eq!(root.usage.objects, 5);
+        assert_eq!(root.usage.versions, 7);
+        assert_eq!(root.usage.delete_markers, 2);
+        assert!(!root.compacted);
+        assert!(!root.truncated);
+        // Breakdown is one level: b (240) before a (100) before loose (10),
+        // each flattened to its own subtree total.
+        let names: Vec<(&str, u64)> = root
+            .sub_prefixes
+            .iter()
+            .map(|entry| (entry.prefix.as_str(), entry.usage.size))
+            .collect();
+        assert_eq!(names, vec![("b", 240), ("a", 100), ("loose", 10)]);
+    }
+
+    #[test]
+    fn prefix_usage_drills_into_arbitrary_prefixes() {
+        let cache = prefix_usage_fixture_cache();
+
+        let b = cache.prefix_usage("bucket", "b", 100).expect("nested prefix must resolve");
+        assert_eq!(b.usage.size, 240);
+        assert_eq!(b.usage.versions, 5);
+        let names: Vec<&str> = b.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["c", "d"]);
+
+        // Prefix slashes are normalized away.
+        let slashed = cache.prefix_usage("bucket", "/b/", 100).expect("slash-insensitive lookup");
+        assert_eq!(slashed.usage.size, 240);
+
+        assert!(cache.prefix_usage("bucket", "absent", 100).is_none(), "unknown prefix must be a miss");
+        assert!(cache.prefix_usage("other", "", 100).is_none(), "unknown bucket must be a miss");
+    }
+
+    #[test]
+    fn prefix_usage_reports_and_respects_truncation() {
+        let cache = prefix_usage_fixture_cache();
+        let capped = cache.prefix_usage("bucket", "", 2).expect("root query");
+        assert!(capped.truncated, "three children capped to two must flag truncation");
+        let names: Vec<&str> = capped.sub_prefixes.iter().map(|entry| entry.prefix.as_str()).collect();
+        assert_eq!(names, vec!["b", "a"], "largest prefixes survive the cut");
+    }
+
+    #[test]
+    fn prefix_usage_marks_compacted_entries() {
+        let mut cache = DataUsageCache::default();
+        cache.replace(
+            "bucket",
+            "",
+            DataUsageEntry {
+                size: 999,
+                objects: 9,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+
+        let compacted = cache.prefix_usage("bucket", "", 100).expect("compacted root resolves");
+        assert!(compacted.compacted, "compaction must be visible to callers");
+        assert_eq!(compacted.usage.size, 999);
+        assert!(compacted.sub_prefixes.is_empty(), "a compacted entry carries no children");
+    }
+
+    #[test]
+    fn prefix_usage_rejects_cyclic_and_dangling_caches() {
+        // A self-referencing child (corrupt cache) must yield a miss for the
+        // whole query, not unbounded recursion.
+        let mut cache = prefix_usage_fixture_cache();
+        if let Some(entry) = cache.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b".to_string());
+        }
+        assert!(cache.prefix_usage("bucket", "b", 100).is_none(), "a cyclic subtree must be rejected");
+        // The unaffected sibling still answers.
+        assert!(cache.prefix_usage("bucket", "a", 100).is_some());
+
+        // A child key with no entry (dangling link) is rejected rather than
+        // silently dropped: half a tree would under-report usage.
+        let mut dangling = prefix_usage_fixture_cache();
+        if let Some(entry) = dangling.cache.get_mut("bucket/b") {
+            entry.children.insert("bucket/b/ghost".to_string());
+        }
+        assert!(
+            dangling.prefix_usage("bucket", "b", 100).is_none(),
+            "a dangling child link must be rejected"
+        );
+    }
+
     #[test]
     fn hash_path_uses_portable_slash_semantics() {
         for (input, expected) in [
@@ -2055,6 +2316,64 @@ mod tests {
         assert_eq!(usage1.size, 300);
         assert_eq!(usage1.objects_count, 30);
         assert_eq!(usage1.versions_count, 15);
+    }
+
+    #[test]
+    fn size_summary_add_saturates_instead_of_overflowing() {
+        // The scanner folds one summary per object into a per-prefix total, so a
+        // counter at its ceiling must stay there rather than panic in a debug
+        // build or wrap in a release one (backlog#1828).
+        let mut summary = SizeSummary {
+            total_size: usize::MAX,
+            versions: usize::MAX,
+            replicated_size: i64::MAX,
+            pending_size: i64::MAX,
+            failed_size: i64::MAX,
+            replica_size: i64::MAX,
+            ..Default::default()
+        };
+        summary.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: i64::MAX,
+                pending_size: i64::MAX,
+                failed_size: i64::MAX,
+                ..Default::default()
+            },
+        );
+
+        let mut increment = SizeSummary {
+            total_size: 1,
+            versions: 1,
+            replicated_size: 1,
+            pending_size: 1,
+            failed_size: 1,
+            replica_size: 1,
+            ..Default::default()
+        };
+        increment.repl_target_stats.insert(
+            "arn".to_string(),
+            ReplTargetSizeSummary {
+                replicated_size: 1,
+                pending_size: 1,
+                failed_size: 1,
+                ..Default::default()
+            },
+        );
+
+        summary.add(&increment);
+
+        assert_eq!(summary.total_size, usize::MAX);
+        assert_eq!(summary.versions, usize::MAX);
+        assert_eq!(summary.replicated_size, i64::MAX);
+        assert_eq!(summary.pending_size, i64::MAX);
+        assert_eq!(summary.failed_size, i64::MAX);
+        assert_eq!(summary.replica_size, i64::MAX);
+
+        let target = summary.repl_target_stats.get("arn").expect("target survives the merge");
+        assert_eq!(target.replicated_size, i64::MAX);
+        assert_eq!(target.pending_size, i64::MAX);
+        assert_eq!(target.failed_size, i64::MAX);
     }
 
     #[test]

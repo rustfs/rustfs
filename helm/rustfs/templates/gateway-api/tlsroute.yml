@@ -1,0 +1,25 @@
+{{- if and .Values.gatewayApi.enabled .Values.gatewayApi.listeners.tls.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ include "rustfs.fullname" . }}-tlsroute
+  namespace: {{ .Release.Namespace }}
+spec:
+  parentRefs:
+    {{- if .Values.gatewayApi.existingGateway.name }}
+    - name: {{ .Values.gatewayApi.existingGateway.name }}
+      {{- if .Values.gatewayApi.existingGateway.namespace }}
+      namespace: {{ .Values.gatewayApi.existingGateway.namespace }}
+      {{- end }}
+      sectionName: {{ .Values.gatewayApi.listeners.tls.name }}
+    {{- else }}
+    - name: {{ include "rustfs.fullname" $ }}-gateway
+      sectionName: {{ .Values.gatewayApi.listeners.tls.name }}
+    {{- end }}
+  hostnames:
+    - {{ .Values.gatewayApi.hostname }}
+  rules:
+    - backendRefs:
+        - name: {{ include "rustfs.fullname" . }}-svc
+          port: {{ .Values.gatewayApi.listeners.tls.backendPort | default .Values.service.console.port }}
+{{- end }}

@@ -68,7 +68,6 @@ pub fn is_env_set(key: &str) -> bool {
 }
 
 /// Returns a list of all proxy-related environment variables and their current values.
-#[allow(dead_code)]
 pub fn get_all_proxy_env_vars() -> Vec<(String, String)> {
     let vars = [
         ENV_TRUSTED_PROXY_ENABLED,

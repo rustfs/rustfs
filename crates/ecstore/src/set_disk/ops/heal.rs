@@ -16,6 +16,7 @@ use super::super::*;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
 use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -453,7 +454,9 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let write_lock_guard = if !opts.no_lock {
+        // Bound, not `_`: this guard must live to the end of the scope. A bare
+        // `_` would drop it here and release the namespace write lock.
+        let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self.new_ns_lock(bucket, object).await?;
             Some(
                 ns_lock
@@ -996,7 +999,7 @@ impl SetDisks {
                                                 readers.push(None);
                                                 continue;
                                             }
-                                            Err(e) => {
+                                            Err(_e) => {
                                                 readers.push(None);
                                                 continue;
                                             }
@@ -1545,6 +1548,9 @@ impl SetDisks {
 
         for candidate in candidates.iter_mut().filter(|candidate| candidate.local_payload) {
             for (disk_index, disk) in disks.iter().enumerate() {
+                // Only the #[cfg(test)] fault-injection branch below reads this.
+                #[cfg(not(test))]
+                let _ = disk_index;
                 let Some(disk) = disk else {
                     return Ok(DanglingDeleteSafety::UnsafeToDelete);
                 };
@@ -1716,6 +1722,10 @@ impl SetDisks {
         Ok((result, None))
     }
 
+    #[allow(
+        dead_code,
+        reason = "lock-taking wrapper over the live heal_object_dir_locked; only comments reference it (backlog#1823)"
+    )]
     #[tracing::instrument(level = "trace", skip(self), fields(bucket = %bucket, object = %object))]
     pub(in crate::set_disk) async fn heal_object_dir(
         &self,
@@ -2048,11 +2058,61 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         Err(Error::DiskNotFound)
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the set layer
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
+    #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        let started_at = std::time::Instant::now();
+        let _write_lock_guard = if !opts.no_lock {
+            let ns_lock = self.new_ns_lock(bucket, object).await?;
+            Some(
+                ns_lock
+                    .get_write_lock(get_lock_acquire_timeout())
+                    .await
+                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
+            )
+        } else {
+            None
+        };
+
+        let removed = if opts.dry_run {
+            self.dry_run_reclaim_orphan_data_dirs(bucket, object).await?
+        } else {
+            self.reclaim_orphan_data_dirs(bucket, object).await?
+        };
+        let state = if opts.dry_run && removed > 0 {
+            "dry_run_matched"
+        } else if removed > 0 {
+            "reclaimed"
+        } else {
+            "checked"
+        };
+        let data_dirs = u64::try_from(removed).unwrap_or(u64::MAX);
+
+        trace_emit(|| {
+            TraceEvent::new(TraceKind::Heal, TraceFunc::HealCheckAbandonedParts)
+                .with_bucket(bucket)
+                .with_object(object)
+                .with_duration(started_at.elapsed())
+                .with_attr("state", state)
+                .with_attr("dry_run", opts.dry_run)
+                .with_attr("data_dirs", data_dirs)
+        });
+
+        if removed > 0 {
+            trace!(
+                event = "heal_abandoned_parts",
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                state = if opts.dry_run { "dry_run_matched" } else { "reclaimed" },
+                result = "ok",
+                bucket,
+                object,
+                dry_run = opts.dry_run,
+                data_dirs = removed,
+                "Heal abandoned parts checked object data directories"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -3236,5 +3296,224 @@ mod heal_result_report_tests {
         assert!(result.detail.contains("no-parity object is unrecoverable"));
         assert!(result.detail.contains("part 1"));
         assert!(result.detail.contains("bitrot_failure=true"));
+    }
+
+    // HS-12 (backlog#1874): a versioned DELETE racing an object heal must never
+    // resurrect the deleted version. The heal has real reconstruction work (a
+    // shard of the doomed version is removed), so both sides touch the same
+    // (bucket, object, data_dir); whichever order the ns write lock serializes
+    // them in, the committed delete must win.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_racing_version_delete_never_resurrects_the_deleted_version() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-race-delete-no-resurrect";
+        let object = "object.bin";
+        set.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("versioned bucket should be created");
+
+        let mut first_reader = PutObjReader::from_vec(vec![0x11; 1024 * 1024]);
+        let first_info = set
+            .put_object(
+                bucket,
+                object,
+                &mut first_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first version should be written");
+        let first_version = first_info
+            .version_id
+            .expect("versioned put should return the first version id")
+            .to_string();
+
+        let mut second_reader = PutObjReader::from_vec(vec![0x22; 1024 * 1024]);
+        let second_info = set
+            .put_object(
+                bucket,
+                object,
+                &mut second_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second version should be written");
+        let second_version = second_info
+            .version_id
+            .expect("versioned put should return the second version id")
+            .to_string();
+
+        // Damage one shard of the doomed version so the racing heal performs an
+        // actual reconstruction over its data dir instead of an early exit.
+        let doomed_source = disks[0]
+            .read_version("", bucket, object, &first_version, &ReadOptions::default())
+            .await
+            .expect("doomed version metadata should be readable");
+        let doomed_data_dir = doomed_source
+            .data_dir
+            .expect("non-inline version should have a data directory");
+        tokio::fs::remove_file(
+            temp_dirs[1]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(doomed_data_dir.to_string())
+                .join("part.1"),
+        )
+        .await
+        .expect("shard damage should be injected before the race");
+
+        let delete_set = set.clone();
+        let (delete_res, heal_res) = tokio::join!(
+            async {
+                delete_set
+                    .delete_object(
+                        bucket,
+                        object,
+                        ObjectOptions {
+                            versioned: true,
+                            version_id: Some(first_version.clone()),
+                            object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                            ))),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            },
+            async {
+                set.heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+            },
+        );
+        delete_res.expect("version delete must succeed under lock serialization");
+        // The heal may legitimately report a transient failure when the version
+        // it was rebuilding disappears mid-flight; only the end state matters.
+        drop(heal_res);
+
+        let resurrected = set
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(first_version.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&resurrected, Err(Error::FileVersionNotFound) | Err(Error::ObjectNotFound(..))),
+            "a racing heal must not resurrect the deleted version: {resurrected:?}"
+        );
+
+        let survivor = set
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(second_version.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("surviving version must remain readable after the race");
+        assert_eq!(survivor.size, 1024 * 1024, "survivor size must be intact");
+    }
+
+    // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
+    // the same object. The overwrite's post-commit tail deletes the replaced
+    // data dir without the ns lock (object.rs commit tail), which is exactly
+    // the intersection the audit flagged: the heal must tolerate the tail race
+    // (retryable outcome) and every committed overwrite must survive — the
+    // final current version is exactly the last payload written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_racing_unversioned_overwrites_preserves_the_last_commit() {
+        let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-race-put-overwrite";
+        let object = "object.bin";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        const ROUNDS: usize = 8;
+        const PAYLOAD_SIZE: usize = 256 * 1024;
+        let mut last_etag = String::new();
+        for round in 0..ROUNDS {
+            // Give the heal something to rebuild on alternating rounds: remove a
+            // shard of the current data dir right before the race.
+            if round % 2 == 1 {
+                let current = disks[2]
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("current metadata should be readable");
+                if let Some(data_dir) = current.data_dir {
+                    let shard = temp_dirs[3]
+                        .path()
+                        .join(bucket)
+                        .join(object)
+                        .join(data_dir.to_string())
+                        .join("part.1");
+                    if shard.exists() {
+                        tokio::fs::remove_file(&shard)
+                            .await
+                            .expect("shard damage should be injectable mid-race");
+                    }
+                }
+            }
+
+            let payload = vec![round as u8; PAYLOAD_SIZE];
+            let mut put_reader = PutObjReader::from_vec(payload);
+            let put_opts = ObjectOptions::default();
+            let heal_opts = HealOpts {
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            };
+            let (put_res, heal_res) = tokio::join!(
+                set.put_object(bucket, object, &mut put_reader, &put_opts),
+                set.heal_object(bucket, object, "", &heal_opts),
+            );
+            let put_info = put_res.expect("overwrite must succeed under lock serialization");
+            last_etag = put_info.etag.clone().unwrap_or_default();
+            // Heal outcome is unconstrained (may hit the tail race and report a
+            // retryable error); the invariant is checked on the end state.
+            drop(heal_res);
+        }
+
+        let final_info = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("object must remain readable after the race loop");
+        assert_eq!(
+            final_info.size, PAYLOAD_SIZE as i64,
+            "final current version must be the last committed overwrite"
+        );
+        assert_eq!(
+            final_info.etag.unwrap_or_default(),
+            last_etag,
+            "the racing heal loop must never leave a stale or resurrected current version"
+        );
     }
 }

@@ -22,7 +22,7 @@ use s3s::Body;
 
 const STREAMING_SIGN_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_SIGN_TRAILER_ALGORITHM: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
-const STREAMING_PAYLOAD_HDR: &str = "AWS4-HMAC-SHA256-PAYLOAD";
+const _STREAMING_PAYLOAD_HDR: &str = "AWS4-HMAC-SHA256-PAYLOAD";
 const _STREAMING_TRAILER_HDR: &str = "AWS4-HMAC-SHA256-TRAILER";
 const _PAYLOAD_CHUNK_SIZE: i64 = 64 * 1024;
 const _CHUNK_SIGCONST_LEN: i64 = 17;
@@ -51,15 +51,14 @@ fn streaming_fail(request: request::Request<Body>, error: SignV4Error) -> Stream
     Err(Box::new(StreamingSignFailure { request, error }))
 }
 
-#[allow(dead_code)]
-fn try_build_chunk_string_to_sign(
+fn _try_build_chunk_string_to_sign(
     t: OffsetDateTime,
     region: &str,
     previous_sig: &str,
     chunk_check_sum: &str,
 ) -> Result<String, SignV4Error> {
     let mut string_to_sign_parts = <Vec<String>>::new();
-    string_to_sign_parts.push(STREAMING_PAYLOAD_HDR.to_string());
+    string_to_sign_parts.push(_STREAMING_PAYLOAD_HDR.to_string());
     let format = format_description!("[year][month][day]T[hour][minute][second]Z");
     string_to_sign_parts.push(
         t.format(&format)
@@ -79,7 +78,7 @@ fn _try_build_chunk_signature(
     previous_signature: &str,
     secret_access_key: &str,
 ) -> Result<String, SignV4Error> {
-    let chunk_string_to_sign = try_build_chunk_string_to_sign(req_time, region, previous_signature, chunk_check_sum)?;
+    let chunk_string_to_sign = _try_build_chunk_string_to_sign(req_time, region, previous_signature, chunk_check_sum)?;
     let signing_key = get_signing_key(secret_access_key, region, req_time, SERVICE_TYPE_S3);
     Ok(get_signature(signing_key, &chunk_string_to_sign))
 }

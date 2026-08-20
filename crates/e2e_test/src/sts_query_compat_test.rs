@@ -25,7 +25,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
-use serial_test::serial;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
@@ -350,7 +349,6 @@ impl Drop for OpaMock {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
     init_logging();
 
@@ -487,7 +485,6 @@ async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sts_assume_role_opa_contract() -> TestResult {
     init_logging();
 
@@ -559,7 +556,6 @@ async fn test_sts_assume_role_opa_contract() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_list_buckets_opa_contract() -> TestResult {
     init_logging();
 
@@ -645,7 +641,6 @@ async fn test_list_buckets_opa_contract() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sts_and_list_buckets_fail_closed_while_opa_is_initializing() -> TestResult {
     init_logging();
 
@@ -662,7 +657,6 @@ async fn test_sts_and_list_buckets_fail_closed_while_opa_is_initializing() -> Te
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sts_and_list_buckets_fail_closed_after_opa_validation_failure() -> TestResult {
     init_logging();
 
@@ -679,7 +673,6 @@ async fn test_sts_and_list_buckets_fail_closed_after_opa_validation_failure() ->
 }
 
 #[tokio::test]
-#[serial]
 async fn test_sts_query_rate_limit_error_is_aws_sdk_compatible() -> TestResult {
     init_logging();
 

@@ -14,8 +14,13 @@
 
 use std::any::Any;
 
+use uuid::Uuid;
+
 use crate::storage_api::DeletedObject;
-use crate::{MrfOpKind, MrfReplicateEntry, ReplicationState, ReplicationType, ReplicationWorkerOperation};
+use crate::{
+    MrfOpKind, MrfReplicateEntry, NULL_VERSION_ID, REPLICATE_EXISTING_DELETE, ReplicateObjectInfo, ReplicationState,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct DeletedObjectReplicationInfo {
@@ -117,17 +122,114 @@ pub fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Opti
     !(is_not_found || matches!(code, Some("MethodNotAllowed" | "405")))
 }
 
+/// Build the delete-replication work item for an existing delete marker or
+/// version purge discovered during a resync scan.
+pub fn resync_existing_delete_replication_info(roi: &ReplicateObjectInfo, target_arn: &str) -> DeletedObjectReplicationInfo {
+    let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
+        (None, roi.version_id)
+    } else {
+        (roi.version_id, None)
+    };
+
+    DeletedObjectReplicationInfo {
+        delete_object: DeletedObject {
+            object_name: roi.name.clone(),
+            delete_marker_version_id: dm_version_id,
+            version_id,
+            replication_state: roi.replication_state.clone(),
+            delete_marker: roi.delete_marker,
+            delete_marker_mtime: roi.mod_time,
+            ..Default::default()
+        },
+        bucket: roi.bucket.clone(),
+        event_type: REPLICATE_EXISTING_DELETE.to_string(),
+        op_type: ReplicationType::ExistingObject,
+        target_arn: target_arn.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Whether a delete replication fully succeeded — the MRF replay acknowledges
+/// (drops) an entry exactly when this returns true.
+///
+/// The delayed purge is deliberately NOT an input: holding the outcome hostage
+/// to it (`&& !requires_delayed_purge`) forced `false` for every delete-marker
+/// entry and retained them all in the durable MRF journal forever. Purge
+/// failures persist their own purge-intent entry instead
+/// (`watch_and_purge_source_delete_marker`), and replays of those entries
+/// report purge success through `purge_stale_delete_marker_targets`.
+pub fn replicate_delete_outcome(
+    expected_targets: usize,
+    replicated_targets: usize,
+    state_persisted: bool,
+    source_state_verified: bool,
+    replication_status: &ReplicationStatusType,
+) -> bool {
+    expected_targets > 0
+        && replicated_targets == expected_targets
+        && state_persisted
+        && source_state_verified
+        && *replication_status == ReplicationStatusType::Completed
+}
+
+pub fn target_delete_version_id(version_id: Uuid, version_purge: bool) -> Option<String> {
+    if version_id.is_nil() {
+        version_purge.then(|| NULL_VERSION_ID.to_string())
+    } else {
+        Some(version_id.to_string())
+    }
+}
+
+/// Which version a delete-marker purge should address on one target.
+///
+/// `None` means do not purge at all: the recorded mapping disagreed across the
+/// dual internal prefixes, and guessing an id could destroy a live version on
+/// the target. `Some(id)` is the exact version the target reported when it
+/// accepted the marker; falling back to a source-derived id is only correct
+/// when the target mirrors source version ids, which a generic S3 target does
+/// not.
+pub fn delete_marker_purge_version_id(
+    state: Option<&ReplicationState>,
+    arn: &str,
+    delete_marker_version_id: Uuid,
+) -> Option<Option<String>> {
+    if state.is_some_and(|state| state.target_delete_marker_version_ids_corrupt) {
+        return None;
+    }
+    let recorded = state.and_then(|state| state.target_delete_marker_version_ids.get(arn).cloned());
+    Some(match recorded {
+        Some(version_id) => Some(version_id),
+        None => target_delete_version_id(delete_marker_version_id, true),
+    })
+}
+
+/// Shape an exhausted purge intent as a marker-creation delete entry. Replay
+/// reconstructs it with `delete_marker: true`, finds the source marker gone,
+/// and funnels into the stale-marker branch of `replicate_delete_with_outcome`
+/// — which re-runs the purge without touching source state and reports purge
+/// success as the replay outcome.
+pub fn delete_marker_purge_mrf_entry(dobj: &DeletedObjectReplicationInfo, failed_arns: Vec<String>) -> MrfReplicateEntry {
+    let mut entry = dobj.to_mrf_entry();
+    entry.delete_marker = true;
+    entry.version_id = None;
+    entry.retry_count = 0;
+    entry.target_arns = failed_arns;
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::{
-        DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
-        should_retry_delete_marker_purge,
+        DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
+        is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome,
+        should_retry_delete_marker_purge, target_delete_version_id,
     };
     use crate::storage_api::DeletedObject;
     use crate::{
-        MrfOpKind, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, VersionPurgeStatusType,
+        MrfOpKind, NULL_VERSION_ID, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+        VersionPurgeStatusType,
     };
     use uuid::Uuid;
 
@@ -327,5 +429,101 @@ mod tests {
         assert!(!is_retryable_delete_replication_head_error(false, Some("MethodNotAllowed")));
         assert!(!is_retryable_delete_replication_head_error(true, Some("NoSuchKey")));
         assert!(is_retryable_delete_replication_head_error(false, Some("AccessDenied")));
+    }
+
+    /// P1-21 regression guard for the outcome formula. A fully successful
+    /// delete-marker replication must acknowledge its MRF entry: the formula
+    /// once carried `&& !requires_delayed_purge`, which pinned every
+    /// delete-marker entry to Missed and retained the whole backlog forever.
+    /// (Deterministically staging a marker-creation entry in the durable
+    /// journal from e2e would require saturating the worker queues, so the
+    /// formula is pinned here instead; the purge-intent replay half is pinned
+    /// by the delayed-purge e2e pair.)
+    #[test]
+    fn test_replicate_delete_outcome_is_not_held_hostage_by_the_delayed_purge() {
+        assert!(
+            replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Completed),
+            "a completed delete-marker replication must be acknowledgeable even though a delayed purge watch is pending"
+        );
+        assert!(!replicate_delete_outcome(0, 0, true, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(2, 1, true, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, false, true, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, true, false, &ReplicationStatusType::Completed));
+        assert!(!replicate_delete_outcome(1, 1, true, true, &ReplicationStatusType::Failed));
+    }
+
+    #[test]
+    fn test_delete_marker_purge_mrf_entry_replays_through_the_stale_marker_branch() {
+        let delete_marker_version_id = Uuid::new_v4();
+        let dobj = DeletedObjectReplicationInfo {
+            delete_object: DeletedObject {
+                object_name: "doc.txt".to_string(),
+                // A version-purge flavored source event: the entry must still
+                // be reshaped as a marker-creation delete so replay funnels
+                // into the stale-marker branch instead of re-running the full
+                // delete replication (whose source-state stamping would fail
+                // against the already-purged version).
+                delete_marker: false,
+                version_id: Some(Uuid::new_v4()),
+                delete_marker_version_id: Some(delete_marker_version_id),
+                ..Default::default()
+            },
+            bucket: "bucket-a".to_string(),
+            ..Default::default()
+        };
+
+        let entry = delete_marker_purge_mrf_entry(&dobj, vec!["arn:a".to_string()]);
+
+        assert!(entry.delete_marker, "purge intents must replay as marker-creation deletes");
+        assert_eq!(entry.version_id, None, "the purged data version must not leak into the replay");
+        assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
+        assert_eq!(
+            entry.target_arns,
+            vec!["arn:a".to_string()],
+            "only the targets whose purge failed may be retried"
+        );
+        assert_eq!(entry.retry_count, 0);
+        assert_eq!(entry.bucket, "bucket-a");
+        assert_eq!(entry.object, "doc.txt");
+    }
+
+    #[test]
+    fn target_delete_version_id_preserves_explicit_null_purges() {
+        let version_id = Uuid::new_v4();
+
+        assert_eq!(target_delete_version_id(version_id, true), Some(version_id.to_string()));
+        assert_eq!(target_delete_version_id(Uuid::nil(), true).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(target_delete_version_id(Uuid::nil(), false), None);
+    }
+
+    #[test]
+    fn delete_marker_purge_prefers_the_recorded_target_version() {
+        let source = Uuid::new_v4();
+        let arn = "arn:rustfs:replication::target:bucket";
+
+        // No recorded mapping: fall back to deriving from the source uuid.
+        assert_eq!(delete_marker_purge_version_id(None, arn, source), Some(Some(source.to_string())));
+
+        // Recorded mapping wins — a generic S3 target assigns its own id, so the
+        // derived one would purge the wrong version or nothing at all.
+        let mut state = ReplicationState::default();
+        state
+            .target_delete_marker_version_ids
+            .insert(arn.to_string(), "target-assigned-id".to_string());
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), arn, source),
+            Some(Some("target-assigned-id".to_string()))
+        );
+
+        // A mapping recorded for a different ARN must not be reused.
+        assert_eq!(
+            delete_marker_purge_version_id(Some(&state), "arn:rustfs:replication::other:bucket", source),
+            Some(Some(source.to_string()))
+        );
+
+        // Inconsistent persisted metadata: refuse to purge rather than guess.
+        let mut corrupt = state.clone();
+        corrupt.target_delete_marker_version_ids_corrupt = true;
+        assert_eq!(delete_marker_purge_version_id(Some(&corrupt), arn, source), None);
     }
 }

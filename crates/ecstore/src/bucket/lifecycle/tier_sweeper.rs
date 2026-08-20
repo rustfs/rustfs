@@ -177,9 +177,10 @@ fn should_record_remote_delete_failure(err: &std::io::Error) -> bool {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 struct ObjSweeper {
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     object: String,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     bucket: String,
     version_id: Option<Uuid>,
     versioned: bool,
@@ -191,9 +192,9 @@ struct ObjSweeper {
     remote_object: String,
 }
 
-#[allow(dead_code)]
 impl ObjSweeper {
     #[allow(clippy::new_ret_no_self)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub async fn new(bucket: &str, object: &str) -> Result<Self, std::io::Error> {
         Ok(Self {
             object: object.into(),
@@ -202,17 +203,20 @@ impl ObjSweeper {
         })
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
         self.version_id = vid.clone();
         self
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_versioning(&mut self, versioned: bool, suspended: bool) -> &Self {
         self.versioned = versioned;
         self.suspended = suspended;
         self
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn get_opts(&self) -> lifecycle::ObjectOpts {
         let mut opts = ObjectOpts {
             version_id: self.version_id.clone(),
@@ -226,6 +230,7 @@ impl ObjSweeper {
         opts
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn set_transition_state(&mut self, info: TransitionedObject) {
         self.transition_tier = info.tier;
         self.transition_status = info.status;
@@ -266,6 +271,7 @@ impl ObjSweeper {
         None
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub async fn sweep(&self, api: Arc<ECStore>) {
         let Some(je) = self.should_remove_remote_object() else {
             return;
@@ -385,6 +391,10 @@ impl ExpiryOp for Jentry {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
     let result = delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await;
     if let Err(err) = &result
@@ -395,6 +405,10 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
     result
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
     #[cfg(test)]
     if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, tier_name) {
@@ -405,6 +419,10 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
     delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, &tier_config_mgr).await
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 async fn delete_object_from_remote_tier_raw_with_manager(
     obj_name: &str,
     rv_id: &str,
@@ -485,6 +503,10 @@ pub enum RemoteTierDeleteOutcome {
     AlreadyRemoved,
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn delete_object_from_remote_tier_idempotent(
     obj_name: &str,
     rv_id: &str,

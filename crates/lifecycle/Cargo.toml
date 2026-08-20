@@ -67,7 +67,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 
 [dev-dependencies]
-metrics-util = { version = "0.20", features = ["debugging"] }
+metrics-util = { workspace = true, features = ["debugging"] }
 proptest = "1"
 serial_test.workspace = true
 temp-env.workspace = true

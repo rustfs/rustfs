@@ -22,6 +22,18 @@ Use the automated path when you want the lab to:
 - upload a predefined SSE fixture case
 - export the generated backend tree into the lab layout
 
+## Networks without Docker Hub access
+
+`capture_via_docker.sh` pulls its two base images from Docker Hub by default. Where that registry is unreachable, point the build at mirrors carrying the same content — quay.io publishes the MinIO releases and public.ecr.aws mirrors the official Python images:
+
+```bash
+MINIO_LAB_MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
+MINIO_LAB_PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim \
+./capture_via_docker.sh
+```
+
+Pin the MinIO tag to the same release the Dockerfile names; an unpinned `:latest` captures whatever format that day's build writes, which is not what the interop tests were validated against.
+
 ## Layout
 
 The default root is `artifacts/minio-fixture-lab`, which is already ignored by the repository.

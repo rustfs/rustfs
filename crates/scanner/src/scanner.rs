@@ -1425,10 +1425,6 @@ fn maintenance_inspection_decision(generation: u64, current_generation: u64, att
     }
 }
 
-fn single_disk_default_cycle_secs(_features: ScannerMaintenanceFeatures) -> Option<u64> {
-    None
-}
-
 fn single_disk_default_speed() -> ScannerSpeed {
     ScannerSpeed::Default
 }
@@ -1592,9 +1588,12 @@ async fn configure_scanner_defaults(
                     scanner_maintenance_generation(),
                 )
             });
-        let default_cycle_secs = single_disk_default_cycle_secs(features);
+        // Single-disk keeps the speed-preset-derived default cycle (60s at the
+        // `default` preset) instead of a special shorter cycle: no measured
+        // cold-start ILM latency basis for an override, and clean-idle backoff
+        // already stretches idle cadence. Decision record: backlog#1878 (HS-16).
         set_scanner_default_speed(single_disk_default_speed());
-        set_scanner_default_cycle_secs(default_cycle_secs);
+        set_scanner_default_cycle_secs(None);
         info!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_RUNTIME_CONFIG,
@@ -1603,7 +1602,6 @@ async fn configure_scanner_defaults(
             env_speed = ENV_SCANNER_SPEED,
             env_cycle = ENV_SCANNER_CYCLE,
             env_start_delay = ENV_SCANNER_START_DELAY_SECS,
-            ?default_cycle_secs,
             lifecycle_active = features.lifecycle,
             replication_active = features.replication,
             feature_inspection_failed = features.inspection_failed,
@@ -4574,7 +4572,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_randomized_cycle_delay_keeps_configured_start_delay() {
         // 120s with ±10% jitter should stay clearly above the historic 30s cap.
         let delay = randomized_cycle_delay_for(Duration::from_secs(120));
@@ -4593,7 +4590,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_uses_configured_start_delay() {
         let delay = initial_scanner_delay_for(Some(120));
         assert!(delay >= Duration::from_secs(108));
@@ -4613,14 +4609,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
         assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
         let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
         assert!(delay >= Duration::from_secs(108));
@@ -4628,14 +4622,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
         let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
         assert_eq!(delay, Duration::ZERO);
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
         // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
         // from a crash are healed on the first cycle, not after a 27-33 min sleep.
@@ -4644,7 +4636,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
         // Active replication but no buckets → no objects to scan, keep normal delay.
         let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
@@ -6958,11 +6949,6 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_default_cycle_uses_speed_based_interval_without_maintenance_features() {
-        assert_eq!(single_disk_default_cycle_secs(ScannerMaintenanceFeatures::default()), None);
-    }
-
-    #[test]
     fn test_single_disk_default_speed_uses_regular_scanner_default() {
         assert_eq!(single_disk_default_speed(), ScannerSpeed::Default);
     }
@@ -7399,7 +7385,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn clean_idle_cap_allows_policy_max_when_bitrot_is_disabled() {
         let config = ScannerRuntimeConfig {
             bitrot_cycle: None,
@@ -7421,39 +7406,6 @@ mod tests {
         with_var("RUSTFS_HEAL_OBJECT_SELECT_PROB", Some("1024"), || {
             assert_eq!(scanner_clean_idle_max_interval(Duration::from_secs(60), &config), Duration::from_secs(60));
         });
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_for_lifecycle() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                lifecycle: true,
-                ..Default::default()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_for_replication() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                replication: true,
-                ..Default::default()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn test_single_disk_default_cycle_preserves_regular_cycle_on_inspection_failure() {
-        assert_eq!(
-            single_disk_default_cycle_secs(ScannerMaintenanceFeatures {
-                inspection_failed: true,
-                ..Default::default()
-            }),
-            None
-        );
     }
 
     #[test]
@@ -7515,7 +7467,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_randomized_cycle_delay_handles_small_start_delay() {
         // 0 is treated as minimum 1 second before jitter, with lower bound preserved.
         let delay = randomized_cycle_delay_for(Duration::from_secs(0));
@@ -8174,7 +8125,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_scan_complete_marks_deep_idle() {
         let started_at = Utc::now();
         let info = BackgroundHealInfo {
@@ -8192,7 +8142,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_scan_complete_leaves_normal_scan_unchanged() {
         let info = BackgroundHealInfo {
             bitrot_start_time: Some(Utc::now()),
@@ -8204,7 +8153,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
         let info = BackgroundHealInfo {
             bitrot_start_time: Some(Utc::now()),

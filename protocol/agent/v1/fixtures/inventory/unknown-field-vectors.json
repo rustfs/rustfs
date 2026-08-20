@@ -1,0 +1,230 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "unknown-field-vectors",
+  "description": "Unknown optional members and unknown coarse flag tokens. Every one is accepted, discarded before validation, never persisted, never echoed back, and never logged in raw form. Every vector here carries the same content hash as the valid fixture's fully populated snapshot, which is the executable statement that an unknown member cannot influence stored inventory. The discarded list is bookkeeping: its membership is the contract, not its order.",
+  "baseVector": "fully populated snapshot",
+  "baseContentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+  "vectors": [
+    {
+      "name": "one unknown optional member from a newer agent",
+      "category": "unknown-field",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["cluster.degraded", "drive.offline"],
+        "telemetryProfile": "extended"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": ["telemetryProfile"],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "unknown optional members of every JSON type at once",
+      "category": "unknown-field",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["cluster.degraded", "drive.offline"],
+        "erasureSetSize": 12,
+        "experimentalFlags": { "fastInventory": true },
+        "regionHints": ["eu-west", "us-east"],
+        "supersededBy": null,
+        "telemetryProfile": "extended"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [
+          "erasureSetSize",
+          "experimentalFlags",
+          "regionHints",
+          "supersededBy",
+          "telemetryProfile"
+        ],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "unknown member nested inside osVersion",
+      "category": "unknown-field",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": {
+          "family": "linux",
+          "major": 6,
+          "minor": 8,
+          "distribution": "debian",
+          "kernelRelease": "6.8.0-41-generic"
+        },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["cluster.degraded", "drive.offline"]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": ["osVersion.distribution", "osVersion.kernelRelease"],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "coarse flag tokens this Connect does not know",
+      "category": "unknown-field",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": [
+          "cluster.degraded",
+          "drive.offline",
+          "rebalance.pending",
+          "tier.transition.stalled"
+        ]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [
+          "coarseFlags[rebalance.pending]",
+          "coarseFlags[tier.transition.stalled]"
+        ],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    },
+    {
+      "name": "near-miss member names are unknown because matching is exact and case sensitive",
+      "category": "unknown-field",
+      "sameContentHashAs": "fully populated snapshot",
+      "input": {
+        "protocolVersion": "v1",
+        "rustfsVersion": "1.4.2",
+        "osVersion": { "family": "linux", "major": 6, "minor": 8 },
+        "nodeCount": 8,
+        "driveCount": 96,
+        "capacityTotalBytes": 1099511627776,
+        "capacityUsedBytes": 412316860416,
+        "coarseFlags": ["cluster.degraded", "drive.offline"],
+        "RustfsVersion": "1.4.2",
+        "capacityFreeBytes": 687194767360,
+        "capacity_used_bytes": 412316860416,
+        "nodeCounts": 8
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "reason": null,
+        "httpStatus": null,
+        "retained": [
+          "protocolVersion",
+          "rustfsVersion",
+          "osVersion",
+          "nodeCount",
+          "driveCount",
+          "capacityTotalBytes",
+          "capacityUsedBytes",
+          "coarseFlags"
+        ],
+        "discarded": [
+          "RustfsVersion",
+          "capacityFreeBytes",
+          "capacity_used_bytes",
+          "nodeCounts"
+        ],
+        "defaultsApplied": {},
+        "canonicalJson": "{\"capacityTotalBytes\":1099511627776,\"capacityUsedBytes\":412316860416,\"coarseFlags\":[\"cluster.degraded\",\"drive.offline\"],\"driveCount\":96,\"nodeCount\":8,\"osVersion\":{\"family\":\"linux\",\"major\":6,\"minor\":8},\"rustfsVersion\":\"1.4.2\"}",
+        "contentHash": "e1cba9f30a26b94bb289a8a4b630a704dafaeb4960bffd38cef98e3d2581518f",
+        "echoedBack": [],
+        "stored": [],
+        "logged": []
+      }
+    }
+  ]
+}

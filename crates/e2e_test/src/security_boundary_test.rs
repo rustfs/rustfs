@@ -25,7 +25,6 @@ use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_put, init_
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Tag, Tagging};
-use serial_test::serial;
 use std::error::Error;
 use tracing::info;
 
@@ -36,7 +35,6 @@ use tracing::info;
 /// far beyond that limit and assert the server rejects it with the specific
 /// error, rather than accepting an arbitrarily large control-plane body.
 #[tokio::test]
-#[serial]
 async fn test_large_xml_body_rejection() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -92,7 +90,6 @@ async fn test_large_xml_body_rejection() -> Result<(), Box<dyn Error + Send + Sy
 
 /// Excessive multipart parts must be rejected.
 #[tokio::test]
-#[serial]
 async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -149,7 +146,6 @@ async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + S
 /// (last-writer-wins, no torn/garbage state) and that it is absent after a
 /// subsequent delete.
 #[tokio::test]
-#[serial]
 async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -232,7 +228,6 @@ async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send 
 /// pattern used by the other admin-API E2E tests in this crate; the test is
 /// skipped when `awscurl` is not installed.
 #[tokio::test]
-#[serial]
 async fn test_tiering_url_validation() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     if !awscurl_available() {

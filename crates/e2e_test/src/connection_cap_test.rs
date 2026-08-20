@@ -18,7 +18,6 @@
 //! concurrency — a queued connection is served only after a held one closes.
 
 use crate::common::{RustFSTestEnvironment, init_logging};
-use serial_test::serial;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -57,7 +56,6 @@ async fn read_response_head(stream: &mut TcpStream, dur: Duration) -> Option<Str
 }
 
 #[tokio::test]
-#[serial]
 async fn connection_cap_releases_permits_on_close() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -89,7 +87,6 @@ async fn open_and_stall(addr: &str) -> std::io::Result<TcpStream> {
 }
 
 #[tokio::test]
-#[serial]
 async fn connection_cap_blocks_excess_connections_until_permits_free() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;

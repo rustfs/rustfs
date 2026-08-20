@@ -450,6 +450,10 @@ impl VaultRestoreClient {
             address: target.address.clone(),
             namespace: target.namespace.clone(),
             attempt_timeout: kms_config.effective_timeout(),
+            // A restore target carries no TLS settings, so certificates are
+            // always verified: recovery is the last path that should accept an
+            // unauthenticated Vault.
+            skip_tls_verify: false,
         };
         let source = token_source_for(&target.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(

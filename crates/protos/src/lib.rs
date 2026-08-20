@@ -2433,7 +2433,7 @@ mod tests {
                 json_field: "opts",
                 bin_field: "opts_bin",
             },
-            json_encoder: "let opts_str = compat_json(opts)?;",
+            json_encoder: "let encoded_opts = compat_json(opts).and_then(|opts_str| encode_msgpack(opts).map(|opts_bin| (opts_str, opts_bin)));",
             policy: RequestJsonPolicy::MsgpackOnlyEligible,
         },
         RequestCompatSendSite {
@@ -2557,7 +2557,7 @@ mod tests {
 
     fn production_source(source: &'static str, file_name: &str) -> &'static str {
         source
-            .split("\n#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
     }

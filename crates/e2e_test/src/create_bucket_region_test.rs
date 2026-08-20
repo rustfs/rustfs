@@ -25,13 +25,11 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
-    use serial_test::serial;
     use std::error::Error;
 
     /// `CreateBucket` with a `LocationConstraint` body must pass SigV4 validation
     /// and create the bucket, mirroring `minio-go` `MakeBucket(bucket, "us-east-1")`.
     #[tokio::test]
-    #[serial]
     async fn test_create_bucket_with_us_east_1_location_constraint() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;
@@ -62,7 +60,6 @@ mod tests {
     /// A plain `CreateBucket` (no body) must also succeed; guards against a
     /// regression where an empty body would be hashed incorrectly during SigV4.
     #[tokio::test]
-    #[serial]
     async fn test_create_bucket_without_location_constraint() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         let mut env = RustFSTestEnvironment::new().await?;

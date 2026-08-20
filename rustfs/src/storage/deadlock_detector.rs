@@ -56,7 +56,6 @@
 //! ```
 
 // Allow dead_code for public API that may be used by external modules or future features
-#![allow(dead_code)]
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -264,6 +263,10 @@ pub struct ResourceUsage {
 /// Deadlock detector.
 pub struct DeadlockDetector {
     /// Configuration.
+    #[allow(
+        dead_code,
+        reason = "policy snapshot retained beside the detector it configures (backlog#1823)"
+    )]
     config: RequestHangDetectionPolicy,
     /// Shared concurrency facade policy.
     policy: DeadlockMonitorPolicy,

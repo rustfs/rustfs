@@ -17,7 +17,6 @@
 use crate::common::{RustFSTestEnvironment, admin_request, awscurl_delete, awscurl_get, awscurl_put, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
-use serial_test::serial;
 use tracing::info;
 
 fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
@@ -84,7 +83,6 @@ async fn update_group_members_rejects_invalid_new_group_names() -> Result<(), Bo
 
 /// Test that deleting a group with members fails, and deleting an empty group succeeds.
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -144,7 +142,6 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
 /// Test that a user with only group membership (no explicit user policy) gets group policies
 /// and can perform actions allowed by the group (regression test for #2028.1).
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
@@ -212,7 +209,6 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
 /// Test that after deleting a user who was the only member of a group, the group can be deleted
 /// (regression test for #2028.2: delete group uses backend membership, not stale cache).
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_after_deleting_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();

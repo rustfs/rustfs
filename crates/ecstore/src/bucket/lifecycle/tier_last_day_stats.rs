@@ -80,7 +80,10 @@ impl LastDayTierStats {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
         let mut cm = m;

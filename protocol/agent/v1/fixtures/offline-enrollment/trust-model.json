@@ -1,0 +1,299 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "offline-enrollment",
+    "fixture": "trust-model",
+    "description": "The frozen offline trust model: how an air-gapped device and Connect authenticate signed artifacts to each other without a network, a certificate, or trust on first use. R05 (the RustFS CLI) and R07 (the bundle writer) implement against this file; api/tests/Feature/Diagnostics/OfflineTrustFixtureTest.php replays it.",
+    "signature": {
+        "signatureAlgorithm": "ES256",
+        "curve": "P-256",
+        "hash": "SHA-256",
+        "signatureEncoding": "fixed-width-r-s",
+        "signatureLengthBytes": 64,
+        "signatureTransferEncoding": "base64url-unpadded",
+        "signatureValuePattern": "^[A-Za-z0-9_-]{86}$",
+        "lowSRequired": true,
+        "groupOrder": "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        "maxS": "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8",
+        "publicKeyEncoding": "sec1-uncompressed",
+        "publicKeyLengthBytes": 65,
+        "publicKeyTransferEncoding": "base64url-unpadded",
+        "subjectPublicKeyInfoDerPrefix": "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+        "keyIdAlgorithm": "SHA-256",
+        "keyIdOver": "DER SubjectPublicKeyInfo",
+        "keyIdEncoding": "lowercase-hex",
+        "keyIdPattern": "^[0-9a-f]{64}$",
+        "documentTransferEncoding": "base64-padded"
+    },
+    "domainSeparation": {
+        "rule": "signatureInput = domainSeparationTag || 0x00 || the exact raw octets of the signed document as transmitted",
+        "separatorByte": "0x00",
+        "tagEncoding": "US-ASCII, no terminator beyond the single 0x00 separator",
+        "reserialisationPermitted": false,
+        "canonicalisationPermitted": false,
+        "note": "A verifier never parses, re-encodes, re-indents, reorders, or normalises a document before verifying it. It hashes the bytes it received. Parsing happens only after the signature over those exact bytes has verified.",
+        "tags": {
+            "trustLink": "rustfs-offline-trust-link-v1",
+            "enrollmentChallenge": "rustfs-offline-enrollment-challenge-v1",
+            "enrollmentResponse": "rustfs-offline-enrollment-response-v1",
+            "supportBundleManifest": "rustfs-support-bundle-v1"
+        }
+    },
+    "verifierMustReject": [
+        "A signature that is not exactly 64 octets of fixed-width r||s.",
+        "A DER or any other ASN.1 encoded signature, even when it decodes to the same r and s.",
+        "A signature encoded with the standard base64 alphabet or with = padding.",
+        "A signature whose r or s is zero, or is greater than or equal to the group order.",
+        "A signature whose s is greater than half the group order, even though such a signature verifies mathematically. ECDSA is malleable and only the low-S form is a canonical artifact identity.",
+        "An algorithm value other than ES256, including a downgrade to a hash other than SHA-256.",
+        "A public key that is not a 65 octet uncompressed SEC1 point on P-256, and any compressed or hybrid point form.",
+        "A keyId that is not the lowercase SHA-256 hex of the DER SubjectPublicKeyInfo built from the accompanying public key.",
+        "A signature checked against re-serialised, re-indented, key-reordered, or otherwise regenerated document bytes rather than the received octets.",
+        "A document that verifies under one domain separation tag being accepted for another artifact type."
+    ],
+    "rejectedSignatureEncodings": [
+        {
+            "name": "high-S signature over an otherwise valid challenge",
+            "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpntPLpXsi_cR64KPVuzhr7nK1Q3Xrg4lu7qctp1IVhQnQ",
+            "acceptedByALenientVerifier": true,
+            "reason": "SIGNATURE_NOT_CANONICAL",
+            "note": "The malleated pair (r, n - s) of a valid signature. Every ECDSA library accepts it, which is exactly why the encoding rule and not the library has to reject it."
+        },
+        {
+            "name": "DER encoded signature",
+            "value": "MEUCIQCOINXhbLzVbCpDCXFWoXR4VOH2MQycPeaRRYHleoaamQIgEsNFp03QI7lR9cKkTHlBGJGSw07u3weWCUbwTdsK1LQ",
+            "acceptedByALenientVerifier": true,
+            "reason": "SIGNATURE_MALFORMED",
+            "note": "The same r and s in ASN.1. A verifier that hands whatever it decoded to its library accepts it; this surface has exactly one signature encoding."
+        },
+        {
+            "name": "padded base64url signature",
+            "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpkSw0WnTdAjuVH1wqRMeUEYkZLDTu7fB5YJRvBN2wrUtA==",
+            "acceptedByALenientVerifier": true,
+            "reason": "SIGNATURE_MALFORMED",
+            "note": "The same 64 octets with = padding. Two spellings of one signature would make the signature useless as an artifact identity."
+        },
+        {
+            "name": "truncated signature",
+            "value": "jiDV4Wy81WwqQwlxVqF0eFTh9jEMnD3mkUWB5XqGmpkSw0WnTdAjuVH1wqRMeUEYkZLDTu7fB5YJRvBN",
+            "acceptedByALenientVerifier": false,
+            "reason": "SIGNATURE_MALFORMED",
+            "note": "Sixty octets. Left-padding it back to 64 would change r, so a verifier must reject rather than repair."
+        },
+        {
+            "name": "zero r and zero s",
+            "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "acceptedByALenientVerifier": false,
+            "reason": "SIGNATURE_MALFORMED",
+            "note": "Well formed in length and alphabet, and out of range in value."
+        }
+    ],
+    "verificationOrder": {
+        "principle": "Parse as late as the verification key allows, and treat anything read before the signature verified as untrusted routing information rather than as a fact.",
+        "enrollmentChallenge": {
+            "note": "A challenge carries its own chain, so the CLI must read structure before it can verify anything. The pre-parse yields only trustChain, connectKeyId, and issuedAt, and none of them is believed: the chain has to close on a pinned root, and the challenge signature has to verify, before any other field is used.",
+            "steps": [
+                "check the signature encoding",
+                "pre-parse the untrusted document for trustChain, connectKeyId, and issuedAt",
+                "reject unless trustChain[0].issuerKeyId is a pinned root",
+                "verify every trust link against its issuer and its validity at issuedAt",
+                "reject unless connectKeyId is the subject of the last link",
+                "verify the challenge signature over the received octets",
+                "only now read protocolVersion, then formatVersion",
+                "check the freshness window"
+            ]
+        },
+        "enrollmentResponse": {
+            "note": "A response presents the device key it is enrolling, so Connect necessarily reads that key from the document. Proof of possession is what makes it safe: the presented key must be the key that signed the presenting document.",
+            "steps": [
+                "check the signature encoding",
+                "reject unless deviceKeyId is the fingerprint of devicePublicKey and the signature verifies under devicePublicKey",
+                "only now read protocolVersion, then formatVersion",
+                "compare organization, then cluster, against the stored challenge",
+                "compare challengeId, challengeNonce, and challengeProof against the stored challenge",
+                "check the freshness window against producedAt, then against the receive time",
+                "reject a challenge that was already consumed"
+            ]
+        },
+        "supportBundleManifest": {
+            "note": "Connect already knows which device key is effective for a bundle, so nothing has to be parsed to find the verification key. Verification comes first and the manifest is not parsed at all until it has.",
+            "steps": [
+                "check the signature encoding",
+                "resolve the detached signature keyId against the enrolled keys of the named bundle device",
+                "verify the manifest signature over the raw manifest octets",
+                "only now parse the manifest, and read protocolVersion, then formatVersion",
+                "reject unless the manifest deviceKeyId is the key that signed it",
+                "compare organization, cluster, and device against the authorised bundle",
+                "check redactionVersion, then every entry type and classification",
+                "check the freshness window",
+                "reject a replayed nonce"
+            ]
+        }
+    },
+    "trustAnchor": {
+        "trustOnFirstUse": false,
+        "rootLearnedFromArtifact": false,
+        "rootShippedWithArtifact": false,
+        "distribution": "The hosted RustFS enrollment root public key fingerprint is compiled into official RustFS builds. It is never read from a challenge, a bundle, a configuration file, or an operator prompt.",
+        "pinnedRootKeyIds": [
+            "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f"
+        ],
+        "pinnedRootPublicKeys": [
+            {
+                "keyId": "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+                "publicKey": "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s"
+            }
+        ],
+        "chainLinkCount": 2,
+        "maxChainLinkCount": 2,
+        "chainOrder": "index 0 is issued by a pinned root, index 1 is issued by the subject of index 0",
+        "note": "Because no root is ever learned at runtime, an operator cannot be socially engineered into accepting an attacker root, and a stolen intermediate cannot mint its own root. The cost is that a root rollover requires redistributing the RustFS build, which is stated in rollover.root."
+    },
+    "keyHierarchy": [
+        {
+            "role": "enrollment-root",
+            "holder": "RustFS",
+            "algorithm": "ES256",
+            "signs": [
+                "intermediate trust links"
+            ],
+            "maxValiditySeconds": null,
+            "distribution": "pinned in official RustFS builds"
+        },
+        {
+            "role": "intermediate",
+            "holder": "RustFS Connect",
+            "algorithm": "ES256",
+            "signs": [
+                "signing trust links"
+            ],
+            "maxValiditySeconds": 31536000,
+            "distribution": "carried inside every challenge as a signed trust link"
+        },
+        {
+            "role": "signing",
+            "holder": "RustFS Connect",
+            "algorithm": "ES256",
+            "signs": [
+                "enrollment challenges"
+            ],
+            "maxValiditySeconds": 2678400,
+            "distribution": "carried inside every challenge as a signed trust link"
+        },
+        {
+            "role": "device",
+            "holder": "the air-gapped cluster device",
+            "algorithm": "ES256",
+            "signs": [
+                "enrollment responses",
+                "support bundle manifests"
+            ],
+            "maxValiditySeconds": null,
+            "distribution": "generated on the device, never transmitted; only the public point leaves it"
+        }
+    ],
+    "rollover": {
+        "root": {
+            "mechanism": "A new root is pinned by shipping a new official RustFS build. Both the outgoing and the incoming root stay pinned for the overlap window so a device running either build can still enroll.",
+            "maxOverlapSeconds": 31536000,
+            "learnedAtRuntime": false,
+            "consequence": "A device that never takes a new build eventually cannot enroll. That is the accepted cost of refusing trust on first use."
+        },
+        "intermediate": {
+            "mechanism": "Overlapping links. A challenge carries exactly the chain that validated it when it was issued, so a rolled intermediate does not invalidate challenges already in the field.",
+            "maxValiditySeconds": 31536000,
+            "validityEvaluatedAgainst": "the issuedAt of the challenge that carries the link, with no skew tolerance"
+        },
+        "signing": {
+            "mechanism": "Overlapping links, rotated at least monthly.",
+            "maxValiditySeconds": 2678400,
+            "validityEvaluatedAgainst": "the issuedAt of the challenge that carries the link, with no skew tolerance"
+        },
+        "device": {
+            "mechanism": "A device key is durable. Replacing it is a new enrollment: a fresh challenge, a fresh response, and a fresh device public key. There is no in-band device key rotation message.",
+            "maxOverlapSeconds": 604800,
+            "consequence": "The outgoing device key is revoked when the incoming one becomes effective, so a device never has more than one effective offline key."
+        }
+    },
+    "revocation": {
+        "device": {
+            "effect": "immediate",
+            "authority": "Connect, which holds the device key state and evaluates every artifact it receives",
+            "retroactive": true,
+            "note": "An artifact signed before revocation but received after it is still rejected. Revocation is not a validity window and past signatures are not grandfathered.",
+            "reason": "DEVICE_KEY_REVOKED"
+        },
+        "signing": {
+            "effect": "bounded by link validity",
+            "authority": "RustFS Connect",
+            "mechanism": "No CRL and no OCSP: an air-gapped device cannot fetch either, and a revocation list carried inside the artifact would simply be omitted by an attacker. Exposure is bounded by the 31 day signing link validity, and official RustFS builds additionally carry a denylist of revoked keyIds updated with each release."
+        },
+        "intermediate": {
+            "effect": "bounded by link validity",
+            "authority": "RustFS",
+            "mechanism": "Same as signing, bounded by the 365 day intermediate link validity plus the build denylist."
+        },
+        "root": {
+            "effect": "requires redistributing official RustFS builds",
+            "authority": "RustFS",
+            "mechanism": "There is nothing above the root to revoke it. This asymmetry is deliberate and is the reason the root signs nothing except intermediate links."
+        },
+        "asymmetry": "Connect can revoke a device key instantly because Connect holds that state and sees every artifact. A device cannot learn about a revoked Connect key promptly, because it has no network. Every offline-facing key therefore has a short validity instead of a revocation channel."
+    },
+    "clockSkew": {
+        "toleranceSeconds": 300,
+        "deviceClockAuthority": "advisory",
+        "challengeWindow": "accepted while verifierNow is within [issuedAt - 300, expiresAt + 300]",
+        "chainLinkWindow": "each link must satisfy notBefore <= challenge.issuedAt <= notAfter, evaluated with no tolerance because the issuer controls both values",
+        "maxChallengeLifetimeSeconds": 604800,
+        "maxManifestAgeSeconds": 2592000,
+        "maxManifestFutureSkewSeconds": 300,
+        "responseWindow": "producedAt must fall within [challenge.issuedAt - 300, challenge.expiresAt + 300]",
+        "note": "ADR 0003 already treats client clocks as advisory for heartbeat freshness. An air-gapped device is worse: it may have no synchronised clock at all. Every window is therefore evaluated against the Connect clock for artifacts Connect receives, and against the issuer-supplied issuedAt for the chain a device validates locally."
+    },
+    "replay": {
+        "challengeIdSingleUse": true,
+        "consumedChallengeRetention": "until expiresAt + 300 seconds, so a late replay still meets a stored record rather than an empty table",
+        "nonceLengthBytes": 32,
+        "nonceEncoding": "base64url-unpadded",
+        "noncePattern": "^[A-Za-z0-9_-]{43}$",
+        "manifestNonceUniqueness": "unique per organization, cluster, and device for at least maxManifestAgeSeconds",
+        "signatureCanonicality": "Low-S normalisation makes the 64 octet signature a canonical identity for the artifact, so a malleated copy is not a second distinct artifact and cannot slip past deduplication.",
+        "reasons": [
+            "ENROLLMENT_REPLAYED",
+            "BUNDLE_REPLAYED"
+        ]
+    },
+    "versioning": {
+        "protocolVersionRule": "Identical to protocol/agent/v1/authentication.md: protocolVersion is v<major> matching ^v[1-9][0-9]{0,3}$, Connect supports major 1, and anything else fails closed with UNSUPPORTED_PROTOCOL and HTTP 400. Nothing is partially processed.",
+        "supportedMajorVersions": [
+            1
+        ],
+        "protocolVersionPattern": "^v[1-9][0-9]{0,3}$",
+        "formatVersionRule": "formatVersion is matched exactly against the closed list below. An unknown value fails closed with UNSUPPORTED_FORMAT and is never guessed at, prefix-matched, or downgraded.",
+        "supportedFormatVersions": [
+            "rustfs.connect.offline.trustLink/1",
+            "rustfs.connect.offline.enrollmentChallenge/1",
+            "rustfs.connect.offline.enrollmentResponse/1",
+            "rustfs.connect.support.bundleManifest/1"
+        ],
+        "additive": {
+            "unknownOptionalFieldPolicy": "accept-and-discard",
+            "unknownOptionalEntryFieldPolicy": "accept-and-discard",
+            "echoedBack": false,
+            "stored": false,
+            "absentOptionalFieldPolicy": "take the documented default",
+            "requiredFieldsMayBeAdded": false,
+            "existingFieldsMayChangeTypeOrMeaning": false,
+            "signatureImpact": "None. An unknown field is inside the signed octets and is therefore authentic; discarding it after verification cannot change the signature input, because the input is the received bytes and not a projection of the parsed document."
+        },
+        "closedEnumerations": {
+            "note": "Enumerated values are closed and are NOT additive. Only optional fields are additive. An unrecognised enumerated value is a rejection, never a discard, because silently ignoring an unknown classification or entry type would let a producer widen what it collects.",
+            "enumerations": [
+                "signature.algorithm",
+                "trustLink.role",
+                "manifest.entries[].type",
+                "manifest.entries[].classification"
+            ]
+        }
+    }
+}

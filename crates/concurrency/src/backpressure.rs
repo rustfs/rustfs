@@ -14,9 +14,8 @@
 
 //! Shared backpressure policy type.
 //!
-//! The runtime backpressure implementation (byte-watermark pipes and
-//! monitors) lives in `rustfs/src/storage/backpressure.rs`; this module only
-//! carries the watermark policy type that implementation shares.
+//! This module only carries the watermark policy; the admission primitive it
+//! projects into lives in `rustfs-io-core`.
 
 use rustfs_io_core::BackpressureConfig as CoreBackpressureConfig;
 

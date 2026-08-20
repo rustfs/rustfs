@@ -16,7 +16,6 @@ use crate::{MetricName, MetricNamespace, MetricSubsystem, MetricType};
 use std::collections::HashSet;
 
 /// MetricDescriptor - Metric descriptors
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MetricDescriptor {
     pub name: MetricName,
@@ -52,7 +51,6 @@ impl MetricDescriptor {
     }
 
     /// Get the full metric name in Prometheus style: <namespace>_<subsystem>_<name>
-    #[allow(dead_code)]
     pub fn get_full_metric_name(&self) -> String {
         let namespace = self.namespace.as_str();
         let formatted_subsystem = self.subsystem.as_str();
@@ -61,7 +59,6 @@ impl MetricDescriptor {
     }
 
     /// check whether the label is in the label set
-    #[allow(dead_code)]
     pub fn has_label(&mut self, label: &str) -> bool {
         self.get_label_set().contains(label)
     }

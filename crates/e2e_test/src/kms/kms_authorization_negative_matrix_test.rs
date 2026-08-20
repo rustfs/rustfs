@@ -35,7 +35,6 @@ use aws_sdk_s3::config::{Config, Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use serial_test::serial;
 use std::time::Duration;
 use tracing::info;
 
@@ -209,7 +208,6 @@ fn disable_body(key_id: &str) -> String {
 
 /// Data-path matrix: SSE-KMS writes and reads are authorized against the resolved key.
 #[tokio::test]
-#[serial]
 async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
     init_logging();
 
@@ -355,7 +353,6 @@ async fn sse_kms_per_key_authorization_negative_matrix() -> TestResult {
 /// Runs without the SSE enforcement switch: admin scoping is unconditional, and
 /// leaving the switch off proves the two planes are independent.
 #[tokio::test]
-#[serial]
 async fn kms_admin_per_key_authorization_negative_matrix() -> TestResult {
     init_logging();
 

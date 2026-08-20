@@ -16,7 +16,6 @@ use crate::common::RustFSTestClusterEnvironment;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use bytes::Bytes;
-use serial_test::serial;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use tracing::{info, warn};
@@ -135,7 +134,6 @@ async fn run_race_iteration(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::common::init_logging();
     info!("Starting conditional PUT race test with auto cluster");
@@ -192,7 +190,6 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-#[serial]
 async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::common::init_logging();
     info!("Starting basic conditional PUT test with auto cluster");

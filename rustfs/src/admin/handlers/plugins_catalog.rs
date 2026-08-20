@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     plugin_contract::{
         PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
         PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
@@ -21,8 +21,7 @@ use crate::admin::{
     router::{AdminOperation, Operation, S3Router},
     runtime_sources::default_admin_usecase,
 };
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
@@ -114,23 +113,15 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
     }
 }
 
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_plugin_catalog_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    Ok(())
 }
 
 fn build_json_response(
@@ -173,6 +164,30 @@ mod tests {
             handler_block.contains("authorize_plugin_catalog_request(&req).await?;"),
             "plugin catalog GET should require admin authorization"
         );
+    }
+
+    /// This endpoint authorizes through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message it has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn plugin_catalog_gate_keeps_its_missing_credentials_message() {
+        let req = s3s::S3Request {
+            input: s3s::Body::from(String::new()),
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/rustfs/admin/v4/plugins/catalog"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = super::authorize_plugin_catalog_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
     }
 
     #[test]

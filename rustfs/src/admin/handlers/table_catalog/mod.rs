@@ -2995,9 +2995,9 @@ fn table_entry_from_create_table_request(
     let CreateTableRequest {
         name,
         location,
-        schema,
-        partition_spec,
-        write_order,
+        mut schema,
+        mut partition_spec,
+        mut write_order,
         stage_create,
         mut properties,
     } = request;
@@ -3030,6 +3030,9 @@ fn table_entry_from_create_table_request(
     validate_table_location_in_bucket(bucket, &warehouse_location)?;
     let metadata_location =
         crate::table_catalog::default_table_metadata_file_path(namespace, &table, &next_metadata_file_name(1, &table_id));
+
+    crate::table_catalog::assign_fresh_create_schema_ids(&mut schema, partition_spec.as_mut(), write_order.as_mut())
+        .map_err(catalog_store_error)?;
 
     let entry = crate::table_catalog::TableEntry {
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,

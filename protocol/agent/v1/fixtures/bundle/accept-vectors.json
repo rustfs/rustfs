@@ -1,0 +1,96 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "bundle",
+    "fixture": "accept-vectors",
+    "description": "Support bundle manifests that verify. The second vector is the load-bearing one: its bytes are deliberately non-canonical, and re-serialising them before verification breaks the signature. bytes is standard padded base64 of the exact raw manifest octets.",
+    "authorisedBundle": {
+        "bundleUid": "0198f3a1-8000-7e50-8f61-4a5b6c7d8e94",
+        "organizationName": "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50",
+        "clusterName": "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50/clusters/0198f3a1-5d00-7b20-9c31-1d2e3f4a5b61",
+        "deviceName": "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50/clusters/0198f3a1-5d00-7b20-9c31-1d2e3f4a5b61/clusterDevices/0198f3a1-6e00-7c30-ad41-2e3f4a5b6c72",
+        "effectiveDeviceKeyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+        "note": "What Connect authorised, read from the support_bundles row and the enrolled device key. Every name in a manifest is compared against this and never trusted on its own."
+    },
+    "vectors": [
+        {
+            "name": "manifest signed by the effective device key",
+            "signerKey": "device",
+            "evaluationTime": "2026-08-21T00:00:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Quc3VwcG9ydC5idW5kbGVNYW5pZmVzdC8xIiwKICAgICJwcm90b2NvbFZlcnNpb24iOiAidjEiLAogICAgImJ1bmRsZVVpZCI6ICIwMTk4ZjNhMS04MDAwLTdlNTAtOGY2MS00YTViNmM3ZDhlOTQiLAogICAgIm9yZ2FuaXphdGlvbk5hbWUiOiAib3JnYW5pemF0aW9ucy8wMTk4ZjNhMS00YzAwLTdhMTAtOGIyMS0wYzFkMmUzZjRhNTAiLAogICAgImNsdXN0ZXJOYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwL2NsdXN0ZXJzLzAxOThmM2ExLTVkMDAtN2IyMC05YzMxLTFkMmUzZjRhNWI2MSIsCiAgICAiZGV2aWNlTmFtZSI6ICJvcmdhbml6YXRpb25zLzAxOThmM2ExLTRjMDAtN2ExMC04YjIxLTBjMWQyZTNmNGE1MC9jbHVzdGVycy8wMTk4ZjNhMS01ZDAwLTdiMjAtOWMzMS0xZDJlM2Y0YTViNjEvY2x1c3RlckRldmljZXMvMDE5OGYzYTEtNmUwMC03YzMwLWFkNDEtMmUzZjRhNWI2YzcyIiwKICAgICJkZXZpY2VLZXlJZCI6ICIzOWNhMjRjOGIwMmE1NTlmZDliZWIyYjFmNWQxOGNlZDIwYzRiYjI0NjU3N2I5MjkxNGFlNjgxNGMzZjcwYWNmIiwKICAgICJub25jZSI6ICI0dE1NQndDY1hqRVUxTEM1cDlNeGJaLTM3VGVZRFFSWWpSanNnbTR5dWUwIiwKICAgICJwcm9kdWNlZEF0IjogIjIwMjYtMDgtMjBUMDk6MzA6MDBaIiwKICAgICJyZWRhY3Rpb25WZXJzaW9uIjogInJ1c3Rmcy5jb25uZWN0LnJlZGFjdGlvbi52MSIsCiAgICAicnVsZXNldEhhc2giOiAiYjM3NDM2ZDhlNzI1MTUzOTRhMTIyZDYzMzg2NWIxZGMwMjhkNGVjZTM0OTM1MmEwYTNhMjNmNTJjYTQyODVmMyIsCiAgICAiY2xhc3NpZmljYXRpb25SZWdpc3RyeVZlcnNpb24iOiAxLAogICAgImVudHJpZXMiOiBbCiAgICAgICAgewogICAgICAgICAgICAicGF0aCI6ICJkaWFnbm9zdGljcy9vZmZsaW5lLXN1bW1hcnkuanNvbiIsCiAgICAgICAgICAgICJ0eXBlIjogIm9mZmxpbmUtZGlhZ25vc3RpYyIsCiAgICAgICAgICAgICJzaXplQnl0ZXMiOiAyMDQ4LAogICAgICAgICAgICAic2hhMjU2IjogIjFkOTY1N2E2N2RmYzEyYTBjNmY5NzQ1ODZjMDQxZDZkY2U2ZjQ4MzNmYjkwZGZhNjBhYWYwYTQ1NWRkYzE2NzkiLAogICAgICAgICAgICAiY2xhc3NpZmljYXRpb24iOiAiTDAiCiAgICAgICAgfSwKICAgICAgICB7CiAgICAgICAgICAgICJwYXRoIjogImRpYWdub3N0aWNzL2hvc3Qtc3VtbWFyeS5qc29uIiwKICAgICAgICAgICAgInR5cGUiOiAib2ZmbGluZS1kaWFnbm9zdGljIiwKICAgICAgICAgICAgInNpemVCeXRlcyI6IDQwOTYsCiAgICAgICAgICAgICJzaGEyNTYiOiAiNDViYjZhMjgxYzk4MzBkOGUxNmQ4NTg3MDA2ODQwMTA0OGY2NDQ0YmFkY2UyMGFhOThlYTNmMGNjMGVkYjIwNCIsCiAgICAgICAgICAgICJjbGFzc2lmaWNhdGlvbiI6ICJMMSIKICAgICAgICB9LAogICAgICAgIHsKICAgICAgICAgICAgInBhdGgiOiAicmVkYWN0aW9uL3JlcG9ydC5qc29uIiwKICAgICAgICAgICAgInR5cGUiOiAicmVkYWN0aW9uLXJlcG9ydCIsCiAgICAgICAgICAgICJzaXplQnl0ZXMiOiA1MTIsCiAgICAgICAgICAgICJzaGEyNTYiOiAiZGFmMWQ2MTUyZmQzNzc1MmNiOTU1ZjQ2ZjM2ZTQ2YTUxZThjMTQ2ZTFiMzcxODE5NDY5NjljMWU1NTE3MzczNiIsCiAgICAgICAgICAgICJjbGFzc2lmaWNhdGlvbiI6ICJMMCIKICAgICAgICB9CiAgICBdCn0K",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+                    "value": "st6Svkk8UgwDMq_8rEomsdIdANyPjqTYFTWPN4FISYor3su27YNRnoWWIyemileZusezfHd8BlxuiSvzJrCcnw"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "organizationMatches": true,
+                "clusterMatches": true,
+                "deviceMatches": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "manifest whose bytes no re-serialiser would reproduce",
+            "signerKey": "device",
+            "evaluationTime": "2026-08-21T00:00:00Z",
+            "document": {
+                "bytes": "ewogICAicHJvdG9jb2xWZXJzaW9uIjogInYxIiwgIAoJImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Quc3VwcG9ydC5idW5kbGVNYW5pZmVzdFwvMSIsCiAgICJlbnRyaWVzIjogWwogICAgICB7ICJzaGEyNTYiOiAiMWQ5NjU3YTY3ZGZjMTJhMGM2Zjk3NDU4NmMwNDFkNmRjZTZmNDgzM2ZiOTBkZmE2MGFhZjBhNDU1ZGRjMTY3OSIsICJjbGFzc2lmaWNhdGlvbiI6ICJMMCIsICJwYXRoIjogImRpYWdub3N0aWNzXC9vZmZsaW5lLXN1bW1hcnkuanNvbiIsICJ0eXBlIjogIm9mZmxpbmUtZGlhZ25vc3RpYyIsICJzaXplQnl0ZXMiOiAyMDQ4IH0sCiAgICAgIHsicGF0aCI6ICJyZWRhY3Rpb25cL3JlcG9ydC5qc29uIiwJInR5cGUiOiAicmVkYWN0aW9uLXJlcG9ydCIsICJzaXplQnl0ZXMiOiA1MTIsICJzaGEyNTYiOiAiZGFmMWQ2MTUyZmQzNzc1MmNiOTU1ZjQ2ZjM2ZTQ2YTUxZThjMTQ2ZTFiMzcxODE5NDY5NjljMWU1NTE3MzczNiIsICJjbGFzc2lmaWNhdGlvbiI6ICJMMCJ9CiAgIF0sCiAgIm5vbmNlIjogIjhEUFJ4TGVVclVzTWdia09MWkJsTE5LMXRmQVFhTHNuVHVWRmxXX0d3ZkEiLCAgIAogICAgICAicHJvZHVjZWRBdCI6ICIyMDI2LTA4LTIwVDA5OjMxOjAwWiIsCiAgICJkZXZpY2VLZXlJZCI6ICIzOWNhMjRjOGIwMmE1NTlmZDliZWIyYjFmNWQxOGNlZDIwYzRiYjI0NjU3N2I5MjkxNGFlNjgxNGMzZjcwYWNmIiwKICAgImJ1bmRsZVVpZCI6ICIwMTk4ZjNhMS04MDAwLTdlNTAtOGY2MS00YTViNmM3ZDhlOTQiLAogICAib3JnYW5pemF0aW9uTmFtZSI6ICJvcmdhbml6YXRpb25zXC8wMTk4ZjNhMS00YzAwLTdhMTAtOGIyMS0wYzFkMmUzZjRhNTAiLAogICAiY2x1c3Rlck5hbWUiOiAib3JnYW5pemF0aW9uc1wvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwXC9jbHVzdGVyc1wvMDE5OGYzYTEtNWQwMC03YjIwLTljMzEtMWQyZTNmNGE1YjYxIiwKICAgImRldmljZU5hbWUiOiAib3JnYW5pemF0aW9uc1wvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwXC9jbHVzdGVyc1wvMDE5OGYzYTEtNWQwMC03YjIwLTljMzEtMWQyZTNmNGE1YjYxXC9jbHVzdGVyRGV2aWNlc1wvMDE5OGYzYTEtNmUwMC03YzMwLWFkNDEtMmUzZjRhNWI2YzcyIiwKICAgInJlZGFjdGlvblZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3QucmVkYWN0aW9uLnYxIiwKCSJydWxlc2V0SGFzaCI6ICJiMzc0MzZkOGU3MjUxNTM5NGExMjJkNjMzODY1YjFkYzAyOGQ0ZWNlMzQ5MzUyYTBhM2EyM2Y1MmNhNDI4NWYzIiwgIAogICAiY2xhc3NpZmljYXRpb25SZWdpc3RyeVZlcnNpb24iOiAxCn0=",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+                    "value": "byAAzj9jJJSXCv50pU2M5ugSES4kgN_DQzY_CFFDG64rXqn8EBApEGH_a2_TodAyArhpoM2HicOmHi_csL11cQ"
+                }
+            },
+            "nonCanonical": {
+                "keyOrderDiffersFromSchema": true,
+                "mixedIndentation": true,
+                "containsTabs": true,
+                "containsTrailingWhitespace": true,
+                "escapesSolidus": true,
+                "entriesOnOneLine": true,
+                "note": "Every one of these survives a signature over the raw octets and none survives a re-serialisation. reject-vectors.json carries the re-serialised copy of exactly this document under the same signature; it must fail."
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "organizationMatches": true,
+                "clusterMatches": true,
+                "deviceMatches": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null
+            }
+        },
+        {
+            "name": "manifest carrying an unknown optional field is accepted and the field is discarded",
+            "signerKey": "device",
+            "evaluationTime": "2026-08-21T00:00:00Z",
+            "document": {
+                "bytes": "ewogICAgImZvcm1hdFZlcnNpb24iOiAicnVzdGZzLmNvbm5lY3Quc3VwcG9ydC5idW5kbGVNYW5pZmVzdC8xIiwKICAgICJwcm90b2NvbFZlcnNpb24iOiAidjEiLAogICAgImJ1bmRsZVVpZCI6ICIwMTk4ZjNhMS04MDAwLTdlNTAtOGY2MS00YTViNmM3ZDhlOTQiLAogICAgIm9yZ2FuaXphdGlvbk5hbWUiOiAib3JnYW5pemF0aW9ucy8wMTk4ZjNhMS00YzAwLTdhMTAtOGIyMS0wYzFkMmUzZjRhNTAiLAogICAgImNsdXN0ZXJOYW1lIjogIm9yZ2FuaXphdGlvbnMvMDE5OGYzYTEtNGMwMC03YTEwLThiMjEtMGMxZDJlM2Y0YTUwL2NsdXN0ZXJzLzAxOThmM2ExLTVkMDAtN2IyMC05YzMxLTFkMmUzZjRhNWI2MSIsCiAgICAiZGV2aWNlTmFtZSI6ICJvcmdhbml6YXRpb25zLzAxOThmM2ExLTRjMDAtN2ExMC04YjIxLTBjMWQyZTNmNGE1MC9jbHVzdGVycy8wMTk4ZjNhMS01ZDAwLTdiMjAtOWMzMS0xZDJlM2Y0YTViNjEvY2x1c3RlckRldmljZXMvMDE5OGYzYTEtNmUwMC03YzMwLWFkNDEtMmUzZjRhNWI2YzcyIiwKICAgICJkZXZpY2VLZXlJZCI6ICIzOWNhMjRjOGIwMmE1NTlmZDliZWIyYjFmNWQxOGNlZDIwYzRiYjI0NjU3N2I5MjkxNGFlNjgxNGMzZjcwYWNmIiwKICAgICJub25jZSI6ICJ6eTg4bmI2QXNQbXZYa2YxR3hwTU1VYnhqcEdGQ2llWkFGQ19XMDFJZUVjIiwKICAgICJwcm9kdWNlZEF0IjogIjIwMjYtMDgtMjBUMDk6MzA6MDBaIiwKICAgICJyZWRhY3Rpb25WZXJzaW9uIjogInJ1c3Rmcy5jb25uZWN0LnJlZGFjdGlvbi52MSIsCiAgICAicnVsZXNldEhhc2giOiAiYjM3NDM2ZDhlNzI1MTUzOTRhMTIyZDYzMzg2NWIxZGMwMjhkNGVjZTM0OTM1MmEwYTNhMjNmNTJjYTQyODVmMyIsCiAgICAiY2xhc3NpZmljYXRpb25SZWdpc3RyeVZlcnNpb24iOiAxLAogICAgImVudHJpZXMiOiBbCiAgICAgICAgewogICAgICAgICAgICAicGF0aCI6ICJkaWFnbm9zdGljcy9vZmZsaW5lLXN1bW1hcnkuanNvbiIsCiAgICAgICAgICAgICJ0eXBlIjogIm9mZmxpbmUtZGlhZ25vc3RpYyIsCiAgICAgICAgICAgICJzaXplQnl0ZXMiOiAyMDQ4LAogICAgICAgICAgICAic2hhMjU2IjogIjFkOTY1N2E2N2RmYzEyYTBjNmY5NzQ1ODZjMDQxZDZkY2U2ZjQ4MzNmYjkwZGZhNjBhYWYwYTQ1NWRkYzE2NzkiLAogICAgICAgICAgICAiY2xhc3NpZmljYXRpb24iOiAiTDAiCiAgICAgICAgfSwKICAgICAgICB7CiAgICAgICAgICAgICJwYXRoIjogImRpYWdub3N0aWNzL2hvc3Qtc3VtbWFyeS5qc29uIiwKICAgICAgICAgICAgInR5cGUiOiAib2ZmbGluZS1kaWFnbm9zdGljIiwKICAgICAgICAgICAgInNpemVCeXRlcyI6IDQwOTYsCiAgICAgICAgICAgICJzaGEyNTYiOiAiNDViYjZhMjgxYzk4MzBkOGUxNmQ4NTg3MDA2ODQwMTA0OGY2NDQ0YmFkY2UyMGFhOThlYTNmMGNjMGVkYjIwNCIsCiAgICAgICAgICAgICJjbGFzc2lmaWNhdGlvbiI6ICJMMSIKICAgICAgICB9LAogICAgICAgIHsKICAgICAgICAgICAgInBhdGgiOiAicmVkYWN0aW9uL3JlcG9ydC5qc29uIiwKICAgICAgICAgICAgInR5cGUiOiAicmVkYWN0aW9uLXJlcG9ydCIsCiAgICAgICAgICAgICJzaXplQnl0ZXMiOiA1MTIsCiAgICAgICAgICAgICJzaGEyNTYiOiAiZGFmMWQ2MTUyZmQzNzc1MmNiOTU1ZjQ2ZjM2ZTQ2YTUxZThjMTQ2ZTFiMzcxODE5NDY5NjljMWU1NTE3MzczNiIsCiAgICAgICAgICAgICJjbGFzc2lmaWNhdGlvbiI6ICJMMCIKICAgICAgICB9CiAgICBdLAogICAgImNvbGxlY3RvckhpbnQiOiAiaWdub3JlZCIKfQo=",
+                "signature": {
+                    "algorithm": "ES256",
+                    "keyId": "39ca24c8b02a559fd9beb2b1f5d18ced20c4bb246577b92914ae6814c3f70acf",
+                    "value": "YeAkr64tXPUwLUjNNKU2AGsYKzt47uh0l6H_3OwaL5cQ28fGmGoYOMIN8jXLkiEJlbTiAQ0jG7Uda6LK0CD7qw"
+                }
+            },
+            "expected": {
+                "signatureVerifies": true,
+                "organizationMatches": true,
+                "clusterMatches": true,
+                "deviceMatches": true,
+                "withinWindow": true,
+                "accepted": true,
+                "reason": null,
+                "discardedFields": [
+                    "collectorHint"
+                ],
+                "echoedBack": [],
+                "stored": []
+            }
+        }
+    ]
+}

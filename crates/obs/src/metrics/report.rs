@@ -145,21 +145,18 @@ impl PrometheusMetric {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_label(mut self, key: &'static str, value: impl Into<Cow<'static, str>>) -> Self {
         self.labels.push((key, value.into()));
         self
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_label_owned(mut self, key: &'static str, value: String) -> Self {
         self.labels.push((key, Cow::Owned(value)));
         self
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_labels(mut self, labels: Vec<(&'static str, Cow<'static, str>)>) -> Self {
         self.labels = labels;
         self

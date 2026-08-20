@@ -37,7 +37,11 @@ hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 [dependencies]
 hotpath.workspace = true
 humantime.workspace = true
+http.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
+reqwest = { workspace = true, features = ["json"] }
+rustfs-signer.workspace = true
+s3s.workspace = true
 jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -49,3 +53,4 @@ doctest = false
 
 [dev-dependencies]
 rmp-serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

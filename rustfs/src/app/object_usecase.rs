@@ -46,9 +46,10 @@ use super::storage_api::object_usecase::bucket::{
     replication::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        force_delete_target_set, has_active_delete_rule, load_delete_config_snapshot, must_replicate_object,
-        persist_force_delete_intent, schedule_object_replication, schedule_replication_delete, schedule_replication_deletes,
-        set_deleted_object_replication_state, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, load_delete_config_snapshot,
+        must_replicate_object, persist_force_delete_intent, record_replication_proxy, schedule_object_replication,
+        schedule_replication_delete, schedule_replication_deletes, set_deleted_object_replication_state,
+        should_schedule_delete_replication, should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -56,8 +57,8 @@ use super::storage_api::object_usecase::bucket::{
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size,
-    get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectAdmission, PutObjectGuard,
+    get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
@@ -96,7 +97,7 @@ use super::storage_api::object_usecase::set_disk::{
 };
 use super::storage_api::object_usecase::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
-    authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
+    authorize_sse_kms_object_read, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_decryption, sse_encryption,
     validate_bucket_object_lock_enabled_state,
@@ -168,7 +169,7 @@ use s3s::dto::{
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
     SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
-    ServerSideEncryptionByDefault, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
+    ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
     WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
@@ -737,7 +738,7 @@ struct GetObjectPreparedRead {
 }
 
 struct GetObjectStrategyContext {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
     enable_readahead: bool,
@@ -782,6 +783,7 @@ const MID_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = MI_B as i64;
 const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
+const ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE: &str = "RUSTFS_GET_SMALL_BODY_ONCE_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
 const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
 const GET_READER_STREAM_POLL_PENDING: &str = "pending";
@@ -811,6 +813,18 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_small_body_once_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, false))
+    }
 }
 
 fn is_get_seek_buffer_enabled() -> bool {
@@ -932,6 +946,30 @@ struct MemoryTrackedBytesStream {
     lifecycle: GetObjectBodyLifecycle,
 }
 
+struct MemoryOnceBodyOwner {
+    bytes: Bytes,
+    _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    // Body::Once has no poll hook, so this opt-in path only holds the request
+    // guard until the bytes are dropped; the result status remains unknown.
+    _lifecycle: GetObjectBodyLifecycle,
+}
+
+impl MemoryOnceBodyOwner {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>, lifecycle: GetObjectBodyLifecycle) -> Self {
+        Self {
+            bytes,
+            _guard: guard,
+            _lifecycle: lifecycle,
+        }
+    }
+}
+
+impl AsRef<[u8]> for MemoryOnceBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 #[derive(Default)]
 struct GetObjectBodyLifecycle {
     request_guard: Option<GetObjectGuard>,
@@ -1018,7 +1056,20 @@ pin_project! {
         remaining: usize,
         emitted: usize,
         expected: usize,
+        // Diagnostic-only identity for the body this stream is serving. Unset in
+        // unit tests that drive the stream over a bare reader; every production
+        // body carries it via `with_diagnostics`.
+        diagnostics: GetObjectReaderStreamDiagnostics,
     }
+}
+
+/// Object identity carried alongside a streaming GET body purely so a
+/// mid-stream failure names the object it happened on.
+#[derive(Clone, Default)]
+struct GetObjectReaderStreamDiagnostics {
+    bucket: String,
+    object: String,
+    request_id: String,
 }
 
 impl MemoryTrackedBytesStream {
@@ -1069,12 +1120,23 @@ where
             remaining,
             emitted: 0,
             expected: remaining,
+            diagnostics: GetObjectReaderStreamDiagnostics::default(),
         }
+    }
+
+    /// Attach the object identity a failed body should be reported against.
+    fn with_diagnostics(mut self, bucket: &str, object: &str, request_id: &str) -> Self {
+        self.diagnostics = GetObjectReaderStreamDiagnostics {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            request_id: request_id.to_string(),
+        };
+        self
     }
 }
 
 impl futures::Stream for MemoryTrackedBytesStream {
-    type Item = std::io::Result<Bytes>;
+    type Item = Result<Bytes, S3StdError>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -1105,7 +1167,8 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("materialized GET body length mismatch: expected {}, got {}", this.expected, actual),
-            ))));
+            )
+            .into())));
         }
 
         let Some(bytes) = this.bytes.take() else {
@@ -1129,6 +1192,16 @@ impl futures::Stream for MemoryTrackedBytesStream {
             );
         }
         Poll::Ready(Some(Ok(bytes)))
+    }
+}
+
+impl ByteStream for MemoryTrackedBytesStream {
+    fn remaining_length(&self) -> RemainingLength {
+        if self.emitted || self.bytes.is_none() {
+            RemainingLength::new_exact(0)
+        } else {
+            RemainingLength::new_exact(self.expected)
+        }
     }
 }
 
@@ -1520,12 +1593,29 @@ where
                     *this.emitted,
                     *this.remaining,
                 );
-                #[cfg(feature = "tracing-chunk-debug")]
-                tracing::error!(
-                    emitted = *this.emitted,
+                // The inner GetObjectStreamingReader is what normally reports a
+                // short body, so reaching this arm means the reader signalled a
+                // clean EOF while this layer still owed bytes against an
+                // already-committed Content-Length. That disagreement is a data
+                // plane fault, not chunk noise: log it unconditionally so the
+                // truncated object is named in the operator's log rather than
+                // only in a metric counter (issue #4784).
+                error!(
+                    event = EVENT_GET_OBJECT_STREAM_BODY,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    bucket = %this.diagnostics.bucket,
+                    object = %this.diagnostics.object,
+                    request_id = %this.diagnostics.request_id,
+                    size_bucket = get_object_stream_size_bucket(*this.expected),
                     expected = *this.expected,
+                    emitted = *this.emitted,
+                    remaining = *this.remaining,
+                    strategy = this.strategy,
+                    buffer_source = this.buffer_source,
+                    state = "reader_stream_short_eof",
                     error = %err,
-                    "GetObject ReaderStream ended before expected length"
+                    "GetObject reader stream ended before the committed content length"
                 );
                 Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
@@ -1541,10 +1631,17 @@ where
                     *this.emitted,
                     *this.remaining,
                 );
+                // Deliberately not logged at warn here: every production body
+                // wraps a GetObjectStreamingReader, and that layer already
+                // reports this same error once with `state = "read_failed"` and
+                // the object identity. A second unconditional line per failed
+                // GET would read as two distinct faults. The chunk-debug build
+                // still gets this layer's view of the same error.
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
                     expected = *this.expected,
+                    error_class = error_class,
                     error = %err,
                     "GetObject ReaderStream returned error"
                 );
@@ -1597,8 +1694,12 @@ where
 
 struct GetObjectStreamingReader<R> {
     inner: Option<R>,
-    // request_id + optional content_range are only used for diagnostic correlation and
-    // failure bucketing; they do not alter stream behavior.
+    // bucket/object + request_id + optional content_range are only used for diagnostic
+    // correlation and failure bucketing; they do not alter stream behavior. The object
+    // identity is what turns a mid-stream failure into an actionable report: a request_id
+    // alone cannot tell an operator which object reads short (issue #4784).
+    bucket: String,
+    object: String,
     request_id: String,
     content_range: Option<String>,
     expected: usize,
@@ -1617,8 +1718,8 @@ impl<R> GetObjectStreamingReader<R> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         inner: R,
-        _bucket: &str,
-        _key: &str,
+        bucket: &str,
+        key: &str,
         request_id: &str,
         content_range: Option<String>,
         expected: usize,
@@ -1628,6 +1729,8 @@ impl<R> GetObjectStreamingReader<R> {
     ) -> Self {
         Self {
             inner: Some(inner),
+            bucket: bucket.to_string(),
+            object: key.to_string(),
             request_id: request_id.to_string(),
             content_range,
             expected,
@@ -1768,6 +1871,8 @@ impl<R> GetObjectStreamingReader<R> {
                 event = EVENT_GET_OBJECT_STREAM_BODY,
                 component = LOG_COMPONENT_APP,
                 subsystem = LOG_SUBSYSTEM_OBJECT,
+                bucket = %self.bucket,
+                object = %self.object,
                 request_id = %self.request_id,
                 range = %self.content_range.as_deref().unwrap_or("full"),
                 size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1804,6 +1909,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1822,10 +1929,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         self.timer = None;
                         let failure_reason = Self::classify_read_error(&error);
                         self.finish_err();
-                        warn!(
+                        error!(
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1867,6 +1976,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                                         event = EVENT_GET_OBJECT_STREAM_BODY,
                                         component = LOG_COMPONENT_APP,
                                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                                        bucket = %self.bucket,
+                                        object = %self.object,
                                         request_id = %self.request_id,
                                         range = %self.content_range.as_deref().unwrap_or("full"),
                                         size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1907,10 +2018,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                             self.begin_resume(error);
                             continue;
                         }
-                        warn!(
+                        error!(
                             event = EVENT_GET_OBJECT_STREAM_BODY,
                             component = LOG_COMPONENT_APP,
                             subsystem = LOG_SUBSYSTEM_OBJECT,
+                            bucket = %self.bucket,
+                            object = %self.object,
                             request_id = %self.request_id,
                             range = %self.content_range.as_deref().unwrap_or("full"),
                             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1941,10 +2054,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     let failure_reason = Self::classify_read_error(&err);
                     self.timer = None;
                     self.finish_err();
-                    warn!(
+                    error!(
                         event = EVENT_GET_OBJECT_STREAM_BODY,
                         component = LOG_COMPONENT_APP,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                        bucket = %self.bucket,
+                        object = %self.object,
                         request_id = %self.request_id,
                         range = %self.content_range.as_deref().unwrap_or("full"),
                         size_bucket = get_object_stream_size_bucket(self.expected),
@@ -1980,6 +2095,8 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
+            bucket = %self.bucket,
+            object = %self.object,
             request_id = %self.request_id,
             range = %self.content_range.as_deref().unwrap_or("full"),
             size_bucket = get_object_stream_size_bucket(self.expected),
@@ -2627,23 +2744,37 @@ fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
         || headers.get(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID).is_some()
 }
 
-/// Managed SSE resolved from a bucket default encryption rule on the copy path.
+/// Resolve the effective server-side encryption for a write against the bucket's
+/// default encryption configuration.
 ///
-/// Unknown algorithms fall back to AES256, the same total mapping as the PUT and
-/// extract paths and the storage-layer resolver (`prepare_sse_configuration`), which
-/// `sse_encryption` re-runs when it mints the destination DEK. Resolving `None` here
-/// instead lets a same-name copy under a malformed bucket default pass the
-/// `copy_changes_encryption` guard and take the metadata-only shortcut while the
-/// storage layer still encrypts: fresh DEK metadata is committed beside the untouched
-/// plaintext blocks and the object becomes unreadable. Reachable only via corrupt or
-/// hand-edited bucket metadata — PutBucketEncryption rejects unknown algorithms
-/// (backlog#1826).
-fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
-    match sse.sse_algorithm.as_str() {
-        "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-    }
+/// A request-level value always wins; the bucket default only fills a gap, and
+/// the unknown-algorithm fallback lives once in [`bucket_default_write_sse`].
+///
+/// `has_explicit_ssec` suppresses the default entirely. Only COPY passes `true`
+/// today: its destination may carry SSE-C, which must not also be given managed
+/// encryption. PUT and extract pass `false`, matching their current behaviour —
+/// see backlog#1826 for the divergence that leaves.
+///
+/// Callers layering further overrides (PUT's `ciphertext_passthrough`) apply
+/// them to the returned pair.
+fn resolve_bucket_default_sse(
+    bucket_sse_config: Option<&ServerSideEncryptionConfiguration>,
+    requested_sse: Option<ServerSideEncryption>,
+    requested_kms_key_id: Option<SSEKMSKeyId>,
+    has_explicit_ssec: bool,
+) -> (Option<ServerSideEncryption>, Option<SSEKMSKeyId>) {
+    let bucket_default = || {
+        if has_explicit_ssec {
+            return None;
+        }
+        bucket_sse_config
+            .and_then(|config| config.rules.first())
+            .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+    };
+
+    let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
+    let effective_kms_key_id = requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()));
+    (effective_sse, effective_kms_key_id)
 }
 
 fn should_use_small_eager_put_path(
@@ -2947,6 +3078,10 @@ pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs:
             Err(_) => warn!("Failed to parse {name} checksum header value; skipping"),
         }
     }
+}
+
+fn inject_accept_ranges_header(headers: &mut HeaderMap) {
+    headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
 }
 
 /// Derive the response-header echo pairs for an additional-checksum algorithm
@@ -4149,7 +4284,12 @@ impl DefaultObjectUsecase {
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle));
+        let blob = if is_get_small_body_once_enabled() && bytes_len == remaining {
+            let owner = MemoryOnceBodyOwner::new(bytes, guard, lifecycle);
+            StreamingBlob::from_bytes(Bytes::from_owner(owner))
+        } else {
+            StreamingBlob::new(MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle))
+        };
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -4231,7 +4371,8 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
-        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
+        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
+            .with_diagnostics(bucket, key, request_id);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -5670,6 +5811,35 @@ impl DefaultObjectUsecase {
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
+        // Resolve the store through the request-bound server context
+        // (backlog#1052 S6), not the process-global handle, so an embedded
+        // second server never writes into the first server's store.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
+
+        let put_admission = match get_concurrency_manager()
+            .admit_put_object()
+            .await
+            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+        {
+            PutObjectAdmission::Disabled => None,
+            PutObjectAdmission::Admitted(permit) => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            PutObjectAdmission::Rejected => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(s3_error!(
+                    SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate"
+                ));
+            }
+        };
+
         let mut put_request_guard = PutObjectGuard::new();
         let concurrent_put_requests = PutObjectGuard::concurrent_requests();
 
@@ -5722,16 +5892,6 @@ impl DefaultObjectUsecase {
             use_large_put_concurrency_tuning,
         );
 
-        // Resolve the store through the request-bound server context
-        // (backlog#1052 S6), not the process-global handle, so an embedded
-        // second server never writes into the first server's store.
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-        let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        validate_bucket_exists(&store, &bucket).await?;
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
-
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
@@ -5746,19 +5906,12 @@ impl DefaultObjectUsecase {
         );
 
         let original_sse = server_side_encryption.clone();
-        let mut effective_sse = server_side_encryption.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default.as_ref().map(|sse| {
-                        match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256), // fallback to AES256
-                        }
-                    })
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
+            server_side_encryption,
+            ssekms_key_id,
+            false,
+        );
         debug!(
             target: "rustfs::app::object_usecase",
             component = "app",
@@ -5769,16 +5922,6 @@ impl DefaultObjectUsecase {
             effective = ?effective_sse,
             "Resolved effective SSE configuration"
         );
-
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
 
         if ciphertext_passthrough {
             // The replica keeps the source's SSE-C metadata; the bucket
@@ -6121,7 +6264,9 @@ impl DefaultObjectUsecase {
             let cache_adapter = cache_adapter.clone();
             let request_id = request_id.clone();
             let put_path = put_path.to_string();
+            let put_admission = put_admission;
             async move {
+                let _put_admission = put_admission;
                 let object_traffic_progress = object_traffic_health
                     .as_deref()
                     .and_then(ObjectTrafficHealth::track_write_storage);
@@ -6172,6 +6317,7 @@ impl DefaultObjectUsecase {
                     }
                 };
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_store_put", store_put_stage_start);
+                drop(_put_admission);
                 drop(object_traffic_progress);
                 #[cfg(test)]
                 wait_for_put_post_store_test_hook(&bucket).await;
@@ -6424,6 +6570,7 @@ impl DefaultObjectUsecase {
         };
         let helper = helper.version_id(version_id_for_event);
         let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
@@ -6557,7 +6704,6 @@ impl DefaultObjectUsecase {
             content_encoding: info.content_encoding.clone(),
             cache_control,
             content_disposition,
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
@@ -6585,6 +6731,225 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
             extra_checksum_headers: checksums.extra,
         })
+    }
+
+    /// Headers a proxied read forwards verbatim to the replication target:
+    /// only the client's SSE-C key family, so the target performs the real
+    /// SSE-C decryption (never the replication-check exemption). HTTP
+    /// conditional headers (If-Match & co.) are deliberately NOT forwarded —
+    /// MinIO does not forward them either, and a remote 304/412 would leak a
+    /// conditional evaluation against a replica the local site never saw.
+    /// Range and part-number travel as typed SDK parameters instead.
+    fn proxy_read_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
+        const FORWARDED: &[&str] = &[
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ];
+        let mut forwarded = HeaderMap::new();
+        for name in FORWARDED {
+            if let Ok(header_name) = http::HeaderName::from_str(name)
+                && let Some(value) = headers.get(&header_name)
+            {
+                forwarded.insert(header_name, value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// True when a proxied SDK call failed because the target does not have
+    /// the object either (service-level not-found or a raw 404, which also
+    /// covers NoSuchVersion): the caller tries the next target silently.
+    fn proxy_sdk_error_is_not_found<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
+        err.raw_response().is_some_and(|resp| resp.status().as_u16() == 404)
+    }
+
+    /// Serve a GET whose local read failed with not-found by proxying to the
+    /// bucket's replication targets (MinIO `proxyGetToReplicationTarget`,
+    /// backlog#1675 P1-5). Returns None when no target can serve the object;
+    /// the caller then returns the original local error.
+    async fn proxy_get_object_to_replication_targets(
+        req: &S3Request<GetObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<GetObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .get_object(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt
+                    // (targets were available), one failed when no target
+                    // served it — never per target.
+                    record_replication_proxy(bucket, "GetObject", false).await;
+                    return Some(Self::proxy_sdk_get_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: GET against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "GetObject", true).await;
+        None
+    }
+
+    /// Serve a HEAD whose local lookup failed with not-found by proxying to
+    /// the bucket's replication targets (MinIO `proxyHeadToRepTarget`).
+    async fn proxy_head_object_to_replication_targets(
+        req: &S3Request<HeadObjectInput>,
+        bucket: &str,
+        key: &str,
+        opts: &ObjectOptions,
+    ) -> Option<HeadObjectOutput> {
+        let targets = get_read_proxy_targets(bucket, key, opts).await;
+        if targets.is_empty() {
+            return None;
+        }
+        let extra_headers = Self::proxy_read_passthrough_headers(&req.headers);
+        let range = req
+            .headers
+            .get(http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let part_number = req.input.part_number;
+
+        for target in targets {
+            match target
+                .head_object_for_proxy(
+                    &target.bucket,
+                    key,
+                    opts.version_id.clone(),
+                    range.clone(),
+                    part_number,
+                    extra_headers.clone(),
+                )
+                .await
+            {
+                Ok(remote) => {
+                    // MinIO-aligned accounting: one total per proxy attempt,
+                    // one failed when no target served it.
+                    record_replication_proxy(bucket, "HeadObject", false).await;
+                    return Some(Self::proxy_sdk_head_output_to_s3s(remote));
+                }
+                Err(err) if Self::proxy_sdk_error_is_not_found(&err) => {
+                    debug!(bucket, key, arn = %target.arn, "read proxy: target does not have the object");
+                }
+                Err(err) => {
+                    warn!(bucket, key, arn = %target.arn, error = %err, "read proxy: HEAD against replication target failed");
+                }
+            }
+        }
+        record_replication_proxy(bucket, "HeadObject", true).await;
+        None
+    }
+
+    /// Translate a proxied SDK GET response into the s3s output, forwarding
+    /// the body as a stream (no buffering, no local persistence).
+    fn proxy_sdk_get_output_to_s3s(remote: aws_sdk_s3::operation::get_object::GetObjectOutput) -> GetObjectOutput {
+        let body = remote.body;
+        let body_stream = tokio_util::io::ReaderStream::with_capacity(body.into_async_read(), 64 * 1024);
+        GetObjectOutput {
+            body: Some(StreamingBlob::wrap(body_stream)),
+            content_length: remote.content_length,
+            content_range: remote.content_range,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            tag_count: remote.tag_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
+    }
+
+    /// Translate a proxied SDK HEAD response into the s3s output.
+    ///
+    /// Known gaps: the SDK's HeadObjectOutput does not model 206/Content-Range
+    /// for a ranged HEAD (the SDK exposes no content_range member on HEAD),
+    /// and s3s' typed HeadObjectOutput has no tag_count field (the local path
+    /// injects x-amz-tagging-count as a raw header) — both are dropped for
+    /// proxied HEADs.
+    fn proxy_sdk_head_output_to_s3s(remote: aws_sdk_s3::operation::head_object::HeadObjectOutput) -> HeadObjectOutput {
+        HeadObjectOutput {
+            content_length: remote.content_length,
+            content_type: remote.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+            content_encoding: remote.content_encoding,
+            content_disposition: remote.content_disposition,
+            content_language: remote.content_language,
+            cache_control: remote.cache_control,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
+            last_modified: remote
+                .last_modified
+                .and_then(|dt| OffsetDateTime::from_unix_timestamp_nanos(dt.as_nanos()).ok())
+                .map(Timestamp::from),
+            metadata: remote.metadata,
+            version_id: remote.version_id,
+            server_side_encryption: remote
+                .server_side_encryption
+                .map(|sse| ServerSideEncryption::from(sse.as_str().to_string())),
+            sse_customer_algorithm: remote.sse_customer_algorithm,
+            sse_customer_key_md5: remote.sse_customer_key_md5,
+            ssekms_key_id: remote.ssekms_key_id,
+            parts_count: remote.parts_count,
+            storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
+            expiration: remote.expiration,
+            restore: remote.restore,
+            checksum_crc32: remote.checksum_crc32,
+            checksum_crc32c: remote.checksum_crc32_c,
+            checksum_crc64nvme: remote.checksum_crc64_nvme,
+            checksum_sha1: remote.checksum_sha1,
+            checksum_sha256: remote.checksum_sha256,
+            checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
+            ..Default::default()
+        }
     }
 
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
@@ -6712,6 +7077,20 @@ impl DefaultObjectUsecase {
         {
             Ok(prepared_read) => prepared_read,
             Err(err) => {
+                // Active-active replication lag window: an object missing
+                // locally (and only missing — other errors keep their
+                // semantics) may still be served by proxying the GET to a
+                // replication target (backlog#1675 P1-5).
+                if matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
+                    && let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await
+                {
+                    lifecycle.finish_ok();
+                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    inject_accept_ranges_header(&mut response.headers);
+                    let result = Ok(response);
+                    let _ = helper.version_id(version_id_for_event).complete(&result);
+                    return result;
+                }
                 lifecycle.finish_err();
                 return Err(err);
             }
@@ -7345,30 +7724,12 @@ impl DefaultObjectUsecase {
             }
         };
 
-        let mut effective_sse = requested_sse.or_else(|| {
-            if has_explicit_ssec {
-                return None;
-            }
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(bucket_default_write_sse)
-                })
-            })
-        });
-        let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
-            if has_explicit_ssec {
-                return None;
-            }
-            bucket_sse_config.as_ref().and_then(|(config, _)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _)| config),
+            requested_sse,
+            requested_kms_key_id,
+            has_explicit_ssec,
+        );
 
         let h = build_ssec_read_headers(
             copy_source_sse_customer_algorithm.as_ref(),
@@ -8621,6 +8982,17 @@ impl DefaultObjectUsecase {
                         let msg = head_prefix_not_found_message(&bucket, &key, has_children);
                         return Err(S3Error::with_message(S3ErrorCode::NoSuchKey, msg));
                     }
+                    // Active-active replication lag window: an object missing
+                    // locally may still be served by proxying the HEAD to a
+                    // replication target (backlog#1675 P1-5).
+                    if let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                        let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                        let result = Ok(response);
+                        let _ = helper
+                            .version_id(req.input.version_id.clone().unwrap_or_default())
+                            .complete(&result);
+                        return result;
+                    }
                     return Err(S3Error::new(S3ErrorCode::NoSuchKey));
                 }
                 // Other errors, such as insufficient permissions, still return the original error
@@ -9263,28 +9635,12 @@ impl DefaultObjectUsecase {
 
         let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
-        let mut effective_sse = original_sse.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .map(|sse| match sse.sse_algorithm.as_str() {
-                            "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                            "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                            _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        })
-                })
-            })
-        });
-        let mut effective_kms_key_id = ssekms_key_id.or_else(|| {
-            bucket_sse_config.as_ref().and_then(|(config, _timestamp)| {
-                config.rules.first().and_then(|rule| {
-                    rule.apply_server_side_encryption_by_default
-                        .as_ref()
-                        .and_then(|sse| sse.kms_master_key_id.clone())
-                })
-            })
-        });
+        let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
+            bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
+            original_sse,
+            ssekms_key_id,
+            false,
+        );
         if effective_sse
             .as_ref()
             .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
@@ -9809,8 +10165,8 @@ mod tests {
         DefaultRetention, Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus, ObjectIdentifier,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ReplicaModifications, ReplicaModificationsStatus,
-        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, SourceSelectionCriteria,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -9970,6 +10326,34 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    #[test]
+    fn inject_accept_ranges_header_writes_static_bytes_value() {
+        let mut headers = HeaderMap::new();
+        inject_accept_ranges_header(&mut headers);
+
+        assert_eq!(headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+    }
+
+    #[tokio::test]
+    async fn finalize_get_object_response_injects_accept_ranges_header() {
+        let req = build_request(GetObjectInput::default(), Method::GET);
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let response = DefaultObjectUsecase::finalize_get_object_response(
+            helper,
+            "bucket",
+            &req.method,
+            &req.headers,
+            None,
+            String::new(),
+            GetObjectOutput::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("finalize response");
+
+        assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -10043,6 +10427,74 @@ mod tests {
             };
             assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
         }
+    }
+
+    fn bucket_sse_config_with(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionConfiguration {
+        ServerSideEncryptionConfiguration {
+            rules: vec![ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                    sse_algorithm: ServerSideEncryption::from(String::from(algorithm)),
+                    kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                }),
+                bucket_key_enabled: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_prefers_the_request_over_the_bucket_default() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(
+            Some(&config),
+            Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            Some(SSEKMSKeyId::from("request-key".to_string())),
+            false,
+        );
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert_eq!(kms_key_id.as_deref(), Some("request-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_fills_gaps_from_the_bucket_default() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_falls_back_to_aes256_for_an_unknown_algorithm() {
+        // Reachable only through corrupt or hand-edited bucket metadata;
+        // PutBucketEncryption rejects unknown algorithms. All three call sites
+        // now share this single decision (backlog#1826).
+        let config = bucket_sse_config_with("garbage", None);
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+
+        assert_eq!(sse.as_ref().map(|sse| sse.as_str()), Some(ServerSideEncryption::AES256));
+        assert!(kms_key_id.is_none());
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_suppresses_the_default_for_explicit_ssec() {
+        let config = bucket_sse_config_with(ServerSideEncryption::AES256, Some("bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, true);
+
+        assert!(sse.is_none(), "an SSE-C destination must not also get managed encryption");
+        assert!(kms_key_id.is_none());
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_returns_nothing_without_a_bucket_default() {
+        let (sse, kms_key_id) = resolve_bucket_default_sse(None, None, None, false);
+
+        assert!(sse.is_none());
+        assert!(kms_key_id.is_none());
     }
 
     #[test]
@@ -12882,7 +13334,10 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("a short memory body must fail the stream instead of serving a truncated body");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
         assert!(stream.next().await.is_none(), "stream must terminate after the error");
     }
 
@@ -12901,7 +13356,62 @@ mod tests {
             .await
             .expect("mismatched memory body must yield an item")
             .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn memory_blob_preserves_exact_remaining_length() {
+        let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            GetObjectBodyLifecycle::disabled(),
+        );
+
+        assert_eq!(blob.remaining_length().exact(), Some(5));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_holds_guard_until_bytes_drop() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let initial = GetObjectGuard::concurrent_count();
+            let guard = GetObjectGuard::new();
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"hello"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::tracked(guard),
+            );
+            let mut body = s3s::Body::from(blob);
+            let bytes = body.take_bytes().expect("opt-in exact memory body should stay on Body::Once");
+
+            assert_eq!(bytes, Bytes::from_static(b"hello"));
+            assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+            drop(bytes);
+            assert_eq!(GetObjectGuard::concurrent_count(), initial);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_blob_once_fast_path_rejects_length_mismatch() {
+        temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some("true"), || {
+            let blob = DefaultObjectUsecase::build_memory_bytes_blob(
+                Bytes::from_static(b"test"),
+                5,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                GetObjectBodyLifecycle::disabled(),
+            );
+            let mut body = s3s::Body::from(blob);
+
+            assert!(body.take_bytes().is_none(), "mismatched memory body must keep the guarded stream path");
+        });
     }
 
     #[tokio::test]
@@ -15885,7 +16395,12 @@ mod tests {
         assert_eq!(body, vec![b'a'; 65]);
     }
 
+    // Serial with the capture test below: both drive the same short-EOF log
+    // callsite, and `tracing` caches callsite interest process-wide. Running
+    // this one concurrently on a thread with no subscriber re-caches that
+    // callsite as "never interested" and blinds the capture.
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_object_reader_stream_errors_on_short_eof() {
         let stream = GetObjectReaderStream::new(
             std::io::Cursor::new(b"he".to_vec()),
@@ -15906,6 +16421,134 @@ mod tests {
             err.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
             Some(std::io::ErrorKind::UnexpectedEof)
         );
+    }
+
+    /// Collects the structured fields of every event emitted while installed,
+    /// so a test can assert what an operator would actually read in the log
+    /// rather than only that an error value was returned.
+    type CapturedFieldMap = std::collections::HashMap<String, String>;
+    type CapturedEventLog = Arc<Mutex<Vec<CapturedFieldMap>>>;
+
+    struct CapturedEvents(CapturedEventLog);
+
+    struct CapturedFields(CapturedFieldMap);
+
+    impl tracing::field::Visit for CapturedFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let mut fields = CapturedFields(CapturedFieldMap::new());
+            event.record(&mut fields);
+            self.0.lock().expect("captured events should not poison").push(fields.0);
+        }
+    }
+
+    fn capture_events() -> (CapturedEventLog, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::{Registry, prelude::*};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(CapturedEvents(Arc::clone(&captured)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        // `tracing` caches per-callsite interest process-wide, so a subscriber
+        // installed by a test running in parallel can leave the log sites below
+        // cached as "never interested" and this capture would silently see
+        // nothing. Force the callsites to re-ask the subscriber we just
+        // installed.
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard)
+    }
+
+    fn find_stream_body_event(captured: &CapturedEventLog, state: &str) -> CapturedFieldMap {
+        let events = captured.lock().expect("captured events should not poison");
+        events
+            .iter()
+            .find(|fields| fields.get("state").is_some_and(|value| value == state))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a `{state}` streaming body failure must be logged, not only counted in a metric. \
+                     Captured {} event(s): {:?}",
+                    events.len(),
+                    events
+                )
+            })
+            .clone()
+    }
+
+    /// rustfs#4784: a GET body that ends short of its committed Content-Length
+    /// is the fault that breaks every downstream copier (replication, site
+    /// replication, `rclone sync`), yet this layer only fed a metric counter —
+    /// its log line was compiled out unless the `tracing-chunk-debug` feature
+    /// was on, so operators saw nothing on the source side.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_reader_stream_short_eof_names_the_object() {
+        let (captured, _guard) = capture_events();
+
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(b"he".to_vec()),
+            64,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        )
+        .with_diagnostics("restic-paperless", "index/41b5a4c2344edb90", "req-reader-stream-short-eof");
+
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("short reader should fail the streaming body");
+
+        let event = find_stream_body_event(&captured, "reader_stream_short_eof");
+        assert_eq!(event.get("bucket").map(String::as_str), Some("restic-paperless"));
+        assert_eq!(event.get("object").map(String::as_str), Some("index/41b5a4c2344edb90"));
+        assert_eq!(event.get("request_id").map(String::as_str), Some("req-reader-stream-short-eof"));
+        assert_eq!(event.get("expected").map(String::as_str), Some("5"));
+        assert_eq!(event.get("emitted").map(String::as_str), Some("2"));
+        assert_eq!(event.get("remaining").map(String::as_str), Some("3"));
+    }
+
+    /// The inner reader already logged mid-stream failures, but only under a
+    /// request_id — which cannot be resolved back to an object once the request
+    /// is gone. Without the identity the report in #4784 was unactionable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_streaming_reader_short_eof_names_the_object() {
+        use tokio::io::AsyncReadExt;
+
+        let (captured, _guard) = capture_events();
+
+        let mut reader = GetObjectStreamingReader::new(
+            std::io::Cursor::new(b"short".to_vec()),
+            "restic-paperless",
+            "index/41b5a4c2344edb90",
+            "req-streaming-short-eof",
+            None,
+            10,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::tracked(GetObjectGuard::new()),
+            None,
+        );
+
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("short body under a larger Content-Length must fail the stream");
+
+        let event = find_stream_body_event(&captured, "short_eof");
+        assert_eq!(event.get("bucket").map(String::as_str), Some("restic-paperless"));
+        assert_eq!(event.get("object").map(String::as_str), Some("index/41b5a4c2344edb90"));
+        assert_eq!(event.get("request_id").map(String::as_str), Some("req-streaming-short-eof"));
     }
 
     #[test]

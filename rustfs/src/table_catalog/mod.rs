@@ -18,8 +18,6 @@
 //! S3 object behavior. It defines the stable internal boundary that later
 //! catalog routes and object guards can share.
 
-#![allow(dead_code)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
@@ -87,8 +85,20 @@ pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved
 pub(crate) const TABLE_BUCKET_CATALOG_TYPE: &str = "iceberg-rest";
 pub(crate) const TABLE_BUCKET_CONFIG_VERSION: u16 = 1;
 pub(crate) const DEFAULT_WAREHOUSE_ID: &str = "default";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_NAMESPACE_MARKER_VERSION: u16 = 1;
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
@@ -123,9 +133,25 @@ const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";
 const TABLE_ROOT: &str = "tables";
 const VIEW_ROOT: &str = "views";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const NAMESPACE_MARKER_FILE: &str = "namespace.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const TABLE_MARKER_FILE: &str = "table.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const CURRENT_POINTER_FILE: &str = "current.json";
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 const LIFECYCLE_FILE: &str = "lifecycle.json";
 const METADATA_DIR: &str = "metadata";
 const DATA_DIR: &str = "data";

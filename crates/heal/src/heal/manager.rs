@@ -86,7 +86,7 @@ fn unblock_replacement_recovery_sets_after_validation(
     }
 }
 
-// Admission/scheduler outcomes for per-object requests (Object/Metadata/MRF/
+// Admission/scheduler outcomes for per-object requests (Object/Metadata/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
 // recovery loops submit those per object, so a full queue or a retry storm
 // would otherwise emit one warn! per object (rustfs/rustfs#5716). The
@@ -143,6 +143,16 @@ async fn pause_duplicate_admission_after_active_lock(request_id: &str) {
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 
+/// Per-key bookkeeping for the queued-request dedup index: how many queued
+/// requests hold the key, and the id of the first request that opened it —
+/// the O(1) stand-in for the former heap scan when a merge receipt needs to
+/// name a queued representative.
+#[derive(Debug)]
+struct DedupKeyEntry {
+    refcount: usize,
+    representative_request_id: String,
+}
+
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
 #[derive(Debug)]
@@ -151,8 +161,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Deduplication key reference counts for queued requests
-    dedup_keys: HashMap<String, usize>,
+    /// Deduplication index for queued requests
+    dedup_keys: HashMap<String, DedupKeyEntry>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -217,9 +227,14 @@ impl ForegroundPressure {
 struct CompletedHealStatus {
     heal_type: HealType,
     status: HealTaskStatus,
-    result_items: Vec<HealResultItem>,
     result_items_truncated: bool,
     completed_at: SystemTime,
+    /// Sequence-stamped retained window, archived with the completion so
+    /// incremental consumers keep their cursor across the transition (HS-06).
+    /// The un-stamped legacy view is derived from it on demand.
+    seqed_items: Vec<(u64, HealResultItem)>,
+    next_seq: u64,
+    min_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +255,65 @@ pub struct HealTaskReport {
     pub result_items: Vec<HealResultItem>,
     pub result_items_truncated: bool,
     pub progress: Option<HealProgress>,
+    /// Cursor for incremental consumption: sequence number of the next item
+    /// to be produced. `0` on reports from sources without sequencing.
+    pub next_seq: u64,
+    /// Oldest sequence still retained (`0` together with `next_seq` when
+    /// sequencing is unavailable).
+    pub min_seq: u64,
+}
+
+/// Report from a live task, honoring the client's incremental cursor.
+async fn active_task_report(task: &HealTask, since: Option<u64>) -> HealTaskReport {
+    let window = task.get_result_items_since(since).await;
+    HealTaskReport {
+        status: task.get_status().await,
+        result_items: window.items,
+        // The legacy flag stays set once anything was evicted; a lagging
+        // incremental cursor additionally marks this response truncated so
+        // the client knows to restart from `min_seq`.
+        result_items_truncated: task.result_items_truncated() || window.lagged,
+        progress: Some(task.get_progress().await),
+        next_seq: window.next_seq,
+        min_seq: window.min_seq,
+    }
+}
+
+fn empty_task_report(status: HealTaskStatus) -> HealTaskReport {
+    HealTaskReport {
+        status,
+        result_items: Vec::new(),
+        result_items_truncated: false,
+        progress: None,
+        next_seq: 0,
+        min_seq: 0,
+    }
+}
+
+fn completed_task_report(completed: &CompletedHealStatus, since: Option<u64>) -> HealTaskReport {
+    let mut lagged = false;
+    let result_items = match since {
+        None => completed.seqed_items.iter().map(|(_, item)| item.clone()).collect(),
+        Some(cursor) => {
+            if cursor + 1 < completed.min_seq {
+                lagged = true;
+            }
+            completed
+                .seqed_items
+                .iter()
+                .filter(|(seq, _)| *seq > cursor)
+                .map(|(_, item)| item.clone())
+                .collect()
+        }
+    };
+    HealTaskReport {
+        status: completed.status.clone(),
+        result_items,
+        result_items_truncated: completed.result_items_truncated || lagged,
+        progress: None,
+        next_seq: completed.next_seq,
+        min_seq: completed.min_seq,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -270,6 +344,8 @@ pub struct HealSourceCounts {
     pub auto_heal: u64,
     pub internal: u64,
     pub read_repair: u64,
+    #[serde(default)]
+    pub mrf: u64,
 }
 
 impl HealSourceCounts {
@@ -280,6 +356,7 @@ impl HealSourceCounts {
             HealRequestSource::AutoHeal => self.auto_heal += 1,
             HealRequestSource::Internal => self.internal += 1,
             HealRequestSource::ReadRepair => self.read_repair += 1,
+            HealRequestSource::Mrf => self.mrf += 1,
         }
     }
 }
@@ -335,8 +412,16 @@ impl PriorityHealQueue {
             return QueuePushOutcome::Merged;
         }
         // Track dedup keys for both normal and forced requests so queued forced work
-        // also reserves the dedup key for later non-forced duplicates.
-        *self.dedup_keys.entry(key).or_insert(0) += 1;
+        // also reserves the dedup key for later non-forced duplicates. The first
+        // request that opens the key becomes the named representative for merge
+        // receipts (taken before `request` moves into the heap).
+        self.dedup_keys
+            .entry(key)
+            .or_insert_with(|| DedupKeyEntry {
+                refcount: 0,
+                representative_request_id: request.id.clone(),
+            })
+            .refcount += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
@@ -380,6 +465,7 @@ impl PriorityHealQueue {
         let displaced = displaced.map(|item| {
             let key = Self::make_dedup_key(&item.request);
             Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            self.refresh_dedup_representative(&key);
             item.request
         });
 
@@ -492,9 +578,6 @@ impl PriorityHealQueue {
             HealType::Metadata { bucket, object } => {
                 format!("metadata:{bucket}:{object}")
             }
-            HealType::MRF { meta_path } => {
-                format!("mrf:{meta_path}")
-            }
             HealType::ECDecode {
                 bucket,
                 object,
@@ -505,27 +588,24 @@ impl PriorityHealQueue {
         }
     }
 
-    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
-        if let Some(count) = dedup_keys.get_mut(key) {
-            if *count <= 1 {
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, DedupKeyEntry>, key: &str) {
+        if let Some(entry) = dedup_keys.get_mut(key) {
+            if entry.refcount <= 1 {
                 dedup_keys.remove(key);
             } else {
-                *count -= 1;
+                entry.refcount -= 1;
             }
         }
     }
-
-    /// Check if a request with the same key already exists in the queue
-    #[allow(dead_code)]
-    fn contains_key(&self, request: &HealRequest) -> bool {
-        let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains_key(&key)
-    }
-
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");
         self.dedup_keys.contains_key(&key)
+    }
+
+    /// Iterate queued requests (used by the admin overlap check).
+    fn requests(&self) -> impl Iterator<Item = &HealRequest> {
+        self.heap.iter().map(|item| &item.request)
     }
 
     fn contains_request_id(&self, request_id: &str) -> bool {
@@ -538,10 +618,32 @@ impl PriorityHealQueue {
             .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
     }
 
-    fn request_for_dedup_key(&self, key: &str) -> Option<&HealRequest> {
-        self.heap
+    fn queued_request_id_for_dedup_key(&self, key: &str) -> Option<&str> {
+        self.dedup_keys.get(key).map(|entry| entry.representative_request_id.as_str())
+    }
+
+    /// Re-elect the representative for `key` from the queue entries holding
+    /// it. Needed after a holder leaves the queue *without* becoming active
+    /// (canceled by id, or displaced): the former opener may be the request
+    /// that just left, and a merge receipt must never name an id that
+    /// resolves nowhere. The scheduler pop path does not need this — the
+    /// popped request surfaces in `active_heals` under the same id and the
+    /// duplicate pre-check consults active heals before the queue. No-op for
+    /// released keys; the survivor scan only runs when a key still has
+    /// holders, which under forced duplicates is the rare admin path.
+    fn refresh_dedup_representative(&mut self, key: &str) {
+        if !self.dedup_keys.contains_key(key) {
+            return;
+        }
+        if let Some(id) = self
+            .heap
             .iter()
-            .find_map(|item| (Self::make_dedup_key(&item.request) == key).then_some(&item.request))
+            .find(|item| Self::make_dedup_key(&item.request) == key)
+            .map(|item| item.request.id.clone())
+            && let Some(entry) = self.dedup_keys.get_mut(key)
+        {
+            entry.representative_request_id = id;
+        }
     }
 
     fn contains_matching<F>(&self, mut matches: F) -> bool
@@ -566,6 +668,9 @@ impl PriorityHealQueue {
         }
 
         self.heap = retained;
+        if let Some(removed) = removed.as_ref() {
+            self.refresh_dedup_representative(&Self::make_dedup_key(removed));
+        }
         removed
     }
 
@@ -575,11 +680,13 @@ impl PriorityHealQueue {
     {
         let mut retained = BinaryHeap::new();
         let mut removed = Vec::new();
+        let mut affected_keys = Vec::new();
 
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
                 let key = Self::make_dedup_key(&item.request);
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                affected_keys.push(key);
                 removed.push(item.request);
             } else {
                 retained.push(item);
@@ -587,6 +694,9 @@ impl PriorityHealQueue {
         }
 
         self.heap = retained;
+        for key in &affected_keys {
+            self.refresh_dedup_representative(key);
+        }
         removed
     }
 }
@@ -614,7 +724,6 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
         HealType::Bucket { bucket } => heal_path == bucket,
         HealType::Prefix { bucket, prefix } => heal_path_matches_bucket_child(heal_path, bucket, prefix),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
-        HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
 }
 
@@ -686,6 +795,77 @@ fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
 }
 
 /// Heal config
+/// HS-06 admin overlap policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealOverlapPolicy {
+    /// Default: overlapping admin starts merge into the existing task
+    /// (today's dedup semantics).
+    #[default]
+    Merge,
+    /// Return a typed already-running / overlapping-paths rejection like
+    /// madmin's ErrHealAlreadyRunning / ErrHealOverlappingPaths.
+    MinioError,
+}
+
+/// Path view of a heal type for overlap comparison: a bucket plus a
+/// prefix/object path inside it (`None` bucket = cluster-wide, overlaps
+/// everything).
+fn heal_type_path_view(heal_type: &HealType) -> (Option<&str>, &str) {
+    match heal_type {
+        HealType::Cluster => (None, ""),
+        HealType::Bucket { bucket } => (Some(bucket), ""),
+        HealType::Prefix { bucket, prefix } => (Some(bucket), prefix),
+        HealType::Object { bucket, object, .. }
+        | HealType::Metadata { bucket, object }
+        | HealType::ECDecode { bucket, object, .. } => (Some(bucket), object),
+        // Erasure-set heal: the set id is the overlap dimension.
+        HealType::ErasureSet { set_disk_id, .. } => (Some("\u{0}set"), set_disk_id),
+    }
+}
+
+/// How two heal paths relate for the admin overlap check (HS-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlapVerdict {
+    /// Distinct targets: no conflict.
+    Disjoint,
+    /// Same target: an identical heal is already in flight.
+    SameTarget,
+    /// One target contains the other.
+    Overlapping,
+}
+
+fn prefix_paths_overlap(a: &str, b: &str) -> OverlapVerdict {
+    if a == b {
+        return OverlapVerdict::SameTarget;
+    }
+    if a.is_empty() || b.is_empty() || a.starts_with(b) || b.starts_with(a) {
+        return OverlapVerdict::Overlapping;
+    }
+    OverlapVerdict::Disjoint
+}
+
+fn heal_types_overlap(left: &HealType, right: &HealType) -> OverlapVerdict {
+    let (left_bucket, left_path) = heal_type_path_view(left);
+    let (right_bucket, right_path) = heal_type_path_view(right);
+    match (left_bucket, right_bucket) {
+        // Cluster-wide overlaps everything (but an exact cluster match is
+        // SameTarget).
+        (None, _) | (_, None) => {
+            if matches!(left, HealType::Cluster) && matches!(right, HealType::Cluster) {
+                OverlapVerdict::SameTarget
+            } else {
+                OverlapVerdict::Overlapping
+            }
+        }
+        (Some(lb), Some(rb)) => {
+            if lb != rb {
+                return OverlapVerdict::Disjoint;
+            }
+            prefix_paths_overlap(left_path, right_path)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HealConfig {
     /// Whether to enable auto heal
@@ -706,6 +886,9 @@ pub struct HealConfig {
     pub low_priority_drop_when_full: bool,
     /// Whether notify-driven scheduler wakeups are enabled.
     pub event_driven_scheduler_enable: bool,
+    /// How admin heal starts behave on path overlap (HS-06): merge into the
+    /// existing task (default) or return a typed already-running rejection.
+    pub overlap_policy: HealOverlapPolicy,
     /// Whether per-set bulkhead scheduling is enabled.
     pub set_bulkhead_enable: bool,
     /// Whether erasure-set page parallelism is enabled.
@@ -754,6 +937,14 @@ impl Default for HealConfig {
             rustfs_config::ENV_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
             rustfs_config::DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
         );
+        let overlap_policy =
+            match rustfs_utils::get_env_str(rustfs_config::ENV_HEAL_OVERLAP_POLICY, rustfs_config::DEFAULT_HEAL_OVERLAP_POLICY)
+                .to_lowercase()
+                .as_str()
+            {
+                "minio_error" => HealOverlapPolicy::MinioError,
+                _ => HealOverlapPolicy::Merge,
+            };
         let set_bulkhead_enable = rustfs_utils::get_env_bool(
             rustfs_config::ENV_HEAL_SET_BULKHEAD_ENABLE,
             rustfs_config::DEFAULT_HEAL_SET_BULKHEAD_ENABLE,
@@ -790,6 +981,7 @@ impl Default for HealConfig {
             low_priority_merge_enable,
             low_priority_drop_when_full,
             event_driven_scheduler_enable,
+            overlap_policy,
             set_bulkhead_enable,
             page_parallel_enable,
             mainline_throttle_enable,
@@ -827,8 +1019,10 @@ pub struct HealManager {
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     /// Heal queue (priority-based)
     heal_queue: Arc<Mutex<PriorityHealQueue>>,
-    /// Recently completed heal statuses retained for status queries.
-    completed_heals: Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
+    /// Recently completed heal statuses retained for status queries. Values
+    /// are shared so the lookup helper can hand a completed entry to a
+    /// caller without cloning the retained result window.
+    completed_heals: Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     /// Client tokens merged into an existing task id.
     task_aliases: Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     /// Heal tasks waiting for a retry backoff to expire.
@@ -851,10 +1045,21 @@ pub struct HealManager {
     workload_provider: Option<WorkloadSnapshotProviderRef>,
 }
 
+/// Where a task-id lookup resolved. The variants carry the resolved state
+/// so both the status and the report adapters can consume one shared
+/// cascade without re-locking.
+enum TaskStateLookup {
+    Active(Arc<HealTask>),
+    Retrying(HealTaskStatus),
+    Completed(Arc<CompletedHealStatus>),
+    Queued,
+    NotFound,
+}
+
 struct HealQueueContext<'a> {
     heal_queue: &'a Arc<Mutex<PriorityHealQueue>>,
     active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
-    completed_heals: &'a Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
+    completed_heals: &'a Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
     replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     config: &'a Arc<RwLock<HealConfig>>,
@@ -1756,6 +1961,50 @@ impl HealManager {
         request: HealRequest,
         preserve_alias: bool,
     ) -> Result<HealAdmissionReceipt> {
+        // HS-06 forceStart semantics (admin only): MinIO stops the old task
+        // first and then starts the new one. Cancel any active admin task
+        // overlapping this request's path before entering admission, so the
+        // fresh task is never merged into the one being replaced.
+        if request.source == HealRequestSource::Admin && request.force_start {
+            let overlapping: Vec<String> = {
+                let active_heals = self.active_heals.lock().await;
+                active_heals
+                    .iter()
+                    .filter(|(task_id, task)| {
+                        task.source == HealRequestSource::Admin
+                            && heal_types_overlap(&request.heal_type, &task.heal_type) != OverlapVerdict::Disjoint
+                            && *task_id != &request.id
+                    })
+                    .map(|(task_id, _)| task_id.clone())
+                    .collect()
+            };
+            for task_id in overlapping {
+                match self.cancel_task(&task_id).await {
+                    Ok(_) => info!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        cancelled_task_id = %task_id,
+                        result = "force_start_cancelled_overlap",
+                        "Admin forceStart cancelled an overlapping heal task"
+                    ),
+                    Err(err) => warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        cancelled_task_id = %task_id,
+                        error = %err,
+                        result = "force_start_cancel_failed",
+                        "Admin forceStart failed to cancel an overlapping heal task"
+                    ),
+                }
+            }
+        }
+
         let config = self.config.read().await;
         let dedup_key = PriorityHealQueue::make_dedup_key(&request);
 
@@ -1772,13 +2021,21 @@ impl HealManager {
                 .map(|(task_id, _)| (task_id, "active"))
                 .or_else(|| {
                     queue
-                        .request_for_dedup_key(&dedup_key)
-                        .map(|queued| (queued.id.clone(), "queued"))
+                        .queued_request_id_for_dedup_key(&dedup_key)
+                        .map(|queued_id| (queued_id.to_string(), "queued"))
                 })
                 .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
         });
         if let Some((merged_task_id, duplicate_state)) = duplicate.flatten() {
-            let admission = Self::duplicate_admission_for_request(&request, &config);
+            // HS-06: under the minio_error overlap policy an exact duplicate
+            // admin start reports the typed AlreadyRunning rejection instead
+            // of the silent merge (MinIO's ErrHealAlreadyRunning).
+            let admission =
+                if request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError {
+                    HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+                } else {
+                    Self::duplicate_admission_for_request(&request, &config)
+                };
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
@@ -1824,12 +2081,68 @@ impl HealManager {
             });
         }
 
+        // HS-06 typed overlap rejection (admin only, minio_error policy):
+        // paths containing or contained by an active/queued task reject with
+        // AlreadyRunning / OverlappingPaths instead of merging. Exact
+        // duplicates already merged above; scanner/autoheal/read-repair
+        // sources never take this path.
+        if request.source == HealRequestSource::Admin && config.overlap_policy == HealOverlapPolicy::MinioError {
+            let mut rejection = None;
+            for (task_id, task) in active_heals.iter() {
+                match heal_types_overlap(&request.heal_type, &task.heal_type) {
+                    OverlapVerdict::SameTarget => {
+                        rejection = Some((HealAdmissionDropReason::AlreadyRunning, task_id.clone()));
+                        break;
+                    }
+                    OverlapVerdict::Overlapping => {
+                        rejection = Some((HealAdmissionDropReason::OverlappingPaths, task_id.clone()));
+                    }
+                    OverlapVerdict::Disjoint => {}
+                }
+            }
+            if rejection.is_none() {
+                for queued in queue.requests() {
+                    match heal_types_overlap(&request.heal_type, &queued.heal_type) {
+                        OverlapVerdict::SameTarget => {
+                            rejection = Some((HealAdmissionDropReason::AlreadyRunning, queued.id.clone()));
+                            break;
+                        }
+                        OverlapVerdict::Overlapping => {
+                            rejection = Some((HealAdmissionDropReason::OverlappingPaths, queued.id.clone()));
+                        }
+                        OverlapVerdict::Disjoint => {}
+                    }
+                }
+            }
+            if let Some((reason, overlap_task_id)) = rejection {
+                drop(retrying_heals);
+                drop(queue);
+                drop(active_heals);
+                Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request.id,
+                    overlap_task_id = %overlap_task_id,
+                    reason = reason.as_str(),
+                    result = "overlap_rejected",
+                    "Admin heal start rejected by overlap policy"
+                );
+                return Ok(HealAdmissionReceipt {
+                    result: HealAdmissionResult::Dropped(reason),
+                    task_id: overlap_task_id,
+                });
+            }
+        }
+
         let mut task_id = request.id.clone();
         let admission = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
         if admission == HealAdmissionResult::Merged
-            && let Some(queued) = queue.request_for_dedup_key(&dedup_key)
+            && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
         {
-            task_id.clone_from(&queued.id);
+            task_id = queued_id.to_owned();
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
         drop(retrying_heals);
@@ -1852,198 +2165,127 @@ impl HealManager {
     }
 
     /// Get task status
-    pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
-        let canonical_task_id = self.canonical_task_id(task_id).await;
+    /// Ordered task-state lookup shared by every status/report query. The
+    /// map precedence mirrors the historical per-method cascades exactly:
+    /// active, then retrying, then completed — where a completed entry in a
+    /// retrying state outranks the queue so a retrying task reports
+    /// Retrying, never Pending — then the queue, and finally a terminal
+    /// completed entry. `heal_path` additionally constrains the map matches
+    /// the way the `*_for_path` variants always have.
+    async fn lookup_task_state(&self, canonical_task_id: &str, heal_path: Option<&str>) -> TaskStateLookup {
+        let matches_path = |heal_type: &HealType| heal_path.is_none_or(|path| heal_type_matches_path(heal_type, path));
+
         {
             let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id) {
-                return Ok(task.get_status().await);
+            if let Some(task) = active_heals
+                .get(canonical_task_id)
+                .filter(|task| matches_path(&task.heal_type))
+            {
+                return TaskStateLookup::Active(Arc::clone(task));
             }
         }
 
         {
             let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
-                return Ok(retrying.status());
+            if let Some(retrying) = retrying_heals
+                .get(canonical_task_id)
+                .filter(|retrying| matches_path(&retrying.request.heal_type))
+            {
+                return TaskStateLookup::Retrying(retrying.status());
+            }
+        }
+
+        // One completed-map pass (single lock + prune): a retrying completion
+        // returns immediately; a terminal completion is held back until the
+        // queue has been checked, so queued work outranks it.
+        let mut terminal_completed: Option<Arc<CompletedHealStatus>> = None;
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(canonical_task_id).filter(|c| matches_path(&c.heal_type)) {
+                if completed_status_is_retrying(&completed.status) {
+                    return TaskStateLookup::Completed(Arc::clone(completed));
+                }
+                terminal_completed = Some(Arc::clone(completed));
             }
         }
 
         {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed.status.clone());
+            let queue = self.heal_queue.lock().await;
+            let queued = match heal_path {
+                Some(path) => queue.contains_request_id_matching_path(canonical_task_id, path),
+                None => queue.contains_request_id(canonical_task_id),
+            };
+            if queued {
+                return TaskStateLookup::Queued;
             }
         }
 
-        let queue = self.heal_queue.lock().await;
-        if queue.contains_request_id(&canonical_task_id) {
-            return Ok(HealTaskStatus::Pending);
+        match terminal_completed {
+            Some(completed) => TaskStateLookup::Completed(completed),
+            None => TaskStateLookup::NotFound,
         }
-        drop(queue);
+    }
 
-        let mut completed_heals = self.completed_heals.lock().await;
-        prune_completed_heal_statuses(&mut completed_heals);
-        if let Some(completed) = completed_heals.get(&canonical_task_id) {
-            return Ok(completed.status.clone());
+    pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
+        let canonical_task_id = self.canonical_task_id(task_id).await;
+        match self.lookup_task_state(&canonical_task_id, None).await {
+            TaskStateLookup::Active(task) => Ok(task.get_status().await),
+            TaskStateLookup::Retrying(status) => Ok(status),
+            TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
+            TaskStateLookup::Queued => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::NotFound => Err(Error::TaskNotFound {
+                task_id: task_id.to_string(),
+            }),
         }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     pub async fn get_task_report(&self, task_id: &str) -> Result<HealTaskReport> {
+        self.get_task_report_since(task_id, None).await
+    }
+
+    /// Incremental variant of [`Self::get_task_report`] (HS-06): `since` is
+    /// the client's last seen sequence number; `None` keeps the legacy
+    /// full-snapshot semantics.
+    pub async fn get_task_report_since(&self, task_id: &str, since: Option<u64>) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: task.get_status().await,
-                    result_items: task.get_result_items().await,
-                    result_items_truncated: task.result_items_truncated(),
-                    progress: Some(task.get_progress().await),
-                });
-            }
+        match self.lookup_task_state(&canonical_task_id, None).await {
+            TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
+            TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
+            TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
+            TaskStateLookup::Queued => Ok(empty_task_report(HealTaskStatus::Pending)),
+            TaskStateLookup::NotFound => Err(Error::TaskNotFound {
+                task_id: task_id.to_string(),
+            }),
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: retrying.status(),
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id(&canonical_task_id) {
-                return Ok(HealTaskReport {
-                    status: HealTaskStatus::Pending,
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
-            }
-        }
-
-        let mut completed_heals = self.completed_heals.lock().await;
-        prune_completed_heal_statuses(&mut completed_heals);
-        if let Some(completed) = completed_heals.get(&canonical_task_id) {
-            return Ok(HealTaskReport {
-                status: completed.status.clone(),
-                result_items: completed.result_items.clone(),
-                result_items_truncated: completed.result_items_truncated,
-                progress: None,
-            });
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
+        self.get_task_report_for_path_since(heal_path, task_id, None).await
+    }
+
+    /// Incremental variant of [`Self::get_task_report_for_path`] (HS-06).
+    pub async fn get_task_report_for_path_since(
+        &self,
+        heal_path: &str,
+        task_id: &str,
+        since: Option<u64>,
+    ) -> Result<HealTaskReport> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&task.heal_type, heal_path)
-            {
-                return Ok(HealTaskReport {
-                    status: task.get_status().await,
-                    result_items: task.get_result_items().await,
-                    result_items_truncated: task.result_items_truncated(),
-                    progress: Some(task.get_progress().await),
-                });
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+            TaskStateLookup::Active(task) => Ok(active_task_report(&task, since).await),
+            TaskStateLookup::Retrying(status) => Ok(empty_task_report(status)),
+            TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
+            TaskStateLookup::Queued => Ok(empty_task_report(HealTaskStatus::Pending)),
+            TaskStateLookup::NotFound => {
+                if self.path_has_task(heal_path).await {
+                    return Err(Error::InvalidClientToken);
+                }
+                Err(Error::TaskNotFound {
+                    task_id: task_id.to_string(),
+                })
             }
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&retrying.request.heal_type, heal_path)
-            {
-                return Ok(HealTaskReport {
-                    status: retrying.status(),
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id_matching_path(&canonical_task_id, heal_path) {
-                return Ok(HealTaskReport {
-                    status: HealTaskStatus::Pending,
-                    result_items: Vec::new(),
-                    result_items_truncated: false,
-                    progress: None,
-                });
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-            {
-                return Ok(HealTaskReport {
-                    status: completed.status.clone(),
-                    result_items: completed.result_items.clone(),
-                    result_items_truncated: completed.result_items_truncated,
-                    progress: None,
-                });
-            }
-        }
-
-        if self.path_has_task(heal_path).await {
-            return Err(Error::InvalidClientToken);
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     /// Get task status for a path-bound client token.
@@ -2053,59 +2295,20 @@ impl HealManager {
     /// recently completed task, a different token is invalid for that path.
     pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
         let canonical_task_id = self.canonical_task_id(task_id).await;
-        {
-            let active_heals = self.active_heals.lock().await;
-            if let Some(task) = active_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&task.heal_type, heal_path)
-            {
-                return Ok(task.get_status().await);
+        match self.lookup_task_state(&canonical_task_id, Some(heal_path)).await {
+            TaskStateLookup::Active(task) => Ok(task.get_status().await),
+            TaskStateLookup::Retrying(status) => Ok(status),
+            TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
+            TaskStateLookup::Queued => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::NotFound => {
+                if self.path_has_task(heal_path).await {
+                    return Err(Error::InvalidClientToken);
+                }
+                Err(Error::TaskNotFound {
+                    task_id: task_id.to_string(),
+                })
             }
         }
-
-        {
-            let retrying_heals = self.retrying_heals.lock().await;
-            if let Some(retrying) = retrying_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&retrying.request.heal_type, heal_path)
-            {
-                return Ok(retrying.status());
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-                && completed_status_is_retrying(&completed.status)
-            {
-                return Ok(completed.status.clone());
-            }
-        }
-
-        {
-            let queue = self.heal_queue.lock().await;
-            if queue.contains_request_id_matching_path(&canonical_task_id, heal_path) {
-                return Ok(HealTaskStatus::Pending);
-            }
-        }
-
-        {
-            let mut completed_heals = self.completed_heals.lock().await;
-            prune_completed_heal_statuses(&mut completed_heals);
-            if let Some(completed) = completed_heals.get(&canonical_task_id)
-                && heal_type_matches_path(&completed.heal_type, heal_path)
-            {
-                return Ok(completed.status.clone());
-            }
-        }
-
-        if self.path_has_task(heal_path).await {
-            return Err(Error::InvalidClientToken);
-        }
-
-        Err(Error::TaskNotFound {
-            task_id: task_id.to_string(),
-        })
     }
 
     async fn path_has_task(&self, heal_path: &str) -> bool {
@@ -2385,8 +2588,27 @@ impl HealManager {
             snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
             snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
             snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
+            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
+            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
+            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
+            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
             snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
+            snapshot.start_time = match (snapshot.start_time, progress.start_time) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
+                (Some(current), Some(next)) => Some(current.max(next)),
+                (None, next) => next,
+                (current, None) => current,
+            };
+            if progress.current_object.is_some() {
+                snapshot.current_object = progress.current_object;
+            }
         }
+        snapshot.refresh_progress_percentage();
+        snapshot.refresh_estimated_completion_time();
         Some(snapshot)
     }
 
@@ -3208,21 +3430,30 @@ impl HealManager {
                         } else {
                             completed_task.get_status().await
                         };
+                        let completed_progress = completed_task.get_progress().await;
+                        // Single snapshot of the retained window: the task is
+                        // finished and already off the active map, so there is
+                        // no concurrent writer to race with.
+                        let seqed_items = completed_task.get_seqed_result_items().await;
+                        let (next_seq, min_seq) = completed_task.result_seq_cursors();
                         let completed_status_entry = CompletedHealStatus {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
-                            result_items: completed_task.get_result_items().await,
                             result_items_truncated: completed_task.result_items_truncated(),
                             completed_at: SystemTime::now(),
+                            seqed_items,
+                            next_seq,
+                            min_seq,
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
                         prune_completed_heal_statuses(&mut completed_heals_guard);
-                        completed_heals_guard.insert(task_id.clone(), completed_status_entry);
+                        completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
+                                stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);
                             }
                             HealTaskStatus::Retrying { .. } => {}
                             _ => {
@@ -3454,7 +3685,6 @@ fn heal_request_type_label(request: &HealRequest) -> &'static str {
         HealType::Prefix { .. } => "prefix",
         HealType::ErasureSet { .. } => "erasure_set",
         HealType::Metadata { .. } => "metadata",
-        HealType::MRF { .. } => "mrf",
         HealType::ECDecode { .. } => "ec_decode",
     }
 }
@@ -3509,7 +3739,7 @@ fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
     }
 }
 
-fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, CompletedHealStatus>) {
+fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, Arc<CompletedHealStatus>>) {
     let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
         return;
     };
@@ -3624,40 +3854,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<crate::heal::storage::DiskStatus> {
-            Ok(crate::heal::storage::DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -3669,14 +3871,6 @@ mod tests {
 
         async fn object_exists(&self, bucket: &str, _object: &str) -> Result<bool> {
             Ok(bucket == "retry-transition")
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -3740,15 +3934,12 @@ mod tests {
             Ok((HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<crate::heal::storage::HealListItem>> {
-            Ok(Vec::new())
-        }
-
         async fn list_objects_for_heal_page(
             &self,
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -3883,6 +4074,46 @@ mod tests {
         assert_eq!(admitted.priority, HealPriority::High);
         assert_eq!(admitted.id, high_id);
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn queued_request_id_for_dedup_key_tracks_the_representative() {
+        let mut queue = PriorityHealQueue::new();
+
+        let first = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        let first_id = first.id.clone();
+        let first_key = PriorityHealQueue::make_dedup_key(&first);
+        assert_eq!(queue.push(first), QueuePushOutcome::Accepted);
+
+        // A forced duplicate of the same target opens a second entry under
+        // the same key; the representative stays the request that opened it.
+        let mut second = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        second.force_start = true;
+        let second_id = second.id.clone();
+        assert_eq!(queue.push(second), QueuePushOutcome::Accepted);
+
+        let representative = queue
+            .queued_request_id_for_dedup_key(&first_key)
+            .expect("key must be reserved while either request is queued");
+        assert_eq!(representative, first_id);
+
+        // A holder leaving WITHOUT becoming active (canceled by id) must
+        // re-elect the representative to the surviving queued request, or a
+        // later merge receipt would name an id that resolves nowhere. The
+        // scheduler pop path needs no re-election: the popped request
+        // surfaces in active_heals under the same id and the duplicate
+        // pre-check consults active heals before the queue.
+        queue.remove_request_id(&first_id);
+        assert_eq!(
+            queue.queued_request_id_for_dedup_key(&first_key),
+            Some(second_id.as_str()),
+            "canceling the opener must re-elect the surviving queued holder"
+        );
+
+        // Pop the last holder: the key is released entirely.
+        let last = queue.pop_next().expect("second request must be queued");
+        assert_eq!(last.id, second_id);
+        assert!(queue.queued_request_id_for_dedup_key(&first_key).is_none());
     }
 
     #[test]
@@ -4975,16 +5206,18 @@ mod tests {
         );
         manager.completed_heals.lock().await.insert(
             task_id,
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: request.heal_type,
                 status: HealTaskStatus::Retrying {
                     error: "Lock acquisition timeout".to_string(),
                     retry_attempt: request.retry_attempts,
                 },
-                result_items: Vec::new(),
                 result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
         cancel_token
     }
@@ -5264,6 +5497,136 @@ mod tests {
         assert_eq!(snapshot.queued_by_source.internal, 0);
     }
 
+    // HS-06 (backlog#1870): overlap policy + forceStart semantics.
+    fn manager_with_policy(policy: HealOverlapPolicy) -> HealManager {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        HealManager::new(
+            storage,
+            Some(HealConfig {
+                overlap_policy: policy,
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn admin_prefix_request(bucket: &str, prefix: &str) -> HealRequest {
+        let mut request = HealRequest::new(
+            HealType::Prefix {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        request
+    }
+
+    async fn insert_active_task(manager: &HealManager, request: HealRequest) -> String {
+        let task = Arc::new(HealTask::from_request(request, manager.storage.clone()));
+        let task_id = task.id.clone();
+        manager.active_heals.lock().await.insert(task_id.clone(), task);
+        task_id
+    }
+
+    #[tokio::test]
+    async fn overlap_policy_minio_error_rejects_same_and_containing_paths() {
+        let manager = manager_with_policy(HealOverlapPolicy::MinioError);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        // Same target: typed AlreadyRunning.
+        let same = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            same,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning),
+            "an identical target must reject with already-running"
+        );
+
+        // Contained path: typed OverlappingPaths.
+        let nested = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/app/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            nested,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
+            "a path inside the active task's path must reject with overlapping-paths"
+        );
+
+        // Containing path (bucket-wide vs nested active): also overlapping.
+        let wide = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", ""))
+            .await
+            .expect("admission must decide");
+        assert_eq!(
+            wide,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths),
+            "a bucket-wide start overlapping a nested active heal must reject"
+        );
+
+        // Disjoint bucket: unaffected.
+        let disjoint = manager
+            .submit_heal_request(admin_prefix_request("bucket-b", "logs/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(disjoint, HealAdmissionResult::Accepted);
+    }
+
+    #[tokio::test]
+    async fn overlap_policy_default_merge_keeps_today_semantics() {
+        let manager = manager_with_policy(HealOverlapPolicy::Merge);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        // Different-dedup-key overlap still merges under the default policy:
+        // the nested path dedups to its own key but nothing rejects it.
+        let nested = manager
+            .submit_heal_request(admin_prefix_request("bucket-a", "logs/app/"))
+            .await
+            .expect("admission must decide");
+        assert_eq!(nested, HealAdmissionResult::Accepted, "default policy must not reject overlaps");
+
+        // Non-admin sources never get overlap rejections even under minio_error.
+        let manager = manager_with_policy(HealOverlapPolicy::MinioError);
+        insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+        let mut scanner_request = admin_prefix_request("bucket-a", "logs/app/");
+        scanner_request.source = HealRequestSource::Scanner;
+        let admitted = manager
+            .submit_heal_request(scanner_request)
+            .await
+            .expect("admission must decide");
+        assert_eq!(admitted, HealAdmissionResult::Accepted, "scanner sources must never be overlap-rejected");
+    }
+
+    #[tokio::test]
+    async fn admin_force_start_cancels_overlapping_active_task_first() {
+        let manager = manager_with_policy(HealOverlapPolicy::Merge);
+        let old_id = insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+
+        let mut replacement = admin_prefix_request("bucket-a", "logs/");
+        replacement.force_start = true;
+        let receipt = manager
+            .submit_heal_request_with_receipt(replacement)
+            .await
+            .expect("force-start submission must decide");
+
+        assert!(receipt.result.is_admitted(), "the new task must be admitted (Accepted or Merged)");
+        let old_task_gone = {
+            let active_heals = manager.active_heals.lock().await;
+            !active_heals.contains_key(&old_id)
+        };
+        assert!(
+            old_task_gone,
+            "the overlapping admin task must be cancelled (removed from the active table) before the new one starts"
+        );
+        assert!(
+            matches!(manager.get_task_status(&old_id).await, Err(Error::TaskNotFound { .. })),
+            "a cancelled task must no longer resolve as an active heal"
+        );
+    }
+
     #[tokio::test]
     async fn test_operations_snapshot_counts_active_by_source_and_priority() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
@@ -5396,6 +5759,8 @@ mod tests {
         ));
         {
             let mut progress = first.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(20));
+            progress.set_total_baseline(12, 8192);
             progress.update_progress(7, 3, 1, 4096);
         }
 
@@ -5405,6 +5770,8 @@ mod tests {
         ));
         {
             let mut progress = second.progress.write().await;
+            progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
+            progress.set_total_baseline(8, 4096);
             progress.update_progress(11, 5, 2, 2048);
         }
 
@@ -5419,7 +5786,11 @@ mod tests {
         assert_eq!(progress.objects_scanned, 18);
         assert_eq!(progress.objects_healed, 8);
         assert_eq!(progress.objects_failed, 3);
+        assert_eq!(progress.objects_total_count, 20);
+        assert_eq!(progress.objects_total_size, 12288);
         assert_eq!(progress.bytes_processed, 6144);
+        assert!((progress.progress_percentage - 50.0).abs() < 0.001);
+        assert!(progress.estimated_completion_time.is_some());
     }
 
     #[tokio::test]
@@ -5545,21 +5916,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        // A completed entry recorded in a Retrying state for a task whose
+        // request is also (still) queued under the same id: the retrying
+        // completion must win the lookup, or the task would read back as
+        // Pending while it is actually waiting out a retry backoff.
+        let request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        let task_id = request.id.clone();
+        manager.completed_heals.lock().await.insert(
+            task_id.clone(),
+            Arc::new(CompletedHealStatus {
+                heal_type: request.heal_type.clone(),
+                status: HealTaskStatus::Retrying {
+                    error: "transient disk failure".to_string(),
+                    retry_attempt: 1,
+                },
+                result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
+                completed_at: SystemTime::now(),
+            }),
+        );
+        manager.heal_queue.lock().await.push(HealRequest {
+            id: task_id.clone(),
+            heal_type: request.heal_type,
+            ..request
+        });
+
+        assert_eq!(
+            manager.get_task_status(&task_id).await.expect("task must resolve"),
+            HealTaskStatus::Retrying {
+                error: "transient disk failure".to_string(),
+                retry_attempt: 1
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_task_status_reads_recent_completed_status() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let manager = HealManager::new(storage, None);
 
         manager.completed_heals.lock().await.insert(
             "completed-token".to_string(),
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: HealType::Bucket {
                     bucket: "bucket".to_string(),
                 },
                 status: HealTaskStatus::Completed,
-                result_items: Vec::new(),
                 result_items_truncated: false,
+                seqed_items: Vec::new(),
+                next_seq: 0,
+                min_seq: 0,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
 
         assert_eq!(
@@ -5578,22 +5992,27 @@ mod tests {
 
         manager.completed_heals.lock().await.insert(
             "completed-token".to_string(),
-            CompletedHealStatus {
+            Arc::new(CompletedHealStatus {
                 heal_type: HealType::Object {
                     bucket: "bucket".to_string(),
                     object: "object".to_string(),
                     version_id: None,
                 },
                 status: HealTaskStatus::Completed,
-                result_items: vec![HealResultItem {
-                    bucket: "bucket".to_string(),
-                    object: "object".to_string(),
-                    object_size: 1024,
-                    ..Default::default()
-                }],
                 result_items_truncated: true,
+                seqed_items: vec![(
+                    1,
+                    HealResultItem {
+                        bucket: "bucket".to_string(),
+                        object: "object".to_string(),
+                        object_size: 1024,
+                        ..Default::default()
+                    },
+                )],
+                next_seq: 2,
+                min_seq: 1,
                 completed_at: SystemTime::now(),
-            },
+            }),
         );
 
         let report = manager
@@ -5605,6 +6024,10 @@ mod tests {
         assert_eq!(report.status, HealTaskStatus::Completed);
         assert_eq!(report.result_items.len(), 1);
         assert_eq!(report.result_items[0].object_size, 1024);
+        // The archived cursors pass through to the report so an incremental
+        // consumer can resume against the next expected sequence.
+        assert_eq!(report.next_seq, 2);
+        assert_eq!(report.min_seq, 1);
     }
 
     #[tokio::test]

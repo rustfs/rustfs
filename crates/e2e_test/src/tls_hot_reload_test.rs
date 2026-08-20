@@ -34,7 +34,6 @@ use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, Error as RustlsError, SignatureScheme, StreamOwned};
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::io::{Read, Write};
@@ -242,7 +241,6 @@ async fn roundtrip_and_return(mut session: TlsSession) -> Result<TlsSession, Box
 }
 
 #[tokio::test]
-#[serial]
 async fn test_tls_certificate_hot_reload_live_listener() -> TestResult {
     init_logging();
     // Install the process-wide rustls crypto provider (idempotent).

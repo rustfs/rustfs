@@ -34,6 +34,7 @@ impl ECStore {
         forward_to: Option<&str>,
         batch_objects: usize,
         version_budget: usize,
+        include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealWalkVersion>, Option<String>, bool)> {
         if pool_idx >= self.pools.len() || set_idx >= self.pools[pool_idx].disk_set.len() {
             return Err(Error::other(format!(
@@ -43,7 +44,7 @@ impl ECStore {
         }
 
         self.pools[pool_idx].disk_set[set_idx]
-            .heal_walk_versions_page(bucket, prefix, forward_to, batch_objects, version_budget)
+            .heal_walk_versions_page(bucket, prefix, forward_to, batch_objects, version_budget, include_lifecycle_object_info)
             .await
             .map_err(Error::from)
     }

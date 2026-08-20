@@ -1,0 +1,203 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "inventory",
+  "fixture": "field-registry",
+  "description": "The frozen v1 inventory snapshot envelope. Every collected member cites its data-collection registry id from protocol/data-collection-fields.json. Any member not listed here is unknown: it is accepted, discarded before validation, never persisted, never echoed back, and its raw text is never logged.",
+  "envelope": "InventorySnapshot",
+  "schema": "protocol/agent/v1/inventory-snapshot.schema.json",
+  "classificationRegistry": "protocol/data-collection-fields.json",
+  "level": "L0",
+  "source": "inventory",
+  "retentionDays": 90,
+  "cadence": "per-inventory",
+  "supportedMajorVersions": [1],
+  "protocolVersionPattern": "^v[1-9][0-9]{0,3}$",
+  "unknownFieldPolicy": "accept-and-discard",
+  "unknownCoarseFlagPolicy": "discard",
+  "unknownMajorVersionPolicy": "reject",
+  "fields": [
+    {
+      "name": "protocolVersion",
+      "registryId": null,
+      "collected": false,
+      "requiredness": "required",
+      "type": "string",
+      "default": null,
+      "limits": {
+        "type": "string",
+        "pattern": "^v[1-9][0-9]{0,3}$"
+      },
+      "includedInContentHash": false,
+      "note": "Negotiation input shared with the frozen v1 negotiation envelope. It gates processing, is never persisted as an inventory attribute, and therefore has no data-collection registry id."
+    },
+    {
+      "name": "rustfsVersion",
+      "registryId": "inventory.rustfsVersion",
+      "collected": true,
+      "requiredness": "required",
+      "type": "string",
+      "default": null,
+      "limits": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,3})\\.(0|[1-9][0-9]{0,3})\\.(0|[1-9][0-9]{0,3})$"
+      },
+      "includedInContentHash": true,
+      "note": "Coarse release only. Pre-release and build metadata are rejected because a build identifier fingerprints a private build."
+    },
+    {
+      "name": "osVersion",
+      "registryId": "inventory.osVersion",
+      "collected": true,
+      "requiredness": "optional",
+      "type": ["object", "null"],
+      "default": null,
+      "limits": {
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": ["family", "major", "minor"]
+      },
+      "memberLimits": {
+        "family": {
+          "type": "string",
+          "enum": ["linux", "darwin", "windows", "freebsd", "other"]
+        },
+        "major": { "type": "integer", "minimum": 0, "maximum": 9999 },
+        "minor": { "type": "integer", "minimum": 0, "maximum": 9999 }
+      },
+      "includedInContentHash": true,
+      "note": "The family is a closed vocabulary, never free text. An unlisted operating system reports 'other'. Unknown members of this object are discarded exactly like unknown top-level members."
+    },
+    {
+      "name": "nodeCount",
+      "registryId": "inventory.nodeCount",
+      "collected": true,
+      "requiredness": "required",
+      "type": "integer",
+      "default": null,
+      "limits": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 4096
+      },
+      "includedInContentHash": true,
+      "note": "A cluster reporting inventory has at least one node."
+    },
+    {
+      "name": "driveCount",
+      "registryId": "inventory.driveCount",
+      "collected": true,
+      "requiredness": "required",
+      "type": "integer",
+      "default": null,
+      "limits": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1048576
+      },
+      "includedInContentHash": true,
+      "note": "Zero is legal while a cluster is being provisioned."
+    },
+    {
+      "name": "capacityTotalBytes",
+      "registryId": "inventory.capacityTotalBytes",
+      "collected": true,
+      "requiredness": "required",
+      "type": "integer",
+      "default": null,
+      "limits": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "includedInContentHash": true,
+      "note": "2^53-1 is the largest integer Rust u64, PHP int, JavaScript number, and JSON all represent exactly. Above the cap is a validation error, never a silent truncation."
+    },
+    {
+      "name": "capacityUsedBytes",
+      "registryId": "inventory.capacityUsedBytes",
+      "collected": true,
+      "requiredness": "required",
+      "type": "integer",
+      "default": null,
+      "limits": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "includedInContentHash": true,
+      "note": "Must not exceed capacityTotalBytes. JSON Schema cannot compare two members, so the validator enforces that invariant separately."
+    },
+    {
+      "name": "coarseFlags",
+      "registryId": "inventory.coarseFlags",
+      "collected": true,
+      "requiredness": "optional",
+      "type": "array",
+      "default": [],
+      "limits": {
+        "type": "array",
+        "maxItems": 8,
+        "uniqueItems": true
+      },
+      "itemLimits": {
+        "type": "string",
+        "enum": [
+          "capacity.critical",
+          "capacity.warning",
+          "clock.skew",
+          "cluster.degraded",
+          "cluster.healing",
+          "cluster.readonly",
+          "drive.offline",
+          "node.offline"
+        ]
+      },
+      "includedInContentHash": true,
+      "note": "Allow-listed conditions only. Normalization discards unknown tokens, de-duplicates, and sorts ascending by UTF-8 bytes, so agent-side ordering never changes the content hash."
+    }
+  ],
+  "errorReasons": {
+    "description": "Inventory-scoped ErrorInfo reasons. The negotiation reason is not redeclared here: an unsupported major version fails with UNSUPPORTED_PROTOCOL from protocol/agent/v1/fixtures/auth/error-codes.json, before any inventory member is read. INVENTORY_FIELD_INVALID is new in this issue and must not collide with a reason already frozen for authentication.",
+    "versionFailure": "UNSUPPORTED_PROTOCOL",
+    "payloadFailure": {
+      "reason": "INVENTORY_FIELD_INVALID",
+      "status": "INVALID_ARGUMENT",
+      "httpStatus": 400,
+      "domain": "rustfs.connect",
+      "meaning": "The normalized inventory snapshot violates the frozen schema or a cross-field invariant."
+    },
+    "disclosureRules": [
+      "A rejection names the frozen member path that failed and never the value that failed.",
+      "A rejection never names, quotes, or counts an unknown member, so discarded text cannot reach an error body or a log line.",
+      "A raw input bound rejection names the bound that was exceeded and never the body."
+    ]
+  },
+  "rawInputBounds": {
+    "description": "Denial-of-service bounds applied to the raw body after the version gate and before normalization. They are deliberately far above what a v1 snapshot needs so that additive growth never trips them. A violation is rejected without naming or echoing the offending value.",
+    "maxBodyBytes": 8192,
+    "maxDepth": 8,
+    "maxTopLevelMembers": 64,
+    "maxRawCoarseFlagItems": 64,
+    "reason": "INVENTORY_FIELD_INVALID",
+    "httpStatus": 400
+  },
+  "crossFieldInvariants": [
+    {
+      "name": "usedNeverExceedsTotal",
+      "expression": "capacityUsedBytes <= capacityTotalBytes",
+      "reason": "INVENTORY_FIELD_INVALID"
+    }
+  ],
+  "forbiddenFieldClasses": {
+    "description": "L0 inventory cannot express any of these. The frozen schema sets additionalProperties false at every level and every string member is an enum or a numeric-component pattern, so none of these sample values can be carried by any member, known or unknown, that survives normalization.",
+    "classes": [
+      { "class": "bucket", "samples": ["customer-backups", "prod-media-eu"] },
+      { "class": "object", "samples": ["invoices/2026/08/inv-1.pdf", "db-dump.sql.gz"] },
+      { "class": "path", "samples": ["/var/lib/rustfs/data/disk1", "C:\\rustfs\\data"] },
+      { "class": "endpoint", "samples": ["https://rustfs.internal:9000", "10.4.2.17:9000", "node-3.storage.example.com"] },
+      { "class": "configuration", "samples": ["RUSTFS_ERASURE_SET_SIZE=12", "{\"tls\":{\"minVersion\":\"1.3\"}}"] },
+      { "class": "credential", "samples": ["AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln", "-----BEGIN PRIVATE KEY-----"] },
+      { "class": "identifier", "samples": ["node-3.storage.example.com", "aa:bb:cc:dd:ee:ff", "acme-corp"] }
+    ]
+  }
+}

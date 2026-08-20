@@ -26,7 +26,6 @@ pub enum StorageMedia {
 }
 
 impl StorageMedia {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Nvme => "nvme",
@@ -60,7 +59,6 @@ pub enum AccessPattern {
 }
 
 impl AccessPattern {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Sequential => "sequential",
@@ -71,25 +69,21 @@ impl AccessPattern {
     }
 
     /// Check if this is a sequential access pattern.
-    #[allow(dead_code)]
     pub fn is_sequential(&self) -> bool {
         matches!(self, Self::Sequential)
     }
 
     /// Check if this is a random access pattern.
-    #[allow(dead_code)]
     pub fn is_random(&self) -> bool {
         matches!(self, Self::Random)
     }
 
     /// Check if this is a mixed access pattern.
-    #[allow(dead_code)]
     pub fn is_mixed(&self) -> bool {
         matches!(self, Self::Mixed)
     }
 
     /// Check if this pattern is unknown.
-    #[allow(dead_code)]
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
@@ -442,30 +436,45 @@ mod tests {
         assert_eq!(unknown_profile.sequential_boost_multiplier, 1.0);
     }
 
-    #[cfg(target_os = "linux")]
+    // What platform probing returns depends on the machine, so these pin the two
+    // rules that do not: the override wins over probing, and probing that is
+    // switched off reports Unknown rather than guessing (rustfs/backlog#1836).
     #[test]
-    fn test_linux_storage_detection_exists() {
-        // This test just verifies the detection function exists and doesn't panic
-        // The actual result depends on the system it's running on
-        let result = detect_storage_media(true, "");
-        // We should get some result (not panic)
-        match result {
-            StorageMedia::Nvme | StorageMedia::Ssd | StorageMedia::Hdd | StorageMedia::Unknown => {
-                // All valid results
-            }
+    fn storage_media_override_wins_over_platform_detection() {
+        for (override_value, expected) in [
+            ("nvme", StorageMedia::Nvme),
+            ("ssd", StorageMedia::Ssd),
+            ("hdd", StorageMedia::Hdd),
+        ] {
+            assert_eq!(detect_storage_media(true, override_value), expected);
+            assert_eq!(
+                detect_storage_media(false, override_value),
+                expected,
+                "an override must be honoured even with detection disabled"
+            );
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn test_macos_storage_detection_exists() {
-        // This test just verifies the detection function exists and doesn't panic
-        let result = detect_storage_media(true, "");
-        // We should get some result (not panic)
-        match result {
-            StorageMedia::Nvme | StorageMedia::Ssd | StorageMedia::Hdd | StorageMedia::Unknown => {
-                // All valid results
-            }
-        }
+    fn disabled_detection_reports_unknown_instead_of_guessing() {
+        assert_eq!(detect_storage_media(false, ""), StorageMedia::Unknown);
+        assert_eq!(
+            detect_storage_media(false, "not-a-medium"),
+            StorageMedia::Unknown,
+            "an unparseable override falls through to the disabled path"
+        );
+    }
+
+    #[test]
+    fn enabled_detection_returns_a_medium_for_this_platform() {
+        // Whatever this machine reports, it must be one of the known variants and
+        // it must be stable across calls — a probe that flapped would make the
+        // scheduler's profile depend on when it asked.
+        let first = detect_storage_media(true, "");
+        assert!(matches!(
+            first,
+            StorageMedia::Nvme | StorageMedia::Ssd | StorageMedia::Hdd | StorageMedia::Unknown
+        ));
+        assert_eq!(detect_storage_media(true, ""), first);
     }
 }

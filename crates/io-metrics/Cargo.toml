@@ -58,7 +58,7 @@ sysinfo = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
-metrics-util = { version = "0.20", features = ["debugging"] }
+metrics-util = { workspace = true, features = ["debugging"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs", "rt-multi-thread"] }
 
 [lints]

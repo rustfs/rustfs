@@ -15,15 +15,6 @@
 use super::ECStore;
 use crate::storage::storage_api::head_prefix_consumer::contract::list::ListOperations as _;
 use std::sync::Arc;
-
-/// Determines if the key "looks like a prefix" (ends with `/`).
-/// Note: No special handling for empty strings here; the caller must ensure the key has passed `validate_object_key`.
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn is_prefix_key(key: &str) -> bool {
-    key.ends_with('/')
-}
-
 /// Constructs a more explicit error message when `HEAD` is performed on a `prefix`-style key but the directory marker object is missing.
 ///
 /// `has_children`:

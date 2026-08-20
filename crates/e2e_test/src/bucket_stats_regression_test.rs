@@ -35,7 +35,6 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use rustfs_data_usage::DataUsageInfo;
-    use serial_test::serial;
     use std::error::Error;
     use tokio::time::{Duration, sleep};
     use tracing::info;
@@ -59,7 +58,6 @@ mod tests {
     /// 3. Query admin data usage API
     /// 4. Verify object count > 0
     #[tokio::test]
-    #[serial]
     async fn test_bucket_object_count_updates_after_put() -> TestResult {
         init_logging();
         info!("RT-09: bucket object count updates after PUT");
@@ -126,7 +124,6 @@ mod tests {
     /// Regression pattern: stats remain unchanged after objects are deleted
     /// (rustfs#5615).
     #[tokio::test]
-    #[serial]
     async fn test_bucket_object_count_updates_after_delete() -> TestResult {
         init_logging();
         info!("RT-09b: bucket object count updates after DELETE");
@@ -220,7 +217,6 @@ mod tests {
     /// Regression pattern: DataUsageInfo undercounts versioned bucket versions
     /// and delete markers (rustfs#3898).
     #[tokio::test]
-    #[serial]
     async fn test_versioned_bucket_stats_count_all_versions() -> TestResult {
         init_logging();
         info!("RT-09c: versioned bucket stats count all versions");

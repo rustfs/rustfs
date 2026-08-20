@@ -34,7 +34,6 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
-static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
 static NOTIFY_BUCKET_RULES_RECONCILED: AtomicBool = AtomicBool::new(false);
 static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
@@ -70,13 +69,11 @@ fn should_reconcile_bucket_notification_rules(runtime_changed: bool, notify_enab
 
 pub fn refresh_notify_module_enabled() -> bool {
     let enabled = resolve_notify_module_state().enabled;
-    NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+    crate::module_switches::set_notify_module_enabled(enabled);
     enabled
 }
 
-pub fn is_notify_module_enabled() -> bool {
-    NOTIFY_MODULE_ENABLED.load(Ordering::Relaxed)
-}
+pub use crate::module_switches::is_notify_module_enabled;
 
 pub(crate) use crate::shared_types::convert_ecstore_object_info;
 
@@ -171,7 +168,7 @@ pub(crate) async fn reconcile_event_notifier_from_store(
         let transition_system = system.clone();
         let transition_store = store.clone();
         let transition = with_refreshed_notify_module_state_from(store.clone(), move |resolution| async move {
-            NOTIFY_MODULE_ENABLED.store(resolution.enabled, Ordering::Relaxed);
+            crate::module_switches::set_notify_module_enabled(resolution.enabled);
             let read_store = transition_store.clone();
             let config_system = transition_system.clone();
             with_server_config_read_lock(transition_store, move || async move {

@@ -24,16 +24,14 @@
 //! - **Concurrency Management**: Coordination of concurrent GetObject requests
 //! - **Request Tracking**: RAII guards for request lifecycle management
 //!
-//! # Migration Note
+//! # Relationship to the shared crates
 //!
-//! Core algorithms have been migrated to `rustfs-io-core` and metrics to
-//! `rustfs-io-metrics`. This module maintains API compatibility while
-//! delegating to the new implementations.
+//! The scheduling algorithm lives in [`io_schedule`], not in `rustfs-io-core`:
+//! this module does not delegate to it. `rustfs-io-core` owns the shared
+//! config shapes and the `io_profile` storage-media model that [`io_schedule`]
+//! consumes, and `rustfs-io-metrics` owns bandwidth sampling and metric
+//! recording.
 
-// Sub-modules
-// pub mod bandwidth_monitor; // Migrated to rustfs-io-metrics
-// pub mod global_metrics; // Migrated to rustfs-io-metrics
-// pub mod io_profile; // Migrated to rustfs-io-core
 pub mod io_schedule;
 pub mod manager;
 pub mod request_guard;
@@ -45,34 +43,15 @@ pub mod request_guard;
 // I/O scheduling types (from io_schedule.rs for backward compatibility)
 #[allow(unused_imports)]
 pub use io_schedule::{
-    IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
-    IoSchedulerConfig, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
-    get_put_concurrency_aware_buffer_size,
+    IoLoadLevel, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
+    get_advanced_buffer_size, get_concurrency_aware_buffer_size, get_put_concurrency_aware_buffer_size,
 };
 
 // Request tracking
 pub use request_guard::{GetObjectGuard, PutObjectGuard};
 
 // Concurrency manager
-pub use manager::{ConcurrencyManager, DiskReadAdmission};
-
-// ============================================
-// New Module Re-exports (for gradual migration)
-// ============================================
-
-// Re-export types from rustfs-io-core for convenience
-pub use rustfs_io_core::{
-    // Backpressure types
-    BackpressureMonitor,
-    // Deadlock detection types
-    DeadlockDetector,
-    // Scheduler types
-    IoScheduler,
-    // Lock optimization types
-    LockOptimizer,
-};
-
-// Re-export types from rustfs-io-metrics for convenience
+pub use manager::{ConcurrencyManager, DiskReadAdmission, PutObjectAdmission};
 
 // ============================================
 // Helper Functions
@@ -83,37 +62,8 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
     ConcurrencyManager::global()
 }
 
-/// Reset the active get requests counter (for testing).
-#[allow(dead_code)]
-pub fn reset_active_get_requests() {
-    io_schedule::ACTIVE_GET_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[allow(dead_code)]
+/// Reset the active put requests counter (for testing).
+#[cfg(test)]
 pub fn reset_active_put_requests() {
     io_schedule::ACTIVE_PUT_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Create a new I/O scheduler with default configuration.
-#[allow(dead_code)]
-pub fn create_io_scheduler() -> IoScheduler {
-    IoScheduler::with_defaults()
-}
-
-/// Create a new backpressure monitor with default configuration.
-#[allow(dead_code)]
-pub fn create_backpressure_monitor() -> BackpressureMonitor {
-    BackpressureMonitor::with_defaults()
-}
-
-/// Create a new deadlock detector with default configuration.
-#[allow(dead_code)]
-pub fn create_deadlock_detector() -> DeadlockDetector {
-    DeadlockDetector::with_defaults()
-}
-
-/// Create a new lock optimizer with default configuration.
-#[allow(dead_code)]
-pub fn create_lock_optimizer() -> LockOptimizer {
-    LockOptimizer::with_defaults()
 }

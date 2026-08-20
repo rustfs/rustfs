@@ -49,7 +49,6 @@ pub struct IndexInfo {
     pub uncompressed_offset: i64,
 }
 
-#[allow(dead_code)]
 impl Index {
     pub fn new() -> Self {
         Self {
@@ -58,14 +57,6 @@ impl Index {
             info: Vec::new(),
             est_block_uncomp: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    fn reset(&mut self, max_block: usize) {
-        self.est_block_uncomp = max_block as i64;
-        self.total_compressed = -1;
-        self.total_uncompressed = -1;
-        self.info.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -509,47 +500,6 @@ fn read_varint(buf: &[u8]) -> io::Result<(i64, usize)> {
     }
 
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))
-}
-
-// Helper functions for index header manipulation
-#[allow(dead_code)]
-pub fn remove_index_headers(b: &[u8]) -> Option<&[u8]> {
-    if b.len() < 4 + S2_INDEX_TRAILER.len() {
-        return None;
-    }
-
-    // Skip size
-    let b = &b[4..];
-
-    // Check trailer
-    if !b.starts_with(S2_INDEX_TRAILER) {
-        return None;
-    }
-
-    Some(&b[S2_INDEX_TRAILER.len()..])
-}
-
-#[allow(dead_code)]
-pub fn restore_index_headers(in_data: &[u8]) -> Vec<u8> {
-    if in_data.is_empty() {
-        return Vec::new();
-    }
-
-    let mut b = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + in_data.len() + S2_INDEX_TRAILER.len() + 4);
-    b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]);
-    b.extend_from_slice(S2_INDEX_HEADER);
-    b.extend_from_slice(in_data);
-
-    let total_size = (b.len() + 4 + S2_INDEX_TRAILER.len()) as u32;
-    b.extend_from_slice(&total_size.to_le_bytes());
-    b.extend_from_slice(S2_INDEX_TRAILER);
-
-    let chunk_len = b.len() - 4;
-    b[1] = chunk_len as u8;
-    b[2] = (chunk_len >> 8) as u8;
-    b[3] = (chunk_len >> 16) as u8;
-
-    b
 }
 
 #[cfg(test)]

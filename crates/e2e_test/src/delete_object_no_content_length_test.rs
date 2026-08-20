@@ -24,7 +24,6 @@ mod tests {
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
     use rustfs_signer::sign_v4;
     use s3s::Body;
-    use serial_test::serial;
     use std::error::Error;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -92,7 +91,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_delete_object_version_without_content_length_succeeds() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("🧪 TEST: signed DELETE Object?versionId succeeds without Content-Length");

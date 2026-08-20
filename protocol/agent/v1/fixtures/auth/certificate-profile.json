@@ -1,0 +1,82 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "certificate-profile",
+  "description": "Frozen shape of the client certificate an online device presents and of the RFC 9440 header that conveys it.",
+  "certificate": {
+    "subject": {
+      "rdnCount": 1,
+      "commonName": "{clusterDeviceUid}",
+      "forbiddenAttributes": ["O", "OU", "C", "ST", "L", "emailAddress"]
+    },
+    "subjectAlternativeName": {
+      "entryCount": 1,
+      "type": "uniformResourceIdentifier",
+      "value": "urn:rustfs:connect:device:{clusterDeviceUid}",
+      "forbiddenTypes": ["dNSName", "iPAddress", "rfc822Name", "directoryName"],
+      "wildcardsAccepted": false
+    },
+    "clusterDeviceUid": {
+      "source": "cluster_devices.uid",
+      "format": "lowercase canonical UUIDv7",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "keyAlgorithm": "EC",
+    "keyCurve": "P-256",
+    "signatureAlgorithm": "ES256",
+    "certificateSigningRequest": {
+      "format": "PKCS#10",
+      "signatureAlgorithm": "ES256",
+      "proofOfPossession": "self-signed with the device private key"
+    },
+    "lifetimeSeconds": 86400,
+    "maxRotationOverlapSeconds": 86400,
+    "recommendedRotationLeadSeconds": 28800,
+    "maxPresentableCredentialsPerDevice": 2,
+    "serial": {
+      "encoding": "lowercase-hex",
+      "length": 32,
+      "pattern": "^[0-9a-f]{32}$",
+      "entropyBits": 128
+    },
+    "certificateFingerprint": {
+      "algorithm": "SHA-256",
+      "over": "DER certificate",
+      "encoding": "lowercase-hex",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "publicKeyFingerprint": {
+      "algorithm": "SHA-256",
+      "over": "DER SubjectPublicKeyInfo",
+      "encoding": "lowercase-hex",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "keyId": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{7,127}$"
+    },
+    "carriesOrganizationIdentifier": false,
+    "carriesClusterIdentifier": false,
+    "tenantBinding": {
+      "source": "device_credentials matched by certificate serial and certificate fingerprint",
+      "resolver": "ClusterDeviceIdentityPort::resolveOnlineCertificate"
+    }
+  },
+  "header": {
+    "name": "Client-Cert",
+    "specification": "RFC 9440",
+    "encoding": "sf-binary",
+    "valueTemplate": ":{base64(DER certificate)}:",
+    "example": ":MIIBkDCCATagAwIBAgIQZXhhbXBsZQ==:",
+    "chainHeader": {
+      "name": "Client-Cert-Chain",
+      "accepted": false,
+      "reason": "Chain validation belongs to the trusted ingress, which verifies against the Connect device CA before forwarding."
+    },
+    "setByTrustedIngressOnly": true,
+    "inboundHeaderStripped": true,
+    "appendAccepted": false,
+    "acceptedOnSurfaces": ["/agent"],
+    "ignoredOnSurfaces": ["/api"],
+    "backendPubliclyReachable": false
+  }
+}

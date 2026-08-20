@@ -812,12 +812,10 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
 /// # Returns
 /// * `AuthType` - The determined authentication type
 ///
-#[allow(dead_code)]
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     get_request_auth_type_with_query(header, None)
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
@@ -846,20 +844,6 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
     }
 }
 
-/// Helper function to determine auth type and signature version
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `(String, String)` - Tuple of auth type and signature version
-///
-#[allow(dead_code)]
-fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
-    determine_auth_type_and_version_with_query(header, None)
-}
-
-#[allow(dead_code)]
 fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
     match get_request_auth_type_with_query(header, query) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
@@ -923,18 +907,6 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
         return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
     }
     false
-}
-
-/// Verify if request has AWS PreSign Version '4'
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `bool` - True if request has AWS PreSign Version '4', false otherwise
-#[allow(dead_code)]
-pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
-    is_request_presigned_signature_v4_with_query(header, None)
 }
 
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
@@ -2236,6 +2208,89 @@ mod tests_policy {
         };
 
         assert!(!policy.is_allowed(&args_fail).await, "IAM Policy should deny non-matching IP");
+    }
+
+    /// The failure this issue is about: when `remote_addr` is dropped the
+    /// `aws:SourceIp` key never reaches the condition map, and `AddrFunc::evaluate`
+    /// returns `false` for an absent key. That flips two policy shapes in
+    /// opposite directions, and only one of them looks like a failure
+    /// (rustfs/backlog#1885).
+    #[tokio::test]
+    async fn source_ip_policies_break_in_both_directions_when_the_key_is_missing() {
+        let allow_from_office = |effect: &str| {
+            format!(
+                r#"{{
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {{"Effect": "Allow", "Action": ["admin:ConfigUpdate"], "Resource": ["arn:aws:s3:::*"]}},
+                        {{
+                            "Effect": "{effect}",
+                            "Action": ["admin:ConfigUpdate"],
+                            "Resource": ["arn:aws:s3:::*"],
+                            "Condition": {{"IpAddress": {{"aws:SourceIp": "192.168.1.0/24"}}}}
+                        }}
+                    ]
+                }}"#
+            )
+        };
+
+        let claims = HashMap::new();
+        let groups = None;
+        let mut with_ip = HashMap::new();
+        with_ip.insert("SourceIp".to_string(), vec!["192.168.1.10".to_string()]);
+        let without_ip: HashMap<String, Vec<String>> = HashMap::new();
+
+        let args_with_ip = Args {
+            account: "test-account",
+            groups: &groups,
+            action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::ConfigUpdateAdminAction),
+            bucket: "",
+            conditions: &with_ip,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        let args_without_ip = Args {
+            conditions: &without_ip,
+            ..args_with_ip
+        };
+
+        // Deny + blacklist: the bypass shape. With the key present the deny
+        // matches and the request is refused; drop the key and the deny stops
+        // matching, so a source that policy means to block gets through.
+        let deny_policy: Policy = serde_json::from_str(&allow_from_office("Deny")).expect("deny policy parses");
+        assert!(
+            !deny_policy.is_allowed(&args_with_ip).await,
+            "a blacklisted source must be refused while aws:SourceIp is present"
+        );
+        assert!(
+            deny_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr makes the Deny statement unreachable — this is the bypass"
+        );
+
+        // Allow + whitelist: the availability shape, and the only one an
+        // operator would notice, which is why the bypass above went unseen.
+        let allow_policy: Policy = serde_json::from_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["admin:ConfigUpdate"],
+                    "Resource": ["arn:aws:s3:::*"],
+                    "Condition": {"IpAddress": {"aws:SourceIp": "192.168.1.0/24"}}
+                }]
+            }"#,
+        )
+        .expect("allow policy parses");
+        assert!(
+            allow_policy.is_allowed(&args_with_ip).await,
+            "a whitelisted source must be allowed while aws:SourceIp is present"
+        );
+        assert!(
+            !allow_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr locks out a legitimate admin"
+        );
     }
 
     #[tokio::test]

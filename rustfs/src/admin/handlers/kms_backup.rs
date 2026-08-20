@@ -286,6 +286,7 @@ fn auth_method_kind(auth: &VaultAuthMethod) -> String {
     match auth {
         VaultAuthMethod::Token { .. } => "token",
         VaultAuthMethod::AppRole { .. } => "approle",
+        VaultAuthMethod::Kubernetes { .. } => "kubernetes",
         VaultAuthMethod::TokenFile { .. } => "token-file",
     }
     .to_string()
@@ -484,7 +485,10 @@ fn business_trust_root_secrets(config: &KmsConfig) -> Vec<Zeroizing<String>> {
             secrets.push(Zeroizing::new(role_id.clone()));
             secrets.push(Zeroizing::new(secret_id.clone()));
         }
-        VaultAuthMethod::TokenFile { .. } => {}
+        // Kubernetes and TokenFile hold no inline plaintext credential: the
+        // ServiceAccount token and the agent-managed token live in files, and
+        // the role names a Vault binding rather than half a credential pair.
+        VaultAuthMethod::Kubernetes { .. } | VaultAuthMethod::TokenFile { .. } => {}
     };
 
     match &config.backend_config {

@@ -13,28 +13,33 @@
 // limitations under the License.
 
 use super::profile::{authorize_profile_request, profile_not_implemented_response};
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use regex::Regex;
+use rustfs_common::trace_bus::{TraceEvent, TraceKind, TraceVal, subscribe_trace_events};
 use rustfs_madmin::service_commands::ServiceTraceOpts;
+use rustfs_madmin::trace::TraceType;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
 use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
+use url::form_urlencoded;
 
 #[derive(Serialize)]
 struct ProfileStatus {
@@ -83,14 +88,14 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 }
 
 /// Authorize a request against a single admin action (profiling or trace).
+/// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
 async fn authorize_action(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 pub struct ProfileHandler {}
@@ -206,16 +211,164 @@ impl Stream for TraceStream {
 
 impl ByteStream for TraceStream {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceKindFilter {
+    heal: bool,
+    scanner: bool,
+}
+
+impl TraceKindFilter {
+    const ALL_SUPPORTED: Self = Self {
+        heal: true,
+        scanner: true,
+    };
+
+    fn from_request(uri: &hyper::Uri, trace_types: TraceType) -> S3Result<Self> {
+        let mut has_kind = false;
+        let mut filter = Self {
+            heal: false,
+            scanner: false,
+        };
+
+        for (key, value) in trace_query_pairs(uri) {
+            if key != "kind" {
+                continue;
+            }
+            has_kind = true;
+            for item in value.split(',') {
+                match item.trim().to_ascii_lowercase().as_str() {
+                    "heal" | "healing" => filter.heal = true,
+                    "scanner" => filter.scanner = true,
+                    "all" => return Ok(Self::ALL_SUPPORTED),
+                    _ => return Err(s3_error!(InvalidRequest, "invalid trace kind")),
+                }
+            }
+        }
+
+        if has_kind {
+            return Ok(filter);
+        }
+
+        if trace_types.mask() == 0 || trace_query_flag(uri, "all") {
+            return Ok(Self::ALL_SUPPORTED);
+        }
+
+        Ok(Self {
+            heal: trace_types.overlaps(&TraceType::HEALING),
+            scanner: trace_types.overlaps(&TraceType::SCANNER),
+        })
+    }
+
+    const fn matches(self, kind: TraceKind) -> bool {
+        match kind {
+            TraceKind::Heal => self.heal,
+            TraceKind::Scanner => self.scanner,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TraceStreamFilter {
+    kinds: TraceKindFilter,
+    regex: Option<Regex>,
+    threshold: Duration,
+}
+
+impl TraceStreamFilter {
+    fn from_request(uri: &hyper::Uri, opts: &ServiceTraceOpts) -> S3Result<Self> {
+        if opts.only_errors() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "trace error-only filter is not supported for heal/scanner trace"
+            ));
+        }
+
+        Ok(Self {
+            kinds: TraceKindFilter::from_request(uri, opts.trace_types())?,
+            regex: trace_regex_filter(uri)?,
+            threshold: opts.threshold(),
+        })
+    }
+
+    fn matches_kind(&self, kind: TraceKind) -> bool {
+        self.kinds.matches(kind)
+    }
+
+    fn matches_record(&self, record: &TraceWireRecord) -> bool {
+        record.duration >= self.threshold && self.regex.as_ref().is_none_or(|regex| record.matches_regex(regex))
+    }
+}
+
+#[derive(Serialize)]
+struct TraceWireRecord {
+    #[serde(rename = "type")]
+    trace_type: u64,
+    #[serde(rename = "nodename")]
+    node_name: String,
+    #[serde(rename = "funcname")]
+    func_name: String,
+    #[serde(rename = "time")]
+    time: String,
+    #[serde(rename = "path")]
+    path: String,
+    #[serde(rename = "dur")]
+    duration: Duration,
+    #[serde(rename = "bytes", skip_serializing_if = "Option::is_none")]
+    bytes: Option<i64>,
+    #[serde(rename = "msg", skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(rename = "custom", skip_serializing_if = "Option::is_none")]
+    custom: Option<HashMap<String, String>>,
+}
+
+impl TraceWireRecord {
+    fn from_event(node_name: &str, event: &TraceEvent) -> Self {
+        Self {
+            trace_type: trace_type_mask(event.kind),
+            node_name: node_name.to_owned(),
+            func_name: event.func.as_str().to_owned(),
+            time: trace_time_string(event.time),
+            path: trace_path(event),
+            duration: event.duration,
+            bytes: trace_bytes(event.bytes),
+            message: None,
+            custom: trace_custom_attrs(event),
+        }
+    }
+
+    fn dropped(node_name: &str, dropped: u64) -> Self {
+        let mut custom = HashMap::new();
+        custom.insert("dropped_events".to_string(), dropped.to_string());
+
+        Self {
+            trace_type: 0,
+            node_name: node_name.to_owned(),
+            func_name: "trace.Dropped".to_string(),
+            time: trace_time_string(SystemTime::now()),
+            path: String::new(),
+            duration: Duration::ZERO,
+            bytes: None,
+            message: Some("trace subscriber lagged".to_string()),
+            custom: Some(custom),
+        }
+    }
+
+    fn matches_regex(&self, regex: &Regex) -> bool {
+        regex.is_match(&self.func_name)
+            || regex.is_match(&self.path)
+            || self.message.as_ref().is_some_and(|message| regex.is_match(message))
+            || self
+                .custom
+                .as_ref()
+                .is_some_and(|custom| custom.iter().any(|(key, value)| regex.is_match(key) || regex.is_match(value)))
+    }
+}
+
 /// `GET /v3/trace` — stream real-time server trace events.
 ///
-/// RustFS emits diagnostics through the `tracing` pipeline but does not expose
-/// an in-process subscriber that can fan trace events out to an admin client
-/// (there is no request-trace broadcast channel). Rather than return an opaque
-/// `501` — which would make `mc admin trace` fail to connect — this honors the
-/// streaming NDJSON contract: it validates the requested trace filters, opens
-/// the stream, emits a single capability record explaining that live tracing is
-/// not wired, then holds the connection open with keep-alives. No fabricated
-/// trace records are ever sent.
+/// RustFS currently publishes heal and scanner diagnostics through the common
+/// trace bus. The admin endpoint exposes those events as MinIO-shaped NDJSON
+/// records while keeping unsupported trace classes filtered out.
 pub struct TraceHandler {}
 
 #[async_trait::async_trait]
@@ -228,24 +381,13 @@ impl Operation for TraceHandler {
         let mut opts = ServiceTraceOpts::default();
         opts.parse_params(&req.uri)
             .map_err(|_| s3_error!(InvalidRequest, "invalid trace parameters"))?;
+        let filter = TraceStreamFilter::from_request(&req.uri, &opts)?;
 
         let node_name = sysinfo::System::host_name().unwrap_or_else(|| "rustfs".to_string());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(8);
+        let mut subscription = subscribe_trace_events();
+        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(64);
 
         spawn_traced(async move {
-            let notice = serde_json::json!({
-                "nodename": node_name,
-                "funcname": "admin.Trace",
-                "msg": "RustFS does not expose an in-process trace-event subscriber; live tracing is not yet available",
-                "err": "trace_streaming_unsupported",
-            });
-            if let Ok(mut encoded) = serde_json::to_vec(&notice) {
-                encoded.push(b'\n');
-                if tx.send(Ok(Bytes::from(encoded))).await.is_err() {
-                    return;
-                }
-            }
-
             let mut ticker = tokio::time::interval(Duration::from_secs(15));
             ticker.tick().await;
             loop {
@@ -254,6 +396,26 @@ impl Operation for TraceHandler {
                     _ = ticker.tick() => {
                         if tx.send(Ok(Bytes::from_static(b" \n"))).await.is_err() {
                             break;
+                        }
+                    }
+                    received = subscription.recv() => {
+                        match received {
+                            Ok(event) => {
+                                if !filter.matches_kind(event.kind) {
+                                    continue;
+                                }
+                                let record = TraceWireRecord::from_event(&node_name, &event);
+                                if filter.matches_record(&record) && send_trace_record(&tx, &record).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                                let record = TraceWireRecord::dropped(&node_name, dropped);
+                                if send_trace_record(&tx, &record).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
@@ -269,17 +431,116 @@ impl Operation for TraceHandler {
     }
 }
 
+async fn send_trace_record(tx: &mpsc::Sender<Result<Bytes, StdError>>, record: &TraceWireRecord) -> Result<(), ()> {
+    let Some(encoded) = encode_ndjson(record) else {
+        return Ok(());
+    };
+    tx.send(Ok(encoded)).await.map_err(|_| ())
+}
+
+fn encode_ndjson(value: &impl Serialize) -> Option<Bytes> {
+    let mut encoded = serde_json::to_vec(value).ok()?;
+    encoded.push(b'\n');
+    Some(Bytes::from(encoded))
+}
+
+fn trace_query_pairs(uri: &hyper::Uri) -> impl Iterator<Item = (String, String)> + '_ {
+    uri.query()
+        .into_iter()
+        .flat_map(|query| form_urlencoded::parse(query.as_bytes()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+}
+
+fn trace_query_flag(uri: &hyper::Uri, flag: &str) -> bool {
+    trace_query_pairs(uri).any(|(key, value)| key == flag && value == "true")
+}
+
+fn trace_regex_filter(uri: &hyper::Uri) -> S3Result<Option<Regex>> {
+    trace_query_pairs(uri)
+        .find_map(|(key, value)| {
+            if key == "filter" && !value.is_empty() {
+                Some(value)
+            } else {
+                None
+            }
+        })
+        .map(|pattern| Regex::new(&pattern).map_err(|_| s3_error!(InvalidRequest, "invalid trace filter")))
+        .transpose()
+}
+
+fn trace_type_mask(kind: TraceKind) -> u64 {
+    match kind {
+        TraceKind::Heal => TraceType::HEALING.mask(),
+        TraceKind::Scanner => TraceType::SCANNER.mask(),
+    }
+}
+
+fn trace_time_string(time: SystemTime) -> String {
+    match OffsetDateTime::from(time).format(&Rfc3339) {
+        Ok(value) => value,
+        Err(_) => "1970-01-01T00:00:00Z".to_string(),
+    }
+}
+
+fn trace_path(event: &TraceEvent) -> String {
+    match (event.bucket.as_deref(), event.object.as_deref()) {
+        (Some(bucket), Some(object)) if !object.is_empty() => format!("{bucket}/{object}"),
+        (Some(bucket), _) => bucket.to_owned(),
+        (None, Some(object)) => object.to_owned(),
+        (None, None) => String::new(),
+    }
+}
+
+fn trace_bytes(bytes: u64) -> Option<i64> {
+    if bytes == 0 {
+        return None;
+    }
+
+    match i64::try_from(bytes) {
+        Ok(value) => Some(value),
+        Err(_) => Some(i64::MAX),
+    }
+}
+
+fn trace_custom_attrs(event: &TraceEvent) -> Option<HashMap<String, String>> {
+    if event.attrs.is_empty() {
+        return None;
+    }
+
+    Some(
+        event
+            .attrs
+            .iter()
+            .map(|attr| (attr.key.to_string(), trace_value_string(&attr.value)))
+            .collect(),
+    )
+}
+
+fn trace_value_string(value: &TraceVal) -> String {
+    match value {
+        TraceVal::Bool(value) => value.to_string(),
+        TraceVal::U64(value) => value.to_string(),
+        TraceVal::I64(value) => value.to_string(),
+        TraceVal::Str(value) => value.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ProfileControlHandler, ProfileHandler, ProfileStatusHandler, ProfilingDownloadHandler, ProfilingStartHandler,
-        TraceHandler,
+        TraceHandler, TraceKindFilter, TraceStreamFilter, TraceWireRecord, authorize_action,
     };
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind};
+    use rustfs_madmin::service_commands::ServiceTraceOpts;
+    use rustfs_madmin::trace::TraceType;
+    use rustfs_policy::policy::action::AdminAction;
+    use s3s::{Body, S3ErrorCode, S3Request, S3Result};
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn build_profile_request(uri: &'static str) -> S3Request<Body> {
         S3Request {
@@ -293,6 +554,29 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    fn build_trace_stream_filter(uri: &'static str) -> S3Result<TraceStreamFilter> {
+        let uri = Uri::from_static(uri);
+        let mut opts = ServiceTraceOpts::default();
+        opts.parse_params(&uri).expect("test trace params should parse");
+        TraceStreamFilter::from_request(&uri, &opts)
+    }
+
+    /// The profiling/trace endpoints authorize through the shared admin gate, which
+    /// rejects a credential-less request with `InvalidRequest` "get cred failed". The
+    /// pre-check keeps the `AccessDenied` response they have always returned
+    /// (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn profile_admin_gate_keeps_its_missing_credentials_response() {
+        let err = authorize_action(
+            &build_profile_request("/rustfs/admin/v3/profiling/start"),
+            AdminAction::ProfilingAdminAction,
+        )
+        .await
+        .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("Signature is required"));
     }
 
     #[tokio::test]
@@ -357,5 +641,109 @@ mod tests {
             .await
             .expect_err("trace must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn trace_kind_filter_supports_kind_query() {
+        let uri = Uri::from_static("/rustfs/admin/v3/trace?kind=heal");
+        let filter = TraceKindFilter::from_request(&uri, TraceType::default()).expect("kind filter should parse");
+
+        assert!(filter.matches(TraceKind::Heal));
+        assert!(!filter.matches(TraceKind::Scanner));
+    }
+
+    #[test]
+    fn trace_kind_filter_defaults_to_supported_events_without_type_flags() {
+        let uri = Uri::from_static("/rustfs/admin/v3/trace");
+        let filter = TraceKindFilter::from_request(&uri, TraceType::default()).expect("empty filter should parse");
+
+        assert!(filter.matches(TraceKind::Heal));
+        assert!(filter.matches(TraceKind::Scanner));
+    }
+
+    #[test]
+    fn trace_kind_filter_rejects_unknown_kind() {
+        let uri = Uri::from_static("/rustfs/admin/v3/trace?kind=s3");
+        let err = TraceKindFilter::from_request(&uri, TraceType::default()).expect_err("unknown kind should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn trace_stream_filter_matches_regex_against_path_and_attrs() {
+        let filter = build_trace_stream_filter("/rustfs/admin/v3/trace?kind=heal&filter=data/.%2Bxl.meta")
+            .expect("regex filter should parse");
+        let event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealObject)
+            .with_bucket("data")
+            .with_object("dir/xl.meta")
+            .with_attr("dry_run", true);
+        let record = TraceWireRecord::from_event("node-a", &event);
+
+        assert!(filter.matches_kind(event.kind));
+        assert!(filter.matches_record(&record));
+    }
+
+    #[test]
+    fn trace_stream_filter_rejects_invalid_regex() {
+        let err = build_trace_stream_filter("/rustfs/admin/v3/trace?kind=heal&filter=[").expect_err("invalid regex should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn trace_stream_filter_applies_threshold() {
+        let filter =
+            build_trace_stream_filter("/rustfs/admin/v3/trace?kind=heal&threshold=10ms").expect("threshold should parse");
+        let short = TraceWireRecord::from_event(
+            "node-a",
+            &TraceEvent::new(TraceKind::Heal, TraceFunc::HealObject).with_duration(Duration::from_millis(9)),
+        );
+        let long = TraceWireRecord::from_event(
+            "node-a",
+            &TraceEvent::new(TraceKind::Heal, TraceFunc::HealObject).with_duration(Duration::from_millis(10)),
+        );
+
+        assert!(!filter.matches_record(&short));
+        assert!(filter.matches_record(&long));
+    }
+
+    #[test]
+    fn trace_stream_filter_rejects_error_only_filter() {
+        let err = build_trace_stream_filter("/rustfs/admin/v3/trace?kind=heal&err=true").expect_err("err filter should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn trace_wire_record_contains_madmin_trace_fields() {
+        let event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealObject)
+            .with_bucket("bucket")
+            .with_object("object")
+            .with_duration(Duration::from_millis(3))
+            .with_bytes(17)
+            .with_attr("dry", true);
+        let mut record = TraceWireRecord::from_event("node-a", &event);
+        record.time = "1970-01-01T00:00:00Z".to_string();
+
+        let value = serde_json::to_value(&record).expect("trace record should serialize");
+
+        assert_eq!(value["type"], TraceType::HEALING.mask());
+        assert_eq!(value["nodename"], "node-a");
+        assert_eq!(value["funcname"], "heal.Object");
+        assert_eq!(value["time"], "1970-01-01T00:00:00Z");
+        assert_eq!(value["path"], "bucket/object");
+        assert_eq!(value["bytes"], 17);
+        assert_eq!(value["custom"]["dry"], "true");
+    }
+
+    #[test]
+    fn trace_wire_record_formats_epoch_time() {
+        let event = TraceEvent {
+            time: UNIX_EPOCH,
+            ..TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerFolder)
+        };
+        let record = TraceWireRecord::from_event("node-a", &event);
+
+        assert_eq!(record.time, "1970-01-01T00:00:00Z");
     }
 }

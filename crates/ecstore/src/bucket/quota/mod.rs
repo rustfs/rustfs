@@ -193,6 +193,7 @@ pub enum QuotaError {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub struct QuotaErrorResponse {
     #[serde(rename = "Code")]
     pub code: String,
@@ -208,6 +209,7 @@ pub struct QuotaErrorResponse {
 }
 
 impl QuotaErrorResponse {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub fn new(quota_error: &QuotaError, request_id: &str, host_id: &str) -> Self {
         match quota_error {
             QuotaError::QuotaExceeded { .. } => Self {
@@ -310,9 +312,7 @@ mod tests {
         }
         #[derive(Deserialize)]
         struct LegacyBucketQuota {
-            #[allow(dead_code)]
             quota: Option<u64>,
-            #[allow(dead_code)]
             quota_type: LegacyQuotaType,
         }
         let legacy = serde_json::from_slice::<LegacyBucketQuota>(&json)

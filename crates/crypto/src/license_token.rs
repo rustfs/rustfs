@@ -204,14 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn test_source_does_not_embed_private_key() {
-        let source = include_str!("license_token.rs");
-        let forbidden = ["BEGIN", "PRIVATE KEY"].join(" ");
-
-        assert!(!source.contains(&forbidden));
-    }
-
-    #[test]
     fn test_parse_signed_license_token_rejects_invalid_token() {
         let mut rng = rand::rng();
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate private key");

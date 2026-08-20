@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+#### rustfs-io-core
+- **Zero-consumer modules** (added in 0.0.5): `reader`, `writer`, `bufreader_optimizer`, `shared_memory`, `direct_io`, `timeout_wrapper`, `io_priority_queue`, and `scheduler` had no caller in the workspace and were removed (rustfs/backlog#1824). The scheduling algorithm and the request timeout wrapper that RustFS actually runs live in `rustfs/src/storage/`; this crate keeps the config shapes they project into. `OperationProgress` moved to the new `progress` module and is still exported as `rustfs_io_core::OperationProgress`.
+
 #### rustfs-io-metrics
 - **Unified configuration** (added in 0.0.5): the zero-consumer `IoConfig`, `CacheSettings`, `IoSchedulerSettings`, `BackpressureSettings`, `TimeoutSettings`, `DeadlockDetectionSettings` types and their `DEFAULT_*` constants were removed (rustfs/rustfs#6008); rustfs-io-core's `IoSchedulerConfig`/`BackpressureConfig` remain the canonical configuration types.
 

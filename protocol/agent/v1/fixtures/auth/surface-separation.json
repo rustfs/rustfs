@@ -1,0 +1,78 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "surface-separation",
+  "description": "The control surface and the agent surface have disjoint credentials. Neither accepts the other's, and neither OpenAPI document declares the other's security scheme.",
+  "httpVectors": [
+    {
+      "name": "agent client certificate presented to the control surface",
+      "surface": "/api",
+      "request": {
+        "method": "GET",
+        "path": "/api/session",
+        "headers": {
+          "Client-Cert": ":MIIBkDCCATagAwIBAgIQZXhhbXBsZQ==:"
+        },
+        "browserSession": false
+      },
+      "expected": {
+        "authenticated": false,
+        "httpStatus": 401,
+        "status": "UNAUTHENTICATED",
+        "reason": "UNAUTHENTICATED"
+      }
+    },
+    {
+      "name": "browser session presented to the agent surface",
+      "surface": "/agent",
+      "request": {
+        "method": "GET",
+        "path": "/agent/protocolStatus",
+        "headers": {},
+        "browserSession": true
+      },
+      "expected": {
+        "deviceIdentityEstablished": false,
+        "httpStatus": 200,
+        "body": {
+          "protocolVersion": "v1"
+        },
+        "identicalToUnauthenticatedRequest": true,
+        "note": "getProtocolStatus is the pre-registration operation and is public on purpose. An authenticated browser session neither changes its answer nor grants anything on the agent surface."
+      }
+    }
+  ],
+  "documentVectors": [
+    {
+      "document": "openapi/agent.json",
+      "securityScheme": "agentMutualTls",
+      "schemeType": "mutualTLS",
+      "forbiddenSecuritySchemes": ["sessionCookie"],
+      "defaultSecurity": ["agentMutualTls"],
+      "publicOperations": ["getProtocolStatus"]
+    },
+    {
+      "document": "openapi/control.json",
+      "securityScheme": "sessionCookie",
+      "schemeType": "apiKey",
+      "forbiddenSecuritySchemes": ["agentMutualTls"],
+      "defaultSecurity": [],
+      "publicOperations": null
+    }
+  ],
+  "routeGuards": {
+    "surfacePrefix": "agent/",
+    "description": "No agent route may be protected by a session authentication guard. A device is identified by its certificate or not at all.",
+    "forbiddenMiddlewarePrefixes": ["auth:", "auth.session"],
+    "forbiddenMiddleware": ["auth"],
+    "forbiddenMiddlewareClasses": [
+      "Illuminate\\Auth\\Middleware\\Authenticate",
+      "Illuminate\\Auth\\Middleware\\AuthenticateSession"
+    ],
+    "knownGap": {
+      "middleware": "Laravel\\Sanctum\\Http\\Middleware\\EnsureFrontendRequestsAreStateful",
+      "description": "The agent routes still share the api middleware group with the control surface, so Sanctum's stateful frontend middleware runs on them. It establishes no device identity and no agent route uses an authentication guard, but the agent surface should get its own middleware group when the first authenticated agent operation lands.",
+      "owner": "the issue that adds the first authenticated agent operation"
+    }
+  }
+}

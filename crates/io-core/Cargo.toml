@@ -20,8 +20,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Buffered I/O reader and writer implementations for RustFS (mmap-then-copy, aligned pread)"
-keywords = ["io", "reader", "writer", "rustfs", "mmap"]
+description = "Shared I/O primitives for RustFS (buffer pool, storage profiling, backpressure, deadlock detection)"
+keywords = ["io", "buffer", "pool", "rustfs", "backpressure"]
 categories = ["development-tools", "filesystem"]
 
 [lints]
@@ -38,7 +38,6 @@ hotpath.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "fs", "sync", "rt-multi-thread"] }
-memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 tracing = { workspace = true }
 

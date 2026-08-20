@@ -16,7 +16,6 @@
 ///
 /// The table follows Linux `include/uapi/linux/magic.h`; filesystem magic
 /// values without a stable Linux uapi source stay `UNKNOWN`.
-#[allow(dead_code)]
 pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
     // Magic numbers for various filesystems.
     match fs_type {

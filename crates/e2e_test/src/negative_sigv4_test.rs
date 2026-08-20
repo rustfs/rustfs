@@ -37,7 +37,6 @@ use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::primitives::ByteStream;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::request_signature_v4::{SIGN_V4_ALGORITHM, get_scope, get_signature, get_signing_key};
-use serial_test::serial;
 use std::fmt::Write as _;
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime};
@@ -183,7 +182,6 @@ async fn setup(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn std::error
 /// this, every negative assertion below could pass for the wrong reason (a
 /// broken signer that never produces a valid signature).
 #[tokio::test]
-#[serial]
 async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -214,7 +212,6 @@ async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error:
 /// (a) Tampering the `Signature=` component must be rejected with
 /// SignatureDoesNotMatch / 403.
 #[tokio::test]
-#[serial]
 async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -254,7 +251,6 @@ async fn tampered_signature_returns_signature_does_not_match() -> Result<(), Box
 /// (b) A valid AccessKeyId paired with the wrong secret key must be rejected
 /// with SignatureDoesNotMatch / 403.
 #[tokio::test]
-#[serial]
 async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -279,7 +275,6 @@ async fn wrong_secret_key_returns_signature_does_not_match() -> Result<(), Box<d
 /// signature itself is valid (it covers the *declared* hash), so the server is
 /// forced to detect the payload/hash mismatch while streaming the body.
 #[tokio::test]
-#[serial]
 async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -320,7 +315,6 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
 /// x-amz-date both derive from the same skewed timestamp, so skew — not a
 /// signature mismatch — is the failure.
 #[tokio::test]
-#[serial]
 async fn skewed_date_returns_request_time_too_skewed() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -344,7 +338,6 @@ async fn skewed_date_returns_request_time_too_skewed() -> Result<(), Box<dyn std
 /// structurally invalid SigV4 header that must be rejected before any
 /// credential/service handling.
 #[tokio::test]
-#[serial]
 async fn malformed_authorization_header_returns_clean_4xx() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;

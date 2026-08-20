@@ -16,8 +16,16 @@ use serde::{Deserialize, Serialize};
 use std::{fmt::Display, io};
 use tracing::info;
 
+#[allow(
+    dead_code,
+    reason = "tier config wire version stamped by the parity constructors below (backlog#1823)"
+)]
 const C_TIER_CONFIG_VER: &str = "v1";
 
+#[allow(
+    dead_code,
+    reason = "tier-name validation message reached only from the parity constructors below (backlog#1823)"
+)]
 const ERR_TIER_NAME_EMPTY: &str = "remote tier name empty";
 const WASABI_US_EAST_ENDPOINT: &str = "https://s3.wasabisys.com";
 const WASABI_ALTERNATIVE_ENDPOINTS: &[(&str, &str)] = &[
@@ -264,7 +272,6 @@ impl Clone for TierConfig {
     }
 }
 
-#[allow(dead_code)]
 impl TierConfig {
     pub(crate) fn clone_with_credentials(&self) -> Self {
         Self {
@@ -284,6 +291,7 @@ impl TierConfig {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn endpoint(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().map(|s| s.endpoint.clone()).unwrap_or_default(),
@@ -303,6 +311,7 @@ impl TierConfig {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn bucket(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().map(|s| s.bucket.clone()).unwrap_or_default(),
@@ -322,6 +331,7 @@ impl TierConfig {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn prefix(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().map(|s| s.prefix.clone()).unwrap_or_default(),
@@ -341,6 +351,7 @@ impl TierConfig {
         }
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn region(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().map(|s| s.region.clone()).unwrap_or_default(),
@@ -457,7 +468,7 @@ impl TierWasabi {
 }
 
 impl TierS3 {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn create<F>(
         name: &str,
         access_key: &str,
@@ -528,7 +539,7 @@ pub struct TierMinIO {
 }
 
 impl TierMinIO {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     fn create<F>(
         name: &str,
         endpoint: &str,

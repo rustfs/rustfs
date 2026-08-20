@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
     DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
-    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, SizeSummary, hash_path,
+    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -32,6 +32,7 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
+use crate::storage_api::owner::{EcstoreEventArgs, ecstore_send_event};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
@@ -41,9 +42,10 @@ use rustfs_common::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
+use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -51,10 +53,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::{
-    BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE,
-    ScannerDiskExt as _, ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule,
-    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts, ReplicationConfig,
+    ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
+    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
     path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
     scanner_replication_config_for_lifecycle_eval,
 };
@@ -69,7 +71,6 @@ const EVENT_SCANNER_METADATA_CORRUPT: &str = "scanner_metadata_corrupt";
 const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
 const EVENT_SCANNER_HEAL_ADMISSION: &str = "scanner_heal_admission";
 const EVENT_SCANNER_ALERT_STATE: &str = "scanner_alert_state";
-const EVENT_SCANNER_COMPAT_STATE: &str = "scanner_compat_state";
 
 const DATA_USAGE_UPDATE_DIR_CYCLES: u32 = 16;
 const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
@@ -90,17 +91,109 @@ const ENV_FAILED_OBJECTS_MAX: &str = "RUSTFS_DATA_USAGE_FAILED_OBJECTS_MAX";
 const DEFAULT_FAILED_OBJECT_TTL_SECS: u32 = 86_400;
 const DEFAULT_FAILED_OBJECTS_MAX: u32 = 10_000;
 const DEFAULT_SCANNER_DEEP_VERIFY_COOLDOWN_SECS: u64 = 60;
-const METRIC_SCANNER_INLINE_HEAL_TOTAL: &str = "rustfs_scanner_inline_heal_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSIONS_TOTAL: &str = "rustfs_scanner_excess_object_versions_total";
 const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_excess_object_version_size_total";
 const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders_total";
 const METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL: &str = "rustfs_scanner_pending_heal_prune_total";
 const METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL: &str = "rustfs_scanner_pending_heal_malformed_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
+
+// --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
+//
+// The excess-versions / excess-version-size / excess-folders alerts were
+// metrics-and-logs only; subscribers (consoles, external auditors) had no way
+// to hear them. MinIO emits s3:ObjectManyVersions / s3:ObjectLargeVersions /
+// s3:PrefixManyFolders for the same conditions — RustFS carries those as
+// EventName::Scanner* with the wire names below. Without a cooldown a single
+// over-threshold object would re-emit on every scan cycle (~a minute), so
+// emissions are edge-held per (kind, bucket, object) for 24h.
+
+/// `s3:Scanner:ManyVersions` (MinIO `s3:ObjectManyVersions`).
+pub const EVENT_SCANNER_MANY_VERSIONS: &str = "s3:Scanner:ManyVersions";
+/// `s3:Scanner:LargeVersions` (MinIO `s3:ObjectLargeVersions`).
+pub const EVENT_SCANNER_LARGE_VERSIONS: &str = "s3:Scanner:LargeVersions";
+/// `s3:Scanner:BigPrefix` (MinIO `s3:PrefixManyFolders`).
+pub const EVENT_SCANNER_BIG_PREFIX: &str = "s3:Scanner:BigPrefix";
+const ENV_SCANNER_ALERT_COOLDOWN_SECS: &str = "RUSTFS_SCANNER_ALERT_COOLDOWN_SECS";
+const DEFAULT_SCANNER_ALERT_COOLDOWN_SECS: u64 = 86_400;
+/// Hard cap on distinct cooldown keys; a pathological number of over-threshold
+/// objects clears the map wholesale instead of growing without bound (the
+/// worst case is one re-emission per still-hot key per scan cycle).
+const MAX_SCANNER_ALERT_COOLDOWN_KEYS: usize = 4096;
+
+/// Distinct alert kinds sharing one cooldown map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScannerAlertKind {
+    ManyVersions,
+    LargeVersions,
+    BigPrefix,
+}
+
+type ScannerAlertCooldownKey = (ScannerAlertKind, String, String);
+type ScannerAlertCooldownMap = HashMap<ScannerAlertCooldownKey, Instant>;
+
+static SCANNER_ALERT_EMISSION_COOLDOWN: Mutex<Option<ScannerAlertCooldownMap>> = Mutex::new(None);
+
+fn scanner_alert_cooldown() -> Duration {
+    let raw = std::env::var(ENV_SCANNER_ALERT_COOLDOWN_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    Duration::from_secs(raw.unwrap_or(DEFAULT_SCANNER_ALERT_COOLDOWN_SECS))
+}
+
+/// Edge-held emission gate: returns `true` (and records the cooldown) only
+/// when this (kind, bucket, object) last fired longer than the cooldown ago —
+/// or never. Metrics and logs stay level-triggered every cycle; only the
+/// notification events are held back.
+fn scanner_alert_emission_allows(kind: ScannerAlertKind, bucket: &str, object: &str, cooldown: Duration) -> bool {
+    let key = (kind, bucket.to_string(), object.to_string());
+    let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let guard = guard.get_or_insert_with(ScannerAlertCooldownMap::new);
+    let now = Instant::now();
+    // Expired entries leave first; the cap is still exceeded only when live
+    // keys alone overflow it, in which case a wholesale clear trades one
+    // extra emission per hot key for a hard memory bound.
+    if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+        guard.retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        if guard.len() >= MAX_SCANNER_ALERT_COOLDOWN_KEYS {
+            guard.clear();
+        }
+    }
+    match guard.get(&key) {
+        Some(fired_at) if now.duration_since(*fired_at) < cooldown => false,
+        _ => {
+            guard.insert(key, now);
+            true
+        }
+    }
+}
+
+/// Emit a scanner alert as an S3 notification event through the standard
+/// dispatch pipeline. Fire-and-forget: the notify layer owns delivery,
+/// retry, and target filtering; the scanner never waits on it.
+fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: i64, details: &[(&str, String)]) {
+    let mut req_params = HashMap::with_capacity(details.len());
+    for (key, value) in details {
+        req_params.insert((*key).to_string(), value.clone());
+    }
+    ecstore_send_event(EcstoreEventArgs {
+        event_name: event_name.to_string(),
+        bucket_name: bucket.to_string(),
+        object: crate::ScannerObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size,
+            ..Default::default()
+        },
+        req_params,
+        user_agent: "Scanner".to_string(),
+        ..Default::default()
+    });
+}
 const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
 
-static SCANNER_INLINE_HEAL_WARN_ONCE: Once = Once::new();
-static SCANNER_INLINE_HEAL_METRICS_ONCE: Once = Once::new();
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
 
 #[cfg(test)]
@@ -152,27 +245,6 @@ fn effective_object_heal_scan_mode(heal_bitrot: bool, mod_time: Option<OffsetDat
     } else {
         HealScanMode::Deep
     }
-}
-
-fn scanner_inline_heal_enabled() -> bool {
-    scanner_inline_heal_enabled_from_value(std::env::var(rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE).ok().as_deref())
-}
-
-fn scanner_inline_heal_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
-        None => rustfs_config::DEFAULT_SCANNER_INLINE_HEAL_ENABLE,
-    }
-}
-
-fn ensure_scanner_inline_heal_metric_registered() {
-    SCANNER_INLINE_HEAL_METRICS_ONCE.call_once(|| {
-        describe_counter!(
-            METRIC_SCANNER_INLINE_HEAL_TOTAL,
-            "Total number of inline heal operations executed directly by scanner."
-        );
-        counter!(METRIC_SCANNER_INLINE_HEAL_TOTAL).increment(0);
-    });
 }
 
 fn ensure_scanner_alert_metrics_registered() {
@@ -408,26 +480,115 @@ fn should_alert_excessive_versions(remaining_versions: usize, cumulative_size: i
     (too_many_versions, too_large_versions)
 }
 
-fn warn_inline_heal_compat_requested() {
-    if !scanner_inline_heal_enabled() {
-        return;
-    }
+fn non_negative_i64_to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}
 
-    SCANNER_INLINE_HEAL_WARN_ONCE.call_once(|| {
-        warn!(
-            target: "rustfs::scanner::folder",
-            event = EVENT_SCANNER_COMPAT_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_HEAL,
-            env = rustfs_config::ENV_SCANNER_INLINE_HEAL_ENABLE,
-            state = "inline_heal_rollback_unsupported",
-            "Scanner inline-heal rollback is unsupported; using async heal admission"
-        );
+fn trace_start_instant() -> Option<Instant> {
+    (trace_subscriber_count() > 0).then(Instant::now)
+}
+
+fn emit_scanner_folder_trace(root: &str, folder: &str, objects: u64, started_at: Option<Instant>, state: &'static str) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    trace_emit(|| {
+        let (bucket, prefix) = path2_bucket_object_with_base_path(root, folder);
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerFolder)
+            .with_bucket(bucket)
+            .with_object(prefix)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("objects", objects)
     });
 }
 
-fn non_negative_i64_to_u64(value: i64) -> u64 {
-    value.max(0) as u64
+fn emit_scanner_ilm_action_trace(
+    bucket: &str,
+    object: &str,
+    action: IlmAction,
+    count: u64,
+    queued: bool,
+    started_at: Option<Instant>,
+) {
+    let Some(started_at) = started_at else {
+        return;
+    };
+
+    let state = if queued { "queued" } else { "not_queued" };
+    trace_emit(|| {
+        TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+            .with_bucket(bucket)
+            .with_object(object)
+            .with_duration(started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("action", action.as_str())
+            .with_attr("count", count)
+            .with_attr("queued", queued)
+    });
+}
+
+struct ScannerHealCandidateTraceContext {
+    bucket: String,
+    object: Option<String>,
+    version_id: Option<String>,
+    scan_mode: Option<HealScanMode>,
+    started_at: Instant,
+}
+
+fn scanner_heal_candidate_trace_context(request: &HealChannelRequest) -> Option<ScannerHealCandidateTraceContext> {
+    let started_at = trace_start_instant()?;
+    Some(ScannerHealCandidateTraceContext {
+        bucket: request.bucket.clone(),
+        object: request.object_prefix.clone(),
+        version_id: request.object_version_id.clone(),
+        scan_mode: request.scan_mode,
+        started_at,
+    })
+}
+
+struct ScannerHealCandidateTrace<'a> {
+    candidate_type: &'static str,
+    bucket: &'a str,
+    object: Option<&'a str>,
+    version_id: Option<&'a str>,
+    priority: HealChannelPriority,
+    scan_mode: Option<HealScanMode>,
+    result: Result<HealAdmissionResult, &'a str>,
+    started_at: Instant,
+}
+
+fn emit_scanner_heal_candidate_trace(trace: ScannerHealCandidateTrace<'_>) {
+    trace_emit(|| {
+        let (state, admission, error) = match trace.result {
+            Ok(result) if result.is_admitted() => ("admitted", describe_heal_admission(result), None),
+            Ok(result) => ("not_admitted", describe_heal_admission(result), None),
+            Err(error) => ("submit_failed", "channel_error".to_string(), Some(error)),
+        };
+        let mut event = TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerHealCandidate)
+            .with_bucket(trace.bucket)
+            .with_duration(trace.started_at.elapsed())
+            .with_attr("state", state)
+            .with_attr("candidate_type", trace.candidate_type)
+            .with_attr("priority", heal_priority_label(trace.priority))
+            .with_attr("admission", admission);
+
+        if let Some(object) = trace.object {
+            event = event.with_object(object);
+        }
+        if let Some(version_id) = trace.version_id {
+            event = event.with_attr("version_id", version_id);
+        }
+        if let Some(scan_mode) = trace.scan_mode {
+            event = event.with_attr("scan_mode", scan_mode.as_str());
+        }
+        if let Some(error) = error {
+            event = event.with_attr("error", error);
+        }
+
+        event
+    });
 }
 
 fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
@@ -484,6 +645,32 @@ enum GetSizeFailureAction {
     HealMetadata { object: String },
 }
 
+/// How the corrupt-metadata branch records the repair after attempting an
+/// MRF intent (backlog#1894 axis A).
+#[derive(Debug, PartialEq, Eq)]
+enum CorruptMetadataRecording {
+    /// Intent accepted: the MRF consumer owns the repair (High Metadata
+    /// heal, durable after the journal's group-commit flush), so the
+    /// immediate heal request is skipped — the manager would otherwise book
+    /// two tasks for one target. A pending-ledger entry stays behind as the
+    /// backstop for what the journal cannot cover on its own (a crash inside
+    /// the flush window, or the consumer exhausting its admission attempts);
+    /// the repaired-notice fanout (axis B) drops the entry once the repair
+    /// lands.
+    LedgerOnly,
+    /// Intent rejected (feature disabled, channel uninitialized, or full):
+    /// the historical immediate heal request plus the ledger entry.
+    ImmediateAndLedger,
+}
+
+fn corrupt_metadata_recording(mrf_accepted: bool) -> CorruptMetadataRecording {
+    if mrf_accepted {
+        CorruptMetadataRecording::LedgerOnly
+    } else {
+        CorruptMetadataRecording::ImmediateAndLedger
+    }
+}
+
 fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> HealChannelRequest {
     HealChannelRequest {
         bucket,
@@ -537,6 +724,16 @@ fn pending_scanner_heal_identity(entry: &PendingScannerHeal) -> (u8, &str, Optio
         PendingScannerHealKind::Object => 1,
     };
     (kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref())
+}
+
+/// Decode an MRF repaired-notice version id for ledger matching. A nil UUID
+/// means "no value" per the repo-wide defensive-UUID invariant, so it maps
+/// to `None` and matches unversioned ledger entries only.
+fn mrf_repaired_version_id(version_id: Option<[u8; 16]>) -> Option<String> {
+    version_id
+        .map(uuid::Uuid::from_bytes)
+        .filter(|uuid| !uuid.is_nil())
+        .map(|uuid| uuid.to_string())
 }
 
 fn sort_pending_scanner_heals_for_retry(entries: &mut [PendingScannerHeal]) {
@@ -677,9 +874,22 @@ async fn send_scanner_heal_request(
     request: HealChannelRequest,
 ) -> Result<HealAdmissionResult, ScannerError> {
     let priority = request.priority;
+    let trace_context = scanner_heal_candidate_trace_context(&request);
     match send_heal_request_with_admission(request).await {
         Ok(result) => {
             record_heal_candidate_admission(candidate_type, priority, result);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Ok(result),
+                    started_at: trace_context.started_at,
+                });
+            }
             Ok(result)
         }
         Err(err) => {
@@ -690,6 +900,18 @@ async fn send_scanner_heal_request(
                 "result" => "channel_error".to_string()
             )
             .increment(1);
+            if let Some(trace_context) = trace_context.as_ref() {
+                emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+                    candidate_type,
+                    bucket: &trace_context.bucket,
+                    object: trace_context.object.as_deref(),
+                    version_id: trace_context.version_id.as_deref(),
+                    priority,
+                    scan_mode: trace_context.scan_mode,
+                    result: Err(err.as_str()),
+                    started_at: trace_context.started_at,
+                });
+            }
             Err(ScannerError::Other(err))
         }
     }
@@ -748,6 +970,7 @@ impl ScannerItem {
         &mut self,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
+        versioning_config: VersioningConfiguration,
         size_summary: &mut SizeSummary,
     ) {
         if object_infos.is_empty() {
@@ -772,21 +995,8 @@ impl ScannerItem {
             "Scanner lifecycle evaluation started"
         );
 
-        let versioning_config = match BucketVersioningSys::get(&self.bucket).await {
-            Ok(versioning_config) => versioning_config,
-            Err(_) => {
-                warn!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    bucket = %self.bucket,
-                    state = "versioning_lookup_failed_defaulting",
-                    "Scanner lifecycle action falling back to default bucket versioning"
-                );
-                Default::default()
-            }
-        };
+        // `versioning_config` is resolved once per object by the caller
+        // (`get_size`) and handed in; only `prefix_enabled` is consulted here.
 
         let Some(lifecycle) = self.lifecycle.as_ref() else {
             let mut cumulative_size = 0;
@@ -905,7 +1115,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             remaining_versions = 0;
@@ -957,7 +1169,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                             if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
@@ -995,7 +1209,9 @@ impl ScannerItem {
                             "Scanner lifecycle action dispatched"
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
+                        let trace_started_at = trace_start_instant();
                         let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
                         }
@@ -1019,7 +1235,21 @@ impl ScannerItem {
             let action = event.action;
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
+            let trace_started_at = trace_start_instant();
             let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
+            if let Some(trace_started_at) = trace_started_at {
+                let state = if queued { "queued" } else { "not_queued" };
+                trace_emit(|| {
+                    TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
+                        .with_bucket(self.bucket.as_str())
+                        .with_object(self.object_path())
+                        .with_duration(trace_started_at.elapsed())
+                        .with_attr("state", state)
+                        .with_attr("action", action.as_str())
+                        .with_attr("count", count)
+                        .with_attr("queued", queued)
+                });
+            }
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
@@ -1033,7 +1263,6 @@ impl ScannerItem {
 
     async fn heal_actions(&mut self, oi: &ObjectInfo, actual_size: i64, size_summary: &mut SizeSummary) -> i64 {
         if self.heal_enabled {
-            warn_inline_heal_compat_requested();
             self.enqueue_heal(oi).await;
         }
 
@@ -1197,6 +1426,12 @@ impl ScannerItem {
     fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
+        // Threshold check first so healthy objects never pay for the
+        // object-path allocation below.
+        if !too_many_versions && !too_large_versions {
+            return;
+        }
+        let object_path = self.object_path();
         if too_many_versions {
             global_metrics().record_scanner_source_executed(ScannerWorkSource::Alerts, 1);
             counter!(
@@ -1204,13 +1439,26 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, &self.bucket, &object_path, scanner_alert_cooldown())
+            {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_MANY_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("threshold", scanner_excess_versions_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 threshold = scanner_excess_versions_threshold(),
                 state = "excess_versions",
@@ -1224,13 +1472,31 @@ impl ScannerItem {
                 "bucket" => self.bucket.clone()
             )
             .increment(1);
+            if scanner_alert_emission_allows(
+                ScannerAlertKind::LargeVersions,
+                &self.bucket,
+                &object_path,
+                scanner_alert_cooldown(),
+            ) {
+                emit_scanner_alert_event(
+                    EVENT_SCANNER_LARGE_VERSIONS,
+                    &self.bucket,
+                    &object_path,
+                    cumulative_size,
+                    &[
+                        ("versions", remaining_versions.to_string()),
+                        ("cumulativeSize", cumulative_size.to_string()),
+                        ("threshold", scanner_excess_version_size_threshold().to_string()),
+                    ],
+                );
+            }
             warn!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_ALERT_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_FOLDER,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object_path,
                 versions = remaining_versions,
                 cumulative_size,
                 threshold = scanner_excess_version_size_threshold(),
@@ -1402,6 +1668,32 @@ impl FolderScanner {
         }
     }
 
+    /// Batched variant of [`Self::clear_pending_scanner_heal`] for repaired
+    /// notices (backlog#1894 axis B): one retain pass and one ledger sync
+    /// for the whole notice set, so a mass-recovery first sweep cannot turn
+    /// into thousands of full-table clones on the scan task. Only Object
+    /// entries match — bucket-level heals are never the MRF consumer's work.
+    fn clear_pending_scanner_heals_for_repaired(&mut self, events: &[rustfs_common::mrf_channel::MrfRepairedEvent]) {
+        // Pre-resolve the notice version strings once; each ledger entry then
+        // compares against plain Option<&str>.
+        let targets: Vec<(&str, &str, Option<String>)> = events
+            .iter()
+            .map(|event| (event.bucket.as_ref(), event.object.as_ref(), mrf_repaired_version_id(event.version_id)))
+            .collect();
+        let before = self.new_cache.info.pending_heals.len();
+        self.new_cache.info.pending_heals.retain(|entry| {
+            entry.kind != PendingScannerHealKind::Object
+                || !targets.iter().any(|(bucket, object, version)| {
+                    entry.bucket.as_str() == *bucket
+                        && entry.object.as_deref() == Some(*object)
+                        && entry.version_id.as_deref() == version.as_deref()
+                })
+        });
+        if self.new_cache.info.pending_heals.len() != before {
+            self.sync_pending_heals();
+        }
+    }
+
     fn record_pending_scanner_heal(
         &mut self,
         kind: PendingScannerHealKind,
@@ -1487,6 +1779,13 @@ impl FolderScanner {
                 self.record_pending_scanner_heal(kind, bucket, object, version_id, scan_mode, result);
             }
             HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => {
+                self.clear_pending_scanner_heal(kind, bucket, object, version_id);
+            }
+            // Admin-only overlap rejections (HS-06); the scanner never sees
+            // them, but if it ever does, treat them as terminal like any
+            // other policy drop rather than endlessly retrying.
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+            | HealAdmissionResult::Dropped(HealAdmissionDropReason::OverlappingPaths) => {
                 self.clear_pending_scanner_heal(kind, bucket, object, version_id);
             }
         }
@@ -1611,6 +1910,15 @@ impl FolderScanner {
             "root" => self.root.clone()
         )
         .increment(1);
+        if scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, &self.root, folder, scanner_alert_cooldown()) {
+            emit_scanner_alert_event(
+                EVENT_SCANNER_BIG_PREFIX,
+                &self.root,
+                folder,
+                0,
+                &[("folders", total_folders.to_string()), ("threshold", threshold.to_string())],
+            );
+        }
         warn!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_ALERT_STATE,
@@ -1724,6 +2032,14 @@ impl FolderScanner {
         }
 
         let bucket = self.new_cache.info.name.clone();
+        // Backlog#1894 axis B: repairs the MRF consumer landed hand the
+        // manager the heal task, so the matching pending-ledger entries are
+        // retried nowhere — drop them here. Best-effort: a lost notice just
+        // leaves the entry to expire through its own attempts/age limits.
+        let repaired = rustfs_common::mrf_channel::take_mrf_repaired_events_for(&bucket);
+        if !repaired.is_empty() {
+            self.clear_pending_scanner_heals_for_repaired(&repaired);
+        }
         for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
             if !self.should_heal().await {
                 break;
@@ -1830,6 +2146,7 @@ impl FolderScanner {
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
+        let trace_started_at = trace_start_instant();
 
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2187,20 +2504,46 @@ impl FolderScanner {
                         }
 
                         if let GetSizeFailureAction::HealMetadata { object } = failure_action {
-                            self.send_required_scanner_heal_request(
-                                PendingScannerHealKind::Object,
-                                item.bucket.clone(),
-                                Some(object.clone()),
+                            // Single-flight (backlog#1894 axis A) — the
+                            // recording mode and its guarantees are pinned by
+                            // corrupt_metadata_recording below.
+                            let mrf_accepted = rustfs_common::mrf_channel::try_send_mrf_intent(
+                                rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+                                &item.bucket,
+                                &object,
                                 None,
-                                build_object_heal_request(
-                                    item.bucket.clone(),
-                                    object.clone(),
-                                    None,
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                ),
-                            )
-                            .await?;
+                            );
+                            match corrupt_metadata_recording(mrf_accepted) {
+                                CorruptMetadataRecording::LedgerOnly => {
+                                    // Recorded as Full (retry-later): admission
+                                    // for this target happens in the MRF
+                                    // consumer, not in the manager's queue here.
+                                    self.update_pending_scanner_heal_after_admission(
+                                        PendingScannerHealKind::Object,
+                                        &item.bucket,
+                                        Some(&object),
+                                        None,
+                                        self.scan_mode,
+                                        HealAdmissionResult::Full,
+                                    );
+                                }
+                                CorruptMetadataRecording::ImmediateAndLedger => {
+                                    self.send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        item.bucket.clone(),
+                                        Some(object.clone()),
+                                        None,
+                                        build_object_heal_request(
+                                            item.bucket.clone(),
+                                            object.clone(),
+                                            None,
+                                            self.scan_mode,
+                                            HealChannelPriority::High,
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
 
                         timer.sleep().await;
@@ -2895,6 +3238,8 @@ impl FolderScanner {
         }
 
         done_folder();
+        let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
+        emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
         Ok(())
     }
@@ -2921,8 +3266,6 @@ pub async fn scan_data_folder(
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
-
-    ensure_scanner_inline_heal_metric_registered();
 
     // Check that we're not trying to scan the root
     if cache.info.name.is_empty() || cache.info.name == DATA_USAGE_ROOT {
@@ -3076,6 +3419,101 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::Mutex;
+
+    /// Reset the process-global alert cooldown map; test-only.
+    fn reset_alert_cooldowns() {
+        *SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(ScannerAlertCooldownMap::new());
+    }
+
+    /// The emitted event-name strings must be exactly what `EventName`
+    /// serializes, or a bucket notification subscribed to the documented name
+    /// would silently never match (rustfs/backlog#1868).
+    #[test]
+    fn scanner_alert_wire_names_match_canonical_event_names() {
+        use rustfs_s3_types::EventName;
+        assert_eq!(EVENT_SCANNER_MANY_VERSIONS, EventName::ScannerManyVersions.to_string());
+        assert_eq!(EVENT_SCANNER_LARGE_VERSIONS, EventName::ScannerLargeVersions.to_string());
+        assert_eq!(EVENT_SCANNER_BIG_PREFIX, EventName::ScannerBigPrefix.to_string());
+    }
+
+    /// Single-flight decision for the corrupt-metadata branch (backlog#1894
+    /// axis A): an accepted MRF intent must drop the immediate heal request
+    /// (the consumer files one; the manager would double-book) while a
+    /// rejected one must keep it — in both cases a ledger entry remains, so
+    /// the backstop survives regardless of delivery.
+    #[test]
+    fn corrupt_metadata_recording_maps_delivery_to_backstop() {
+        assert_eq!(corrupt_metadata_recording(true), CorruptMetadataRecording::LedgerOnly);
+        assert_eq!(corrupt_metadata_recording(false), CorruptMetadataRecording::ImmediateAndLedger);
+    }
+
+    fn cooldown_map_len() -> usize {
+        SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Backdate every recorded cooldown so the next check fires again.
+    fn expire_all_alert_cooldowns(cooldown: Duration) {
+        let now = Instant::now();
+        let mut guard = SCANNER_ALERT_EMISSION_COOLDOWN
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(map) = guard.as_mut() {
+            for fired_at in map.values_mut() {
+                if let Some(expired) = now.checked_sub(cooldown + Duration::from_secs(1)) {
+                    *fired_at = expired;
+                }
+            }
+        }
+    }
+
+    /// The emission gate is the only thing standing between an over-threshold
+    /// object and one S3 event per scan cycle, so its edge semantics get
+    /// pinned directly. All scenarios share one #[test] because the cooldown
+    /// map is process-global and parallel tests would read each other's
+    /// firings.
+    #[test]
+    fn scanner_alert_emission_is_edge_held_per_key_and_bounded() {
+        reset_alert_cooldowns();
+        let cooldown = Duration::from_secs(3600);
+
+        // First firing allows, an immediate re-check is held.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+        assert!(!scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // Different kind, object, and bucket are independent keys.
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::LargeVersions, "bkt", "obj", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "other", cooldown));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "other", "obj", cooldown));
+        assert_eq!(cooldown_map_len(), 4);
+
+        // After the cooldown elapses the same key fires again.
+        expire_all_alert_cooldowns(cooldown);
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::ManyVersions, "bkt", "obj", cooldown));
+
+        // A zero cooldown degenerates to always-emit (operators may want that).
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+        assert!(scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", "dir", Duration::ZERO));
+
+        // Hard bound: overflow the cap with zero-cooldown keys and confirm the
+        // map clears rather than growing past it.
+        reset_alert_cooldowns();
+        for index in 0..=(MAX_SCANNER_ALERT_COOLDOWN_KEYS + 8) {
+            let _ = scanner_alert_emission_allows(ScannerAlertKind::BigPrefix, "bkt", &format!("dir-{index}"), Duration::ZERO);
+        }
+        assert!(
+            cooldown_map_len() <= MAX_SCANNER_ALERT_COOLDOWN_KEYS,
+            "cooldown map must stay bounded, got {}",
+            cooldown_map_len()
+        );
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use temp_env::{with_var, with_var_unset};
     use tracing_subscriber::fmt::MakeWriter;
@@ -3933,19 +4371,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scanner_inline_heal_enabled_defaults_to_false() {
-        assert!(!scanner_inline_heal_enabled_from_value(None));
-    }
-
-    #[test]
-    fn test_scanner_inline_heal_enabled_reads_env_override() {
-        assert!(scanner_inline_heal_enabled_from_value(Some("true")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("YES")));
-        assert!(scanner_inline_heal_enabled_from_value(Some("1")));
-        assert!(!scanner_inline_heal_enabled_from_value(Some("false")));
-    }
-
-    #[test]
     fn test_build_object_heal_request_omits_nil_version_id() {
         let request = build_object_heal_request(
             "bucket".to_string(),
@@ -3995,6 +4420,86 @@ mod tests {
             last_admission_result: "full".to_string(),
             last_admission_reason: "none".to_string(),
         }
+    }
+
+    /// The nil-UUID branch of the defensive-UUID invariant: a nil version in
+    /// a repaired notice means "no value" and must match unversioned ledger
+    /// entries only.
+    #[test]
+    fn test_mrf_repaired_version_id_maps_nil_to_none() {
+        assert_eq!(mrf_repaired_version_id(None), None);
+        assert_eq!(mrf_repaired_version_id(Some([0u8; 16])), None);
+        let uuid = Uuid::new_v4();
+        assert_eq!(mrf_repaired_version_id(Some(*uuid.as_bytes())), Some(uuid.to_string()));
+    }
+
+    /// Full wiring of backlog#1894 axis B: notes taken for the scanned bucket
+    /// clear exactly the matching Object ledger entries — bucket-level
+    /// entries, other buckets' entries, and version-mismatched entries
+    /// survive; a real (non-nil) version matches only the same version.
+    #[tokio::test]
+    async fn test_mrf_repaired_notices_clear_matching_ledger_entries() {
+        use rustfs_common::mrf_channel::note_mrf_repaired;
+
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+        scanner.new_cache.info.name = "bucket".to_string();
+        scanner.update_cache.info.name = "bucket".to_string();
+        scanner.heal_object_select = 1;
+
+        let version = Uuid::new_v4().to_string();
+        scanner.new_cache.info.pending_heals = vec![
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-a"), None, 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-b"), Some(&version), 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "bucket", Some("object-c"), None, 1, 1),
+            pending_heal(
+                PendingScannerHealKind::Object,
+                "bucket",
+                Some("object-c"),
+                Some("00000000-0000-0000-0000-000000000001"),
+                1,
+                1,
+            ),
+            pending_heal(PendingScannerHealKind::Bucket, "bucket", None, None, 1, 1),
+            pending_heal(PendingScannerHealKind::Object, "other-bucket", Some("object-a"), None, 1, 1),
+        ];
+
+        note_mrf_repaired("bucket", "object-a", None);
+        note_mrf_repaired("bucket", "object-b", Some(*Uuid::parse_str(&version).unwrap().as_bytes()));
+        // A nil-UUID notice for object-c means "no value": it clears the
+        // unversioned entry but must not touch the versioned one.
+        note_mrf_repaired("bucket", "object-c", Some([0u8; 16]));
+        // A notice for a target the ledger does not track must be a no-op.
+        note_mrf_repaired("bucket", "object-untracked", None);
+
+        scanner
+            .retry_pending_scanner_heals()
+            .await
+            .expect("retry pass should succeed");
+
+        let survivors: Vec<(PendingScannerHealKind, &str, Option<&str>, Option<&str>)> = scanner
+            .new_cache
+            .info
+            .pending_heals
+            .iter()
+            .map(|entry| (entry.kind, entry.bucket.as_str(), entry.object.as_deref(), entry.version_id.as_deref()))
+            .collect();
+        // Cleared: object-a (no version), object-b (exact version match), and
+        // object-c's unversioned entry (the nil branch matched no-version
+        // only — the versioned object-c entry survives).
+        assert_eq!(
+            survivors,
+            vec![
+                (
+                    PendingScannerHealKind::Object,
+                    "bucket",
+                    Some("object-c"),
+                    Some("00000000-0000-0000-0000-000000000001")
+                ),
+                (PendingScannerHealKind::Bucket, "bucket", None, None),
+                (PendingScannerHealKind::Object, "other-bucket", Some("object-a"), None),
+            ]
+        );
     }
 
     #[test]
@@ -4400,6 +4905,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn scanner_trace_helpers_emit_expected_events() {
+        let mut trace = rustfs_common::trace_bus::subscribe_trace_events();
+
+        emit_scanner_folder_trace(
+            "/tmp/rustfs-scanner-trace",
+            "/tmp/rustfs-scanner-trace/bucket-a/folder-a",
+            7,
+            Some(Instant::now()),
+            "completed",
+        );
+        let folder = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerFolder,
+            Some("bucket-a"),
+            Some("folder-a"),
+            Some("completed"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&folder, "objects").as_deref(), Some("7"));
+
+        emit_scanner_ilm_action_trace("bucket-a", "object-a", IlmAction::DeleteAction, 2, true, Some(Instant::now()));
+        let ilm = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerIlmAction,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("queued"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&ilm, "action").as_deref(), Some("delete"));
+        assert_eq!(trace_attr_string(&ilm, "count").as_deref(), Some("2"));
+        assert_eq!(trace_attr_string(&ilm, "queued").as_deref(), Some("true"));
+
+        emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
+            candidate_type: "object",
+            bucket: "bucket-a",
+            object: Some("object-a"),
+            version_id: Some("version-a"),
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Deep),
+            result: Ok(HealAdmissionResult::Merged),
+            started_at: Instant::now(),
+        });
+        let heal_candidate = recv_scanner_trace_event(
+            &mut trace,
+            TraceFunc::ScannerHealCandidate,
+            Some("bucket-a"),
+            Some("object-a"),
+            Some("admitted"),
+        )
+        .await;
+        assert_eq!(trace_attr_string(&heal_candidate, "candidate_type").as_deref(), Some("object"));
+        assert_eq!(trace_attr_string(&heal_candidate, "priority").as_deref(), Some("high"));
+        assert_eq!(trace_attr_string(&heal_candidate, "scan_mode").as_deref(), Some("deep"));
+        assert_eq!(trace_attr_string(&heal_candidate, "version_id").as_deref(), Some("version-a"));
+        assert_eq!(trace_attr_string(&heal_candidate, "admission").as_deref(), Some("merged"));
+    }
+
+    async fn recv_scanner_trace_event(
+        trace: &mut rustfs_common::trace_bus::TraceSubscription,
+        func: TraceFunc,
+        bucket: Option<&str>,
+        object: Option<&str>,
+        state: Option<&str>,
+    ) -> TraceEvent {
+        for _ in 0..32 {
+            let event = tokio::time::timeout(Duration::from_secs(1), trace.recv())
+                .await
+                .expect("scanner trace event should arrive")
+                .expect("trace bus should stay open");
+            if event.kind == TraceKind::Scanner
+                && event.func == func
+                && event.bucket.as_deref() == bucket
+                && event.object.as_deref() == object
+                && state.is_none_or(|state| trace_attr_string(&event, "state").as_deref() == Some(state))
+            {
+                return (*event).clone();
+            }
+        }
+
+        panic!("expected scanner trace event {func:?} for bucket {bucket:?} object {object:?}");
+    }
+
+    fn trace_attr_string(event: &TraceEvent, key: &str) -> Option<String> {
+        event.attrs.iter().find_map(|attr| {
+            if attr.key != key {
+                return None;
+            }
+            Some(match &attr.value {
+                rustfs_common::trace_bus::TraceVal::Bool(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::U64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::I64(value) => value.to_string(),
+                rustfs_common::trace_bus::TraceVal::Str(value) => value.to_string(),
+            })
+        })
+    }
+
     #[test]
     fn test_build_high_priority_heal_admission_error_contains_context() {
         let err = build_high_priority_heal_admission_error(
@@ -4621,6 +5224,8 @@ mod tests {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
         let (mut scanner, temp_dir) = build_test_scanner().await;
+        // Canonicalize for the "drive" field comparison (scanner resolves symlinks).
+        let canonical_temp_dir = std::fs::canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
 
         let object_dir = temp_dir.join("bucket").join("object");
@@ -4689,7 +5294,7 @@ mod tests {
         let fields = &events[0]["fields"];
         assert_eq!(fields["component"], LOG_COMPONENT_SCANNER);
         assert_eq!(fields["subsystem"], LOG_SUBSYSTEM_FOLDER);
-        assert_eq!(fields["drive"], temp_dir.to_string_lossy().as_ref());
+        assert_eq!(fields["drive"], canonical_temp_dir.to_string_lossy().as_ref());
         assert_eq!(fields["bucket"], "bucket");
         assert_eq!(fields["object"], "object");
         assert_eq!(fields["metadata_path"], metadata_path.to_string_lossy().as_ref());

@@ -87,6 +87,10 @@ impl Namespace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub struct TableIdentifier {
     warehouse: IdentifierSegment,
     namespace: Namespace,
@@ -94,6 +98,10 @@ pub struct TableIdentifier {
 }
 
 impl TableIdentifier {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn new(warehouse: IdentifierSegment, namespace: Namespace, name: IdentifierSegment) -> Self {
         Self {
             warehouse,
@@ -116,6 +124,10 @@ impl TableIdentifier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub struct TablePathResolver {
     reserved_prefix: &'static str,
 }
@@ -129,14 +141,26 @@ impl Default for TablePathResolver {
 }
 
 impl TablePathResolver {
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn current_pointer_path(&self, table: &TableIdentifier) -> String {
         format!("{}/{}", self.table_root(table), CURRENT_POINTER_FILE)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn metadata_dir_path(&self, table: &TableIdentifier) -> String {
         format!("{}/{}", self.table_root(table), METADATA_DIR)
     }
 
+    #[allow(
+        dead_code,
+        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     pub fn metadata_file_path(&self, table: &TableIdentifier, metadata_file_name: &str) -> String {
         format!("{}/{}", self.metadata_dir_path(table), metadata_file_name)
     }
@@ -169,6 +193,10 @@ pub(crate) fn default_namespace_root_prefix() -> String {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_namespace_marker_path(namespace: &Namespace) -> String {
     format!("{}{}/{}", default_namespace_root_prefix(), namespace.storage_id(), NAMESPACE_MARKER_FILE)
 }
@@ -185,6 +213,10 @@ pub(crate) fn default_table_bucket_publication_lock_path() -> String {
     rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH.to_string()
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_marker_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), TABLE_MARKER_FILE)
 }
@@ -225,14 +257,26 @@ pub(crate) fn default_table_metadata_file_path(
     format!("{}/{}", default_table_metadata_dir_path(namespace, table), metadata_file_name)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_current_pointer_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), CURRENT_POINTER_FILE)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn default_table_lifecycle_path(namespace: &Namespace, table: &IdentifierSegment) -> String {
     format!("{}{}/{}", default_table_root_prefix(namespace), table.as_str(), LIFECYCLE_FILE)
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn namespace_name_from_marker_path(object_key: &str) -> Option<String> {
     let prefix = default_namespace_root_prefix();
     let suffix = format!("/{NAMESPACE_MARKER_FILE}");
@@ -244,6 +288,10 @@ pub(crate) fn namespace_name_from_marker_path(object_key: &str) -> Option<String
         .map(|value| value.replace('/', "."))
 }
 
+#[allow(
+    dead_code,
+    reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn table_name_from_marker_path(namespace: &Namespace, object_key: &str) -> Option<String> {
     let prefix = default_table_root_prefix(namespace);
     let suffix = format!("/{TABLE_MARKER_FILE}");

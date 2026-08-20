@@ -32,7 +32,6 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-    use serial_test::serial;
     use std::error::Error;
     use tracing::info;
 
@@ -47,7 +46,6 @@ mod tests {
     /// starts successfully with notification enabled and can serve S3 requests.
     /// A full webhook delivery test is in notification_webhook_test.rs.
     #[tokio::test]
-    #[serial]
     async fn test_notification_enabled_server_starts_cleanly() -> TestResult {
         init_logging();
         info!("RT-01: notification enabled server starts cleanly");
@@ -92,7 +90,6 @@ mod tests {
     /// 3. Restart server
     /// 4. Verify notification config still exists
     #[tokio::test]
-    #[serial]
     async fn test_notification_config_survives_restart() -> TestResult {
         init_logging();
         info!("RT-02: notification config survives restart");

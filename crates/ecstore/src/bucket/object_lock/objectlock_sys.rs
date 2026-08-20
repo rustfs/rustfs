@@ -136,6 +136,7 @@ pub fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
 
 /// Check if an object has legal hold enabled.
 /// Returns true if legal hold is ON.
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> bool {
     let lhold = objectlock::get_object_legalhold_meta(user_defined);
     matches!(lhold.status, Some(ref st) if st.as_str() == ObjectLockLegalHoldStatus::ON)
@@ -151,6 +152,7 @@ fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> b
 /// # Returns
 /// * `true` if the object is locked (cannot be deleted/modified)
 /// * `false` if the object is not locked
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn is_object_locked_by_metadata(user_defined: &std::collections::HashMap<String, String>, is_delete_marker: bool) -> bool {
     // Delete markers are never locked
     if is_delete_marker {

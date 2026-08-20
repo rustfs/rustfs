@@ -1,0 +1,132 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "version",
+  "fixture": "negotiation-vectors",
+  "description": "Protocol version decisions. A rejected version fails closed: nothing in the payload is processed, stored, or echoed.",
+  "vectors": [
+    {
+      "name": "supported major version",
+      "request": {
+        "protocolVersion": "v1",
+        "agentVersion": "1.4.0",
+        "capabilities": ["heartbeat", "inventory"]
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "negotiatedProtocolVersion": "v1",
+        "reason": null,
+        "httpStatus": null
+      }
+    },
+    {
+      "name": "supported major version reported by an agent that sends nothing else",
+      "request": {
+        "protocolVersion": "v1"
+      },
+      "expected": {
+        "decision": "ACCEPT",
+        "negotiatedProtocolVersion": "v1",
+        "reason": null,
+        "httpStatus": null
+      }
+    },
+    {
+      "name": "next major version from a future agent",
+      "request": {
+        "protocolVersion": "v2",
+        "agentVersion": "2.0.0",
+        "capabilities": ["heartbeat"]
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "far future major version",
+      "request": {
+        "protocolVersion": "v9999"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "missing protocol version",
+      "request": {
+        "agentVersion": "1.4.0"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "version without its prefix",
+      "request": {
+        "protocolVersion": "1"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "uppercase prefix",
+      "request": {
+        "protocolVersion": "V1"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "dotted version",
+      "request": {
+        "protocolVersion": "v1.2"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "zero major version",
+      "request": {
+        "protocolVersion": "v0"
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    },
+    {
+      "name": "empty protocol version",
+      "request": {
+        "protocolVersion": ""
+      },
+      "expected": {
+        "decision": "REJECT",
+        "negotiatedProtocolVersion": null,
+        "reason": "UNSUPPORTED_PROTOCOL",
+        "httpStatus": 400
+      }
+    }
+  ]
+}

@@ -132,7 +132,6 @@ impl RebalanceStopPropagationRecord {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct DiskStat {
     pub total_space: u64,

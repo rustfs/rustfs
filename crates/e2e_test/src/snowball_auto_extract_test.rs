@@ -17,7 +17,6 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use std::error::Error;
     use std::io::Cursor;
 
@@ -101,7 +100,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_supports_minio_prefix_and_directory_markers() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -138,7 +136,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_supports_standard_headers_with_combined_extract_options()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -229,7 +226,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_ignores_directories_when_requested() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -268,7 +264,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_ignores_invalid_entries_when_requested() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -304,7 +299,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_rejects_parent_dir_entry_without_cross_bucket_write()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
@@ -347,7 +341,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn snowball_auto_extract_prefers_exact_minio_prefix_over_suffix_fallback() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 

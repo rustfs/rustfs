@@ -101,7 +101,6 @@ use rustfs_config::{
 };
 use rustfs_protos::canonical_make_volume_request_body;
 use rustfs_protos::proto_gen::node_service::{MakeVolumeRequest, MakeVolumeResponse, PingRequest, PingResponse};
-use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use tonic::{Code, Request, Response, Status};
@@ -397,7 +396,6 @@ fn assert_rejected(result: Result<MakeVolumeResponse, Status>, expected: Code, e
 /// Grouped into one server start because each case is independent and spawning
 /// a `rustfs` process per assertion would dominate the runtime.
 #[tokio::test]
-#[serial]
 async fn internode_rpc_signature_default_posture_e2e() -> TestResult {
     init_logging();
     align_rpc_secret_with_server();
@@ -424,7 +422,6 @@ async fn internode_rpc_signature_default_posture_e2e() -> TestResult {
 /// epoch is learned from a real response, then the same server is restarted in place to prove its
 /// replacement epoch rejects the captured request even though the nonce cache is necessarily new.
 #[tokio::test]
-#[serial]
 async fn replay_scope_rejects_replay_path_transplant_and_stale_epoch_e2e() -> TestResult {
     init_logging();
     align_rpc_secret_with_server();
@@ -497,7 +494,6 @@ async fn replay_scope_rejects_replay_path_transplant_and_stale_epoch_e2e() -> Te
 /// A mutating v2 request cannot use that lane; once the epoch proof is returned, the first v3
 /// mutation succeeds. This protects a server restart without reopening a general downgrade path.
 #[tokio::test]
-#[serial]
 async fn replay_scope_strict_requires_v3_after_ping_bootstrap_e2e() -> TestResult {
     init_logging();
     align_rpc_secret_with_server();
@@ -704,7 +700,6 @@ async fn legacy_only_signature_is_accepted_in_default_posture(url: &str) {
 ///
 /// The paired v2 positive control rules out "strict simply breaks everything".
 #[tokio::test]
-#[serial]
 async fn signature_strict_rejects_legacy_only_downgrade() -> TestResult {
     init_logging();
     align_rpc_secret_with_server();
@@ -741,7 +736,6 @@ async fn signature_strict_rejects_legacy_only_downgrade() -> TestResult {
 /// takes the still-open legacy lane), which is what pins the rejection to the
 /// handler's digest gate; the cited message confirms which check spoke.
 #[tokio::test]
-#[serial]
 async fn body_digest_strict_rejects_digestless_mutation() -> TestResult {
     init_logging();
     align_rpc_secret_with_server();

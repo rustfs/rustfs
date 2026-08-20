@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
     handlers::audit_runtime_config::{load_server_config_from_store, remove_audit_target_config, set_audit_target_config},
     handlers::notify_runtime_access::{
         load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
@@ -29,10 +29,9 @@ use crate::admin::{
     },
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
-    ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled,
-    refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
+    ADMIN_PREFIX, is_audit_module_enabled, is_notify_module_enabled, refresh_audit_module_enabled, refresh_notify_module_enabled,
+    refresh_persisted_module_switches_from_store,
 };
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -563,42 +562,26 @@ fn plugin_instance_matches_query(instance: &PluginInstanceEntry, query: &str) ->
     .any(|field| field.to_ascii_lowercase().contains(&query))
 }
 
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_plugin_instance_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::GetBucketTargetAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::GetBucketTargetAction)]).await?;
+    Ok(())
 }
 
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_plugin_instance_write_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::SetBucketTargetAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::SetBucketTargetAction)]).await?;
+    Ok(())
 }
 
 fn plugin_instance_mutation_block_reason(
@@ -940,6 +923,36 @@ mod tests {
             read_auth_block.contains("AdminAction::GetBucketTargetAction"),
             "plugin instance read routes should require GetBucketTargetAction"
         );
+    }
+
+    /// Both instance gates authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message these endpoints have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn plugin_instance_gates_keep_their_missing_credentials_message() {
+        let credential_less_request = || S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v4/plugins/instances"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        for err in [
+            super::authorize_plugin_instance_request(&credential_less_request())
+                .await
+                .expect_err("a request without credentials must be rejected"),
+            super::authorize_plugin_instance_write_request(&credential_less_request())
+                .await
+                .expect_err("a request without credentials must be rejected"),
+        ] {
+            assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(err.message(), Some("authentication required"));
+        }
     }
 
     #[test]

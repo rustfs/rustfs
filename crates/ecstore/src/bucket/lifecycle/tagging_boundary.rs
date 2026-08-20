@@ -14,6 +14,10 @@
 
 use std::collections::HashMap;
 
+#[allow(
+    dead_code,
+    reason = "declared boundary surface for the ECStore replication split plan; no caller in this port (backlog#1823)"
+)]
 pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
     crate::bucket::tagging::decode_tags_to_map(tags)
 }

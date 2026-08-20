@@ -16,13 +16,12 @@
 
 use super::kms_dynamic::current_kms_config_fingerprint;
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_kms_runtime_service_manager, current_notification_system, current_or_init_kms_runtime_service_manager,
 };
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_kms::KmsBackend;
@@ -67,6 +66,18 @@ fn kms_configure_actions() -> Vec<Action> {
 
 fn kms_clear_cache_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ClearCacheAction)]
+}
+
+/// Admin gate for the KMS management endpoints, none of which act on a key.
+///
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
+async fn authorize_kms_management_request(req: &S3Request<Body>, actions: Vec<Action>) -> S3Result<()> {
+    if req.credentials.is_none() {
+        return Err(s3_error!(InvalidRequest, "authentication required"));
+    }
+    authorize_admin_request(req, actions).await?;
+    Ok(())
 }
 
 /// Response of `POST /kms/clear-cache`.
@@ -260,22 +271,7 @@ pub struct KmsStatusHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_service_control_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -326,22 +322,7 @@ pub struct KmsConfigHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_configure_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_configure_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -375,22 +356,7 @@ pub struct KmsClearCacheHandler {}
 #[async_trait::async_trait]
 impl Operation for KmsClearCacheHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            kms_clear_cache_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_kms_management_request(&req, kms_clear_cache_actions()).await?;
 
         let Some(service) = kms_encryption_service_from_context().await else {
             return Err(s3_error!(InternalError, "KMS service not initialized"));
@@ -422,9 +388,14 @@ impl Operation for KmsClearCacheHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{KmsClearCacheResponse, kms_clear_cache_actions, kms_configure_actions, kms_service_control_actions};
+    use super::{
+        KmsClearCacheResponse, authorize_kms_management_request, kms_clear_cache_actions, kms_configure_actions,
+        kms_service_control_actions,
+    };
     use crate::admin::handlers::kms_keys::stable_json_value;
+    use hyper::HeaderMap;
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use s3s::{Body, S3Request};
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
@@ -432,6 +403,58 @@ mod tests {
 
     fn assert_lacks_action(actions: &[Action], action: Action) {
         assert!(!actions.contains(&action), "expected action list not to contain {action:?}");
+    }
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message these endpoints have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn kms_management_gate_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: http::Method::GET,
+            uri: "/rustfs/admin/v3/kms/status".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize_kms_management_request(&req, kms_service_control_actions())
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    /// Every management endpoint must reach the shared gate, each with its own
+    /// action set. The action lists are pinned above, but nothing else checks
+    /// which handler asks for which, and a handler that lost its gate entirely
+    /// would still serve its response.
+    #[test]
+    fn management_handlers_authorize_with_their_dedicated_actions() {
+        let src = include_str!("kms_management.rs");
+
+        for (handler, actions) in [
+            ("KmsStatusHandler", "kms_service_control_actions()"),
+            ("KmsConfigHandler", "kms_configure_actions()"),
+            ("KmsClearCacheHandler", "kms_clear_cache_actions()"),
+        ] {
+            let block = src
+                .split_once(&format!("impl Operation for {handler}"))
+                .unwrap_or_else(|| panic!("{handler} impl should exist"))
+                .1;
+            let end = block
+                .find("\nimpl Operation for")
+                .or_else(|| block.find("\n#[cfg(test)]"))
+                .unwrap_or(block.len());
+            assert!(
+                block[..end].contains(&format!("authorize_kms_management_request(&req, {actions})")),
+                "{handler} must authorize through the shared gate with {actions}"
+            );
+        }
     }
 
     #[test]

@@ -23,7 +23,6 @@
 #[cfg(test)]
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path};
-    use serial_test::serial;
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
@@ -31,7 +30,6 @@ mod tests {
     /// while :9001 is occupied: the server exits at startup, and the harness
     /// must surface that promptly rather than waiting out the 60s timeout.
     #[tokio::test]
-    #[serial]
     async fn test_start_fails_fast_when_server_exits_during_startup() {
         init_logging();
 

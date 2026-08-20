@@ -211,7 +211,6 @@ fn apply_valid_status(state: &mut LicenseState, token: Token) {
 ///
 /// This is the extension point for OEM/build-time overlays.
 /// Returns `false` if the verifier was already initialized.
-#[allow(dead_code)]
 pub fn set_license_verifier(verifier: SharedLicenseVerifier) -> bool {
     LICENSE_VERIFIER.set(verifier).is_ok()
 }

@@ -116,6 +116,7 @@ impl SetDisks {
             .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<Arc<GetObjectMetadataCacheEntry>> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
             MetadataCacheLookup::Hit(entry) => Some(entry),
@@ -1076,14 +1077,23 @@ impl SetDisks {
                             "Recoverable decode error triggered read repair"
                         );
                         let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                        submit_read_repair_heal(
-                            bucket,
-                            object,
-                            version_id.as_deref(),
-                            pool_index,
-                            set_index,
-                            Some(part_number),
-                            "decode_error",
+                        // Single-flight (backlog#1894 axis A): the durable
+                        // MRF intent (Urgent ECDecode across restarts, HS-01)
+                        // is bound to the read-repair reservation, so only the
+                        // first sighting within the dedup TTL books a journal
+                        // record instead of one per retried read.
+                        submit_read_repair_heal_with_submitter(
+                            ReadRepairHealSubmission {
+                                bucket,
+                                object,
+                                version_id: version_id.as_deref(),
+                                pool_index,
+                                set_index,
+                                part_number: Some(part_number),
+                                reason: "decode_error",
+                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
+                            },
+                            send_read_repair_heal_request,
                         )
                         .await;
                         has_err = false;
@@ -1826,6 +1836,7 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
         .then_some(GET_METADATA_CACHE_REASON_META_BUCKET)
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
     get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
 }
@@ -2566,6 +2577,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             slow_read_repair_submitter,
         )
@@ -2600,6 +2612,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             dropped_read_repair_submitter,
         )
@@ -2636,6 +2649,7 @@ mod metadata_cache_tests {
                 set_index: 0,
                 part_number: Some(1),
                 reason: "missing_shards",
+                mrf_intent: None,
             },
             capture_read_repair_submitter,
         )
@@ -3886,13 +3900,15 @@ mod tests {
                 assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
                 // observe=false (non-observed fanout) also disables early-stop.
                 assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
-                assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
+                // Whole/latest data-read metadata is now allowed by default;
+                // the inline verifier still decides whether it can stop early.
+                assert!(metadata_early_stop_permitted(true, true, true, "", false, false));
             },
         );
     }
 
     #[test]
-    fn metadata_early_stop_keeps_data_reads_opt_in_by_default() {
+    fn metadata_early_stop_allows_safe_data_reads_by_default() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
@@ -3900,7 +3916,7 @@ mod tests {
                 (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
             ],
             || {
-                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(should_allow_metadata_early_stop(true, "", false, false));
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
                 assert!(!should_allow_metadata_early_stop(false, "version-id", false, false));
@@ -3928,6 +3944,34 @@ mod tests {
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
                 assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_early_stop_bounded_fanout_defaults_to_enabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, None),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, None),
+            ],
+            || {
+                assert!(is_get_metadata_data_read_early_stop_enabled());
+                assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
+            },
+        );
+        temp_env::with_vars([(ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false"))], || {
+            assert!(!is_get_metadata_early_stop_bounded_fanout_enabled());
+        });
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+            ],
+            || {
+                assert!(!is_get_metadata_data_read_early_stop_enabled());
+                assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
             },
         );
     }

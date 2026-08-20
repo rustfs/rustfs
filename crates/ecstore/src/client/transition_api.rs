@@ -54,6 +54,10 @@ use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
+    http::headers::{
+        AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_SHA1,
+        AMZ_CHECKSUM_SHA256,
+    },
     net::get_endpoint_url,
     retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer},
 };
@@ -1383,12 +1387,12 @@ pub(crate) fn to_object_info_for_provider(
     };
 
     // Extract checksums
-    let checksum_crc32 = get_header("x-amz-checksum-crc32");
-    let checksum_crc32c = get_header("x-amz-checksum-crc32c");
-    let checksum_sha1 = get_header("x-amz-checksum-sha1");
-    let checksum_sha256 = get_header("x-amz-checksum-sha256");
-    let checksum_crc64nvme = get_header("x-amz-checksum-crc64nvme");
-    let checksum_mode = get_header("x-amz-checksum-mode");
+    let checksum_crc32 = get_header(AMZ_CHECKSUM_CRC32);
+    let checksum_crc32c = get_header(AMZ_CHECKSUM_CRC32C);
+    let checksum_sha1 = get_header(AMZ_CHECKSUM_SHA1);
+    let checksum_sha256 = get_header(AMZ_CHECKSUM_SHA256);
+    let checksum_crc64nvme = get_header(AMZ_CHECKSUM_CRC64NVME);
+    let checksum_mode = get_header(AMZ_CHECKSUM_MODE);
 
     // Build and return the ObjectInfo struct
     Ok(ObjectInfo {

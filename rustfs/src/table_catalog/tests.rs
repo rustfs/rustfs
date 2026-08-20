@@ -3630,7 +3630,10 @@ async fn configured_table_catalog_store_uses_durable_strong_snapshot() {
 
 #[tokio::test]
 async fn object_table_catalog_store_persists_view_entries_and_blocks_non_empty_namespace_drop() {
-    let backend = TestCatalogObjectBackend::default();
+    let backend = TestCatalogObjectBackend {
+        reject_reads_while_write_locked: true,
+        ..Default::default()
+    };
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").unwrap();
@@ -6442,7 +6445,10 @@ async fn maintenance_scheduler_report_marks_disabled_default() {
 
 #[tokio::test]
 async fn maintenance_scheduler_run_queues_one_durable_job() {
-    let backend = TestCatalogObjectBackend::default();
+    let backend = TestCatalogObjectBackend {
+        reject_reads_while_write_locked: true,
+        ..Default::default()
+    };
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");

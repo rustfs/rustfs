@@ -95,7 +95,6 @@ impl TransitionClient {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct GetRequest {
     pub buffer: Vec<u8>,
     pub offset: i64,
@@ -107,11 +106,12 @@ pub struct GetRequest {
     pub setting_object_info: bool,
 }
 
-#[allow(dead_code)]
 pub struct GetResponse {
     pub size: i64,
     //pub error:       error,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     pub did_read: bool,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     pub object_info: ObjectInfo,
 }
 

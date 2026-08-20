@@ -1,0 +1,52 @@
+{
+  "protocolVersion": "v1",
+  "maxFilesPerSet": 12,
+  "manifestFile": "MANIFEST.sha256",
+  "consumerCopy": {
+    "repository": "rustfs/rustfs",
+    "path": "protocol/agent/v1/fixtures",
+    "requirement": "Byte-identical copy of every populated set, compared by make protocol-compat."
+  },
+  "sets": [
+    {
+      "name": "auth",
+      "status": "populated",
+      "purpose": "Client certificate profile, RFC 9440 header profile, authentication accept and reject vectors, surface separation, and the frozen error reason registry."
+    },
+    {
+      "name": "version",
+      "status": "populated",
+      "purpose": "Protocol version negotiation decisions, the frozen v1 negotiation field registry, and additive compatibility in both skew directions."
+    },
+    {
+      "name": "registration",
+      "status": "populated",
+      "purpose": "Registration token exchange, proof of possession, replay rejection, and certificate issuance."
+    },
+    {
+      "name": "heartbeat",
+      "status": "reserved",
+      "purpose": "Heartbeat payloads, Connect receive time, and freshness window behavior."
+    },
+    {
+      "name": "inventory",
+      "status": "populated",
+      "purpose": "Inventory snapshot payloads and their allow-listed collection fields."
+    },
+    {
+      "name": "offline-enrollment",
+      "status": "populated",
+      "purpose": "Air-gapped device enrolment and signed artifact exchange without a certificate."
+    },
+    {
+      "name": "bundle",
+      "status": "populated",
+      "purpose": "Support bundle manifests, upload authorization, and archive validation."
+    },
+    {
+      "name": "redaction",
+      "status": "populated",
+      "purpose": "Deterministic redaction of telemetry and support bundle content."
+    }
+  ]
+}

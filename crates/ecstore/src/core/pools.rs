@@ -16,6 +16,7 @@ use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
+        LifecycleExpiryConfigs,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
@@ -1040,12 +1041,25 @@ fn should_count_decommission_version_complete(ignore: bool, cleanup_ignored: boo
 fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
     // DataMovementOverwriteErr only means source and destination pool resolved to
     // the same pool. Without a target equivalence check it is not cleanup-safe.
-    is_err_object_not_found(err) || is_err_version_not_found(err)
+    if is_err_object_not_found(err) || is_err_version_not_found(err) {
+        return true;
+    }
+
+    // A not-found surfacing from inside a data-movement stage is the same
+    // condition once the wrapper is unwrapped (backlog#1827 T2).
+    crate::data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
 }
 
 fn is_decommission_target_capacity_error(err: &Error) -> bool {
     if matches!(err, Error::DiskFull | Error::StorageFull) {
         return true;
+    }
+
+    // A stage failure keeps the error it wrapped, so classify by type rather
+    // than by the rendered message (backlog#1827 T2). The substring fallback
+    // stays for errors that reached here through some other wrapper.
+    if let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+        return is_decommission_target_capacity_error(source);
     }
 
     let message = err.to_string();
@@ -1996,11 +2010,11 @@ impl PoolMeta {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn validate(&self, pools: Vec<Arc<Sets>>) -> Result<bool> {
         struct PoolInfo {
             position: usize,
             completed: bool,
+            #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
             decom_started: bool,
         }
 
@@ -2335,6 +2349,10 @@ fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
     )
 }
 
+fn lifecycle_action_skips_heal_version(action: IlmAction) -> bool {
+    action.delete()
+}
+
 fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
     if !apply_actions || applied {
         return Ok(true);
@@ -2385,7 +2403,80 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     }
 }
 
+pub struct HealLifecycleExpiryContext {
+    configs: LifecycleExpiryConfigs,
+}
+
 impl ECStore {
+    pub async fn load_heal_lifecycle_expiry_context(&self, bucket: &str) -> Result<Option<HealLifecycleExpiryContext>> {
+        if bucket == RUSTFS_META_BUCKET {
+            return Ok(None);
+        }
+
+        let configs = get_expiry_configs(self, bucket).await?;
+        if configs.lifecycle.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(HealLifecycleExpiryContext { configs }))
+    }
+
+    pub async fn enqueue_heal_lifecycle_expiry(
+        self: &Arc<Self>,
+        context: &HealLifecycleExpiryContext,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        object_info: Option<&crate::object_api::ObjectInfo>,
+    ) -> Result<bool> {
+        let Some(lifecycle_config) = context.configs.lifecycle.as_ref() else {
+            return Ok(false);
+        };
+
+        let object_info = if let Some(object_info) = object_info {
+            if object_info.bucket != bucket || object_info.name != object {
+                return Ok(false);
+            }
+            let snapshot_version_id = object_info
+                .version_id
+                .filter(|version_id| !version_id.is_nil())
+                .map(|version_id| version_id.to_string());
+            if snapshot_version_id.as_deref() != version_id {
+                return Ok(false);
+            }
+            object_info.clone()
+        } else {
+            match self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: version_id.map(str::to_string),
+                        versioned: version_id.is_some(),
+                        expected_bucket_incarnation_id: Some(context.configs.bucket_incarnation_id),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(object_info) => object_info,
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        };
+
+        let event = eval_action_from_lifecycle(lifecycle_config, context.configs.object_lock.as_deref(), &object_info).await;
+        if !lifecycle_action_skips_heal_version(event.action) {
+            return Ok(false);
+        }
+
+        if lifecycle_delete_all_versions_blocked_by_replication(self.clone(), bucket, &object_info.name, event.action).await? {
+            return Ok(false);
+        }
+
+        Ok(apply_expiry_rule_in(self.clone(), &event, &LcEventSrc::Scanner, &object_info).await)
+    }
+
     async fn save_current_pool_meta(&self) -> Result<()> {
         let _save_guard = self.pool_meta_save_gate.lock().await;
         let snapshot = {
@@ -4288,6 +4379,19 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_action_skips_heal_version_for_every_delete_action() {
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteRestoredVersionAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DeleteAllVersionsAction));
+        assert!(lifecycle_action_skips_heal_version(IlmAction::DelMarkerDeleteAllVersionsAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::TransitionVersionAction));
+        assert!(!lifecycle_action_skips_heal_version(IlmAction::NoneAction));
+    }
+
+    #[test]
     fn resolve_data_movement_lifecycle_expiry_result_allows_dry_run_skip() {
         let skip = resolve_data_movement_lifecycle_expiry_result(IlmAction::DeleteVersionAction, false, false)
             .expect("dry-run lifecycle evaluation should not require expiry enqueue");
@@ -4334,6 +4438,36 @@ mod tests {
     fn decommission_target_capacity_error_accepts_direct_capacity_errors() {
         assert!(is_decommission_target_capacity_error(&Error::DiskFull));
         assert!(is_decommission_target_capacity_error(&Error::StorageFull));
+    }
+
+    /// The decommission loop classifies errors that came back through a
+    /// data-movement stage wrapper. Before backlog#1827 T2 the wrapper flattened
+    /// everything into `Error::other(String)`, so these two classifiers had to
+    /// match on rendered text; now the wrapped error is recoverable by type.
+    #[test]
+    fn decommission_classifiers_see_through_a_stage_wrapper() {
+        let wrap = |inner: Error| {
+            crate::data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                "put_object",
+                "bucket-a",
+                "object-a",
+                inner,
+            )
+        };
+
+        // Capacity: the target pool filling up must still stop the loop.
+        assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+        assert!(is_decommission_target_capacity_error(&wrap(Error::StorageFull)));
+        assert!(!is_decommission_target_capacity_error(&wrap(Error::SlowDown)));
+
+        // Cleanup safety: a not-found surfacing from inside a stage is the same
+        // condition as one surfacing directly, so the source entry stays
+        // eligible for cleanup.
+        let not_found = Error::ObjectNotFound("bucket-a".to_string(), "object-a".to_string());
+        assert!(is_decommission_copy_cleanup_safe_error(&not_found));
+        assert!(is_decommission_copy_cleanup_safe_error(&wrap(not_found)));
+        assert!(!is_decommission_copy_cleanup_safe_error(&wrap(Error::SlowDown)));
     }
 
     #[test]
@@ -4958,13 +5092,19 @@ fn is_disk_online_state(state: &str) -> bool {
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_total_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_total_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_total_capacity_dedup(disks)
 }
 
 #[deprecated(since = "0.1.0", note = "Use fallback_free_capacity_dedup instead")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "superseded by the replacement named in the comment at pools.rs:5071 (backlog#1823)"
+)]
 fn fallback_free_capacity(disks: &[rustfs_madmin::Disk]) -> usize {
     fallback_free_capacity_dedup(disks)
 }

@@ -180,11 +180,13 @@ pub(in crate::set_disk) enum GetCodecStreamingReaderBuildOutcome {
     Fallback(GetCodecStreamingFallbackReason),
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) struct MultipartCodecStreamingReader {
     pub(in crate::set_disk) readers: VecDeque<Box<dyn AsyncRead + Unpin + Send + Sync>>,
 }
 
 impl MultipartCodecStreamingReader {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) fn new(readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>>) -> Self {
         Self {
             readers: VecDeque::from(readers),
@@ -666,6 +668,60 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
+    if let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(candidate) {
+        return Some(reason);
+    }
+
+    let Ok(erasure) = coding::Erasure::try_new_with_options(
+        candidate.erasure.data_blocks,
+        candidate.erasure.parity_blocks,
+        candidate.erasure.block_size,
+        candidate.uses_legacy_checksum,
+    ) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+    };
+    let data_files =
+        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
+            disks.get(index).is_some_and(Option::is_some)
+        }) {
+            Ok(data_files) => data_files,
+            Err(reason) => return Some(reason),
+        };
+
+    let Some(part) = candidate.parts.first() else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+    };
+    let Ok(object_size) = usize::try_from(candidate.size) else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+    };
+    let checksum_info = candidate.erasure.get_checksum_info(part.number);
+    let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    };
+    let read_length = inline_erasure_shard_file_offset(
+        0,
+        object_size,
+        object_size,
+        candidate.erasure.block_size,
+        erasure.data_shards,
+        candidate.uses_legacy_checksum,
+    );
+    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, erasure.data_shards, candidate.uses_legacy_checksum);
+    let Ok(mut readers) =
+        build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
+    else {
+        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+    };
+
+    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
+        Some(body) if body.len() == object_size => None,
+        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+    }
+}
+
+fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Option<&'static str> {
     // `inline_data` excludes remote objects; this diagnostic reports them separately.
     if !rustfs_utils::http::contains_key_str(&candidate.metadata, rustfs_utils::http::SUFFIX_INLINE_DATA) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE);
@@ -703,51 +759,7 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     if !can_try_inline_data_shards_direct(object_size, candidate.erasure.block_size) {
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
-
-    let Ok(erasure) = coding::Erasure::try_new_with_options(
-        candidate.erasure.data_blocks,
-        candidate.erasure.parity_blocks,
-        candidate.erasure.block_size,
-        candidate.uses_legacy_checksum,
-    ) else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
-    };
-    let data_files =
-        match collect_inline_data_shard_fileinfos_by_index_or_reason(parts_metadata, candidate, erasure.data_shards, |index| {
-            disks.get(index).is_some_and(Option::is_some)
-        }) {
-            Ok(data_files) => data_files,
-            Err(reason) => return Some(reason),
-        };
-
-    let Some(part) = candidate.parts.first() else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
-    };
-    let checksum_info = candidate.erasure.get_checksum_info(part.number);
-    let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-        HashAlgorithm::HighwayHash256SLegacy
-    } else {
-        checksum_info.algorithm
-    };
-    let read_length = inline_erasure_shard_file_offset(
-        0,
-        object_size,
-        object_size,
-        candidate.erasure.block_size,
-        erasure.data_shards,
-        candidate.uses_legacy_checksum,
-    );
-    let shard_size = inline_erasure_shard_size(candidate.erasure.block_size, erasure.data_shards, candidate.uses_legacy_checksum);
-    let Ok(mut readers) =
-        build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
-    else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
-    };
-
-    match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
-        Some(body) if body.len() == object_size => None,
-        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
-    }
+    None
 }
 
 fn data_read_inline_missing_shards_are_pending(
@@ -1083,6 +1095,14 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) set_index: usize,
     pub(in crate::set_disk) part_number: Option<usize>,
     pub(in crate::set_disk) reason: &'static str,
+    /// Durable MRF journal intent to file alongside the read-repair request
+    /// (backlog#1894 axis A): the intent kind plus its native `Uuid`
+    /// version id (the submission's string form stays display-only). Bound
+    /// to the reservation — the intent is only delivered when this sighting
+    /// wins the dedup TTL, so a burst of reads failing on the same object
+    /// books exactly one journal record instead of one per retry. `None`
+    /// keeps the historical no-intent behavior.
+    pub(in crate::set_disk) mrf_intent: Option<(rustfs_common::mrf_channel::MrfKind, Option<uuid::Uuid>)>,
 }
 
 pub(in crate::set_disk) fn send_read_repair_heal_request(
@@ -1114,6 +1134,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal(
             set_index,
             part_number,
             reason,
+            mrf_intent: None,
         },
         send_read_repair_heal_request,
     )
@@ -1132,6 +1153,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         set_index,
         part_number,
         reason,
+        mrf_intent,
     } = submission;
 
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
@@ -1142,6 +1164,12 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         );
         return;
     };
+
+    // Reservation won: this sighting owns the repair records for the object,
+    // including the durable journal intent when the caller asked for one.
+    if let Some((kind, version_uuid)) = mrf_intent {
+        rustfs_common::mrf_channel::try_send_mrf_intent(kind, bucket, object, version_uuid);
+    }
 
     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -1836,6 +1864,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
@@ -2126,6 +2155,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     setup
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub(in crate::set_disk) async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -2442,6 +2472,7 @@ impl SetDisks {
         let bucket: Arc<str> = Arc::from(bucket);
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let task_opts = opts;
@@ -2449,10 +2480,14 @@ impl SetDisks {
             let bucket = bucket.clone();
             let object = object.clone();
             let version_id = version_id.clone();
+            let slowtail_fault = slowtail_fault.clone();
             tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
+                    if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
+                        tokio::time::sleep(delay).await;
+                    }
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                         .await
                 } else {
@@ -2548,6 +2583,7 @@ impl SetDisks {
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
         let mut final_miss_reason_override = None;
+        let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
                 let task_opts = opts;
@@ -2555,6 +2591,7 @@ impl SetDisks {
                 let bucket = bucket.clone();
                 let object = object.clone();
                 let version_id = version_id.clone();
+                let slowtail_fault = slowtail_fault.clone();
                 join_set.spawn(async move {
                     let response_start = Instant::now();
                     let result = if let Some(disk) = disk {
@@ -2563,6 +2600,9 @@ impl SetDisks {
                         Self::record_read_version_call(&object, index);
                         #[cfg(test)]
                         Self::read_version_fanout_barrier(&object, index).await;
+                        if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
+                            tokio::time::sleep(delay).await;
+                        }
                         disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
                             .await
                     } else {
@@ -2596,6 +2636,14 @@ impl SetDisks {
                     Ok(file_info) => {
                         observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
                         accumulator.observe_file_info(&file_info);
+                        if bounded_fanout
+                            && read_data
+                            && !force_full_wait
+                            && let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(&file_info)
+                        {
+                            force_full_wait = true;
+                            final_miss_reason_override.get_or_insert(reason);
+                        }
                         if let Some(slot) = ress.get_mut(index) {
                             *slot = file_info;
                         }
@@ -2955,6 +3003,7 @@ impl SetDisks {
         (meta_file_infos, errs)
     }
 
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn read_multiple_files(
         disks: &[Option<DiskStore>],
         req: ReadMultipleReq,
@@ -2988,13 +3037,10 @@ impl SetDisks {
             });
         }
 
-        let (ress, errors) = match collect_read_multiple_results(futures, read_quorum).await {
+        let (ress, _errors) = match collect_read_multiple_results(futures, read_quorum).await {
             Ok(collected) => collected,
             Err(()) => return empty_quorum_result(),
         };
-
-        // debug!("ReadMultipleResp ress {:?}", ress);
-        // debug!("ReadMultipleResp errors {:?}", errors);
 
         let mut ret = Vec::with_capacity(req.files.len());
 
@@ -3134,6 +3180,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) committed_file_info: FileInfo,
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
     RenameConvergence,
@@ -3143,6 +3190,7 @@ type RenameDataLegacyTuple = (
 );
 
 impl RenameDataCommit {
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     fn into_legacy_tuple(self) -> RenameDataLegacyTuple {
         (
             self.online_disks,
@@ -3261,6 +3309,7 @@ impl SetDisks {
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub(in crate::set_disk) async fn rename_data(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -3356,8 +3405,15 @@ impl SetDisks {
                         // A no-op immediately-ready future in production.
                         Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                        disk.rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
-                            .await
+                        let disk_wait_started = rustfs_io_metrics::put_stage_timer();
+                        let result = disk
+                            .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                            .await;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                            disk_wait_started,
+                        );
+                        result
                     })
                     .catch_unwind()
                 });
@@ -3370,7 +3426,32 @@ impl SetDisks {
         let mut cleanup_data_dirs = vec![None; disk_count];
         let mut old_current_sizes = vec![None; disk_count];
 
-        let (results, mut file_infos) = fanout.await.map_err(|_| DiskError::Unexpected)?;
+        let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
+        let fanout_result = fanout.await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
+            quorum_wait_started,
+        );
+        let (results, mut file_infos) = fanout_result.map_err(|_| DiskError::Unexpected)?;
+        if rustfs_io_metrics::put_stage_metrics_enabled() {
+            let mut fanout_success = 0;
+            let mut fanout_error = 0;
+            let mut fanout_panic = 0;
+            for result in &results {
+                match result {
+                    Ok(Ok(_)) => fanout_success += 1,
+                    Ok(Err(_)) => fanout_error += 1,
+                    Err(_) => fanout_panic += 1,
+                }
+            }
+            rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
+                results.len(),
+                write_quorum,
+                fanout_success,
+                fanout_error,
+                fanout_panic,
+            );
+        }
 
         for (idx, result) in results.iter().enumerate() {
             match result {
@@ -4827,6 +4908,14 @@ impl SetDisks {
     /// is best-effort maintenance: individual delete failures are logged and
     /// skipped rather than propagated.
     pub(crate) async fn reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, false).await
+    }
+
+    pub(crate) async fn dry_run_reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        self.reclaim_orphan_data_dirs_inner(bucket, object, true).await
+    }
+
+    async fn reclaim_orphan_data_dirs_inner(&self, bucket: &str, object: &str, dry_run: bool) -> disk::error::Result<usize> {
         let disks = self.get_disks_internal().await;
 
         // Phase 1 (read-only): build the referenced-data-dir union and record the
@@ -4934,6 +5023,20 @@ impl SetDisks {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
+                if dry_run {
+                    removed += 1;
+                    debug!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = "heal_abandoned_parts",
+                        component = "ecstore",
+                        subsystem = "heal",
+                        state = "dry_run_matched",
+                        result = "matched",
+                        bucket, object, data_dir = %dir,
+                        "Heal abandoned parts dry-run matched orphaned data directory"
+                    );
+                    continue;
+                }
                 match disk
                     .delete(
                         bucket,
@@ -5073,6 +5176,7 @@ fn is_cleanup_not_found(e: &DiskError) -> bool {
 /// normalized to `DiskNotFound`: a panic is not a "disk absent" condition and
 /// must not be silently swallowed as an ignorable error (fixes the historical
 /// `Unexpected`/`DiskNotFound` misclassification).
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn map_cleanup_join_result(joined: std::result::Result<Option<DiskError>, tokio::task::JoinError>) -> Option<DiskError> {
     match joined {
         Ok(res) => res,
@@ -5297,6 +5401,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier_phase {
     /// The per-disk old-data-dir cleanup phase of the commit fan-out.
     pub const CLEANUP: &str = "cleanup";
     /// The per-disk `read_version` phase of metadata read fan-out.
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
     pub const READ_VERSION: &str = "read_version";
 }
 
@@ -5732,6 +5837,130 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[test]
+    fn metadata_slowtail_fault_delay_parses_and_filters_request() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some("bench-bucket")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            || {
+                assert_eq!(
+                    get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, true),
+                    Some(Duration::from_millis(25))
+                );
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 2, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("other-bucket", "objects/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "other/000001", 3, true).is_none());
+                assert!(get_metadata_slowtail_fault_delay("bench-bucket", "objects/000001", 3, false).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_slowtail_fault_delay_disables_invalid_disk_list() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("25")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("1,nope")),
+            ],
+            || {
+                assert!(get_metadata_slowtail_fault_delay("bucket", "object", 1, true).is_none());
+            },
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_only_data_read_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-fault-bucket";
+        let object = "objects/metadata-slowtail-fault-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let read_without_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", false, false, false, true, 2);
+                tokio::time::timeout(Duration::from_millis(100), read_without_data)
+                    .await
+                    .expect("non-data metadata fanout must not be delayed by the data-read slowtail hook")
+                    .expect("metadata fanout without read_data should resolve");
+
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "data-read metadata fanout must wait for the injected slow read_version response"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected slowtail should eventually complete")
+                    .expect("data-read metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_delays_early_stop_metadata_task() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-early-stop-bucket";
+        let object = "objects/metadata-slowtail-early-stop-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("false")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some("3")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
+                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
+                        .await
+                        .is_err(),
+                    "early-stop metadata fanout must still wait for the injected slow response after fallback to full wait"
+                );
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
+                    .await
+                    .expect("injected early-stop slowtail should eventually complete")
+                    .expect("early-stop metadata fanout should resolve");
+                assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+                assert!(errs.iter().all(Option::is_none));
+                assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
     }
 
     /// Demo / regression guard for the backlog#1325 per-disk call counters.
@@ -7081,7 +7310,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bounded_non_inline_data_get_hedges_then_waits_for_full_fanout() {
+    async fn bounded_non_inline_data_get_immediately_forces_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-hedge-bucket";
         let object = "bounded-data-get-hedge-object";
@@ -7112,7 +7341,7 @@ mod tests {
                     }
                 })
                 .await
-                .expect("bounded data-read fanout should hedge by starting the spare disk");
+                .expect("bounded non-inline data-read fanout should immediately schedule the spare disk");
 
                 let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
                 assert!(
@@ -7128,7 +7357,7 @@ mod tests {
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "bounded data-read fanout should issue the paused disk plus one spare hedge"
+                    "bounded non-inline data-read fanout should issue the paused disk plus the remaining spare"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
@@ -7141,7 +7370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_metadata_early_stop_defaults_keep_data_get_full_fanout() {
+    async fn bounded_metadata_early_stop_defaults_keep_non_inline_data_get_full_fanout() {
         const DISKS: usize = 4;
         let bucket = "bounded-data-get-default-bucket";
         let object = "bounded-data-get-default-object";
@@ -7155,16 +7384,42 @@ mod tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
             ],
             async {
+                let barrier = rename_fanout_barrier::arm(object, 2, rename_fanout_barrier::PHASE_READ_VERSION);
                 let calls = disk_call_counters::observe(object);
-                let (parts_metadata, errs, diagnostics) =
-                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2)
+                let disks_for_read = disks.clone();
+                let mut read = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed(&disks_for_read, bucket, bucket, object, "", true, false, false, true, 2)
                         .await
-                        .expect("default data-read metadata should resolve");
+                });
+
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                    .await
+                    .expect("default bounded non-inline read should schedule the paused metadata task");
+                tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                    while calls.for_disk(disk_call_counters::KIND_READ_VERSION, 3) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect(
+                    "default bounded non-inline read should immediately force full fanout after the first non-inline response",
+                );
+
+                let pending = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read).await;
+                assert!(
+                    pending.is_err(),
+                    "default non-inline data reads must not return before the paused metadata response"
+                );
+                barrier.release();
+                let (parts_metadata, errs, diagnostics) = read
+                    .await
+                    .expect("metadata read task should not panic")
+                    .expect("default data-read metadata should resolve");
 
                 assert_eq!(
                     calls.total(disk_call_counters::KIND_READ_VERSION),
                     DISKS as u64,
-                    "default GET data-read metadata must keep full fanout for read-failure tolerance"
+                    "default non-inline GET data-read metadata must keep full fanout without waiting for a quorum miss first"
                 );
                 assert_eq!(diagnostics.total_responses(), DISKS);
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
@@ -8472,6 +8727,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn mrf_intent_is_filed_once_per_read_repair_reservation() {
+        // Serial: owns the process-global MRF channel for this test binary
+        // (same key as the other channel-owning tests above).
+        let bucket = format!("mrf-intent-bucket-{}", Uuid::new_v4());
+        let object = format!("object-{}", Uuid::new_v4());
+        let mut receiver = rustfs_common::mrf_channel::init_mrf_channel().expect("first channel init in this binary");
+        rustfs_common::mrf_channel::set_mrf_delivery_enabled(true);
+
+        fn intent_submission<'a>(bucket: &'a str, object: &'a str) -> ReadRepairHealSubmission<'a> {
+            ReadRepairHealSubmission {
+                bucket,
+                object,
+                version_id: None,
+                pool_index: 9,
+                set_index: 9,
+                part_number: Some(1),
+                reason: "decode_error",
+                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, None)),
+            }
+        }
+
+        // First sighting wins the reservation: the journal intent is filed
+        // synchronously before the admission task is spawned.
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
+        let first = receiver.try_recv().expect("first sighting must file exactly one MRF intent");
+        assert_eq!(*first.bucket, bucket);
+        assert_eq!(*first.object, object);
+
+        // Second sighting within the dedup TTL is a duplicate: no request, no
+        // second journal record.
+        submit_read_repair_heal_with_submitter(intent_submission(&bucket, &object), accepted_read_repair_submitter).await;
+        assert!(receiver.try_recv().is_err(), "duplicate sighting must not file another MRF intent");
+    }
+
+    #[tokio::test]
     async fn reserve_read_repair_heal_dedupes_by_object_version_and_set() {
         let object = format!("object-{}", Uuid::new_v4());
         let key = reserve_read_repair_heal("bucket", &object, Some("version-1"), 1, 2)
@@ -8579,6 +8870,7 @@ mod tests {
                 set_index: 2,
                 part_number: Some(1),
                 reason: "test",
+                mrf_intent: None,
             },
             failed_read_repair_submitter,
         )
@@ -8607,6 +8899,7 @@ mod tests {
                 set_index: 3,
                 part_number: Some(2),
                 reason: "test",
+                mrf_intent: None,
             },
             dropped_read_repair_submitter,
         )
@@ -8635,6 +8928,7 @@ mod tests {
                 set_index: 4,
                 part_number: None,
                 reason: "test",
+                mrf_intent: None,
             },
             accepted_read_repair_submitter,
         )

@@ -58,7 +58,7 @@ tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
-metrics-util = { version = "0.20", features = ["debugging"] }
+metrics-util = { workspace = true, features = ["debugging"] }
 # `rt-multi-thread` lets the concurrency stress tests run tasks on real worker
 # threads, so they exercise true parallelism on the shared singleflight/index
 # state rather than only cooperative interleaving.

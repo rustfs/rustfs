@@ -73,23 +73,6 @@ pub fn check_valid_bucket_name_strict(bucket_name: &str) -> Result<()> {
     check_bucket_name_common(bucket_name, true)
 }
 
-pub fn check_valid_object_name_prefix(object_name: &str) -> Result<()> {
-    if object_name.len() > 1024 {
-        return Err(Error::other("Object name cannot be longer than 1024 characters"));
-    }
-    if !object_name.is_ascii() {
-        return Err(Error::other("Object name with non-UTF-8 strings are not supported"));
-    }
-    Ok(())
-}
-
-pub fn check_valid_object_name(object_name: &str) -> Result<()> {
-    if object_name.trim().is_empty() {
-        return Err(Error::other("Object name cannot be empty"));
-    }
-    check_valid_object_name_prefix(object_name)
-}
-
 pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
 where
     T: for<'xml> xml::Deserialize<'xml>,
@@ -100,6 +83,10 @@ where
     Ok(ans)
 }
 
+#[allow(
+    dead_code,
+    reason = "xml serialize helper with no caller in this port; the live sibling is deserialize (backlog#1823)"
+)]
 pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
     let mut buf = Vec::with_capacity(256);
     {
@@ -186,15 +173,27 @@ pub fn is_valid_object_name(object: &str) -> bool {
 /// Client-facing reason attached to rejections of object keys that Win32/NTFS
 /// cannot represent as file paths (issue #3299). Deployments on Linux/macOS
 /// accept the full S3 key character set.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
 pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str =
     "object key contains characters unsupported on Windows hosts (one of ':', '*', '?', '\"', '|', '<', '>')";
 
 /// Client-facing reason for path segments Windows can store but not address
 /// afterwards (issue #3449): trailing dot/space or reserved DOS device names.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
 pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1)";
 
 /// Reserved DOS device names that shadow regular files on Windows, even when
 /// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
     "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -204,6 +203,10 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 /// the Win32 API cannot address afterwards (issue #3449): segments ending in a
 /// dot or a space, and reserved DOS device names — bare or with an extension
 /// (`NUL.txt`), matching classic Win32 path resolution semantics.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
 pub fn object_name_has_windows_incompatible_segment(object: &str) -> bool {
     object.split(['/', '\\']).any(|segment| {
         if segment.ends_with('.') || segment.ends_with(' ') {

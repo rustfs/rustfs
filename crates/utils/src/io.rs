@@ -68,7 +68,6 @@ pub async fn read_full_or_eof<R: AsyncRead + Send + Sync + Unpin>(
 
 /// Read exactly buf.len() bytes into buf, or return an error if EOF is reached before any bytes are read.
 /// Like Go's io.ReadFull.
-#[allow(dead_code)]
 pub async fn read_full<R: AsyncRead + Send + Sync + Unpin>(reader: R, buf: &mut [u8]) -> std::io::Result<usize> {
     match read_full_or_eof(reader, buf).await? {
         Some(n) => Ok(n),

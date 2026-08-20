@@ -117,7 +117,7 @@ pub(crate) mod access_consumer {
 
 pub(crate) mod concurrency_consumer {
     pub(crate) use super::super::concurrency::{
-        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard,
+        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectAdmission, PutObjectGuard,
         get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
@@ -253,8 +253,6 @@ pub(crate) mod rpc_consumer {
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
         #[cfg(test)]
-        pub(crate) type HealEndpoint = super::super::ecstore_disk::endpoint::Endpoint;
-        #[cfg(test)]
         pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
 
         pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;
@@ -346,9 +344,9 @@ pub(crate) mod s3_api_consumer {
 
 pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
-        EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
-        extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode, map_get_object_reader_error,
-        mark_encrypted_multipart_metadata,
+        EncryptionKeyKind, SSEType, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
+        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata,
     };
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
@@ -568,6 +566,10 @@ pub(crate) mod ecstore_set_disk {
 pub(crate) mod ecstore_erasure {
     pub(crate) use rustfs_ecstore::api::erasure::{BitrotReader, Erasure};
 }
+
+/// Startup bitrot algorithm self-test (rustfs/backlog#1873), re-exported for
+/// the root facade's background-startup section.
+pub(crate) use rustfs_ecstore::api::erasure::{BitrotSelfTestError, bitrot_self_test};
 
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
@@ -805,6 +807,10 @@ impl StorageReplicationStatsHandle {
             proxy_head_failed: metrics.proxied.head_failed,
             proxy_put_tag_total: metrics.proxied.put_tag_total,
             proxy_put_tag_failed: metrics.proxied.put_tag_failed,
+            proxy_get_tag_total: metrics.proxied.get_tag_total,
+            proxy_get_tag_failed: metrics.proxied.get_tag_failed,
+            proxy_delete_tag_total: metrics.proxied.delete_tag_total,
+            proxy_delete_tag_failed: metrics.proxied.delete_tag_failed,
             replica_size: metrics.replica_size,
             replica_count: metrics.replica_count,
         }
@@ -841,6 +847,10 @@ pub(crate) struct ReplicationSiteMetricsSnapshot {
     pub(crate) proxy_head_failed: i64,
     pub(crate) proxy_put_tag_total: i64,
     pub(crate) proxy_put_tag_failed: i64,
+    pub(crate) proxy_get_tag_total: i64,
+    pub(crate) proxy_get_tag_failed: i64,
+    pub(crate) proxy_delete_tag_total: i64,
+    pub(crate) proxy_delete_tag_failed: i64,
     pub(crate) replica_size: i64,
     pub(crate) replica_count: i64,
 }
@@ -1487,12 +1497,6 @@ pub(crate) async fn get_bucket_object_lock_config(
     ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
 }
 
-pub(crate) async fn get_bucket_replication_config(
-    bucket: &str,
-) -> Result<(s3s::dto::ReplicationConfiguration, time::OffsetDateTime)> {
-    ecstore_bucket::metadata_sys::get_replication_config(bucket).await
-}
-
 pub(crate) async fn persist_force_delete_intent(
     api: Arc<ECStore>,
     entry: ecstore_bucket::replication::MrfReplicateEntry,
@@ -1836,18 +1840,6 @@ pub(crate) async fn all_local_disk_path() -> Vec<String> {
 
 pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     ecstore_storage::find_local_disk_by_ref(disk_ref).await
-}
-
-pub(crate) trait StorageReplicationConfigExt {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool;
-}
-
-impl StorageReplicationConfigExt for s3s::dto::ReplicationConfiguration {
-    fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
-        <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::has_active_rules(
-            self, prefix, recursive,
-        )
-    }
 }
 
 pub(crate) trait StorageVersioningConfigExt {

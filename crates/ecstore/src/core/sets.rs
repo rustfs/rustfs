@@ -1140,11 +1140,11 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
 
         Err(Error::DiskNotFound)
     }
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the pool/set layers
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
+    #[tracing::instrument(level = "debug", skip(self, opts), fields(bucket = %bucket, object = %object, dry_run = opts.dry_run))]
+    async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
+        self.get_disks_for_heal_object(object, opts)?
+            .check_abandoned_parts(bucket, object, opts)
+            .await
     }
 }
 
@@ -1996,7 +1996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sets_check_abandoned_parts_returns_typed_not_implemented_error() {
+    async fn sets_check_abandoned_parts_rejects_invalid_set_scope() {
         let format = FormatV3::new(1, 1);
         let sets = Sets {
             id: format.id,
@@ -2021,10 +2021,21 @@ mod tests {
         };
 
         let err = sets
-            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+            .check_abandoned_parts(
+                "bucket",
+                "object",
+                &HealOpts {
+                    set: Some(1),
+                    ..Default::default()
+                },
+            )
             .await
-            .expect_err("abandoned-parts ownership should stay above the pool/set storage layers");
-        assert!(matches!(err, StorageError::NotImplemented));
+            .expect_err("out-of-range abandoned-parts set scope must fail closed");
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "set" && reason.contains("invalid heal set index 1")),
+            "unexpected invalid set error: {err:?}"
+        );
     }
 
     // Builds a single-set `Sets` over `SET_DRIVE_COUNT` local temp-dir disks,

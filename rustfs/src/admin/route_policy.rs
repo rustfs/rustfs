@@ -1559,6 +1559,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/object-zip-downloads",
         DeferredRoutePolicyReason::S3Action,
@@ -1593,6 +1598,10 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     ),
 ];
 
+#[allow(
+    dead_code,
+    reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub fn validate_admin_route_policy_specs() -> Result<(), AdminRouteMatrixError> {
     validate_admin_route_specs(ADMIN_ROUTE_POLICY_SPECS)
 }

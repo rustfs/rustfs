@@ -219,10 +219,6 @@ impl PartialEq for Functions {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct Value;
-
 #[cfg(test)]
 mod tests {
     use crate::policy::Functions;

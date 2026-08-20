@@ -42,12 +42,20 @@ impl<'a> SetDisksCtx<'a> {
     }
 
     /// The borrowed core, for state not yet fronted by a typed accessor.
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn core(&self) -> &'a SetDisks {
         self.core
     }
 
     // --- Immutable topology / config (fixed after construction) ---
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn set_index(&self) -> usize {
         self.core.set_index
     }
@@ -56,14 +64,26 @@ impl<'a> SetDisksCtx<'a> {
         self.core.pool_index
     }
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn set_drive_count(&self) -> usize {
         self.core.set_drive_count
     }
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn default_parity_count(&self) -> usize {
         self.core.default_parity_count
     }
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn set_endpoints(&self) -> &'a [Endpoint] {
         &self.core.set_endpoints
     }
@@ -72,6 +92,10 @@ impl<'a> SetDisksCtx<'a> {
         &self.core.format
     }
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn locker_owner(&self) -> &'a str {
         &self.core.locker_owner
     }
@@ -84,6 +108,10 @@ impl<'a> SetDisksCtx<'a> {
 
     // --- Locker trio ---
 
+    #[allow(
+        dead_code,
+        reason = "SetDisks split seam (backlog#815) with no caller in this port (backlog#1823)"
+    )]
     pub(crate) fn lockers(&self) -> &'a [Arc<dyn LockClient>] {
         &self.core.lockers
     }

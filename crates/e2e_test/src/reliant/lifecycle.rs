@@ -168,6 +168,24 @@ async fn wait_for_version_expired(
     }
 }
 
+async fn wait_for_key_versions_empty(client: &Client, bucket: &str, key: &str, deadline: StdDuration) -> TestResult {
+    let start = std::time::Instant::now();
+    loop {
+        let listing = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+        if listing.versions().is_empty() && listing.delete_markers().is_empty() {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "object {bucket}/{key} still had versions or delete markers after {}s: {listing:?}",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+    }
+}
+
 /// Build a prefix-scoped `Days`-based expiration rule.
 fn expiration_rule(id: &str, prefix: &str, days: i32) -> Result<LifecycleRule, Box<dyn std::error::Error + Send + Sync>> {
     let rule = LifecycleRule::builder()
@@ -187,6 +205,21 @@ fn noncurrent_expiration_rule(
     let rule = LifecycleRule::builder()
         .id(id)
         .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .noncurrent_version_expiration(NoncurrentVersionExpiration::builder().noncurrent_days(days).build())
+        .status(ExpirationStatus::Enabled)
+        .build()?;
+    Ok(rule)
+}
+
+fn noncurrent_expiration_with_delete_marker_cleanup_rule(
+    id: &str,
+    prefix: &str,
+    days: i32,
+) -> Result<LifecycleRule, Box<dyn std::error::Error + Send + Sync>> {
+    let rule = LifecycleRule::builder()
+        .id(id)
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .expiration(LifecycleExpiration::builder().expired_object_delete_marker(true).build())
         .noncurrent_version_expiration(NoncurrentVersionExpiration::builder().noncurrent_days(days).build())
         .status(ExpirationStatus::Enabled)
         .build()?;
@@ -407,6 +440,143 @@ async fn test_lifecycle_noncurrent_version_expiry_removes_only_old_version() -> 
         versions.delete_markers().is_empty(),
         "noncurrent version expiry must not create delete markers, got: {:?}",
         versions.delete_markers()
+    );
+
+    Ok(())
+}
+
+/// A combined `NoncurrentDays=1` and `ExpiredObjectDeleteMarker=true` rule
+/// must remove a noncurrent data version and then its sole latest delete
+/// marker, without expiring current-only objects. A second prefix with only
+/// noncurrent expiry proves that marker cleanup comes from EODM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lifecycle_noncurrent_expiry_then_cleans_expired_delete_marker() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    let mut extra_env = fast_lifecycle_env();
+    extra_env.push(("RUSTFS_ILM_DEBUG_DAY_SECS", "2"));
+    env.start_rustfs_server_with_env(vec![], &extra_env).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "ilm-expired-delete-marker";
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let cascade_key = "cascade/deleted.txt";
+    let cascade_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(cascade_key)
+        .body(ByteStream::from_static(b"cascade payload"))
+        .send()
+        .await?;
+    let cascade_data_version = cascade_put
+        .version_id()
+        .map(str::to_string)
+        .expect("cascade PUT returns a version id");
+    let cascade_delete = client.delete_object().bucket(bucket).key(cascade_key).send().await?;
+    let cascade_marker_version = cascade_delete
+        .version_id()
+        .map(str::to_string)
+        .expect("cascade DELETE returns a marker version id");
+    assert_eq!(cascade_delete.delete_marker(), Some(true));
+
+    let survivor_key = "cascade/current-only.txt";
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(survivor_key)
+        .body(ByteStream::from_static(b"current payload"))
+        .send()
+        .await?;
+    let survivor_before = client.get_object().bucket(bucket).key(survivor_key).send().await?;
+    assert_eq!(survivor_before.body.collect().await?.into_bytes().as_ref(), b"current payload");
+
+    let control_key = "nve-only/deleted.txt";
+    let control_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(control_key)
+        .body(ByteStream::from_static(b"control payload"))
+        .send()
+        .await?;
+    let control_data_version = control_put
+        .version_id()
+        .map(str::to_string)
+        .expect("control PUT returns a version id");
+    let control_delete = client.delete_object().bucket(bucket).key(control_key).send().await?;
+    let control_marker_version = control_delete
+        .version_id()
+        .map(str::to_string)
+        .expect("control DELETE returns a marker version id");
+    assert_eq!(control_delete.delete_marker(), Some(true));
+
+    let cascade_before = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix(cascade_key)
+        .send()
+        .await?;
+    assert!(
+        cascade_before
+            .versions()
+            .iter()
+            .any(|version| version.version_id() == Some(cascade_data_version.as_str())),
+        "cascade data version must exist before lifecycle is installed: {cascade_before:?}"
+    );
+    assert!(
+        cascade_before
+            .delete_markers()
+            .iter()
+            .any(|marker| { marker.version_id() == Some(cascade_marker_version.as_str()) && marker.is_latest() == Some(true) }),
+        "cascade latest delete marker must exist before lifecycle is installed: {cascade_before:?}"
+    );
+
+    let lifecycle = BucketLifecycleConfiguration::builder()
+        .rules(noncurrent_expiration_with_delete_marker_cleanup_rule(
+            "expire-and-clean-marker",
+            "cascade/",
+            1,
+        )?)
+        .rules(noncurrent_expiration_rule("expire-only", "nve-only/", 1)?)
+        .build()?;
+    client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(lifecycle)
+        .send()
+        .await?;
+
+    wait_for_key_versions_empty(&client, bucket, cascade_key, StdDuration::from_secs(90)).await?;
+    wait_for_version_expired(&client, bucket, control_key, &control_data_version, StdDuration::from_secs(90)).await?;
+
+    let survivor = client.get_object().bucket(bucket).key(survivor_key).send().await?;
+    assert_eq!(survivor.body.collect().await?.into_bytes().as_ref(), b"current payload");
+
+    let control_after = client
+        .list_object_versions()
+        .bucket(bucket)
+        .prefix(control_key)
+        .send()
+        .await?;
+    assert!(
+        control_after.versions().is_empty(),
+        "NVE-only control must remove its data version: {control_after:?}"
+    );
+    assert!(
+        control_after
+            .delete_markers()
+            .iter()
+            .any(|marker| { marker.version_id() == Some(control_marker_version.as_str()) && marker.is_latest() == Some(true) }),
+        "NVE-only control must preserve its latest delete marker: {control_after:?}"
     );
 
     Ok(())

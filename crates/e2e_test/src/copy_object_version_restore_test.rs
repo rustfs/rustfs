@@ -21,11 +21,9 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-    use serial_test::serial;
     use tracing::info;
 
     #[tokio::test]
-    #[serial]
     async fn test_self_copy_of_historical_version_restores_data_and_metadata() {
         init_logging();
         info!("Issue #4238: self-copy of a historical version must be allowed and preserve metadata");
@@ -165,7 +163,6 @@ mod tests {
     /// version copied via `x-amz-copy-source-version-id` (SDK `CopySourceVersionId`), kept distinct
     /// from the newly created destination `x-amz-version-id`.
     #[tokio::test]
-    #[serial]
     async fn test_copy_of_non_latest_source_version_returns_copy_source_version_id() {
         init_logging();
         info!("Issue #4976: versioned CopyObject must return x-amz-copy-source-version-id for the exact source version");

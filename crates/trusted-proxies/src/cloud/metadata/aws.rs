@@ -27,6 +27,10 @@ use crate::CloudMetadataFetcher;
 #[derive(Debug, Clone)]
 pub struct AwsMetadataFetcher {
     client: Client,
+    #[allow(
+        dead_code,
+        reason = "IMDS endpoint retained beside the client it configures; requests build their own URLs (backlog#1823)"
+    )]
     metadata_endpoint: String,
 }
 
@@ -44,55 +48,6 @@ impl AwsMetadataFetcher {
         Self {
             client,
             metadata_endpoint: "http://169.254.169.254".to_string(),
-        }
-    }
-
-    /// Retrieves an IMDSv2 token for secure metadata access.
-    #[allow(dead_code)]
-    async fn get_metadata_token(&self) -> Result<String, AppError> {
-        let url = format!("{}/latest/api/token", self.metadata_endpoint);
-
-        match self
-            .client
-            .put(&url)
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let token = response
-                        .text()
-                        .await
-                        .map_err(|e| AppError::cloud(format!("Failed to read IMDSv2 token: {}", e)))?;
-                    Ok(token)
-                } else {
-                    debug!(
-                        event = "trusted_proxies.cloud_metadata",
-                        component = "trusted_proxies",
-                        subsystem = "aws_metadata",
-                        provider = "aws",
-                        operation = "imdsv2_token",
-                        result = "http_error",
-                        status = %response.status(),
-                        "trusted proxy cloud metadata request failed"
-                    );
-                    Err(AppError::cloud("Failed to obtain IMDSv2 token"))
-                }
-            }
-            Err(e) => {
-                debug!(
-                    event = "trusted_proxies.cloud_metadata",
-                    component = "trusted_proxies",
-                    subsystem = "aws_metadata",
-                    provider = "aws",
-                    operation = "imdsv2_token",
-                    result = "request_failed",
-                    error = %e,
-                    "trusted proxy cloud metadata request failed"
-                );
-                Err(AppError::cloud(format!("IMDSv2 request failed: {}", e)))
-            }
         }
     }
 }

@@ -214,7 +214,9 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
-        pub(crate) use crate::storage::storage_api::{ECStore, set_workload_admission_snapshot_provider};
+        pub(crate) use crate::storage::storage_api::{
+            BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
+        };
     }
 
     pub(crate) mod bucket_metadata {

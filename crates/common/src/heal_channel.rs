@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, ReplicationConfiguration, ReplicationRuleStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display},
@@ -224,6 +223,13 @@ pub struct HealOpts {
 pub enum HealAdmissionDropReason {
     QueueFull,
     PolicyDropped,
+    /// HS-06: an admin heal start overlaps (same bucket with mutually
+    /// containing prefixes, or the same erasure set) an already running or
+    /// queued task. Only produced when RUSTFS_HEAL_OVERLAP_POLICY=minio_error.
+    AlreadyRunning,
+    /// HS-06: same as [`Self::AlreadyRunning`] but for paths that merely
+    /// contain (or are contained by) the active task's path.
+    OverlappingPaths,
 }
 
 impl HealAdmissionDropReason {
@@ -231,6 +237,8 @@ impl HealAdmissionDropReason {
         match self {
             Self::QueueFull => "queue_full",
             Self::PolicyDropped => "policy_dropped",
+            Self::AlreadyRunning => "already_running",
+            Self::OverlappingPaths => "overlapping_paths",
         }
     }
 }
@@ -287,6 +295,9 @@ pub enum HealRequestSource {
     Scanner,
     AutoHeal,
     ReadRepair,
+    /// Mission Repair Feed: intents delivered by error paths and replayed
+    /// from the durable MRF journal.
+    Mrf,
 }
 
 impl HealRequestSource {
@@ -297,6 +308,7 @@ impl HealRequestSource {
             Self::Scanner => "scanner",
             Self::AutoHeal => "auto_heal",
             Self::ReadRepair => "read_repair",
+            Self::Mrf => "mrf",
         }
     }
 }
@@ -313,6 +325,9 @@ pub enum HealChannelCommand {
     Query {
         heal_path: String,
         client_token: String,
+        /// Incremental result cursor (HS-06): only items with a sequence
+        /// greater than this are returned; `None` keeps the full snapshot.
+        since_seq: Option<u64>,
         response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
     },
     /// Cancel heal task
@@ -518,10 +533,21 @@ async fn receive_heal_channel_response(
 
 /// Send heal query request
 pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    query_heal_status_since(heal_path, client_token, None).await
+}
+
+/// Incremental heal query (HS-06): pass the client's last seen sequence
+/// number to receive only newer result items.
+pub async fn query_heal_status_since(
+    heal_path: String,
+    client_token: String,
+    since_seq: Option<u64>,
+) -> Result<HealChannelResponse, String> {
     let (response_tx, response_rx) = oneshot::channel();
     send_heal_command(HealChannelCommand::Query {
         heal_path,
         client_token,
+        since_seq,
         response_tx,
     })
     .await?;
@@ -604,104 +630,6 @@ pub fn create_heal_response(
         data,
         error,
     }
-}
-
-fn lc_get_prefix(rule: &LifecycleRule) -> String {
-    if let Some(p) = &rule.prefix {
-        return p.to_string();
-    } else if let Some(filter) = &rule.filter {
-        if let Some(p) = &filter.prefix {
-            return p.to_string();
-        } else if let Some(and) = &filter.and
-            && let Some(p) = &and.prefix
-        {
-            return p.to_string();
-        }
-    }
-
-    "".into()
-}
-
-pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) -> bool {
-    if config.rules.is_empty() {
-        return false;
-    }
-
-    for rule in config.rules.iter() {
-        if rule.status == ExpirationStatus::from_static(ExpirationStatus::DISABLED) {
-            continue;
-        }
-        let rule_prefix = lc_get_prefix(rule);
-        if !prefix.is_empty() && !rule_prefix.is_empty() && !prefix.starts_with(&rule_prefix) && !rule_prefix.starts_with(prefix)
-        {
-            continue;
-        }
-
-        if let Some(e) = &rule.noncurrent_version_expiration {
-            if e.noncurrent_days.is_some() {
-                return true;
-            }
-            if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
-                return true;
-            }
-        }
-
-        if rule.noncurrent_version_transitions.is_some() {
-            return true;
-        }
-        if let Some(true) = rule.expiration.as_ref().map(|e| e.date.is_some()) {
-            return true;
-        }
-
-        if let Some(true) = rule.expiration.as_ref().map(|e| e.days.is_some()) {
-            return true;
-        }
-
-        if let Some(Some(true)) = rule.expiration.as_ref().map(|e| e.expired_object_delete_marker) {
-            return true;
-        }
-
-        if let Some(true) = rule.transitions.as_ref().map(|t| !t.is_empty()) {
-            return true;
-        }
-
-        if rule.transitions.is_some() {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, recursive: bool) -> bool {
-    if config.rules.is_empty() {
-        return false;
-    }
-
-    for rule in config.rules.iter() {
-        if rule
-            .status
-            .eq(&ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED))
-        {
-            continue;
-        }
-        if !prefix.is_empty()
-            && let Some(filter) = &rule.filter
-            && let Some(r_prefix) = &filter.prefix
-            && !r_prefix.is_empty()
-        {
-            // incoming prefix must be in rule prefix
-            if !recursive && !prefix.starts_with(r_prefix) {
-                continue;
-            }
-            // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
-            // does not match
-            if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
-                continue;
-            }
-        }
-        return true;
-    }
-    false
 }
 
 pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {

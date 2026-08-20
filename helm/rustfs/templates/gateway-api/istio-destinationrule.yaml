@@ -1,0 +1,16 @@
+{{- if and .Values.gatewayApi.enabled (eq .Values.gatewayApi.gatewayClass "istio") }}
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: {{ include "rustfs.fullname" . }}-sticky
+  namespace: {{ .Release.Namespace }}
+spec:
+  host: {{ include "rustfs.fullname" . }}-svc.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpCookie:
+          name: rustfs
+          path: /
+          ttl: 0s
+{{- end }}

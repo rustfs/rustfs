@@ -853,13 +853,32 @@ mod tests {
 
     #[test]
     fn test_error_conversions() {
-        // Test From implementations
+        // A plain io::Error carries no typed payload to recover, so it lands in
+        // `Io` rather than being guessed at from its kind — `NotFound` here must
+        // not silently become `FileNotFound`, which quorum aggregation counts as
+        // a different error (rustfs/backlog#1836).
         let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
-        let _disk_error: DiskError = io_error.into();
+        let disk_error: DiskError = io_error.into();
+        match &disk_error {
+            DiskError::Io(inner) => assert_eq!(inner.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("a plain io::Error must stay typed as Io, got {other:?}"),
+        }
 
-        let json_str = r#"{"invalid": json}"#; // Invalid JSON
+        // A typed DiskError boxed through io::Error round-trips back to itself
+        // instead of degrading to `Io`.
+        let boxed: std::io::Error = std::io::Error::other(DiskError::VolumeNotFound);
+        assert_eq!(DiskError::from(boxed), DiskError::VolumeNotFound);
+
+        // serde_json errors have no dedicated variant and fold into `other`,
+        // keeping the original message.
+        let json_str = r#"{"invalid": json}"#;
         let json_error = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
-        let _disk_error: DiskError = json_error.into();
+        let json_message = json_error.to_string();
+        let disk_error: DiskError = json_error.into();
+        assert!(
+            disk_error.to_string().contains(&json_message),
+            "the json error message must survive the conversion: {disk_error}"
+        );
     }
 
     #[test]

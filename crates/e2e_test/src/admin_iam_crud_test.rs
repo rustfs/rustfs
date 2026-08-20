@@ -33,7 +33,6 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use reqwest::StatusCode;
-use serial_test::serial;
 use std::error::Error;
 use tokio::time::{Duration, sleep};
 
@@ -178,7 +177,6 @@ async fn assert_admin_status(
 }
 
 #[tokio::test]
-#[serial]
 async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestResult {
     init_logging();
 
@@ -348,7 +346,6 @@ async fn test_update_service_account_enforces_owner_and_parent_scope() -> TestRe
 /// Full user -> policy -> service-account lifecycle, proving each management
 /// call takes effect on the data plane, not just that the endpoint answers 200.
 #[tokio::test]
-#[serial]
 async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
     init_logging();
 
@@ -573,7 +570,6 @@ async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
 /// non-admin credential with 403 AccessDenied (sec-4 assertion pattern; the
 /// gate implementation itself is owned by sec-4 / admin_auth_test).
 #[tokio::test]
-#[serial]
 async fn test_admin_iam_endpoints_deny_non_admin_credential() -> TestResult {
     init_logging();
 

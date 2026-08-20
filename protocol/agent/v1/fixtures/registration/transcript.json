@@ -1,0 +1,289 @@
+{
+    "protocolVersion": "v1",
+    "fixtureSet": "registration",
+    "fixture": "transcript",
+    "description": "The frozen canonical byte sequence a RustFS device signs to prove possession of its device key during the registration token exchange, the frozen request body that carries it, and the order a verifier applies its checks in. protocol/agent/v1/registration-proof.md is the prose; this file is the machine-readable freeze. R01 and R02 implement against both; api/tests/Feature/Agent/RegistrationProofFixtureTest.php replays them.",
+    "transcript": {
+        "domain": "RUSTFS-CONNECT-REGISTRATION-V1",
+        "domainEncoding": "US-ASCII, 30 octets, compared octet for octet. Case sensitive; no other spelling exists.",
+        "domainTerminator": "0x0a",
+        "fieldEncoding": "decimalOctetLength 0x3a valueOctets 0x0a",
+        "lengthEncoding": "The shortest ASCII decimal spelling of the value length in octets: no sign, no leading zero, no padding, no separators. It counts octets and never characters.",
+        "fieldSeparator": "0x3a",
+        "fieldTerminator": "0x0a",
+        "fieldCount": 7,
+        "fieldOrder": [
+            "registrationTokenUid",
+            "organizationUid",
+            "clusterUid",
+            "requestId",
+            "challengeNonce",
+            "expiresUnix",
+            "certificateRequestSha256"
+        ],
+        "trailingTerminator": true,
+        "isADocument": false,
+        "isJson": false,
+        "reserialisationPermitted": false,
+        "canonicalisationPermitted": false,
+        "normalisationPermitted": false,
+        "rule": "transcript = domain || 0x0a || field(registrationTokenUid) || field(organizationUid) || field(clusterUid) || field(requestId) || field(challengeNonce) || field(expiresUnix) || field(certificateRequestSha256), where field(v) = decimal(octetLength(v)) || 0x3a || v || 0x0a.",
+        "note": "The transcript is built, never parsed. A verifier constructs it from the registration token row it resolved plus two values the request carries, and compares nothing but the resulting signature. There is therefore no such thing as a malformed transcript on the wire: a field that cannot be spelled canonically is refused before a transcript exists.",
+        "fields": [
+            {
+                "position": 1,
+                "name": "registrationTokenUid",
+                "source": "the resolved registration token row",
+                "encoding": "lowercase canonical UUIDv7, 36 octets of US-ASCII",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "binds": "the one token row this exchange spends",
+                "absenceWouldAllow": "A proof produced for one token to be presented with another token of the same cluster whose nonce and expiry an attacker could otherwise reproduce, spending a credential its holder never used."
+            },
+            {
+                "position": 2,
+                "name": "organizationUid",
+                "source": "the resolved registration token row",
+                "encoding": "lowercase canonical UUIDv7, 36 octets of US-ASCII",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "binds": "the tenant that issued the token",
+                "absenceWouldAllow": "A device to be enrolled into a tenant other than the one whose operator issued its token, if a token row were ever moved between organizations by a bug or a restore. It also makes an implementation structurally unable to build a tenant-agnostic transcript."
+            },
+            {
+                "position": 3,
+                "name": "clusterUid",
+                "source": "the resolved registration token row",
+                "encoding": "lowercase canonical UUIDv7, 36 octets of US-ASCII",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "binds": "the cluster the device joins",
+                "absenceWouldAllow": "A proof to enrol a device into a different cluster of the same tenant, which is the intra-tenant half of the same substitution and is not covered by organizationUid."
+            },
+            {
+                "position": 4,
+                "name": "requestId",
+                "source": "the request body",
+                "encoding": "lowercase canonical UUIDv4, 36 octets of US-ASCII",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "binds": "the single idempotent attempt the proof belongs to",
+                "absenceWouldAllow": "A captured request body to be resubmitted under a fresh idempotency key. A registration token reservation is held by (requestId, csrHash), so a replay under a new requestId could take the exchange over once the original reservation lapsed. With requestId bound, a captured body can only ever be replayed as itself, which is exactly an idempotent retry."
+            },
+            {
+                "position": 5,
+                "name": "challengeNonce",
+                "source": "the resolved registration token row",
+                "encoding": "64 octets of lowercase hexadecimal, the 256 bit nonce as it is stored",
+                "pattern": "^[0-9a-f]{64}$",
+                "binds": "the one-time challenge delivered with the token secret",
+                "absenceWouldAllow": "A proof to be precomputed from public token metadata alone. The token uid, the organization, and the cluster all appear in ordinary console responses; the nonce is delivered exactly once, beside the secret, to the operator enrolling the cluster. Without it, anyone who can read the console could build every transcript in advance and would only need a secret leaked later through some other channel."
+            },
+            {
+                "position": 6,
+                "name": "expiresUnix",
+                "source": "the resolved registration token row",
+                "encoding": "seconds since the Unix epoch as shortest ASCII decimal: no sign, no leading zero, no fraction, no padding",
+                "pattern": "^[1-9][0-9]{0,18}$",
+                "binds": "the enrolment window the control plane recorded",
+                "absenceWouldAllow": "An expired exchange to be resurrected by widening the window it was produced against. Every proof made for the old window stops verifying the moment expires_at changes, so a row edited to extend a spent enrolment yields nothing."
+            },
+            {
+                "position": 7,
+                "name": "certificateRequestSha256",
+                "source": "recomputed over the exact octets of the presented certificate request",
+                "encoding": "unpadded base64url of the 32 octet SHA-256 digest, 43 octets of US-ASCII",
+                "pattern": "^[A-Za-z0-9_-]{43}$",
+                "binds": "the exact certificate request being answered, and through it the device public key",
+                "absenceWouldAllow": "A captured proof to be presented with an attacker certificate request, so that Connect issues a device certificate for an attacker key against an operator token. This is the proof-of-possession property itself. The digest covers the transmitted octets and not a parsed structure, so a re-encoded certificate request is a different artifact rather than an equivalent one."
+            }
+        ],
+        "excluded": [
+            {
+                "value": "the registration token secret",
+                "reason": "It is proven by comparing its SHA-256 against the stored digest, and it is the one value in the exchange that must never reach a signature input, a debug dump, or an audit record. Nothing is weakened by leaving it out: the token uid already names the row, and the nonce already makes the transcript unguessable from public metadata."
+            },
+            {
+                "value": "the certificate request octets themselves",
+                "reason": "Only their digest. A signature input that carried a whole PKCS#10 would make every verifier hold the artifact in the hashing path for no additional binding."
+            },
+            {
+                "value": "any organization, cluster, device, or expiry the client states",
+                "reason": "The request body has no field for one. Every tenancy value in the transcript is read from the token row after the token is resolved, so a client cannot choose what its own proof is checked against (ADR 0002)."
+            },
+            {
+                "value": "a keyId beside the proof",
+                "reason": "The verifying key is the SubjectPublicKeyInfo inside the presented certificate request and nothing else. A keyId would be a lookup hint that is not one, and the first implementation to trust it would have re-introduced key substitution."
+            },
+            {
+                "value": "a timestamp produced by the device",
+                "reason": "Device clocks are advisory (ADR 0003). Freshness is the token row expiry evaluated against the Connect clock, which is already bound as expiresUnix."
+            }
+        ]
+    },
+    "signature": {
+        "signatureAlgorithm": "ES256",
+        "curve": "P-256",
+        "hash": "SHA-256",
+        "signatureEncoding": "fixed-width-r-s",
+        "signatureLengthBytes": 64,
+        "signatureTransferEncoding": "base64url-unpadded",
+        "signatureValuePattern": "^[A-Za-z0-9_-]{86}$",
+        "lowSRequired": true,
+        "groupOrder": "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        "maxS": "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8",
+        "algorithmField": "proof.algorithm",
+        "algorithmEnumeration": [
+            "ES256"
+        ],
+        "algorithmEnumerationIsClosed": true,
+        "verifyingKey": "the SubjectPublicKeyInfo of the presented certificate request, and never a key named anywhere in the request",
+        "subjectPublicKeyInfoDerPrefix": "3059301306072a8648ce3d020106082a8648ce3d030107034200",
+        "note": "Identical to the encoding ADR 0009 freezes for the offline surface, so one repository has one signature encoding. Only the signature input differs, and transcript.divergenceFromAdr0009 says why."
+    },
+    "divergenceFromAdr0009": {
+        "shared": [
+            "ES256 on P-256 with SHA-256.",
+            "The 64 octet fixed-width r||s encoding, low-S normalised, as unpadded base64url.",
+            "A domain separation tag in front of everything, so a signature made for one surface can never be replayed on another.",
+            "Closed enumerations: an unrecognised algorithm is refused, never discarded."
+        ],
+        "differs": [
+            {
+                "aspect": "what is signed",
+                "adr0009": "the exact raw octets of a document as transmitted",
+                "here": "a transcript the verifier constructs from values it already holds",
+                "reason": "ADR 0009 signs bytes because a document crosses the wire and re-serialising it before verification would verify something the producer never signed. There is no such document here. Five of the seven bound values are never transmitted at all: they are read from the registration token row after the token is resolved. A signature input assembled from a document could therefore only bind what the client chose to send, which is the precise thing this exchange must not do."
+            },
+            {
+                "aspect": "the separator after the domain tag",
+                "adr0009": "0x00, the one octet that cannot appear in an ASCII tag or in JSON",
+                "here": "0x0a, once after the domain and once after every field",
+                "reason": "ADR 0009 needs an octet that cannot occur in either half because the second half is an opaque document of unbounded shape. Here every field is length-prefixed and the arity is fixed at seven, so the parse is unambiguous whatever the separator is; the separator only has to be a byte no field value can contain, and none of the seven patterns admits 0x0a. Choosing 0x0a instead makes the whole transcript printable US-ASCII, which is why this fixture can publish the literal canonical string beside its digest and ADR 0009 cannot."
+            }
+        ],
+        "note": "These are two signature inputs, not two signing conventions. An implementation that already produces ADR 0009 signatures changes only what it hashes."
+    },
+    "request": {
+        "operation": "POST /agent/registrationTokens:exchange",
+        "authentication": "none; ADR 0008 lets only a pre-registration operation opt out, because a device has no certificate until this exchange gives it one",
+        "contentType": "application/json",
+        "abuseGate": "api/app/Modules/Agent/Http/Middleware/RegistrationAbuseGuard.php, which runs before this body is parsed",
+        "registrationTokenUidMustAppearWithinFirstBytes": 1024,
+        "registrationTokenUidPlacementNote": "The abuse gate finds the token uid by scanning at most the first 1024 octets of the body, so a producer MUST place registrationTokenUid inside that window. A body that does not is not rejected; it silently loses its per-token rate bucket and is bounded by source address alone. That is why this is a stated requirement and not left to JSON member order being unobservable.",
+        "fields": [
+            {
+                "name": "protocolVersion",
+                "required": true,
+                "type": "string",
+                "rule": "v<major>, exactly as protocol/agent/v1/authentication.md freezes it. Anything else is UNSUPPORTED_PROTOCOL and HTTP 400 with nothing partially processed."
+            },
+            {
+                "name": "requestId",
+                "required": true,
+                "type": "string",
+                "rule": "Lowercase canonical UUIDv4 idempotency key, bound into the transcript at position 4 and into the token reservation."
+            },
+            {
+                "name": "registrationTokenUid",
+                "required": true,
+                "type": "string",
+                "rule": "The public lookup half of the token. Not a secret, and not authorization evidence: it selects a row and nothing more."
+            },
+            {
+                "name": "registrationTokenSecret",
+                "required": true,
+                "type": "string",
+                "rule": "The 256 bit secret as unpadded base64url, compared in constant time against the stored SHA-256 digest. It is never part of the transcript and no fixture in this set carries one."
+            },
+            {
+                "name": "certificateRequest",
+                "required": true,
+                "type": "string",
+                "rule": "PKCS#10 DER as standard padded base64. Its digest is bound at position 7 and its SubjectPublicKeyInfo is the verifying key."
+            },
+            {
+                "name": "proof",
+                "required": true,
+                "type": "object",
+                "rule": "Exactly two members: algorithm, fixed at ES256, and value, the 64 octet r||s proof as unpadded base64url."
+            }
+        ],
+        "absentByConstruction": [
+            "organizationUid",
+            "organizationName",
+            "clusterUid",
+            "clusterName",
+            "clusterDeviceUid",
+            "challengeNonce",
+            "expiresUnix",
+            "proof.keyId"
+        ],
+        "reservationCertificateRequestHash": "lowercase SHA-256 hex over the same certificate request octets that position 7 digests",
+        "reservationCertificateRequestHashNote": "RegistrationToken::isReservableBy() holds a reservation under (requestId, csrHash). The reservation and the transcript must digest the same octets the same way, or one request could hold a token for a certificate request its proof does not cover. Same input, same algorithm, different transfer encoding only because one value is a database column and the other is a transcript field.",
+        "absentByConstructionNote": "There is no field for any of these, so no implementation can accept one \"just to compare it\". Connect reads all of them from the token row.",
+        "certificateRequestProfile": {
+            "format": "PKCS#10, DER",
+            "publicKey": "ECDSA on NIST P-256",
+            "selfSignature": "ES256 by the key it presents, verified over the DER-encoded certificationRequestInfo",
+            "selfSignatureEncodingConstrained": false,
+            "selfSignatureEncodingNote": "The PKCS#10 self-signature is ordinary ASN.1 DER and is not held to the r||s or low-S rules; it is not an artifact identity, and its exact octets are already bound by the position 7 digest. Two certificate requests that differ only in their self-signature are two different artifacts, each with its own transcript.",
+            "subjectUsed": false,
+            "sanUsed": false,
+            "extensionsUsed": false,
+            "attributesUsed": false,
+            "claimedDeviceUidInFixtures": "0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7",
+            "claimedSubjectAlternativeNameInFixtures": "urn:rustfs:connect:device:0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7",
+            "claimedIdentityNote": "Every certificate request in this set carries the subject CN=0198f4b0-8b00-7d80-9491-9fa0b1c2d3e7 and the matching device URN as its only subject alternative name. Connect assigned no such device, and no vector references that uid anywhere else. A verifier that reads an identity out of a certificate request will visibly agree with a value nothing else in the exchange corroborates, which is easier to notice than an omission.",
+            "ignoredFieldsNote": "Connect consumes a certificate request for its SubjectPublicKeyInfo and its self-signature and for nothing else. The subject, the subject alternative names, any requested extensions, and any attributes are ignored and are never copied into the issued certificate. A device cannot name itself: ADR 0008 fixes the issued subject as CN=<clusterDeviceUid> and the SAN as urn:rustfs:connect:device:<clusterDeviceUid>, and Connect assigns that uid during this exchange. A device has no uid to put in a certificate request, which is the structural reason the request cannot be the source of its own identity.",
+            "selfSignatureAloneIsInsufficient": "A valid self-signature proves only that somebody holds the key in the request. It binds no token, no tenant, no cluster, and no attempt, so a verifier that stopped there would issue a device certificate to any key presented with any stolen token. reject-vectors.json publishes exactly that vector under \"accepted proof presented with a substituted certificate request\"."
+        }
+    },
+    "verificationOrder": {
+        "principle": "Refuse on what can be refused without a database read, then resolve the token, then verify the proof. The order is not a preference: four of the seven transcript fields exist only in the token row, so no signature can be checked before that row is resolved.",
+        "steps": [
+            "read protocolVersion and refuse an unsupported major version with UNSUPPORTED_PROTOCOL",
+            "refuse a proof.algorithm other than ES256 with UNSUPPORTED_ALGORITHM",
+            "refuse a proof.value that is not 86 base64url characters decoding to 64 octets with r and s in [1, n) with SIGNATURE_MALFORMED",
+            "refuse a proof.value whose s exceeds half the group order with SIGNATURE_NOT_CANONICAL, before any key is loaded",
+            "decode the certificate request, refuse anything that is not one well-formed PKCS#10 DER with no trailing octets with CERTIFICATE_REQUEST_MALFORMED",
+            "refuse a SubjectPublicKeyInfo that is not an ECDSA key on P-256 with DEVICE_KEY_UNSUPPORTED",
+            "refuse a certificate request whose ES256 self-signature does not verify under its own key with CERTIFICATE_REQUEST_MALFORMED",
+            "resolve the registration token by uid and secret digest and refuse anything not usable now with REGISTRATION_TOKEN_UNUSABLE",
+            "rebuild the transcript from the resolved row plus requestId and the recomputed certificate request digest",
+            "verify the proof over those octets under the certificate request key and refuse with REGISTRATION_PROOF_INVALID"
+        ],
+        "ownedByThisContract": [
+            "UNSUPPORTED_ALGORITHM",
+            "SIGNATURE_MALFORMED",
+            "SIGNATURE_NOT_CANONICAL",
+            "CERTIFICATE_REQUEST_MALFORMED",
+            "DEVICE_KEY_UNSUPPORTED",
+            "REGISTRATION_PROOF_INVALID"
+        ],
+        "ownedElsewhere": [
+            {
+                "reason": "UNSUPPORTED_PROTOCOL",
+                "owner": "protocol/agent/v1/authentication.md"
+            },
+            {
+                "reason": "REGISTRATION_TOKEN_UNUSABLE",
+                "owner": "App\\Modules\\Clusters\\Application\\Contracts\\RegistrationTokenPort"
+            }
+        ],
+        "note": "A rejection never says which of the seven bindings disagreed. All of them collapse into REGISTRATION_PROOF_INVALID, because a response that distinguished them would tell an unauthenticated caller which of its guesses about a token row was right."
+    },
+    "example": {
+        "note": "The first accept vector, written out. A producer that reproduces these octets from these inputs has a correct transcript builder and has not needed a single line of cryptography to prove it.",
+        "inputs": {
+            "registrationTokenUid": "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5",
+            "organizationUid": "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70",
+            "clusterUid": "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81",
+            "requestId": "3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b",
+            "challengeNonce": "a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f",
+            "expiresUnix": 1787228100,
+            "certificateRequestSha256": "H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4"
+        },
+        "canonicalTranscript": "RUSTFS-CONNECT-REGISTRATION-V1\n36:0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5\n36:0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70\n36:0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81\n36:3f2a1c94-5b6d-4e8f-9a0b-1c2d3e4f5a6b\n64:a3f1c07d9b2e4856af0c1d3b5e7f9012c4a6b8d0e2f4061738495a6b7c8d9e0f\n10:1787228100\n43:H3RBnh-SfmAAnMKVdPKlQeWuuexx2_yY_c0t1TSddo4\n",
+        "canonicalTranscriptLengthBytes": 320,
+        "canonicalTranscriptSha256": "2552ab455a86703b75321cf70c7ee48034f0ad8a56dae0dbdc462c7fbe762477",
+        "canonicalTranscriptBase64": "UlVTVEZTLUNPTk5FQ1QtUkVHSVNUUkFUSU9OLVYxCjM2OjAxOThmNGIwLTZmMDAtN2I2MC05MjcxLTdkOGU5ZmEwYjFjNQozNjowMTk4ZjRiMC0xYTAwLTdjMTAtOGQyMS0yZTNmNGE1YjZjNzAKMzY6MDE5OGY0YjAtMmIwMC03ZDIwLTllMzEtM2Y0YTViNmM3ZDgxCjM2OjNmMmExYzk0LTViNmQtNGU4Zi05YTBiLTFjMmQzZTRmNWE2Ygo2NDphM2YxYzA3ZDliMmU0ODU2YWYwYzFkM2I1ZTdmOTAxMmM0YTZiOGQwZTJmNDA2MTczODQ5NWE2YjdjOGQ5ZTBmCjEwOjE3ODcyMjgxMDAKNDM6SDNSQm5oLVNmbUFBbk1LVmRQS2xRZVd1dWV4eDJfeVlfYzB0MVRTZGRvNAo=",
+        "proof": "iULWfq3BzJQ2mIqFkZomPHAXahWjbUP1ETO8KBIRr-s9RnUdst7MP_kuaizIZozfAmhaKIOImCejwpptE_9atQ"
+    }
+}

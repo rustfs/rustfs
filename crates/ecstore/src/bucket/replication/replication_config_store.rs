@@ -37,6 +37,10 @@ impl ReplicationConfigStore {
         com::read_config_limited(api, file, max_bytes).await
     }
 
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity replication surface with no caller in this port (backlog#1823)"
+    )]
     pub(crate) async fn read_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
     where
         S: ReplicationObjectIO,

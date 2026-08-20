@@ -23,6 +23,7 @@
 //! per-version `SetDisks::heal_object`.
 
 use super::super::*;
+use crate::object_api::ObjectInfo;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,12 +40,16 @@ const BACKGROUND_WALKDIR_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// it must not gate healing logic — the delete-marker vs data path is chosen
 /// inside `ops/heal.rs` from the resolved latest metadata. `version_id` is
 /// normalized (nil/absent UUID => `None`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HealWalkVersion {
     /// object key
     pub name: String,
     /// normalized version id (`None` when the version is nil/absent)
     pub version_id: Option<String>,
+    /// version modification time as Unix nanoseconds
+    pub mod_time_unix_nanos: Option<i128>,
+    /// object snapshot for lifecycle evaluation
+    pub lifecycle_object_info: Option<ObjectInfo>,
     /// whether this version is a delete marker (observability only)
     pub is_delete_marker: bool,
 }
@@ -63,6 +68,7 @@ struct HealWalkCollector {
     bucket: String,
     batch_objects: usize,
     version_budget: usize,
+    include_lifecycle_object_info: bool,
     objects: Mutex<Vec<HealWalkObject>>,
     decode_error: Mutex<Option<DiskError>>,
     version_total: AtomicUsize,
@@ -116,10 +122,25 @@ impl HealWalkCollector {
 
         let mut versions = Vec::with_capacity(fiv.versions.len() + fiv.free_versions.len());
         for fi in fiv.versions.iter().chain(fiv.free_versions.iter()) {
+            let version_uuid = fi.version_id.filter(|version_id| !version_id.is_nil());
+            let lifecycle_object_info = if self.include_lifecycle_object_info {
+                let mut lifecycle_fi = fi.clone();
+                lifecycle_fi.version_id = version_uuid;
+                Some(ObjectInfo::from_file_info(
+                    &lifecycle_fi,
+                    &self.bucket,
+                    &entry.name,
+                    version_uuid.is_some(),
+                ))
+            } else {
+                None
+            };
             versions.push(HealWalkVersion {
                 name: entry.name.clone(),
                 // Normalize: nil/absent version id => None.
-                version_id: fi.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string()),
+                version_id: version_uuid.map(|u| u.to_string()),
+                mod_time_unix_nanos: fi.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos()),
+                lifecycle_object_info,
                 is_delete_marker: fi.deleted,
             });
         }
@@ -173,11 +194,26 @@ impl HealWalkCollector {
                 }
             };
             for fi in fiv.versions.iter().chain(fiv.free_versions.iter()) {
-                let vid = fi.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string());
+                let version_uuid = fi.version_id.filter(|version_id| !version_id.is_nil());
+                let vid = version_uuid.map(|u| u.to_string());
                 if seen.insert(vid.clone()) {
+                    let lifecycle_object_info = if self.include_lifecycle_object_info {
+                        let mut lifecycle_fi = fi.clone();
+                        lifecycle_fi.version_id = version_uuid;
+                        Some(ObjectInfo::from_file_info(
+                            &lifecycle_fi,
+                            &self.bucket,
+                            &entry.name,
+                            version_uuid.is_some(),
+                        ))
+                    } else {
+                        None
+                    };
                     versions.push(HealWalkVersion {
                         name: entry.name.clone(),
                         version_id: vid,
+                        mod_time_unix_nanos: fi.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos()),
+                        lifecycle_object_info,
                         is_delete_marker: fi.deleted,
                     });
                 }
@@ -255,6 +291,7 @@ impl SetDisks {
         forward_to: Option<&str>,
         batch_objects: usize,
         version_budget: usize,
+        include_lifecycle_object_info: bool,
     ) -> disk::error::Result<(Vec<HealWalkVersion>, Option<String>, bool)> {
         assert!(batch_objects >= 2, "heal_walk_versions_page requires batch_objects >= 2");
 
@@ -264,6 +301,7 @@ impl SetDisks {
             bucket: bucket.to_string(),
             batch_objects,
             version_budget: version_budget.max(1),
+            include_lifecycle_object_info,
             objects: Mutex::new(Vec::new()),
             decode_error: Mutex::new(None),
             version_total: AtomicUsize::new(0),
@@ -347,6 +385,7 @@ mod tests {
             bucket: "bucket".to_string(),
             batch_objects: 2,
             version_budget: 2,
+            include_lifecycle_object_info: false,
             objects: Mutex::new(Vec::new()),
             decode_error: Mutex::new(None),
             version_total: AtomicUsize::new(0),
@@ -388,6 +427,8 @@ mod tests {
         HealWalkVersion {
             name: name.to_string(),
             version_id: Some(id.to_string()),
+            mod_time_unix_nanos: None,
+            lifecycle_object_info: None,
             is_delete_marker: dm,
         }
     }
@@ -491,6 +532,7 @@ mod tests {
             bucket: "bucket".to_string(),
             batch_objects: 1000,
             version_budget: 10_000,
+            include_lifecycle_object_info: false,
             objects: Mutex::new(Vec::new()),
             version_total: AtomicUsize::new(0),
             decode_error: Mutex::new(None),
@@ -567,7 +609,7 @@ mod tests {
         .expect("corrupt test metadata should be written");
 
         let error = set_disks
-            .heal_walk_versions_page(bucket, "", None, 2, 2)
+            .heal_walk_versions_page(bucket, "", None, 2, 2, false)
             .await
             .expect_err("semantic metadata corruption must fail the heal disk walk");
 

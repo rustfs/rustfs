@@ -571,8 +571,12 @@ async fn execute_heal_control_envelope_with_manager(
                 admission: receipt.result.into(),
             }
         }
-        rustfs_protos::heal_control::ExecutableCommand::Query { heal_path, client_token } => {
-            let response = timeout(remaining, processor.execute_query_request(heal_path, client_token))
+        rustfs_protos::heal_control::ExecutableCommand::Query {
+            heal_path,
+            client_token,
+            since_seq,
+        } => {
+            let response = timeout(remaining, processor.execute_query_request_since(heal_path, client_token, since_seq))
                 .await
                 .map_err(|_| Status::deadline_exceeded("heal control query expired before execution"))?
                 .map_err(|_| Status::internal("heal control query failed"))?;
@@ -2202,7 +2206,7 @@ mod tests {
         previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
-    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo, HealEndpoint};
+    use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,
@@ -2330,40 +2334,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
-        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
-            Ok(true)
-        }
-
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
-            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
-        }
-
-        async fn format_disk(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<()> {
-            Ok(())
-        }
-
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<HealBucketInfo>> {
             Ok(None)
-        }
-
-        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
-            Ok(())
         }
 
         async fn list_buckets(&self) -> rustfs_heal::Result<Vec<HealBucketInfo>> {
@@ -2372,14 +2348,6 @@ mod tests {
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
             Ok(false)
-        }
-
-        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
-            Ok(None)
-        }
-
-        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
-            Ok(None)
         }
 
         async fn heal_object(
@@ -2407,19 +2375,12 @@ mod tests {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(
-            &self,
-            _bucket: &str,
-            _prefix: &str,
-        ) -> rustfs_heal::Result<Vec<rustfs_heal::heal::storage::HealListItem>> {
-            Ok(Vec::new())
-        }
-
         async fn list_objects_for_heal_page(
             &self,
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
+            _include_lifecycle_object_info: bool,
         ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
@@ -2516,6 +2477,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token.clone(),
+            None,
         )
         .unwrap();
         let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
@@ -2554,6 +2516,7 @@ mod tests {
             metadata(),
             "bucket/prefix".to_string(),
             canonical_token,
+            None,
         )
         .unwrap();
         let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))

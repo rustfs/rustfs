@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[allow(dead_code)]
 pub fn is_simple_match<P, N>(pattern: P, name: N) -> bool
 where
     P: AsRef<str>,
@@ -29,7 +28,10 @@ where
     inner_match(pattern, name, false)
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "prefix-matcher asserted by this file's tests; no production caller yet (backlog#1823)"
+)]
 pub fn is_match_as_pattern_prefix<P, N>(pattern: P, text: N) -> bool
 where
     P: AsRef<str>,

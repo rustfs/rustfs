@@ -1199,7 +1199,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_expiration_days() {
         // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and
         // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
@@ -1233,7 +1232,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1263,7 +1261,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_positive_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1290,7 +1287,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_one_day_boundary_values() {
         // Pin the exact >= 1 boundary: a value of 1 is the smallest legal positive
         // integer and must be accepted for every day-count field tightened for S3
@@ -1325,7 +1321,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn has_active_rules_accepts_zero_day_expiration() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1350,7 +1345,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_noncurrent_expiration_days() {
         // S3 compatibility: NoncurrentVersionExpiration.NoncurrentDays must be a positive
         // integer (>= 1); AWS rejects 0 with InvalidArgument.
@@ -1382,7 +1376,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_noncurrent_expiration_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1412,7 +1405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_abort_incomplete_multipart_upload_only_rule() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1438,7 +1430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_abort_incomplete_multipart_upload_days() {
         // S3 compatibility: AbortIncompleteMultipartUpload.DaysAfterInitiation must be a
         // positive integer (>= 1); AWS rejects 0 with InvalidArgument.
@@ -1469,7 +1460,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_missing_abort_incomplete_multipart_upload_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1495,7 +1485,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_negative_abort_incomplete_multipart_upload_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1556,7 +1545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_non_midnight_expiration_date() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1638,7 +1626,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_accepts_multiple_rules_without_ids() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1682,7 +1669,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_rule_id_too_long() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1709,7 +1695,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_duplicate_rule_ids() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1752,7 +1737,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_transition_without_storage_class() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1780,7 +1764,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_transition_without_date_or_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1808,7 +1791,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_noncurrent_transition_without_days() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -2365,7 +2347,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn noncurrent_versions_expiration_limit_returns_configured_limits() {
         let lc = Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -2456,7 +2437,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_invalid_status_case_sensitive() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -2483,7 +2463,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_prefix() {
         let filter = LifecycleRuleFilter {
             prefix: Some("prefix".to_string()),
@@ -2528,7 +2507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_and_prefix() {
         let and = s3s::dto::LifecycleRuleAndOperator {
             prefix: Some("prefix".to_string()),
@@ -2578,7 +2556,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_tag() {
         let filter = LifecycleRuleFilter {
             tag: Some(s3s::dto::Tag {
@@ -2632,7 +2609,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn filter_rules_respects_filter_and_tags() {
         let filter = LifecycleRuleFilter {
             and: Some(s3s::dto::LifecycleRuleAndOperator {
@@ -3086,7 +3062,6 @@ mod tests {
     // --- TASK-002 tests: Object Lock + ExpiredObjectDeleteMarker compatibility ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_delete_marker_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3118,7 +3093,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_delete_marker_on_unlocked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3146,7 +3120,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_non_delete_marker_expiration_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3179,7 +3152,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_del_marker_expiration_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3210,7 +3182,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_zero_day_del_marker_expiration_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3594,7 +3565,6 @@ mod tests {
     // --- TASK-007 tests: Legacy Prefix/Filter conflict ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_prefix_and_filter_both_present() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3623,7 +3593,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_prefix_without_filter() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3650,7 +3619,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_filter_without_prefix() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3680,7 +3648,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_empty_prefix_with_filter() {
         // Empty prefix should be treated as "not set"
         let lc = BucketLifecycleConfiguration {
@@ -3713,7 +3680,6 @@ mod tests {
     // --- TASK-004 tests: ExpiredObjectAllVersions ---
 
     #[tokio::test]
-    #[serial]
     async fn validate_rejects_expired_object_all_versions_on_locked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3745,7 +3711,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn validate_allows_expired_object_all_versions_on_unlocked_bucket() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,

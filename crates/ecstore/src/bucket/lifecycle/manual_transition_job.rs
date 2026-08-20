@@ -759,6 +759,10 @@ pub struct ManualTransitionWorkerResultRecord {
 }
 
 impl ManualTransitionWorkerResultRecord {
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+    )]
     pub fn new(job_id: Uuid, task_key: impl Into<String>, result: ManualTransitionWorkerResult) -> Self {
         Self::new_with_reason(job_id, task_key, result, None)
     }
@@ -1257,6 +1261,10 @@ pub(crate) async fn save_manual_transition_task_if_absent(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn load_manual_transition_task_record(
     api: Arc<ECStore>,
     job_id: Uuid,
@@ -1320,6 +1328,10 @@ async fn scan_manual_transition_task_journal(api: Arc<ECStore>, job_id: Uuid) ->
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn load_manual_transition_worker_result_stats(
     api: Arc<ECStore>,
     job_id: Uuid,
@@ -1455,6 +1467,10 @@ async fn scan_manual_transition_worker_result_journal(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn reconcile_manual_transition_worker_results(
     api: Arc<ECStore>,
     job_id: Uuid,

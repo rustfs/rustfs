@@ -28,8 +28,15 @@ called helper. Known false-positive classes are excluded up front:
   parameters; the assert lives in the shared body — still scanned, but a
   body that asserts is not flagged anyway; the exclusion covers wrappers
   that only delegate to a suite runner).
-- Functions whose body calls a helper with `assert`, `verify`, `check`,
-  `expect`, `run_` or `_case` in its name (suite-delegation pattern).
+- Functions whose body calls a helper *named* like a shared check or suite
+  runner: an `assert_`/`verify_`/`check_`/`expect_`/`ensure_`/`run_` prefix,
+  or a `_case`/`_cases`/`_harness`/`_roundtrip` suffix. The name must carry
+  the token as its own leading or trailing segment — matching it anywhere
+  inside the identifier hid whole test bodies behind an unrelated domain
+  call such as `record_get_object_bitrot_verify_duration(..)`.
+- Functions whose body only defines an unused inner `fn _name(..)`: that is
+  the compile-time shape check (exhaustive match, signature pin), where the
+  type system is the assertion.
 
 Usage:
     scripts/find_assertless_tests.py [path ...]     # default: crates rustfs/src
@@ -42,13 +49,117 @@ import sys
 from pathlib import Path
 
 VERIFY_SIGNALS = re.compile(
-    r"assert!|assert_eq!|assert_ne!|debug_assert|panic!\(|\.expect\(|\.unwrap\(|"
+    r"assert[a-z0-9_]*!|debug_assert|panic!\(|\.expect\(|\.unwrap\(|"
     r"unreachable!|matches!\(|insta::|proptest!|\.await\?|\)\?|\?;|should_panic"
 )
-DELEGATION = re.compile(r"\b[a-z0-9_]*(?:assert|verify|check|expect|run_case|_case|harness|round_trip|roundtrip)[a-z0-9_]*\s*\(")
+DELEGATION = re.compile(
+    r"\b(?:assert|verify|check|expect|ensure|run)_[a-z0-9_]*(?:::<[^>]*>)?\s*\(|"
+    r"\b[a-z0-9_]+_(?:case|cases|harness|roundtrip|round_trip)(?:::<[^>]*>)?\s*\("
+)
+
+# A body whose whole content is one call delegates by construction, whatever the
+# callee is named: `run(DurabilityMode::Strict).await` and
+# `aborting_encode_drops_blocked_producer(EncodePipeline::Vec).await` both hand
+# every assertion to a shared harness.
+SINGLE_CALL_BODY = re.compile(
+    r"\A\s*[a-zA-Z_][a-zA-Z0-9_:]*(?:::<[^>]*>)?\s*\([^;]*\)\s*(?:\.await\s*)?;?\s*\Z",
+    re.S,
+)
+
+# A nested `fn` that is only bound and discarded is a signature guard: the type
+# system is the assertion, exactly like the `fn _name()` form below.
+SIGNATURE_GUARD = re.compile(r"\bfn\s+[a-zA-Z0-9_]+\s*(?:<[^>]*>)?\s*\([^;]*\)[^;]*\{", re.S)
+DISCARDED_BINDING = re.compile(r"\blet\s+_\s*=\s*[a-zA-Z_][a-zA-Z0-9_]*\s*;")
+# `let _ = Type::<T>::method;` — a path item referenced but never called can only
+# be a signature guard; the call form (`let _ = x.foo();`) is excluded by the
+# absence of parens before the semicolon.
+DISCARDED_PATH_ITEM = re.compile(r"\blet\s+_\s*=\s*[a-zA-Z_][a-zA-Z0-9_]*(?:::(?:<[^>]*>|[a-zA-Z_][a-zA-Z0-9_]*))+\s*;")
+COMPILE_TIME_CHECK = re.compile(r"\bfn\s+_[a-zA-Z0-9_]*\s*(?:<[^>]*>)?\s*\(")
 TEST_ATTR = re.compile(r"#\[(?:tokio::)?test[\](]")
 TEST_CASE_ATTR = re.compile(r"#\[test_case")
 FN_LINE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)")
+
+
+
+# A char literal is 'x' or '\n'; a lone `'` is a lifetime (`&'a str`), and
+# consuming to the next quote on one would swallow the rest of the line.
+CHAR_LITERAL = re.compile(r"'(?:[^'\\]|\\.)'")
+RAW_STRING_OPEN = re.compile(r'r(#*)"')
+
+
+class LiteralStripper:
+    """Blanks out literals and comments so brace matching sees only code.
+
+    Carries state across lines: Rust string literals — the JSON and `r#"..."#`
+    fixtures these tests are full of — routinely span lines, and a per-line
+    scanner falls out of phase on the first one. A `{` inside a string would
+    otherwise unbalance the count and truncate a test body before its
+    assertions.
+    """
+
+    def __init__(self) -> None:
+        self.in_string = False
+        self.raw_hashes = None  # None when the open string is not raw
+
+    def feed(self, line: str) -> str:
+        out = []
+        i = 0
+        n = len(line)
+        while i < n:
+            if self.in_string:
+                if self.raw_hashes is not None:
+                    close = '"' + "#" * self.raw_hashes
+                    idx = line.find(close, i)
+                    if idx == -1:
+                        return "".join(out)
+                    i = idx + len(close)
+                    self.in_string = False
+                    self.raw_hashes = None
+                    continue
+                if line[i] == "\\":
+                    i += 2
+                    continue
+                if line[i] == '"':
+                    self.in_string = False
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            ch = line[i]
+            if ch == "/" and i + 1 < n and line[i + 1] == "/":
+                break
+            m = RAW_STRING_OPEN.match(line, i)
+            if m:
+                self.in_string = True
+                self.raw_hashes = len(m.group(1))
+                i = m.end()
+                continue
+            if ch == '"':
+                self.in_string = True
+                self.raw_hashes = None
+                i += 1
+                continue
+            if ch == "'":
+                cm = CHAR_LITERAL.match(line, i)
+                if cm:
+                    i = cm.end()
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+
+def extract_body(text: str) -> str:
+    """Return what is between the outermost braces of a scanned function."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return text
+    return text[start + 1 : end]
 
 
 def scan_file(path: Path):
@@ -82,8 +193,9 @@ def scan_file(path: Path):
         begun = False
         body = []
         k = j
+        stripper = LiteralStripper()
         while k < len(lines):
-            for ch in lines[k]:
+            for ch in stripper.feed(lines[k]):
                 if ch == "{":
                     depth += 1
                     begun = True
@@ -94,7 +206,17 @@ def scan_file(path: Path):
                 break
             k += 1
         text = "\n".join(body)
-        if not VERIFY_SIGNALS.search(text) and not DELEGATION.search(text):
+        # The attribute block carries verification too: `#[should_panic(expected
+        # = "...")]` makes the panic message the assertion.
+        attr_text = "\n".join(attrs)
+        inner = extract_body(text)
+        delegates = (
+            DELEGATION.search(text)
+            or SINGLE_CALL_BODY.match(inner)
+            or (SIGNATURE_GUARD.search(inner) and DISCARDED_BINDING.search(inner))
+            or DISCARDED_PATH_ITEM.search(inner)
+        )
+        if not VERIFY_SIGNALS.search(text) and not VERIFY_SIGNALS.search(attr_text) and not delegates and not COMPILE_TIME_CHECK.search(text):
             print(f"{path}:{j + 1}: {name}")
         i = k + 1
 

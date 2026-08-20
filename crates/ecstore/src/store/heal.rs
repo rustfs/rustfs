@@ -18,6 +18,7 @@ use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
+const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
 
@@ -256,13 +257,40 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
-        let _ = (bucket, object, opts);
-        // Stale multipart reconciliation is already owned by the lifecycle-driven
-        // background cleanup path in `bucket_lifecycle_ops.rs`. There is currently
-        // no stable object-heal contract that should fan this request out through
-        // pool/set storage layers, so keep the placeholder explicit at the ECStore
-        // boundary instead of dispatching into lower layers.
-        Err(StorageError::NotImplemented)
+        let object = encode_dir_object(object);
+        let pools = self.get_pools_for_heal_object(opts)?;
+
+        let mut futures = Vec::with_capacity(pools.len());
+        for pool in pools.iter() {
+            futures.push(pool.check_abandoned_parts(bucket, &object, opts));
+        }
+
+        let mut first_error = None;
+        for result in join_all(futures).await {
+            if let Err(err) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        trace!(
+            event = EVENT_HEAL_ABANDONED_PARTS,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_HEAL,
+            state = "completed",
+            result = "ok",
+            bucket,
+            object,
+            dry_run = opts.dry_run,
+            "Heal abandoned parts completed"
+        );
+
+        Ok(())
     }
 }
 

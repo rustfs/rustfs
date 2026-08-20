@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
+use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use jiff::Timestamp;
 use rmp_serde::Deserializer;
@@ -585,6 +585,7 @@ mod tests {
         let decoded = decode_node_heal_status(&encoded).expect("fixed v1 fixture should decode");
         assert_eq!(decoded.info().bitrot_start_cycle, 9);
         assert_eq!(decoded.operations.queue_length, 2);
+        assert_eq!(decoded.operations.queued_by_source.mrf, 0);
     }
 
     #[test]

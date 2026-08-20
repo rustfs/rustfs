@@ -18,13 +18,11 @@
 //! completely inert with default configuration.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
-use serial_test::serial;
 use tracing::info;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
-#[serial]
 async fn api_rate_limit_enforces_429_with_retry_after_when_enabled() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -87,7 +85,6 @@ async fn api_rate_limit_enforces_429_with_retry_after_when_enabled() -> TestResu
 }
 
 #[tokio::test]
-#[serial]
 async fn api_rate_limit_bucket_dimension_throttles_per_bucket() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
@@ -133,7 +130,6 @@ async fn api_rate_limit_bucket_dimension_throttles_per_bucket() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn api_rate_limit_stays_inert_by_default() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
