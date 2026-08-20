@@ -1018,7 +1018,7 @@ fn pending_heal(
         object: object.map(ToOwned::to_owned),
         version_id: version_id.map(ToOwned::to_owned),
         scan_mode: HealScanMode::Deep,
-        first_seen: 1,
+        first_seen: FolderScanner::now_secs(),
         last_attempt,
         attempts,
         last_admission_result: "full".to_string(),
@@ -1153,6 +1153,52 @@ fn test_pending_heal_retry_candidates_respect_cap_and_order() {
     assert_eq!(candidates.len(), MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET);
     assert_eq!(candidates.first().and_then(|entry| entry.object.as_deref()), Some("object-000"));
     assert_eq!(candidates.last().and_then(|entry| entry.object.as_deref()), Some("object-127"));
+}
+
+#[tokio::test]
+async fn test_pending_heal_prune_expires_stale_entries() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("stale"), None, 1, 1);
+    stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
+    let fresh = pending_heal(PendingScannerHealKind::Object, "bucket", Some("fresh"), None, 1, 1);
+    scanner.new_cache.info.pending_heals = vec![stale, fresh];
+
+    scanner.prune_pending_scanner_heals();
+
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("fresh"));
+    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
+    assert!(scanner.pending_heals_changed);
+}
+
+#[tokio::test]
+async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("object"), None, 1, 1);
+    stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
+    scanner.new_cache.info.pending_heals = vec![stale];
+
+    scanner.update_pending_scanner_heal_after_admission(
+        PendingScannerHealKind::Object,
+        "bucket",
+        Some("object"),
+        None,
+        HealScanMode::Deep,
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
+    );
+
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 2);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("object"));
+    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
 
 #[tokio::test]

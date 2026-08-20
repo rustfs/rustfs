@@ -84,6 +84,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         heal_queue: &manager.heal_queue,
         active_heals: &manager.active_heals,
         completed_heals: &manager.completed_heals,
+        task_aliases: &manager.task_aliases,
         retrying_heals: &manager.retrying_heals,
         replacement_recovery_anchors: &manager.replacement_recovery_anchors,
         config: &manager.config,
@@ -837,6 +838,46 @@ async fn test_admin_duplicate_receipt_returns_canonical_task_without_alias() {
     assert_eq!(accepted.task_id, original_id);
     assert_eq!(merged.result, HealAdmissionResult::Merged);
     assert_eq!(merged.task_id, original_id);
+    assert_eq!(manager.canonical_task_id(&duplicate_id).await, duplicate_id);
+}
+
+#[tokio::test]
+async fn test_task_alias_is_removed_after_terminal_completion() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+    let original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    let original_id = original.id.clone();
+    let duplicate = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    let duplicate_id = duplicate.id.clone();
+
+    assert_eq!(
+        manager
+            .submit_heal_request(original)
+            .await
+            .expect("first request should be accepted"),
+        HealAdmissionResult::Accepted
+    );
+    assert_eq!(
+        manager
+            .submit_heal_request(duplicate)
+            .await
+            .expect("duplicate request should merge"),
+        HealAdmissionResult::Merged
+    );
+    assert_eq!(manager.canonical_task_id(&duplicate_id).await, original_id);
+
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(manager.get_task_status(&original_id).await, Ok(HealTaskStatus::Completed)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("task should complete promptly");
+
     assert_eq!(manager.canonical_task_id(&duplicate_id).await, duplicate_id);
 }
 

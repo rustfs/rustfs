@@ -21,6 +21,7 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let completed_heals = self.completed_heals.clone();
+        let task_aliases = self.task_aliases.clone();
         let retrying_heals = self.retrying_heals.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let cancel_token = self.cancel_token.clone();
@@ -51,6 +52,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
@@ -67,6 +69,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
@@ -92,6 +95,7 @@ impl HealManager {
             heal_queue,
             active_heals,
             completed_heals,
+            task_aliases,
             retrying_heals,
             replacement_recovery_anchors,
             config,
@@ -175,6 +179,7 @@ impl HealManager {
                 let active_heals_clone = active_heals.clone();
                 let heal_queue_clone = heal_queue.clone();
                 let completed_heals_clone = completed_heals.clone();
+                let task_aliases_clone = task_aliases.clone();
                 let retrying_heals_clone = retrying_heals.clone();
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
                 let statistics_clone = statistics.clone();
@@ -295,6 +300,7 @@ impl HealManager {
                         } else {
                             completed_task.get_status().await
                         };
+                        let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
                         let completed_progress = completed_task.get_progress().await;
                         // Single snapshot of the retained window: the task is
                         // finished and already off the active map, so there is
@@ -326,6 +332,13 @@ impl HealManager {
                             }
                         }
                         stats.update_running_tasks(usize_to_u64_saturated(active_count));
+                        drop(stats);
+                        if terminal_completion {
+                            task_aliases_clone
+                                .lock()
+                                .await
+                                .retain(|alias_id, alias| alias_id != &task_id && alias.task_id != task_id);
+                        }
                     }
 
                     if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =

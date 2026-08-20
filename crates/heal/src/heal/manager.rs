@@ -294,7 +294,7 @@ fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
     matches!(status, HealTaskStatus::Retrying { .. })
 }
 
-fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
+fn retry_budget_for_result(task: &HealTask, result: &Result<()>) -> Option<(Duration, String)> {
     let Err(err) = result else {
         return None;
     };
@@ -310,14 +310,35 @@ fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(Hea
         return None;
     }
 
-    let request = task.retry_request();
-    let delay = recoverable_heal_retry_delay(request.retry_attempts);
-    Some((request, delay, error))
+    let retry_attempt = task.retry_attempts.saturating_add(1);
+    let delay = recoverable_heal_retry_delay(retry_attempt);
+    Some((delay, error))
+}
+
+#[cfg(test)]
+fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
+    let (delay, error) = retry_budget_for_result(task, result)?;
+    Some((task.retry_request(), delay, error))
 }
 
 async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
-    let (_, delay, error) = retry_request_for_result(task, result)?;
-    let request = task.retry_request_with_remaining_timeout().await.ok()?;
+    let (delay, error) = retry_budget_for_result(task, result)?;
+    let request = match task.retry_request_with_remaining_timeout().await {
+        Ok(request) => request,
+        Err(err) => {
+            debug!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                task_id = %task.id,
+                error = %err,
+                result = "retry_budget_exhausted",
+                "Heal retry admission decided"
+            );
+            return None;
+        }
+    };
     Some((request, delay, error))
 }
 
@@ -593,6 +614,7 @@ struct HealQueueContext<'a> {
     heal_queue: &'a Arc<Mutex<PriorityHealQueue>>,
     active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     completed_heals: &'a Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
+    task_aliases: &'a Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
     replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     config: &'a Arc<RwLock<HealConfig>>,
@@ -899,7 +921,9 @@ impl HealManager {
             QueuePushOutcome::Accepted => {
                 publish_heal_queue_length(queue);
                 Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
-                if matches!(priority, HealPriority::High | HealPriority::Urgent) {
+                if matches!(priority, HealPriority::High | HealPriority::Urgent)
+                    && tracing::enabled!(target: "rustfs::heal::manager", tracing::Level::DEBUG)
+                {
                     let stats = queue.get_priority_stats();
                     debug!(
                         target: "rustfs::heal::manager",
