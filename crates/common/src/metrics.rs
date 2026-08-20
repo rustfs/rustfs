@@ -729,7 +729,7 @@ fn timestamp_elapsed_seconds_since(now: Timestamp, earlier: Timestamp) -> u64 {
         return 0;
     }
 
-    u64::try_from(duration.as_secs()).map_or(u64::MAX, |seconds| seconds)
+    u64::try_from(duration.as_secs()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Default)]

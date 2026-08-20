@@ -214,7 +214,7 @@ async fn head_object_for_worker(
     target_bucket: &str,
     object: &str,
     version_id: Option<String>,
-) -> std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+) -> std::result::Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>> {
     target_client.head_object(target_bucket, object, version_id).await
 }
 
@@ -233,7 +233,7 @@ async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetCli
 async fn head_object_fallback(
     tgt_client: &TargetClient,
     object: &str,
-) -> std::result::Result<Option<HeadObjectOutput>, SdkError<HeadObjectError>> {
+) -> std::result::Result<Option<HeadObjectOutput>, Box<SdkError<HeadObjectError>>> {
     match head_object_for_worker(tgt_client, &tgt_client.bucket, object, None).await {
         Ok(oi) => Ok(Some(oi)),
         Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
@@ -1152,11 +1152,11 @@ fn spawn_resync_walk_task<S: ReplicationStorage>(
 /// updating the per-object status counters and returning the accounted size
 /// together with any verification error.
 async fn verify_resync_head_result(
-    head_result: std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>>,
+    head_result: std::result::Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>>,
     roi: &ReplicateObjectInfo,
     st: &mut TargetReplicationResyncStatus,
     target_client: &Arc<TargetClient>,
-) -> (i64, Option<SdkError<HeadObjectError>>) {
+) -> (i64, Option<Box<SdkError<HeadObjectError>>>) {
     match head_result {
         Ok(_) => {
             st.replicated_count += 1;
@@ -1275,7 +1275,7 @@ async fn resync_worker_process_object<S: ReplicationStorage>(
             "Processed resync object"
         );
     }
-    st.error = err.as_ref().and_then(resync_target_error_detail);
+    st.error = err.as_ref().and_then(|err| resync_target_error_detail(err));
 
     st
 }
@@ -2467,7 +2467,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             Ok(_) => {}
             Err(e) => {
                 let non_retryable = matches!(
-                    &e,
+                    &*e,
                     SdkError::ServiceError(service_err)
                         if is_retryable_delete_replication_head_error(
                             service_err.err().is_not_found(),

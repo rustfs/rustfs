@@ -1322,7 +1322,12 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let object_info = prepared_object_info
             .unwrap_or_else(|| build_get_object_info(fi, bucket, object, opts.versioned || opts.version_suspended));
         let object_class = classify_get_codec_streaming_object_class(&range, &object_info, fi);
-        let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
+        let metrics_size = if stage_metrics_enabled {
+            object_info.get_actual_size().unwrap_or(object_info.size)
+        } else {
+            object_info.size
+        };
+        let size_bucket = rustfs_io_metrics::get_object_size_bucket(metrics_size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
         let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
         rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
@@ -3766,7 +3771,7 @@ pub(crate) async fn complete_transition_upload<Remote, Producer>(
     producer: Producer,
     expected_size: u64,
     consumed: Arc<AtomicU64>,
-) -> std::result::Result<TransitionUploadCompletion, TransitionUploadFailure>
+) -> std::result::Result<TransitionUploadCompletion, Box<TransitionUploadFailure>>
 where
     Remote: Future<Output = std::result::Result<String, std::io::Error>>,
     Producer: Future<Output = Result<u64>>,
@@ -3784,23 +3789,23 @@ where
                 Err(_) => StorageError::Unexpected,
                 Ok(Ok(_)) => StorageError::Io(remote_error),
             };
-            return Err(TransitionUploadFailure { error, candidate: None });
+            return Err(Box::new(TransitionUploadFailure { error, candidate: None }));
         }
     };
     let candidate = TransitionUploadCandidate::from_put_response(remote_version);
     let produced = match producer_result {
         Ok(Ok(produced)) => produced,
         Ok(Err(error)) => {
-            return Err(TransitionUploadFailure {
+            return Err(Box::new(TransitionUploadFailure {
                 error,
                 candidate: Some(candidate),
-            });
+            }));
         }
         Err(_) => {
-            return Err(TransitionUploadFailure {
+            return Err(Box::new(TransitionUploadFailure {
                 error: StorageError::Unexpected,
                 candidate: Some(candidate),
-            });
+            }));
         }
     };
     let consumed = consumed.load(Ordering::Acquire);
@@ -3810,10 +3815,10 @@ where
         } else {
             StorageError::MoreData
         };
-        return Err(TransitionUploadFailure {
+        return Err(Box::new(TransitionUploadFailure {
             error,
             candidate: Some(candidate),
-        });
+        }));
     }
     Ok(TransitionUploadCompletion {
         candidate,
@@ -7284,7 +7289,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             let gr = gr?;
             let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
+            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, oi.get_actual_size()?, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
             return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
                 Ok(restored_info) => {
@@ -8826,7 +8831,7 @@ mod transition_commit_failure_tests {
     use s3s::dto::RestoreRequest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
+    pub(super) fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         rustfs_utils::http::metadata_compat::insert_str(
             &mut metadata,
@@ -8836,7 +8841,7 @@ mod transition_commit_failure_tests {
         metadata
     }
 
-    fn restore_metadata(operation_id: Uuid, ongoing: bool) -> HashMap<String, String> {
+    pub(super) fn restore_metadata(operation_id: Uuid, ongoing: bool) -> HashMap<String, String> {
         let mut metadata = restore_operation_id_metadata(operation_id);
         metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
         metadata
@@ -10097,6 +10102,51 @@ mod transition_commit_failure_tests {
             .await
             .expect("operation B should replace operation A before final commit");
 
+        let mismatch = set_disks
+            .finalize_restore_metadata(
+                bucket,
+                object,
+                &set_disks
+                    .get_object_info(bucket, object, &ObjectOptions::default())
+                    .await
+                    .expect("operation B metadata should be readable"),
+                &ObjectOptions {
+                    user_defined: restore_operation_id_metadata(operation_a),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("operation A must not finalize operation B metadata");
+        assert!(matches!(
+            mismatch,
+            Error::Io(ref error)
+                if error.kind() == std::io::ErrorKind::Other
+                    && error.to_string() == "restore operation id changed before metadata finalization"
+        ));
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain after mismatched finalization");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "mismatched finalization must not remove operation B"
+        );
+        assert!(
+            parse_restore_obj_status(
+                current
+                    .user_defined
+                    .get(s3s::header::X_AMZ_RESTORE.as_str())
+                    .expect("operation B restore header should remain pending"),
+            )
+            .expect("operation B restore header should parse")
+            .on_going(),
+            "mismatched finalization must not publish restore completion"
+        );
+
         let mut stale_restore_reader = PutObjReader::from_vec(b"stale A restored body".repeat(1024));
         let result = set_disks
             .put_object(
@@ -10126,18 +10176,37 @@ mod transition_commit_failure_tests {
 
         let mut matching_restore_reader = PutObjReader::from_vec(b"matching B restored body".repeat(1024));
         let operation_b_restore_metadata = restore_metadata(operation_b, false);
-        set_disks
+        let restored = set_disks
             .put_object(
                 bucket,
                 object,
                 &mut matching_restore_reader,
                 &ObjectOptions {
-                    user_defined: operation_b_restore_metadata,
+                    user_defined: operation_b_restore_metadata.clone(),
                     ..Default::default()
                 },
             )
             .await
             .expect("matching operation B should be allowed to commit");
+        set_disks
+            .finalize_restore_metadata(
+                bucket,
+                object,
+                &restored,
+                &ObjectOptions {
+                    user_defined: restore_operation_id_metadata(operation_b),
+                    transition: TransitionOptions {
+                        restore_request: RestoreRequest {
+                            days: Some(1),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B should finalize after its commit consumes the operation id");
         let restored = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
@@ -10503,13 +10572,16 @@ mod transition_commit_failure_tests {
 #[cfg(all(test, feature = "test-util"))]
 mod transition_upload_integrity_tests {
     use super::hermetic_set_disks_support::{hermetic_set_disks, hermetic_set_disks_with_lockers};
+    use super::transition_commit_failure_tests::{restore_metadata, restore_operation_id_metadata};
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
     use crate::layout::endpoints::SetupType;
     use crate::services::tier::test_util::register_mock_tier;
+    use crate::set_disk::replication::RestoreFinalizeBarrier;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use rustfs_filemeta::RestoreStatusOps as _;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats};
     use std::collections::HashSet;
@@ -10653,6 +10725,162 @@ mod transition_upload_integrity_tests {
         async fn is_local(&self) -> bool {
             false
         }
+    }
+
+    async fn write_committed_restore(
+        set_disks: &Arc<SetDisks>,
+        disk_stores: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        operation_id: Uuid,
+    ) -> ObjectInfo {
+        for disk in disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut source = PutObjReader::from_vec(b"restore source body".repeat(1024));
+        set_disks
+            .put_object(bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("pending restore metadata should be installed");
+
+        let mut restored_reader = PutObjReader::from_vec(b"restored body".repeat(1024));
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut restored_reader,
+                &ObjectOptions {
+                    user_defined: restore_metadata(operation_id, true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching restore commit should consume its operation id")
+    }
+
+    fn restore_finalize_options(operation_id: Uuid) -> ObjectOptions {
+        ObjectOptions {
+            user_defined: restore_operation_id_metadata(operation_id),
+            transition: TransitionOptions {
+                restore_request: s3s::dto::RestoreRequest {
+                    days: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("pending restore metadata should remain readable");
+        assert!(
+            restore_operation_id_from_metadata(current.user_defined.as_ref())
+                .expect("operation id metadata should parse")
+                .is_none(),
+            "successful restore commit must have consumed the operation id"
+        );
+        assert!(
+            rustfs_filemeta::parse_restore_obj_status(
+                current
+                    .user_defined
+                    .get(s3s::header::X_AMZ_RESTORE.as_str())
+                    .expect("pending restore header should remain"),
+            )
+            .expect("restore header should parse")
+            .on_going(),
+            "failed finalization must not publish completion metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn restore_finalize_rejects_acquired_lock_loss_after_commit() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "restore-finalize-acquired-lock-lost-bucket";
+        let object = "object.bin";
+        let operation_id = Uuid::new_v4();
+        let restored = write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = RestoreFinalizeBarrier::install(bucket, object);
+        let finalize_set = Arc::clone(&set_disks);
+        let finalize = tokio::spawn(async move {
+            finalize_set
+                .finalize_restore_metadata(bucket, object, &restored, &restore_finalize_options(operation_id))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(refresh_calls.load(Ordering::SeqCst) > 0, "restore finalization lock must attempt renewal");
+        barrier.release();
+
+        let error = finalize
+            .await
+            .expect("restore finalization task should join")
+            .expect_err("lost acquired lock must reject restore finalization");
+        assert!(matches!(
+            error,
+            Error::Io(ref error)
+                if error.kind() == std::io::ErrorKind::Other
+                    && error.to_string() == "restore finalization lock lost before metadata update"
+        ));
+        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_finalize_rejects_outer_fence_loss_after_metadata_read() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-finalize-outer-fence-lost-bucket";
+        let object = "object.bin";
+        let operation_id = Uuid::new_v4();
+        let restored = write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await;
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let barrier = RestoreFinalizeBarrier::install(bucket, object);
+        let finalize_set = Arc::clone(&set_disks);
+        let finalize = tokio::spawn(async move {
+            let mut opts = restore_finalize_options(operation_id);
+            opts.no_lock = true;
+            opts.namespace_lock_fence = Some(fence);
+            finalize_set.finalize_restore_metadata(bucket, object, &restored, &opts).await
+        });
+        barrier.wait_until_paused().await;
+        loss_handle.store(true, std::sync::atomic::Ordering::Release);
+        barrier.release();
+
+        let error = finalize
+            .await
+            .expect("restore finalization task should join")
+            .expect_err("lost outer fence must reject restore finalization");
+        assert!(matches!(
+            error,
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "restore_finalize_metadata",
+                required: 1,
+                achieved: 0,
+                ..
+            }
+        ));
+        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
     }
 
     async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {

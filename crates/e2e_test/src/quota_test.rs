@@ -169,6 +169,42 @@ impl QuotaTestEnv {
         bucket: &str,
         quota_bytes: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.wait_for_quota_usage_for(bucket).await?;
+
+        let quota_path = format!("/rustfs/admin/v3/quota/{bucket}");
+        let quota_config = serde_json::json!({
+            "quota": quota_bytes,
+            "quota_type": "HARD"
+        })
+        .to_string();
+        let readiness = async {
+            loop {
+                let (status, response) = admin_request(
+                    &self.env.url,
+                    Method::PUT,
+                    &quota_path,
+                    Some(quota_config.clone()),
+                    &self.env.access_key,
+                    &self.env.secret_key,
+                )
+                .await?;
+                if status.is_success() {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                if status != StatusCode::SERVICE_UNAVAILABLE {
+                    return Err(format!("failed to set quota for {bucket}: {status} {response}").into());
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        };
+        match timeout(Duration::from_secs(30), readiness).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("quota readiness did not converge for {bucket} within 30 seconds").into()),
+        }
+    }
+
+    pub async fn wait_for_quota_usage_for(&self, bucket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stats_path = format!("/rustfs/admin/v3/quota-stats/{bucket}");
         let readiness = async {
             loop {
@@ -181,28 +217,12 @@ impl QuotaTestEnv {
                 if status != StatusCode::SERVICE_UNAVAILABLE {
                     return Err(format!("quota usage readiness failed for {bucket}: {status} {response}").into());
                 }
-
                 sleep(Duration::from_secs(1)).await;
             }
         };
         match timeout(Duration::from_secs(30), readiness).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(format!("quota usage did not become authoritative for {bucket} within 30 seconds").into());
-            }
-        }
-
-        let url = format!("{}/rustfs/admin/v3/quota/{}", self.env.url, bucket);
-        let quota_config = serde_json::json!({
-            "quota": quota_bytes,
-            "quota_type": "HARD"
-        });
-
-        let response = awscurl_put(&url, &quota_config.to_string(), &self.env.access_key, &self.env.secret_key).await?;
-        if response.contains("error") {
-            Err(format!("Failed to set quota: {}", response).into())
-        } else {
-            Ok(())
+            Ok(result) => result,
+            Err(_) => Err(format!("quota usage did not become authoritative for {bucket} within 30 seconds").into()),
         }
     }
 
@@ -621,12 +641,7 @@ mod integration_tests {
         assert!(response.contains("quota") && response.contains("null"));
 
         // Test 2: PUT quota - valid config
-        let quota_config = serde_json::json!({
-            "quota": 1048576,
-            "quota_type": "HARD"
-        });
-        let response = awscurl_put(&url, &quota_config.to_string(), &env.env.access_key, &env.env.secret_key).await?;
-        assert!(response.contains("success") || !response.contains("error"));
+        env.set_bucket_quota(1048576).await?;
 
         // Test 3: GET quota after setting
         let response = awscurl_get(&url, &env.env.access_key, &env.env.secret_key).await?;

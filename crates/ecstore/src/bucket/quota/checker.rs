@@ -76,7 +76,12 @@ impl QuotaChecker {
 
         let current_usage = self.get_real_time_usage(bucket).await?;
 
-        let admission_size = if uses_durable_reservations { 0 } else { operation_size };
+        // The reporting path projects this operation; storage mutations reserve it at commit.
+        let admission_size = if uses_durable_reservations && !force_usage_calculation {
+            0
+        } else {
+            operation_size
+        };
         let expected_usage = match operation {
             QuotaOperation::PutObject | QuotaOperation::PostObject | QuotaOperation::CopyObject => {
                 current_usage.saturating_add(admission_size)

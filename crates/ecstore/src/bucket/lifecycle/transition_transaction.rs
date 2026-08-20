@@ -1016,7 +1016,7 @@ pub async fn recover_transition_transaction_records(
         return Err(Error::other("transition transaction recovery limit must be greater than zero"));
     }
 
-    let list_limit = i32::try_from(limit).map_or(i32::MAX, |value| value);
+    let list_limit = i32::try_from(limit).unwrap_or(i32::MAX);
     let list = api
         .clone()
         .list_objects_v2(

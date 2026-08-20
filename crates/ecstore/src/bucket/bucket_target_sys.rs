@@ -1968,7 +1968,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+    ) -> Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>> {
         // Announce the replication check so a RustFS target returns SSE-C
         // object metadata (etag/size) without the customer key the replication
         // worker cannot hold; otherwise SSE-C replicas never converge on HEAD.
@@ -1981,8 +1981,7 @@ impl TargetClient {
         // object with an identical ETag, and the worker concludes the object
         // already converged — so it never actually replicates it.
         insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "false");
-        match self
-            .client
+        self.client
             .head_object()
             .bucket(bucket)
             .key(object)
@@ -1999,10 +1998,7 @@ impl TargetClient {
             })
             .send()
             .await
-        {
-            Ok(res) => Ok(res),
-            Err(e) => Err(e),
-        }
+            .map_err(Box::new)
     }
 
     /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
@@ -2023,7 +2019,7 @@ impl TargetClient {
         range: Option<String>,
         part_number: Option<i32>,
         extra_headers: HeaderMap,
-    ) -> Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+    ) -> Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>> {
         let headers = proxy_outbound_headers(extra_headers);
         self.client
             .head_object()
@@ -2036,6 +2032,7 @@ impl TargetClient {
             .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
+            .map_err(Box::new)
     }
 
     /// GET used by the read-proxy path (MinIO `proxyGetToReplicationTarget`).
@@ -2051,7 +2048,7 @@ impl TargetClient {
         range: Option<String>,
         part_number: Option<i32>,
         extra_headers: HeaderMap,
-    ) -> Result<GetObjectOutput, SdkError<GetObjectError>> {
+    ) -> Result<GetObjectOutput, Box<SdkError<GetObjectError>>> {
         let headers = proxy_outbound_headers(extra_headers);
         self.client
             .get_object()
@@ -2064,6 +2061,7 @@ impl TargetClient {
             .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
+            .map_err(Box::new)
     }
 
     /// GetObjectTagging for the tagging read-proxy path
@@ -2073,7 +2071,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<GetObjectTaggingOutput, SdkError<GetObjectTaggingError>> {
+    ) -> Result<GetObjectTaggingOutput, Box<SdkError<GetObjectTaggingError>>> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .get_object_tagging()
@@ -2084,6 +2082,7 @@ impl TargetClient {
             .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
+            .map_err(Box::new)
     }
 
     /// PutObjectTagging for the tagging proxy path
@@ -2094,7 +2093,7 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
         tagging: SdkTagging,
-    ) -> Result<PutObjectTaggingOutput, SdkError<PutObjectTaggingError>> {
+    ) -> Result<PutObjectTaggingOutput, Box<SdkError<PutObjectTaggingError>>> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .put_object_tagging()
@@ -2106,6 +2105,7 @@ impl TargetClient {
             .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
+            .map_err(Box::new)
     }
 
     /// DeleteObjectTagging for the tagging proxy path
@@ -2115,7 +2115,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<DeleteObjectTaggingOutput, SdkError<DeleteObjectTaggingError>> {
+    ) -> Result<DeleteObjectTaggingOutput, Box<SdkError<DeleteObjectTaggingError>>> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .delete_object_tagging()
@@ -2126,6 +2126,7 @@ impl TargetClient {
             .map_request(move |req| apply_extra_headers(req, &headers))
             .send()
             .await
+            .map_err(Box::new)
     }
 
     /// On success returns the version id the target assigned (from
