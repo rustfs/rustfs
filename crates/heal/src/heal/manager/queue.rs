@@ -249,14 +249,6 @@ impl PriorityHealQueue {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn pop_runnable<F>(&mut self, can_run: F) -> Option<HealRequest>
-    where
-        F: Fn(&HealRequest) -> bool,
-    {
-        self.pop_runnable_with_skips(can_run, |_| None).0
-    }
-
     pub(super) fn pop_runnable_with_skips<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
     where
         F: Fn(&HealRequest) -> bool,
@@ -277,9 +269,7 @@ impl PriorityHealQueue {
             deferred.push(item);
         }
 
-        for item in deferred {
-            self.heap.push(item);
-        }
+        self.restore_deferred_items(deferred);
 
         (
             selected.map(|item| {
@@ -288,6 +278,23 @@ impl PriorityHealQueue {
             }),
             skipped,
         )
+    }
+
+    fn restore_deferred_items(&mut self, deferred: Vec<PriorityQueueItem>) {
+        if deferred.is_empty() {
+            return;
+        }
+
+        if deferred.len() > self.heap.len() / 2 {
+            let mut items = std::mem::take(&mut self.heap).into_vec();
+            items.reserve(deferred.len());
+            items.extend(deferred);
+            self.heap = BinaryHeap::from(items);
+        } else {
+            for item in deferred {
+                self.heap.push(item);
+            }
+        }
     }
 
     /// Create a deduplication key from a heal request
