@@ -427,6 +427,19 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
 
+/// Environment variable for the experimental PUT commit namespace lock acquire timeout in milliseconds.
+///
+/// A value of `0` disables the experiment and keeps
+/// `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` as the timeout. This only bounds the
+/// `put_object_commit` namespace write-lock wait and is intended for #925
+/// tail-drain admission experiments.
+///
+/// Default: 0 milliseconds (disabled).
+pub const ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS: &str = "RUSTFS_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS";
+
+/// Default: PUT commit namespace lock acquire timeout override is disabled.
+pub const DEFAULT_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS: u64 = 0;
+
 /// Environment variable for remote namespace lock RPC transport timeout in milliseconds.
 ///
 /// This timeout bounds the internode RPC call itself. It is intentionally

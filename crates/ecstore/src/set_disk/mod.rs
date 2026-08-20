@@ -1501,6 +1501,58 @@ pub fn get_lock_acquire_timeout() -> Duration {
     }
 }
 
+fn get_put_object_commit_lock_acquire_timeout_override_ms() -> u64 {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+            rustfs_config::DEFAULT_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<u64> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_u64(
+                rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+                rustfs_config::DEFAULT_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS,
+            )
+        })
+    }
+}
+
+fn get_put_object_commit_lock_acquire_timeout(op: &'static str) -> Duration {
+    let default_timeout = get_lock_acquire_timeout();
+    if op != "put_object_commit" {
+        return default_timeout;
+    }
+
+    let timeout_ms = get_put_object_commit_lock_acquire_timeout_override_ms();
+    if timeout_ms == 0 {
+        default_timeout
+    } else {
+        Duration::from_millis(timeout_ms)
+    }
+}
+
+fn put_object_commit_lock_timeout_override_enabled(op: &'static str) -> bool {
+    op == "put_object_commit" && get_put_object_commit_lock_acquire_timeout_override_ms() != 0
+}
+
+fn map_put_object_commit_lock_acquire_error(
+    set: &SetDisks,
+    op: &'static str,
+    bucket: &str,
+    object: &str,
+    err: rustfs_lock::error::LockError,
+) -> StorageError {
+    if put_object_commit_lock_timeout_override_enabled(op) && matches!(err, rustfs_lock::error::LockError::Timeout { .. }) {
+        StorageError::SlowDown
+    } else {
+        set.map_namespace_lock_error(bucket, object, "write", err)
+    }
+}
+
 pub fn is_object_lock_diag_enabled() -> bool {
     *OBJECT_LOCK_DIAG_ENABLED.get_or_init(|| {
         let enabled = rustfs_utils::get_env_bool(
@@ -3302,10 +3354,11 @@ impl SetDisks {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
+        let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
         let guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
+            .get_write_lock(acquire_timeout)
             .await
-            .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?;
+            .map_err(|e| map_put_object_commit_lock_acquire_error(self, op, bucket, object, e))?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -3340,7 +3393,8 @@ impl SetDisks {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
-        let acquire = ns_lock.get_write_lock(get_lock_acquire_timeout());
+        let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
+        let acquire = ns_lock.get_write_lock(acquire_timeout);
         tokio::pin!(acquire);
         let mut on_pending = Some(on_pending);
         let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
@@ -3353,7 +3407,7 @@ impl SetDisks {
             std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
         })
         .await
-        .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?;
+        .map_err(|e| map_put_object_commit_lock_acquire_error(self, op, bucket, object, e))?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -5789,6 +5843,64 @@ mod tests {
                 assert_eq!(put_object_commit_namespace_lock_wait_sample_count(&snapshotter), 1);
 
                 rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_timeout_override_only_applies_to_put_commit() {
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("17"))], || {
+            assert_eq!(get_put_object_commit_lock_acquire_timeout("put_object_commit"), Duration::from_millis(17));
+            assert_eq!(
+                get_put_object_commit_lock_acquire_timeout("complete_multipart_upload_commit"),
+                get_lock_acquire_timeout()
+            );
+        });
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("0"))], || {
+            assert_eq!(
+                get_put_object_commit_lock_acquire_timeout("put_object_commit"),
+                get_lock_acquire_timeout()
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_timeout_override_bounds_contention_wait() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("1"))], || {
+            runtime.block_on(async {
+                let ctx = Arc::new(InstanceContext::new());
+                ctx.update_erasure_type(SetupType::Erasure).await;
+                let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                let bucket = "bucket";
+                let object = "object";
+
+                let held_guard = set
+                    .acquire_write_lock_diag("put_object_commit", bucket, object)
+                    .await
+                    .expect("holder acquire should succeed");
+                let started = Instant::now();
+                let err = match set.acquire_write_lock_diag("put_object_commit", bucket, object).await {
+                    Ok(_) => panic!("contended PUT commit lock should honor the short timeout"),
+                    Err(err) => err,
+                };
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "short PUT commit lock timeout should not wait for the global timeout"
+                );
+                assert!(matches!(err, StorageError::SlowDown));
+
+                drop(held_guard);
+                set.acquire_write_lock_diag("put_object_commit", bucket, object)
+                    .await
+                    .expect("permit should not leak after timeout");
             });
         });
     }
