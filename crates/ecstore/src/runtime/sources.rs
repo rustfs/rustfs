@@ -573,9 +573,7 @@ pub(crate) async fn initialize_local_disk_maps(
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
     let handle = get_global_tier_config_mgr();
     TierConfigMgr::reload_handle(&handle, store.clone()).await?;
-    if setup_is_dist_erasure().await {
-        tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
-    }
+    tokio::spawn(TierConfigMgr::refresh_tier_config_handle(handle, store));
     Ok(())
 }
 
