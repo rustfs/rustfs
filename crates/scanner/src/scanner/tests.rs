@@ -3108,6 +3108,31 @@ fn clean_idle_backoff_requires_activity_probes() {
 }
 
 #[test]
+fn dirty_usage_wakes_are_disabled_for_explicit_cycle_policy() {
+    let default_config = ScannerRuntimeConfig::default();
+
+    let default_observed = ScannerCycleObservedGenerations::for_wait(&default_config, None, 7, 11, 13);
+    assert_eq!(default_observed.dirty_usage, Some(7));
+    assert_eq!(default_observed.runtime_config, 11);
+    assert_eq!(default_observed.maintenance, 13);
+    assert!(!default_observed.defer_cluster_activity);
+
+    let retry_observed = ScannerCycleObservedGenerations::for_wait(&default_config, Some(Duration::from_secs(11)), 7, 11, 13);
+    assert_eq!(retry_observed.dirty_usage, None);
+    assert!(retry_observed.defer_cluster_activity);
+
+    for source in [ScannerRuntimeConfigSource::Env, ScannerRuntimeConfigSource::Config] {
+        let explicit_cycle = ScannerRuntimeConfig {
+            cycle_interval_source: source,
+            ..default_config.clone()
+        };
+        let explicit_observed = ScannerCycleObservedGenerations::for_wait(&explicit_cycle, None, 7, 11, 13);
+        assert_eq!(explicit_observed.dirty_usage, None);
+        assert!(!explicit_observed.defer_cluster_activity);
+    }
+}
+
+#[test]
 #[serial]
 fn clean_idle_cap_preserves_default_bitrot_coverage_window() {
     let config = ScannerRuntimeConfig {
