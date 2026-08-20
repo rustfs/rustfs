@@ -122,11 +122,20 @@ pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rena
 
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
+pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
+pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER: &str = "follower";
+pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS: &str = "enqueue_waiters";
+pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES: &str = "enqueue_files";
+pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS: &str = "batch_waiters";
+pub const PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES: &str = "batch_files";
 pub const PUT_RENAME_QUORUM_FANOUT_STATE_SCHEDULED: &str = "scheduled";
 pub const PUT_RENAME_QUORUM_FANOUT_STATE_WRITE_QUORUM: &str = "write_quorum";
 pub const PUT_RENAME_QUORUM_FANOUT_STATE_SUCCESS: &str = "success";
 pub const PUT_RENAME_QUORUM_FANOUT_STATE_ERROR: &str = "error";
 pub const PUT_RENAME_QUORUM_FANOUT_STATE_PANIC: &str = "panic";
+pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST: &str = "quorum_first";
+pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL: &str = "quorum_tail";
+pub const PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR: &str = "error";
 
 #[inline(always)]
 pub fn get_stage_metrics_enabled() -> bool {
@@ -2067,6 +2076,30 @@ pub fn record_put_rename_fdatasync_batch(mode: &'static str, files: usize) {
 }
 
 #[inline(always)]
+pub fn record_put_rename_fdatasync_group_wait(role: &'static str, duration_ms: f64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_rename_fdatasync_group_wait_ms", "role" => role).record(duration_ms);
+}
+
+#[inline(always)]
+pub fn record_put_rename_fdatasync_group_outstanding(state: &'static str, count: usize) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_rename_fdatasync_group_outstanding", "state" => state).record(put_stage_count_value(count));
+}
+
+#[inline(always)]
+pub fn record_put_rename_disk_wait_completion(position: &'static str, duration_ms: f64) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_s3_put_object_rename_disk_wait_completion_ms", "position" => position).record(duration_ms);
+}
+
+#[inline(always)]
 pub fn record_put_rename_quorum_wait_fanout(
     scheduled: usize,
     write_quorum: usize,
@@ -3176,10 +3209,22 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             set_put_stage_metrics_enabled(false);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, 2);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
+            record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST, 3.0);
             record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
 
             set_put_stage_metrics_enabled(true);
             record_put_rename_fdatasync_batch(PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL, 9);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER, 1.0);
+            record_put_rename_fdatasync_group_wait(PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER, 2.0);
+            record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS, 2);
+            record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES, 4);
+            record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS, 3);
+            record_put_rename_fdatasync_group_outstanding(PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES, 6);
+            record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST, 3.0);
+            record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL, 4.0);
+            record_put_rename_disk_wait_completion(PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR, 5.0);
             record_put_rename_quorum_wait_fanout(4, 3, 3, 1, 0);
             set_put_stage_metrics_enabled(false);
         });
@@ -3205,6 +3250,87 @@ mod tests {
 
         let quorum_samples = histogram_samples(&rows, "rustfs_s3_put_object_rename_quorum_wait_fanout_disks");
         assert_eq!(quorum_samples, vec![0.0, 1.0, 3.0, 3.0, 4.0]);
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_wait_ms"),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_fdatasync_group_outstanding"),
+            vec![2.0, 3.0, 4.0, 6.0]
+        );
+        assert_eq!(
+            histogram_samples(&rows, "rustfs_s3_put_object_rename_disk_wait_completion_ms"),
+            vec![3.0, 4.0, 5.0]
+        );
+        let group_wait_roles = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == "rustfs_s3_put_object_rename_fdatasync_group_wait_ms"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "role")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            group_wait_roles,
+            HashSet::from([
+                PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER.to_string(),
+            ])
+        );
+        let group_outstanding_states = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == "rustfs_s3_put_object_rename_fdatasync_group_outstanding"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "state")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            group_outstanding_states,
+            HashSet::from([
+                PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS.to_string(),
+                PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES.to_string(),
+            ])
+        );
+        let disk_wait_positions = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Histogram
+                    && composite.key().name() == "rustfs_s3_put_object_rename_disk_wait_completion_ms"
+            })
+            .flat_map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .filter(|label| label.key() == "position")
+                    .map(|label| label.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            disk_wait_positions,
+            HashSet::from([
+                PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST.to_string(),
+                PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL.to_string(),
+                PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR.to_string(),
+            ])
+        );
         let quorum_states = rows
             .iter()
             .filter(|(composite, _, _, _)| {

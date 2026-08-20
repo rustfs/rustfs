@@ -23,6 +23,7 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
+    time::Instant,
 };
 use tokio::fs;
 use tokio::sync::{
@@ -766,6 +767,8 @@ type FileFdatasyncGroupKey = usize;
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
+    enqueued_at: Option<Instant>,
+    wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
 }
 
@@ -799,6 +802,7 @@ struct FileFdatasyncGroup {
 #[derive(Default)]
 struct FileFdatasyncGroupInner {
     worker_running: bool,
+    pending_files: usize,
     pending: VecDeque<FileFdatasyncWaiter>,
 }
 
@@ -865,11 +869,30 @@ impl FileFdatasyncGroupCommit {
         };
         let file_count = files.len();
         let mut group_state = group.inner.lock();
-        group_state.pending.push_back(FileFdatasyncWaiter { files, result_tx });
         let start_worker = !group_state.worker_running;
+        let wait_role = if start_worker {
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER
+        } else {
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_FOLLOWER
+        };
+        group_state.pending.push_back(FileFdatasyncWaiter {
+            files,
+            enqueued_at: rustfs_io_metrics::put_stage_timer(),
+            wait_role,
+            result_tx,
+        });
+        group_state.pending_files += file_count;
         if start_worker {
             group_state.worker_running = true;
         }
+        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_WAITERS,
+            group_state.pending.len(),
+        );
+        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_ENQUEUE_FILES,
+            group_state.pending_files,
+        );
         registry.total_waiters += 1;
         registry.total_files += file_count;
         drop(group_state);
@@ -911,9 +934,11 @@ async fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) {
         #[cfg(test)]
         file_sync_probe::run_before_group_batch();
         tokio::task::yield_now().await;
-        let batch: Vec<FileFdatasyncWaiter> = {
+        let (batch, batch_file_count): (Vec<FileFdatasyncWaiter>, usize) = {
             let mut group_state = group.inner.lock();
-            group_state.pending.drain(..).collect()
+            let batch_file_count = group_state.pending_files;
+            group_state.pending_files = 0;
+            (group_state.pending.drain(..).collect(), batch_file_count)
         };
         if batch.is_empty() {
             let mut group_state = group.inner.lock();
@@ -923,8 +948,23 @@ async fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) {
             return;
         }
 
+        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS,
+            batch.len(),
+        );
+        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES,
+            batch_file_count,
+        );
+        for waiter in &batch {
+            if let Some(enqueued_at) = waiter.enqueued_at {
+                rustfs_io_metrics::record_put_rename_fdatasync_group_wait(
+                    waiter.wait_role,
+                    enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
         let batch_files: Vec<PathBuf> = batch.iter().flat_map(|waiter| waiter.files.iter().cloned()).collect();
-        let batch_file_count = batch_files.len();
         #[cfg(test)]
         file_sync_probe::record_group_batch(batch_file_count);
         rustfs_io_metrics::record_put_rename_fdatasync_batch(
