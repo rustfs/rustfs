@@ -109,6 +109,7 @@ pub fn put_stage_timer() -> Option<std::time::Instant> {
     put_stage_metrics_enabled().then(std::time::Instant::now)
 }
 
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT: &str = "put_object_commit_namespace_lock_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT: &str = "set_disk_rename_quorum_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_DISK_WAIT: &str = "set_disk_rename_disk_wait";
 pub const PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT: &str = "set_disk_rename_file_sync_permit_wait";
@@ -3147,7 +3148,9 @@ mod tests {
     #[test]
     fn put_stage_sync_tail_labels_are_static_and_gated() {
         let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT, "put_object_commit_namespace_lock_wait");
         let stages = [
+            PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT,
             PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
             PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
             PUT_STAGE_SET_DISK_RENAME_FILE_SYNC_PERMIT_WAIT,
@@ -3161,11 +3164,11 @@ mod tests {
         ];
         let unique = stages.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), stages.len());
-        assert!(
-            stages
-                .iter()
-                .all(|stage| stage.starts_with("set_disk_rename_") && !stage.contains('/') && !stage.contains('{'))
-        );
+        assert!(stages.iter().all(|stage| {
+            (stage.starts_with("set_disk_rename_") || *stage == PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT)
+                && !stage.contains('/')
+                && !stage.contains('{')
+        }));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
