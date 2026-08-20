@@ -963,8 +963,10 @@ mod tests {
         };
         let source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
-        let mut identity = rustfs_policy::auth::UserIdentity::default();
-        identity.credentials = credentials.clone();
+        let identity = rustfs_policy::auth::UserIdentity {
+            credentials: credentials.clone(),
+            ..Default::default()
+        };
         let principal = rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(identity));
         let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
         let mut headers = HeaderMap::new();
