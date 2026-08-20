@@ -66,9 +66,10 @@ impl Evaluator {
     }
 
     /// IsObjectLocked checks if it is appropriate to remove an
-    /// object according to its persisted object-lock metadata.
+    /// object according to its persisted object-lock metadata and the bucket
+    /// default retention.
     pub fn is_object_locked(&self, obj: &ObjectOpts) -> bool {
-        object_lock::is_object_locked_by_metadata(&obj.user_defined, obj.delete_marker)
+        object_lock::is_object_locked(&obj.user_defined, obj.delete_marker, self.lock_retention.as_deref(), obj.mod_time)
     }
 
     /// eval will return a lifecycle event for each object in objs for a given time.
@@ -198,8 +199,9 @@ mod tests {
 
     use rustfs_common::metrics::IlmAction;
     use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, ObjectLockConfiguration,
-        ObjectLockEnabled, Transition, TransitionStorageClass,
+        BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule,
+        NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
+        Transition, TransitionStorageClass,
     };
     use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use time::OffsetDateTime;
@@ -297,6 +299,40 @@ mod tests {
         Arc::new(ObjectLockConfiguration {
             object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
             rule: None,
+        })
+    }
+
+    fn lock_enabled_with_default_retention(days: i32) -> Arc<ObjectLockConfiguration> {
+        Arc::new(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    days: Some(days),
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    years: None,
+                }),
+            }),
+        })
+    }
+
+    fn noncurrent_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
+        Arc::new(BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
         })
     }
 
@@ -457,6 +493,52 @@ mod tests {
             .expect("explicit legal hold should still produce a lifecycle decision");
 
         assert_eq!(events[0].action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn evaluator_skips_noncurrent_expiration_during_default_retention() {
+        let evaluator =
+            Evaluator::new(noncurrent_expiration_lifecycle()).with_lock_retention(Some(lock_enabled_with_default_retention(30)));
+        let successor_time = OffsetDateTime::now_utc() - time::Duration::days(2);
+        let noncurrent = ObjectOpts {
+            name: "logs/object".to_string(),
+            mod_time: Some(successor_time - time::Duration::days(1)),
+            successor_mod_time: Some(successor_time),
+            version_id: Some(Uuid::new_v4()),
+            is_latest: false,
+            num_versions: 1,
+            ..Default::default()
+        };
+
+        let events = evaluator
+            .eval(&[noncurrent])
+            .await
+            .expect("lifecycle evaluation should succeed");
+
+        assert_eq!(events[0].action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn evaluator_allows_noncurrent_expiration_after_default_retention() {
+        let evaluator =
+            Evaluator::new(noncurrent_expiration_lifecycle()).with_lock_retention(Some(lock_enabled_with_default_retention(1)));
+        let successor_time = OffsetDateTime::now_utc() - time::Duration::days(2);
+        let noncurrent = ObjectOpts {
+            name: "logs/object".to_string(),
+            mod_time: Some(successor_time - time::Duration::days(1)),
+            successor_mod_time: Some(successor_time),
+            version_id: Some(Uuid::new_v4()),
+            is_latest: false,
+            num_versions: 1,
+            ..Default::default()
+        };
+
+        let events = evaluator
+            .eval(&[noncurrent])
+            .await
+            .expect("lifecycle evaluation should succeed");
+
+        assert_eq!(events[0].action, IlmAction::DeleteVersionAction);
     }
 
     #[tokio::test]
