@@ -579,7 +579,7 @@ mod tests {
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
-            tier::{TIER_CONFIG_FILE, TierConfigMgr},
+            tier::{TIER_CONFIG_FILE, TierConfigMgr, tier_config_candidate_digest},
             tier_config::{TierConfig, TierType, TierWasabi},
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
@@ -5455,10 +5455,29 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-handler", &[4])).await;
-        let mutation_id = uuid::Uuid::new_v4();
-        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
-        let prepare_payload = intent.encode().expect("prepare intent should encode");
         register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let (candidate_digest, config_etag) = {
+            let tier_config_mgr = store.tier_config_mgr();
+            let manager = tier_config_mgr.read().await;
+            let candidate_digest = tier_config_candidate_digest(&manager).expect("peer commit candidate digest should build");
+            manager
+                .save_tiering_config(store.clone())
+                .await
+                .expect("peer commit config fixture should persist");
+            let config_info = store
+                .get_object_info(
+                    RUSTFS_META_BUCKET,
+                    &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("peer commit config fixture should load");
+            (candidate_digest, config_info.etag.expect("peer commit config should carry an ETag"))
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        intent.old_config_etag = Some(config_etag.clone());
+        let prepare_payload = intent.encode().expect("prepare intent should encode");
 
         let prepared = handle_tier_mutation_peer_request(
             store.clone(),
@@ -5500,21 +5519,77 @@ mod tests {
             "prepared retry should keep the existing blocked-tier error: {retried_blocked}"
         );
 
+        let mismatched_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"not-the-current-etag",
+        )
+        .await
+        .expect_err("commit with a mismatched config proof must fail closed");
+        assert!(matches!(mismatched_commit, TierMutationPeerError::CommitProofMismatch));
+
+        register_mock_tier(&store.tier_config_mgr(), "COLD-C").await;
+        let bad_digest_id = uuid::Uuid::new_v4();
+        let mut bad_digest_intent = tier_mutation_peer_test_intent(bad_digest_id, "COLD-C", [9; 32]);
+        bad_digest_intent.old_config_etag = Some(config_etag.clone());
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            bad_digest_id,
+            &bad_digest_intent.encode().expect("bad digest prepare intent should encode"),
+        )
+        .await
+        .expect("bad digest prepare should install a prepared intent");
+        let mismatched_digest_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            bad_digest_id,
+            config_etag.as_bytes(),
+        )
+        .await
+        .expect_err("a correct ETag with a mismatched candidate digest must fail closed");
+        assert!(matches!(mismatched_digest_commit, TierMutationPeerError::CommitProofMismatch));
+        let bad_digest_loaded = load_tier_mutation_intent_record(store.clone(), bad_digest_id)
+            .await
+            .expect("mismatched digest must leave the prepared intent durable");
+        assert_eq!(bad_digest_loaded.state, TierMutationIntentState::Prepared);
+        let bad_digest_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-C").await {
+            Ok(_) => panic!("mismatched digest must retain the prepared runtime fence"),
+            Err(err) => err,
+        };
+        assert!(bad_digest_blocked.message.contains("being replaced"), "{bad_digest_blocked}");
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            bad_digest_id,
+            b"",
+        )
+        .await
+        .expect("the negative digest proof fixture should clean up through abort");
+
         let committed = handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Commit,
             mutation_id,
-            b"new-etag",
+            config_etag.as_bytes(),
         )
         .await
         .expect("commit should advance the prepared peer intent");
         assert!(committed.applied);
         assert_eq!(committed.state, TierMutationPeerState::Committed);
-        drop(
-            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
-                .await
-                .expect("committed peer mutation should clear the prepared runtime block"),
+        let committed_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("committed peer mutation must remain blocked until local reload publishes the config"),
+            Err(err) => err,
+        };
+        assert!(
+            committed_blocked.message.contains("being replaced"),
+            "committed peer mutation should keep the existing blocked-tier error: {committed_blocked}"
         );
 
         let retried_commit = handle_tier_mutation_peer_request(
@@ -5522,12 +5597,20 @@ mod tests {
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Commit,
             mutation_id,
-            b"new-etag",
+            config_etag.as_bytes(),
         )
         .await
         .expect("same commit retry should be idempotent");
         assert!(!retried_commit.applied);
         assert_eq!(retried_commit.state, TierMutationPeerState::Committed);
+        let retried_commit_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("committed retry must keep the tier blocked until local reload"),
+            Err(err) => err,
+        };
+        assert!(
+            retried_commit_blocked.message.contains("being replaced"),
+            "committed retry should keep the existing blocked-tier error: {retried_commit_blocked}"
+        );
 
         let delayed_prepare_retry = handle_tier_mutation_peer_request(
             store.clone(),
@@ -5540,17 +5623,20 @@ mod tests {
         .expect("delayed duplicate prepare should report the durable committed state");
         assert!(!delayed_prepare_retry.applied);
         assert_eq!(delayed_prepare_retry.state, TierMutationPeerState::Committed);
-        drop(
-            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
-                .await
-                .expect("delayed committed prepare retry must not recreate a runtime block"),
+        let delayed_prepare_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("delayed committed prepare retry must preserve the committed runtime block"),
+            Err(err) => err,
+        };
+        assert!(
+            delayed_prepare_blocked.message.contains("being replaced"),
+            "delayed committed prepare retry should keep the existing blocked-tier error: {delayed_prepare_blocked}"
         );
 
         let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
             .await
             .expect("committed peer intent should remain durable");
         assert_eq!(loaded.state, TierMutationIntentState::Committed);
-        assert_eq!(loaded.committed_config_etag.as_deref(), Some("new-etag"));
+        assert_eq!(loaded.committed_config_etag.as_deref(), Some(config_etag.as_str()));
 
         store
             .tier_config_mgr()
@@ -5570,7 +5656,7 @@ mod tests {
         let tier_config_etag = tier_config_info.etag.expect("tier config should carry an ETag");
         delete_tier_mutation_intent_record(store.clone(), mutation_id)
             .await
-            .expect("committed peer intent cleanup should persist");
+            .expect("simulate another node cleaning the shared committed peer intent");
         let cleaned_commit_retry = handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -5582,6 +5668,14 @@ mod tests {
         .expect("commit retry after durable cleanup should be idempotently terminal");
         assert!(!cleaned_commit_retry.applied);
         assert_eq!(cleaned_commit_retry.state, TierMutationPeerState::Committed);
+        let cleaned_commit_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("shared intent cleanup must not clear this node's committed runtime block"),
+            Err(err) => err,
+        };
+        assert!(
+            cleaned_commit_blocked.message.contains("being replaced"),
+            "commit retry after shared cleanup should keep the existing blocked-tier error: {cleaned_commit_blocked}"
+        );
         let mismatched_cleaned_commit = handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -5592,11 +5686,46 @@ mod tests {
         .await
         .expect_err("missing intent without a matching committed config ETag must fail closed");
         assert!(matches!(mismatched_cleaned_commit, TierMutationPeerError::Store(Error::ConfigNotFound)));
+        let refresh_store = store.clone();
+        let refresh_manager = store.tier_config_mgr();
+        let refresh_worker = tokio::spawn(async move {
+            TierConfigMgr::refresh_tier_config_handle_with(refresh_manager, refresh_store).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+                    drop(lease);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("matching cleaned commit should wake the refresh worker and clear the committed fence");
+        refresh_worker.abort();
+        let _ = refresh_worker.await;
 
         let abort_id = uuid::Uuid::new_v4();
-        let abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);
-        let abort_prepare_payload = abort_intent.encode().expect("abort prepare intent should encode");
         register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("abort target tier config should persist");
+        let abort_config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("abort target config metadata should load");
+        let abort_config_etag = abort_config_info.etag.expect("abort target config should carry an ETag");
+        let mut abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);
+        abort_intent.old_config_etag = Some(abort_config_etag);
+        let abort_prepare_payload = abort_intent.encode().expect("abort prepare intent should encode");
         handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -5626,23 +5755,238 @@ mod tests {
         .expect("abort should advance the prepared peer intent");
         assert!(aborted.applied);
         assert_eq!(aborted.state, TierMutationPeerState::Aborted);
-        drop(
-            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B")
-                .await
-                .expect("aborted peer mutation should clear the prepared runtime block"),
-        );
+        let aborted_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+            Ok(_) => panic!("aborted peer mutation must remain blocked until local recovery cleans it up"),
+            Err(err) => err,
+        };
+        assert!(aborted_blocked.message.contains("being replaced"), "{aborted_blocked}");
 
         let retried_abort = handle_tier_mutation_peer_request(
-            store,
+            store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Abort,
             abort_id,
             b"",
         )
         .await
-        .expect("same abort retry should be idempotent");
+        .expect("same abort retry should be idempotent before recovery cleanup");
         assert!(!retried_abort.applied);
         assert_eq!(retried_abort.state, TierMutationPeerState::Aborted);
+
+        let refresh_store = store.clone();
+        let refresh_manager = store.tier_config_mgr();
+        let refresh_worker = tokio::spawn(async move {
+            TierConfigMgr::refresh_tier_config_handle_with(refresh_manager, refresh_store).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+                    drop(lease);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abort notification should drive cleanup before clearing the prepared fence");
+        refresh_worker.abort();
+        let _ = refresh_worker.await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn late_abort_after_config_commit_keeps_fence_until_commit_recovery() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-late-abort", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("base tier config should persist");
+        let base_config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("base tier config metadata should load");
+        let base_etag = base_config_info.etag.expect("base tier config should carry an ETag");
+
+        register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
+        let candidate_digest = {
+            let manager = store.tier_config_mgr();
+            let manager = manager.read().await;
+            tier_config_candidate_digest(&manager).expect("candidate digest should build")
+        };
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-B", candidate_digest);
+        intent.old_config_etag = Some(base_etag.clone());
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &intent.encode().expect("late abort prepare intent should encode"),
+        )
+        .await
+        .expect("prepare should install the runtime fence");
+
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("candidate tier config should persist before the late abort");
+        let committed_config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("committed tier config metadata should load");
+        let committed_etag = committed_config_info
+            .etag
+            .expect("committed tier config should carry an ETag");
+        assert_ne!(committed_etag, base_etag);
+
+        let late_abort = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            mutation_id,
+            b"",
+        )
+        .await
+        .expect_err("an abort after the candidate config commit must fail closed");
+        assert!(matches!(late_abort, TierMutationPeerError::AbortProofMismatch));
+        let prepared = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("rejected late abort must retain the prepared intent");
+        assert_eq!(prepared.state, TierMutationIntentState::Prepared);
+        let blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+            Ok(_) => panic!("rejected late abort must retain the runtime fence"),
+            Err(err) => err,
+        };
+        assert!(blocked.message.contains("being replaced"), "{blocked}");
+
+        let committed = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            committed_etag.as_bytes(),
+        )
+        .await
+        .expect("matching commit should converge the rejected late abort fixture");
+        assert!(committed.applied);
+        assert_eq!(committed.state, TierMutationPeerState::Committed);
+
+        let refresh_store = store.clone();
+        let refresh_manager = store.tier_config_mgr();
+        let refresh_worker = tokio::spawn(async move {
+            TierConfigMgr::refresh_tier_config_handle_with(refresh_manager, refresh_store).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+                    drop(lease);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit recovery should publish before clearing the late-abort fence");
+        refresh_worker.abort();
+        let _ = refresh_worker.await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn missing_record_commit_promotes_prepared_fence_until_worker_publish() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-missing-record-commit", &[4]))
+                .await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let tier_config_mgr = store.tier_config_mgr();
+        let candidate_digest = {
+            let manager = tier_config_mgr.read().await;
+            let digest = tier_config_candidate_digest(&manager).expect("candidate digest should build");
+            manager
+                .save_tiering_config(store.clone())
+                .await
+                .expect("candidate config should persist");
+            digest
+        };
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("candidate config metadata should load");
+        let config_etag = config_info.etag.expect("candidate config should carry an ETag");
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", candidate_digest);
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &intent.encode().expect("prepare intent should encode"),
+        )
+        .await
+        .expect("prepare should install the runtime fence");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("simulate shared intent cleanup before the local commit arrives");
+
+        let committed = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            config_etag.as_bytes(),
+        )
+        .await
+        .expect("matching commit after shared cleanup should be terminal");
+        assert!(!committed.applied);
+        assert_eq!(committed.state, TierMutationPeerState::Committed);
+        let blocked = match TierConfigMgr::acquire_operation_lease(&tier_config_mgr, "COLD-A").await {
+            Ok(_) => panic!("the promoted committed fence must block old-generation leases"),
+            Err(err) => err,
+        };
+        assert!(blocked.message.contains("being replaced"), "{blocked}");
+
+        let refresh_store = store.clone();
+        let refresh_manager = tier_config_mgr.clone();
+        let refresh_worker = tokio::spawn(async move {
+            TierConfigMgr::refresh_tier_config_handle_with(refresh_manager, refresh_store).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, "COLD-A").await {
+                    drop(lease);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the commit notification should drive publish and clear the promoted fence");
+        refresh_worker.abort();
+        let _ = refresh_worker.await;
     }
 
     #[cfg(feature = "test-util")]

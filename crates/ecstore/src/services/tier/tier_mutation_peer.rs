@@ -17,7 +17,7 @@ use std::sync::Arc;
 use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
 use uuid::Uuid;
 
-use super::tier::{TierConfigMgr, tier_config_etag_matches};
+use super::tier::{TierConfigMgr, tier_config_abort_matches, tier_config_commit_matches, tier_config_etag_matches};
 use super::tier_mutation_intent::{
     MAX_TIER_MUTATION_INTENT_SIZE, TierMutationIntent, TierMutationIntentState, advance_tier_mutation_intent_record_idempotent,
     load_tier_mutation_intent_record, save_tier_mutation_intent_record_if_absent,
@@ -53,6 +53,10 @@ pub enum TierMutationPeerError {
     InvalidPayload(String),
     #[error("tier mutation peer intent conflicts with existing record")]
     ConflictingIntent,
+    #[error("tier mutation peer commit proof does not match the persisted tier configuration")]
+    CommitProofMismatch,
+    #[error("tier mutation peer abort proof does not match the persisted tier configuration")]
+    AbortProofMismatch,
     #[error("tier mutation peer runtime error: {0}")]
     Runtime(#[source] AdminError),
     #[error("tier mutation peer store error: {0}")]
@@ -120,8 +124,13 @@ async fn handle_prepare(
                         .await
                         .map_err(TierMutationPeerError::Runtime)?;
                 }
-                TierMutationIntentState::Committed | TierMutationIntentState::Aborted => {
-                    TierConfigMgr::clear_prepared_mutation_intent_block(&tier_config_mgr, mutation_id).await;
+                TierMutationIntentState::Committed => {
+                    TierConfigMgr::apply_committed_mutation_intent_block(&tier_config_mgr, &existing)
+                        .await
+                        .map_err(TierMutationPeerError::Runtime)?;
+                }
+                TierMutationIntentState::Aborted => {
+                    TierConfigMgr::request_committed_mutation_refresh(&tier_config_mgr).await;
                 }
             }
             Ok(TierMutationPeerOutcome {
@@ -140,6 +149,18 @@ async fn handle_commit(
 ) -> TierMutationPeerResult<TierMutationPeerOutcome> {
     let committed_config_etag = parse_commit_etag(canonical_payload)?;
     let tier_config_mgr = api.tier_config_mgr();
+    match load_tier_mutation_intent_record(api.clone(), mutation_id).await {
+        Ok(intent) if intent.state == TierMutationIntentState::Prepared => {
+            let proof_matches = tier_config_commit_matches(api.clone(), &committed_config_etag, intent.candidate_digest)
+                .await
+                .map_err(Error::other)?;
+            if !proof_matches {
+                return Err(TierMutationPeerError::CommitProofMismatch);
+            }
+        }
+        Ok(_) | Err(Error::ConfigNotFound) => {}
+        Err(err) => return Err(err.into()),
+    }
     let (intent, applied) = match advance_tier_mutation_intent_record_idempotent(
         api.clone(),
         mutation_id,
@@ -154,6 +175,9 @@ async fn handle_commit(
                 .await
                 .map_err(Error::other)? =>
         {
+            TierConfigMgr::promote_prepared_mutation_intent_block(&tier_config_mgr, mutation_id)
+                .await
+                .map_err(TierMutationPeerError::Runtime)?;
             return Ok(TierMutationPeerOutcome {
                 state: TierMutationPeerState::Committed,
                 applied: false,
@@ -162,7 +186,9 @@ async fn handle_commit(
         Err(err) => return Err(err.into()),
     };
     if intent.state == TierMutationIntentState::Committed {
-        TierConfigMgr::clear_prepared_mutation_intent_block(&tier_config_mgr, mutation_id).await;
+        TierConfigMgr::apply_committed_mutation_intent_block(&tier_config_mgr, &intent)
+            .await
+            .map_err(TierMutationPeerError::Runtime)?;
     }
     Ok(TierMutationPeerOutcome {
         state: peer_state_from_intent(intent.state),
@@ -178,11 +204,18 @@ async fn handle_abort(
     if !canonical_payload.is_empty() {
         return Err(TierMutationPeerError::InvalidPayload("abort payload must be empty".to_string()));
     }
-    let tier_config_mgr = api.tier_config_mgr();
+    let existing = load_tier_mutation_intent_record(api.clone(), mutation_id).await?;
+    if existing.state == TierMutationIntentState::Prepared
+        && !tier_config_abort_matches(api.clone(), &existing)
+            .await
+            .map_err(Error::other)?
+    {
+        return Err(TierMutationPeerError::AbortProofMismatch);
+    }
     let (intent, applied) =
-        advance_tier_mutation_intent_record_idempotent(api, mutation_id, TierMutationIntentState::Aborted, None).await?;
+        advance_tier_mutation_intent_record_idempotent(api.clone(), mutation_id, TierMutationIntentState::Aborted, None).await?;
     if intent.state == TierMutationIntentState::Aborted {
-        TierConfigMgr::clear_prepared_mutation_intent_block(&tier_config_mgr, mutation_id).await;
+        TierConfigMgr::request_committed_mutation_refresh(&api.tier_config_mgr()).await;
     }
     Ok(TierMutationPeerOutcome {
         state: peer_state_from_intent(intent.state),
