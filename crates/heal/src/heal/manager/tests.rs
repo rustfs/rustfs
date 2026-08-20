@@ -86,6 +86,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         completed_heals: &manager.completed_heals,
         task_aliases: &manager.task_aliases,
         retrying_heals: &manager.retrying_heals,
+        mrf_repair_notice_targets: &manager.mrf_repair_notice_targets,
         replacement_recovery_anchors: &manager.replacement_recovery_anchors,
         config: &manager.config,
         statistics: &manager.statistics,
@@ -727,18 +728,138 @@ fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
 
     assert_eq!(queue.push(blocked), QueuePushOutcome::Accepted);
     assert_eq!(queue.push(runnable), QueuePushOutcome::Accepted);
+    for bucket in ["tail-a", "tail-b", "tail-c"] {
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: bucket.to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Low,
+            )),
+            QueuePushOutcome::Accepted
+        );
+    }
 
     let mut running = HashMap::new();
     running.insert("pool_0_set_1".to_string(), 1);
 
-    let popped = queue
-        .pop_runnable(|request| can_schedule_request(request, &running, 1))
-        .expect("should find runnable request");
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+    let popped = popped.expect("should find runnable request");
 
+    assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string()]);
     assert!(matches!(
         popped.heal_type,
         HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_2"
     ));
+    assert_eq!(queue.len(), 4);
+    let still_blocked = queue.pop_next().expect("blocked request should stay queued");
+    assert!(matches!(
+        still_blocked.heal_type,
+        HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_1"
+    ));
+}
+
+#[test]
+fn test_priority_queue_pop_runnable_restores_all_blocked_items() {
+    let mut queue = PriorityHealQueue::new();
+    let mut queued_requests = Vec::new();
+
+    for set_disk_id in ["pool_0_set_1", "pool_0_set_2", "pool_0_set_3"] {
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket".to_string()],
+                set_disk_id: set_disk_id.to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        let request_id = request.id.clone();
+        let dedup_key = PriorityHealQueue::make_dedup_key(&request);
+        assert_eq!(queue.push(request), QueuePushOutcome::Accepted);
+        queued_requests.push((request_id, dedup_key));
+    }
+
+    let mut running = HashMap::new();
+    running.insert("pool_0_set_1".to_string(), 1);
+    running.insert("pool_0_set_2".to_string(), 1);
+    running.insert("pool_0_set_3".to_string(), 1);
+
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+
+    assert!(popped.is_none());
+    assert_eq!(
+        skipped_sets,
+        vec![
+            "pool_0_set_1".to_string(),
+            "pool_0_set_2".to_string(),
+            "pool_0_set_3".to_string(),
+        ]
+    );
+    assert_eq!(queue.len(), 3);
+    for (request_id, dedup_key) in &queued_requests {
+        assert_eq!(
+            queue.queued_request_id_for_dedup_key(dedup_key),
+            Some(request_id.as_str()),
+            "deferred blocked request must keep its dedup representative"
+        );
+    }
+    for (request_id, _) in queued_requests {
+        let request = queue.pop_next().expect("blocked request should remain queued");
+        assert_eq!(request.id, request_id, "deferred requests must preserve FIFO order");
+    }
+}
+
+#[test]
+fn test_priority_queue_pop_runnable_restores_deferred_with_tail() {
+    let mut queue = PriorityHealQueue::new();
+
+    for (set_disk_id, priority) in [
+        ("pool_0_set_1", HealPriority::Urgent),
+        ("pool_0_set_2", HealPriority::High),
+        ("pool_0_set_3", HealPriority::Normal),
+        ("pool_0_set_4", HealPriority::Low),
+    ] {
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec!["bucket".to_string()],
+                    set_disk_id: set_disk_id.to_string(),
+                },
+                HealOptions::default(),
+                priority,
+            )),
+            QueuePushOutcome::Accepted
+        );
+    }
+
+    let mut running = HashMap::new();
+    running.insert("pool_0_set_1".to_string(), 1);
+    running.insert("pool_0_set_2".to_string(), 1);
+
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+
+    assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string(), "pool_0_set_2".to_string()]);
+    assert!(matches!(
+        popped.expect("normal-priority request should be runnable").heal_type,
+        HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_3"
+    ));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.pop_next().expect("urgent request should remain queued").priority,
+        HealPriority::Urgent
+    );
+    assert_eq!(queue.pop_next().expect("high request should remain queued").priority, HealPriority::High);
+    assert_eq!(queue.pop_next().expect("low request should remain queued").priority, HealPriority::Low);
 }
 
 #[test]
@@ -2357,6 +2478,84 @@ async fn test_cancel_task_removes_queued_request() {
 }
 
 #[tokio::test]
+async fn test_mrf_repaired_notice_waits_for_successful_completion() {
+    let bucket = "mrf-completion-success";
+    let object = "object";
+    let version_id = Some([9u8; 16]);
+    let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+
+    let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from(object), version_id)
+        .await
+        .expect("MRF request should be admitted");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .contains_key(&receipt.task_id),
+        "MRF notice ownership must be registered before the scheduler can observe the queued task"
+    );
+
+    assert!(
+        rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty(),
+        "admission alone must not clear the scanner pending-heal ledger"
+    );
+
+    process_manager_queue_once(&manager).await;
+    for _ in 0..100 {
+        let events = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+        if !events.is_empty() {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].object.as_ref(), object);
+            assert_eq!(events[0].version_id, version_id);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("successful MRF-owned heal should emit one repaired event");
+}
+
+#[tokio::test]
+async fn test_mrf_repaired_notice_removed_on_queued_cancel_without_event() {
+    let bucket = "mrf-completion-cancel";
+    let object = "object";
+    let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+
+    let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from(object), None)
+        .await
+        .expect("MRF request should be admitted");
+
+    manager
+        .cancel_task(&receipt.task_id)
+        .await
+        .expect("queued MRF request should cancel");
+
+    assert!(
+        rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty(),
+        "cancelled MRF-owned heal must not emit a repaired event"
+    );
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .is_empty(),
+        "cancel must discard completion notice ownership"
+    );
+}
+
+#[tokio::test]
 async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new(storage, None);
@@ -2567,6 +2766,54 @@ async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
             .await
             .expect("high priority request should remain queued"),
         HealTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn test_displacing_registered_mrf_task_drops_notice_ownership() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            ..HealConfig::default()
+        }),
+    );
+
+    let mut low = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    low.source = HealRequestSource::Mrf;
+    low.priority = HealPriority::Low;
+    let high = HealRequest::new(
+        HealType::Bucket {
+            bucket: "manual-bucket".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+
+    assert_eq!(
+        manager
+            .submit_mrf_heal_request_with_receipt(low, Arc::from("bucket"), Arc::from("object"), None)
+            .await
+            .expect("low priority MRF request should be accepted first")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+
+    assert_eq!(
+        manager
+            .submit_heal_request(high)
+            .await
+            .expect("high priority request should displace low priority work"),
+        HealAdmissionResult::Accepted
+    );
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .is_empty(),
+        "displaced MRF-owned task cannot reach completion, so its notice ownership must be dropped"
     );
 }
 

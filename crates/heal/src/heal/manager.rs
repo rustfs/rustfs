@@ -27,7 +27,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::LazyLock;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -112,6 +112,51 @@ async fn pause_duplicate_admission_after_active_lock(request_id: &str) {
 }
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MrfRepairNoticeTarget {
+    bucket: Arc<str>,
+    object: Arc<str>,
+    version_id: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealAdmissionDecision {
+    result: HealAdmissionResult,
+    displaced_task_id: Option<String>,
+}
+
+impl HealAdmissionDecision {
+    const fn new(result: HealAdmissionResult) -> Self {
+        Self {
+            result,
+            displaced_task_id: None,
+        }
+    }
+
+    fn accepted_with_displacement(displaced_task_id: String) -> Self {
+        Self {
+            result: HealAdmissionResult::Accepted,
+            displaced_task_id: Some(displaced_task_id),
+        }
+    }
+}
+
+fn lock_mrf_repair_notice_targets(
+    registry: &StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>,
+) -> StdMutexGuard<'_, HashMap<String, Vec<MrfRepairNoticeTarget>>> {
+    match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+async fn remove_task_aliases_for_task(registry: &Arc<Mutex<HashMap<String, HealTaskAlias>>>, task_id: &str) {
+    registry
+        .lock()
+        .await
+        .retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
+}
 
 #[derive(Debug, Clone)]
 pub struct HealTaskReport {
@@ -270,10 +315,6 @@ fn publish_active_heal_count(active_heals: &HashMap<String, Arc<HealTask>>) {
 
 fn publish_heal_queue_length(queue: &PriorityHealQueue) {
     crate::set_heal_queue_length(queue.len());
-}
-
-fn active_heals_contains_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key: &str) -> bool {
-    active_heal_for_dedup_key(active_heals, key).is_some()
 }
 
 fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key: &str) -> Option<(String, HealType)> {
@@ -581,6 +622,10 @@ pub struct HealManager {
     task_aliases: Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     /// Heal tasks waiting for a retry backoff to expire.
     retrying_heals: Arc<Mutex<HashMap<String, RetryingHeal>>>,
+    /// MRF repaired-event targets keyed by canonical heal task id. Admission
+    /// only registers ownership; the scheduler emits the event after a real
+    /// successful completion.
+    mrf_repair_notice_targets: Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
     /// Surviving disks that hold durable replacement intents, keyed by task ID.
     /// This is rebuilt from durable state after restart and never crosses the
     /// public request boundary.
@@ -616,6 +661,7 @@ struct HealQueueContext<'a> {
     completed_heals: &'a Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     task_aliases: &'a Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
+    mrf_repair_notice_targets: &'a Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
     replacement_recovery_anchors: &'a Arc<std::sync::Mutex<HashMap<String, String>>>,
     config: &'a Arc<RwLock<HealConfig>>,
     statistics: &'a Arc<RwLock<HealStatistics>>,
@@ -779,12 +825,27 @@ impl HealManager {
         .increment(1);
     }
 
+    fn remove_mrf_repair_notice_targets_for_task(&self, task_id: &str) {
+        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(task_id);
+    }
+
+    fn insert_mrf_repair_notice_target(
+        registry: &mut HashMap<String, Vec<MrfRepairNoticeTarget>>,
+        task_id: &str,
+        target: MrfRepairNoticeTarget,
+    ) {
+        let task_targets = registry.entry(task_id.to_string()).or_default();
+        if !task_targets.contains(&target) {
+            task_targets.push(target);
+        }
+    }
+
     fn admit_request_to_queue(
         queue: &mut PriorityHealQueue,
         request: HealRequest,
         config: &HealConfig,
         context: &'static str,
-    ) -> HealAdmissionResult {
+    ) -> HealAdmissionDecision {
         let queue_len = queue.len();
         publish_heal_queue_length(queue);
         let queue_capacity = config.queue_size;
@@ -813,7 +874,7 @@ impl HealManager {
                         result = "accepted_by_displacement",
                         "Heal queue request accepted by displacement"
                     });
-                    return HealAdmissionResult::Accepted;
+                    return HealAdmissionDecision::accepted_with_displacement(displaced.id);
                 }
 
                 demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
@@ -830,7 +891,7 @@ impl HealManager {
                     "Heal queue request rejected without displacement"
                 });
                 Self::record_admission_metric(source, HealAdmissionResult::Full, context);
-                return HealAdmissionResult::Full;
+                return HealAdmissionDecision::new(HealAdmissionResult::Full);
             }
 
             let admission = Self::classify_full_admission(&request, config);
@@ -869,7 +930,7 @@ impl HealManager {
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
             }
-            return admission;
+            return HealAdmissionDecision::new(admission);
         }
 
         if let Some(admission) = Self::classify_pressure_admission(&request, queue_len, queue_capacity) {
@@ -892,7 +953,7 @@ impl HealManager {
                     "Heal queue request dropped under pressure"
                 );
             }
-            return admission;
+            return HealAdmissionDecision::new(admission);
         }
 
         if queue_capacity > 0 {
@@ -956,7 +1017,7 @@ impl HealManager {
                     result = "accepted",
                     "Heal queue request accepted"
                 );
-                HealAdmissionResult::Accepted
+                HealAdmissionDecision::new(HealAdmissionResult::Accepted)
             }
             QueuePushOutcome::Merged => {
                 Self::record_admission_metric(source, HealAdmissionResult::Merged, context);
@@ -973,7 +1034,7 @@ impl HealManager {
                     result = "merged_duplicate",
                     "Heal queue request merged"
                 );
-                HealAdmissionResult::Merged
+                HealAdmissionDecision::new(HealAdmissionResult::Merged)
             }
         }
     }
@@ -1001,10 +1062,7 @@ impl HealManager {
     }
 
     async fn remove_aliases_for_task(&self, task_id: &str) {
-        self.task_aliases
-            .lock()
-            .await
-            .retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
+        remove_task_aliases_for_task(&self.task_aliases, task_id).await;
     }
 
     fn block_replacement_recovery_set(&self, set_disk_id: &str) {
@@ -1049,6 +1107,7 @@ impl HealManager {
             completed_heals: Arc::new(Mutex::new(HashMap::new())),
             task_aliases: Arc::new(Mutex::new(HashMap::new())),
             retrying_heals: Arc::new(Mutex::new(HashMap::new())),
+            mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
             replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
             replacement_recovery_blocked_sets: Arc::new(std::sync::Mutex::new(HashSet::new())),
             storage,
@@ -1152,6 +1211,7 @@ impl HealManager {
         self.completed_heals.lock().await.clear();
         self.task_aliases.lock().await.clear();
         self.retrying_heals.lock().await.clear();
+        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).clear();
         crate::set_heal_queue_length(0);
 
         // update state
@@ -1178,6 +1238,35 @@ impl HealManager {
         &self,
         request: HealRequest,
         preserve_alias: bool,
+    ) -> Result<HealAdmissionReceipt> {
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, preserve_alias, None)
+            .await
+    }
+
+    pub(crate) async fn submit_mrf_heal_request_with_receipt(
+        &self,
+        request: HealRequest,
+        bucket: Arc<str>,
+        object: Arc<str>,
+        version_id: Option<[u8; 16]>,
+    ) -> Result<HealAdmissionReceipt> {
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(
+            request,
+            true,
+            Some(MrfRepairNoticeTarget {
+                bucket,
+                object,
+                version_id,
+            }),
+        )
+        .await
+    }
+
+    async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
+        &self,
+        request: HealRequest,
+        preserve_alias: bool,
+        mrf_notice_target: Option<MrfRepairNoticeTarget>,
     ) -> Result<HealAdmissionReceipt> {
         // HS-06 forceStart semantics (admin only): MinIO stops the old task
         // first and then starts the new one. Cancel any active admin task
@@ -1254,6 +1343,12 @@ impl HealManager {
                 } else {
                     Self::duplicate_admission_for_request(&request, &config)
                 };
+            if matches!(admission, HealAdmissionResult::Merged)
+                && let Some(target) = mrf_notice_target
+            {
+                let mut targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+                Self::insert_mrf_repair_notice_target(&mut targets, &merged_task_id, target);
+            }
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
@@ -1356,16 +1451,31 @@ impl HealManager {
         }
 
         let mut task_id = request.id.clone();
-        let admission = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        let admission_decision = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        let admission = admission_decision.result;
         if admission == HealAdmissionResult::Merged
             && let Some(queued_id) = queue.queued_request_id_for_dedup_key(&dedup_key)
         {
             task_id = queued_id.to_owned();
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
+        let displaced_task_id = admission_decision.displaced_task_id;
+        if matches!(admission, HealAdmissionResult::Accepted | HealAdmissionResult::Merged)
+            && let Some(target) = mrf_notice_target
+        {
+            let mut targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+            Self::insert_mrf_repair_notice_target(&mut targets, &task_id, target);
+        }
+        if let Some(displaced_task_id) = &displaced_task_id {
+            lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(displaced_task_id);
+        }
         drop(retrying_heals);
         drop(queue);
         drop(active_heals);
+
+        if let Some(displaced_task_id) = displaced_task_id {
+            self.remove_aliases_for_task(&displaced_task_id).await;
+        }
 
         if should_notify {
             self.notify.notify_one();
@@ -1603,6 +1713,7 @@ impl HealManager {
                 );
                 drop(active_heals);
                 self.remove_aliases_for_task(&canonical_task_id).await;
+                self.remove_mrf_repair_notice_targets_for_task(&canonical_task_id);
                 return Ok(());
             }
         }
@@ -1614,6 +1725,7 @@ impl HealManager {
                 drop(retrying_heals);
                 self.completed_heals.lock().await.remove(&canonical_task_id);
                 self.remove_aliases_for_task(&canonical_task_id).await;
+                self.remove_mrf_repair_notice_targets_for_task(&canonical_task_id);
                 info!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_MANAGER_STATE,
@@ -1641,6 +1753,7 @@ impl HealManager {
             );
             drop(queue);
             self.remove_aliases_for_task(&canonical_task_id).await;
+            self.remove_mrf_repair_notice_targets_for_task(&canonical_task_id);
             return Ok(());
         }
 
@@ -1674,6 +1787,7 @@ impl HealManager {
             drop(active_heals);
             for task_id in &task_ids {
                 self.remove_aliases_for_task(task_id).await;
+                self.remove_mrf_repair_notice_targets_for_task(task_id);
             }
         }
 
@@ -1703,6 +1817,7 @@ impl HealManager {
 
                 for task_id in &task_ids {
                     self.remove_aliases_for_task(task_id).await;
+                    self.remove_mrf_repair_notice_targets_for_task(task_id);
                 }
             }
         }
@@ -1716,6 +1831,7 @@ impl HealManager {
         drop(queue);
         for request in &queued_cancelled {
             self.remove_aliases_for_task(&request.id).await;
+            self.remove_mrf_repair_notice_targets_for_task(&request.id);
         }
 
         if cancelled == 0 {

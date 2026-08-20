@@ -23,6 +23,7 @@ impl HealManager {
         let completed_heals = self.completed_heals.clone();
         let task_aliases = self.task_aliases.clone();
         let retrying_heals = self.retrying_heals.clone();
+        let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
@@ -54,6 +55,7 @@ impl HealManager {
                             completed_heals: &completed_heals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
+                            mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
                             statistics: &statistics,
@@ -71,6 +73,7 @@ impl HealManager {
                             completed_heals: &completed_heals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
+                            mrf_repair_notice_targets: &mrf_repair_notice_targets,
                             replacement_recovery_anchors: &replacement_recovery_anchors,
                             config: &config,
                             statistics: &statistics,
@@ -97,6 +100,7 @@ impl HealManager {
             completed_heals,
             task_aliases,
             retrying_heals,
+            mrf_repair_notice_targets,
             replacement_recovery_anchors,
             config,
             statistics,
@@ -181,6 +185,7 @@ impl HealManager {
                 let completed_heals_clone = completed_heals.clone();
                 let task_aliases_clone = task_aliases.clone();
                 let retrying_heals_clone = retrying_heals.clone();
+                let mrf_repair_notice_targets_clone = mrf_repair_notice_targets.clone();
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
@@ -301,6 +306,7 @@ impl HealManager {
                             completed_task.get_status().await
                         };
                         let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                        let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
                         let completed_progress = completed_task.get_progress().await;
                         // Single snapshot of the retained window: the task is
                         // finished and already off the active map, so there is
@@ -319,6 +325,7 @@ impl HealManager {
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
                         prune_completed_heal_statuses(&mut completed_heals_guard);
                         completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
+                        drop(completed_heals_guard);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -334,6 +341,10 @@ impl HealManager {
                         stats.update_running_tasks(usize_to_u64_saturated(active_count));
                         drop(stats);
                         if terminal_completion {
+                            let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
+                            if successful_completion {
+                                emit_mrf_repaired_events(notice_targets);
+                            }
                             task_aliases_clone
                                 .lock()
                                 .await
@@ -351,6 +362,8 @@ impl HealManager {
                         let retry_active_heals = active_heals_clone.clone();
                         let retry_heal_queue = heal_queue_clone.clone();
                         let retrying_heals_for_spawn = retrying_heals_clone.clone();
+                        let retry_task_aliases = task_aliases_clone.clone();
+                        let retry_mrf_repair_notice_targets = mrf_repair_notice_targets_clone.clone();
                         let retry_completed_heals = completed_heals_clone.clone();
                         let retry_notify = notify_clone.clone();
                         let retry_manager_cancel_token = manager_cancel_token.clone();
@@ -386,12 +399,17 @@ impl HealManager {
                                     }
                                 }
 
-                                let active_duplicate = {
+                                let active_duplicate_task_id = {
                                     let active_heals_guard = retry_active_heals.lock().await;
-                                    active_heals_contains_dedup_key(&active_heals_guard, &retry_key)
+                                    active_heal_for_dedup_key(&active_heals_guard, &retry_key).map(|(task_id, _)| task_id)
                                 };
-                                if active_duplicate {
+                                if let Some(active_duplicate_task_id) = active_duplicate_task_id {
                                     retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                    move_mrf_repair_notice_targets(
+                                        &retry_mrf_repair_notice_targets,
+                                        &retry_request_id,
+                                        &active_duplicate_task_id,
+                                    );
                                     debug!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -407,8 +425,9 @@ impl HealManager {
                                 }
 
                                 let mut queue = retry_heal_queue.lock().await;
-                                let admission =
+                                let admission_decision =
                                     Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;
                                 match admission {
@@ -418,7 +437,15 @@ impl HealManager {
                                         #[cfg(test)]
                                         pause_retry_ownership_transition(&retry_request_id, true).await;
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        let displaced_task_id = admission_decision.displaced_task_id;
                                         drop(queue);
+                                        if let Some(displaced_task_id) = displaced_task_id {
+                                            remove_task_aliases_for_task(&retry_task_aliases, &displaced_task_id).await;
+                                            remove_mrf_repair_notice_targets(
+                                                &retry_mrf_repair_notice_targets,
+                                                &displaced_task_id,
+                                            );
+                                        }
                                         retry_completed_heals.lock().await.remove(&retry_request_id);
                                         debug!(
                                             target: "rustfs::heal::manager",
@@ -439,8 +466,17 @@ impl HealManager {
                                         return;
                                     }
                                     HealAdmissionResult::Merged => {
+                                        let merged_task_id =
+                                            queue.queued_request_id_for_dedup_key(&retry_key).map(ToOwned::to_owned);
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
                                         drop(queue);
+                                        if let Some(merged_task_id) = merged_task_id {
+                                            move_mrf_repair_notice_targets(
+                                                &retry_mrf_repair_notice_targets,
+                                                &retry_request_id,
+                                                &merged_task_id,
+                                            );
+                                        }
                                         debug!(
                                             target: "rustfs::heal::manager",
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -595,6 +631,43 @@ pub(super) fn running_heal_set_counts(active_heals: &HashMap<String, Arc<HealTas
         }
     }
     running
+}
+
+fn remove_mrf_repair_notice_targets(registry: &Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>, task_id: &str) {
+    lock_mrf_repair_notice_targets(registry).remove(task_id);
+}
+
+fn take_mrf_repair_notice_targets(
+    registry: &Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
+    task_id: &str,
+) -> Vec<MrfRepairNoticeTarget> {
+    lock_mrf_repair_notice_targets(registry).remove(task_id).unwrap_or_default()
+}
+
+fn move_mrf_repair_notice_targets(
+    registry: &Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
+    from_task_id: &str,
+    to_task_id: &str,
+) {
+    if from_task_id == to_task_id {
+        return;
+    }
+    let mut registry = lock_mrf_repair_notice_targets(registry);
+    let Some(moving) = registry.remove(from_task_id) else {
+        return;
+    };
+    let targets = registry.entry(to_task_id.to_string()).or_default();
+    for target in moving {
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+}
+
+fn emit_mrf_repaired_events(targets: Vec<MrfRepairNoticeTarget>) {
+    for target in targets {
+        rustfs_common::mrf_channel::note_mrf_repaired(&target.bucket, &target.object, target.version_id);
+    }
 }
 
 pub(super) fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
