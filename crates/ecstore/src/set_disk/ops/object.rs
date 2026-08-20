@@ -3771,7 +3771,7 @@ pub(crate) async fn complete_transition_upload<Remote, Producer>(
     producer: Producer,
     expected_size: u64,
     consumed: Arc<AtomicU64>,
-) -> std::result::Result<TransitionUploadCompletion, TransitionUploadFailure>
+) -> std::result::Result<TransitionUploadCompletion, Box<TransitionUploadFailure>>
 where
     Remote: Future<Output = std::result::Result<String, std::io::Error>>,
     Producer: Future<Output = Result<u64>>,
@@ -3789,23 +3789,23 @@ where
                 Err(_) => StorageError::Unexpected,
                 Ok(Ok(_)) => StorageError::Io(remote_error),
             };
-            return Err(TransitionUploadFailure { error, candidate: None });
+            return Err(Box::new(TransitionUploadFailure { error, candidate: None }));
         }
     };
     let candidate = TransitionUploadCandidate::from_put_response(remote_version);
     let produced = match producer_result {
         Ok(Ok(produced)) => produced,
         Ok(Err(error)) => {
-            return Err(TransitionUploadFailure {
+            return Err(Box::new(TransitionUploadFailure {
                 error,
                 candidate: Some(candidate),
-            });
+            }));
         }
         Err(_) => {
-            return Err(TransitionUploadFailure {
+            return Err(Box::new(TransitionUploadFailure {
                 error: StorageError::Unexpected,
                 candidate: Some(candidate),
-            });
+            }));
         }
     };
     let consumed = consumed.load(Ordering::Acquire);
@@ -3815,10 +3815,10 @@ where
         } else {
             StorageError::MoreData
         };
-        return Err(TransitionUploadFailure {
+        return Err(Box::new(TransitionUploadFailure {
             error,
             candidate: Some(candidate),
-        });
+        }));
     }
     Ok(TransitionUploadCompletion {
         candidate,

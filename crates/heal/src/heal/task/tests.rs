@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{DiskOption, DiskStore, Endpoint, HealDiskExt as _, new_disk};
+use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
 use crate::heal::storage::{HealListItem, HealObjectInfo};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, TraceSubscription, TraceVal, subscribe_trace_events};

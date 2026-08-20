@@ -643,7 +643,7 @@ mod tests {
     fn decode_hex_fixture(value: &str) -> Vec<u8> {
         value
             .split_ascii_whitespace()
-            .flat_map(|line| line.as_bytes().chunks_exact(2))
+            .flat_map(|line| line.as_bytes().as_chunks::<2>().0.iter())
             .map(|pair| {
                 let pair = std::str::from_utf8(pair).expect("fixture contains ASCII hex");
                 u8::from_str_radix(pair, 16).expect("fixture contains valid hex")
