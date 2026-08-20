@@ -5717,8 +5717,8 @@ mod tests {
             .filter(|(composite, _, _, _)| {
                 composite.key().name() == "rustfs_s3_put_object_stage_duration_ms"
                     && composite.key().labels().any(|label| {
-                        label.key().to_string() == "stage"
-                            && label.value().to_string() == rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT
+                        label.key() == "stage"
+                            && label.value() == rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_WAIT
                     })
             })
             .map(|(_, _, _, value)| match value {

@@ -744,10 +744,8 @@ fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
     let mut running = HashMap::new();
     running.insert("pool_0_set_1".to_string(), 1);
 
-    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
-        |request| can_schedule_request(request, &running, 1),
-        |request| heal_request_set_key(request),
-    );
+    let (popped, skipped_sets) =
+        queue.pop_runnable_with_skips(|request| can_schedule_request(request, &running, 1), heal_request_set_key);
     let popped = popped.expect("should find runnable request");
 
     assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string()]);
@@ -788,10 +786,8 @@ fn test_priority_queue_pop_runnable_restores_all_blocked_items() {
     running.insert("pool_0_set_2".to_string(), 1);
     running.insert("pool_0_set_3".to_string(), 1);
 
-    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
-        |request| can_schedule_request(request, &running, 1),
-        |request| heal_request_set_key(request),
-    );
+    let (popped, skipped_sets) =
+        queue.pop_runnable_with_skips(|request| can_schedule_request(request, &running, 1), heal_request_set_key);
 
     assert!(popped.is_none());
     assert_eq!(
@@ -843,10 +839,8 @@ fn test_priority_queue_pop_runnable_restores_deferred_with_tail() {
     running.insert("pool_0_set_1".to_string(), 1);
     running.insert("pool_0_set_2".to_string(), 1);
 
-    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
-        |request| can_schedule_request(request, &running, 1),
-        |request| heal_request_set_key(request),
-    );
+    let (popped, skipped_sets) =
+        queue.pop_runnable_with_skips(|request| can_schedule_request(request, &running, 1), heal_request_set_key);
 
     assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string(), "pool_0_set_2".to_string()]);
     assert!(matches!(
@@ -902,6 +896,31 @@ fn test_can_schedule_scoped_object_request_respects_per_set_limit() {
 
     assert!(!can_schedule_request(&request, &running, 1));
     assert!(can_schedule_request(&request, &running, 2));
+}
+
+#[test]
+fn test_heal_request_and_task_metric_labels_match() {
+    let request = HealRequest::new(
+        HealType::Object {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+        },
+        HealOptions {
+            pool_index: Some(0),
+            set_index: Some(1),
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+
+    assert_eq!(heal_request_type_label(&request), "object");
+    assert_eq!(heal_request_set_key(&request), Some("pool_0_set_1".to_string()));
+    assert_eq!(heal_request_set_metric_label(&request), "pool_0_set_1");
+
+    let task = HealTask::from_request(request, Arc::new(MockStorage));
+    assert_eq!(task.metric_type_label(), "object");
+    assert_eq!(task.metric_set_label(), "pool_0_set_1");
 }
 
 #[tokio::test]

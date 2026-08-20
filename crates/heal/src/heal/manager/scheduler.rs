@@ -567,35 +567,17 @@ impl HealManager {
 pub(super) fn heal_request_set_key(request: &HealRequest) -> Option<String> {
     match &request.heal_type {
         HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
-        HealType::Object { .. } => heal_options_set_key(&request.options),
-        _ => None,
-    }
-}
-
-pub(super) fn heal_options_set_key(options: &HealOptions) -> Option<String> {
-    match (options.pool_index, options.set_index) {
-        (Some(pool), Some(set)) => Some(format!("pool_{pool}_set_{set}")),
+        HealType::Object { .. } => request.options.set_key(),
         _ => None,
     }
 }
 
 pub(super) fn heal_request_type_label(request: &HealRequest) -> &'static str {
-    match &request.heal_type {
-        HealType::Cluster => "cluster",
-        HealType::Object { .. } => "object",
-        HealType::Bucket { .. } => "bucket",
-        HealType::Prefix { .. } => "prefix",
-        HealType::ErasureSet { .. } => "erasure_set",
-        HealType::Metadata { .. } => "metadata",
-        HealType::ECDecode { .. } => "ec_decode",
-    }
+    request.heal_type.kind_label()
 }
 
 pub(super) fn heal_request_set_metric_label(request: &HealRequest) -> String {
-    heal_request_set_key(request).unwrap_or_else(|| match (request.options.pool_index, request.options.set_index) {
-        (Some(pool), Some(set)) => format!("pool_{pool}_set_{set}"),
-        _ => "global".to_string(),
-    })
+    heal_request_set_key(request).unwrap_or_else(|| request.options.set_metric_label())
 }
 
 pub(super) fn record_scheduler_skip(set_label: &str) {
@@ -673,7 +655,7 @@ fn emit_mrf_repaired_events(targets: Vec<MrfRepairNoticeTarget>) {
 pub(super) fn heal_request_set_key_for_task(task: &HealTask) -> Option<String> {
     match &task.heal_type {
         HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
-        HealType::Object { .. } => heal_options_set_key(&task.options),
+        HealType::Object { .. } => task.options.set_key(),
         _ => None,
     }
 }

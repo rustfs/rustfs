@@ -218,15 +218,6 @@ impl HealStatistics {
         self.total_bytes_healed += bytes;
         self.last_update_time = SystemTime::now();
     }
-
-    pub fn get_success_rate(&self) -> f64 {
-        let total = self.successful_tasks + self.failed_tasks;
-        if total > 0 {
-            (self.successful_tasks as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        }
-    }
 }
 
 #[cfg(test)]
@@ -538,39 +529,5 @@ mod tests {
 
         assert_eq!(stats.total_objects_healed, 8);
         assert_eq!(stats.total_bytes_healed, 8192);
-    }
-
-    #[test]
-    fn test_heal_statistics_get_success_rate() {
-        let mut stats = HealStatistics::new();
-        stats.successful_tasks = 8;
-        stats.failed_tasks = 2;
-
-        // success_rate = 8 / (8 + 2) * 100 = 80%
-        assert!((stats.get_success_rate() - 80.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_heal_statistics_get_success_rate_zero_total() {
-        let stats = HealStatistics::new();
-        assert_eq!(stats.get_success_rate(), 0.0);
-    }
-
-    #[test]
-    fn test_heal_statistics_get_success_rate_all_success() {
-        let mut stats = HealStatistics::new();
-        stats.successful_tasks = 10;
-        stats.failed_tasks = 0;
-
-        assert!((stats.get_success_rate() - 100.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_heal_statistics_get_success_rate_all_failure() {
-        let mut stats = HealStatistics::new();
-        stats.successful_tasks = 0;
-        stats.failed_tasks = 5;
-
-        assert_eq!(stats.get_success_rate(), 0.0);
     }
 }
