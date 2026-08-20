@@ -211,6 +211,146 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
 
 static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
 
+#[cfg(not(test))]
+struct InternodeServerMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+}
+
+#[cfg(not(test))]
+impl InternodeServerMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => server),
+            recv_bytes: counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => server),
+            outgoing_requests: counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => server),
+            incoming_requests: counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => server),
+            errors: counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => server),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static INTERNODE_SERVER_METRIC_HANDLES: LazyLock<InternodeServerMetricHandles> =
+    LazyLock::new(|| InternodeServerMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+struct GrpcReadVersionMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+    duration: metrics::Histogram,
+    request_encode: metrics::Histogram,
+    request_decode: metrics::Histogram,
+    disk_read: metrics::Histogram,
+    response_json_encode: metrics::Histogram,
+    response_msgpack_encode: metrics::Histogram,
+    rpc_roundtrip: metrics::Histogram,
+    response_decode: metrics::Histogram,
+}
+
+#[cfg(not(test))]
+impl GrpcReadVersionMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!(
+                INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            recv_bytes: counter!(
+                INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            outgoing_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            incoming_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            errors: counter!(
+                INTERNODE_OPERATION_ERRORS_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            duration: metrics::histogram!(
+                INTERNODE_OPERATION_DURATION_MS,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            request_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE),
+            request_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE),
+            disk_read: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_DISK_READ),
+            response_json_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE),
+            response_msgpack_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE),
+            rpc_roundtrip: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP),
+            response_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE),
+        }
+    }
+
+    fn stage_duration(server: &'static str, stage: &'static str) -> metrics::Histogram {
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => server,
+            OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+            BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC,
+            STAGE_LABEL => stage
+        )
+    }
+
+    fn stage_duration_for(&self, stage: &'static str) -> Option<&metrics::Histogram> {
+        match stage {
+            INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE => Some(&self.request_encode),
+            INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE => Some(&self.request_decode),
+            INTERNODE_STAGE_READ_VERSION_DISK_READ => Some(&self.disk_read),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE => Some(&self.response_json_encode),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE => Some(&self.response_msgpack_encode),
+            INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP => Some(&self.rpc_roundtrip),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE => Some(&self.response_decode),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(test))]
+static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> =
+    LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    Some(&INTERNODE_SERVER_METRIC_HANDLES)
+}
+
+#[cfg(not(test))]
+fn grpc_read_version_metric_handles_if_ready(
+    operation: &'static str,
+    backend: &'static str,
+) -> Option<&'static GrpcReadVersionMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    if operation == INTERNODE_OPERATION_GRPC_READ_VERSION && backend == INTERNODE_TRANSPORT_BACKEND_GRPC {
+        Some(&GRPC_READ_VERSION_METRIC_HANDLES)
+    } else {
+        None
+    }
+}
+
 /// Injects the stable server label (node name or address) stamped on
 /// internode metrics. The runtime calls this when the local node name is
 /// published (see ecstore's `set_local_node_name`); the first write wins.
@@ -284,6 +424,11 @@ impl InternodeMetrics {
             return;
         }
         self.sent_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.sent_bytes.increment(bytes);
+            return;
+        }
         counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
@@ -296,6 +441,11 @@ impl InternodeMetrics {
 
         let bytes = bytes as u64;
         if bytes == 0 {
+            return;
+        }
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.sent_bytes.increment(bytes);
             return;
         }
         counter!(
@@ -313,6 +463,11 @@ impl InternodeMetrics {
             return;
         }
         self.recv_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
         counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
@@ -327,6 +482,11 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_RECV_BYTES_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -338,6 +498,11 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -347,6 +512,11 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_outgoing_request();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -358,6 +528,11 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request(&self) {
         self.incoming_requests_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.incoming_requests.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -367,6 +542,11 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_incoming_request();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.incoming_requests.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -378,6 +558,11 @@ impl InternodeMetrics {
 
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.errors.increment(1);
+            return;
+        }
         counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
@@ -387,6 +572,11 @@ impl InternodeMetrics {
 
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.errors.increment(1);
+            return;
+        }
         counter!(
             INTERNODE_OPERATION_ERRORS_TOTAL,
             SERVER_LABEL => current_server_label(),
@@ -398,6 +588,11 @@ impl InternodeMetrics {
 
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.duration.record(duration_ms);
+            return;
+        }
         metrics::histogram!(
             INTERNODE_OPERATION_DURATION_MS,
             SERVER_LABEL => current_server_label(),
@@ -415,6 +610,13 @@ impl InternodeMetrics {
         duration: Duration,
     ) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend)
+            && let Some(histogram) = handles.stage_duration_for(stage)
+        {
+            histogram.record(duration_ms);
+            return;
+        }
         metrics::histogram!(
             INTERNODE_OPERATION_STAGE_DURATION_MS,
             SERVER_LABEL => current_server_label(),
