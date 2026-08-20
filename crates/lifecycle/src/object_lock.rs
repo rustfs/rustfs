@@ -113,8 +113,8 @@ fn explicit_lock_metadata_is_well_formed(user_defined: &HashMap<String, String>)
 
 fn default_retention_until(mod_time: OffsetDateTime, retention: &s3s::dto::DefaultRetention) -> Option<OffsetDateTime> {
     match (retention.days, retention.years) {
-        (Some(days), None) if days >= 0 => Some(mod_time.saturating_add(time::Duration::days(i64::from(days)))),
-        (None, Some(years)) if years >= 0 => add_years(mod_time, years),
+        (Some(days), None) if days > 0 => Some(mod_time.saturating_add(time::Duration::days(i64::from(days)))),
+        (None, Some(years)) if years > 0 => add_years(mod_time, years),
         _ => None,
     }
 }
@@ -182,6 +182,31 @@ mod tests {
         let config = default_retention_config(30);
 
         assert!(is_object_locked(&HashMap::new(), false, Some(&config), None));
+    }
+
+    #[test]
+    fn zero_default_retention_days_fail_closed() {
+        let config = default_retention_config(0);
+        let created = OffsetDateTime::now_utc() - Duration::days(2);
+
+        assert!(is_object_locked(&HashMap::new(), false, Some(&config), Some(created)));
+    }
+
+    #[test]
+    fn zero_default_retention_years_fail_closed() {
+        let config = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(ObjectLockRule {
+                default_retention: Some(DefaultRetention {
+                    days: None,
+                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    years: Some(0),
+                }),
+            }),
+        };
+        let created = OffsetDateTime::now_utc() - Duration::days(2);
+
+        assert!(is_object_locked(&HashMap::new(), false, Some(&config), Some(created)));
     }
 
     #[test]
