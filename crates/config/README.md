@@ -115,6 +115,15 @@ Current guidance:
   - enables KMS readiness enforcement for `/health/ready`.
   - default is `false`.
 
+## Object lock admission environment variables
+
+- `RUSTFS_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS`
+  - experimental same-object PUT commit namespace-lock admission budget.
+  - default is `0`, which disables this override and keeps `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` behavior.
+  - when set, only `put_object_commit` write-lock acquisition is bounded by this millisecond budget; other namespace lock users keep the global object-lock timeout.
+  - timeout returns S3 `SlowDown`, so clients should use normal SDK retry handling.
+  - this is not a fdatasync or group-commit switch. Track fdatasync batching separately with `rustfs_s3_put_object_rename_fdatasync_batch_files`.
+
 ## Drive timeout environment variables
 
 - `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS`

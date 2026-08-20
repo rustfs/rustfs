@@ -2694,7 +2694,7 @@ async fn ssec_passthrough_probe_object(
     let head = target_client
         .head_object(target_bucket, probe_key, head_version)
         .await
-        .map_err(S3ClientError::from)?;
+        .map_err(|err| S3ClientError::from(*err))?;
 
     Ok(ReplicationSsecProbeOutcome {
         evidence_present: head.sse_customer_algorithm().is_some_and(|algorithm| !algorithm.is_empty()),

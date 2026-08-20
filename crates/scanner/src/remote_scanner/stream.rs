@@ -22,7 +22,7 @@ use crate::scanner_io::{
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
-    DataUsageScanPlanDigest, Disk, ScannerDiskExt as _, ScannerError, StorageError, resolve_scanner_object_store_handle,
+    DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_common::heal_channel::HealScanMode;

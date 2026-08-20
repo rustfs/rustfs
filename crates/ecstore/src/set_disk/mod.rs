@@ -1539,6 +1539,50 @@ fn put_object_commit_lock_timeout_override_enabled(op: &'static str) -> bool {
     op == "put_object_commit" && get_put_object_commit_lock_acquire_timeout_override_ms() != 0
 }
 
+fn put_object_commit_lock_admission_budget_label() -> &'static str {
+    match get_put_object_commit_lock_acquire_timeout_override_ms() {
+        0 => rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED,
+        1..=250 => rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+        251..=500 => rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS,
+        501..=1000 => rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_1000MS,
+        _ => rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_GT_1000MS,
+    }
+}
+
+fn record_put_object_commit_lock_admission(op: &'static str, outcome: &'static str) {
+    if op != "put_object_commit" || !rustfs_io_metrics::put_stage_metrics_enabled() {
+        return;
+    }
+    rustfs_io_metrics::record_put_object_commit_lock_admission(put_object_commit_lock_admission_budget_label(), outcome);
+}
+
+fn put_object_commit_lock_acquire_error_outcome(op: &'static str, err: &rustfs_lock::error::LockError) -> &'static str {
+    if put_object_commit_lock_timeout_override_enabled(op) && matches!(err, rustfs_lock::error::LockError::Timeout { .. }) {
+        rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN
+    } else {
+        rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR
+    }
+}
+
+fn resolve_put_object_commit_lock_acquire_result(
+    set: &SetDisks,
+    op: &'static str,
+    bucket: &str,
+    object: &str,
+    result: std::result::Result<rustfs_lock::namespace::NamespaceLockGuard, rustfs_lock::error::LockError>,
+) -> Result<rustfs_lock::namespace::NamespaceLockGuard> {
+    match result {
+        Ok(guard) => {
+            record_put_object_commit_lock_admission(op, rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED);
+            Ok(guard)
+        }
+        Err(err) => {
+            record_put_object_commit_lock_admission(op, put_object_commit_lock_acquire_error_outcome(op, &err));
+            Err(map_put_object_commit_lock_acquire_error(set, op, bucket, object, err))
+        }
+    }
+}
+
 fn map_put_object_commit_lock_acquire_error(
     set: &SetDisks,
     op: &'static str,
@@ -3355,10 +3399,13 @@ impl SetDisks {
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
-        let guard = ns_lock
-            .get_write_lock(acquire_timeout)
-            .await
-            .map_err(|e| map_put_object_commit_lock_acquire_error(self, op, bucket, object, e))?;
+        let guard = resolve_put_object_commit_lock_acquire_result(
+            self,
+            op,
+            bucket,
+            object,
+            ns_lock.get_write_lock(acquire_timeout).await,
+        )?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -3397,17 +3444,22 @@ impl SetDisks {
         let acquire = ns_lock.get_write_lock(acquire_timeout);
         tokio::pin!(acquire);
         let mut on_pending = Some(on_pending);
-        let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
-            std::task::Poll::Pending => {
-                if let Some(on_pending) = on_pending.take() {
-                    on_pending();
+        let guard = resolve_put_object_commit_lock_acquire_result(
+            self,
+            op,
+            bucket,
+            object,
+            futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+                std::task::Poll::Pending => {
+                    if let Some(on_pending) = on_pending.take() {
+                        on_pending();
+                    }
+                    std::task::Poll::Pending
                 }
-                std::task::Poll::Pending
-            }
-            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
-        })
-        .await
-        .map_err(|e| map_put_object_commit_lock_acquire_error(self, op, bucket, object, e))?;
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+            })
+            .await,
+        )?;
         Self::record_put_object_commit_namespace_lock_wait(op, acquire_start);
         let owner = diag_enabled.then(|| ns_lock.owner().to_string());
         self.log_object_lock_acquire_if_slow(
@@ -5782,6 +5834,81 @@ mod tests {
             .sum()
     }
 
+    fn put_object_commit_lock_admission_count(
+        rows: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        budget: &'static str,
+        outcome: &'static str,
+    ) -> u64 {
+        rows.iter()
+            .filter(|(composite, _, _, _)| {
+                composite.key().name() == "rustfs_s3_put_object_commit_namespace_lock_admission_total"
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "budget" && label.value() == budget)
+                    && composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "outcome" && label.value() == outcome)
+            })
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(count) => *count,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_budget_labels_are_bounded() {
+        let cases = [
+            ("0", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED),
+            ("250", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS),
+            ("251", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS),
+            ("500", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS),
+            ("501", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_1000MS),
+            ("1000", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_1000MS),
+            ("1001", rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_GT_1000MS),
+        ];
+        for (timeout_ms, expected) in cases {
+            temp_env::with_vars(
+                [(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some(timeout_ms))],
+                || {
+                    assert_eq!(put_object_commit_lock_admission_budget_label(), expected);
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_error_outcomes_are_bounded() {
+        let timeout = LockError::timeout("bucket/object", Duration::from_millis(1));
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("1"))], || {
+            assert_eq!(
+                put_object_commit_lock_acquire_error_outcome("put_object_commit", &timeout),
+                rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN
+            );
+            assert_eq!(
+                put_object_commit_lock_acquire_error_outcome("complete_multipart_upload_commit", &timeout),
+                rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR
+            );
+        });
+
+        let internal = LockError::internal("simulated lock manager error");
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("1"))], || {
+            assert_eq!(
+                put_object_commit_lock_acquire_error_outcome("put_object_commit", &internal),
+                rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR
+            );
+        });
+    }
+
     #[test]
     #[serial]
     fn put_object_commit_namespace_lock_wait_metric_is_wired_to_both_write_lock_paths() {
@@ -5902,6 +6029,231 @@ mod tests {
                     .await
                     .expect("permit should not leak after timeout");
             });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_records_acquired_and_timeout() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("1"))], || {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+                runtime.block_on(async {
+                    let ctx = Arc::new(InstanceContext::new());
+                    ctx.update_erasure_type(SetupType::Erasure).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    let held_guard = set
+                        .acquire_write_lock_diag("put_object_commit", "bucket", "object")
+                        .await
+                        .expect("holder acquire should succeed");
+                    let err = match set.acquire_write_lock_diag("put_object_commit", "bucket", "object").await {
+                        Ok(_) => panic!("contended PUT commit acquire should return SlowDown"),
+                        Err(err) => err,
+                    };
+                    assert!(matches!(err, StorageError::SlowDown));
+                    drop(held_guard);
+                    rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+                });
+            });
+
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED,
+                ),
+                1
+            );
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN,
+                ),
+                1
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_records_disabled_budget_acquired() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("0"))], || {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+                runtime.block_on(async {
+                    let ctx = Arc::new(InstanceContext::new());
+                    ctx.update_erasure_type(SetupType::Erasure).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    let guard = set
+                        .acquire_write_lock_diag("put_object_commit", "bucket", "object")
+                        .await
+                        .expect("PUT commit acquire should succeed with default timeout");
+                    drop(guard);
+                    rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+                });
+            });
+
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED,
+                ),
+                1
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_skips_non_put_commit_ops() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("250"))], || {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+                runtime.block_on(async {
+                    let ctx = Arc::new(InstanceContext::new());
+                    ctx.update_erasure_type(SetupType::Erasure).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    let guard = set
+                        .acquire_write_lock_diag("complete_multipart_upload_commit", "bucket", "object")
+                        .await
+                        .expect("non-PUT commit acquire should succeed");
+                    drop(guard);
+                    rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+                });
+            });
+
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                rows.iter()
+                    .filter(|(composite, _, _, _)| {
+                        composite.key().name() == "rustfs_s3_put_object_commit_namespace_lock_admission_total"
+                    })
+                    .count(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_records_lock_error() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("250"))], || {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+                runtime.block_on(async {
+                    let healthy: Arc<dyn LockClient> =
+                        Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+                    let failing: Arc<dyn LockClient> = Arc::new(FailingClient);
+                    let ctx = Arc::new(InstanceContext::new());
+                    ctx.update_erasure_type(SetupType::DistErasure).await;
+                    let set = make_test_set_disks_with_ctx(vec![healthy, failing], ctx).await;
+                    assert!(
+                        set.acquire_write_lock_diag("put_object_commit", "bucket", "object")
+                            .await
+                            .is_err(),
+                        "one healthy locker must not satisfy the PUT commit write quorum"
+                    );
+                    rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+                });
+            });
+
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR,
+                ),
+                1
+            );
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN,
+                ),
+                0
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn put_object_commit_lock_admission_records_pending_hook_acquired() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        temp_env::with_vars([(rustfs_config::ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS, Some("500"))], || {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                rustfs_io_metrics::set_put_stage_metrics_enabled(true);
+                runtime.block_on(async {
+                    let ctx = Arc::new(InstanceContext::new());
+                    ctx.update_erasure_type(SetupType::Erasure).await;
+                    let set = make_test_set_disks_with_ctx(Vec::new(), ctx).await;
+                    let held_guard = set
+                        .acquire_write_lock_diag("put_object_commit", "bucket", "object")
+                        .await
+                        .expect("holder acquire should succeed");
+                    let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+                    let pending_acquire =
+                        set.acquire_write_lock_diag_with_pending_hook("put_object_commit", "bucket", "object", move || {
+                            let _ = pending_tx.send(());
+                        });
+                    let release_holder = async {
+                        pending_rx.await.expect("pending hook should fire");
+                        drop(held_guard);
+                    };
+                    let (pending_guard, ()) = tokio::join!(pending_acquire, release_holder);
+                    drop(pending_guard.expect("pending-hook PUT commit acquire should succeed"));
+                    rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+                });
+            });
+
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                put_object_commit_lock_admission_count(
+                    &rows,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS,
+                    rustfs_io_metrics::PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED,
+                ),
+                2
+            );
         });
     }
 
