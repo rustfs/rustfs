@@ -267,6 +267,7 @@ tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time
 # dispatcher to keep tracing's process-global callsite-interest cache honest.
 tracing-core = { workspace = true }
 serial_test = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 proptest = "1"
 rcgen.workspace = true
