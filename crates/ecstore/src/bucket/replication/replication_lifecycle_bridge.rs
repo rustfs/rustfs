@@ -23,6 +23,8 @@ use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_storage_boundary::{
     DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, deleted_object_for_replication,
 };
+#[cfg(test)]
+use std::sync::Mutex;
 
 #[allow(
     dead_code,
@@ -31,6 +33,9 @@ use super::replication_storage_boundary::{
 pub(crate) type ReplicationLifecycleConfig = ReplicationConfig;
 
 pub(crate) struct ReplicationLifecycleBridge;
+
+#[cfg(test)]
+static SCHEDULED_DELETE_OBJECTS: Mutex<Vec<DeletedObject>> = Mutex::new(Vec::new());
 
 impl ReplicationLifecycleBridge {
     #[allow(
@@ -85,6 +90,13 @@ impl ReplicationLifecycleBridge {
     }
 
     pub(crate) async fn schedule_delete(bucket: String, delete_object: DeletedObject) {
+        #[cfg(test)]
+        {
+            SCHEDULED_DELETE_OBJECTS
+                .lock()
+                .expect("scheduled delete test hook lock should not poison")
+                .push(delete_object.clone());
+        }
         super::replication_pool::schedule_replication_delete(DeletedObjectReplicationInfo {
             delete_object: deleted_object_for_replication(delete_object),
             bucket,
@@ -92,6 +104,15 @@ impl ReplicationLifecycleBridge {
             ..Default::default()
         })
         .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_scheduled_deletes_for_test() -> Vec<DeletedObject> {
+        std::mem::take(
+            &mut *SCHEDULED_DELETE_OBJECTS
+                .lock()
+                .expect("scheduled delete test hook lock should not poison"),
+        )
     }
 }
 

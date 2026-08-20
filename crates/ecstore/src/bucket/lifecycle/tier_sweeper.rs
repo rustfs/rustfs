@@ -334,32 +334,6 @@ impl TierDeleteSourceIdentity {
         }
     }
 
-    pub(crate) fn lookup_options(&self) -> crate::object_api::ObjectOptions {
-        crate::object_api::ObjectOptions {
-            version_id: self.version_id.clone(),
-            versioned: self.versioned,
-            version_suspended: self.version_suspended,
-            ..Default::default()
-        }
-    }
-
-    pub(crate) fn matches(&self, info: &ObjectInfo) -> bool {
-        if self.bucket != info.bucket {
-            return false;
-        }
-        if let Some(version_id) = &self.version_id {
-            return info.version_id.map(|id| id.to_string()).as_deref() == Some(version_id.as_str())
-                && self.data_dir == info.data_dir.map(|id| id.to_string());
-        }
-        if self.data_dir.is_some() {
-            return self.data_dir == info.data_dir.map(|id| id.to_string());
-        }
-        self.etag.is_some()
-            && self.etag == info.etag
-            && self.mod_time.is_some()
-            && self.mod_time == info.mod_time.map(|time| time.to_string())
-    }
-
     pub(crate) fn has_stable_identity(&self) -> bool {
         self.version_id.is_some() || self.data_dir.is_some() || (self.etag.is_some() && self.mod_time.is_some())
     }

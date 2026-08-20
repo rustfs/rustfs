@@ -1162,55 +1162,71 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
     assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[test]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-async fn get_transitioned_object_uses_remote_codec_fallback_path() {
-    with_get_codec_streaming_remote_probe_env(|| async {
-        let (_disk_paths, ecstore) = setup_test_env().await;
+fn get_transitioned_object_uses_remote_codec_fallback_path() {
+    // CI's default test stack overflows this deep async path; run it on a dedicated large-stack thread.
+    std::thread::Builder::new()
+        .name("lifecycle-transition-remote-codec-fallback".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("remote codec fallback test runtime should build");
 
-        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
-        let backend = register_mock_tier(&tier_name).await;
+            runtime.block_on(async {
+                with_get_codec_streaming_remote_probe_env(|| async {
+                    let (_disk_paths, ecstore) = setup_test_env().await;
 
-        let bucket = format!("test-api-get-remote-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let object = "test/remote-codec-fallback.txt";
-        let payload: Vec<u8> = (0..(1024 * 1024))
-            .map(|index| u8::try_from(index % 251).expect("payload byte fits in u8"))
-            .collect();
+                    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+                    let backend = register_mock_tier(&tier_name).await;
 
-        create_test_bucket(&ecstore, bucket.as_str()).await;
+                    let bucket = format!("test-api-get-remote-{}", &Uuid::new_v4().simple().to_string()[..8]);
+                    let object = "test/remote-codec-fallback.txt";
+                    let payload: Vec<u8> = (0..(1024 * 1024))
+                        .map(|index| u8::try_from(index % 251).expect("payload byte fits in u8"))
+                        .collect();
 
-        let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
-        let transition_opts = ObjectOptions {
-            transition: lifecycle::lifecycle_contract::TransitionOptions {
-                status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
-                tier: tier_name.clone(),
-                etag: uploaded.etag.clone().unwrap_or_default(),
-                ..Default::default()
-            },
-            version_id: uploaded.version_id.map(|version| version.to_string()),
-            versioned: true,
-            mod_time: uploaded.mod_time,
-            ..Default::default()
-        };
-        ecstore
-            .transition_object(bucket.as_str(), object, &transition_opts)
-            .await
-            .expect("Failed to transition object directly");
+                    create_test_bucket(&ecstore, bucket.as_str()).await;
 
-        let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
-            .await
-            .expect("object should transition before remote fallback GET");
+                    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+                    let transition_opts = ObjectOptions {
+                        transition: lifecycle::lifecycle_contract::TransitionOptions {
+                            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+                            tier: tier_name.clone(),
+                            etag: uploaded.etag.clone().unwrap_or_default(),
+                            ..Default::default()
+                        },
+                        version_id: uploaded.version_id.map(|version| version.to_string()),
+                        versioned: true,
+                        mod_time: uploaded.mod_time,
+                        ..Default::default()
+                    };
+                    ecstore
+                        .transition_object(bucket.as_str(), object, &transition_opts)
+                        .await
+                        .expect("Failed to transition object directly");
 
-        assert_eq!(transitioned.transitioned_object.status, "complete");
-        assert_eq!(transitioned.transitioned_object.tier, tier_name);
-        assert!(!transitioned.transitioned_object.name.is_empty());
-        assert!(backend.contains(&transitioned.transitioned_object.name).await);
+                    let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+                        .await
+                        .expect("object should transition before remote fallback GET");
 
-        let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
-        assert_eq!(actual, payload);
-    })
-    .await;
+                    assert_eq!(transitioned.transitioned_object.status, "complete");
+                    assert_eq!(transitioned.transitioned_object.tier, tier_name);
+                    assert!(!transitioned.transitioned_object.name.is_empty());
+                    assert!(backend.contains(&transitioned.transitioned_object.name).await);
+
+                    let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
+                    assert_eq!(actual, payload);
+                })
+                .await;
+            });
+        })
+        .expect("remote codec fallback test thread should spawn")
+        .join()
+        .expect("remote codec fallback test thread should not panic");
 }
 
 /// Regression test for rustfs/rustfs#4827: a duplicate transition task that runs
@@ -2059,9 +2075,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
-        message.contains(
-            "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket"
-        ),
+        message.contains("Days must be a positive integer with DelMarkerExpiration"),
         "unexpected error message: {message}"
     );
 }
