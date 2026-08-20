@@ -6268,10 +6268,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             }
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                             if let Some((_, deleted_object)) = replication_delete {
-                                opts.lifecycle_delete_all_journal()
-                                    .ok_or(StorageError::PreconditionFailed)?
-                                    .lock()
-                                    .record_replication_delete(deleted_object.clone());
                                 ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
                             }
                         }
@@ -14043,6 +14039,7 @@ mod delete_objects_lock_gating_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_with_lockers_and_ctx;
     use super::*;
     use crate::disk::DiskAPI as _;
+    use serial_test::serial;
 
     async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
         let mut reader = PutObjReader::from_vec(vec![3u8; 1024]);
@@ -14277,6 +14274,7 @@ mod delete_objects_lock_gating_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn lifecycle_delete_all_history_records_exact_replication_purge() {
         use s3s::dto::{
             BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
@@ -14362,22 +14360,19 @@ mod delete_objects_lock_gating_tests {
             ..Default::default()
         };
         opts.ensure_lifecycle_delete_all_journal();
+        let _ = crate::bucket::replication::ReplicationLifecycleBridge::take_scheduled_deletes_for_test();
 
         set_disks
             .delete_object(bucket, object, opts.clone())
             .await
             .expect("history phase should delete the old version");
 
-        let deletes = opts
-            .lifecycle_delete_all_journal()
-            .expect("delete-all journal should be initialized")
-            .lock()
-            .replication_deletes();
-        assert_eq!(deletes.len(), 1);
-        assert_eq!(deletes[0].object_name, object);
-        assert_eq!(deletes[0].version_id, Some(first_version_id));
-        assert!(!deletes[0].delete_marker);
-        let state = deletes[0]
+        let scheduled = crate::bucket::replication::ReplicationLifecycleBridge::take_scheduled_deletes_for_test();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].object_name, object);
+        assert_eq!(scheduled[0].version_id, Some(first_version_id));
+        assert!(!scheduled[0].delete_marker);
+        let state = scheduled[0]
             .replication_state
             .as_ref()
             .expect("delete-all history purge should carry replication state");

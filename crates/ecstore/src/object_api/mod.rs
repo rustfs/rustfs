@@ -25,7 +25,6 @@ use crate::error::{Error, Result};
 use crate::io_support::rio::{HardLimitReader, HashReader};
 use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
-    object::DeletedObject,
     range::HTTPRangeSpec,
 };
 use crate::store::utils::clean_metadata;
