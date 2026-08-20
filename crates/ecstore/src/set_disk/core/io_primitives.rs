@@ -138,6 +138,7 @@ use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+pub(in crate::set_disk) const ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE: &str = "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE";
 /// Default reader-setup strategy for the GET read path (rustfs/backlog#1215,
 /// #1159, #923).
 ///
@@ -3181,6 +3182,7 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) cleanup_disks: Vec<Option<DiskStore>>,
     pub(in crate::set_disk) old_current_size: Option<OldCurrentSize>,
     pub(in crate::set_disk) committed_file_info: FileInfo,
+    pub(in crate::set_disk) tail_drain: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -3191,6 +3193,10 @@ type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
     Option<OldCurrentSize>,
 );
+
+fn put_rename_early_ack_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, false)
+}
 
 impl RenameDataCommit {
     #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -3290,6 +3296,49 @@ impl SetDisks {
         }
     }
 
+    fn rename_data_commit_from_observations(
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        disk_versions: &[Option<Vec<u8>>],
+        errs: &[Option<DiskError>],
+        cleanup_data_dirs: &[Option<Uuid>],
+        old_current_sizes: &[Option<OldCurrentSize>],
+        write_quorum: usize,
+    ) -> disk::error::Result<RenameDataCommit> {
+        let data_dir = Self::reduce_common_data_dir(cleanup_data_dirs, write_quorum);
+        let convergence = Self::classify_rename_convergence(disk_versions, errs);
+        let old_current_size = Self::reduce_common_old_current_size(old_current_sizes, write_quorum);
+        let online_disks = Self::eval_disks(disks, errs);
+        let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
+        let committed_file_info = file_infos.get(committed_slot).cloned().ok_or(DiskError::Unexpected)?;
+        let cleanup_disks = if let Some(data_dir) = data_dir {
+            disks
+                .iter()
+                .zip(errs.iter())
+                .zip(cleanup_data_dirs.iter())
+                .map(|((disk, err), old_data_dir)| {
+                    if err.is_none() && *old_data_dir == Some(data_dir) {
+                        disk.clone()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; disks.len()]
+        };
+
+        Ok(RenameDataCommit {
+            online_disks,
+            convergence,
+            data_dir,
+            cleanup_disks,
+            old_current_size,
+            committed_file_info,
+            tail_drain: None,
+        })
+    }
+
     pub(in crate::set_disk) async fn abort_quota_reservation_after_fence(
         reservation: crate::bucket::quota::reservation::QuotaReservation,
         disks: &[Option<DiskStore>],
@@ -3328,6 +3377,274 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
+    async fn rename_data_owned_early_ack(
+        disks: &[Option<DiskStore>],
+        src_bucket: &str,
+        src_object: &str,
+        file_infos: Vec<FileInfo>,
+        dst_bucket: &str,
+        dst_object: &str,
+        write_quorum: usize,
+    ) -> disk::error::Result<RenameDataCommit> {
+        if let Some(file_info) = disks
+            .iter()
+            .zip(file_infos.iter())
+            .find_map(|(disk, file_info)| disk.as_ref().map(|_| file_info))
+        {
+            if file_info.is_canonical_delete_marker() {
+                file_info.validate_for_metadata_read()?;
+            } else {
+                file_info.validate_for_erasure_write()?;
+            }
+        }
+
+        let disk_count = disks.len();
+        let fanout_disks = disks.to_vec();
+        let coordinator_disks = fanout_disks.clone();
+        let src_bucket = Arc::new(src_bucket.to_string());
+        let src_object = Arc::new(src_object.to_string());
+        let dst_bucket = Arc::new(dst_bucket.to_string());
+        let dst_object = Arc::new(dst_object.to_string());
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+
+        let tail_drain = tokio::spawn({
+            let fanout_src_bucket = src_bucket.clone();
+            let fanout_src_object = src_object.clone();
+            let fanout_dst_bucket = dst_bucket.clone();
+            let fanout_dst_object = dst_object.clone();
+            async move {
+                let successful_rename_completion_rank =
+                    rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+                let mut tasks = JoinSet::new();
+                for (i, (disk, file_info)) in fanout_disks.into_iter().zip(file_infos.iter()).enumerate() {
+                    let src_bucket = fanout_src_bucket.clone();
+                    let src_object = fanout_src_object.clone();
+                    let dst_bucket = fanout_dst_bucket.clone();
+                    let dst_object = fanout_dst_object.clone();
+                    let file_info = file_info.clone();
+                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    tasks.spawn(async move {
+                        let result = std::panic::AssertUnwindSafe(async move {
+                            #[allow(clippy::let_unit_value)]
+                            let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+
+                            let Some(disk) = disk else {
+                                return Err(DiskError::DiskNotFound);
+                            };
+
+                            let is_delete_marker = file_info.is_canonical_delete_marker();
+                            let mut local_file_info;
+                            let file_info = if file_info.erasure.index == 0 {
+                                local_file_info = file_info.clone();
+                                local_file_info.erasure.index = i + 1;
+                                &local_file_info
+                            } else {
+                                &file_info
+                            };
+                            if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
+                                return Err(DiskError::FileCorrupt);
+                            }
+
+                            Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
+
+                            if let Some(err) = Self::rename_injected_error(&dst_object, i) {
+                                return Err(err);
+                            }
+
+                            let disk_wait_started = rustfs_io_metrics::put_stage_timer();
+                            let result = disk
+                                .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                                .await;
+                            if let Some(disk_wait_started) = disk_wait_started {
+                                let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
+                                rustfs_io_metrics::record_put_object_stage_duration(
+                                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                                    duration_ms,
+                                );
+                                let position = if result.is_ok() {
+                                    let rank = successful_rename_completion_rank
+                                        .as_ref()
+                                        .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
+                                        .unwrap_or(1);
+                                    if rank <= write_quorum {
+                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
+                                    } else {
+                                        rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
+                                    }
+                                } else {
+                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
+                                };
+                                rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
+                            }
+                            result
+                        })
+                        .catch_unwind()
+                        .await;
+                        (i, result)
+                    });
+                }
+
+                let mut commit_tx = Some(commit_tx);
+                let mut sent_commit = false;
+                let mut success_count = 0usize;
+                let mut fanout_panic = 0usize;
+                let mut results_seen = 0usize;
+                let mut errs = vec![Some(DiskError::DiskNotFound); disk_count];
+                let mut disk_versions = vec![None; disk_count];
+                let mut data_dirs = vec![None; disk_count];
+                let mut cleanup_data_dirs = vec![None; disk_count];
+                let mut old_current_sizes = vec![None; disk_count];
+
+                while let Some(joined) = tasks.join_next().await {
+                    results_seen += 1;
+                    match joined {
+                        Ok((idx, Ok(Ok(res)))) => {
+                            data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
+                            cleanup_data_dirs[idx] = res.cleanup_data_dir;
+                            disk_versions[idx] = res.sign;
+                            old_current_sizes[idx] = res.old_current_size;
+                            errs[idx] = None;
+                            success_count += 1;
+                        }
+                        Ok((idx, Ok(Err(err)))) => {
+                            errs[idx] = Some(err);
+                        }
+                        Ok((idx, Err(_))) => {
+                            errs[idx] = Some(DiskError::Unexpected);
+                            fanout_panic += 1;
+                        }
+                        Err(_) => {
+                            fanout_panic += 1;
+                        }
+                    }
+
+                    if !sent_commit && success_count >= write_quorum {
+                        let snapshot_commit = Self::rename_data_commit_from_observations(
+                            &coordinator_disks,
+                            &file_infos,
+                            &disk_versions,
+                            &errs,
+                            &cleanup_data_dirs,
+                            &old_current_sizes,
+                            write_quorum,
+                        );
+                        if let Some(commit_tx) = commit_tx.take() {
+                            let _ = commit_tx.send(snapshot_commit);
+                        }
+                        sent_commit = true;
+                    }
+                }
+
+                if rustfs_io_metrics::put_stage_metrics_enabled() {
+                    let fanout_success = errs.iter().filter(|err| err.is_none()).count();
+                    let fanout_error = errs.len().saturating_sub(fanout_success + fanout_panic);
+                    rustfs_io_metrics::record_put_rename_quorum_wait_fanout(
+                        results_seen,
+                        write_quorum,
+                        fanout_success,
+                        fanout_error,
+                        fanout_panic,
+                    );
+                }
+
+                if !sent_commit {
+                    let ret_err =
+                        reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum).unwrap_or(DiskError::Unexpected);
+                    let mut rollbacks = Vec::new();
+                    let mut rollback_file_infos = file_infos;
+                    for (i, err) in errs.iter().enumerate() {
+                        if err.is_some() {
+                            continue;
+                        }
+
+                        if let Some(disk) = coordinator_disks[i].as_ref() {
+                            let fi = std::mem::take(&mut rollback_file_infos[i]);
+                            let old_data_dir = data_dirs[i];
+                            let disk = disk.clone();
+                            let dst_bucket = fanout_dst_bucket.clone();
+                            let dst_object = fanout_dst_object.clone();
+                            rollbacks.push(tokio::spawn(async move {
+                                disk.delete_version(
+                                    &dst_bucket,
+                                    &dst_object,
+                                    fi,
+                                    false,
+                                    DeleteOptions {
+                                        undo_write: true,
+                                        old_data_dir,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            }));
+                        }
+                    }
+                    let _ = join_all(rollbacks).await;
+                    if let Some(commit_tx) = commit_tx.take() {
+                        let _ = commit_tx.send(Err(ret_err));
+                    }
+                    return;
+                }
+
+                let mut backup_reclaims = Vec::new();
+                for (idx, disk) in coordinator_disks.iter().enumerate() {
+                    if errs[idx].is_some() {
+                        continue;
+                    }
+                    let Some(rollback_dir) = data_dirs[idx] else {
+                        continue;
+                    };
+                    if cleanup_data_dirs[idx] == Some(rollback_dir) {
+                        continue;
+                    }
+                    let Some(disk) = disk.clone() else {
+                        continue;
+                    };
+                    let dst_bucket = fanout_dst_bucket.clone();
+                    let dst_object = fanout_dst_object.clone();
+                    backup_reclaims.push(tokio::spawn(async move {
+                        let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
+                        disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                    }));
+                }
+                for result in join_all(backup_reclaims).await {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(DiskError::FileNotFound | DiskError::VolumeNotFound)) => {}
+                        Ok(Err(err)) => {
+                            warn!(
+                                dst_bucket = %fanout_dst_bucket,
+                                dst_object = %fanout_dst_object,
+                                error = %err,
+                                "rollback backup reclamation failed after committed rename"
+                            );
+                        }
+                        Err(join_err) => {
+                            warn!(
+                                dst_bucket = %fanout_dst_bucket,
+                                dst_object = %fanout_dst_object,
+                                error = %join_err,
+                                "rollback backup reclamation task failed after committed rename"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        let quorum_wait_started = rustfs_io_metrics::put_stage_timer();
+        let commit = commit_rx.await.map_err(|_| DiskError::Unexpected)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_QUORUM_WAIT,
+            quorum_wait_started,
+        );
+        commit.map(|mut commit| {
+            commit.tail_drain = Some(tail_drain);
+            commit
+        })
+    }
+
+    #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     pub(in crate::set_disk) async fn rename_data_owned(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -3337,6 +3654,18 @@ impl SetDisks {
         dst_object: &str,
         write_quorum: usize,
     ) -> disk::error::Result<RenameDataCommit> {
+        if put_rename_early_ack_enabled() {
+            return Self::rename_data_owned_early_ack(
+                disks,
+                src_bucket,
+                src_object,
+                file_infos,
+                dst_bucket,
+                dst_object,
+                write_quorum,
+            )
+            .await;
+        }
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -3410,6 +3739,10 @@ impl SetDisks {
                         // Test-only awaitable pause point right before the disk rename.
                         // A no-op immediately-ready future in production.
                         Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
+
+                        if let Some(err) = Self::rename_injected_error(&dst_object, i) {
+                            return Err(err);
+                        }
 
                         let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                         let result = disk
@@ -3679,6 +4012,7 @@ impl SetDisks {
             cleanup_disks,
             old_current_size,
             committed_file_info,
+            tail_drain: None,
         })
     }
 
@@ -3887,6 +4221,20 @@ impl SetDisks {
     #[cfg(not(test))]
     #[inline(always)]
     fn cleanup_injected_error(_object: &str, _disk_index: usize) -> Option<DiskError> {
+        None
+    }
+
+    /// Test-only fault-injection seam for the rename-data fan-out. In production
+    /// this is inlined to `None`; only the `#[cfg(test)]` variant consults the
+    /// fault registry after the per-disk barrier and before mutating the disk.
+    #[cfg(test)]
+    fn rename_injected_error(object: &str, disk_index: usize) -> Option<DiskError> {
+        rename_fault_injection::injected_error(object, disk_index)
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn rename_injected_error(_object: &str, _disk_index: usize) -> Option<DiskError> {
         None
     }
 
@@ -5308,6 +5656,60 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
         match &s.object {
             Some(target) if target == object && s.fail_indices.contains(&disk_index) => {
                 Some(DiskError::other("injected old-data-dir cleanup failure (test-only)"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Test-only rename fault-injection seam for the set-disk rename fan-out.
+///
+/// This entire module is `#[cfg(test)]`, so it never compiles into production.
+/// The registry is keyed by object name because the disk mutations happen in
+/// spawned fan-out tasks; each test uses a unique object and clears the
+/// registry through the returned guard.
+#[cfg(test)]
+pub(in crate::set_disk) mod rename_fault_injection {
+    use super::DiskError;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct FaultState {
+        object: Option<String>,
+        fail_indices: Vec<usize>,
+    }
+
+    fn state() -> &'static Mutex<FaultState> {
+        static STATE: OnceLock<Mutex<FaultState>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(FaultState::default()))
+    }
+
+    /// Guard that clears the fault registry on drop.
+    pub struct FaultGuard;
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            if let Ok(mut s) = state().lock() {
+                *s = FaultState::default();
+            }
+        }
+    }
+
+    /// Force rename-data mutations for `object` on the given disk indices to
+    /// fail with a transient error, until the returned guard is dropped.
+    #[must_use]
+    pub fn fail_rename_on(object: &str, indices: &[usize]) -> FaultGuard {
+        let mut s = state().lock().expect("rename fault registry poisoned");
+        s.object = Some(object.to_string());
+        s.fail_indices = indices.to_vec();
+        FaultGuard
+    }
+
+    pub(super) fn injected_error(object: &str, disk_index: usize) -> Option<DiskError> {
+        let s = state().lock().expect("rename fault registry poisoned");
+        match &s.object {
+            Some(target) if target == object && s.fail_indices.contains(&disk_index) => {
+                Some(DiskError::other("injected rename failure (test-only)"))
             }
             _ => None,
         }
@@ -7908,6 +8310,293 @@ mod tests {
         }
 
         drop(dirs);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_early_ack_returns_after_write_quorum_and_drains_tail_success() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-early-ack-tail-success-bucket";
+            let object = "rename-early-ack-tail-success-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let file_infos = rename_commit_fileinfos(object, DISKS, "early-tail-success-etag");
+            let tracker = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+            let mut rename = Box::pin(SetDisks::rename_data(
+                &disks,
+                RUSTFS_META_TMP_BUCKET,
+                "source",
+                &file_infos,
+                bucket,
+                object,
+                3,
+            ));
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                tokio::select! {
+                    () = barrier.wait_until_paused() => {}
+                    result = rename.as_mut() => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+                }
+            })
+            .await
+            .expect("paused disk must reach the armed rename barrier");
+
+            rename
+                .await
+                .expect("early ACK must return once the other three disks satisfy write quorum");
+            assert!(
+                tracker.running() >= 1,
+                "the paused tail disk must continue in the background after early ACK"
+            );
+
+            barrier.release();
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                while tracker.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background tail disk must drain after release");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let stored = reopened
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {idx} must contain the early-ACK commit after reopen: {err:?}"));
+                assert_eq!(
+                    stored.metadata.get("etag").map(String::as_str),
+                    Some("early-tail-success-etag"),
+                    "disk {idx} must expose the same committed metadata after background tail success and reopen"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_early_ack_tail_failure_does_not_expose_partial_fresh_after_reopen() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-early-ack-tail-failure-bucket";
+            let object = "rename-early-ack-tail-failure-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let file_infos = rename_commit_fileinfos(object, DISKS, "early-tail-failure-etag");
+            let tracker = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let _fault = rename_fault_injection::fail_rename_on(object, &[0]);
+
+            let mut rename = Box::pin(SetDisks::rename_data(
+                &disks,
+                RUSTFS_META_TMP_BUCKET,
+                "source",
+                &file_infos,
+                bucket,
+                object,
+                3,
+            ));
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                tokio::select! {
+                    () = barrier.wait_until_paused() => {}
+                    result = rename.as_mut() => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+                }
+            })
+            .await
+            .expect("paused disk must reach the armed rename barrier");
+
+            rename
+                .await
+                .expect("early ACK must return after write quorum before the tail failure");
+            barrier.release();
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                while tracker.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background tail failure must drain after release");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let read = reopened.read_version("", bucket, object, "", &ReadOptions::default()).await;
+                if idx == 0 {
+                    assert!(
+                        matches!(read, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                        "failed background tail disk must not expose a partial fresh commit after reopen: {read:?}"
+                    );
+                } else {
+                    let stored = read.unwrap_or_else(|err| {
+                        panic!("quorum disk {idx} must contain the early-ACK commit after reopen: {err:?}")
+                    });
+                    assert_eq!(
+                        stored.metadata.get("etag").map(String::as_str),
+                        Some("early-tail-failure-etag"),
+                        "quorum disk {idx} must expose the committed metadata after reopen"
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_early_ack_tail_failure_preserves_overwrite_after_reopen() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-early-ack-overwrite-tail-failure-bucket";
+            let object = "rename-early-ack-overwrite-tail-failure-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let mut old = metadata_test_fileinfo(object);
+            old.mod_time = Some(OffsetDateTime::now_utc());
+            old.data = Some(Bytes::from_static(b"old-inline-body"));
+            old.metadata.insert("etag".to_string(), "early-old-etag".to_string());
+            for disk in disks.iter().flatten() {
+                disk.write_metadata(bucket, bucket, object, old.clone())
+                    .await
+                    .expect("old metadata should be written before early overwrite");
+            }
+
+            let file_infos = rename_commit_fileinfos(object, DISKS, "early-new-etag");
+            let tracker = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let _fault = rename_fault_injection::fail_rename_on(object, &[0]);
+
+            let mut rename = Box::pin(SetDisks::rename_data(
+                &disks,
+                RUSTFS_META_TMP_BUCKET,
+                "source",
+                &file_infos,
+                bucket,
+                object,
+                3,
+            ));
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                tokio::select! {
+                    () = barrier.wait_until_paused() => {}
+                    result = rename.as_mut() => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+                }
+            })
+            .await
+            .expect("paused disk must reach the armed rename barrier");
+
+            rename
+                .await
+                .expect("early ACK must return after write quorum before overwrite tail failure");
+            barrier.release();
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                while tracker.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background overwrite tail failure must drain after release");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let stored = reopened
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {idx} must have a readable version after early overwrite: {err:?}"));
+                let expected_etag = if idx == 0 { "early-old-etag" } else { "early-new-etag" };
+                assert_eq!(
+                    stored.metadata.get("etag").map(String::as_str),
+                    Some(expected_etag),
+                    "disk {idx} must keep the correct early-ACK overwrite visibility after reopen"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_early_ack_background_drains_after_caller_cancellation() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-early-ack-cancel-bucket";
+            let object = "rename-early-ack-cancel-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let file_infos = rename_commit_fileinfos(object, DISKS, "early-cancel-etag");
+            let tracker = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+            let mut rename = Box::pin(SetDisks::rename_data(
+                &disks,
+                RUSTFS_META_TMP_BUCKET,
+                "source",
+                &file_infos,
+                bucket,
+                object,
+                3,
+            ));
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                tokio::select! {
+                    () = barrier.wait_until_paused() => {}
+                    result = rename.as_mut() => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+                }
+            })
+            .await
+            .expect("paused disk must reach the armed rename barrier");
+
+            drop(rename);
+            barrier.release();
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                while tracker.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background rename fan-out must drain after caller cancellation");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let stored = reopened
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {idx} must contain the cancelled early-ACK commit after drain: {err:?}"));
+                assert_eq!(
+                    stored.metadata.get("etag").map(String::as_str),
+                    Some("early-cancel-etag"),
+                    "disk {idx} must expose the background-drained commit after caller cancellation"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_early_ack_strict_quorum_failure_rolls_back_fresh_after_reopen() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-early-ack-strict-rollback-bucket";
+            let object = "rename-early-ack-strict-rollback-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let file_infos = rename_commit_fileinfos(object, DISKS, "early-strict-rollback-etag");
+            let _fault = rename_fault_injection::fail_rename_on(object, &[0]);
+
+            SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 4)
+                .await
+                .expect_err("three successful disks must fail an early-ACK strict write quorum of four");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let read = reopened.read_version("", bucket, object, "", &ReadOptions::default()).await;
+                assert!(
+                    matches!(read, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                    "disk {idx} must not expose a fresh object after early-ACK strict rollback and reopen: {read:?}"
+                );
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
