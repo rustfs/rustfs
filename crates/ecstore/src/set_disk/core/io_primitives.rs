@@ -74,7 +74,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -3368,6 +3371,8 @@ impl SetDisks {
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
         let fanout = tokio::spawn(async move {
+            let successful_rename_completion_rank =
+                rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
                 .into_iter()
                 .zip(fanout_file_infos.iter())
@@ -3377,6 +3382,7 @@ impl SetDisks {
                     let src_object = fanout_src_object.clone();
                     let dst_object = fanout_dst_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
+                    let successful_rename_completion_rank = successful_rename_completion_rank.clone();
 
                     std::panic::AssertUnwindSafe(async move {
                         // Test-only introspection guard: counts this operation as
@@ -3409,10 +3415,27 @@ impl SetDisks {
                         let result = disk
                             .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
                             .await;
-                        rustfs_io_metrics::record_put_object_stage_duration_from(
-                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
-                            disk_wait_started,
-                        );
+                        if let Some(disk_wait_started) = disk_wait_started {
+                            let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT,
+                                duration_ms,
+                            );
+                            let position = if result.is_ok() {
+                                let rank = successful_rename_completion_rank
+                                    .as_ref()
+                                    .map(|rank| rank.fetch_add(1, Ordering::Relaxed) + 1)
+                                    .unwrap_or(1);
+                                if rank <= write_quorum {
+                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_FIRST
+                                } else {
+                                    rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_QUORUM_TAIL
+                                }
+                            } else {
+                                rustfs_io_metrics::PUT_RENAME_DISK_WAIT_COMPLETION_POSITION_ERROR
+                            };
+                            rustfs_io_metrics::record_put_rename_disk_wait_completion(position, duration_ms);
+                        }
                         result
                     })
                     .catch_unwind()
