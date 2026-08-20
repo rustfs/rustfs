@@ -4578,10 +4578,15 @@ impl SetDisks {
         )?;
         let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
         let write_quorum = layout.write_quorum;
-        if opts
-            .bucket_lifecycle_lock_fence
-            .as_ref()
-            .is_some_and(NamespaceLockFence::is_lock_lost)
+        if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
             || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
         {
             return Err(StorageError::NamespaceLockQuorumUnavailable {

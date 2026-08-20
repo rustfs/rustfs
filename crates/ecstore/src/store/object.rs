@@ -14,6 +14,8 @@
 
 use super::*;
 use crate::bucket::lifecycle::{
+    bucket_lifecycle_ops::eval_action_from_lifecycle,
+    get_expiry_configs,
     tier_delete_journal::{
         abort_prepared_tier_delete_journal_entry as abort_prepared_journal_entry_if_current, commit_tier_delete_journal_entry,
         enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
@@ -211,7 +213,8 @@ async fn delete_prefix_with_tier_delete_journal(
     opts: &ObjectOptions,
     tier_journal_api: Option<&Arc<ECStore>>,
 ) -> Result<()> {
-    let journal_entry = if let Some(api) = tier_journal_api {
+    let lifecycle_delete_all = opts.lifecycle_delete_all.is_some();
+    let journal_entry = if !lifecycle_delete_all && let Some(api) = tier_journal_api {
         Some(prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?)
     } else {
         None
@@ -220,14 +223,34 @@ async fn delete_prefix_with_tier_delete_journal(
     let result = store.delete_prefix(bucket, object, opts).await;
     match result {
         Ok(()) => {
-            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
+            let lifecycle_entries = if lifecycle_delete_all {
+                opts.lifecycle_delete_all_journal()
+                    .ok_or(StorageError::PreconditionFailed)?
+                    .lock()
+                    .prepared_entries()
+            } else {
+                Vec::new()
+            };
+            let entries = journal_entry.as_deref().unwrap_or(&lifecycle_entries);
+            if let Some(api) = tier_journal_api {
                 commit_prepared_tier_delete_journal_entries(api, entries).await;
             }
             Ok(())
         }
         Err(err) => {
-            if let (Some(api), Some(entries)) = (tier_journal_api, journal_entry.as_ref()) {
-                abort_prepared_tier_delete_journal_entries(api, entries).await;
+            if let Some(api) = tier_journal_api {
+                if lifecycle_delete_all {
+                    let (abort, entries) = {
+                        let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
+                        let state = journal.lock();
+                        (!state.mutation_started(), state.prepared_entries())
+                    };
+                    if abort {
+                        abort_prepared_tier_delete_journal_entries(api, &entries).await;
+                    }
+                } else if let Some(entries) = journal_entry.as_ref() {
+                    abort_prepared_tier_delete_journal_entries(api, entries).await;
+                }
             }
             Err(err)
         }
@@ -327,7 +350,7 @@ impl fmt::Display for ObjectLockDiagMode {
     }
 }
 
-struct ObjectLockDiagGuard {
+pub(crate) struct ObjectLockDiagGuard {
     guard: rustfs_lock::NamespaceLockGuard,
     enabled: bool,
     op: &'static str,
@@ -360,14 +383,14 @@ impl ObjectLockDiagGuard {
         }
     }
 
-    fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+    pub(crate) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
         match &self.guard {
             rustfs_lock::NamespaceLockGuard::Standard(guard) => Some(guard.lock_lost()),
             rustfs_lock::NamespaceLockGuard::Fast(_) => None,
         }
     }
 
-    fn is_lock_lost(&self) -> bool {
+    pub(crate) fn is_lock_lost(&self) -> bool {
         self.guard.is_lock_lost()
     }
 }
@@ -1109,6 +1132,26 @@ fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo,
         && source_actual_size == target_actual_size
 }
 
+fn tiered_data_movement_source_matches(
+    expected: &rustfs_filemeta::FileInfo,
+    current: &rustfs_filemeta::FileInfo,
+) -> Result<bool> {
+    let expected_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&expected.metadata)?;
+    let current_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&current.metadata)?;
+    Ok(expected.version_id == current.version_id
+        && expected.data_dir == current.data_dir
+        && expected.mod_time == current.mod_time
+        && expected.size == current.size
+        && expected.get_etag() == current.get_etag()
+        && expected.transition_status == current.transition_status
+        && expected.transitioned_objname == current.transitioned_objname
+        && expected.transition_tier == current.transition_tier
+        && expected.transition_version_id == current.transition_version_id
+        && expected.transition_version == current.transition_version
+        && expected.transition_version_state == current.transition_version_state
+        && expected_backend == current_backend)
+}
+
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
     target_pool_idx != src_pool_idx
 }
@@ -1247,7 +1290,9 @@ impl ECStore {
         let mut opts = opts.clone();
         opts.no_lock = false;
         opts.metadata_cache_safe = false;
-        let read_lock_guards = self.acquire_select_object_read_locks(bucket, &object, &mut opts).await?;
+        let read_lock_guards = self
+            .acquire_all_object_read_locks("select_object", bucket, &object, &mut opts)
+            .await?;
         if self.ctx.lock_manager().is_disabled() {
             return Err(SnapshotConsistencyError::LockingDisabled.into());
         }
@@ -1488,8 +1533,9 @@ impl ECStore {
         )))
     }
 
-    async fn acquire_select_object_read_locks(
+    pub(crate) async fn acquire_all_object_read_locks(
         &self,
+        op: &'static str,
         bucket: &str,
         object: &str,
         opts: &mut ObjectOptions,
@@ -1501,10 +1547,7 @@ impl ECStore {
         // for each object's hashed set. DELETE and same-key CopyObject use the
         // fixed domain, while PUT commits and data movement use the hashed set.
         let distributed = self.ctx.is_dist_erasure().await;
-        if let Some(guard) = self
-            .acquire_object_read_lock_if_needed("select_object", bucket, object, opts)
-            .await?
-        {
+        if let Some(guard) = self.acquire_object_read_lock_if_needed(op, bucket, object, opts).await? {
             guards.push(guard);
         }
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
@@ -1527,7 +1570,7 @@ impl ECStore {
                 .map_err(|err| Self::map_namespace_lock_error(bucket, object, "read", err))?;
             let owner = diag_enabled.then(|| ns_lock.owner().to_string());
             log_object_lock_acquire_if_slow(
-                "select_object",
+                op,
                 bucket,
                 object,
                 owner.as_deref(),
@@ -1538,7 +1581,7 @@ impl ECStore {
             guards.push(ObjectLockDiagGuard::new(
                 guard,
                 diag_enabled,
-                "select_object",
+                op,
                 diag_enabled.then(|| bucket.to_string()),
                 diag_enabled.then(|| object.to_string()),
                 owner,
@@ -1546,6 +1589,77 @@ impl ECStore {
             ));
             locked_sets.push(hashed_set);
         }
+        Ok(guards)
+    }
+
+    async fn acquire_data_movement_object_write_locks(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("tiered data movement requires namespace locking"));
+        }
+        let distributed = self.ctx.is_dist_erasure().await;
+        let diag_enabled = is_object_lock_diag_enabled();
+        let mut pool_indices = [source_pool_idx, target_pool_idx];
+        pool_indices.sort_unstable();
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let mut locked_sets = vec![fixed_set];
+        let mut guards = Vec::with_capacity(3);
+
+        // Lock order matches journal recovery: fixed store domain first, then
+        // hashed domains by ascending pool index. This also serializes source
+        // revalidation and target publication against ordinary object deletes.
+        guards.push(self.acquire_object_write_lock("tiered_data_movement", bucket, object).await?);
+        for pool_idx in pool_indices {
+            let pool = self
+                .pools
+                .get(pool_idx)
+                .ok_or_else(|| Error::other(format!("invalid tiered data movement pool {pool_idx}")))?;
+            let set = pool.get_disks_by_key(object);
+            let lock_domain_already_held = !distributed
+                || locked_sets.iter().any(|locked_set: &Arc<crate::set_disk::SetDisks>| {
+                    same_distributed_lock_domain(&locked_set.lockers, &set.lockers)
+                });
+            if lock_domain_already_held {
+                continue;
+            }
+            let ns_lock = set.new_ns_lock(bucket, object).await?;
+            let acquire_start = Instant::now();
+            let guard = ns_lock
+                .get_write_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|err| Self::map_namespace_lock_error(bucket, object, "write", err))?;
+            let owner = diag_enabled.then(|| ns_lock.owner().to_string());
+            log_object_lock_acquire_if_slow(
+                "tiered_data_movement",
+                bucket,
+                object,
+                owner.as_deref(),
+                ObjectLockDiagMode::Write,
+                acquire_start.elapsed(),
+                diag_enabled,
+            );
+            guards.push(ObjectLockDiagGuard::new(
+                guard,
+                diag_enabled,
+                "tiered_data_movement",
+                diag_enabled.then(|| bucket.to_string()),
+                diag_enabled.then(|| object.to_string()),
+                owner,
+                ObjectLockDiagMode::Write,
+            ));
+            locked_sets.push(set);
+        }
+        opts.no_lock = true;
+        for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        opts.ensure_namespace_lock_fence();
         Ok(guards)
     }
 
@@ -1686,13 +1800,8 @@ impl ECStore {
             Some(guard)
         };
 
-        let mut fi = fi.clone();
-        if opts.data_movement {
-            crate::data_movement::prepare_tiered_data_movement_file_info(&mut fi)?;
-        }
-
-        let object = encode_dir_object(object);
-
+        let logical_object = object;
+        let object = encode_dir_object(logical_object);
         if self.single_pool() {
             return Self::resolve_decommission_tiered_object_result(
                 Err(Error::other("single pool deployments cannot decommission tiered objects")),
@@ -1715,6 +1824,33 @@ impl ECStore {
                 &object,
             )?
         };
+        let _object_guards = self
+            .acquire_data_movement_object_write_locks(bucket, &object, opts.src_pool_idx, idx, &mut opts)
+            .await?;
+        let source_pool = self
+            .pools
+            .get(opts.src_pool_idx)
+            .ok_or_else(|| Error::other(format!("invalid tiered data movement source pool {}", opts.src_pool_idx)))?;
+        let source_versions = source_pool
+            .get_disks_by_key(&object)
+            .load_file_info_versions_exact(bucket, logical_object)
+            .await?;
+        let current_source = source_versions
+            .as_ref()
+            .and_then(|versions| {
+                versions
+                    .versions
+                    .iter()
+                    .find(|current| current.version_id == fi.version_id && !current.tier_free_version())
+            })
+            .ok_or_else(|| to_object_err(StorageError::FileNotFound, vec![bucket, object.as_str()]))?;
+        if !tiered_data_movement_source_matches(fi, current_source)? {
+            return Err(to_object_err(StorageError::FileNotFound, vec![bucket, object.as_str()]));
+        }
+        let mut fi = current_source.clone();
+        if opts.data_movement {
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut fi)?;
+        }
         if opts.data_movement && idx == opts.src_pool_idx {
             let resume_target_pool_idx = self
                 .get_available_pool_idx_excluding(bucket, &object, fi.size, opts.src_pool_idx)
@@ -2190,6 +2326,10 @@ impl ECStore {
     ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
+        if opts.lifecycle_delete_all.is_some() && self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("lifecycle delete-all requires namespace locking"));
+        }
+
         let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
             None
         } else if opts.delete_prefix {
@@ -2204,6 +2344,11 @@ impl ECStore {
         };
         let object = object.as_str();
         let mut opts = opts;
+        let delete_all_configs = if opts.lifecycle_delete_all.is_some() {
+            Some(get_expiry_configs(self, bucket).await?)
+        } else {
+            None
+        };
         opts.tier_delete_journal_api = tier_journal_api.clone();
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
@@ -2301,6 +2446,34 @@ impl ECStore {
         } else {
             None
         };
+        if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
+            let configs = delete_all_configs.as_ref().ok_or(StorageError::PreconditionFailed)?;
+            let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+            if configs.table_bucket_enabled || configs.bucket_incarnation_id != expected_bucket_incarnation_id {
+                return Err(StorageError::PreconditionFailed);
+            }
+            let lifecycle = configs.lifecycle.as_ref().ok_or(StorageError::PreconditionFailed)?;
+            let (mut current, _) = self
+                .get_latest_object_info_with_idx(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let current_version_id = current.version_id.filter(|version_id| !version_id.is_nil());
+            if current_version_id != trigger.version_id || current.delete_marker != trigger.delete_marker {
+                return Err(StorageError::PreconditionFailed);
+            }
+            current.name = decode_dir_object(&current.name);
+            let current_event = eval_action_from_lifecycle(lifecycle, configs.object_lock.as_deref(), &current).await;
+            if current_event.action != trigger.action || current_event.rule_id != trigger.rule_id {
+                return Err(StorageError::PreconditionFailed);
+            }
+        }
         if opts.delete_prefix {
             delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
@@ -3826,6 +3999,24 @@ mod tests {
         let target = tiered_equivalence_target(&source);
 
         assert!(is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn tiered_data_movement_source_match_rejects_transition_identity_changes() {
+        let source = tiered_equivalence_source();
+        assert!(tiered_data_movement_source_matches(&source, &source).expect("matching source metadata should parse"));
+
+        let mut changed_remote = source.clone();
+        changed_remote.transitioned_objname = "remote/replaced".to_string();
+        assert!(!tiered_data_movement_source_matches(&source, &changed_remote).expect("changed remote metadata should parse"));
+
+        let mut changed_backend = source.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut changed_backend.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex([9; 32]),
+        );
+        assert!(!tiered_data_movement_source_matches(&source, &changed_backend).expect("backend metadata should parse"));
     }
 
     #[test]

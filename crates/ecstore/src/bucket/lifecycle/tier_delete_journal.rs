@@ -435,12 +435,88 @@ async fn process_committed_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jen
     remove_tier_delete_journal_entry(api, je).await
 }
 
-async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
-    let (data, metadata) =
-        config_boundary::read_config_with_metadata(api.clone(), &tier_delete_journal_object_name(je), &ObjectOptions::default())
+fn object_info_references_tier_delete(info: &ObjectInfo, je: &Jentry) -> std::io::Result<bool> {
+    if info.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE
+        || info.transitioned_object.name != je.obj_name
+        || info.transitioned_object.tier != je.tier_name
+    {
+        return Ok(false);
+    }
+    let source_backend_identity = tier_destination_id_from_metadata(&info.user_defined)?;
+    if source_backend_identity.is_some() && source_backend_identity != je.backend_identity {
+        return Ok(false);
+    }
+    if !je.version_id_exact {
+        return Ok(true);
+    }
+    Ok(match info.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => true,
+        rustfs_filemeta::TransitionVersionState::KnownDisabled => false,
+        rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact => {
+            info.transitioned_object.version_id == je.version_id
+        }
+    })
+}
+
+async fn prepared_tier_delete_has_live_source(
+    api: &ECStore,
+    source: &TierDeleteSourceIdentity,
+    je: &Jentry,
+) -> std::io::Result<(bool, Vec<crate::store::ObjectLockDiagGuard>)> {
+    let lock_object = rustfs_utils::path::encode_dir_object(&source.object);
+    let mut lock_opts = ObjectOptions::default();
+    let read_guards = api
+        .acquire_all_object_read_locks("tier_delete_journal_recovery", &source.bucket, &lock_object, &mut lock_opts)
+        .await
+        .map_err(std::io::Error::other)?;
+    if api.ctx.lock_manager().is_disabled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier delete journal recovery requires namespace locking",
+        ));
+    }
+    let mut has_live_source = false;
+    for pool in &api.pools {
+        let set = pool.get_disks_by_key(&lock_object);
+        let Some(versions) = set
+            .load_file_info_versions_exact(&source.bucket, &source.object)
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(std::io::Error::other)?
+        else {
+            continue;
+        };
+        for version in versions.versions.iter().filter(|version| !version.tier_free_version()) {
+            let info = ObjectInfo::from_file_info(version, &source.bucket, &source.object, source.versioned);
+            if object_info_references_tier_delete(&info, je)? {
+                has_live_source = true;
+                break;
+            }
+        }
+        if has_live_source {
+            break;
+        }
+    }
+    if read_guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier delete journal recovery object read lock was lost",
+        ));
+    }
+    Ok((has_live_source, read_guards))
+}
+
+async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
+    let journal_name = tier_delete_journal_object_name(je);
+    let (data, metadata) = config_boundary::read_config_with_metadata(api.clone(), &journal_name, &ObjectOptions::default())
+        .await
+        .map_err(std::io::Error::other)?;
     let current = decode_tier_delete_journal_entry(&data).map_err(std::io::Error::other)?;
+    if tier_delete_journal_object_name(&current) != journal_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "prepared tier delete journal content does not match its object name",
+        ));
+    }
     if current.state != TierDeleteJournalState::Prepared {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -453,16 +529,21 @@ async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Je
             "prepared tier delete journal has no entity tag",
         ));
     };
-    let source = je
+    let source = current
         .source
         .as_ref()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "prepared tier delete journal has no source"))?;
-    match api
-        .get_object_info(&source.bucket, &source.object, &source.lookup_options())
-        .await
-    {
-        Ok(info) if source.matches(&info) => {
-            match config_boundary::delete_config_if_match(api, &tier_delete_journal_object_name(&current), &etag).await {
+    match prepared_tier_delete_has_live_source(&api, source, &current).await {
+        Ok((true, read_guards)) => {
+            if read_guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "tier delete journal recovery object read lock was lost before abort",
+                ));
+            }
+            let result = config_boundary::delete_config_if_match(api, &tier_delete_journal_object_name(&current), &etag).await;
+            drop(read_guards);
+            match result {
                 Ok(()) => Ok(()),
                 Err(Error::PreconditionFailed) => Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
@@ -471,17 +552,32 @@ async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Je
                 Err(err) => Err(std::io::Error::other(err)),
             }
         }
-        Ok(_info) if source.has_stable_identity() => {
-            commit_prepared_tier_delete_journal_entry_if_current(api, current, etag).await
+        Ok((false, read_guards)) if source.has_stable_identity() => {
+            if read_guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "tier delete journal recovery object read lock was lost before commit",
+                ));
+            }
+            let mut commit_opts = ObjectOptions::default();
+            for signal in read_guards
+                .iter()
+                .filter_map(crate::store::ObjectLockDiagGuard::lock_lost_signal)
+            {
+                commit_opts.add_namespace_lock_lost_signal(signal);
+            }
+            let committed =
+                commit_prepared_tier_delete_journal_entry_if_current(api.clone(), current, etag, &commit_opts).await?;
+            // Keep namespace locks only through the journal CAS. Remote-tier IO
+            // must not block writers for the object during recovery.
+            drop(read_guards);
+            process_committed_tier_delete_journal_entry(api, &committed).await
         }
-        Ok(_) => Err(std::io::Error::new(
+        Ok((false, _read_guards)) => Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "prepared tier delete journal source identity is not sufficient to confirm deletion",
         )),
-        Err(Error::ObjectNotFound(_, _)) | Err(Error::FileNotFound) | Err(Error::FileVersionNotFound) => {
-            commit_prepared_tier_delete_journal_entry_if_current(api, current, etag).await
-        }
-        Err(err) => Err(std::io::Error::other(err)),
+        Err(err) => Err(err),
     }
 }
 
@@ -489,7 +585,8 @@ async fn commit_prepared_tier_delete_journal_entry_if_current(
     api: Arc<ECStore>,
     mut committed: Jentry,
     etag: String,
-) -> std::io::Result<()> {
+    lock_opts: &ObjectOptions,
+) -> std::io::Result<Jentry> {
     committed.state = TierDeleteJournalState::Committed;
     let data = encode_tier_delete_journal_entry(&committed).map_err(std::io::Error::other)?;
     match config_boundary::save_config_with_opts(
@@ -502,12 +599,13 @@ async fn commit_prepared_tier_delete_journal_entry_if_current(
                 if_match: Some(etag),
                 ..Default::default()
             }),
+            namespace_lock_fence: lock_opts.namespace_lock_fence.clone(),
             ..Default::default()
         },
     )
     .await
     {
-        Ok(()) => process_committed_tier_delete_journal_entry(api, &committed).await,
+        Ok(()) => Ok(committed),
         Err(Error::PreconditionFailed) => Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "prepared tier delete journal changed before commit",
@@ -581,6 +679,18 @@ pub async fn recover_tier_delete_journal_entries(
                 continue;
             }
         };
+
+        if tier_delete_journal_object_name(&je) != object.name {
+            stats.failed += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object.name,
+                "Tier delete journal content does not match its object name and will be retained"
+            );
+            continue;
+        }
 
         if je.backend_identity.is_none() {
             stats.failed += 1;
@@ -699,16 +809,14 @@ where
 mod tests {
     use super::{
         TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_STATE_VERSION, await_tier_delete_journal_recovery,
-        decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
-        tier_delete_journal_object_name,
+        decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, object_info_references_tier_delete,
+        record_tier_delete_journal_backend_identity, tier_delete_journal_object_name,
     };
     use crate::bucket::lifecycle::tier_sweeper::{Jentry, TierDeleteJournalState, TierDeleteSourceIdentity};
     use crate::error::Result;
     use crate::object_api::ObjectInfo;
     use std::time::Duration;
-    use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
 
     fn journal_entry() -> Jentry {
         Jentry {
@@ -739,6 +847,16 @@ mod tests {
     }
 
     #[test]
+    fn tier_delete_journal_object_name_binds_persisted_content() {
+        let original = journal_entry();
+        let original_name = tier_delete_journal_object_name(&original);
+        let mut replaced = original;
+        replaced.obj_name = "remote/replaced".to_string();
+
+        assert_ne!(tier_delete_journal_object_name(&replaced), original_name);
+    }
+
+    #[test]
     fn tier_delete_transaction_roundtrips_prepared_source_identity() {
         let mut je = journal_entry();
         je.state = TierDeleteJournalState::Prepared;
@@ -765,26 +883,35 @@ mod tests {
     }
 
     #[test]
-    fn tier_delete_source_identity_rejects_recreated_object() {
-        let version_id = Uuid::from_u128(1);
-        let data_dir = Uuid::from_u128(2);
-        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
-        let info = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            version_id: Some(version_id),
-            data_dir: Some(data_dir),
-            mod_time: Some(mod_time),
+    fn prepared_recovery_blocks_any_live_reference_to_the_remote_version() {
+        let je = journal_entry();
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(je.backend_identity.expect("test journal should bind a backend")),
+        );
+        let mut info = ObjectInfo {
+            user_defined: std::sync::Arc::new(metadata),
+            transitioned_object: crate::storage_api_contracts::lifecycle::TransitionedObject {
+                name: je.obj_name.clone(),
+                version_id: je.version_id.clone(),
+                tier: je.tier_name.clone(),
+                status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
             ..Default::default()
         };
-        let source = TierDeleteSourceIdentity::from_object_info("bucket", "object", &info, true, false);
-        assert!(source.matches(&info));
 
-        let recreated = ObjectInfo {
-            data_dir: Some(Uuid::from_u128(3)),
-            ..info
-        };
-        assert!(!source.matches(&recreated));
+        assert!(object_info_references_tier_delete(&info, &je).expect("matching reference should be valid"));
+        info.transitioned_object.version_id = "other-version".to_string();
+        assert!(!object_info_references_tier_delete(&info, &je).expect("different exact version should be valid"));
+        info.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+        assert!(
+            object_info_references_tier_delete(&info, &je).expect("legacy unknown reference should fail closed"),
+            "an unknown live source may still reference the journaled remote version"
+        );
     }
 
     #[test]
