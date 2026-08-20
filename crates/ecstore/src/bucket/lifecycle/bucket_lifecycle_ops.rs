@@ -4994,6 +4994,9 @@ pub async fn apply_expiry_on_transitioned_object(
     src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> bool {
+    if lc_event.action.delete_all() {
+        return apply_expiry_on_non_transitioned_objects(api, oi, lc_event, src, bucket_incarnation_id).await;
+    }
     let time_ilm = Metrics::time_ilm(lc_event.action);
     if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src, bucket_incarnation_id).await {
         return false;
@@ -5047,13 +5050,24 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     if lc_event.action.delete_all() {
         opts.delete_prefix = true;
         opts.delete_prefix_object = true;
+        opts.lifecycle_delete_all = Some(crate::object_api::LifecycleDeleteAllRequest {
+            version_id: oi.version_id.filter(|version_id| !version_id.is_nil()),
+            delete_marker: oi.delete_marker,
+            action: lc_event.action,
+            rule_id: lc_event.rule_id.clone(),
+            phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+        });
+        opts.ensure_lifecycle_delete_all_journal();
     }
 
     let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
-    let mut dobj = match api.delete_object(&oi.bucket, &encode_dir_object(&oi.name), opts).await {
+    let mut dobj = match api
+        .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
+        .await
+    {
         Ok(dobj) => dobj,
         Err(e) => {
             error!(
@@ -5283,7 +5297,7 @@ mod tests {
     };
     use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
-    use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+    use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
     use crate::bucket::metadata_sys;
     #[cfg(feature = "test-util")]
     use crate::client::transition_api::ReaderImpl;
@@ -5304,6 +5318,7 @@ mod tests {
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
         lifecycle::ExpirationOptions,
+        list::ListOperations as _,
         multipart::MultipartOperations as _,
         object::{ObjectIO as _, ObjectOperations as _},
     };
@@ -10915,6 +10930,199 @@ mod tests {
                 .is_ok(),
             "table data must remain readable after lifecycle admission rejects the delete"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_delete_all_rechecks_a_same_id_rule_moved_into_the_future() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-delete-all-rule-{}", Uuid::new_v4().simple());
+        let object = "object";
+        create_test_bucket(&ecstore, &bucket).await;
+        metadata_sys::update(
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+        let lifecycle_xml = |days| {
+            format!(
+                r#"<LifecycleConfiguration>
+  <Rule>
+    <ID>delete-marker-history</ID>
+    <Status>Enabled</Status>
+    <Filter><Prefix></Prefix></Filter>
+    <DelMarkerExpiration><Days>{days}</Days></DelMarkerExpiration>
+  </Rule>
+</LifecycleConfiguration>"#
+            )
+        };
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(1).into_bytes())
+            .await
+            .expect("initial lifecycle rule should be stored");
+
+        let old_time = OffsetDateTime::now_utc() - time::Duration::days(3);
+        let mut reader = PutObjReader::from_vec(b"old version".to_vec());
+        ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(old_time - time::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old version should be stored");
+        let marker = ecstore
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(old_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker should be created");
+
+        let queued_event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::DelMarkerDeleteAllVersionsAction,
+            rule_id: "delete-marker-history".to_string(),
+            ..Default::default()
+        };
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(30).into_bytes())
+            .await
+            .expect("updated lifecycle rule should be stored");
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+
+        let deleted = super::apply_expiry_on_non_transitioned_objects(
+            ecstore.clone(),
+            &marker,
+            &queued_event,
+            &LcEventSrc::Scanner,
+            incarnation,
+        )
+        .await;
+        assert!(!deleted, "the stale queued rule must be rejected");
+        let versions = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining versions should be listable");
+        assert_eq!(versions.objects.iter().filter(|version| version.name == object).count(), 2);
+
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(1).into_bytes())
+            .await
+            .expect("due lifecycle rule should be restored");
+        let deleted = super::apply_expiry_on_non_transitioned_objects(
+            ecstore.clone(),
+            &marker,
+            &queued_event,
+            &LcEventSrc::Scanner,
+            incarnation,
+        )
+        .await;
+        assert!(deleted, "the current due rule should purge marker and history");
+        let versions = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("purged versions should be listable");
+        assert_eq!(versions.objects.iter().filter(|version| version.name == object).count(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_expired_object_all_versions_purges_history_through_transitioned_dispatch() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("expired-all-versions-{}", Uuid::new_v4().simple());
+        let object = "object";
+        create_test_bucket(&ecstore, &bucket).await;
+        metadata_sys::update(
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+        metadata_sys::update(
+            &bucket,
+            BUCKET_LIFECYCLE_CONFIG,
+            br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>delete-all-versions</ID>
+    <Status>Enabled</Status>
+    <Filter><Prefix></Prefix></Filter>
+    <Expiration><Days>1</Days><ExpiredObjectAllVersions>true</ExpiredObjectAllVersions></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#
+                .to_vec(),
+        )
+        .await
+        .expect("delete-all lifecycle rule should be stored");
+
+        let old_time = OffsetDateTime::now_utc() - time::Duration::days(3);
+        let mut old_reader = PutObjReader::from_vec(b"old version".to_vec());
+        ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(old_time - time::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old version should be stored");
+        let mut current_reader = PutObjReader::from_vec(b"current version".to_vec());
+        let mut current = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(old_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("current version should be stored");
+        current.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+        let deleted = super::apply_expiry_on_transitioned_object(
+            ecstore.clone(),
+            &current,
+            &crate::bucket::lifecycle::lifecycle::Event {
+                action: IlmAction::DeleteAllVersionsAction,
+                rule_id: "delete-all-versions".to_string(),
+                ..Default::default()
+            },
+            &LcEventSrc::Scanner,
+            incarnation,
+        )
+        .await;
+
+        assert!(deleted, "delete-all must not degrade to transitioned single-version expiry");
+        let versions = ecstore
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("purged versions should be listable");
+        assert_eq!(versions.objects.iter().filter(|version| version.name == object).count(), 0);
     }
 
     #[tokio::test]

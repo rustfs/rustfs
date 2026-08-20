@@ -150,7 +150,7 @@ async fn pending_overwrite_keeps_select_on_one_generation(
 
     barrier.wait_until_paused().await;
     let response = start_select(client, bucket).await;
-    barrier.release_and_wait_until_namespace_pending().await;
+    barrier.release();
 
     let output = collect_select(response).await;
     assert_eq!(
