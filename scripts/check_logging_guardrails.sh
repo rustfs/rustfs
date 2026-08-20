@@ -963,9 +963,11 @@ if [[ "$demoted_task_sites" -lt 4 ]]; then
   exit 1
 fi
 
-demoted_task_total_sites="$(rg -c -F 'demote_to_debug_when!(' crates/heal/src/heal/task.rs || echo 0)"
+# task.rs and its task/ child modules are one logical module tree since the
+# per-heal-kind split; count the demoted sites across the whole tree.
+demoted_task_total_sites="$(cat crates/heal/src/heal/task.rs crates/heal/src/heal/task/*.rs 2>/dev/null | rg -c -F 'demote_to_debug_when!(' || echo 0)"
 if [[ "$demoted_task_total_sites" -lt 5 ]]; then
-  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites, found $demoted_task_total_sites)" >&2
+  echo "❌ logging guardrail violation: the background-source missing-object warn in crates/heal/src/heal/task.rs must stay level-split via demote_to_debug_when! (expected >= 5 total sites in the task module tree, found $demoted_task_total_sites)" >&2
   exit 1
 fi
 
