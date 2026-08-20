@@ -31,7 +31,7 @@ impl DateFunc {
                 return false;
             };
 
-            if !op(&inner.values.0, &rv) {
+            if !op(&rv, &inner.values.0) {
                 return false;
             }
         }
@@ -95,6 +95,7 @@ mod tests {
         key_name::KeyName::{self, *},
         key_name::S3KeyName::*,
     };
+    use std::collections::HashMap;
     use test_case::test_case;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -121,5 +122,17 @@ mod tests {
         let v = serde_json::to_string(&input)?;
         assert_eq!(v, expect);
         Ok(())
+    }
+
+    #[test]
+    fn evaluate_compares_request_date_to_policy_date() {
+        let function = new_func(S3(S3ObjectLockRetainUntilDate), None, "2030-01-01T00:00:00Z");
+        let later = HashMap::from([("object-lock-retain-until-date".to_string(), vec!["2099-01-01T00:00:00Z".to_string()])]);
+        let earlier = HashMap::from([("object-lock-retain-until-date".to_string(), vec!["2029-01-01T00:00:00Z".to_string()])]);
+
+        assert!(function.evaluate(OffsetDateTime::gt, &later));
+        assert!(!function.evaluate(OffsetDateTime::gt, &earlier));
+        assert!(function.evaluate(OffsetDateTime::lt, &earlier));
+        assert!(!function.evaluate(OffsetDateTime::lt, &later));
     }
 }

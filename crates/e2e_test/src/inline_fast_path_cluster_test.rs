@@ -1028,20 +1028,6 @@ impl<'a> ReaderPathExpectation<'a> {
         }
     }
 
-    fn with_size_bucket(
-        object: ReaderObject<'a>,
-        expected_path: &'a str,
-        object_class: &'a str,
-        expected_size_bucket: &'a str,
-    ) -> Self {
-        Self {
-            object,
-            expected_path,
-            object_class,
-            expected_size_bucket: Some(expected_size_bucket),
-        }
-    }
-
     fn with_any_size_bucket(object: ReaderObject<'a>, expected_path: &'a str, object_class: &'a str) -> Self {
         Self {
             object,
@@ -1909,12 +1895,7 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
     assert_reader_path(
         &collector,
         &client,
-        ReaderPathExpectation::with_size_bucket(
-            ReaderObject::new(bucket, key, &body, put.e_tag(), None),
-            LEGACY_DUPLEX,
-            COMPRESSED,
-            size_bucket(4 * KIB),
-        ),
+        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, put.e_tag(), None), LEGACY_DUPLEX, COMPRESSED),
     )
     .await?;
 

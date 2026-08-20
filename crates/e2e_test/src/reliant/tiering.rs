@@ -110,6 +110,7 @@ const USER_META_KEY: &str = "ilm7-origin";
 const USER_META_VAL: &str = "hermetic-transition";
 const HDR_SOURCE_REPLICATION_REQUEST: &str = "x-rustfs-source-replication-request";
 const HDR_SOURCE_MTIME: &str = "x-rustfs-source-mtime";
+const TIER_MUTATION_RECOVERY_CHANGED: &str = "Remote tier mutation recovery changed before publish";
 
 /// 5 MiB — the S3 minimum size for a non-final multipart part; the object's only
 /// internal part boundary sits at this offset.
@@ -183,19 +184,39 @@ async fn add_rustfs_tier(hot: &RustFSTestEnvironment, cold: &RustFSTestEnvironme
     })
     .to_string();
 
-    let (status, resp) = signed_admin_request(
-        &hot.url,
-        Method::PUT,
-        "/rustfs/admin/v3/tier",
-        Some(&body),
-        &hot.access_key,
-        &hot.secret_key,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("AddTier(RustFS) failed: status={status}, body={resp}").into());
+    let verify_path = format!("/rustfs/admin/v3/tier/{TIER_NAME}");
+    let deadline = Instant::now() + StdDuration::from_secs(30);
+    let mut recovery_changed = false;
+    loop {
+        if recovery_changed {
+            let (status, _) =
+                signed_admin_request(&hot.url, Method::GET, &verify_path, None, &hot.access_key, &hot.secret_key).await?;
+            if status.is_success() {
+                return Ok(());
+            }
+        }
+        let (status, resp) = signed_admin_request(
+            &hot.url,
+            Method::PUT,
+            "/rustfs/admin/v3/tier",
+            Some(&body),
+            &hot.access_key,
+            &hot.secret_key,
+        )
+        .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if resp.contains(TIER_MUTATION_RECOVERY_CHANGED) {
+            recovery_changed = true;
+        } else if !recovery_changed || !resp.contains("TierNameAlreadyExist") {
+            return Err(format!("AddTier(RustFS) failed: status={status}, body={resp}").into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("AddTier(RustFS) failed: status={status}, body={resp}").into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
     }
-    Ok(())
 }
 
 async fn remove_rustfs_tier_force(hot: &RustFSTestEnvironment) -> TestResult {
@@ -207,10 +228,12 @@ async fn remove_rustfs_tier_force(hot: &RustFSTestEnvironment) -> TestResult {
         if status.is_success() {
             return Ok(());
         }
-        if !resp.contains("TierNameBackendInUse") || Instant::now() >= deadline {
+        if (!resp.contains("TierNameBackendInUse") && !resp.contains(TIER_MUTATION_RECOVERY_CHANGED))
+            || Instant::now() >= deadline
+        {
             return Err(format!("RemoveTier(RustFS) failed: status={status}, body={resp}").into());
         }
-        // AddTier cleanup is asynchronous; wait until its committed mutation fence clears.
+        // Tier mutation cleanup and startup recovery are asynchronous.
         tokio::time::sleep(StdDuration::from_millis(100)).await;
     }
 }
