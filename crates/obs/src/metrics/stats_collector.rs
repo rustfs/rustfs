@@ -18,15 +18,15 @@
 //! RustFS internal sources (storage layer, bucket monitor, system info)
 //! and convert them to the Stats structs used by collectors.
 
-use crate::metrics::collectors::scanner::{ScannerBucketDriveResultStats, ScannerSourceWorkStats};
+use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
     BucketReplicationRuntimeStats, BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
     BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
     ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
-    DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmRuntimeStats, IlmStats,
-    MemoryStats, NetworkStats, ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerRuntimeStats,
-    ScannerStats,
+    DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmBackpressureStats,
+    IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType,
+    ReplicationStats, ResourceStats, ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -38,7 +38,10 @@ use crate::metrics::{
 use crate::node_identity::current_local_node_identity;
 use jiff::Timestamp;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot, global_metrics};
+use rustfs_common::metrics::{
+    ScannerActiveBucketDriveSnapshot, ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot,
+    global_metrics,
+};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, s3_op_metrics_snapshot,
@@ -835,6 +838,8 @@ pub(crate) async fn collect_disk_and_system_drive_runtime_stats()
                         drive_api_latency_micros(metrics.last_minute.values().map(|action| (action.count, action.acc_time)))
                     }),
                     health: if is_online { 1 } else { 0 },
+                    writes_total: disk.metrics.as_ref().map(|metrics| metrics.total_writes),
+                    deletes_total: disk.metrics.as_ref().map(|metrics| metrics.total_deletes),
                     reads_per_sec: None,
                     reads_kb_per_sec: None,
                     reads_await: None,
@@ -1275,6 +1280,110 @@ fn ilm_action_task_stats(ilm: &ObsIlmRuntimeSnapshot) -> Vec<IlmActionTaskStats>
     ]
 }
 
+fn ilm_queue_task_stats(metrics: &ScannerMetricsReport) -> Vec<IlmQueueTaskStats> {
+    let expiry = &metrics.lifecycle_expiry;
+    let transition = &metrics.lifecycle_transition;
+    vec![
+        IlmQueueTaskStats {
+            action: "expiry".to_string(),
+            state: "pending".to_string(),
+            value: expiry.current_queued,
+        },
+        IlmQueueTaskStats {
+            action: "expiry".to_string(),
+            state: "active".to_string(),
+            value: expiry.current_active,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "pending".to_string(),
+            value: transition.current_queued,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "active".to_string(),
+            value: transition.current_active,
+        },
+        IlmQueueTaskStats {
+            action: "transition".to_string(),
+            state: "compensation_running".to_string(),
+            value: transition.compensation_running,
+        },
+    ]
+}
+
+fn ilm_task_event_stats(metrics: &ScannerMetricsReport) -> Vec<IlmTaskEventStats> {
+    let expiry = &metrics.lifecycle_expiry;
+    let transition = &metrics.lifecycle_transition;
+    vec![
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "queued".to_string(),
+            value: expiry.scanner_queued,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "missed".to_string(),
+            value: expiry.scanner_missed,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "blocked".to_string(),
+            value: expiry.scanner_blocked,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "not_enqueued".to_string(),
+            value: expiry.scanner_not_enqueued,
+        },
+        IlmTaskEventStats {
+            action: "expiry".to_string(),
+            result: "failed".to_string(),
+            value: expiry.delete_failed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "queued".to_string(),
+            value: transition.scanner_queued,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "missed".to_string(),
+            value: transition.scanner_missed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "completed".to_string(),
+            value: transition.completed,
+        },
+        IlmTaskEventStats {
+            action: "transition".to_string(),
+            result: "failed".to_string(),
+            value: transition.failed,
+        },
+    ]
+}
+
+fn ilm_backpressure_stats(metrics: &ScannerMetricsReport) -> Vec<IlmBackpressureStats> {
+    vec![
+        IlmBackpressureStats {
+            action: "expiry".to_string(),
+            reason: "queue_missed".to_string(),
+            value: metrics.lifecycle_expiry.queue_missed,
+        },
+        IlmBackpressureStats {
+            action: "transition".to_string(),
+            reason: "queue_full".to_string(),
+            value: metrics.lifecycle_transition.queue_full,
+        },
+        IlmBackpressureStats {
+            action: "transition".to_string(),
+            reason: "send_timeout".to_string(),
+            value: metrics.lifecycle_transition.queue_send_timeout,
+        },
+    ]
+}
+
 /// Collect ILM metrics from the current lifecycle runtime state.
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     collect_ilm_runtime_metric_stats().await.map(|stats| stats.stats)
@@ -1288,6 +1397,10 @@ pub(crate) async fn collect_ilm_runtime_metric_stats() -> Option<IlmRuntimeStats
     Some(IlmRuntimeStats {
         server: current_local_node_identity(),
         action_tasks: ilm_action_task_stats(&ilm),
+        queue_tasks: ilm_queue_task_stats(&metrics),
+        task_events: ilm_task_event_stats(&metrics),
+        backpressure: ilm_backpressure_stats(&metrics),
+        versions_scanned,
         stats: IlmStats {
             expiry_pending_tasks: ilm.expiry_pending_tasks,
             transition_active_tasks: ilm.transition_active_tasks,
@@ -1377,6 +1490,27 @@ fn scanner_bucket_drive_result_stats(results: &[ScannerBucketDriveResultSnapshot
     stats
 }
 
+fn scanner_active_bucket_drive_stats(results: &[ScannerActiveBucketDriveSnapshot]) -> Vec<ScannerActiveBucketDriveStats> {
+    let mut stats = results
+        .iter()
+        .filter(|result| !result.source.is_empty() && !result.bucket.is_empty() && !result.drive.is_empty() && result.count > 0)
+        .map(|result| ScannerActiveBucketDriveStats {
+            source: result.source.clone(),
+            bucket: result.bucket.clone(),
+            drive: result.drive.clone(),
+            count: result.count,
+            age_seconds: result.age_seconds,
+        })
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.bucket.cmp(&right.bucket))
+            .then_with(|| left.drive.cmp(&right.drive))
+    });
+    stats
+}
+
 pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     collect_scanner_runtime_metric_stats().await.map(|stats| stats.stats)
 }
@@ -1418,6 +1552,7 @@ pub(crate) async fn collect_scanner_runtime_metric_stats() -> Option<ScannerRunt
             &runtime_details.current_cycle_bucket_drive_results,
         ),
         last_cycle_bucket_drive_results: scanner_bucket_drive_result_stats(&runtime_details.last_cycle_bucket_drive_results),
+        active_bucket_drive_scans: scanner_active_bucket_drive_stats(&runtime_details.active_bucket_drive_scans),
         stats: ScannerStats {
             bucket_scans_finished,
             bucket_scans_started,
@@ -1982,6 +2117,72 @@ mod tests {
         };
 
         assert_eq!(scanner_lifecycle_checked_versions(&report), 37);
+    }
+
+    #[test]
+    fn ilm_detail_stats_keep_expiry_and_transition_results_separate() {
+        let report = ScannerMetricsReport {
+            lifecycle_expiry: rustfs_common::metrics::ScannerLifecycleExpirySnapshot {
+                current_queued: 2,
+                current_active: 1,
+                scanner_queued: 10,
+                scanner_missed: 3,
+                delete_failed: 4,
+                ..Default::default()
+            },
+            lifecycle_transition: rustfs_common::metrics::ScannerLifecycleTransitionSnapshot {
+                current_queued: 5,
+                current_active: 6,
+                queue_full: 7,
+                queue_send_timeout: 8,
+                scanner_queued: 11,
+                completed: 12,
+                failed: 13,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let queues = ilm_queue_task_stats(&report);
+        assert!(
+            queues
+                .iter()
+                .any(|task| task.action == "expiry" && task.state == "pending" && task.value == 2)
+        );
+        assert!(
+            queues
+                .iter()
+                .any(|task| task.action == "transition" && task.state == "active" && task.value == 6)
+        );
+
+        let events = ilm_task_event_stats(&report);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "expiry" && event.result == "failed" && event.value == 4)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "transition" && event.result == "completed" && event.value == 12)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "transition" && event.result == "failed" && event.value == 13)
+        );
+
+        let backpressure = ilm_backpressure_stats(&report);
+        assert!(
+            backpressure
+                .iter()
+                .any(|event| event.action == "transition" && event.reason == "queue_full" && event.value == 7)
+        );
+        assert!(
+            backpressure
+                .iter()
+                .any(|event| event.action == "transition" && event.reason == "send_timeout" && event.value == 8)
+        );
     }
 
     #[test]

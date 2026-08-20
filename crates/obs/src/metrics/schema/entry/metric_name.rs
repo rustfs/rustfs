@@ -371,6 +371,8 @@ pub enum MetricName {
     DriveWaitingIO,
     DriveAPILatencyMicros,
     DriveHealth,
+    DriveWritesTotal,
+    DriveDeletesTotal,
 
     DriveOfflineCount,
     DriveOnlineCount,
@@ -780,6 +782,8 @@ impl MetricName {
             Self::DriveWaitingIO => "waiting_io".to_string(),
             Self::DriveAPILatencyMicros => "api_latency_micros".to_string(),
             Self::DriveHealth => "health".to_string(),
+            Self::DriveWritesTotal => "writes_total".to_string(),
+            Self::DriveDeletesTotal => "deletes_total".to_string(),
 
             Self::DriveOfflineCount => "offline_count".to_string(),
             Self::DriveOnlineCount => "online_count".to_string(),

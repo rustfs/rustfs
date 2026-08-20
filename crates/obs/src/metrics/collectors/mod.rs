@@ -59,9 +59,12 @@ pub use cluster_iam::{IamStats, collect_iam_metrics};
 pub use cluster_usage::{BucketUsageStats, ClusterUsageStats, collect_bucket_usage_metrics, collect_cluster_usage_metrics};
 pub use compression::{CompressionClusterStats, collect_compression_cluster_metrics};
 pub use dial9::{Dial9Stats, collect_current_dial9_metrics, collect_dial9_metrics, is_dial9_enabled};
-pub(crate) use ilm::{IlmActionTaskStats, IlmRuntimeStats, collect_ilm_runtime_metrics};
+pub(crate) use ilm::{
+    IlmActionTaskStats, IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmTaskEventStats, collect_ilm_runtime_metrics,
+};
 pub use ilm::{IlmStats, collect_ilm_metrics};
 pub use node::{DiskStats, collect_node_metrics};
+pub(crate) use notification::collect_notification_runtime_metrics;
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};

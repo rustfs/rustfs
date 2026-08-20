@@ -19,9 +19,12 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::cluster_notification::{
-    NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD, NOTIFICATION_EVENTS_ERRORS_TOTAL_MD, NOTIFICATION_EVENTS_SENT_TOTAL_MD,
-    NOTIFICATION_EVENTS_SKIPPED_TOTAL_MD,
+    NOTIFICATION_CURRENT_SEND_IN_PROGRESS_BY_SERVER_MD, NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD,
+    NOTIFICATION_EVENTS_ERRORS_TOTAL_BY_SERVER_MD, NOTIFICATION_EVENTS_ERRORS_TOTAL_MD,
+    NOTIFICATION_EVENTS_SENT_TOTAL_BY_SERVER_MD, NOTIFICATION_EVENTS_SENT_TOTAL_MD,
+    NOTIFICATION_EVENTS_SKIPPED_TOTAL_BY_SERVER_MD, NOTIFICATION_EVENTS_SKIPPED_TOTAL_MD, SERVER,
 };
+use std::borrow::Cow;
 
 /// Notification statistics.
 #[derive(Debug, Clone, Default)]
@@ -47,6 +50,30 @@ pub fn collect_notification_metrics(stats: &NotificationStats) -> Vec<Prometheus
         PrometheusMetric::from_descriptor(&NOTIFICATION_EVENTS_SENT_TOTAL_MD, stats.events_sent_total as f64),
         PrometheusMetric::from_descriptor(&NOTIFICATION_EVENTS_SKIPPED_TOTAL_MD, stats.events_skipped_total as f64),
     ]
+}
+
+/// Collects the legacy aggregate metrics and node-local runtime siblings.
+pub(crate) fn collect_notification_runtime_metrics(stats: &NotificationStats, server: &str) -> Vec<PrometheusMetric> {
+    let mut metrics = collect_notification_metrics(stats);
+    if server.is_empty() {
+        return metrics;
+    }
+
+    let server_label: Cow<'static, str> = Cow::Owned(server.to_string());
+    metrics.extend([
+        PrometheusMetric::from_descriptor(
+            &NOTIFICATION_CURRENT_SEND_IN_PROGRESS_BY_SERVER_MD,
+            stats.current_send_in_progress as f64,
+        )
+        .with_label(SERVER, server_label.clone()),
+        PrometheusMetric::from_descriptor(&NOTIFICATION_EVENTS_ERRORS_TOTAL_BY_SERVER_MD, stats.events_errors_total as f64)
+            .with_label(SERVER, server_label.clone()),
+        PrometheusMetric::from_descriptor(&NOTIFICATION_EVENTS_SENT_TOTAL_BY_SERVER_MD, stats.events_sent_total as f64)
+            .with_label(SERVER, server_label.clone()),
+        PrometheusMetric::from_descriptor(&NOTIFICATION_EVENTS_SKIPPED_TOTAL_BY_SERVER_MD, stats.events_skipped_total as f64)
+            .with_label(SERVER, server_label),
+    ]);
+    metrics
 }
 
 #[cfg(test)]
@@ -85,5 +112,33 @@ mod tests {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
         }
+    }
+
+    #[test]
+    fn runtime_metrics_keep_aggregate_and_add_server_siblings() {
+        let stats = NotificationStats {
+            current_send_in_progress: 5,
+            events_errors_total: 10,
+            events_sent_total: 100,
+            events_skipped_total: 2,
+        };
+
+        let metrics = collect_notification_runtime_metrics(&stats, "node1:9000");
+        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.iter().filter(|metric| metric.labels.is_empty()).count(), 4);
+        assert_eq!(metrics.iter().filter(|metric| metric.labels.len() == 1).count(), 4);
+        assert!(metrics.iter().filter(|metric| metric.labels.len() == 1).all(|metric| {
+            metric
+                .labels
+                .iter()
+                .any(|(name, value)| *name == SERVER && value == "node1:9000")
+        }));
+    }
+
+    #[test]
+    fn runtime_metrics_do_not_publish_empty_server_series() {
+        let metrics = collect_notification_runtime_metrics(&NotificationStats::default(), "");
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().all(|metric| metric.labels.is_empty()));
     }
 }
