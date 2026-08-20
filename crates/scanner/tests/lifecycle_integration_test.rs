@@ -1058,10 +1058,27 @@ mod serial_tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[test]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-    async fn test_transition_and_restore_flows() {
+    fn test_transition_and_restore_flows() {
+        std::thread::Builder::new()
+            .name("scanner-transition-restore-flows".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("transition and restore test runtime should build");
+
+                runtime.block_on(test_transition_and_restore_flows_inner());
+            })
+            .expect("transition and restore test thread should spawn")
+            .join()
+            .expect("transition and restore test thread should finish");
+    }
+
+    async fn test_transition_and_restore_flows_inner() {
         async move {
             let (disk_paths, ecstore) = setup_test_env().await;
 
