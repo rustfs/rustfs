@@ -5655,6 +5655,8 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
 
 #[cfg(test)]
 mod tests {
+    use crate::disk::local::{DurabilityMode, durability_mode_override};
+
     use super::*;
     use std::io::Cursor;
     use tempfile::TempDir;
@@ -5860,6 +5862,34 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    async fn reopen_local_disk(dir: &TempDir) -> DiskStore {
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should reopen from the same tempdir")
+    }
+
+    async fn prepare_rename_source_dirs(dirs: &[TempDir], disks: &[Option<DiskStore>], source: &str) {
+        for (dir, disk) in dirs.iter().zip(disks.iter()) {
+            let Some(disk) = disk else {
+                continue;
+            };
+            match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+                Ok(()) | Err(DiskError::VolumeExists) => {}
+                Err(err) => panic!("temporary metadata volume should be available: {err:?}"),
+            }
+            std::fs::create_dir_all(dir.path().join(RUSTFS_META_TMP_BUCKET).join(source))
+                .expect("rename staging source dir should be created");
+        }
     }
 
     #[test]
@@ -7503,6 +7533,19 @@ mod tests {
         (0..count).map(|_| metadata_test_fileinfo(object)).collect()
     }
 
+    fn rename_commit_fileinfos(object: &str, count: usize, etag: &str) -> Vec<FileInfo> {
+        (0..count)
+            .map(|idx| {
+                let mut file_info = metadata_test_fileinfo(object);
+                file_info.mod_time = Some(OffsetDateTime::now_utc());
+                file_info.erasure.index = idx + 1;
+                file_info.data = Some(Bytes::from_static(b"inline-body"));
+                file_info.metadata.insert("etag".to_string(), etag.to_string());
+                file_info
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn rename_data_skips_offline_placeholder_when_validating_new_metadata() {
         let (_dirs, mut online_disks) = call_counter_local_disks("rename-validation-bucket", 1).await;
@@ -7774,6 +7817,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
     async fn rename_fanout_drains_after_caller_cancellation() {
         const DISKS: usize = 4;
         let bucket = "rename-cancel-bucket";
@@ -7814,6 +7858,189 @@ mod tests {
             assert!(
                 dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
                 "disk {idx} must finish the rename after caller cancellation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_waits_for_tail_disk_after_write_quorum() {
+        const DISKS: usize = 4;
+        let bucket = "rename-tail-success-bucket";
+        let object = "rename-tail-success-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let file_infos = rename_commit_fileinfos(object, DISKS, "tail-success-etag");
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        let rename = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 3);
+        tokio::pin!(rename);
+        tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+            tokio::select! {
+                () = barrier.wait_until_paused() => {}
+                result = &mut rename => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+            }
+        })
+        .await
+        .expect("paused disk must reach the armed rename barrier");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut rename).await.is_err(),
+            "current rename_data waits for the paused fan-out disk even after the other three disks can reach write quorum"
+        );
+
+        barrier.release();
+        rename
+            .await
+            .expect("tail success must complete the rename after the barrier is released");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            let reopened = reopen_local_disk(dir).await;
+            let stored = reopened
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {idx} must contain the tail-success commit after reopen: {err:?}"));
+            assert_eq!(
+                stored.metadata.get("etag").map(String::as_str),
+                Some("tail-success-etag"),
+                "disk {idx} must expose the same committed metadata after tail success and reopen"
+            );
+        }
+
+        drop(dirs);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_commits_fresh_object_when_tail_disk_fails_after_write_quorum() {
+        const DISKS: usize = 4;
+        let bucket = "rename-tail-failure-fresh-bucket";
+        let object = "rename-tail-failure-fresh-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let mut file_infos = rename_commit_fileinfos(object, DISKS, "fresh-etag");
+        file_infos[3] = FileInfo::default();
+
+        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 3)
+            .await
+            .expect("three successful disks must satisfy write quorum despite one tail failure");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            let reopened = reopen_local_disk(dir).await;
+            let read = reopened.read_version("", bucket, object, "", &ReadOptions::default()).await;
+            if idx < 3 {
+                read.unwrap_or_else(|err| panic!("quorum disk {idx} must contain the fresh commit after reopen: {err:?}"));
+            } else {
+                assert!(
+                    matches!(read, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                    "failed tail disk must not expose a partial fresh commit after reopen: {read:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_overwrite_tail_failure_preserves_old_tail_version_after_reopen() {
+        const DISKS: usize = 4;
+        let bucket = "rename-tail-failure-overwrite-bucket";
+        let object = "rename-tail-failure-overwrite-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let mut old = metadata_test_fileinfo(object);
+        old.mod_time = Some(OffsetDateTime::now_utc());
+        old.data = Some(Bytes::from_static(b"old-inline-body"));
+        old.metadata.insert("etag".to_string(), "old-etag".to_string());
+        for disk in disks.iter().flatten() {
+            disk.write_metadata(bucket, bucket, object, old.clone())
+                .await
+                .expect("old metadata should be written before overwrite");
+        }
+
+        let mut file_infos = rename_commit_fileinfos(object, DISKS, "new-etag");
+        file_infos[3] = FileInfo::default();
+
+        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 3)
+            .await
+            .expect("three successful disks must satisfy overwrite quorum despite one tail failure");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            let reopened = reopen_local_disk(dir).await;
+            let stored = reopened
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {idx} must have a readable version after reopen: {err:?}"));
+            let expected_etag = if idx < 3 { "new-etag" } else { "old-etag" };
+            assert_eq!(
+                stored.metadata.get("etag").map(String::as_str),
+                Some(expected_etag),
+                "disk {idx} must keep the correct overwrite visibility after reopen"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_strict_quorum_failure_rolls_back_fresh_object_after_reopen() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        const DISKS: usize = 4;
+        let bucket = "rename-strict-rollback-fresh-bucket";
+        let object = "rename-strict-rollback-fresh-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let mut file_infos = rename_commit_fileinfos(object, DISKS, "fresh-rollback-etag");
+        file_infos[3] = FileInfo::default();
+
+        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 4)
+            .await
+            .expect_err("three successful disks must fail a strict write quorum of four");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            let reopened = reopen_local_disk(dir).await;
+            let read = reopened.read_version("", bucket, object, "", &ReadOptions::default()).await;
+            assert!(
+                matches!(read, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                "disk {idx} must not expose a fresh object after strict quorum rollback and reopen: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn rename_data_strict_quorum_failure_restores_overwrite_after_reopen() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        const DISKS: usize = 4;
+        let bucket = "rename-strict-rollback-overwrite-bucket";
+        let object = "rename-strict-rollback-overwrite-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let mut old = metadata_test_fileinfo(object);
+        old.mod_time = Some(OffsetDateTime::now_utc());
+        old.data = Some(Bytes::from_static(b"old-inline-body"));
+        old.metadata.insert("etag".to_string(), "old-rollback-etag".to_string());
+        for disk in disks.iter().flatten() {
+            disk.write_metadata(bucket, bucket, object, old.clone())
+                .await
+                .expect("old metadata should be written before overwrite rollback test");
+        }
+
+        let mut file_infos = rename_commit_fileinfos(object, DISKS, "new-rollback-etag");
+        file_infos[3] = FileInfo::default();
+
+        SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 4)
+            .await
+            .expect_err("three successful disks must fail a strict overwrite quorum of four");
+
+        for (idx, dir) in dirs.iter().enumerate() {
+            let reopened = reopen_local_disk(dir).await;
+            let stored = reopened
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {idx} must keep old metadata after strict rollback: {err:?}"));
+            assert_eq!(
+                stored.metadata.get("etag").map(String::as_str),
+                Some("old-rollback-etag"),
+                "disk {idx} must restore the old overwrite target after strict rollback and reopen"
             );
         }
     }
