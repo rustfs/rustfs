@@ -15,11 +15,24 @@
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
+pub const SERVER: &str = "server";
+
+const SERVER_LABELS: [&str; 1] = [SERVER];
+
 pub static NOTIFICATION_CURRENT_SEND_IN_PROGRESS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::NotificationCurrentSendInProgress,
         "Number of concurrent async Send calls active to all targets",
         &[],
+        subsystems::NOTIFICATION,
+    )
+});
+
+pub static NOTIFICATION_CURRENT_SEND_IN_PROGRESS_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("current_send_in_progress_by_server".to_string()),
+        "Number of concurrent async Send calls active to all targets by server",
+        &SERVER_LABELS,
         subsystems::NOTIFICATION,
     )
 });
@@ -33,6 +46,15 @@ pub static NOTIFICATION_EVENTS_ERRORS_TOTAL_MD: LazyLock<MetricDescriptor> = Laz
     )
 });
 
+pub static NOTIFICATION_EVENTS_ERRORS_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("events_errors_total_by_server".to_string()),
+        "Events that failed to be sent to the targets by server",
+        &SERVER_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
 pub static NOTIFICATION_EVENTS_SENT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::NotificationEventsSentTotal,
@@ -42,11 +64,29 @@ pub static NOTIFICATION_EVENTS_SENT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyL
     )
 });
 
+pub static NOTIFICATION_EVENTS_SENT_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("events_sent_total_by_server".to_string()),
+        "Total number of events sent to the targets by server",
+        &SERVER_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
 pub static NOTIFICATION_EVENTS_SKIPPED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::NotificationEventsSkippedTotal,
         "Notification dispatch attempts skipped before delivery",
         &[],
+        subsystems::NOTIFICATION,
+    )
+});
+
+pub static NOTIFICATION_EVENTS_SKIPPED_TOTAL_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("events_skipped_total_by_server".to_string()),
+        "Notification dispatch attempts skipped before delivery by server",
+        &SERVER_LABELS,
         subsystems::NOTIFICATION,
     )
 });

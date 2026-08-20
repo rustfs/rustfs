@@ -109,7 +109,7 @@ pub enum HealType {
 }
 
 impl HealType {
-    fn log_kind(&self) -> &'static str {
+    pub(crate) fn kind_label(&self) -> &'static str {
         match self {
             Self::Cluster => "cluster",
             Self::Object { .. } => "object",
@@ -224,6 +224,19 @@ impl Default for HealOptions {
             pool_index: None,
             set_index: None,
         }
+    }
+}
+
+impl HealOptions {
+    pub(crate) fn set_key(&self) -> Option<String> {
+        match (self.pool_index, self.set_index) {
+            (Some(pool), Some(set)) => Some(format!("pool_{pool}_set_{set}")),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_metric_label(&self) -> String {
+        self.set_key().unwrap_or_else(|| "global".to_string())
     }
 }
 
@@ -491,15 +504,7 @@ impl HealTask {
     }
 
     pub fn metric_type_label(&self) -> &'static str {
-        match &self.heal_type {
-            HealType::Cluster => "cluster",
-            HealType::Object { .. } => "object",
-            HealType::Bucket { .. } => "bucket",
-            HealType::Prefix { .. } => "prefix",
-            HealType::ErasureSet { .. } => "erasure_set",
-            HealType::Metadata { .. } => "metadata",
-            HealType::ECDecode { .. } => "ec_decode",
-        }
+        self.heal_type.kind_label()
     }
 
     pub(crate) fn has_batch_failure(&self) -> bool {
@@ -520,10 +525,7 @@ impl HealTask {
     pub fn metric_set_label(&self) -> String {
         match &self.heal_type {
             HealType::ErasureSet { set_disk_id, .. } => set_disk_id.clone(),
-            _ => match (self.options.pool_index, self.options.set_index) {
-                (Some(pool), Some(set)) => format!("pool_{pool}_set_{set}"),
-                _ => "global".to_string(),
-            },
+            _ => self.options.set_metric_label(),
         }
     }
 
@@ -532,7 +534,7 @@ impl HealTask {
             let mut event = TraceEvent::new(TraceKind::Heal, TraceFunc::HealTask)
                 .with_duration(duration)
                 .with_attr("task_id", self.id.as_str())
-                .with_attr("heal_type", self.heal_type.log_kind())
+                .with_attr("heal_type", self.heal_type.kind_label())
                 .with_attr("state", state)
                 .with_attr("source", self.source.as_str())
                 .with_attr("priority", self.priority.as_str())
@@ -795,7 +797,7 @@ impl HealTask {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_TASK,
             task_id = %self.id,
-            heal_type = self.heal_type.log_kind(),
+            heal_type = self.heal_type.kind_label(),
             state = "started",
             queue_delay = ?queue_delay,
             "Heal task started"
@@ -836,7 +838,7 @@ impl HealTask {
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
-                    heal_type = self.heal_type.log_kind(),
+                    heal_type = self.heal_type.kind_label(),
                     state = "completed",
                     "Heal task completed"
                 });
@@ -850,7 +852,7 @@ impl HealTask {
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
-                    heal_type = self.heal_type.log_kind(),
+                    heal_type = self.heal_type.kind_label(),
                     state = "cancelled",
                     "Heal task cancelled"
                 );
@@ -863,7 +865,7 @@ impl HealTask {
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
-                    heal_type = self.heal_type.log_kind(),
+                    heal_type = self.heal_type.kind_label(),
                     state = "timed_out",
                     "Heal task timed out"
                 });
@@ -880,7 +882,7 @@ impl HealTask {
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_TASK,
                     task_id = %self.id,
-                    heal_type = self.heal_type.log_kind(),
+                    heal_type = self.heal_type.kind_label(),
                     state = "failed",
                     error = %e,
                     "Heal task failed"
@@ -909,7 +911,7 @@ impl HealTask {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_TASK,
             task_id = %self.id,
-            heal_type = self.heal_type.log_kind(),
+            heal_type = self.heal_type.kind_label(),
             state = "cancelled",
             source = "manual",
             "Heal task cancellation requested"

@@ -184,6 +184,15 @@ pub struct ScannerBucketDriveResultStats {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ScannerActiveBucketDriveStats {
+    pub source: String,
+    pub bucket: String,
+    pub drive: String,
+    pub count: u64,
+    pub age_seconds: u64,
+}
+
 /// Scanner statistics with runtime-local node identity and bounded source/result details.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScannerRuntimeStats {
@@ -195,6 +204,7 @@ pub(crate) struct ScannerRuntimeStats {
     pub(crate) bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
     pub(crate) current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
     pub(crate) last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultStats>,
+    pub(crate) active_bucket_drive_scans: Vec<ScannerActiveBucketDriveStats>,
 }
 
 /// Collects scanner metrics from the given stats.
@@ -452,6 +462,23 @@ fn collect_scanner_metrics_with_runtime(stats: &ScannerStats, runtime: Option<&S
             &runtime.last_cycle_bucket_drive_results,
             Some("last"),
         );
+        for active in &runtime.active_bucket_drive_scans {
+            let labels = |metric: PrometheusMetric| {
+                metric
+                    .with_label_owned(SERVER_LABEL, runtime.server.clone())
+                    .with_label_owned(SOURCE_LABEL, active.source.clone())
+                    .with_label_owned(BUCKET_LABEL, active.bucket.clone())
+                    .with_label_owned(DRIVE_LABEL, active.drive.clone())
+            };
+            metrics.push(labels(PrometheusMetric::from_descriptor(
+                &SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD,
+                active.count as f64,
+            )));
+            metrics.push(labels(PrometheusMetric::from_descriptor(
+                &SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD,
+                active.age_seconds as f64,
+            )));
+        }
     }
 
     metrics
@@ -566,6 +593,13 @@ mod tests {
                 result: "error".to_string(),
                 count: 2,
             }],
+            active_bucket_drive_scans: vec![ScannerActiveBucketDriveStats {
+                source: "usage".to_string(),
+                bucket: "photos".to_string(),
+                drive: "/data1".to_string(),
+                count: 2,
+                age_seconds: 7,
+            }],
             stats: ScannerStats {
                 bucket_scans_finished: 100,
                 bucket_scans_started: 100,
@@ -642,7 +676,7 @@ mod tests {
         let metrics = collect_scanner_runtime_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 90);
+        assert_eq!(metrics.len(), 92);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -655,6 +689,35 @@ mod tests {
             .find(|m| m.name == SCANNER_ACTIVE_PATHS_MD.get_full_metric_name());
         assert_eq!(active_paths.map(|m| m.value), Some(4.0));
         assert_eq!(active_paths.map(|m| m.labels.len()), Some(0));
+
+        let active_bucket_drive = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD.get_full_metric_name())
+            .expect("active bucket-drive metric");
+        assert_eq!(active_bucket_drive.value, 2.0);
+        assert!(
+            active_bucket_drive
+                .labels
+                .iter()
+                .any(|(name, value)| *name == SOURCE_LABEL && value == "usage")
+        );
+        assert!(
+            active_bucket_drive
+                .labels
+                .iter()
+                .any(|(name, value)| *name == BUCKET_LABEL && value == "photos")
+        );
+        assert!(
+            active_bucket_drive
+                .labels
+                .iter()
+                .any(|(name, value)| *name == DRIVE_LABEL && value == "/data1")
+        );
+        let active_age = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD.get_full_metric_name())
+            .expect("active bucket-drive age metric");
+        assert_eq!(active_age.value, 7.0);
 
         let bucket_drive_result = metrics
             .iter()

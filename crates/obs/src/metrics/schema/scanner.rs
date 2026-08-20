@@ -59,6 +59,24 @@ pub static SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD: LazyLock<MetricDescriptor> = La
     )
 });
 
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scans".to_string()),
+        "Current active scanner bucket-drive scans by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scan_age_seconds".to_string()),
+        "Age of the oldest active scanner bucket-drive scan by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
 pub static SCANNER_BUCKET_SCANS_FINISHED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerBucketScansFinished,

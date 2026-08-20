@@ -781,6 +781,19 @@ struct ScannerBucketDriveResultValue {
     last_seen: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ScannerActiveBucketDriveKey {
+    source: String,
+    bucket: String,
+    drive: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScannerActiveBucketDriveValue {
+    count: u64,
+    started_at: Timestamp,
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -813,6 +826,7 @@ pub struct Metrics {
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<ScannerDiskBucketScanKey, ScannerDiskBucketScanState>>,
     scanner_bucket_drive_results: Mutex<ScannerBucketDriveResults>,
+    scanner_active_bucket_drive_scans: Mutex<HashMap<ScannerActiveBucketDriveKey, ScannerActiveBucketDriveValue>>,
     scanner_bucket_drive_result_clock: AtomicU64,
     current_scan_cycle_bucket_drive_results_start: Mutex<HashMap<ScannerBucketDriveResultKey, u64>>,
     last_scan_cycle_bucket_drive_results: Mutex<Vec<ScannerBucketDriveResultSnapshot>>,
@@ -1043,6 +1057,15 @@ pub struct ScannerBucketDriveResultSnapshot {
     pub drive: String,
     pub result: String,
     pub count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerActiveBucketDriveSnapshot {
+    pub source: String,
+    pub bucket: String,
+    pub drive: String,
+    pub count: u64,
+    pub age_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1387,6 +1410,8 @@ pub struct ScannerRuntimeDetailsReport {
     pub current_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
     #[serde(default)]
     pub last_cycle_bucket_drive_results: Vec<ScannerBucketDriveResultSnapshot>,
+    #[serde(default)]
+    pub active_bucket_drive_scans: Vec<ScannerActiveBucketDriveSnapshot>,
 }
 
 impl CurrentCycle {
@@ -1746,7 +1771,7 @@ pub fn emit_scan_cycle_deferred(duration: Duration) {
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_DEFERRED_LABEL).increment(1);
 }
 
-pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
+pub fn emit_scan_bucket_drive_complete(_source: ScannerWorkSource, success: bool, bucket: &str, disk: &str, duration: Duration) {
     let result = if success { "success" } else { "error" };
     global_metrics().record_scanner_bucket_drive_result(bucket, disk, result);
     metrics::counter!(
@@ -1764,7 +1789,7 @@ pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, 
     .record(duration.as_secs_f64());
 }
 
-pub fn emit_scan_bucket_drive_partial(bucket: &str, disk: &str, duration: Duration) {
+pub fn emit_scan_bucket_drive_partial(_source: ScannerWorkSource, bucket: &str, disk: &str, duration: Duration) {
     global_metrics().record_scanner_bucket_drive_result(bucket, disk, SCAN_CYCLE_RESULT_PARTIAL_LABEL);
     metrics::counter!(
         OTEL_SCANNER_BUCKETS_SCANNED,
@@ -1817,6 +1842,7 @@ impl Metrics {
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
             scanner_bucket_drive_results: Mutex::new(ScannerBucketDriveResults::default()),
+            scanner_active_bucket_drive_scans: Mutex::new(HashMap::new()),
             scanner_bucket_drive_result_clock: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_results_start: Mutex::new(HashMap::new()),
             last_scan_cycle_bucket_drive_results: Mutex::new(Vec::new()),
@@ -2308,8 +2334,45 @@ impl Metrics {
         }
     }
 
-    pub fn record_scan_bucket_drive_start(&self) {
+    pub fn record_scan_bucket_drive_start(&self, source: ScannerWorkSource, bucket: &str, drive: &str) {
         self.operations[Metric::ScanBucketDriveStart as usize].fetch_add(1, Ordering::Relaxed);
+        if bucket.is_empty() || drive.is_empty() {
+            return;
+        }
+        let key = ScannerActiveBucketDriveKey {
+            source: source.as_str().to_string(),
+            bucket: bucket.to_string(),
+            drive: drive.to_string(),
+        };
+        let mut active = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .entry(key)
+            .and_modify(|value| value.count = value.count.saturating_add(1))
+            .or_insert(ScannerActiveBucketDriveValue {
+                count: 1,
+                started_at: Timestamp::now(),
+            });
+    }
+
+    pub fn record_scan_bucket_drive_end(&self, source: ScannerWorkSource, bucket: &str, drive: &str) {
+        let key = ScannerActiveBucketDriveKey {
+            source: source.as_str().to_string(),
+            bucket: bucket.to_string(),
+            drive: drive.to_string(),
+        };
+        let mut active = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = active.get_mut(&key) {
+            value.count = value.count.saturating_sub(1);
+            if value.count == 0 {
+                active.remove(&key);
+            }
+        }
     }
 
     pub fn record_scan_bucket_drive_failure(&self) {
@@ -2782,6 +2845,26 @@ impl Metrics {
         } else {
             Vec::new()
         };
+        let now = Timestamp::now();
+        let mut active_bucket_drive_scans = self
+            .scanner_active_bucket_drive_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(key, value)| ScannerActiveBucketDriveSnapshot {
+                source: key.source.clone(),
+                bucket: key.bucket.clone(),
+                drive: key.drive.clone(),
+                count: value.count,
+                age_seconds: timestamp_elapsed_seconds_since(now, value.started_at),
+            })
+            .collect::<Vec<_>>();
+        active_bucket_drive_scans.sort_by(|left, right| {
+            left.source
+                .cmp(&right.source)
+                .then_with(|| left.bucket.cmp(&right.bucket))
+                .then_with(|| left.drive.cmp(&right.drive))
+        });
         ScannerRuntimeDetailsReport {
             disk_bucket_scan_states: self.scanner_disk_bucket_scan_state_snapshots(),
             bucket_drive_results: self.scanner_bucket_drive_result_counter_snapshots(),
@@ -2791,6 +2874,7 @@ impl Metrics {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            active_bucket_drive_scans,
         }
     }
 
@@ -4371,13 +4455,34 @@ mod tests {
     #[tokio::test]
     async fn report_includes_bucket_drive_scan_starts() {
         let metrics = Metrics::new();
-        metrics.record_scan_bucket_drive_start();
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
         metrics.record_scan_bucket_drive_failure();
 
         let report = metrics.report().await;
 
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_start"), Some(&1));
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_failure"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn active_bucket_drive_snapshot_is_structured_and_retired_on_end() {
+        let metrics = Metrics::new();
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        let active = metrics.scanner_runtime_details_report().active_bucket_drive_scans;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].source, ScannerWorkSource::Usage.as_str());
+        assert_eq!(active[0].bucket, "bucket-a");
+        assert_eq!(active[0].drive, "/mnt/data/1");
+        assert_eq!(active[0].count, 2);
+
+        metrics.record_scan_bucket_drive_end(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        assert_eq!(metrics.scanner_runtime_details_report().active_bucket_drive_scans[0].count, 1);
+        metrics.record_scan_bucket_drive_end(ScannerWorkSource::Usage, "bucket-a", "/mnt/data/1");
+        assert!(metrics.scanner_runtime_details_report().active_bucket_drive_scans.is_empty());
+
+        metrics.record_scan_bucket_drive_start(ScannerWorkSource::Usage, "", "/mnt/data/1");
+        assert!(metrics.scanner_runtime_details_report().active_bucket_drive_scans.is_empty());
     }
 
     #[tokio::test]

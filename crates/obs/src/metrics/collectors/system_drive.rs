@@ -60,6 +60,10 @@ pub struct DriveDetailedStats {
     pub api_latency_micros: Option<u64>,
     /// Health status (1=healthy, 0=unhealthy)
     pub health: u8,
+    /// Total successful write operations when backed by a real disk metric.
+    pub writes_total: Option<u64>,
+    /// Total successful delete operations when backed by a real disk metric.
+    pub deletes_total: Option<u64>,
     /// Reads per second when backed by a real iostat sample
     pub reads_per_sec: Option<f64>,
     /// Kilobytes read per second when backed by a real iostat sample
@@ -282,6 +286,12 @@ pub(crate) fn collect_drive_runtime_detailed_metrics(stats: &[DriveRuntimeDetail
         if let Some(value) = stat.stats.perc_util {
             push_drive_metric(&mut metrics, &DRIVE_PERC_UTIL_MD, value, server_label, drive_label);
         }
+        if let Some(value) = stat.stats.writes_total {
+            push_drive_metric(&mut metrics, &DRIVE_WRITES_TOTAL_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.stats.deletes_total {
+            push_drive_metric(&mut metrics, &DRIVE_DELETES_TOTAL_MD, value as f64, server_label, drive_label);
+        }
         if let Some(labels) = &topology_labels {
             if let Some(disk_id) = stat.disk_id.as_ref().filter(|disk_id| !disk_id.is_empty()) {
                 metrics.push(
@@ -449,6 +459,8 @@ mod tests {
                 waiting_io: Some(3),
                 api_latency_micros: Some(1500),
                 health: 1,
+                writes_total: Some(11),
+                deletes_total: Some(4),
                 reads_per_sec: Some(100.0),
                 reads_kb_per_sec: Some(1024.0),
                 reads_await: Some(5.5),
@@ -462,7 +474,7 @@ mod tests {
         let metrics = collect_drive_runtime_detailed_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 34);
+        assert_eq!(metrics.len(), 36);
 
         // Verify total bytes metric
         let total_bytes_name = DRIVE_TOTAL_BYTES_MD.get_full_metric_name();
@@ -503,6 +515,8 @@ mod tests {
                 API_LABEL,
             ],
         );
+        assert_metric_label_keys(&metrics, &DRIVE_WRITES_TOTAL_MD, 11.0, &[SERVER_LABEL, DRIVE_LABEL]);
+        assert_metric_label_keys(&metrics, &DRIVE_DELETES_TOTAL_MD, 4.0, &[SERVER_LABEL, DRIVE_LABEL]);
     }
 
     #[test]
@@ -524,6 +538,8 @@ mod tests {
             waiting_io: None,
             api_latency_micros: None,
             health: 1,
+            writes_total: None,
+            deletes_total: None,
             reads_per_sec: None,
             reads_kb_per_sec: None,
             reads_await: None,
