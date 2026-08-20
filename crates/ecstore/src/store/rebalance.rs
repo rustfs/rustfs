@@ -202,10 +202,73 @@ impl ECStore {
     }
 
     pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        if opts.lifecycle_delete_all.is_some() {
+            let mut preflight_opts = opts.clone();
+            preflight_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::Preflight;
+            for pool in &self.pools {
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Preflight, pool.pool_idx)?;
+                pool.delete_object(bucket, object, preflight_opts.clone()).await?;
+            }
+
+            opts.lifecycle_delete_all_journal.lock().mark_mutation_started();
+            let mut non_trigger_opts = opts.clone();
+            non_trigger_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::History;
+            for pool in &self.pools {
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::History, pool.pool_idx)?;
+                let mut pool_opts = non_trigger_opts.clone();
+                pool_opts.delete_prefix = true;
+                pool.delete_object(bucket, object, pool_opts).await?;
+            }
+
+            let mut final_preflight_opts = opts.clone();
+            final_preflight_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::FinalPreflight;
+            let mut trigger_pools = Vec::new();
+            for (pool_index, pool) in self.pools.iter().enumerate() {
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::FinalPreflight, pool.pool_idx)?;
+                let result = pool.delete_object(bucket, object, final_preflight_opts.clone()).await?;
+                if !result.name.is_empty() {
+                    trigger_pools.push(pool_index);
+                }
+            }
+            if trigger_pools.is_empty() {
+                return Err(StorageError::PreconditionFailed);
+            }
+
+            let mut trigger_opts = opts.clone();
+            trigger_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::Trigger;
+            for pool_index in trigger_pools {
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Trigger, pool_index)?;
+                let mut pool_opts = trigger_opts.clone();
+                pool_opts.delete_prefix = true;
+                self.pools[pool_index].delete_object(bucket, object, pool_opts).await?;
+            }
+            return Ok(());
+        }
+
         let mut first_error = None;
         let mut first_volume_error = None;
         let mut has_success = false;
-        for pool in self.pools.iter() {
+        for pool in &self.pools {
             let mut opts = opts.clone();
             opts.delete_prefix = true;
             match pool.delete_object(bucket, object, opts).await {
@@ -775,29 +838,50 @@ impl ECStore {
 }
 
 #[cfg(test)]
+static LIFECYCLE_DELETE_ALL_TEST_FAILURE: std::sync::Mutex<Option<(crate::object_api::LifecycleDeleteAllPhase, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn lifecycle_delete_all_test_failure(phase: crate::object_api::LifecycleDeleteAllPhase, pool_index: usize) -> Result<()> {
+    if LIFECYCLE_DELETE_ALL_TEST_FAILURE
+        .lock()
+        .expect("lifecycle delete-all failure hook should not poison")
+        .is_some_and(|failure| failure == (phase, pool_index))
+    {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::object_api::ObjectLockConfigSnapshot;
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::object::ObjectIO as _;
     use arc_swap::ArcSwap;
     use rustfs_config::server_config::KVS;
+    use rustfs_filemeta::FileInfo;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
-    #[tokio::test]
-    async fn delete_prefix_attempts_later_pools_after_an_earlier_pool_error() {
-        let temp_dir = tempfile::tempdir().expect("multi-pool delete test directory should be created");
-        let mut pools = Vec::with_capacity(2);
-        for (pool_index, drives_per_set) in [2, 4].into_iter().enumerate() {
+    async fn setup_multi_pool_test_store(
+        name: &str,
+        drives_per_pool: &[usize],
+    ) -> (tempfile::TempDir, Arc<ECStore>, CancellationToken) {
+        let temp_dir = tempfile::tempdir().expect("multi-pool test directory should be created");
+        let mut pools = Vec::with_capacity(drives_per_pool.len());
+        for (pool_index, drives_per_set) in drives_per_pool.iter().copied().enumerate() {
             let mut endpoints = Vec::with_capacity(drives_per_set);
             for disk_index in 0..drives_per_set {
                 let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
                 tokio::fs::create_dir_all(&disk_path)
                     .await
-                    .expect("multi-pool delete test disk should be created");
+                    .expect("multi-pool test disk should be created");
                 let mut endpoint =
                     Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
                 endpoint.set_pool_index(pool_index);
@@ -810,7 +894,7 @@ mod tests {
                 set_count: 1,
                 drives_per_set,
                 endpoints: Endpoints::from(endpoints),
-                cmd_line: format!("delete-prefix-pool-{pool_index}"),
+                cmd_line: format!("{name}-pool-{pool_index}"),
                 platform: "test".to_string(),
             });
         }
@@ -830,6 +914,87 @@ mod tests {
         .await
         .expect("multi-pool store should initialize");
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        (temp_dir, store, shutdown)
+    }
+
+    struct LifecycleDeleteAllFailureGuard;
+
+    impl Drop for LifecycleDeleteAllFailureGuard {
+        fn drop(&mut self) {
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = None;
+        }
+    }
+
+    async fn seed_multi_pool_delete_all(store: &Arc<ECStore>, bucket: &str, object: &str) -> ObjectOptions {
+        let trigger_id = Uuid::new_v4();
+        for (pool_index, pool) in store.pools.iter().enumerate() {
+            let mut history_reader = PutObjReader::from_vec(format!("{object}-history-{pool_index}").into_bytes());
+            pool.put_object(
+                bucket,
+                object,
+                &mut history_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::new_v4().to_string()),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("history should be stored");
+            let mut trigger_reader = PutObjReader::from_vec(format!("{object}-trigger-{pool_index}").into_bytes());
+            pool.put_object(
+                bucket,
+                object,
+                &mut trigger_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(trigger_id.to_string()),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared trigger should be stored");
+        }
+        ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                version_id: Some(trigger_id),
+                delete_marker: false,
+                action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                rule_id: "rule".to_string(),
+                phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            ..Default::default()
+        }
+    }
+
+    async fn ordinary_version_count(store: &ECStore, pool_index: usize, bucket: &str, object: &str) -> usize {
+        store.pools[pool_index].disk_set[0]
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("pool metadata should load")
+            .map(|versions| {
+                versions
+                    .versions
+                    .iter()
+                    .filter(|version| !version.tier_free_version())
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_attempts_later_pools_after_an_earlier_pool_error() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("delete-prefix", &[2, 4]).await;
         let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -917,6 +1082,156 @@ mod tests {
             .await
             .expect_err("a bucket missing from every pool must remain an error");
         assert_eq!(err, StorageError::BucketNotFound(missing_bucket));
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lifecycle_delete_all_history_failure_preserves_trigger_and_retry_converges() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("lifecycle-delete-all", &[4, 4]).await;
+        let bucket = format!("lifecycle-delete-all-{}", Uuid::new_v4().simple());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+
+        for pool_index in 0..2 {
+            let mut reader = PutObjReader::from_vec(format!("pool-{pool_index}-history").into_bytes());
+            store.pools[pool_index]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("historical version should be stored");
+        }
+        let marker = store.pools[0]
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("trigger marker should be stored in the first pool");
+        let marker_id = marker.version_id.expect("trigger marker should have a version id");
+        let opts = ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                version_id: Some(marker_id),
+                delete_marker: true,
+                action: rustfs_common::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+                rule_id: "rule".to_string(),
+                phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            ..Default::default()
+        };
+
+        let _failure_guard = LifecycleDeleteAllFailureGuard;
+        *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+            .lock()
+            .expect("lifecycle delete-all failure hook should not poison") =
+            Some((crate::object_api::LifecycleDeleteAllPhase::History, 1));
+        let err = store
+            .delete_prefix(&bucket, object, &opts)
+            .await
+            .expect_err("a later pool history failure must stop before trigger deletion");
+        assert_eq!(err, StorageError::PreconditionFailed);
+        assert!(opts.lifecycle_delete_all_journal.lock().mutation_started());
+
+        let first_pool = store.pools[0].disk_set[0]
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("first pool metadata should load")
+            .expect("the trigger should remain");
+        let first_pool_ordinary: Vec<&FileInfo> = first_pool
+            .versions
+            .iter()
+            .filter(|version| !version.tier_free_version())
+            .collect();
+        assert_eq!(first_pool_ordinary.len(), 1);
+        assert_eq!(first_pool_ordinary[0].version_id, Some(marker_id));
+        assert!(first_pool_ordinary[0].deleted);
+
+        *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+            .lock()
+            .expect("lifecycle delete-all failure hook should not poison") = None;
+        store
+            .delete_prefix(&bucket, object, &opts)
+            .await
+            .expect("retry should delete remaining history and its trigger owner");
+        for pool in &store.pools {
+            assert!(
+                pool.disk_set[0]
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("pool metadata should load after retry")
+                    .is_none(),
+                "all ordinary versions should be removed after retry"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lifecycle_delete_all_phase_failures_preserve_barriers_and_retry() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("lifecycle-delete-all-phases", &[4, 4]).await;
+        let bucket = format!("lifecycle-delete-all-phases-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+        let _failure_guard = LifecycleDeleteAllFailureGuard;
+
+        for (object, phase, expected_counts, mutation_started) in [
+            ("preflight-failure", crate::object_api::LifecycleDeleteAllPhase::Preflight, [2, 2], false),
+            (
+                "final-preflight-failure",
+                crate::object_api::LifecycleDeleteAllPhase::FinalPreflight,
+                [1, 1],
+                true,
+            ),
+            ("trigger-failure", crate::object_api::LifecycleDeleteAllPhase::Trigger, [0, 1], true),
+        ] {
+            let opts = seed_multi_pool_delete_all(&store, &bucket, object).await;
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = Some((phase, 1));
+            let err = store
+                .delete_prefix(&bucket, object, &opts)
+                .await
+                .expect_err("injected phase failure should stop the transaction");
+            assert_eq!(err, StorageError::PreconditionFailed);
+            assert_eq!(opts.lifecycle_delete_all_journal.lock().mutation_started(), mutation_started);
+            assert_eq!(ordinary_version_count(&store, 0, &bucket, object).await, expected_counts[0]);
+            assert_eq!(ordinary_version_count(&store, 1, &bucket, object).await, expected_counts[1]);
+
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = None;
+            store
+                .delete_prefix(&bucket, object, &opts)
+                .await
+                .expect("retry should converge after the injected failure is removed");
+            assert_eq!(ordinary_version_count(&store, 0, &bucket, object).await, 0);
+            assert_eq!(ordinary_version_count(&store, 1, &bucket, object).await, 0);
+        }
 
         shutdown.cancel();
     }

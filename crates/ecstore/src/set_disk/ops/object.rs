@@ -27,12 +27,12 @@ use crate::set_disk::read::GetObjectDownstreamWriter;
 use crate::bucket::lifecycle::{
     tier_delete_journal::{
         enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
-        record_tier_delete_journal_backend_identity, remove_tier_delete_journal_entry,
+        record_tier_delete_journal_backend_identity, remove_tier_delete_journal_entry, tier_delete_journal_object_name,
     },
     tier_sweeper::{
-        Jentry, RemoteTierDeleteOutcome, TierDeleteJournalState,
+        Jentry, RemoteTierDeleteOutcome, TierDeleteJournalState, attach_tier_delete_source,
         delete_confirmed_transition_candidate_exact_with_lease_idempotent, delete_object_from_remote_tier_with_lease_idempotent,
-        transitioned_delete_journal_entry_for_source,
+        transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
     },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
@@ -42,7 +42,8 @@ use crate::bucket::lifecycle::{
 };
 use crate::bucket::quota::reservation;
 use crate::bucket::replication::{
-    DeleteReplicationConfigSnapshot, VersionPurgeStatusType, replication_state_to_filemeta, version_purge_status_to_filemeta,
+    DeleteReplicationConfigSnapshot, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
+    replication_status_from_filemeta, version_purge_status_to_filemeta,
 };
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
@@ -95,6 +96,573 @@ impl Drop for PutObjectCommitCancellation {
 #[inline]
 fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+struct LifecycleDeleteAllPlan<'a> {
+    history: Vec<&'a FileInfo>,
+    trigger: Option<&'a FileInfo>,
+}
+
+impl<'a> LifecycleDeleteAllPlan<'a> {
+    fn trigger_only(&self) -> Result<Option<&'a FileInfo>> {
+        if !self.history.is_empty() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        Ok(self.trigger)
+    }
+}
+
+fn lifecycle_delete_all_plan<'a>(
+    versions: &'a rustfs_filemeta::FileInfoVersions,
+    trigger: &crate::object_api::LifecycleDeleteAllRequest,
+) -> Result<LifecycleDeleteAllPlan<'a>> {
+    let normalized_version_id = |version: &FileInfo| version.version_id.filter(|version_id| !version_id.is_nil());
+    let mut history = Vec::with_capacity(versions.versions.len());
+    let mut trigger_version = None;
+    for (ordinary_index, version) in versions
+        .versions
+        .iter()
+        .filter(|version| !version.tier_free_version())
+        .enumerate()
+    {
+        if matches!(
+            replication_status_from_filemeta(version.replication_status()),
+            ReplicationStatusType::Pending | ReplicationStatusType::Failed
+        ) || version.version_purge_status().is_pending()
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+        if normalized_version_id(version) == trigger.version_id {
+            if trigger_version.is_some() || ordinary_index != 0 || version.deleted != trigger.delete_marker {
+                return Err(StorageError::PreconditionFailed);
+            }
+            trigger_version = Some(version);
+        } else {
+            history.push(version);
+        }
+    }
+    Ok(LifecycleDeleteAllPlan {
+        history,
+        trigger: trigger_version,
+    })
+}
+
+fn lifecycle_delete_all_tier_journal_entry(
+    bucket: &str,
+    object: &str,
+    version: &FileInfo,
+    opts: &ObjectOptions,
+) -> Result<Option<(String, Jentry)>> {
+    if version.transition_status != rustfs_filemeta::TRANSITION_COMPLETE {
+        return Ok(None);
+    }
+    if version.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown {
+        return Err(StorageError::PreconditionFailed);
+    }
+
+    let logical_object = decode_dir_object(object);
+    let mut source = ObjectInfo::from_file_info(version, bucket, object, true);
+    source.version_id = source.version_id.filter(|version_id| !version_id.is_nil());
+    let mut entry = transitioned_force_delete_journal_entry(&source.transitioned_object, source.transition_version_state)
+        .ok_or(StorageError::PreconditionFailed)?;
+    attach_tier_delete_source(&mut entry, bucket, &logical_object, &source, opts.versioned, opts.version_suspended);
+    record_tier_delete_journal_backend_identity(&mut entry, &source.user_defined).map_err(Error::other)?;
+    let name = tier_delete_journal_object_name(&entry);
+    Ok(Some((name, entry)))
+}
+
+async fn prepare_lifecycle_delete_all_tier_journals(
+    bucket: &str,
+    object: &str,
+    plan: &LifecycleDeleteAllPlan<'_>,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    let Some(api) = opts.tier_delete_journal_api.as_ref() else {
+        return Ok(());
+    };
+    for version in plan.history.iter().copied().chain(plan.trigger) {
+        let Some((name, entry)) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, opts)? else {
+            continue;
+        };
+        if opts.lifecycle_delete_all_journal.lock().contains(&name) {
+            continue;
+        }
+        persist_tier_delete_journal_entry(Arc::clone(api), &entry)
+            .await
+            .map_err(Error::other)?;
+        opts.lifecycle_delete_all_journal.lock().insert(name, entry);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_delete_all_plan_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::bucket::replication::ReplicationState;
+
+    fn delete_opts(request: crate::object_api::LifecycleDeleteAllRequest) -> ObjectOptions {
+        ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(request),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        }
+    }
+
+    fn trigger(version_id: Uuid) -> crate::object_api::LifecycleDeleteAllRequest {
+        crate::object_api::LifecycleDeleteAllRequest {
+            version_id: Some(version_id),
+            delete_marker: true,
+            action: rustfs_common::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+            rule_id: "rule".to_string(),
+            phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+        }
+    }
+
+    #[test]
+    fn orders_history_before_trigger_and_excludes_tier_free_versions() {
+        let trigger_id = Uuid::new_v4();
+        let old_id = Uuid::new_v4();
+        let mut free = FileInfo::default();
+        free.set_tier_free_version();
+        free.version_id = Some(Uuid::new_v4());
+        let versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(trigger_id),
+                    deleted: true,
+                    ..Default::default()
+                },
+                free,
+                FileInfo {
+                    version_id: Some(old_id),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let trigger = trigger(trigger_id);
+
+        let plan = lifecycle_delete_all_plan(&versions, &trigger).expect("valid lifecycle plan");
+        assert_eq!(
+            plan.history.iter().map(|version| version.version_id).collect::<Vec<_>>(),
+            vec![Some(old_id)]
+        );
+        assert_eq!(plan.trigger.and_then(|version| version.version_id), Some(trigger_id));
+        assert!(plan.history.iter().all(|version| !version.tier_free_version()));
+    }
+
+    #[test]
+    fn rejects_a_noncurrent_trigger_copy() {
+        let trigger_id = Uuid::new_v4();
+        let versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(Uuid::new_v4()),
+                    deleted: false,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(trigger_id),
+                    deleted: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let trigger = trigger(trigger_id);
+
+        assert!(matches!(
+            lifecycle_delete_all_plan(&versions, &trigger),
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[test]
+    fn allows_a_history_only_pool_without_the_trigger() {
+        let old_id = Uuid::new_v4();
+        let versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![FileInfo {
+                version_id: Some(old_id),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let plan = lifecycle_delete_all_plan(&versions, &trigger(Uuid::new_v4())).expect("history-only pool should plan");
+        assert_eq!(
+            plan.history.iter().map(|version| version.version_id).collect::<Vec<_>>(),
+            vec![Some(old_id)]
+        );
+        assert!(plan.trigger.is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_trigger_versions() {
+        let trigger_id = Uuid::new_v4();
+        let versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![
+                FileInfo {
+                    version_id: Some(trigger_id),
+                    deleted: true,
+                    ..Default::default()
+                },
+                FileInfo {
+                    version_id: Some(trigger_id),
+                    deleted: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            lifecycle_delete_all_plan(&versions, &trigger(trigger_id)),
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[test]
+    fn rejects_nonterminal_replication_and_purge_states_before_building_a_delete_plan() {
+        let trigger_id = Uuid::new_v4();
+        for (replication_status, purge_status) in [
+            (Some("PENDING"), None),
+            (Some("FAILED"), None),
+            (None, Some("PENDING")),
+            (None, Some("FAILED")),
+        ] {
+            let versions = rustfs_filemeta::FileInfoVersions {
+                versions: vec![
+                    FileInfo {
+                        version_id: Some(trigger_id),
+                        deleted: true,
+                        ..Default::default()
+                    },
+                    FileInfo {
+                        version_id: Some(Uuid::new_v4()),
+                        replication_state_internal: Some(replication_state_to_filemeta(&ReplicationState {
+                            replication_status_internal: replication_status.map(str::to_string),
+                            version_purge_status_internal: purge_status.map(str::to_string),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                lifecycle_delete_all_plan(&versions, &trigger(trigger_id)),
+                Err(StorageError::PreconditionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn final_preflight_and_trigger_reject_remaining_history() {
+        let trigger_id = Uuid::new_v4();
+        let current = FileInfo {
+            version_id: Some(trigger_id),
+            deleted: true,
+            ..Default::default()
+        };
+        let history = FileInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let request = trigger(trigger_id);
+        let with_history = rustfs_filemeta::FileInfoVersions {
+            versions: vec![current.clone(), history.clone()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            lifecycle_delete_all_plan(&with_history, &request).and_then(|plan| plan.trigger_only()),
+            Err(StorageError::PreconditionFailed)
+        ));
+
+        let trigger_only_versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![current],
+            ..Default::default()
+        };
+        let trigger_only = lifecycle_delete_all_plan(&trigger_only_versions, &request)
+            .and_then(|plan| plan.trigger_only())
+            .expect("trigger-only phase should proceed")
+            .expect("trigger should remain");
+        assert_eq!(trigger_only.version_id, Some(trigger_id));
+
+        let history_only_versions = rustfs_filemeta::FileInfoVersions {
+            versions: vec![history],
+            ..Default::default()
+        };
+        assert!(matches!(
+            lifecycle_delete_all_plan(&history_only_versions, &request).and_then(|plan| plan.trigger_only()),
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[test]
+    fn null_trigger_matches_none_and_nil_version_ids() {
+        let request = crate::object_api::LifecycleDeleteAllRequest {
+            version_id: None,
+            delete_marker: false,
+            action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+            rule_id: "rule".to_string(),
+            phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+        };
+        for version_id in [None, Some(Uuid::nil())] {
+            let versions = rustfs_filemeta::FileInfoVersions {
+                versions: vec![FileInfo {
+                    version_id,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            let plan = lifecycle_delete_all_plan(&versions, &request).expect("null trigger should match its persisted form");
+            assert!(plan.history.is_empty());
+            assert!(plan.trigger.is_some());
+        }
+    }
+
+    #[test]
+    fn tier_journal_coverage_is_source_exact_and_rejects_legacy_unknown_state() {
+        let identity = [7_u8; 32];
+        let version_id = Uuid::from_u128(1);
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        let transitioned = |data_dir| FileInfo {
+            version_id: Some(version_id),
+            data_dir: Some(data_dir),
+            metadata: metadata.clone(),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let (first_name, _) =
+            lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(2)), &opts)
+                .expect("exact transitioned source should be journalable")
+                .expect("completed transition should require a journal");
+        let (second_name, _) =
+            lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(3)), &opts)
+                .expect("second pool source should be journalable")
+                .expect("completed transition should require a journal");
+        assert_ne!(first_name, second_name, "each pool-local source needs independent coverage");
+
+        let mut unknown = transitioned(Uuid::from_u128(4));
+        unknown.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+        assert!(matches!(
+            lifecycle_delete_all_tier_journal_entry("bucket", "object", &unknown, &opts),
+            Err(StorageError::PreconditionFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn staged_delete_removes_history_before_the_trigger() {
+        let (temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "lifecycle-delete-all-staged";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        for body in [b"old".as_slice(), b"new".as_slice()] {
+            let mut reader = PutObjReader::from_vec(body.to_vec());
+            set.put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned object should be stored");
+        }
+        let marker = set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker should be created");
+        let marker_id = marker.version_id.expect("delete marker should have a version id");
+        let transitioned_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        for temp_dir in &temp_dirs {
+            let meta_path = temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let encoded = tokio::fs::read(&meta_path).await.expect("xl.meta should be readable");
+            let mut metadata = FileMeta::load(&encoded).expect("xl.meta should decode");
+            metadata
+                .add_version(FileInfo {
+                    volume: bucket.to_string(),
+                    name: object.to_string(),
+                    version_id: Some(transitioned_id),
+                    transition_status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                    transitioned_objname: "remote/lifecycle-delete-all-staged/object".to_string(),
+                    transition_version_id: Some(remote_version_id),
+                    transition_version: Some(remote_version_id.to_string()),
+                    transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                    transition_tier: "WARM".to_string(),
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(10)),
+                    ..Default::default()
+                })
+                .expect("transitioned version should be added");
+            let mut transition_delete = FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: Some(transitioned_id),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            transition_delete.set_tier_free_version_id(&free_version_id.to_string());
+            metadata
+                .delete_version(&transition_delete)
+                .expect("transitioned version should become a free-version record");
+            tokio::fs::write(&meta_path, metadata.marshal_msg().expect("xl.meta should encode"))
+                .await
+                .expect("xl.meta should be rewritten");
+        }
+
+        let mut request = trigger(marker_id);
+        request.phase = crate::object_api::LifecycleDeleteAllPhase::Trigger;
+        let err = set
+            .delete_object(bucket, object, delete_opts(request.clone()))
+            .await
+            .expect_err("trigger must remain while historical versions exist");
+        assert_eq!(err, StorageError::PreconditionFailed);
+
+        request.phase = crate::object_api::LifecycleDeleteAllPhase::Preflight;
+        set.delete_object(bucket, object, delete_opts(request.clone()))
+            .await
+            .expect("preflight should pass");
+        request.phase = crate::object_api::LifecycleDeleteAllPhase::History;
+        set.delete_object(bucket, object, delete_opts(request.clone()))
+            .await
+            .expect("history phase should delete old versions");
+        let after_history = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("metadata should load")
+            .expect("trigger metadata should remain");
+        let ordinary: Vec<_> = after_history
+            .versions
+            .iter()
+            .filter(|version| !version.tier_free_version())
+            .collect();
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].version_id, Some(marker_id));
+
+        request.phase = crate::object_api::LifecycleDeleteAllPhase::Trigger;
+        set.delete_object(bucket, object, delete_opts(request))
+            .await
+            .expect("trigger phase should delete the final marker");
+        for temp_dir in &temp_dirs {
+            let meta_path = temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let encoded = tokio::fs::read(&meta_path).await.expect("free-version xl.meta should remain");
+            let remaining = FileMeta::load(&encoded)
+                .expect("free-version xl.meta should decode")
+                .get_all_file_info_versions(bucket, object, true)
+                .expect("free-version metadata should remain readable");
+            let free_versions: Vec<_> = remaining
+                .versions
+                .iter()
+                .filter(|version| version.tier_free_version())
+                .collect();
+            assert_eq!(free_versions.len(), 1);
+            assert_eq!(free_versions[0].version_id, Some(free_version_id));
+            assert_eq!(free_versions[0].transition_tier, "WARM");
+            assert_eq!(free_versions[0].transitioned_objname, "remote/lifecycle-delete-all-staged/object");
+            assert_eq!(free_versions[0].transition_version_id, Some(remote_version_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_trigger_after_a_new_put_is_rejected_without_writes() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "lifecycle-delete-all-stale-trigger";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(b"old".to_vec());
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("old version should be stored");
+        let marker = set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker should be created");
+        let marker_id = marker.version_id.expect("delete marker should have a version id");
+        let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+        set.put_object(
+            bucket,
+            object,
+            &mut replacement,
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("new current version should be stored");
+        let before = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("metadata should load")
+            .expect("versions should exist");
+
+        let err = set
+            .delete_object(bucket, object, delete_opts(trigger(marker_id)))
+            .await
+            .expect_err("stale marker must not authorize a purge");
+        assert_eq!(err, StorageError::PreconditionFailed);
+        let after = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("metadata should load after rejection")
+            .expect("versions should remain");
+        assert_eq!(
+            after.versions.iter().map(|version| version.version_id).collect::<Vec<_>>(),
+            before.versions.iter().map(|version| version.version_id).collect::<Vec<_>>()
+        );
+    }
 }
 
 pub(in crate::set_disk::ops) fn assign_object_transaction_epoch(
@@ -5579,7 +6147,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         .as_ref()
                         .is_some_and(|delete_opts| delete_opts.bypass_governance);
                     if let Some(object_lock_config) = object_lock_config.as_ref() {
-                        for version in versions.versions.iter().chain(versions.free_versions.iter()) {
+                        for version in versions
+                            .versions
+                            .iter()
+                            .chain(versions.free_versions.iter().filter(|_| opts.lifecycle_delete_all.is_none()))
+                        {
                             let object_info = ObjectInfo::from_file_info(version, bucket, object, true);
                             if check_object_lock_for_deletion_with_state(object_lock_config, &object_info, bypass_governance)?
                                 .is_some()
@@ -5588,26 +6160,68 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             }
                         }
                     }
-                    for version in &versions.versions {
-                        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-                        let mut delete_request = FileInfo {
-                            name: object.to_string(),
-                            version_id: version.version_id,
-                            ..Default::default()
+                    if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
+                        let plan = lifecycle_delete_all_plan(&versions, trigger)?;
+                        if trigger.phase == crate::object_api::LifecycleDeleteAllPhase::Preflight {
+                            prepare_lifecycle_delete_all_tier_journals(bucket, object, &plan, &opts).await?;
+                            return Ok(ObjectInfo::default());
+                        }
+                        if trigger.phase == crate::object_api::LifecycleDeleteAllPhase::FinalPreflight {
+                            return Ok(plan
+                                .trigger_only()?
+                                .map(|version| ObjectInfo::from_file_info(version, bucket, object, true))
+                                .unwrap_or_default());
+                        }
+                        let plan = match trigger.phase {
+                            crate::object_api::LifecycleDeleteAllPhase::History => plan.history,
+                            crate::object_api::LifecycleDeleteAllPhase::Trigger => plan.trigger_only()?.into_iter().collect(),
+                            crate::object_api::LifecycleDeleteAllPhase::Preflight
+                            | crate::object_api::LifecycleDeleteAllPhase::FinalPreflight => {
+                                return Err(StorageError::PreconditionFailed);
+                            }
                         };
-                        delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
-                        self.delete_object_version(bucket, object, &delete_request, false).await?;
-                    }
-                    for version in &versions.free_versions {
-                        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-                        let mut delete_request = FileInfo {
-                            name: object.to_string(),
-                            version_id: version.version_id,
-                            deleted: true,
-                            ..Default::default()
-                        };
-                        delete_request.set_tier_free_version();
-                        self.delete_object_version(bucket, object, &delete_request, false).await?;
+                        for version in plan {
+                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            let mut delete_request = FileInfo {
+                                name: object.to_string(),
+                                version_id: version.version_id,
+                                ..Default::default()
+                            };
+                            delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            if opts.tier_delete_journal_api.is_some()
+                                && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE
+                            {
+                                let (name, _entry) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, &opts)?
+                                    .ok_or(StorageError::PreconditionFailed)?;
+                                if !opts.lifecycle_delete_all_journal.lock().contains(&name) {
+                                    return Err(StorageError::PreconditionFailed);
+                                }
+                                delete_request.set_skip_tier_free_version();
+                            }
+                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                        }
+                    } else {
+                        for version in &versions.versions {
+                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            let mut delete_request = FileInfo {
+                                name: object.to_string(),
+                                version_id: version.version_id,
+                                ..Default::default()
+                            };
+                            delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                        }
+                        for version in &versions.free_versions {
+                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            let mut delete_request = FileInfo {
+                                name: object.to_string(),
+                                version_id: version.version_id,
+                                deleted: true,
+                                ..Default::default()
+                            };
+                            delete_request.set_tier_free_version();
+                            self.delete_object_version(bucket, object, &delete_request, false).await?;
+                        }
                     }
                 }
                 self.invalidate_get_object_metadata_cache(bucket, object).await;
@@ -10077,6 +10691,65 @@ mod transition_upload_integrity_tests {
             .into_owned();
         assert_ne!(stored.transition_status, TRANSITION_COMPLETE);
         assert!(stored.transition_version.is_none());
+    }
+
+    #[tokio::test]
+    async fn data_movement_tiered_metadata_rejects_lost_outer_namespace_fence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "tiered-data-movement-lost-outer-fence";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let version_id = Uuid::new_v4();
+        let source = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
+            size: 12,
+            parts: vec![ObjectPartInfo {
+                number: 1,
+                size: 12,
+                actual_size: 12,
+                etag: "part-etag".to_string(),
+                ..Default::default()
+            }],
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            fresh: true,
+            ..Default::default()
+        };
+        let err = set_disks
+            .decommission_tiered_object(
+                bucket,
+                object,
+                &source,
+                &ObjectOptions {
+                    no_lock: true,
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    mod_time: source.mod_time,
+                    data_movement: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a lost outer object fence must block target metadata publication");
+
+        assert!(matches!(err, StorageError::NamespaceLockQuorumUnavailable { .. }));
+        assert!(
+            set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("target metadata lookup should succeed")
+                .is_none(),
+            "lost outer fence must not publish a target version"
+        );
     }
 
     fn transition_options(original: &ObjectInfo, tier_name: String) -> ObjectOptions {

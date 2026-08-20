@@ -218,6 +218,63 @@ pub struct QuotaAdmission {
     quota_limit: u64,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleDeleteAllRequest {
+    pub(crate) version_id: Option<Uuid>,
+    pub(crate) delete_marker: bool,
+    pub(crate) action: rustfs_common::metrics::IlmAction,
+    pub(crate) rule_id: String,
+    pub(crate) phase: LifecycleDeleteAllPhase,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleDeleteAllPhase {
+    Preflight,
+    History,
+    FinalPreflight,
+    Trigger,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct LifecycleDeleteAllJournalState {
+    prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
+    mutation_started: bool,
+}
+
+impl Debug for LifecycleDeleteAllJournalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleDeleteAllJournalState")
+            .field("prepared_count", &self.prepared.len())
+            .field("mutation_started", &self.mutation_started)
+            .finish()
+    }
+}
+
+impl LifecycleDeleteAllJournalState {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.prepared.contains_key(name)
+    }
+
+    pub(crate) fn insert(&mut self, name: String, entry: crate::bucket::lifecycle::tier_sweeper::Jentry) {
+        self.prepared.insert(name, entry);
+    }
+
+    pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
+        self.prepared.values().cloned().collect()
+    }
+
+    pub(crate) fn mark_mutation_started(&mut self) {
+        self.mutation_started = true;
+    }
+
+    pub(crate) fn mutation_started(&self) -> bool {
+        self.mutation_started
+    }
+}
+
 impl QuotaAdmission {
     pub(crate) fn current_usage(self) -> u64 {
         self.current_usage
@@ -242,6 +299,11 @@ pub struct ObjectOptions {
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
+    /// Lifecycle-only staged purge request checked under the object write lock.
+    #[doc(hidden)]
+    pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    #[doc(hidden)]
+    pub lifecycle_delete_all_journal: Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
