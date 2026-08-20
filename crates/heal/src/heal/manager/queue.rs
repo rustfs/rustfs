@@ -41,6 +41,7 @@ pub(super) struct PriorityHealQueue {
 pub(super) struct PriorityQueueItem {
     pub(super) priority: HealPriority,
     pub(super) sequence: u64,
+    pub(super) dedup_key: String,
     pub(super) request: HealRequest,
 }
 
@@ -135,8 +136,7 @@ impl PriorityHealQueue {
 
     pub(super) fn pop_next(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
-            let key = Self::make_dedup_key(&item.request);
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
             item.request
         })
     }
@@ -157,7 +157,7 @@ impl PriorityHealQueue {
         // request that opens the key becomes the named representative for merge
         // receipts (taken before `request` moves into the heap).
         self.dedup_keys
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| DedupKeyEntry {
                 refcount: 0,
                 representative_request_id: request.id.clone(),
@@ -167,6 +167,7 @@ impl PriorityHealQueue {
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
             sequence: self.sequence,
+            dedup_key: key,
             request,
         });
         QueuePushOutcome::Accepted
@@ -204,9 +205,8 @@ impl PriorityHealQueue {
         self.heap = retained;
 
         let displaced = displaced.map(|item| {
-            let key = Self::make_dedup_key(&item.request);
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
-            self.refresh_dedup_representative(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+            self.refresh_dedup_representative(&item.dedup_key);
             item.request
         });
 
@@ -244,8 +244,7 @@ impl PriorityHealQueue {
     #[cfg(test)]
     pub(super) fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
-            let key = Self::make_dedup_key(&item.request);
-            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
             item.request
         })
     }
@@ -284,8 +283,7 @@ impl PriorityHealQueue {
 
         (
             selected.map(|item| {
-                let key = Self::make_dedup_key(&item.request);
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
                 item.request
             }),
             skipped,
@@ -379,7 +377,7 @@ impl PriorityHealQueue {
         if let Some(id) = self
             .heap
             .iter()
-            .find(|item| Self::make_dedup_key(&item.request) == key)
+            .find(|item| item.dedup_key == key)
             .map(|item| item.request.id.clone())
             && let Some(entry) = self.dedup_keys.get_mut(key)
         {
@@ -397,11 +395,13 @@ impl PriorityHealQueue {
     pub(super) fn remove_request_id(&mut self, request_id: &str) -> Option<HealRequest> {
         let mut retained = BinaryHeap::new();
         let mut removed = None;
+        let mut affected_key = None;
 
         while let Some(item) = self.heap.pop() {
             if removed.is_none() && item.request.id == request_id {
-                let key = Self::make_dedup_key(&item.request);
+                let key = item.dedup_key.clone();
                 Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                affected_key = Some(key);
                 removed = Some(item.request);
             } else {
                 retained.push(item);
@@ -409,8 +409,8 @@ impl PriorityHealQueue {
         }
 
         self.heap = retained;
-        if let Some(removed) = removed.as_ref() {
-            self.refresh_dedup_representative(&Self::make_dedup_key(removed));
+        if let Some(key) = affected_key.as_deref() {
+            self.refresh_dedup_representative(key);
         }
         removed
     }
@@ -425,9 +425,8 @@ impl PriorityHealQueue {
 
         while let Some(item) = self.heap.pop() {
             if should_remove(&item.request) {
-                let key = Self::make_dedup_key(&item.request);
-                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
-                affected_keys.push(key);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &item.dedup_key);
+                affected_keys.push(item.dedup_key);
                 removed.push(item.request);
             } else {
                 retained.push(item);

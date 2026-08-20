@@ -100,19 +100,52 @@ impl FolderScanner {
             last_admission_result: result.result_label().to_string(),
             last_admission_reason: result.reason_label().to_string(),
         });
-        self.prune_pending_scanner_heals();
-        self.sync_pending_heals();
+        if self.prune_pending_scanner_heal_capacity() == 0 {
+            self.sync_pending_heals();
+        }
     }
 
     pub(super) fn prune_pending_scanner_heals(&mut self) {
+        let now = Self::now_secs();
+        let before_expiry = self.new_cache.info.pending_heals.len();
+        self.new_cache
+            .info
+            .pending_heals
+            .retain(|entry| now.saturating_sub(entry.first_seen) <= MAX_PENDING_SCANNER_HEAL_AGE_SECS);
+        let expired = before_expiry.saturating_sub(self.new_cache.info.pending_heals.len());
+        if expired > 0 {
+            counter!(
+                METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL,
+                "bucket" => self.new_cache.info.name.clone()
+            )
+            .increment(u64::try_from(expired).unwrap_or(u64::MAX));
+            warn!(
+                target: "rustfs::scanner::folder",
+                event = EVENT_SCANNER_HEAL_ADMISSION,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_HEAL,
+                bucket = %self.new_cache.info.name,
+                pruned = expired,
+                remaining = self.new_cache.info.pending_heals.len(),
+                state = "pending_heal_expired",
+                "Scanner pending heal ledger expired old entries"
+            );
+            self.sync_pending_heals();
+        }
+
+        self.prune_pending_scanner_heal_capacity();
+    }
+
+    fn prune_pending_scanner_heal_capacity(&mut self) -> usize {
         let len = self.new_cache.info.pending_heals.len();
         if len <= MAX_PENDING_SCANNER_HEALS_PER_BUCKET {
-            return;
+            return 0;
         }
 
         sort_pending_scanner_heals_for_retry(&mut self.new_cache.info.pending_heals);
         let remove_count = len.saturating_sub(MAX_PENDING_SCANNER_HEALS_PER_BUCKET);
         self.new_cache.info.pending_heals.drain(..remove_count);
+        self.sync_pending_heals();
         counter!(
             METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL,
             "bucket" => self.new_cache.info.name.clone()
@@ -129,6 +162,7 @@ impl FolderScanner {
             state = "pending_heal_pruned",
             "Scanner pending heal ledger pruned oldest entries"
         );
+        remove_count
     }
 
     pub(super) fn update_pending_scanner_heal_after_admission(
@@ -174,6 +208,7 @@ impl FolderScanner {
         if !repaired.is_empty() {
             self.clear_pending_scanner_heals_for_repaired(&repaired);
         }
+        self.prune_pending_scanner_heals();
         for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
             if !self.should_heal().await {
                 break;

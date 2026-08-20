@@ -193,6 +193,7 @@ fn emit_scanner_alert_event(event_name: &str, bucket: &str, object: &str, size: 
     });
 }
 const MAX_PENDING_SCANNER_HEALS_PER_BUCKET: usize = 10_000;
+const MAX_PENDING_SCANNER_HEAL_AGE_SECS: u64 = 24 * 60 * 60;
 
 static SCANNER_ALERT_METRICS_ONCE: Once = Once::new();
 
