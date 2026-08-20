@@ -30,6 +30,8 @@
 //! SessionContext type in common::session.
 
 use crate::common::client::s3::StorageBackend;
+#[cfg(feature = "webdav")]
+use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -140,6 +142,8 @@ struct Inner {
     head_bucket: VecDeque<Result<HeadBucketOutput, DummyError>>,
     list_objects_v2: VecDeque<Result<ListObjectsV2Output, DummyError>>,
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
+    session_list_buckets: VecDeque<s3s::S3Result<ListBucketsOutput>>,
+    last_session_list_context: Option<(http::HeaderMap, bool)>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -193,6 +197,8 @@ impl Inner {
             head_bucket: VecDeque::new(),
             list_objects_v2: VecDeque::new(),
             list_buckets: VecDeque::new(),
+            session_list_buckets: VecDeque::new(),
+            last_session_list_context: None,
             create_bucket: VecDeque::new(),
             delete_bucket: VecDeque::new(),
             copy_object: VecDeque::new(),
@@ -299,6 +305,31 @@ impl DummyBackend {
             .expect("lock")
             .create_bucket
             .push_back(Ok(CreateBucketOutput::default()));
+    }
+
+    /// Queue a legacy list_buckets response.
+    pub fn queue_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a legacy list_buckets error.
+    pub fn queue_list_buckets_err(&self, error: DummyError) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Err(error));
+    }
+
+    /// Queue a session-aware list_buckets response.
+    pub fn queue_session_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a session-aware list_buckets error.
+    pub fn queue_session_list_buckets_err(&self, error: s3s::S3Error) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Err(error));
+    }
+
+    /// Return the context from the last session-aware list_buckets request.
+    pub fn last_session_list_context(&self) -> Option<(http::HeaderMap, bool)> {
+        self.inner.lock().expect("lock").last_session_list_context.clone()
     }
 
     /// Queue a put_object error. Used by the commit_write retry tests
@@ -690,11 +721,27 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn list_buckets(&self, _ak: &str, _sk: &str) -> Result<ListBucketsOutput, Self::Error> {
+    async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
         match self.inner.lock().expect("lock").list_buckets.pop_front() {
             Some(r) => r,
             None => Ok(ListBucketsOutput::default()),
         }
+    }
+
+    #[cfg(feature = "webdav")]
+    async fn list_buckets_for_session(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &http::HeaderMap,
+        secure_transport: bool,
+    ) -> s3s::S3Result<ListBucketsOutput> {
+        let _ = session_context;
+        let mut inner = self.inner.lock().expect("lock");
+        inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
+        inner
+            .session_list_buckets
+            .pop_front()
+            .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
     }
 
     async fn create_bucket(&self, _bucket: &str, _ak: &str, _sk: &str) -> Result<CreateBucketOutput, Self::Error> {

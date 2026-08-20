@@ -13,10 +13,16 @@
 // limitations under the License.
 
 use crate::runtime_sources::current_action_credentials;
+#[cfg(feature = "webdav")]
+use crate::shared_types::RemoteAddr;
 use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
+#[cfg(feature = "webdav")]
+use rustfs_protocols::common::SessionContext;
+#[cfg(feature = "webdav")]
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
@@ -88,6 +94,50 @@ fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<
         object = object.unwrap_or_default(),
         "Protocol storage client request"
     );
+}
+
+#[cfg(feature = "webdav")]
+fn session_list_buckets_request(
+    input: ListBucketsInput,
+    session_context: &SessionContext,
+    request_headers: &HeaderMap,
+    secure_transport: bool,
+) -> S3Request<ListBucketsInput> {
+    let credentials = &session_context.principal.user_identity.credentials;
+    let mut extensions = http::Extensions::default();
+    let remote_addr = std::net::SocketAddr::new(session_context.source_ip, 0);
+    extensions.insert(Some(RemoteAddr(remote_addr)));
+    let mut client_info = ClientInfo::direct(remote_addr);
+    client_info.forwarded_proto = Some(if secure_transport { "https" } else { "http" }.to_string());
+    extensions.insert(client_info);
+
+    let is_owner = current_action_credentials().is_some_and(|global_cred| credentials.access_key == global_cred.access_key);
+    extensions.insert(ReqInfo {
+        cred: Some(credentials.clone()),
+        is_owner,
+        bucket: None,
+        object: None,
+        version_id: None,
+        replication_request_authorized: false,
+        region: None,
+        request_context: Some(RequestContext::fallback()),
+        suppress_denial_log: false,
+    });
+
+    S3Request {
+        input,
+        method: Method::GET,
+        uri: http::Uri::from_static("/"),
+        headers: request_headers.clone(),
+        extensions,
+        credentials: Some(s3s::auth::Credentials {
+            access_key: credentials.access_key.clone(),
+            secret_key: credentials.secret_key.clone().into(),
+        }),
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
 }
 
 fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
@@ -467,6 +517,29 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             Ok(response) => Ok(response.output),
             Err(e) => Err(e),
         }
+    }
+
+    #[cfg(feature = "webdav")]
+    async fn list_buckets_for_session(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &HeaderMap,
+        secure_transport: bool,
+    ) -> Result<ListBucketsOutput, Self::Error> {
+        trace!(
+            event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
+            operation = "list_buckets",
+            access_key = %MaskedAccessKey(&session_context.principal.user_identity.credentials.access_key),
+            "Protocol storage client request"
+        );
+
+        let input = ListBucketsInput::builder().build().map_err(|e| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
+        })?;
+        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        self.fs.list_buckets(request).await.map(|response| response.output)
     }
 
     async fn create_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<CreateBucketOutput, Self::Error> {
@@ -872,6 +945,60 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "webdav")]
+    #[test]
+    fn request_extensions_preserve_authenticated_identity_and_source_ip() {
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let claims = HashMap::from([("parent".to_string(), serde_json::json!("alice"))]);
+        let credentials = rustfs_credentials::Credentials {
+            access_key: "service-account".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: "session-token".to_string(),
+            parent_user: "alice".to_string(),
+            groups: Some(vec!["developers".to_string()]),
+            claims: Some(claims.clone()),
+            ..Default::default()
+        };
+        let source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        let identity = rustfs_policy::auth::UserIdentity {
+            credentials: credentials.clone(),
+            ..Default::default()
+        };
+        let principal = rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(identity));
+        let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", http::HeaderValue::from_static("webdav-client"));
+        let request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, true);
+        let request_info = request.extensions.get::<ReqInfo>().expect("request info should be present");
+        let copied = request_info.cred.as_ref().expect("credentials should be present");
+        let remote_addr = request
+            .extensions
+            .get::<Option<RemoteAddr>>()
+            .and_then(Option::as_ref)
+            .expect("remote address should be present");
+        let client_info = request.extensions.get::<ClientInfo>().expect("client info should be present");
+
+        assert_eq!(copied.access_key, credentials.access_key);
+        assert_eq!(copied.secret_key, credentials.secret_key);
+        assert_eq!(copied.session_token, credentials.session_token);
+        assert_eq!(copied.parent_user, credentials.parent_user);
+        assert_eq!(copied.groups, credentials.groups);
+        assert_eq!(copied.claims, Some(claims));
+        assert_eq!(remote_addr.0.ip(), source_ip);
+        assert_eq!(client_info.real_ip, source_ip);
+        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+        assert_eq!(request.headers.get("user-agent").expect("user agent"), "webdav-client");
+
+        let insecure_request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false);
+        let insecure_client_info = insecure_request
+            .extensions
+            .get::<ClientInfo>()
+            .expect("client info should be present");
+        assert_eq!(insecure_client_info.forwarded_proto.as_deref(), Some("http"));
+    }
 
     #[test]
     fn build_object_uri_encodes_key_segments_without_flattening_slashes() {

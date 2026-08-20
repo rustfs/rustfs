@@ -106,7 +106,7 @@ swift = [
     "dep:base64",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
