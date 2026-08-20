@@ -2433,8 +2433,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit_object_lock_guard = object_lock_guard.take();
         let detach_commit_owner = commit_object_lock_guard.is_some() || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
-            let _object_lock_guard = commit_object_lock_guard;
-            let _upload_guard = upload_guard;
+            let mut _object_lock_guard = commit_object_lock_guard;
+            let mut _upload_guard = upload_guard;
             let mut quota_reservation = quota_reservation;
             let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
@@ -2570,6 +2570,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let op_old_dir = rename_commit.data_dir;
             let cleanup_disks = rename_commit.cleanup_disks;
             let committed_file_info = rename_commit.committed_file_info;
+            let rename_tail_drain = rename_commit.tail_drain;
 
             // Detach admission before any post-commit await: client cancellation
             // must not couple durable convergence repair to cleanup work.
@@ -2628,7 +2629,30 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                 .await;
 
-            drop(_object_lock_guard); // release the object lock before multipart cleanup tail IO.
+            if let Some(rename_tail_drain) = rename_tail_drain {
+                let object_lock_guard = _object_lock_guard.take();
+                let upload_guard = _upload_guard.take();
+                let tail_bucket = commit_bucket.clone();
+                let tail_object = commit_object.clone();
+                tokio::spawn(async move {
+                    let _object_lock_guard = object_lock_guard;
+                    let _upload_guard = upload_guard;
+                    if let Err(err) = rename_tail_drain.await {
+                        warn!(
+                            event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_SET_DISK,
+                            state = "failed",
+                            bucket = %tail_bucket,
+                            object = %tail_object,
+                            error = %err,
+                            "rename tail drain failed"
+                        );
+                    }
+                });
+            } else {
+                drop(_object_lock_guard.take()); // release the object lock before multipart cleanup tail IO.
+            }
 
             #[cfg(test)]
             pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterObjectPublication).await;
@@ -2685,7 +2709,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 );
             }
 
-            drop(_upload_guard);
+            drop(_upload_guard.take());
 
             Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
         };

@@ -2916,6 +2916,7 @@ impl SetDisks {
                 let cleanup_disks = rename_commit.cleanup_disks;
                 let old_current_size = rename_commit.old_current_size;
                 let mut fi = rename_commit.committed_file_info;
+                let rename_tail_drain = rename_commit.tail_drain;
                 // Do this before any post-commit await so request cancellation cannot
                 // bypass best-effort admission. A process crash before admission
                 // remains subject to the existing scanner reconciliation path.
@@ -2954,11 +2955,38 @@ impl SetDisks {
                     .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                     .await;
 
-                // `rename_data` has completed the authoritative quorum commit. The
-                // exact old-data-dir reclamation below is best-effort space cleanup;
-                // it must not serialize the next operation on this object.
-                drop(_object_lock_guard);
-                drop(_bucket_lifecycle_guard);
+                // `rename_data` has completed the authoritative quorum commit. With
+                // the default-off early-ACK experiment, tail disk rename tasks may
+                // still be draining after quorum. Keep the namespace guards alive
+                // until that drain completes so the next same-object mutation cannot
+                // race a background tail rename.
+                if let Some(rename_tail_drain) = rename_tail_drain {
+                    let object_lock_guard = _object_lock_guard;
+                    let bucket_lifecycle_guard = _bucket_lifecycle_guard;
+                    let tail_bucket = commit_bucket.clone();
+                    let tail_object = commit_object.clone();
+                    tokio::spawn(async move {
+                        let _object_lock_guard = object_lock_guard;
+                        let _bucket_lifecycle_guard = bucket_lifecycle_guard;
+                        if let Err(err) = rename_tail_drain.await {
+                            warn!(
+                                event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                state = "failed",
+                                bucket = %tail_bucket,
+                                object = %tail_object,
+                                error = %err,
+                                "rename tail drain failed"
+                            );
+                        }
+                    });
+                } else {
+                    // The exact old-data-dir reclamation below is best-effort space
+                    // cleanup; it must not serialize the next operation on this object.
+                    drop(_object_lock_guard);
+                    drop(_bucket_lifecycle_guard);
+                }
 
                 rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
                 if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -12700,7 +12728,7 @@ mod put_object_tmp_cleanup_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
-    use crate::set_disk::core::io_primitives::rename_fanout_barrier;
+    use crate::set_disk::core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
@@ -13045,6 +13073,78 @@ mod put_object_tmp_cleanup_tests {
         let mut body = Vec::new();
         reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
         assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(rename_quorum_ack)]
+    async fn early_ack_tail_drain_retains_namespace_lock_until_background_rename_finishes() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-early-ack-tail-lock";
+            let object = "early-ack-tail-lock-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&set_disks);
+            let first = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                first_store
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("first PUT should pause one tail disk during rename");
+            first
+                .await
+                .expect("first early-ACK PUT task should join before tail release")
+                .expect("first early-ACK PUT should return after write quorum");
+            assert!(
+                rename_tasks.running() >= 1,
+                "tail rename must still be draining after the first PUT returns"
+            );
+
+            let second_namespace_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+            let second_store = Arc::clone(&set_disks);
+            let second = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+                second_store
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            second_namespace_barrier.release_and_wait_until_namespace_pending().await;
+            tokio::task::yield_now().await;
+            assert!(
+                !second.is_finished(),
+                "second writer must remain blocked until the first early-ACK tail drain releases the namespace lock"
+            );
+
+            rename_barrier.release();
+            drop(rename_barrier);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("early-ACK tail rename should drain after release");
+            second
+                .await
+                .expect("second overwrite task should join")
+                .expect("second overwrite should commit after the tail drain releases the namespace lock");
+
+            let mut reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the latest overwrite should be readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
+            assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+        })
+        .await;
     }
 
     #[tokio::test]
