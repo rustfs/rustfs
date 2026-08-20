@@ -113,6 +113,21 @@ const HTTP_STREAMING_BODY_FAILURE_STAGE_TRANSPORT: &str = "http_transport";
 const HTTP_STREAMING_BODY_FAILURE_REASON_TRANSPORT: &str = "transport_failure";
 const HTTP_STREAMING_BODY_FAILURE_CLASS_TRANSPORT: &str = "transport";
 const HTTP_STREAMING_BODY_FAILURE_UNKNOWN: &str = "unknown";
+const HTTP_METHOD_GET_INDEX: usize = 0;
+const HTTP_METHOD_PUT_INDEX: usize = 1;
+const HTTP_METHOD_POST_INDEX: usize = 2;
+const HTTP_METHOD_DELETE_INDEX: usize = 3;
+const HTTP_METHOD_HEAD_INDEX: usize = 4;
+const HTTP_METHOD_OPTIONS_INDEX: usize = 5;
+const HTTP_METHOD_PATCH_INDEX: usize = 6;
+const HTTP_METHOD_CONNECT_INDEX: usize = 7;
+const HTTP_METHOD_TRACE_INDEX: usize = 8;
+const HTTP_METHOD_OTHER_INDEX: usize = 9;
+const HTTP_METHOD_LABELS: [&str; 10] = [
+    "GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE", "OTHER",
+];
+const HTTP_STATUS_UNKNOWN_INDEX: usize = 5;
+const HTTP_STATUS_CLASS_LABELS: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"];
 
 /// Cached handle for the per-response-body-chunk byte counter. A streamed GET
 /// emits many chunks, so resolving the `counter!` registry entry once — the
@@ -126,6 +141,16 @@ static RESP_BODY_CHUNK_LATENCY_HISTOGRAM: std::sync::LazyLock<metrics::Histogram
     std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_CHUNK_LATENCY_SECONDS));
 static RESP_BODY_STREAM_DURATION_HISTOGRAM: std::sync::LazyLock<metrics::Histogram> =
     std::sync::LazyLock::new(|| histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_STREAM_DURATION_SECONDS));
+static ACTIVE_HTTP_REQUESTS_GAUGE: std::sync::LazyLock<metrics::Gauge> =
+    std::sync::LazyLock::new(|| gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS));
+static REQUEST_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL));
+static HTTP_METHOD_METRICS: std::sync::LazyLock<[HttpMethodMetrics; 10]> =
+    std::sync::LazyLock::new(|| HTTP_METHOD_LABELS.map(HttpMethodMetrics::new));
+static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6]> =
+    std::sync::LazyLock::new(|| HTTP_STATUS_CLASS_LABELS.map(HttpStatusClassMetrics::new));
+static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -153,6 +178,36 @@ const TIER_MUTATION_COMMIT_TONIC_RPC_PATH: &str = "/node_service.TierMutationCon
 const TIER_MUTATION_ABORT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/AbortTierMutation";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+struct HttpMethodMetrics {
+    requests: metrics::Counter,
+    request_body_size: metrics::Histogram,
+}
+
+impl HttpMethodMetrics {
+    fn new(method: &'static str) -> Self {
+        Self {
+            requests: counter!(METRIC_HTTP_SERVER_REQUESTS_TOTAL, LABEL_HTTP_METHOD => method),
+            request_body_size: histogram!(METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES, LABEL_HTTP_METHOD => method),
+        }
+    }
+}
+
+struct HttpStatusClassMetrics {
+    request_duration: metrics::Histogram,
+    failures: metrics::Counter,
+    response_body_size: metrics::Histogram,
+}
+
+impl HttpStatusClassMetrics {
+    fn new(status_class: &'static str) -> Self {
+        Self {
+            request_duration: histogram!(METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS, LABEL_HTTP_STATUS_CLASS => status_class),
+            failures: counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => status_class),
+            response_body_size: histogram!(METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES, LABEL_HTTP_STATUS_CLASS => status_class),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct RpcRequestTarget {
@@ -213,31 +268,37 @@ where
 }
 
 #[inline]
-fn request_method_label(method: &Method) -> &'static str {
+fn http_method_index(method: &Method) -> usize {
     match method.as_str() {
-        "GET" => "GET",
-        "PUT" => "PUT",
-        "POST" => "POST",
-        "DELETE" => "DELETE",
-        "HEAD" => "HEAD",
-        "OPTIONS" => "OPTIONS",
-        "PATCH" => "PATCH",
-        "CONNECT" => "CONNECT",
-        "TRACE" => "TRACE",
-        _ => "OTHER",
+        "GET" => HTTP_METHOD_GET_INDEX,
+        "PUT" => HTTP_METHOD_PUT_INDEX,
+        "POST" => HTTP_METHOD_POST_INDEX,
+        "DELETE" => HTTP_METHOD_DELETE_INDEX,
+        "HEAD" => HTTP_METHOD_HEAD_INDEX,
+        "OPTIONS" => HTTP_METHOD_OPTIONS_INDEX,
+        "PATCH" => HTTP_METHOD_PATCH_INDEX,
+        "CONNECT" => HTTP_METHOD_CONNECT_INDEX,
+        "TRACE" => HTTP_METHOD_TRACE_INDEX,
+        _ => HTTP_METHOD_OTHER_INDEX,
     }
 }
 
 #[inline]
-fn status_class_label(status: http::StatusCode) -> &'static str {
+fn http_method_metrics(method: &Method) -> &'static HttpMethodMetrics {
+    &HTTP_METHOD_METRICS[http_method_index(method)]
+}
+
+#[inline]
+fn status_class_index(status: http::StatusCode) -> usize {
     match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "unknown",
+        1..=5 => usize::from(status.as_u16() / 100 - 1),
+        _ => HTTP_STATUS_UNKNOWN_INDEX,
     }
+}
+
+#[inline]
+fn http_status_class_metrics(status: http::StatusCode) -> &'static HttpStatusClassMetrics {
+    &HTTP_STATUS_CLASS_METRICS[status_class_index(status)]
 }
 
 #[inline]
@@ -359,7 +420,7 @@ fn record_active_http_requests(delta: i64) {
             .unwrap_or_else(|current| current)
             .saturating_sub(decrement)
     };
-    gauge!(METRIC_HTTP_SERVER_ACTIVE_REQUESTS).set(next as f64);
+    ACTIVE_HTTP_REQUESTS_GAUGE.set(next as f64);
 }
 
 #[inline]
@@ -464,27 +525,15 @@ where
 fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, span: &Span) {
     span.record("status_code", tracing::field::display(response.status()));
     let _enter = span.enter();
-    let status_class = status_class_label(response.status());
-    histogram!(
-        METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
-        LABEL_HTTP_STATUS_CLASS => status_class
-    )
-    .record(latency.as_secs_f64());
+    let status_metrics = http_status_class_metrics(response.status());
+    status_metrics.request_duration.record(latency.as_secs_f64());
     if response.status().is_client_error() || response.status().is_server_error() {
-        counter!(
-            METRIC_HTTP_SERVER_FAILURES_TOTAL,
-            LABEL_HTTP_STATUS_CLASS => status_class
-        )
-        .increment(1);
+        status_metrics.failures.increment(1);
     }
     if let Some(cl) = response.headers().get("content-length")
         && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
     {
-        histogram!(
-            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
-            LABEL_HTTP_STATUS_CLASS => status_class
-        )
-        .record(len as f64);
+        status_metrics.response_body_size.record(len as f64);
     }
 }
 
@@ -1560,24 +1609,16 @@ fn process_connection(
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
-                            let method = request_method_label(request.method());
+                            let method_metrics = http_method_metrics(request.method());
                             // In-flight counting is handled by InFlightLayer's RAII guard
                             // (backlog#806-35); do not adjust the active-requests gauge here.
-                            counter!(
-                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
-                                LABEL_HTTP_METHOD => method
-                            )
-                            .increment(1);
+                            method_metrics.requests.increment(1);
 
                             if let Some(cl) = request.headers().get("content-length")
                                 && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                             {
-                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
-                                histogram!(
-                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
-                                    LABEL_HTTP_METHOD => method
-                                )
-                                .record(len as f64);
+                                REQUEST_BODY_BYTES_COUNTER.increment(len);
+                                method_metrics.request_body_size.record(len as f64);
                             }
                         })
                         .on_response(trace_on_response)
@@ -1612,11 +1653,7 @@ fn process_connection(
                             // (backlog#806-35). This hook previously also fired for 5xx
                             // responses (which ALSO hit on_response), double-decrementing
                             // the gauge; only the failure metric is recorded here now.
-                            counter!(
-                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                                LABEL_HTTP_STATUS_CLASS => "transport"
-                            )
-                            .increment(1);
+                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
                             record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
@@ -1658,24 +1695,16 @@ fn process_connection(
                         .on_request(|request: &HttpRequest<_>, span: &Span| {
                             let _enter = span.enter();
                             trace!("HTTP request started");
-                            let method = request_method_label(request.method());
+                            let method_metrics = http_method_metrics(request.method());
                             // In-flight counting is handled by InFlightLayer's RAII guard
                             // (backlog#806-35); do not adjust the active-requests gauge here.
-                            counter!(
-                                METRIC_HTTP_SERVER_REQUESTS_TOTAL,
-                                LABEL_HTTP_METHOD => method
-                            )
-                            .increment(1);
+                            method_metrics.requests.increment(1);
 
                             if let Some(cl) = request.headers().get("content-length")
                                 && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                             {
-                                counter!(METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL).increment(len);
-                                histogram!(
-                                    METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES,
-                                    LABEL_HTTP_METHOD => method
-                                )
-                                .record(len as f64);
+                                REQUEST_BODY_BYTES_COUNTER.increment(len);
+                                method_metrics.request_body_size.record(len as f64);
                             }
                         })
                         .on_response(trace_on_response)
@@ -1710,11 +1739,7 @@ fn process_connection(
                             // (backlog#806-35). This hook previously also fired for 5xx
                             // responses (which ALSO hit on_response), double-decrementing
                             // the gauge; only the failure metric is recorded here now.
-                            counter!(
-                                METRIC_HTTP_SERVER_FAILURES_TOTAL,
-                                LABEL_HTTP_STATUS_CLASS => "transport"
-                            )
-                            .increment(1);
+                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
                             record_http_transport_failure_if_body_error(&error);
                             trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
                         }),
@@ -2042,7 +2067,7 @@ mod tests {
     use http::{HeaderMap, StatusCode};
     use http_body_util::{Empty, Full};
     use metrics::with_local_recorder;
-    use metrics_util::debugging::DebuggingRecorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use opentelemetry::propagation::Extractor;
     use std::collections::HashMap;
     use std::convert::Infallible;
@@ -2052,6 +2077,13 @@ mod tests {
     use storage::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
     use storage::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use tower::{Layer, Service, ServiceBuilder};
+
+    type MetricRow = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    );
 
     /// Baseline constants — reference the authoritative config defaults.
     /// If a config default changes, tests automatically follow.
@@ -2185,6 +2217,128 @@ mod tests {
 
         assert_eq!(LABEL_HTTP_METHOD, "method");
         assert_eq!(LABEL_HTTP_STATUS_CLASS, "status_class");
+    }
+
+    #[test]
+    fn cached_http_metric_indexes_match_public_labels() {
+        for (method, expected_index) in [
+            (Method::GET, HTTP_METHOD_GET_INDEX),
+            (Method::PUT, HTTP_METHOD_PUT_INDEX),
+            (Method::POST, HTTP_METHOD_POST_INDEX),
+            (Method::DELETE, HTTP_METHOD_DELETE_INDEX),
+            (Method::HEAD, HTTP_METHOD_HEAD_INDEX),
+            (Method::OPTIONS, HTTP_METHOD_OPTIONS_INDEX),
+            (Method::PATCH, HTTP_METHOD_PATCH_INDEX),
+            (Method::CONNECT, HTTP_METHOD_CONNECT_INDEX),
+            (Method::TRACE, HTTP_METHOD_TRACE_INDEX),
+        ] {
+            assert_eq!(http_method_index(&method), expected_index);
+            assert_eq!(HTTP_METHOD_LABELS[expected_index], method.as_str());
+        }
+        let custom_method = Method::from_bytes(b"PURGE").expect("custom method should parse");
+        assert_eq!(http_method_index(&custom_method), HTTP_METHOD_OTHER_INDEX);
+        assert_eq!(HTTP_METHOD_LABELS[HTTP_METHOD_OTHER_INDEX], "OTHER");
+
+        for (status, expected_index, expected_label) in [
+            (StatusCode::CONTINUE, 0, "1xx"),
+            (StatusCode::OK, 1, "2xx"),
+            (StatusCode::FOUND, 2, "3xx"),
+            (StatusCode::NOT_FOUND, 3, "4xx"),
+            (StatusCode::INTERNAL_SERVER_ERROR, 4, "5xx"),
+        ] {
+            assert_eq!(status_class_index(status), expected_index);
+            assert_eq!(HTTP_STATUS_CLASS_LABELS[expected_index], expected_label);
+        }
+        let unknown_status = StatusCode::from_u16(700).expect("extension status should parse");
+        assert_eq!(status_class_index(unknown_status), HTTP_STATUS_UNKNOWN_INDEX);
+        assert_eq!(HTTP_STATUS_CLASS_LABELS[HTTP_STATUS_UNKNOWN_INDEX], "unknown");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_http_metric_handles_preserve_metric_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let active_before = active_http_requests();
+
+        with_local_recorder(&recorder, || {
+            record_active_http_requests(1);
+            record_active_http_requests(-1);
+
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .header("content-length", "7")
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            let method_metrics = http_method_metrics(request.method());
+            method_metrics.requests.increment(1);
+            REQUEST_BODY_BYTES_COUNTER.increment(7);
+            method_metrics.request_body_size.record(7.0);
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", "1024")
+                .body(Empty::<Bytes>::new())
+                .expect("response");
+            trace_on_response(&response, Duration::from_millis(5), &Span::none());
+
+            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+        });
+
+        assert_eq!(active_http_requests(), active_before, "active request counter must be restored");
+        let rows = snapshotter.snapshot().into_vec();
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_REQUESTS_TOTAL, &[(LABEL_HTTP_METHOD, "GET")], 1);
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL, &[], 7);
+        assert_metric_histogram(&rows, METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES, &[(LABEL_HTTP_METHOD, "GET")], &[7.0]);
+        assert_metric_histogram(
+            &rows,
+            METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
+            &[(LABEL_HTTP_STATUS_CLASS, "2xx")],
+            &[0.005],
+        );
+        assert_metric_histogram(
+            &rows,
+            METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES,
+            &[(LABEL_HTTP_STATUS_CLASS, "2xx")],
+            &[1024.0],
+        );
+        assert_metric_counter(&rows, METRIC_HTTP_SERVER_FAILURES_TOTAL, &[(LABEL_HTTP_STATUS_CLASS, "transport")], 1);
+    }
+
+    fn assert_metric_counter(rows: &[MetricRow], name: &str, labels: &[(&str, &str)], expected: u64) {
+        let value = metric_debug_value(rows, name, labels);
+        match value {
+            DebugValue::Counter(value) => assert_eq!(*value, expected),
+            other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    }
+
+    fn assert_metric_histogram(rows: &[MetricRow], name: &str, labels: &[(&str, &str)], expected: &[f64]) {
+        let value = metric_debug_value(rows, name, labels);
+        match value {
+            DebugValue::Histogram(samples) => {
+                let actual: Vec<_> = samples.iter().map(|sample| sample.0).collect();
+                assert_eq!(actual, expected);
+            }
+            other => panic!("{name} should be a histogram, got {other:?}"),
+        }
+    }
+
+    fn metric_debug_value<'a>(rows: &'a [MetricRow], name: &str, labels: &[(&str, &str)]) -> &'a DebugValue {
+        let mut matching = rows.iter().filter(|(composite, _, _, _)| {
+            composite.key().name() == name
+                && labels.iter().all(|(key, value)| {
+                    composite
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == *key && label.value() == *value)
+                })
+        });
+        let (_, _, _, value) = matching
+            .next()
+            .unwrap_or_else(|| panic!("{name} with labels {labels:?} was not recorded"));
+        assert!(matching.next().is_none(), "{name} with labels {labels:?} was recorded more than once");
+        value
     }
 
     #[test]
