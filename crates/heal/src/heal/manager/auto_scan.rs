@@ -20,6 +20,8 @@ impl HealManager {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
+        let task_aliases = self.task_aliases.clone();
+        let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let storage = self.storage.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let replacement_recovery_blocked_sets = self.replacement_recovery_blocked_sets.clone();
@@ -475,7 +477,8 @@ impl HealManager {
                             let endpoint_count = req.heal_endpoints.len();
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
-                            let admission = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
+                            let admission_decision = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
+                            let admission = admission_decision.result;
                             let should_notify =
                                 matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
                             if matches!(admission, HealAdmissionResult::Accepted)
@@ -488,6 +491,10 @@ impl HealManager {
                             }
                             drop(queue);
                             drop(config);
+                            if let Some(displaced_task_id) = admission_decision.displaced_task_id {
+                                remove_task_aliases_for_task(&task_aliases, &displaced_task_id).await;
+                                lock_mrf_repair_notice_targets(&mrf_repair_notice_targets).remove(&displaced_task_id);
+                            }
                             if matches!(admission, HealAdmissionResult::Accepted) {
                                 if should_notify {
                                     notify.notify_one();

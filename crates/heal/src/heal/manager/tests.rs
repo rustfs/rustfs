@@ -86,6 +86,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         completed_heals: &manager.completed_heals,
         task_aliases: &manager.task_aliases,
         retrying_heals: &manager.retrying_heals,
+        mrf_repair_notice_targets: &manager.mrf_repair_notice_targets,
         replacement_recovery_anchors: &manager.replacement_recovery_anchors,
         config: &manager.config,
         statistics: &manager.statistics,
@@ -2357,6 +2358,84 @@ async fn test_cancel_task_removes_queued_request() {
 }
 
 #[tokio::test]
+async fn test_mrf_repaired_notice_waits_for_successful_completion() {
+    let bucket = "mrf-completion-success";
+    let object = "object";
+    let version_id = Some([9u8; 16]);
+    let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+
+    let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from(object), version_id)
+        .await
+        .expect("MRF request should be admitted");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .contains_key(&receipt.task_id),
+        "MRF notice ownership must be registered before the scheduler can observe the queued task"
+    );
+
+    assert!(
+        rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty(),
+        "admission alone must not clear the scanner pending-heal ledger"
+    );
+
+    process_manager_queue_once(&manager).await;
+    for _ in 0..100 {
+        let events = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+        if !events.is_empty() {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].object.as_ref(), object);
+            assert_eq!(events[0].version_id, version_id);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("successful MRF-owned heal should emit one repaired event");
+}
+
+#[tokio::test]
+async fn test_mrf_repaired_notice_removed_on_queued_cancel_without_event() {
+    let bucket = "mrf-completion-cancel";
+    let object = "object";
+    let _ = rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket);
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(storage, None);
+
+    let mut request = HealRequest::object(bucket.to_string(), object.to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt(request, Arc::from(bucket), Arc::from(object), None)
+        .await
+        .expect("MRF request should be admitted");
+
+    manager
+        .cancel_task(&receipt.task_id)
+        .await
+        .expect("queued MRF request should cancel");
+
+    assert!(
+        rustfs_common::mrf_channel::take_mrf_repaired_events_for(bucket).is_empty(),
+        "cancelled MRF-owned heal must not emit a repaired event"
+    );
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .is_empty(),
+        "cancel must discard completion notice ownership"
+    );
+}
+
+#[tokio::test]
 async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new(storage, None);
@@ -2567,6 +2646,54 @@ async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
             .await
             .expect("high priority request should remain queued"),
         HealTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn test_displacing_registered_mrf_task_drops_notice_ownership() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new(
+        storage,
+        Some(HealConfig {
+            queue_size: 1,
+            ..HealConfig::default()
+        }),
+    );
+
+    let mut low = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    low.source = HealRequestSource::Mrf;
+    low.priority = HealPriority::Low;
+    let high = HealRequest::new(
+        HealType::Bucket {
+            bucket: "manual-bucket".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+
+    assert_eq!(
+        manager
+            .submit_mrf_heal_request_with_receipt(low, Arc::from("bucket"), Arc::from("object"), None)
+            .await
+            .expect("low priority MRF request should be accepted first")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+
+    assert_eq!(
+        manager
+            .submit_heal_request(high)
+            .await
+            .expect("high priority request should displace low priority work"),
+        HealAdmissionResult::Accepted
+    );
+    assert!(
+        manager
+            .mrf_repair_notice_targets
+            .lock()
+            .expect("mrf repair notice registry poisoned")
+            .is_empty(),
+        "displaced MRF-owned task cannot reach completion, so its notice ownership must be dropped"
     );
 }
 
