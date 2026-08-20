@@ -229,6 +229,27 @@ pub(super) struct ScannerCycleObservedGenerations {
     pub(super) defer_cluster_activity: bool,
 }
 
+impl ScannerCycleObservedGenerations {
+    pub(super) fn for_wait(
+        runtime_config: &ScannerRuntimeConfig,
+        convergence_retry_interval: Option<Duration>,
+        dirty_usage_generation_seen: u64,
+        runtime_config_generation: u64,
+        maintenance_generation: u64,
+    ) -> Self {
+        Self {
+            // An explicit cycle override is a duty-cycle policy; dirty usage
+            // wakes stay on the default adaptive path so the interval holds.
+            dirty_usage: (convergence_retry_interval.is_none()
+                && runtime_config.cycle_interval_source == ScannerRuntimeConfigSource::Default)
+                .then_some(dirty_usage_generation_seen),
+            runtime_config: runtime_config_generation,
+            maintenance: maintenance_generation,
+            defer_cluster_activity: convergence_retry_interval.is_some(),
+        }
+    }
+}
+
 pub(super) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -70,6 +70,11 @@ sleep multiplier, maximum wait, and cycle interval. Use `scanner.delay`,
 `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis
 needs a precise override.
 
+An explicit `scanner.cycle` or `RUSTFS_SCANNER_CYCLE` is a minimum inter-cycle
+cadence: dirty-usage notifications do not bypass that configured interval.
+The default adaptive policy continues to use dirty-usage notifications to wake
+the scanner between timer-driven cycles.
+
 ## Single-disk clean-idle scheduling
 
 An erasure single-disk deployment using the built-in cycle and bitrot defaults

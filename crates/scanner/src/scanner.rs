@@ -1804,14 +1804,13 @@ async fn run_data_scanner_with_maintenance_state(
             wait_plan.delay,
             activity_poll_interval,
             &mut scanner_activity_seen,
-            ScannerCycleObservedGenerations {
-                // A non-converged cycle holds further activity notifications
-                // until its bounded retry timer to avoid an unbroken scan loop.
-                dirty_usage: convergence_retry_interval.is_none().then_some(dirty_usage_generation_seen),
-                runtime_config: runtime_config_generation_seen,
-                maintenance: maintenance_generation_before_wait,
-                defer_cluster_activity: convergence_retry_interval.is_some(),
-            },
+            ScannerCycleObservedGenerations::for_wait(
+                &runtime_config,
+                convergence_retry_interval,
+                dirty_usage_generation_seen,
+                runtime_config_generation_seen,
+                maintenance_generation_before_wait,
+            ),
             || guard.is_lock_lost(),
             || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
