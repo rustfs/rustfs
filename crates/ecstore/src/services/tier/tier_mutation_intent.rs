@@ -657,7 +657,7 @@ where
             prefix,
             marker,
             None,
-            i32::try_from(limit).map_or(i32::MAX, |value| value),
+            i32::try_from(limit).unwrap_or(i32::MAX),
             false,
             None,
             false,

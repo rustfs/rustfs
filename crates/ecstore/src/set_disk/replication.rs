@@ -171,10 +171,10 @@ impl SetDisks {
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?
             .into_owned();
-        if let Some(expected_operation_id) = expected_operation_id {
-            if restore_operation_id_from_metadata(&fi.metadata)?.is_some_and(|actual| actual != expected_operation_id) {
-                return Err(Error::other("restore operation id changed before metadata finalization"));
-            }
+        if let Some(expected_operation_id) = expected_operation_id
+            && restore_operation_id_from_metadata(&fi.metadata)?.is_some_and(|actual| actual != expected_operation_id)
+        {
+            return Err(Error::other("restore operation id changed before metadata finalization"));
         }
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Err(Error::other("restored object changed before restore metadata finalization"));

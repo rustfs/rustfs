@@ -2180,7 +2180,7 @@ pub async fn recover_manual_transition_jobs_once(
     if limit == 0 {
         return Err(Error::other("manual transition job recovery limit must be greater than zero"));
     }
-    let list_limit = i32::try_from(limit).map_or(i32::MAX, |value| value);
+    let list_limit = i32::try_from(limit).unwrap_or(i32::MAX);
     let page = api
         .clone()
         .list_objects_v2(
@@ -2386,7 +2386,7 @@ async fn replay_manual_transition_pending_tasks(
             version_id: task.version_id,
             etag: task.etag,
             mod_time,
-            size: task.size.map_or(0, |size| size),
+            size: task.size.unwrap_or(0),
             is_latest: task.is_latest.unwrap_or(false),
             ..Default::default()
         };
