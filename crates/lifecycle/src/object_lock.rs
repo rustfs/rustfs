@@ -245,6 +245,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_explicit_retention_fails_closed() {
+        let config = default_retention_config(1);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            ObjectLockRetentionMode::GOVERNANCE.to_string(),
+        );
+        let created = OffsetDateTime::now_utc() - Duration::days(2);
+
+        assert!(is_object_locked(&user_defined, false, Some(&config), Some(created)));
+    }
+
+    #[test]
     fn delete_markers_are_not_locked_by_default_retention() {
         let config = default_retention_config(30);
 
