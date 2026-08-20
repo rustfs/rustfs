@@ -42,7 +42,8 @@ impl ScannerIODisk for Disk {
             return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
         }
 
-        let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
+        let metadata_object_path = item.object_path();
+        let data = match self.read_metadata(&item.bucket, &metadata_object_path).await {
             Ok(data) => data,
             Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
@@ -51,23 +52,23 @@ impl ScannerIODisk for Disk {
                 return Err(scanner_metadata_transient_error(
                     format!("failed to read metadata: {e}"),
                     &item.bucket,
-                    &item.object_path(),
+                    &metadata_object_path,
                 ));
             }
         };
 
         item.transform_meta_dir();
+        let object_path = item.object_path();
 
-        let meta = FileMeta::load(&data).map_err(|e| {
-            scanner_metadata_corrupt_error(format!("failed to load metadata: {e}"), &item.bucket, &item.object_path())
-        })?;
-        let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
+        let meta = FileMeta::load(&data)
+            .map_err(|e| scanner_metadata_corrupt_error(format!("failed to load metadata: {e}"), &item.bucket, &object_path))?;
+        let fivs = match meta.get_file_info_versions(item.bucket.as_str(), object_path.as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
                 return Err(scanner_metadata_corrupt_error(
                     format!("failed to resolve file info versions: {e}"),
                     &item.bucket,
-                    &item.object_path(),
+                    &object_path,
                 ));
             }
         };
@@ -91,17 +92,17 @@ impl ScannerIODisk for Disk {
                 VersioningConfiguration::default()
             }
         };
-        let versioned = versioning_config.versioned(&item.object_path());
+        let versioned = versioning_config.versioned(&object_path);
 
         let object_infos = fivs
             .versions
             .iter()
-            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
+            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), object_path.as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
         let free_version_infos = fivs
             .free_versions
             .iter()
-            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
+            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), object_path.as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
 
         let mut size_summary = SizeSummary::default();

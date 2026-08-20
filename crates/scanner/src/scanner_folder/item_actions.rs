@@ -274,18 +274,13 @@ impl ScannerItem {
     /// Transform meta directory by splitting prefix and extracting object name
     /// This converts a directory path like "bucket/dir1/dir2/file" to prefix="bucket/dir1/dir2" and object_name="file"
     pub fn transform_meta_dir(&mut self) {
-        let prefix = self.prefix.clone(); // Clone to avoid borrow checker issues
-        let split: Vec<&str> = prefix.split(SLASH_SEPARATOR).collect();
-
-        if split.len() > 1 {
-            let prefix_parts: Vec<&str> = split[..split.len() - 1].to_vec();
-            self.prefix = path_join_buf(&prefix_parts);
+        let prefix = std::mem::take(&mut self.prefix);
+        if let Some((parent, object_name)) = prefix.rsplit_once(SLASH_SEPARATOR) {
+            self.prefix = path_join_buf(&[parent]);
+            self.object_name = object_name.to_string();
         } else {
-            self.prefix = String::new();
+            self.object_name = prefix;
         }
-
-        // Object name is the last element
-        self.object_name = split.last().unwrap_or(&"").to_string();
     }
 
     pub(super) fn metadata_object_path(&self) -> String {
@@ -301,13 +296,14 @@ impl ScannerItem {
         versioning_config: VersioningConfiguration,
         size_summary: &mut SizeSummary,
     ) {
+        let object_path = self.object_path();
         if object_infos.is_empty() {
             debug!(
                 target: "rustfs::scanner::folder",
                 event = EVENT_SCANNER_LIFECYCLE_ACTION,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                object_path = %self.object_path(),
+                object_path = %object_path,
                 state = "no_object_versions",
                 "Scanner lifecycle action skipped"
             );
@@ -318,7 +314,7 @@ impl ScannerItem {
             event = EVENT_SCANNER_LIFECYCLE_ACTION,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-            object_path = %self.object_path(),
+            object_path = %object_path,
             state = "started",
             "Scanner lifecycle evaluation started"
         );
@@ -360,7 +356,7 @@ impl ScannerItem {
                 event = EVENT_SCANNER_LIFECYCLE_ACTION,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                object_path = %self.object_path(),
+                object_path = %object_path,
                 state = "no_lifecycle_config",
                 "Scanner lifecycle action finished without lifecycle rules"
             );
@@ -385,7 +381,7 @@ impl ScannerItem {
                     event = EVENT_SCANNER_LIFECYCLE_ACTION,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    object_path = %self.object_path(),
+                    object_path = %object_path,
                     state = "evaluate_failed",
                     error = %e,
                     "Scanner lifecycle action evaluation failed"
@@ -502,7 +498,7 @@ impl ScannerItem {
                         emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
-                            if !versioning_config.prefix_enabled(&self.object_path()) && event.action == IlmAction::DeleteAction {
+                            if !versioning_config.prefix_enabled(&object_path) && event.action == IlmAction::DeleteAction {
                                 remaining_versions -= 1;
                                 size = 0;
                             }
@@ -570,7 +566,7 @@ impl ScannerItem {
                 trace_emit(|| {
                     TraceEvent::new(TraceKind::Scanner, TraceFunc::ScannerIlmAction)
                         .with_bucket(self.bucket.as_str())
-                        .with_object(self.object_path())
+                        .with_object(object_path.as_str())
                         .with_duration(trace_started_at.elapsed())
                         .with_attr("state", state)
                         .with_attr("action", action.as_str())
@@ -888,4 +884,49 @@ pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, Scann
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scanner_item_with_prefix(prefix: &str) -> ScannerItem {
+        ScannerItem {
+            path: String::new(),
+            bucket: "bucket".to_string(),
+            prefix: prefix.to_string(),
+            object_name: String::new(),
+            file_type: std::fs::metadata(std::env::temp_dir())
+                .expect("temp dir metadata should be readable")
+                .file_type(),
+            lifecycle: None,
+            object_lock: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        }
+    }
+
+    #[test]
+    fn transform_meta_dir_splits_parent_and_object_without_extra_components() {
+        let mut item = scanner_item_with_prefix("bucket/prefix/object");
+
+        item.transform_meta_dir();
+
+        assert_eq!(item.prefix, "bucket/prefix");
+        assert_eq!(item.object_name, "object");
+        assert_eq!(item.object_path(), "bucket/prefix/object");
+    }
+
+    #[test]
+    fn transform_meta_dir_moves_single_component_into_object_name() {
+        let mut item = scanner_item_with_prefix("object");
+
+        item.transform_meta_dir();
+
+        assert_eq!(item.prefix, "");
+        assert_eq!(item.object_name, "object");
+        assert_eq!(item.object_path(), "object");
+    }
 }

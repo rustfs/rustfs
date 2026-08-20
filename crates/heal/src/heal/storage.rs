@@ -1202,13 +1202,22 @@ impl HealStorageAPI for ECStoreHealStorage {
                 let version_id = obj.version_id.map(|u| u.to_string());
                 let mod_time_unix_nanos = obj.mod_time.map(|mod_time| mod_time.unix_timestamp_nanos());
                 let is_delete_marker = obj.delete_marker;
-                let lifecycle_object_info = include_lifecycle_object_info.then(|| obj.clone());
-                HealListItem {
-                    name: obj.name,
-                    version_id,
-                    mod_time_unix_nanos,
-                    lifecycle_object_info,
-                    is_delete_marker,
+                if include_lifecycle_object_info {
+                    HealListItem {
+                        name: obj.name.clone(),
+                        version_id,
+                        mod_time_unix_nanos,
+                        lifecycle_object_info: Some(obj),
+                        is_delete_marker,
+                    }
+                } else {
+                    HealListItem {
+                        name: obj.name,
+                        version_id,
+                        mod_time_unix_nanos,
+                        lifecycle_object_info: None,
+                        is_delete_marker,
+                    }
                 }
             })
             .collect();

@@ -719,13 +719,22 @@ impl ObjectInfo {
     }
 
     pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
-        let name = decode_dir_object(object);
-
         let mut version_id = fi.version_id;
 
         if versioned && version_id.is_none() {
             version_id = Some(Uuid::nil())
         }
+
+        Self::from_file_info_with_version_id(fi, bucket, object, version_id)
+    }
+
+    pub(crate) fn from_file_info_with_version_id(
+        fi: &FileInfo,
+        bucket: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+    ) -> ObjectInfo {
+        let name = decode_dir_object(object);
 
         // etag
         let (content_type, content_encoding, etag) = {
@@ -1638,6 +1647,18 @@ mod tests {
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
 
         assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
+    }
+
+    #[test]
+    fn from_file_info_with_version_id_keeps_normalized_absent_version() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info_with_version_id(&fi, "bucket", "object", None);
+
+        assert_eq!(info.version_id, None, "a normalized absent version must not be rewritten to nil");
     }
 
     #[test]
