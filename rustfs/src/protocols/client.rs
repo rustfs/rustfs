@@ -966,7 +966,7 @@ mod tests {
         let mut identity = rustfs_policy::auth::UserIdentity::default();
         identity.credentials = credentials.clone();
         let principal = rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(identity));
-        let session_context = SessionContext::new(principal, rustfs_protocols::common::Protocol::WebDav, source_ip);
+        let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", http::HeaderValue::from_static("webdav-client"));
         let request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, true);
