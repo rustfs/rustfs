@@ -6,9 +6,6 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::time::sleep;
 use tracing::info;
 
 const COMPRESSION_TEST_BUCKET: &str = "compression-test-bucket";
@@ -87,17 +84,7 @@ async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Resul
     env.process = Some(process);
 
     info!("Waiting for RustFS server with compression enabled on {}", env.address);
-    for i in 0..30 {
-        if TcpStream::connect(&env.address).await.is_ok() {
-            info!("RustFS server is ready after {} attempts", i + 1);
-            return Ok(());
-        }
-        if i == 29 {
-            return Err("RustFS server failed to become ready".into());
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    Ok(())
+    env.wait_for_server_ready().await
 }
 
 #[tokio::test]
@@ -666,17 +653,7 @@ async fn start_rustfs_with_compression_and_sse(
     env.process = Some(process);
 
     info!("Waiting for RustFS server with compression + SSE-S3 enabled on {}", env.address);
-    for i in 0..30 {
-        if TcpStream::connect(&env.address).await.is_ok() {
-            info!("RustFS server is ready after {} attempts", i + 1);
-            return Ok(());
-        }
-        if i == 29 {
-            return Err("RustFS server failed to become ready".into());
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    Ok(())
+    env.wait_for_server_ready().await
 }
 
 /// SSE-S3 + disk compression multipart: each part is compressed and then encrypted, and every GET
