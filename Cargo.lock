@@ -9395,7 +9395,6 @@ dependencies = [
  "async-channel",
  "async-recursion",
  "async-trait",
- "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -10709,8 +10708,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3s"
-version = "0.14.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=d358a68783096df1db0c3e314127f2704603b29e#d358a68783096df1db0c3e314127f2704603b29e"
+version = "0.15.0-alpha.1"
+source = "git+https://github.com/rustfs/s3s.git?rev=ed70cb048cc4be168419d461cb9ac3c2c7fa6d5a#ed70cb048cc4be168419d461cb9ac3c2c7fa6d5a"
 dependencies = [
  "arc-swap",
  "arrayvec",
