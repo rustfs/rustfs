@@ -732,14 +732,122 @@ fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
     let mut running = HashMap::new();
     running.insert("pool_0_set_1".to_string(), 1);
 
-    let popped = queue
-        .pop_runnable(|request| can_schedule_request(request, &running, 1))
-        .expect("should find runnable request");
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+    let popped = popped.expect("should find runnable request");
 
+    assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string()]);
     assert!(matches!(
         popped.heal_type,
         HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_2"
     ));
+    assert_eq!(queue.len(), 1);
+    let still_blocked = queue.pop_next().expect("blocked request should stay queued");
+    assert!(matches!(
+        still_blocked.heal_type,
+        HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_1"
+    ));
+}
+
+#[test]
+fn test_priority_queue_pop_runnable_restores_all_blocked_items() {
+    let mut queue = PriorityHealQueue::new();
+    let mut queued_requests = Vec::new();
+
+    for set_disk_id in ["pool_0_set_1", "pool_0_set_2", "pool_0_set_3"] {
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket".to_string()],
+                set_disk_id: set_disk_id.to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        let request_id = request.id.clone();
+        let dedup_key = PriorityHealQueue::make_dedup_key(&request);
+        assert_eq!(queue.push(request), QueuePushOutcome::Accepted);
+        queued_requests.push((request_id, dedup_key));
+    }
+
+    let mut running = HashMap::new();
+    running.insert("pool_0_set_1".to_string(), 1);
+    running.insert("pool_0_set_2".to_string(), 1);
+    running.insert("pool_0_set_3".to_string(), 1);
+
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+
+    assert!(popped.is_none());
+    assert_eq!(
+        skipped_sets,
+        vec![
+            "pool_0_set_1".to_string(),
+            "pool_0_set_2".to_string(),
+            "pool_0_set_3".to_string(),
+        ]
+    );
+    assert_eq!(queue.len(), 3);
+    for (request_id, dedup_key) in &queued_requests {
+        assert_eq!(
+            queue.queued_request_id_for_dedup_key(dedup_key),
+            Some(request_id.as_str()),
+            "deferred blocked request must keep its dedup representative"
+        );
+    }
+    for (request_id, _) in queued_requests {
+        let request = queue.pop_next().expect("blocked request should remain queued");
+        assert_eq!(request.id, request_id, "deferred requests must preserve FIFO order");
+    }
+}
+
+#[test]
+fn test_priority_queue_pop_runnable_restores_deferred_with_tail() {
+    let mut queue = PriorityHealQueue::new();
+
+    for (set_disk_id, priority) in [
+        ("pool_0_set_1", HealPriority::Urgent),
+        ("pool_0_set_2", HealPriority::High),
+        ("pool_0_set_3", HealPriority::Normal),
+        ("pool_0_set_4", HealPriority::Low),
+    ] {
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec!["bucket".to_string()],
+                    set_disk_id: set_disk_id.to_string(),
+                },
+                HealOptions::default(),
+                priority,
+            )),
+            QueuePushOutcome::Accepted
+        );
+    }
+
+    let mut running = HashMap::new();
+    running.insert("pool_0_set_1".to_string(), 1);
+    running.insert("pool_0_set_2".to_string(), 1);
+
+    let (popped, skipped_sets) = queue.pop_runnable_with_skips(
+        |request| can_schedule_request(request, &running, 1),
+        |request| heal_request_set_key(request),
+    );
+
+    assert_eq!(skipped_sets, vec!["pool_0_set_1".to_string(), "pool_0_set_2".to_string()]);
+    assert!(matches!(
+        popped.expect("normal-priority request should be runnable").heal_type,
+        HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_3"
+    ));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.pop_next().expect("urgent request should remain queued").priority,
+        HealPriority::Urgent
+    );
+    assert_eq!(queue.pop_next().expect("high request should remain queued").priority, HealPriority::High);
+    assert_eq!(queue.pop_next().expect("low request should remain queued").priority, HealPriority::Low);
 }
 
 #[test]
