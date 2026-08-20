@@ -46,7 +46,6 @@ allow-git = [
     # MiMalloc fork pinned for hotpath allocation counting support.
     # owner: houseme  review: 2026-10
     "https://github.com/xonatius/mimalloc_rust.git",
-    "https://github.com/apache/datafusion.git",
 ]
 
 [bans]
