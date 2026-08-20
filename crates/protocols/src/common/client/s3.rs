@@ -15,6 +15,9 @@
 use async_trait::async_trait;
 use s3s::dto::*;
 
+#[cfg(feature = "webdav")]
+use crate::common::session::SessionContext;
+
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
@@ -65,8 +68,24 @@ pub trait StorageBackend: Send + Sync {
         access_key: &str,
         secret_key: &str,
     ) -> Result<ListObjectsV2Output, Self::Error>;
-    /// List all buckets (requires authentication)
+    /// List all buckets (requires authentication).
     async fn list_buckets(&self, access_key: &str, secret_key: &str) -> Result<ListBucketsOutput, Self::Error>;
+    /// List buckets visible to the authenticated session.
+    ///
+    /// Backends that implement this must apply per-bucket authorization. The default denies the
+    /// request so existing backends cannot expose unfiltered bucket names.
+    #[cfg(feature = "webdav")]
+    async fn list_buckets_for_session(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> s3s::S3Result<ListBucketsOutput> {
+        Err(s3s::S3Error::with_message(
+            s3s::S3ErrorCode::AccessDenied,
+            "Session-aware bucket listing is not supported",
+        ))
+    }
     /// Create a new bucket
     async fn create_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<CreateBucketOutput, Self::Error>;
     /// Delete a bucket (must be empty)

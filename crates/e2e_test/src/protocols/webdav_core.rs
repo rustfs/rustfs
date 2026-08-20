@@ -233,6 +233,111 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: PUT file '{}' successful", filename);
 
+        // Regression for #6260: a bucket-scoped policy must be able to discover its bucket at the
+        // WebDAV root without the unrelated global ListAllMyBuckets permission.
+        let scoped_bucket = "webdav-scoped-bucket";
+        let scoped_file = "visible.txt";
+        let scoped_user = "webdav-scoped-user";
+        let scoped_secret = "webdav-scoped-secret";
+        let scoped_policy_name = "webdav-scoped-policy";
+
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), format!("{}/{}", base_url, scoped_bucket))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test bucket should be created");
+
+        let resp = client
+            .put(format!("{}/{}/{}", base_url, scoped_bucket, scoped_file))
+            .header("Authorization", &auth_header)
+            .body("visible to the scoped principal")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test object should be created");
+
+        admin_create_user(&admin_base_url, scoped_user, scoped_secret).await?;
+        admin_add_canned_policy(
+            &admin_base_url,
+            scoped_policy_name,
+            &serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ]
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "Bool": { "aws:SecureTransport": "true" } }
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "StringEquals": { "s3:signatureversion": "AWS4-HMAC-SHA256" } }
+                    }
+                ]
+            }),
+        )
+        .await?;
+        admin_attach_policy_to_user(&admin_base_url, scoped_policy_name, scoped_user).await?;
+
+        let scoped_auth = basic_auth_header_for(scoped_user, scoped_secret);
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "bucket-scoped root PROPFIND should succeed");
+        let root_listing = resp.text().await?;
+        assert!(root_listing.contains(scoped_bucket), "the authorized bucket should be listed");
+        assert!(!root_listing.contains(bucket_name), "an unauthorized bucket must not be listed");
+
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("{}/{}", base_url, scoped_bucket),
+            )
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "authorized bucket PROPFIND should succeed");
+        assert!(resp.text().await?.contains(scoped_file), "the authorized object should be listed");
+
+        let denied_user = "webdav-no-buckets-user";
+        let denied_secret = "webdav-no-buckets-secret";
+        admin_create_user(&admin_base_url, denied_user, denied_secret).await?;
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for(denied_user, denied_secret))
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status().as_u16(),
+            207,
+            "PROPFIND keeps the root resource visible when the directory listing is forbidden"
+        );
+        let denied_body = resp.text().await?;
+        assert!(!denied_body.contains(scoped_bucket), "a denied response must not leak the scoped bucket");
+        assert!(!denied_body.contains(bucket_name), "a denied response must not leak the admin bucket");
+
         // Test GET (download file)
         info!("Testing WebDAV: GET (download file '{}')", filename);
         let resp = client

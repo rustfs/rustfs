@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
-use crate::common::gateway::{S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -24,6 +24,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 use percent_encoding::percent_decode_str;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
+use s3s::S3ErrorCode;
 use s3s::dto::*;
 use std::fmt::Debug;
 use std::io::SeekFrom;
@@ -457,6 +458,10 @@ where
     storage: S,
     /// Session context for authorization
     session_context: Arc<SessionContext>,
+    /// Policy-safe WebDAV request headers used by IAM conditions.
+    request_headers: Option<http::HeaderMap>,
+    /// Whether the WebDAV connection uses TLS.
+    secure_transport: bool,
 }
 
 enum ResolvedPath {
@@ -490,6 +495,8 @@ where
         Self {
             storage: self.storage.clone(),
             session_context: self.session_context.clone(),
+            request_headers: self.request_headers.clone(),
+            secure_transport: self.secure_transport,
         }
     }
 }
@@ -503,7 +510,16 @@ where
         Self {
             storage,
             session_context,
+            request_headers: None,
+            secure_transport: false,
         }
+    }
+
+    /// Attach the request context used by IAM policy conditions.
+    pub fn with_request_context(mut self, request_headers: http::HeaderMap, secure_transport: bool) -> Self {
+        self.request_headers = Some(request_headers);
+        self.secure_transport = secure_transport;
+        self
     }
 
     fn credentials(&self) -> (&str, &str) {
@@ -799,50 +815,41 @@ where
     /// List all buckets (for root path)
     async fn list_buckets(&self) -> FsResult<Vec<WebDavDirEntry>> {
         match authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None).await {
-            Ok(_) => {}
-            Err(_e) => {
-                return Err(FsError::Forbidden);
+            Ok(()) => {
+                let (access_key, secret_key) = self.credentials();
+                return match self.storage.list_buckets(access_key, secret_key).await {
+                    Ok(output) => Ok(Self::bucket_entries(output)),
+                    Err(error) => {
+                        error!(
+                            event = EVENT_WEBDAV_BUCKET_LIST_FAILED,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            error = %error,
+                            access_key = %MaskedAccessKey(access_key),
+                            "webdav bucket list failed"
+                        );
+                        Err(FsError::GeneralFailure)
+                    }
+                };
             }
+            Err(AuthorizationError::AccessDenied) => {}
+            Err(AuthorizationError::IamUnavailable) => return Err(FsError::GeneralFailure),
         }
 
-        match self
+        let Some(request_headers) = self.request_headers.as_ref() else {
+            return Err(FsError::Forbidden);
+        };
+        let result = self
             .storage
-            .list_buckets(
-                &self.session_context.principal.user_identity.credentials.access_key,
-                &self.session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
-            Ok(output) => {
-                let mut entries = Vec::new();
-                if let Some(buckets) = output.buckets {
-                    for bucket in buckets {
-                        if let Some(ref bucket_name) = bucket.name {
-                            let modified = bucket
-                                .creation_date
-                                .map(|dt| {
-                                    let offset_dt: time::OffsetDateTime = dt.into();
-                                    SystemTime::from(offset_dt)
-                                })
-                                .unwrap_or_else(SystemTime::now);
+            .list_buckets_for_session(&self.session_context, request_headers, self.secure_transport)
+            .await;
 
-                            entries.push(WebDavDirEntry {
-                                name: bucket_name.clone(),
-                                metadata: WebDavMetaData {
-                                    size: 0,
-                                    modified,
-                                    created: modified,
-                                    is_dir: true,
-                                    etag: None,
-                                    content_type: None,
-                                },
-                            });
-                        }
-                    }
-                }
-                Ok(entries)
-            }
+        match result {
+            Ok(output) => Ok(Self::bucket_entries(output)),
             Err(e) => {
+                if matches!(e.code(), S3ErrorCode::AccessDenied) {
+                    return Err(FsError::Forbidden);
+                }
                 error!(
                     event = EVENT_WEBDAV_BUCKET_LIST_FAILED,
                     component = LOG_COMPONENT_PROTOCOLS,
@@ -854,6 +861,35 @@ where
                 Err(FsError::GeneralFailure)
             }
         }
+    }
+
+    fn bucket_entries(output: ListBucketsOutput) -> Vec<WebDavDirEntry> {
+        output
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bucket| {
+                let name = bucket.name?;
+                let modified = bucket
+                    .creation_date
+                    .map(|date| {
+                        let date: time::OffsetDateTime = date.into();
+                        SystemTime::from(date)
+                    })
+                    .unwrap_or_else(SystemTime::now);
+                Some(WebDavDirEntry {
+                    name,
+                    metadata: WebDavMetaData {
+                        size: 0,
+                        modified,
+                        created: modified,
+                        is_dir: true,
+                        etag: None,
+                        content_type: None,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// List objects in a bucket
@@ -1715,8 +1751,9 @@ where
 mod tests {
     use super::WebDavDriver;
     use crate::common::client::s3::StorageBackend as S3StorageBackend;
-    use crate::common::gateway::{S3Action, with_test_auth_override};
-    use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+    use crate::common::dummy_storage::DummyBackend;
+    use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
+    use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, test_session};
     use async_trait::async_trait;
     use bytes::Bytes;
     use dav_server::davpath::DavPath;
@@ -1904,6 +1941,134 @@ mod tests {
         );
 
         WebDavDriver::new(DummyStorage, Arc::new(session_context))
+    }
+
+    #[tokio::test]
+    async fn session_bucket_listing_does_not_require_global_list_permission() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_ok(ListBucketsOutput {
+            buckets: Some(vec![Bucket {
+                name: Some("allowed-bucket".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav))).with_request_context(
+            http::HeaderMap::from_iter([(http::header::USER_AGENT, http::HeaderValue::from_static("webdav-test"))]),
+            false,
+        );
+
+        let entries = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect("session-aware backend should own bucket filtering");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "allowed-bucket");
+        let (headers, secure_transport) = storage
+            .last_session_list_context()
+            .expect("request context should be forwarded");
+        assert_eq!(headers.get("user-agent").expect("user agent"), "webdav-test");
+        assert!(!secure_transport);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_maps_typed_access_denied_to_forbidden() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(s3s::S3ErrorCode::AccessDenied, "policy denied"));
+        let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("bucket listing should be denied");
+
+        assert!(matches!(error, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn list_buckets_does_not_classify_error_text_as_access_denied() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(
+            s3s::S3ErrorCode::InternalError,
+            "AccessDenied appears only in the message",
+        ));
+        let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("bucket listing should fail");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+    }
+
+    #[tokio::test]
+    async fn global_list_permission_keeps_the_legacy_backend_path() {
+        let storage = DummyBackend::new();
+        storage.queue_list_buckets_ok(ListBucketsOutput {
+            buckets: Some(vec![Bucket {
+                name: Some("legacy-bucket".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)));
+
+        let entries = with_test_auth_override(|_, _, _| true, driver.list_buckets())
+            .await
+            .expect("globally authorized legacy backend should keep working");
+
+        assert_eq!(entries[0].name, "legacy-bucket");
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_bucket_list_error_is_a_general_failure() {
+        let storage = DummyBackend::new();
+        storage.queue_list_buckets_err(crate::common::dummy_storage::DummyError::Injected("backend failed".to_string()));
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)));
+
+        let error = with_test_auth_override(|_, _, _| true, driver.list_buckets())
+            .await
+            .expect_err("legacy backend error should fail the listing");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn iam_unavailable_does_not_enter_the_session_fallback() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_ok(ListBucketsOutput::default());
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_iam_unavailable(driver.list_buckets())
+            .await
+            .expect_err("IAM outage must fail closed");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_request_context_fails_closed() {
+        let error = with_test_auth_override(|_, _, _| false, driver().list_buckets())
+            .await
+            .expect_err("bucket listing should require the original request context");
+
+        assert!(matches!(error, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn backend_without_session_listing_fails_closed() {
+        let driver = driver().with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("default session listing must deny the request");
+
+        assert!(matches!(error, FsError::Forbidden));
     }
 
     #[derive(Default)]

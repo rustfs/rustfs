@@ -19,6 +19,8 @@ use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_tem
 use bytes::Bytes;
 use dav_server::DavHandler;
 use dav_server::fakels::FakeLs;
+use http::header::{AUTHORIZATION, REFERER, USER_AGENT};
+use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body as HttpBody;
 use hyper::server::conn::http1;
@@ -58,6 +60,20 @@ const EVENT_WEBDAV_CONNECTION_CAP_STATE: &str = "webdav_connection_cap_state";
 /// Boxed instead of collected: buffering the dav-server body would
 /// materialise a whole object in memory for every GET.
 type WebDavBody = Pin<Box<dyn HttpBody<Data = Bytes, Error = io::Error> + Send>>;
+
+fn policy_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut policy_headers = HeaderMap::new();
+    for name in [USER_AGENT, REFERER] {
+        if let Some(value) = headers.get(&name) {
+            policy_headers.insert(name, value.clone());
+        }
+    }
+
+    let mut authorization = HeaderValue::from_static("Basic");
+    authorization.set_sensitive(true);
+    policy_headers.insert(AUTHORIZATION, authorization);
+    policy_headers
+}
 
 /// WebDAV server implementation
 pub struct WebDavServer<S>
@@ -216,7 +232,7 @@ where
                                         match timeout(request_timeout, acceptor.accept(stream)).await {
                                             Ok(Ok(tls_stream)) => {
                                                 let io = TokioIo::new(tls_stream);
-                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size, request_timeout).await {
+                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, true, max_body_size, request_timeout).await {
                                                     debug!(
                                                         event = EVENT_WEBDAV_CONNECTION_STATE,
                                                         component = LOG_COMPONENT_PROTOCOLS,
@@ -254,7 +270,7 @@ where
                                         }
                                     } else {
                                         let io = TokioIo::new(stream);
-                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size, request_timeout).await {
+                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, false, max_body_size, request_timeout).await {
                                             debug!(
                                                 event = EVENT_WEBDAV_CONNECTION_STATE,
                                                 component = LOG_COMPONENT_PROTOCOLS,
@@ -313,6 +329,7 @@ where
         io: TokioIo<I>,
         storage: S,
         source_ip: IpAddr,
+        secure_transport: bool,
         max_body_size: u64,
         request_timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -321,7 +338,7 @@ where
     {
         let service = service_fn(move |req: Request<hyper::body::Incoming>| {
             let storage = storage.clone();
-            async move { Self::handle_request(req, storage, source_ip, max_body_size, request_timeout).await }
+            async move { Self::handle_request(req, storage, source_ip, secure_transport, max_body_size, request_timeout).await }
         });
 
         // A peer that opens a connection and dribbles (or never finishes)
@@ -341,6 +358,7 @@ where
         req: Request<hyper::body::Incoming>,
         storage: S,
         source_ip: IpAddr,
+        secure_transport: bool,
         max_body_size: u64,
         request_timeout: Duration,
     ) -> Result<Response<WebDavBody>, Infallible> {
@@ -398,7 +416,8 @@ where
         };
 
         // Create WebDAV driver with session context
-        let driver = WebDavDriver::new(storage, Arc::new(session_context));
+        let driver = WebDavDriver::new(storage, Arc::new(session_context))
+            .with_request_context(policy_request_headers(req.headers()), secure_transport);
 
         // Build DAV handler with boxed filesystem
         let dav_handler = DavHandler::builder()
@@ -883,6 +902,30 @@ mod tests {
             .expect("build get request")
     }
 
+    #[test]
+    fn policy_headers_drop_credentials_and_s3_auth_spoofing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNzd29yZA=="));
+        headers.insert(USER_AGENT, HeaderValue::from_static("webdav-client"));
+        headers.insert(REFERER, HeaderValue::from_static("https://example.test/"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"));
+        headers.insert("x-amz-signature-age", HeaderValue::from_static("0"));
+
+        let policy_headers = policy_request_headers(&headers);
+
+        assert_eq!(policy_headers.get(AUTHORIZATION).expect("authorization marker"), "Basic");
+        assert!(
+            policy_headers
+                .get(AUTHORIZATION)
+                .expect("authorization marker")
+                .is_sensitive()
+        );
+        assert_eq!(policy_headers.get(USER_AGENT).expect("user agent"), "webdav-client");
+        assert_eq!(policy_headers.get(REFERER).expect("referer"), "https://example.test/");
+        assert!(!policy_headers.contains_key("x-amz-content-sha256"));
+        assert!(!policy_headers.contains_key("x-amz-signature-age"));
+    }
+
     /// R03-CAN-051 / R03-CAN-067 / R05-CAN-094: a chunked upload declares no
     /// Content-Length, so the limit has to hold on the bytes actually read.
     #[tokio::test]
@@ -959,6 +1002,7 @@ mod tests {
             TokioIo::new(server),
             StubStorage,
             TEST_IP,
+            false,
             1024,
             Duration::from_secs(30),
         ));
