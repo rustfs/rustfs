@@ -5169,23 +5169,25 @@ mod tests {
                 .await
                 .expect("source should be written");
 
+            let mut delete_opts = ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                    version_id: original.version_id,
+                    delete_marker: false,
+                    action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                    rule_id: "rule".to_string(),
+                    phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+                }),
+                delete_replication_config_snapshot: Some(Arc::new(
+                    crate::bucket::replication::DeleteReplicationConfigSnapshot::default(),
+                )),
+                ..Default::default()
+            };
+            delete_opts.ensure_lifecycle_delete_all_journal();
+
             let err = store
-                .delete_object_with_tier_delete_journal(
-                    bucket,
-                    object,
-                    ObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
-                        lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
-                            version_id: original.version_id,
-                            delete_marker: false,
-                            action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
-                            rule_id: "rule".to_string(),
-                            phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
-                        }),
-                        ..Default::default()
-                    },
-                )
+                .delete_object_with_tier_delete_journal(bucket, object, delete_opts)
                 .await
                 .expect_err("delete-all must reject disabled namespace locking");
 

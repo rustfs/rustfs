@@ -42,8 +42,8 @@ use crate::bucket::lifecycle::{
 };
 use crate::bucket::quota::reservation;
 use crate::bucket::replication::{
-    DeleteReplicationConfigSnapshot, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
-    replication_status_from_filemeta, version_purge_status_to_filemeta,
+    DeleteReplicationConfigSnapshot, ReplicationLifecycleBridge, ReplicationStatusType, VersionPurgeStatusType,
+    replication_state_to_filemeta, replication_status_from_filemeta, version_purge_status_to_filemeta,
 };
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
@@ -171,6 +171,65 @@ fn lifecycle_delete_all_tier_journal_entry(
     Ok(Some((name, entry)))
 }
 
+fn lifecycle_delete_all_replication_delete(
+    bucket: &str,
+    object: &str,
+    version: &FileInfo,
+    opts: &ObjectOptions,
+) -> Result<Option<(crate::bucket::replication::ReplicationState, DeletedObject)>> {
+    let snapshot = opts
+        .delete_replication_config_snapshot
+        .as_deref()
+        .ok_or(StorageError::PreconditionFailed)?;
+    let logical_object = decode_dir_object(object);
+    if !snapshot.has_active_rule(&logical_object) {
+        return Ok(None);
+    }
+
+    let versioned = opts.versioned || opts.version_suspended;
+    let source = ObjectInfo::from_file_info(version, bucket, object, versioned);
+    let Some(version_id) = source.version_id else {
+        return Err(StorageError::PreconditionFailed);
+    };
+    let delete_opts = ObjectOptions {
+        version_id: Some(version_id.to_string()),
+        versioned: opts.versioned,
+        version_suspended: opts.version_suspended,
+        replication_request: opts.replication_request,
+        no_lock: true,
+        ..Default::default()
+    };
+    let object_to_delete = ObjectToDelete {
+        object_name: logical_object.clone(),
+        version_id: Some(version_id),
+        ..Default::default()
+    };
+    let decision = ReplicationObjectBridge::check_delete_with_snapshot(&object_to_delete, &source, &delete_opts, false, snapshot);
+    if !decision.replicate_any() {
+        return Ok(None);
+    }
+
+    let replication_state = ReplicationLifecycleBridge::version_delete_replication_state(&decision);
+    let deleted_object = if source.delete_marker {
+        DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(version_id),
+            delete_marker_mtime: source.mod_time,
+            object_name: logical_object,
+            replication_state: Some(replication_state_to_filemeta(&replication_state)),
+            ..Default::default()
+        }
+    } else {
+        DeletedObject {
+            object_name: logical_object,
+            version_id: Some(version_id),
+            replication_state: Some(replication_state_to_filemeta(&replication_state)),
+            ..Default::default()
+        }
+    };
+    Ok(Some((replication_state, deleted_object)))
+}
+
 async fn prepare_lifecycle_delete_all_tier_journals(
     bucket: &str,
     object: &str,
@@ -180,17 +239,18 @@ async fn prepare_lifecycle_delete_all_tier_journals(
     let Some(api) = opts.tier_delete_journal_api.as_ref() else {
         return Ok(());
     };
+    let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
     for version in plan.history.iter().copied().chain(plan.trigger) {
         let Some((name, entry)) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, opts)? else {
             continue;
         };
-        if opts.lifecycle_delete_all_journal.lock().contains(&name) {
+        if journal.lock().contains(&name) {
             continue;
         }
         persist_tier_delete_journal_entry(Arc::clone(api), &entry)
             .await
             .map_err(Error::other)?;
-        opts.lifecycle_delete_all_journal.lock().insert(name, entry);
+        journal.lock().insert(name, entry);
     }
     Ok(())
 }
@@ -202,14 +262,17 @@ mod lifecycle_delete_all_plan_tests {
     use crate::bucket::replication::ReplicationState;
 
     fn delete_opts(request: crate::object_api::LifecycleDeleteAllRequest) -> ObjectOptions {
-        ObjectOptions {
+        let mut opts = ObjectOptions {
             delete_prefix: true,
             delete_prefix_object: true,
             versioned: true,
             lifecycle_delete_all: Some(request),
+            delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
             object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
-        }
+        };
+        opts.ensure_lifecycle_delete_all_journal();
+        opts
     }
 
     fn trigger(version_id: Uuid) -> crate::object_api::LifecycleDeleteAllRequest {
@@ -6182,9 +6245,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         };
                         for version in plan {
                             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            let replication_delete = lifecycle_delete_all_replication_delete(bucket, object, version, &opts)?;
                             let mut delete_request = FileInfo {
                                 name: object.to_string(),
                                 version_id: version.version_id,
+                                replication_state_internal: replication_delete
+                                    .as_ref()
+                                    .map(|(state, _)| replication_state_to_filemeta(state)),
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
@@ -6193,12 +6260,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             {
                                 let (name, _entry) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, &opts)?
                                     .ok_or(StorageError::PreconditionFailed)?;
-                                if !opts.lifecycle_delete_all_journal.lock().contains(&name) {
+                                let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
+                                if !journal.lock().contains(&name) {
                                     return Err(StorageError::PreconditionFailed);
                                 }
                                 delete_request.set_skip_tier_free_version();
                             }
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
+                            if let Some((_, deleted_object)) = replication_delete {
+                                opts.lifecycle_delete_all_journal()
+                                    .ok_or(StorageError::PreconditionFailed)?
+                                    .lock()
+                                    .record_replication_delete(deleted_object.clone());
+                                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+                            }
                         }
                     } else {
                         for version in &versions.versions {
@@ -14198,6 +14273,115 @@ mod delete_objects_lock_gating_tests {
             state.version_purge_status_internal.as_deref(),
             Some("arn:rustfs:replication:us-east-1:target:bucket=PENDING;")
         );
+        assert!(state.replicate_decision_str.contains(arn));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_delete_all_history_records_exact_replication_purge() {
+        use s3s::dto::{
+            BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,
+            ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
+        };
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lifecycle-delete-all-replication";
+        let object = "object";
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut first_reader = PutObjReader::from_vec(b"first".to_vec());
+        let first = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut first_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first version should be written");
+        let first_version_id = first.version_id.expect("first PUT should return a version id");
+        let mut trigger_reader = PutObjReader::from_vec(b"trigger".to_vec());
+        let trigger = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut trigger_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("trigger version should be written");
+        let trigger_version_id = trigger.version_id.expect("trigger PUT should return a version id");
+
+        let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            Some(ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: None,
+                    delete_replication: Some(DeleteReplication {
+                        status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                    }),
+                    destination: Destination {
+                        bucket: arn.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter: None,
+                    id: Some("delete-all-purge".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            }),
+        ));
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                version_id: Some(trigger_version_id),
+                delete_marker: false,
+                action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                rule_id: "rule".to_string(),
+                phase: crate::object_api::LifecycleDeleteAllPhase::History,
+            }),
+            delete_replication_config_snapshot: Some(snapshot),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        opts.ensure_lifecycle_delete_all_journal();
+
+        set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("history phase should delete the old version");
+
+        let deletes = opts
+            .lifecycle_delete_all_journal()
+            .expect("delete-all journal should be initialized")
+            .lock()
+            .replication_deletes();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].object_name, object);
+        assert_eq!(deletes[0].version_id, Some(first_version_id));
+        assert!(!deletes[0].delete_marker);
+        let state = deletes[0]
+            .replication_state
+            .as_ref()
+            .expect("delete-all history purge should carry replication state");
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some(format!("{arn}=PENDING;").as_str()));
         assert!(state.replicate_decision_str.contains(arn));
     }
 

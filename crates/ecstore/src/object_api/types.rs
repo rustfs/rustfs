@@ -241,6 +241,7 @@ pub enum LifecycleDeleteAllPhase {
 #[derive(Default)]
 pub struct LifecycleDeleteAllJournalState {
     prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
+    replication_deletes: Vec<DeletedObject>,
     mutation_started: bool,
 }
 
@@ -248,6 +249,7 @@ impl Debug for LifecycleDeleteAllJournalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleDeleteAllJournalState")
             .field("prepared_count", &self.prepared.len())
+            .field("replication_delete_count", &self.replication_deletes.len())
             .field("mutation_started", &self.mutation_started)
             .finish()
     }
@@ -264,6 +266,14 @@ impl LifecycleDeleteAllJournalState {
 
     pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
         self.prepared.values().cloned().collect()
+    }
+
+    pub(crate) fn record_replication_delete(&mut self, deleted_object: DeletedObject) {
+        self.replication_deletes.push(deleted_object);
+    }
+
+    pub(crate) fn replication_deletes(&self) -> Vec<DeletedObject> {
+        self.replication_deletes.clone()
     }
 
     pub(crate) fn mark_mutation_started(&mut self) {
@@ -303,7 +313,7 @@ pub struct ObjectOptions {
     #[doc(hidden)]
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
     #[doc(hidden)]
-    pub lifecycle_delete_all_journal: Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>,
+    pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
@@ -409,6 +419,15 @@ impl ObjectOptions {
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {
+        self.lifecycle_delete_all_journal
+            .get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(LifecycleDeleteAllJournalState::default())));
+    }
+
+    pub(crate) fn lifecycle_delete_all_journal(&self) -> Option<&Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>> {
+        self.lifecycle_delete_all_journal.as_ref()
     }
 
     pub fn add_namespace_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
@@ -1951,5 +1970,14 @@ mod tests {
         assert!(default_cloned.user_defined.is_empty());
         assert!(default_cloned.user_tags.is_empty());
         assert!(default_cloned.parts.is_empty());
+    }
+
+    #[test]
+    fn object_options_default_does_not_allocate_lifecycle_delete_all_journal() {
+        let mut opts = ObjectOptions::default();
+
+        assert!(opts.lifecycle_delete_all_journal().is_none());
+        opts.ensure_lifecycle_delete_all_journal();
+        assert!(opts.lifecycle_delete_all_journal().is_some());
     }
 }

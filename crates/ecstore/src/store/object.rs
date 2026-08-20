@@ -224,7 +224,10 @@ async fn delete_prefix_with_tier_delete_journal(
     match result {
         Ok(()) => {
             let lifecycle_entries = if lifecycle_delete_all {
-                opts.lifecycle_delete_all_journal.lock().prepared_entries()
+                opts.lifecycle_delete_all_journal()
+                    .ok_or(StorageError::PreconditionFailed)?
+                    .lock()
+                    .prepared_entries()
             } else {
                 Vec::new()
             };
@@ -238,7 +241,8 @@ async fn delete_prefix_with_tier_delete_journal(
             if let Some(api) = tier_journal_api {
                 if lifecycle_delete_all {
                     let (abort, entries) = {
-                        let state = opts.lifecycle_delete_all_journal.lock();
+                        let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
+                        let state = journal.lock();
                         (!state.mutation_started(), state.prepared_entries())
                     };
                     if abort {

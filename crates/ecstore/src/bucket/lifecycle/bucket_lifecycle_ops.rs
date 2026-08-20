@@ -5057,6 +5057,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
             rule_id: lc_event.rule_id.clone(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         });
+        opts.ensure_lifecycle_delete_all_journal();
     }
 
     let time_ilm = Metrics::time_ilm(lc_event.action);

@@ -215,7 +215,10 @@ impl ECStore {
                 pool.delete_object(bucket, object, preflight_opts.clone()).await?;
             }
 
-            opts.lifecycle_delete_all_journal.lock().mark_mutation_started();
+            opts.lifecycle_delete_all_journal()
+                .ok_or(StorageError::PreconditionFailed)?
+                .lock()
+                .mark_mutation_started();
             let mut non_trigger_opts = opts.clone();
             non_trigger_opts
                 .lifecycle_delete_all
@@ -959,7 +962,7 @@ mod tests {
             .await
             .expect("shared trigger should be stored");
         }
-        ObjectOptions {
+        let mut opts = ObjectOptions {
             delete_prefix: true,
             delete_prefix_object: true,
             versioned: true,
@@ -973,8 +976,13 @@ mod tests {
             object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
                 crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             ))),
+            delete_replication_config_snapshot: Some(Arc::new(
+                crate::bucket::replication::DeleteReplicationConfigSnapshot::default(),
+            )),
             ..Default::default()
-        }
+        };
+        opts.ensure_lifecycle_delete_all_journal();
+        opts
     }
 
     async fn ordinary_version_count(store: &ECStore, pool_index: usize, bucket: &str, object: &str) -> usize {
@@ -1124,7 +1132,7 @@ mod tests {
             .await
             .expect("trigger marker should be stored in the first pool");
         let marker_id = marker.version_id.expect("trigger marker should have a version id");
-        let opts = ObjectOptions {
+        let mut opts = ObjectOptions {
             delete_prefix: true,
             delete_prefix_object: true,
             versioned: true,
@@ -1138,8 +1146,12 @@ mod tests {
             object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
                 crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             ))),
+            delete_replication_config_snapshot: Some(Arc::new(
+                crate::bucket::replication::DeleteReplicationConfigSnapshot::default(),
+            )),
             ..Default::default()
         };
+        opts.ensure_lifecycle_delete_all_journal();
 
         let _failure_guard = LifecycleDeleteAllFailureGuard;
         *LIFECYCLE_DELETE_ALL_TEST_FAILURE
@@ -1151,7 +1163,12 @@ mod tests {
             .await
             .expect_err("a later pool history failure must stop before trigger deletion");
         assert_eq!(err, StorageError::PreconditionFailed);
-        assert!(opts.lifecycle_delete_all_journal.lock().mutation_started());
+        assert!(
+            opts.lifecycle_delete_all_journal()
+                .expect("delete-all journal should be initialized")
+                .lock()
+                .mutation_started()
+        );
 
         let first_pool = store.pools[0].disk_set[0]
             .load_file_info_versions_exact(&bucket, object)
@@ -1218,7 +1235,13 @@ mod tests {
                 .await
                 .expect_err("injected phase failure should stop the transaction");
             assert_eq!(err, StorageError::PreconditionFailed);
-            assert_eq!(opts.lifecycle_delete_all_journal.lock().mutation_started(), mutation_started);
+            assert_eq!(
+                opts.lifecycle_delete_all_journal()
+                    .expect("delete-all journal should be initialized")
+                    .lock()
+                    .mutation_started(),
+                mutation_started
+            );
             assert_eq!(ordinary_version_count(&store, 0, &bucket, object).await, expected_counts[0]);
             assert_eq!(ordinary_version_count(&store, 1, &bucket, object).await, expected_counts[1]);
 
