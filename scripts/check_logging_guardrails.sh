@@ -845,7 +845,9 @@ done
 # `set_disks` expands every Disk through Debug, including raw format bytes and
 # the full per-operation metrics ring. Keep it out of the INFO scanner span.
 scanner_disk_skip_pattern='#\[(tracing::)?instrument\([^]]*skip\([^)]*\bset_disks\b[^)]*\)[^]]*\)\][[:space:]]*async fn nsscanner_disk\b'
-if ! rg -U "$scanner_disk_skip_pattern" crates/scanner/src/scanner_io.rs >/dev/null; then
+# nsscanner_disk lives in the scanner_io/io_disk.rs child module since the
+# scanner_io module-tree split.
+if ! rg -U "$scanner_disk_skip_pattern" crates/scanner/src/scanner_io/io_disk.rs >/dev/null; then
   echo "❌ logging guardrail violation: nsscanner_disk must skip set_disks in its tracing instrumentation" >&2
   exit 1
 fi
