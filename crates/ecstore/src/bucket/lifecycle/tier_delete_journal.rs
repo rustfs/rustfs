@@ -566,13 +566,12 @@ async fn reconcile_prepared_tier_delete_journal_entry(api: Arc<ECStore>, je: &Je
             {
                 commit_opts.add_namespace_lock_lost_signal(signal);
             }
-            let result =
-                match commit_prepared_tier_delete_journal_entry_if_current(api.clone(), current, etag, &commit_opts).await {
-                    Ok(committed) => process_committed_tier_delete_journal_entry(api, &committed).await,
-                    Err(err) => Err(err),
-                };
+            let committed =
+                commit_prepared_tier_delete_journal_entry_if_current(api.clone(), current, etag, &commit_opts).await?;
+            // Keep namespace locks only through the journal CAS. Remote-tier IO
+            // must not block writers for the object during recovery.
             drop(read_guards);
-            result
+            process_committed_tier_delete_journal_entry(api, &committed).await
         }
         Ok((false, _read_guards)) => Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
