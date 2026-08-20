@@ -18,12 +18,43 @@ use std::sync::LazyLock;
 pub const SERVER_LABEL: &str = "server";
 pub const ACTION_LABEL: &str = "action";
 pub const STATE_LABEL: &str = "state";
+pub const QUEUE_STATE_LABEL: &str = "queue_state";
+pub const RESULT_LABEL: &str = "result";
+pub const REASON_LABEL: &str = "reason";
+pub const SOURCE_LABEL: &str = "source";
 
 pub static ILM_ACTION_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("action_tasks".to_string()),
         "ILM task counts by server, action, and state",
         &[SERVER_LABEL, ACTION_LABEL, STATE_LABEL],
+        subsystems::ILM,
+    )
+});
+
+pub static ILM_TASKS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("tasks".to_string()),
+        "Current ILM task counts by server, action, and queue state",
+        &[SERVER_LABEL, ACTION_LABEL, QUEUE_STATE_LABEL],
+        subsystems::ILM,
+    )
+});
+
+pub static ILM_TASK_EVENTS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("task_events_total".to_string()),
+        "ILM task events by server, action, and result",
+        &[SERVER_LABEL, ACTION_LABEL, RESULT_LABEL],
+        subsystems::ILM,
+    )
+});
+
+pub static ILM_QUEUE_BACKPRESSURE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("queue_backpressure_total".to_string()),
+        "ILM queue backpressure events by server, action, and reason",
+        &[SERVER_LABEL, ACTION_LABEL, REASON_LABEL],
         subsystems::ILM,
     )
 });
@@ -105,6 +136,15 @@ pub static ILM_VERSIONS_SCANNED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|
         MetricName::IlmVersionsScanned,
         "Total number of object versions checked for ILM actions since server start",
         &[],
+        subsystems::ILM,
+    )
+});
+
+pub static ILM_VERSIONS_SCANNED_BY_SERVER_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("versions_scanned_by_server".to_string()),
+        "ILM lifecycle-checked object versions by server and source",
+        &[SERVER_LABEL, SOURCE_LABEL],
         subsystems::ILM,
     )
 });

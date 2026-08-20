@@ -147,11 +147,19 @@ impl Drop for DiskBucketScanActiveGuard {
 
 pub(super) struct BucketDriveFailureGuard {
     failed: bool,
+    source: rustfs_common::metrics::ScannerWorkSource,
+    bucket: String,
+    drive: String,
 }
 
 impl BucketDriveFailureGuard {
-    pub(super) fn new() -> Self {
-        Self { failed: true }
+    pub(super) fn new(source: rustfs_common::metrics::ScannerWorkSource, bucket: &str, drive: &str) -> Self {
+        Self {
+            failed: true,
+            source,
+            bucket: bucket.to_string(),
+            drive: drive.to_string(),
+        }
     }
 
     pub(super) fn mark_not_failed(&mut self) {
@@ -161,6 +169,7 @@ impl BucketDriveFailureGuard {
 
 impl Drop for BucketDriveFailureGuard {
     fn drop(&mut self) {
+        global_metrics().record_scan_bucket_drive_end(self.source, &self.bucket, &self.drive);
         if self.failed {
             global_metrics().record_scan_bucket_drive_failure();
         }
@@ -271,4 +280,29 @@ pub(super) fn record_set_scan_failure(first_err: &mut Option<Error>, err: Error)
 
 pub(super) fn scanner_task_join_error(stage: &str, err: tokio::task::JoinError) -> Error {
     Error::other(format!("{stage} task join failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_common::metrics::{ScannerWorkSource, global_metrics};
+
+    #[test]
+    fn bucket_drive_failure_guard_retires_active_scan_on_drop() {
+        let source = ScannerWorkSource::Usage;
+        let bucket = "__guard_active_lifecycle_test__";
+        let drive = "/__guard_active_lifecycle_test__";
+        global_metrics().record_scan_bucket_drive_start(source, bucket, drive);
+        {
+            let mut guard = BucketDriveFailureGuard::new(source, bucket, drive);
+            guard.mark_not_failed();
+        }
+        assert!(
+            !global_metrics()
+                .scanner_runtime_details_report()
+                .active_bucket_drive_scans
+                .iter()
+                .any(|active| active.source == source.as_str() && active.bucket == bucket && active.drive == drive)
+        );
+    }
 }

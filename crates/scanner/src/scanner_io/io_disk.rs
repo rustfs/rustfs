@@ -147,8 +147,12 @@ impl ScannerIODisk for Disk {
         let drive_start = std::time::Instant::now();
         let bucket = cache.info.name.clone();
         let disk_path = self.path().to_string_lossy().to_string();
-        global_metrics().record_scan_bucket_drive_start();
-        let mut failure_guard = BucketDriveFailureGuard::new();
+        let source = match scan_mode {
+            HealScanMode::Deep => rustfs_common::metrics::ScannerWorkSource::Bitrot,
+            HealScanMode::Normal | HealScanMode::Unknown => rustfs_common::metrics::ScannerWorkSource::Usage,
+        };
+        global_metrics().record_scan_bucket_drive_start(source, &bucket, &disk_path);
+        let mut failure_guard = BucketDriveFailureGuard::new(source, &bucket, &disk_path);
         let _guard = self.start_scan();
 
         let mut cache = cache;
@@ -196,32 +200,32 @@ impl ScannerIODisk for Disk {
         match result {
             Ok(mut data_usage_info) => {
                 done_drive();
-                emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
+                emit_scan_bucket_drive_complete(source, true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
                 failure_guard.mark_not_failed();
                 Ok(ScannerDiskScanOutcome::Complete(data_usage_info))
             }
             Err(ScannerError::PartialCache(mut partial_cache)) => {
                 done_drive();
-                emit_scan_bucket_drive_partial(&bucket, &disk_path, drive_start.elapsed());
+                emit_scan_bucket_drive_partial(source, &bucket, &disk_path, drive_start.elapsed());
                 partial_cache.info.last_update.get_or_insert_with(SystemTime::now);
                 failure_guard.mark_not_failed();
                 Ok(ScannerDiskScanOutcome::Partial(*partial_cache))
             }
             Err(ScannerError::NamespaceNotFoundCache(mut partial_cache)) => {
                 done_drive();
-                emit_scan_bucket_drive_partial(&bucket, &disk_path, drive_start.elapsed());
+                emit_scan_bucket_drive_partial(source, &bucket, &disk_path, drive_start.elapsed());
                 partial_cache.info.last_update.get_or_insert_with(SystemTime::now);
                 failure_guard.mark_not_failed();
                 Ok(ScannerDiskScanOutcome::NamespaceNotFound(*partial_cache))
             }
             Err(e) => {
                 if ctx.is_cancelled() {
-                    emit_scan_bucket_drive_partial(&bucket, &disk_path, drive_start.elapsed());
+                    emit_scan_bucket_drive_partial(source, &bucket, &disk_path, drive_start.elapsed());
                     failure_guard.mark_not_failed();
                 } else {
                     done_drive();
-                    emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                    emit_scan_bucket_drive_complete(source, false, &bucket, &disk_path, drive_start.elapsed());
                 }
                 Err(StorageError::other(format!("Failed to scan data folder: {e}")))
             }

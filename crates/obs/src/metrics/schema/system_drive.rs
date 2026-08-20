@@ -259,6 +259,24 @@ pub static DRIVE_HEALTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     )
 });
 
+pub static DRIVE_WRITES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::DriveWritesTotal,
+        "Total successful write operations on a drive",
+        &ALL_DRIVE_LABELS[..],
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
+pub static DRIVE_DELETES_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::DriveDeletesTotal,
+        "Total successful delete operations on a drive",
+        &ALL_DRIVE_LABELS[..],
+        subsystems::SYSTEM_DRIVE,
+    )
+});
+
 pub static DRIVE_OFFLINE_COUNT_MD: LazyLock<MetricDescriptor> =
     LazyLock::new(|| new_gauge_md(MetricName::DriveOfflineCount, "Count of offline drives", &[], subsystems::SYSTEM_DRIVE));
 
