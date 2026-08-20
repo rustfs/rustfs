@@ -2075,9 +2075,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
     assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
-        message.contains(
-            "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket"
-        ),
+        message.contains("Days must be a positive integer with DelMarkerExpiration"),
         "unexpected error message: {message}"
     );
 }
