@@ -356,6 +356,18 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
     request
 }
 
+async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> crate::Result<HealAdmissionResult> {
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt(
+            build_heal_request(intent),
+            intent.bucket.clone(),
+            intent.object.clone(),
+            intent.version_id,
+        )
+        .await?;
+    Ok(receipt.result)
+}
+
 struct MrfRuntime {
     queue: MrfQueue,
     config: MrfConsumerConfig,
@@ -409,16 +421,11 @@ impl MrfRuntime {
             // attempts counter) changes the encoded snapshot; mark it dirty
             // either way.
             self.dirty = true;
-            let request = build_heal_request(&intent);
-            match manager.submit_heal_request(request).await {
+            match submit_mrf_heal_request(manager, &intent).await {
                 // Accepted intents leave the pending set; the next flush persists the
-                // smaller snapshot, which is the journal's compaction. Fan out a
-                // best-effort repaired notice so retry ledgers (the scanner's
-                // pending-heal oracle) can drop entries whose repair the manager
-                // now owns (backlog#1894 axis B).
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
-                    rustfs_common::mrf_channel::note_mrf_repaired(&intent.bucket, &intent.object, intent.version_id);
-                }
+                // smaller snapshot. The scanner ledger is cleared later, when the
+                // canonical heal task reaches a successful terminal completion.
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts >= MRF_MAX_ATTEMPTS {
@@ -520,11 +527,8 @@ async fn replay_into(
     // stays armed in `queue` for the consumer's retry loop.
     if backoff_until.is_none() {
         while let Some(mut intent) = queue.pop_front() {
-            let request = build_heal_request(&intent);
-            match manager.submit_heal_request(request).await {
-                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
-                    rustfs_common::mrf_channel::note_mrf_repaired(&intent.bucket, &intent.object, intent.version_id);
-                }
+            match submit_mrf_heal_request(manager, &intent).await {
+                Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {}
                 Ok(HealAdmissionResult::Full) | Ok(HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)) => {
                     intent.attempts = intent.attempts.saturating_add(1);
                     if intent.attempts < MRF_MAX_ATTEMPTS {

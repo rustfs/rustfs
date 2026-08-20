@@ -128,18 +128,9 @@ async fn decode_failure_intent_maps_to_urgent_mrf_heal_request() {
         manager.operations_snapshot().await
     );
 
-    // Axis B (backlog#1894): the accepted dispatch must also fan out a
-    // repaired notice for the intent's bucket so the scanner ledger can drop
-    // its retry entry for the same target. Polled: the queue observation
-    // above can land between the manager push and the consumer's notice.
-    let noticed = wait_until(Duration::from_secs(10), || async {
-        !mrf_channel::take_mrf_repaired_events_for("mrf-bucket").is_empty()
-    })
-    .await;
-    assert!(noticed, "accepted intent must fan out a repaired notice");
     assert!(
         mrf_channel::take_mrf_repaired_events_for("mrf-bucket").is_empty(),
-        "notice take is destructive"
+        "accepted intent must wait for successful heal completion before repaired notice fan-out"
     );
 }
 
