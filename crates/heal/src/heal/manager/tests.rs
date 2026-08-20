@@ -728,6 +728,18 @@ fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
 
     assert_eq!(queue.push(blocked), QueuePushOutcome::Accepted);
     assert_eq!(queue.push(runnable), QueuePushOutcome::Accepted);
+    for bucket in ["tail-a", "tail-b", "tail-c"] {
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: bucket.to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Low,
+            )),
+            QueuePushOutcome::Accepted
+        );
+    }
 
     let mut running = HashMap::new();
     running.insert("pool_0_set_1".to_string(), 1);
@@ -743,7 +755,7 @@ fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
         popped.heal_type,
         HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_2"
     ));
-    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.len(), 4);
     let still_blocked = queue.pop_next().expect("blocked request should stay queued");
     assert!(matches!(
         still_blocked.heal_type,
