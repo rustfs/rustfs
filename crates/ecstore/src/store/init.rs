@@ -3568,6 +3568,19 @@ mod tests {
             .expect("pool metadata should reload after the simulated pre-complete crash");
         *store.pool_meta.write().await = crash_restarted_pool_meta;
 
+        let (manual_job_receipt_pool, manual_job_receipt_path) = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("durable ILM receipt paths should be listable")
+            .into_iter()
+            .find(|(_, path)| path.contains(&manual_job_path))
+            .expect("manual job should have one target receipt");
+        let manual_job_receipt_bytes = com::read_config(store.pools[manual_job_receipt_pool].clone(), &manual_job_receipt_path)
+            .await
+            .expect("manual job receipt should be readable before deletion");
+        com::delete_config(store.pools[manual_job_receipt_pool].clone(), &manual_job_receipt_path)
+            .await
+            .expect("manual job receipt should delete after source cleanup");
         com::delete_config(store.pools[1].clone(), &manual_job_path)
             .await
             .expect("post-crash target manual job should delete");
@@ -3576,6 +3589,7 @@ mod tests {
             .await
             .expect_err("completion must reject a missing target after source cleanup and restart")
             .to_string();
+        assert!(missing_after_crash.contains("receipt"));
         assert!(missing_after_crash.contains(&manual_job_path));
         assert!(missing_after_crash.contains(&manual_job_id.to_string()));
         assert!(
@@ -3588,6 +3602,13 @@ mod tests {
         com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
             .await
             .expect("post-crash target manual job should restore");
+        com::save_config(
+            store.pools[manual_job_receipt_pool].clone(),
+            &manual_job_receipt_path,
+            manual_job_receipt_bytes,
+        )
+        .await
+        .expect("manual job receipt should restore after the missing-receipt check");
 
         com::save_config(store.pools[1].clone(), &transaction_path, b"{corrupt".to_vec())
             .await
