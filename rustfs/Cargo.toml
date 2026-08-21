@@ -246,7 +246,7 @@ tempfile = { workspace = true }
 
 # Connect device identity: P-256 keys, PKCS#10 certificate requests, ES256 proofs.
 p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -288,6 +288,7 @@ zstd.workspace = true
 # Cryptography and Security
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
+x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
 time = { workspace = true, features = ["parsing", "formatting", "serde", "macros"] }
