@@ -54,6 +54,7 @@ impl std::fmt::Debug for DeviceCredential {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PendingRegistration {
     pub token_uid: String,
@@ -62,12 +63,14 @@ pub(crate) struct PendingRegistration {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PendingRotation {
     pub credential_fingerprint: String,
     pub device_name: String,
     pub request_id: String,
     pub certificate_request: String,
+    pub next_public_key_sha256: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,16 +110,15 @@ impl CredentialStore {
         self.read(CREDENTIAL_FILE)
     }
 
-    pub fn save(&self, credential: &DeviceCredential) -> Result<(), CredentialStoreError> {
+    pub(crate) fn save(&self, credential: &DeviceCredential) -> Result<(), CredentialStoreError> {
         self.write(CREDENTIAL_FILE, credential)
     }
 
-    pub(crate) fn load_pending_registration(&self) -> Result<Option<PendingRegistration>, CredentialStoreError> {
-        self.read(REGISTRATION_PENDING_FILE)
-    }
-
-    pub(crate) fn save_pending_registration(&self, pending: &PendingRegistration) -> Result<(), CredentialStoreError> {
-        self.write(REGISTRATION_PENDING_FILE, pending)
+    pub(crate) fn claim_pending_registration(
+        &self,
+        pending: &PendingRegistration,
+    ) -> Result<PendingRegistration, CredentialStoreError> {
+        self.claim(REGISTRATION_PENDING_FILE, pending)
     }
 
     pub(crate) fn clear_pending_registration(&self) -> Result<(), CredentialStoreError> {
@@ -127,8 +129,8 @@ impl CredentialStore {
         self.read(ROTATION_PENDING_FILE)
     }
 
-    pub(crate) fn save_pending_rotation(&self, pending: &PendingRotation) -> Result<(), CredentialStoreError> {
-        self.write(ROTATION_PENDING_FILE, pending)
+    pub(crate) fn claim_pending_rotation(&self, pending: &PendingRotation) -> Result<PendingRotation, CredentialStoreError> {
+        self.claim(ROTATION_PENDING_FILE, pending)
     }
 
     pub(crate) fn clear_pending_rotation(&self) -> Result<(), CredentialStoreError> {
@@ -161,46 +163,102 @@ impl CredentialStore {
         })?;
 
         let final_path = self.directory.join(file);
-        let temp_path = self.directory.join(format!(
-            ".{file}.{}.{}.tmp",
-            std::process::id(),
-            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(FILE_MODE);
-        }
-
-        let result = (|| {
-            let mut staging = options.open(&temp_path).map_err(|source| CredentialStoreError::Io {
-                path: temp_path.clone(),
-                source,
-            })?;
-            staging
-                .write_all(&bytes)
-                .and_then(|()| staging.sync_all())
-                .map_err(|source| CredentialStoreError::Io {
-                    path: temp_path.clone(),
-                    source,
-                })?;
-            check_mode(&temp_path)?;
-            fs::rename(&temp_path, &final_path).map_err(|source| CredentialStoreError::Io {
-                path: final_path.clone(),
-                source,
-            })?;
-            fsync_dir(&self.directory).map_err(|source| CredentialStoreError::Io {
-                path: self.directory.clone(),
+        let temp_path = self.stage(file, &bytes)?;
+        let result = fs::rename(&temp_path, &final_path)
+            .map_err(|source| CredentialStoreError::Io {
+                path: final_path,
                 source,
             })
-        })();
+            .and_then(|()| {
+                fsync_dir(&self.directory).map_err(|source| CredentialStoreError::Io {
+                    path: self.directory.clone(),
+                    source,
+                })
+            });
 
         if result.is_err() {
             let _ = fs::remove_file(&temp_path);
         }
         result
+    }
+
+    fn claim<T>(&self, file: &str, value: &T) -> Result<T, CredentialStoreError>
+    where
+        T: Clone + Serialize + for<'de> Deserialize<'de>,
+    {
+        if let Some(existing) = self.read(file)? {
+            return Ok(existing);
+        }
+        let bytes = serde_json::to_vec(value).map_err(|source| CredentialStoreError::Invalid {
+            path: self.directory.join(file),
+            source,
+        })?;
+        fs::create_dir_all(&self.directory).map_err(|source| CredentialStoreError::Io {
+            path: self.directory.clone(),
+            source,
+        })?;
+        let final_path = self.directory.join(file);
+        let temp_path = self.stage(file, &bytes)?;
+        let published = fs::hard_link(&temp_path, &final_path);
+        let _ = fs::remove_file(&temp_path);
+        match published {
+            Ok(()) => {
+                fsync_dir(&self.directory).map_err(|source| CredentialStoreError::Io {
+                    path: self.directory.clone(),
+                    source,
+                })?;
+                Ok(value.clone())
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                fsync_dir(&self.directory).map_err(|source| CredentialStoreError::Io {
+                    path: self.directory.clone(),
+                    source,
+                })?;
+                self.read(file)?.ok_or_else(|| CredentialStoreError::Io {
+                    path: final_path,
+                    source: io::Error::new(io::ErrorKind::NotFound, "pending state vanished after publication"),
+                })
+            }
+            Err(source) => Err(CredentialStoreError::Io {
+                path: final_path,
+                source,
+            }),
+        }
+    }
+
+    fn stage(&self, file: &str, bytes: &[u8]) -> Result<PathBuf, CredentialStoreError> {
+        loop {
+            let path = self.directory.join(format!(
+                ".{file}.{}.{}.tmp",
+                std::process::id(),
+                STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(FILE_MODE);
+            }
+            let mut staging = match options.open(&path) {
+                Ok(staging) => staging,
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(CredentialStoreError::Io { path, source }),
+            };
+            let result = staging
+                .write_all(bytes)
+                .and_then(|()| staging.sync_all())
+                .map_err(|source| CredentialStoreError::Io {
+                    path: path.clone(),
+                    source,
+                })
+                .and_then(|()| check_mode(&path));
+            if let Err(error) = result {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+            return Ok(path);
+        }
     }
 
     fn remove(&self, file: &str) -> Result<(), CredentialStoreError> {

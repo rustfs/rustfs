@@ -27,7 +27,8 @@ use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
 use super::registration::{
     CredentialResponse, CredentialValidationError, ExpectedDevice, RegistrationRequest, RegistrationToken, RotationRequest,
-    certificate_fingerprint, private_key_pem, validate_credential,
+    certificate_fingerprint, certificate_request_matches, private_key_pem, public_key_fingerprint, validate_credential,
+    validate_stored_credential,
 };
 
 const MAX_ATTEMPTS: usize = 3;
@@ -97,24 +98,23 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
-        if let Some(credential) = credential_store.load()? {
+        if let Some((credential, _)) = self.load_valid_credential(identity_store, credential_store)? {
             return Ok(credential);
         }
 
         let identity = identity_store.load_or_create()?;
-        let pending = match credential_store.load_pending_registration()? {
-            Some(pending) if pending.token_uid == token.registration_token_uid => pending,
-            Some(_) => return Err(ClientError::PendingRegistration),
-            None => {
-                let pending = PendingRegistration {
-                    token_uid: token.registration_token_uid.clone(),
-                    request_id: Uuid::new_v4().to_string(),
-                    certificate_request: identity.certificate_request_base64()?,
-                };
-                credential_store.save_pending_registration(&pending)?;
-                pending
-            }
+        let candidate = PendingRegistration {
+            token_uid: token.registration_token_uid.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            certificate_request: identity.certificate_request_base64()?,
         };
+        let pending = credential_store.claim_pending_registration(&candidate)?;
+        if pending.token_uid != token.registration_token_uid
+            || !is_request_id(&pending.request_id)
+            || !certificate_request_matches(&pending.certificate_request, &identity)?
+        {
+            return Err(ClientError::PendingRegistration);
+        }
 
         let csr_der = base64::engine::general_purpose::STANDARD
             .decode(&pending.certificate_request)
@@ -153,29 +153,33 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<Option<DeviceCredential>, ClientError> {
-        let credential = credential_store.load()?.ok_or(ClientError::NotRegistered)?;
+        let (credential, identity) = self
+            .load_valid_credential(identity_store, credential_store)?
+            .ok_or(ClientError::NotRegistered)?;
         if credential.not_after_unix <= now_unix {
             return Err(ClientError::CredentialExpired);
         }
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
             return Ok(None);
         }
-        let identity = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
-        let pending = match credential_store.load_pending_rotation()? {
-            Some(pending) if pending.credential_fingerprint == fingerprint && pending.device_name == credential.name => pending,
-            Some(_) => return Err(ClientError::PendingRotation),
-            None => {
-                let pending = PendingRotation {
-                    credential_fingerprint: fingerprint.clone(),
-                    device_name: credential.name.clone(),
-                    request_id: Uuid::new_v4().to_string(),
-                    certificate_request: identity.certificate_request_base64()?,
-                };
-                credential_store.save_pending_rotation(&pending)?;
-                pending
-            }
+        let next = identity_store.load_or_create_next()?;
+        let candidate = PendingRotation {
+            credential_fingerprint: fingerprint.clone(),
+            device_name: credential.name.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            certificate_request: next.certificate_request_base64()?,
+            next_public_key_sha256: public_key_fingerprint(&next),
         };
+        let pending = credential_store.claim_pending_rotation(&candidate)?;
+        if pending.credential_fingerprint != fingerprint
+            || pending.device_name != credential.name
+            || !is_request_id(&pending.request_id)
+            || pending.next_public_key_sha256 != public_key_fingerprint(&next)
+            || !certificate_request_matches(&pending.certificate_request, &next)?
+        {
+            return Err(ClientError::PendingRotation);
+        }
         let body = RotationRequest::new(
             &identity,
             &fingerprint,
@@ -194,7 +198,7 @@ impl ConnectClient {
         let response = self.send(StatusCode::OK, || client.post(url.clone()).json(&body)).await?;
         let rotated = validate_credential(
             response,
-            &identity,
+            &next,
             &self.roots,
             &self.root_certificates,
             ExpectedDevice::Rotation { name: &credential.name },
@@ -203,8 +207,58 @@ impl ConnectClient {
             return Err(ClientError::Credential(CredentialValidationError::Identity));
         }
         credential_store.save(&rotated)?;
+        identity_store.commit_next(&next)?;
         credential_store.clear_pending_rotation()?;
         Ok(Some(rotated))
+    }
+
+    fn load_valid_credential(
+        &self,
+        identity_store: &IdentityStore,
+        credential_store: &CredentialStore,
+    ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity)>, ClientError> {
+        let Some(credential) = credential_store.load()? else {
+            return Ok(None);
+        };
+        let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
+        let Some(pending) = credential_store.load_pending_rotation()? else {
+            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            credential_store.clear_pending_registration()?;
+            return Ok(Some((credential, current)));
+        };
+        let fingerprint = certificate_fingerprint(&credential.certificate)?;
+        if pending.device_name != credential.name || !is_request_id(&pending.request_id) {
+            return Err(ClientError::PendingRotation);
+        }
+        if fingerprint == pending.credential_fingerprint {
+            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
+            if pending.next_public_key_sha256 != public_key_fingerprint(&next)
+                || !certificate_request_matches(&pending.certificate_request, &next)?
+            {
+                return Err(ClientError::PendingRotation);
+            }
+            return Ok(Some((credential, current)));
+        }
+
+        if public_key_fingerprint(&current) == pending.next_public_key_sha256 {
+            if !certificate_request_matches(&pending.certificate_request, &current)? {
+                return Err(ClientError::PendingRotation);
+            }
+            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+        } else {
+            let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
+            if public_key_fingerprint(&next) != pending.next_public_key_sha256
+                || !certificate_request_matches(&pending.certificate_request, &next)?
+            {
+                return Err(ClientError::PendingRotation);
+            }
+            validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+            identity_store.commit_next(&next)?;
+        }
+        credential_store.clear_pending_rotation()?;
+        let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
+        Ok(Some((credential, current)))
     }
 
     async fn send<F>(&self, success: StatusCode, mut request: F) -> Result<CredentialResponse, ClientError>
@@ -250,6 +304,10 @@ impl ConnectClient {
     fn url(&self, path: &str) -> Result<Url, ClientError> {
         self.endpoint.join(path).map_err(|_| ClientError::Endpoint)
     }
+}
+
+fn is_request_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random) && uuid.to_string() == value)
 }
 
 fn build_client(
