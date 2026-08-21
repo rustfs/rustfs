@@ -47,6 +47,7 @@ const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const FRESH_TOKEN_UID: &str = "0198f4b0-7f00-7c70-a381-8e9fa0b1c2d6";
+const SECOND_TOKEN_UID: &str = "0198f4b0-8f00-7d80-b491-9fa0b1c2d3e7";
 
 struct TestPki {
     root_params: CertificateParams,
@@ -696,6 +697,54 @@ async fn rotation_commit_recovers_after_each_durable_step() {
 }
 
 #[tokio::test]
+async fn pending_reenrollment_blocks_rotation_and_resumes_original_exchange() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (identity_store, credential_store) = stores(&temp);
+    let current = identity_store.load_or_create().expect("create identity");
+    let pki = TestPki::new();
+    let issued = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 13);
+    let registration = server(&pki, vec![Reply::Json(StatusCode::CREATED, issued)]).await;
+    let registered = client(&registration, &pki, Duration::from_secs(2))
+        .register(&identity_store, &credential_store, &token())
+        .await
+        .expect("register");
+
+    let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
+    assert!(matches!(
+        client(&failed, &pki, Duration::from_secs(2))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+
+    let pending_path = temp.path().join("credential/registration.pending.json");
+    let pending = fs::read(&pending_path).expect("read pending reenrollment");
+    let pending_document: Value = serde_json::from_slice(&pending).expect("pending JSON");
+    let next_der = fs::read(temp.path().join("identity/device.key.next")).expect("read next key");
+    let next = rustfs::connect::DeviceIdentity::from_pkcs8_der(&next_der).expect("parse next key");
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
+
+    let rotation = server(&pki, vec![]).await;
+    let error = client(&rotation, &pki, Duration::from_secs(2))
+        .rotate_if_due(&identity_store, &credential_store, registered.not_after_unix - 8 * 60 * 60)
+        .await
+        .expect_err("pending reenrollment blocks rotation");
+    assert!(matches!(error, ClientError::PendingRegistration));
+    assert!(rotation.seen.lock().expect("seen lock").is_empty());
+
+    let resumed = server(&pki, vec![Reply::Json(StatusCode::CREATED, enrolled)]).await;
+    let credential = client(&resumed, &pki, Duration::from_secs(2))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .await
+        .expect("resume reenrollment");
+    assert_eq!(credential.certificate_serial, "0e".repeat(16));
+    let resumed_seen = resumed.seen.lock().expect("seen lock");
+    assert_eq!(resumed_seen.len(), 1);
+    assert_eq!(resumed_seen[0]["requestId"], pending_document["requestId"]);
+    assert_eq!(resumed_seen[0]["certificateRequest"], pending_document["certificateRequest"]);
+}
+
+#[tokio::test]
 async fn reenrollment_commit_recovers_after_each_durable_step() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (identity_store, credential_store) = stores(&temp);
@@ -754,6 +803,15 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         .expect("completed reenrollment is idempotent after pending cleanup");
     assert_eq!(recovered.certificate_serial, "0e".repeat(16));
     assert!(idle.seen.lock().expect("seen lock").is_empty());
+
+    let different = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
+    assert!(matches!(
+        client(&different, &pki, Duration::from_secs(2))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+    assert_eq!(different.seen.lock().expect("seen lock").len(), 3);
 }
 
 #[test]

@@ -236,6 +236,9 @@ impl ConnectClient {
         let (credential, identity) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
+        if credential_store.load_pending_registration()?.is_some() {
+            return Err(ClientError::PendingRegistration);
+        }
         ensure_credential_time(&credential, now_unix)?;
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
             return Ok(None);
