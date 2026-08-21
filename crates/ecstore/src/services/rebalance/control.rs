@@ -232,10 +232,15 @@ where
         fence.add_namespace_lock_fence(&mut opts);
         fence.ensure_held()?;
     }
+    #[cfg(test)]
+    let barrier_pool = pool.clone();
     merged.save_with_opts(pool, opts).await?;
+    #[cfg(test)]
     if let Some(fence) = activation_fence {
-        fence.ensure_held()?;
+        crate::core::pools::pause_pool_activation_after_durable_save(&barrier_pool, fence).await;
     }
+    // With an activation fence, a successful save is the commit point. Lease
+    // loss after this point cannot make the durable activation uncommitted.
     Ok(())
 }
 
@@ -1148,7 +1153,7 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::pools::{PoolActivationStartKind, PoolActivationStartProbe};
+    use crate::core::pools::{PoolActivationDurableSaveBarrier, PoolActivationStartKind, PoolActivationStartProbe};
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
 
@@ -1190,6 +1195,121 @@ mod tests {
             .await
             .expect("retrying admission cancellation should be idempotent");
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_activation_adopts_commit_after_post_save_fence_loss() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        set_rebalance_disk_stats_override_for_test(
+            store.id,
+            vec![
+                DiskStat {
+                    total_space: 100,
+                    available_space: 0,
+                },
+                DiskStat {
+                    total_space: 100,
+                    available_space: 100,
+                },
+            ],
+        );
+        let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
+        let start_store = Arc::clone(&store);
+        let start_task = tokio::spawn(async move {
+            start_store
+                .init_rebalance_start(vec!["post-commit-fence-loss".to_string()])
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        barrier.release_after_fence_loss();
+        let rebalance_id = tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+            .await
+            .expect("rebalance activation should finish after its durable commit")
+            .expect("rebalance activation task should not panic")
+            .expect("post-commit fence loss must not report the committed activation as failed");
+
+        let local_meta = store.rebalance_meta.read().await;
+        let local = local_meta
+            .as_ref()
+            .expect("the committed rebalance metadata should be installed locally");
+        assert_eq!(local.id, rebalance_id);
+        assert!(is_rebalance_conflicting_with_decommission(local));
+        drop(local_meta);
+
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(store.pools[0].clone())
+            .await
+            .expect("the committed rebalance metadata should remain readable");
+        assert_eq!(persisted.id, rebalance_id);
+        assert!(is_rebalance_conflicting_with_decommission(&persisted));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_admission_installs_committed_candidate_after_post_save_fence_loss() {
+        let rebalance_id = "post-save-worker-admission";
+        let active = RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_free_space: 50,
+                    init_capacity: 100,
+                    buckets: vec!["completed-pool-bucket".to_string()],
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    buckets: vec!["active-pool-bucket".to_string()],
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(Some(active)).await;
+        let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
+        let start_store = Arc::clone(&store);
+        let start_task = tokio::spawn(async move { start_store.start_rebalance().await });
+
+        barrier.wait_until_paused().await;
+        barrier.release_after_fence_loss();
+        tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+            .await
+            .expect("rebalance worker admission should finish after its durable commit")
+            .expect("rebalance worker admission task should not panic")
+            .expect("post-commit fence loss must not reject the committed worker candidate");
+
+        let local_meta = store.rebalance_meta.read().await;
+        let local = local_meta
+            .as_ref()
+            .expect("the committed worker candidate should remain installed locally");
+        assert_eq!(local.id, rebalance_id);
+        assert_eq!(local.pool_stats[0].info.status, RebalStatus::Completed);
+        if let Some(cancel) = local.cancel.as_ref() {
+            cancel.cancel();
+        }
+        drop(local_meta);
+
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load(store.pools[0].clone())
+            .await
+            .expect("the committed worker candidate should remain readable");
+        assert_eq!(persisted.id, rebalance_id);
+        assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Completed);
     }
 
     async fn assert_real_activation_start_race(paused_kind: PoolActivationStartKind) {

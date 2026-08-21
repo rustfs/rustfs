@@ -218,10 +218,6 @@ impl ECStore {
                 cancel_tx.cancel();
                 return Err(err);
             }
-            if let Err(err) = activation_fence.ensure_held() {
-                cancel_tx.cancel();
-                return Err(err);
-            }
             let mut rebalance_meta = self.rebalance_meta.write().await;
             let Some(meta) = rebalance_meta.as_mut() else {
                 cancel_tx.cancel();
@@ -237,7 +233,7 @@ impl ECStore {
                 return Err(err);
             }
         }
-        if let Err(err) = activation_fence.ensure_held() {
+        if !must_persist && let Err(err) = activation_fence.ensure_held() {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
             return Err(err);
