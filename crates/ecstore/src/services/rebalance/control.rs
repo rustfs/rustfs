@@ -46,7 +46,44 @@ pub(super) enum RebalanceWorkerActivationFence {
 }
 
 pub(super) struct RebalanceRunGuard {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _local_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    persisted_guard: rustfs_lock::NamespaceLockGuard,
+}
+
+impl RebalanceRunGuard {
+    pub(super) fn ensure_held(&self, stage: &str) -> Result<()> {
+        if self.persisted_guard.is_lock_lost() {
+            return Err(Error::other(format!("rebalance distributed run fence lost during {stage}")));
+        }
+        Ok(())
+    }
+}
+
+async fn acquire_persisted_rebalance_run_guard<S>(
+    pool: Arc<S>,
+    expected_id: &str,
+    stage: &str,
+) -> Result<rustfs_lock::NamespaceLockGuard>
+where
+    S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+{
+    let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    let guard = ns_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_meta_lock_error(err, "read"))?;
+    let mut opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    opts.add_namespace_lock_guard(&guard);
+    let mut persisted = RebalanceMeta::new();
+    persisted.load_with_opts(pool, opts).await?;
+    ensure_rebalance_worker_active(Some(&persisted), expected_id, stage)?;
+    if guard.is_lock_lost() {
+        return Err(Error::other(format!("rebalance distributed run fence lost during {stage}")));
+    }
+    Ok(guard)
 }
 
 async fn merge_and_save_rebalance_meta_no_lock<S>(
@@ -180,6 +217,7 @@ impl ECStore {
     }
 
     pub(super) async fn rebalance_run_guard(&self, expected_id: &str, stage: &str) -> Result<RebalanceRunGuard> {
+        // Runtime fence order is activation_gate -> rebalance.bin.
         let activation_gate = {
             let meta = self.rebalance_meta.read().await;
             ensure_rebalance_worker_active(meta.as_ref(), expected_id, stage)?;
@@ -203,7 +241,12 @@ impl ECStore {
             )));
         }
         drop(meta);
-        Ok(RebalanceRunGuard { _guard: guard })
+        let pool = clone_first_arc(self.pools.as_slice(), "rebalance run fence: no pools available")?;
+        let persisted_guard = acquire_persisted_rebalance_run_guard(pool, expected_id, stage).await?;
+        Ok(RebalanceRunGuard {
+            _local_guard: guard,
+            persisted_guard,
+        })
     }
 
     pub(super) async fn save_rebalance_meta_with_merge<S>(
@@ -247,7 +290,7 @@ impl ECStore {
         let guard = ns_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(rebalance_meta_lock_error)?;
+            .map_err(|err| rebalance_meta_lock_error(err, "write"))?;
         let mut opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
@@ -982,6 +1025,43 @@ mod tests {
             .expect("baseline rebalance metadata should remain readable");
         assert_eq!(after.id, persisted.id);
         assert_eq!(after.pool_stats[0].bytes, 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_rebalance_run_fence_rejects_stale_active_node_after_remote_stop() {
+        let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks_isolated(4).await;
+        let active = RebalanceMeta {
+            id: "rebalance-a".to_string(),
+            cancel: Some(tokio_util::sync::CancellationToken::new()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        active
+            .save(set_disks.clone())
+            .await
+            .expect("active rebalance metadata should be saved");
+        ensure_rebalance_worker_active(Some(&active), active.id.as_str(), "stale node precondition")
+            .expect("the stale node snapshot should still look active locally");
+
+        let mut stopped = active.clone();
+        stopped.stopped_at = Some(OffsetDateTime::now_utc());
+        stopped.pool_stats[0].info.stopping = true;
+        stopped
+            .save(set_disks.clone())
+            .await
+            .expect("remote stop should replace persisted metadata");
+
+        let err = acquire_persisted_rebalance_run_guard(set_disks, active.id.as_str(), "cross-node stale snapshot")
+            .await
+            .expect_err("persisted stop must fence a node that missed stop propagation");
+        assert!(err.to_string().contains("inactive rebalance worker rejected"));
     }
 
     #[test]

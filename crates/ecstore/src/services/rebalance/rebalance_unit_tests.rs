@@ -33,8 +33,8 @@ use super::migration::{
     rebalance_delete_marker_opts,
 };
 use super::runtime::{
-    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation, should_fail_repeated_rebalance_bucket_defer,
-    source_cleanup_defer_attempt,
+    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation, resolve_rebalance_pre_spawn_result,
+    should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt,
 };
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
@@ -2736,6 +2736,54 @@ fn test_stopped_activation_state_prevents_worker_token_commit() {
     assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
 }
 
+#[test]
+fn test_rebalance_start_save_failure_rolls_back_local_worker_token() {
+    let activation_token = tokio_util::sync::CancellationToken::new();
+    let observer = activation_token.clone();
+    let mut meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", activation_token.clone())
+            .expect("active metadata should accept the worker token"),
+        RebalanceLocalActivationOutcome::Started
+    );
+
+    let err = resolve_rebalance_pre_spawn_result(
+        Some(&mut meta),
+        "rebalance-a",
+        &activation_token,
+        Err(Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+            object: super::REBAL_META_NAME.to_string(),
+            required: 3,
+            achieved: 2,
+        }),
+    )
+    .expect_err("metadata save failure must abort local worker activation");
+
+    assert!(matches!(
+        err,
+        Error::NamespaceLockQuorumUnavailable {
+            required: 3,
+            achieved: 2,
+            ..
+        }
+    ));
+    assert!(observer.is_cancelled(), "the failed activation token must be canceled");
+    assert!(meta.cancel.is_none(), "a retry must not see a phantom active worker token");
+}
+
 #[tokio::test]
 async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
     let meta = RebalanceMeta {
@@ -2809,7 +2857,7 @@ async fn test_stop_waits_for_active_rebalance_migration_guard() {
         }],
         ..Default::default()
     };
-    let store = test_store_with_rebalance_meta(meta);
+    let (_temp_dirs, store) = super::test_store_with_persisted_rebalance_meta(meta).await;
     let run_guard = store
         .rebalance_run_guard("rebalance-a", "rebalance remote-tier migration")
         .await
@@ -2830,7 +2878,7 @@ async fn test_stop_waits_for_active_rebalance_migration_guard() {
 
     drop(run_guard);
     stop.await
-        .expect_err("empty test store should fail only after committing the local stop state");
+        .expect("stop should persist after the side-effect fence is released");
     assert!(
         store
             .rebalance_meta

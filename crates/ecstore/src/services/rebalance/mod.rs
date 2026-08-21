@@ -54,4 +54,30 @@ pub use types::{
 use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome};
 
 #[cfg(test)]
+pub(crate) async fn test_store_with_persisted_rebalance_meta(
+    meta: RebalanceMeta,
+) -> (Vec<tempfile::TempDir>, std::sync::Arc<crate::store::ECStore>) {
+    let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
+    let (temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_with_ctx(ctx.clone()).await;
+    meta.save(pool.clone())
+        .await
+        .expect("rebalance test metadata should be persisted");
+    let endpoint_pools: crate::layout::endpoints::EndpointServerPools = vec![pool.endpoints.clone()].into();
+    let store = std::sync::Arc::new(crate::store::ECStore {
+        id: uuid::Uuid::new_v4(),
+        disk_map: std::collections::HashMap::new(),
+        pools: vec![pool],
+        peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, ctx.clone()),
+        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
+        rebalance_meta: tokio::sync::RwLock::new(Some(meta)),
+        decommission_cancelers: tokio::sync::RwLock::new(vec![None]),
+        start_gate: tokio::sync::Mutex::new(()),
+        pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        ctx,
+        bucket_fence_registry: std::sync::Arc::default(),
+    });
+    (temp_dirs, store)
+}
+
+#[cfg(test)]
 mod rebalance_unit_tests;

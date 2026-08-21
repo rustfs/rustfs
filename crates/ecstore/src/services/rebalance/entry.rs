@@ -56,6 +56,7 @@ impl ECStore {
         // Persisted stats can complete a pool on restart, so source cleanup must resolve first.
         let run_guard = self.rebalance_run_guard(expected_id, "rebalance source cleanup").await?;
         let cleanup_result = cleanup.await;
+        run_guard.ensure_held("rebalance source cleanup")?;
         drop(run_guard);
         let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup_result, bucket, object);
         let RebalanceEntryCleanupResult::Completed { warning } = cleanup_result else {
@@ -168,7 +169,7 @@ impl ECStore {
             let run_guard = self
                 .rebalance_run_guard(rebalance_id.as_ref(), "rebalance lifecycle mutation")
                 .await?;
-            let expired_by_lifecycle = crate::core::pools::should_skip_lifecycle_for_data_movement(
+            let lifecycle_result = crate::core::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
                 version,
@@ -177,8 +178,9 @@ impl ECStore {
                 true,
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
             )
-            .await?;
-            drop(run_guard);
+            .await;
+            run_guard.ensure_held("rebalance lifecycle mutation")?;
+            let expired_by_lifecycle = lifecycle_result?;
             if expired_by_lifecycle {
                 expired += 1;
                 // The lifecycle expiry above physically deleted this version from the source set.
@@ -196,6 +198,7 @@ impl ECStore {
                     reason = "expired_by_lifecycle",
                     "Skipped rebalance version"
                 );
+                drop(run_guard);
                 continue;
             }
 
@@ -213,6 +216,7 @@ impl ECStore {
                     reason = "last_delete_marker_without_replication",
                     "Skipped rebalance version"
                 );
+                drop(run_guard);
                 continue;
             }
 
@@ -222,7 +226,6 @@ impl ECStore {
                 let store = self.clone();
                 async move {
                     store
-                        .clone()
                         .rebalance_object(src_pool_idx, bucket, rd, expected_bucket_incarnation_id)
                         .await
                 }
@@ -233,9 +236,6 @@ impl ECStore {
                 let store = self.clone();
                 async move { store.delete_object(&bucket, &object, opts).await }
             };
-            let run_guard = self
-                .rebalance_run_guard(rebalance_id.as_ref(), "rebalance version migration")
-                .await?;
             let result = migrate_entry_version(
                 &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref()),
                 bucket.clone(),
@@ -249,6 +249,7 @@ impl ECStore {
                 &mut delete_marker,
             )
             .await;
+            run_guard.ensure_held("rebalance version migration")?;
             drop(run_guard);
 
             if result.ignored {
@@ -678,31 +679,21 @@ mod tests {
 
     #[tokio::test]
     async fn rebalance_stats_wait_for_source_cleanup_result() {
-        let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
-        let store = Arc::new(ECStore {
-            id: uuid::Uuid::new_v4(),
-            disk_map: std::collections::HashMap::new(),
-            pools: Vec::new(),
-            peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
-            pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
-            rebalance_meta: tokio::sync::RwLock::new(Some(RebalanceMeta {
-                pool_stats: vec![RebalanceStats {
-                    participating: true,
-                    info: RebalanceInfo {
-                        start_time: Some(OffsetDateTime::now_utc()),
-                        status: RebalStatus::Started,
-                        ..Default::default()
-                    },
+        let rebalance_id = "rebalance-test";
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: rebalance_id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    status: RebalStatus::Started,
                     ..Default::default()
-                }],
+                },
                 ..Default::default()
-            })),
-            decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
-            start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(()),
-            ctx: crate::runtime::instance::bootstrap_ctx(),
-            bucket_fence_registry: std::sync::Arc::default(),
-        });
+            }],
+            ..Default::default()
+        })
+        .await;
         let mut version = FileInfo::new("object.bin", 4, 2);
         version.name = "object.bin".to_string();
         version.size = 128;
@@ -713,7 +704,7 @@ mod tests {
         let finish_store = Arc::clone(&store);
         let finish = tokio::spawn(async move {
             finish_store
-                .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&version], "", async move {
+                .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&version], rebalance_id, async move {
                     cleanup_released.await.expect("cleanup release sender should remain alive");
                     Ok(ObjectInfo::default())
                 })
@@ -760,7 +751,7 @@ mod tests {
             meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
         }
         let warning_result = store
-            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], "", async {
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], rebalance_id, async {
                 Err(Error::SlowDown.into())
             })
             .await
@@ -777,7 +768,7 @@ mod tests {
             meta.as_mut().expect("rebalance metadata should exist").pool_stats[0].bytes = 0;
         }
         let deferred = store
-            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], "", async {
+            .finish_rebalance_entry_after_cleanup(0, "bucket", "object.bin", &[&warning_version], rebalance_id, async {
                 Err(data_movement::SourceCleanupError::SourceChanged)
             })
             .await
