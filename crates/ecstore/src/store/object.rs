@@ -32,7 +32,8 @@ use crate::bucket::metadata_sys::{
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
 };
-use crate::bucket::replication::ReplicationObjectBridge;
+use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
+use crate::bucket::versioning::VersioningApi;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
@@ -1031,6 +1032,20 @@ fn delete_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions
 
 fn should_delete_from_all_pools(opts: &ObjectOptions, pool_count: usize) -> bool {
     pool_count > 0 && (!opts.versioned && !opts.version_suspended || opts.version_id.is_some())
+}
+
+fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_snapshot: &DeleteReplicationConfigSnapshot) -> bool {
+    if object.version_id.is_some() {
+        return false;
+    }
+
+    let object_name = decode_dir_object(&object.object_name);
+    let (versioned, version_suspended) = delete_config_snapshot.versioning_config().delete_state(&object_name);
+    versioned || version_suspended
+}
+
+fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
+    !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
 }
 
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
@@ -2984,31 +2999,97 @@ impl ECStore {
             Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
 
-        let mut futures = Vec::with_capacity(self.pools.len());
+        let delete_config_snapshot = opts
+            .delete_replication_config_snapshot
+            .as_deref()
+            .expect("batch delete replication config snapshot should be loaded");
+        let latest_marker_objects = objects
+            .iter()
+            .map(|object| batch_delete_creates_latest_marker(object, delete_config_snapshot))
+            .collect::<Vec<_>>();
+        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(
+            |(object, creates_marker)| async move {
+                if *creates_marker {
+                    Some(self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await)
+                } else {
+                    None
+                }
+            },
+        ))
+        .await;
+        let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
+        for (idx, target_result) in marker_target_results.into_iter().enumerate() {
+            match target_result {
+                Some(Ok(pool_idx)) => marker_target_pool_indices.push(Some(pool_idx)),
+                Some(Err(err)) => {
+                    del_errs[idx] = Some(err);
+                    marker_target_pool_indices.push(None);
+                }
+                None => marker_target_pool_indices.push(None),
+            }
+        }
 
+        let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
             if self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
-            futures.push(pool.delete_objects_with_accounting(bucket, objects.clone(), opts.clone()));
+
+            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
+                })
+                .map(|(idx, object)| (idx, object.clone()))
+                .unzip();
+            if pool_objects.is_empty() {
+                continue;
+            }
+
+            let pool_opts = opts.clone();
+            futures.push(async move {
+                let result = pool.delete_objects(bucket, pool_objects, pool_opts).await;
+                (object_indices, result)
+            });
         }
 
         let results = join_all(futures).await;
 
+        let mut attempted = vec![false; del_objects.len()];
         for idx in 0..del_objects.len() {
-            for (dels, errs, pool_accounting) in results.iter() {
-                if errs[idx].is_none() && dels[idx].found {
+            for (object_indices, (dels, errs)) in results.iter() {
+                let Ok(pool_object_idx) = object_indices.binary_search(&idx) else {
+                    continue;
+                };
+                attempted[idx] = true;
+
+                if errs[pool_object_idx].is_none() && dels[pool_object_idx].found {
                     del_errs[idx] = None;
-                    del_objects[idx] = dels[idx].clone();
-                    accounting[idx] = pool_accounting[idx].clone();
+                    del_objects[idx] = dels[pool_object_idx].clone();
                     break;
                 }
 
                 if del_errs[idx].is_none() {
-                    del_errs[idx] = errs[idx].clone();
-                    del_objects[idx] = dels[idx].clone();
-                    accounting[idx] = pool_accounting[idx].clone();
+                    del_errs[idx] = errs[pool_object_idx].clone();
+                    del_objects[idx] = dels[pool_object_idx].clone();
                 }
+            }
+
+            if !attempted[idx] && del_errs[idx].is_none() && latest_marker_objects[idx] {
+                del_objects[idx] = DeletedObject {
+                    object_name: objects[idx].object_name.clone(),
+                    version_id: objects[idx].version_id,
+                    ..Default::default()
+                };
+                del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
+            }
+        }
+
+        #[cfg(test)]
+        for (idx, object) in objects.iter().enumerate() {
+            if del_errs[idx].is_none() && del_objects[idx].delete_marker {
+                pause_versioned_delete_marker_after_commit(bucket, &object.object_name).await;
             }
         }
 
@@ -4680,6 +4761,37 @@ mod tests {
             1,
         ));
         assert!(!should_delete_from_all_pools(&ObjectOptions::default(), 0));
+    }
+
+    #[test]
+    fn batch_delete_identifies_only_latest_versioned_markers() {
+        let versioned = DeleteReplicationConfigSnapshot::from_configs_for_test(
+            s3s::dto::VersioningConfiguration {
+                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            None,
+        );
+        let latest = ObjectToDelete {
+            object_name: "latest".to_string(),
+            ..Default::default()
+        };
+        assert!(batch_delete_creates_latest_marker(&latest, &versioned));
+        assert!(!batch_delete_targets_pool(true, Some(1), 0));
+        assert!(batch_delete_targets_pool(true, Some(1), 1));
+        assert!(!batch_delete_targets_pool(true, Some(1), 2));
+
+        let explicit = ObjectToDelete {
+            object_name: "explicit".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(!batch_delete_creates_latest_marker(&explicit, &versioned));
+        assert!(batch_delete_targets_pool(false, Some(1), 0));
+
+        let unversioned = DeleteReplicationConfigSnapshot::default();
+        assert!(!batch_delete_creates_latest_marker(&latest, &unversioned));
+        assert!(batch_delete_targets_pool(false, None, 0));
     }
 
     #[test]
