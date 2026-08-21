@@ -2843,12 +2843,11 @@ mod tests {
             .map(|index| format!("object-{index}.bin"))
             .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == 1)
             .expect("the deterministic object search should select source set 1");
-        let source_body = b"source generation".to_vec();
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("create decommission delete-fence bucket");
-        let mut source = PutObjReader::from_vec(source_body.clone());
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
         store.pools[0]
             .put_object(&bucket, &object, &mut source, &ObjectOptions::default())
             .await
@@ -2903,14 +2902,6 @@ mod tests {
             !delete_barrier.namespace_acquired() && !delete.is_finished(),
             "DELETE must remain before namespace acquisition behind the decommission worker's target-commit mutation fence"
         );
-        delete.abort();
-        assert!(
-            delete
-                .await
-                .expect_err("the blocked DELETE should be canceled")
-                .is_cancelled(),
-            "the competing DELETE must remain cancelable while blocked"
-        );
 
         barrier.release();
         cleanup_barrier.wait_until_paused().await;
@@ -2951,22 +2942,29 @@ mod tests {
             .await
             .expect("decommission entry worker should join")
             .expect("decommission entry should migrate and clean its source");
+        delete
+            .await
+            .expect("DELETE task should join")
+            .expect("DELETE should remove the source and migrated target generations");
 
-        store.pools[0]
+        for pool in &store.pools {
+            let err = pool
+                .get_object_info(&bucket, &object, &ObjectOptions::default())
+                .await
+                .expect_err("DELETE must remove the source and migrated target copies");
+            assert!(
+                matches!(err, StorageError::ObjectNotFound(_, _)),
+                "unexpected post-delete pool result: {err:?}"
+            );
+        }
+        let err = store
             .get_object_info(&bucket, &object, &ObjectOptions::default())
             .await
-            .expect_err("the real decommission entry must clean the source generation");
-        let mut target = store.pools[1]
-            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &ObjectOptions::default())
-            .await
-            .expect("the real decommission entry must commit the target generation");
-        let mut actual = Vec::new();
-        target
-            .stream
-            .read_to_end(&mut actual)
-            .await
-            .expect("read the migrated target generation");
-        assert_eq!(actual, source_body, "the decommission worker must preserve the migrated object body");
+            .expect_err("the deleted generation must not become visible again");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _)),
+            "unexpected post-delete store result: {err:?}"
+        );
 
         shutdown.cancel();
     }
