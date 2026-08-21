@@ -1081,18 +1081,6 @@ async fn run_data_scanner_cycle(
         }
     };
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
-    let storeapi_clone = storeapi.clone();
-    let ctx_clone = ctx.clone();
-    let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
-        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
-            ctx_clone,
-            storeapi_clone,
-            receiver,
-            Some(leader_epoch),
-            Some(usage_persist_baseline),
-        )
-        .await
-    }));
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
     let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
@@ -1107,47 +1095,78 @@ async fn run_data_scanner_cycle(
             scan_mode,
         )
         .await;
+    let publication_defer_reason = match &scan_result {
+        Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
+        Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+    };
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
-    let usage_persist_outcome = match wait_for_data_usage_persist_task(ctx, &mut usage_persist_task, usage_persist_timeout).await
-    {
-        DataUsagePersistTaskResult::Completed(outcome) => outcome,
-        DataUsagePersistTaskResult::JoinFailed(err) => {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
-                state = "usage_persist_task_failed",
-                error = %err,
-                "Scanner data usage persistence task failed"
-            );
-            DataUsagePersistOutcome::Failed
+    let usage_persist_outcome = match publication_defer_reason {
+        Some(reason) => {
+            drop(receiver);
+            DataUsagePersistOutcome::Deferred(reason)
         }
-        DataUsagePersistTaskResult::Cancelled => {
-            debug!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
-                state = "usage_persist_task_cancelled",
-                "Scanner data usage persistence task cancelled"
-            );
-            DataUsagePersistOutcome::Failed
-        }
-        DataUsagePersistTaskResult::TimedOut => {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
-                timeout = ?usage_persist_timeout,
-                state = "usage_persist_task_timed_out",
-                "Scanner data usage persistence task timed out"
-            );
-            DataUsagePersistOutcome::Failed
+        None => {
+            // ScannerIO emits its complete or observational update only after
+            // all set workers finish. Persist after the final activity fence;
+            // this also avoids blocking the scanner on a denied publication.
+            let storeapi_clone = storeapi.clone();
+            let ctx_clone = ctx.clone();
+            let route_probe_store = storeapi.clone();
+            let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
+                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+                    ctx_clone,
+                    storeapi_clone,
+                    receiver,
+                    Some(leader_epoch),
+                    Some(usage_persist_baseline),
+                    move || {
+                        let storeapi = route_probe_store.clone();
+                        async move { storeapi.scanner_data_usage_publication_blocked().await }
+                    },
+                )
+                .await
+            }));
+            match wait_for_data_usage_persist_task(ctx, &mut usage_persist_task, usage_persist_timeout).await {
+                DataUsagePersistTaskResult::Completed(outcome) => outcome,
+                DataUsagePersistTaskResult::JoinFailed(err) => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        cycle = cycle_info.current,
+                        state = "usage_persist_task_failed",
+                        error = %err,
+                        "Scanner data usage persistence task failed"
+                    );
+                    DataUsagePersistOutcome::Failed
+                }
+                DataUsagePersistTaskResult::Cancelled => {
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        cycle = cycle_info.current,
+                        state = "usage_persist_task_cancelled",
+                        "Scanner data usage persistence task cancelled"
+                    );
+                    DataUsagePersistOutcome::Failed
+                }
+                DataUsagePersistTaskResult::TimedOut => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        cycle = cycle_info.current,
+                        timeout = ?usage_persist_timeout,
+                        state = "usage_persist_task_timed_out",
+                        "Scanner data usage persistence task timed out"
+                    );
+                    DataUsagePersistOutcome::Failed
+                }
+            }
         }
     };
     let unresolved_heal_work = global_metrics().current_scan_cycle_has_unresolved_heal_work();
@@ -1191,33 +1210,51 @@ async fn run_data_scanner_cycle(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
-    if let Some(required_cycle) = scan_cycle_result.required_cycle_floor() {
-        warn!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_CYCLE_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            cycle = cycle_info.current,
-            required_cycle,
-            state = "cache_cycle_ahead",
-            "Scanner cycle is recovering to a newer durable cache generation"
-        );
-        emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-        return if persist_required_scanner_cycle_floor(
-            ctx,
-            storeapi.clone(),
-            cycle_info,
-            cycle_revision,
-            leader_epoch,
-            required_cycle,
-            &mut cycle_metrics_guard,
-        )
-        .await
-        {
-            ScannerCycleOutcome::Partial
-        } else {
-            ScannerCycleOutcome::Failed
-        };
+    match scanner_cycle_pre_commit_outcome(scan_cycle_result.required_cycle_floor(), &usage_persist_outcome) {
+        Some(ScannerCyclePreCommitOutcome::RecoverCacheCycle(required_cycle)) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                required_cycle,
+                state = "cache_cycle_ahead",
+                "Scanner cycle is recovering to a newer durable cache generation"
+            );
+            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            return if persist_required_scanner_cycle_floor(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                required_cycle,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
+                ScannerCycleOutcome::Partial
+            } else {
+                ScannerCycleOutcome::Failed
+            };
+        }
+        Some(ScannerCyclePreCommitOutcome::Deferred(reason)) => {
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                reason = reason.as_str(),
+                state = "deferred",
+                "Scanner cycle deferred before data usage publication"
+            );
+            emit_scan_cycle_deferred(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(reason);
+        }
+        None => {}
     }
     if usage_persist_outcome == DataUsagePersistOutcome::Failed {
         error!(
@@ -2000,6 +2037,56 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
+async fn final_data_usage_publication_defer_reason(
+    storeapi: &ECStore,
+    status: ScannerCycleStatus,
+) -> Option<ScannerCycleDeferReason> {
+    match status {
+        ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded => {
+            if storeapi.scanner_data_usage_publication_blocked().await {
+                return Some(ScannerCycleDeferReason::DataMovement);
+            }
+            if status == ScannerCycleStatus::Complete {
+                let distributed = storeapi.setup_is_dist_erasure().await;
+                match probe_scanner_activity(storeapi, distributed).await {
+                    Ok(snapshot) if scanner_activity_allows_usage_publication(&snapshot) => None,
+                    Ok(_) => Some(ScannerCycleDeferReason::DataMovement),
+                    Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+                }
+            } else {
+                // A superseded cycle is explicitly observational and cannot
+                // replace the authoritative snapshot. It may still be
+                // persisted as a convergence baseline for the next cycle.
+                None
+            }
+        }
+        ScannerCycleStatus::Deferred(reason) => Some(reason),
+        // Incomplete cycles do not publish a usage snapshot. Keep the
+        // decision permissive so existing partial-cycle handling remains
+        // unchanged if a future scanner path emits a bookkeeping update.
+        ScannerCycleStatus::Incomplete => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCyclePreCommitOutcome {
+    RecoverCacheCycle(u64),
+    Deferred(ScannerCycleDeferReason),
+}
+
+fn scanner_cycle_pre_commit_outcome(
+    required_cycle_floor: Option<u64>,
+    usage_persist_outcome: &DataUsagePersistOutcome,
+) -> Option<ScannerCyclePreCommitOutcome> {
+    // Keep the publication barrier fail-closed: `.bloomcycle.bin` uses the
+    // same routed writer and its floor must remain pending while data movement
+    // hides the source pool.
+    match usage_persist_outcome {
+        DataUsagePersistOutcome::Deferred(reason) => Some(ScannerCyclePreCommitOutcome::Deferred(*reason)),
+        _ => required_cycle_floor.map(ScannerCyclePreCommitOutcome::RecoverCacheCycle),
+    }
+}
+
 fn scanner_cycle_completion_outcome(
     scan_status: ScannerCycleStatus,
     usage_persist_outcome: DataUsagePersistOutcome,
@@ -2007,6 +2094,7 @@ fn scanner_cycle_completion_outcome(
     has_failed_dirty_usage: bool,
 ) -> ScannerCycleOutcome {
     match (scan_status, usage_persist_outcome) {
+        (_, DataUsagePersistOutcome::Deferred(reason)) => ScannerCycleOutcome::Deferred(reason),
         (_, DataUsagePersistOutcome::Failed) => ScannerCycleOutcome::Failed,
         (ScannerCycleStatus::Deferred(reason), DataUsagePersistOutcome::NoUpdate)
             if !has_dirty_usage && !has_failed_dirty_usage =>

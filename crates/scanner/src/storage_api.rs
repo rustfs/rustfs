@@ -47,6 +47,8 @@ pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys 
 pub(crate) use rustfs_ecstore::api::cache::{
     ListPathRawOptions as EcstoreListPathRawOptions, list_path_raw as ecstore_list_path_raw,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::capacity::PoolDecommissionInfo as EcstorePoolDecommissionInfo;
 pub(crate) use rustfs_ecstore::api::capacity::{
     is_reserved_or_invalid_bucket as ecstore_is_reserved_or_invalid_bucket, path2_bucket_object as ecstore_path2_bucket_object,
     path2_bucket_object_with_base_path as ecstore_path2_bucket_object_with_base_path,
@@ -127,9 +129,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreInstanceContext, EcstorePoolEndpoints, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta,
-        EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx,
-        ecstore_new_disk,
+        EcstoreInstanceContext, EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus, EcstoreRebalanceInfo,
+        EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 

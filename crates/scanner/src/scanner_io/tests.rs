@@ -17,7 +17,9 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
-use crate::storage_api::owner::{EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats};
+use crate::storage_api::owner::{
+    EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
+};
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
     DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
@@ -183,6 +185,39 @@ async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
 }
 
 #[tokio::test]
+#[serial]
+async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    for decommission in [
+        EcstorePoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        },
+        EcstorePoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        },
+    ] {
+        store.pool_meta.write().await.pools[0].decommission = Some(decommission);
+        assert!(store.scanner_data_usage_publication_blocked().await);
+
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            ScannerIOCycle::nsscanner_with_status(store.as_ref(), ctx, budget, updates, 1, 1, HealScanMode::Normal),
+        )
+        .await
+        .expect("terminal-decommission-deferred scanner cycle should finish")
+        .expect("terminal-decommission-deferred scanner cycle should succeed");
+
+        assert_eq!(result.status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement));
+        assert!(receiver.recv().await.is_none(), "blocked cycle must not publish usage");
+    }
+}
+
+#[tokio::test]
 async fn data_usage_publish_fails_when_receiver_is_closed() {
     let (updates, receiver) = mpsc::channel(1);
     drop(receiver);
@@ -236,6 +271,10 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
     assert_eq!(bucket_usage.size, 11);
     assert_eq!(usage.objects_total_count, 2);
     assert_eq!(usage.objects_total_size, 11);
+    assert!(
+        receiver.recv().await.is_none(),
+        "a scanner cycle must publish at most one terminal usage snapshot"
+    );
 }
 
 #[tokio::test]
