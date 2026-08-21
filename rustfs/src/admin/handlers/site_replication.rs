@@ -31,6 +31,9 @@ use crate::admin::storage_api::bucket::metadata::{
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
+use crate::admin::storage_api::bucket::replication::{
+    is_site_replication_rule, merge_incoming_replication_config, replication_target_arn_deployment_id,
+};
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
@@ -1115,6 +1118,14 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
             format!("failed to load site replication state: {err}"),
         )),
     }
+}
+
+/// Whether this deployment participates in site replication (two or more
+/// peers in the persisted state). Read by the S3 interface layer to gate
+/// replication-config edits (MinIO `ErrReplicationDenyEditError` semantics,
+/// issue #1948); a state-read failure propagates so the gate fails closed.
+pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
+    Ok(load_site_replication_state().await?.enabled())
 }
 
 async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
@@ -7748,20 +7759,6 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     replication_target_arn_deployment_id(&target.arn)
 }
 
-fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
-    let parts: Vec<_> = arn.split(':').collect();
-    if parts.len() == 6
-        && parts[0] == "arn"
-        && matches!(parts[1], "rustfs" | "minio")
-        && parts[2] == "replication"
-        && !parts[4].is_empty()
-    {
-        return Some(parts[4].to_string());
-    }
-
-    None
-}
-
 fn prune_removed_site_replication_bucket_targets(
     existing: BucketTargets,
     removed_deployment_ids: &HashSet<String>,
@@ -7784,10 +7781,6 @@ fn prune_removed_site_replication_bucket_targets(
     let removed = original_len.saturating_sub(targets.len());
 
     (BucketTargets { targets }, removed)
-}
-
-fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
-    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
 }
 
 /// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
@@ -7813,52 +7806,6 @@ async fn site_replication_targets_online(bucket: &str, replication_config_xml: &
     }
 
     true
-}
-
-/// Merge a peer's replication config into the local one.
-///
-/// `site-repl-*` rules encode the *sender's* outbound direction — their destination ARN
-/// names the receiver — so applying a peer's rule set verbatim replaces the receiver's
-/// reverse rule with one pointing at itself. No bucket target can satisfy that ARN
-/// (`reconcile_site_replication_bucket_targets` skips the local peer), so the receiver
-/// silently stops replicating back: the one-directional symptom. Only operator-authored
-/// rules travel between sites; each site owns its own `site-repl-*` rules.
-fn merge_incoming_replication_config(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
-) -> Option<ReplicationConfiguration> {
-    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
-    // Operator rules first, then the local site rules — the same order
-    // `ensure_site_replication_bucket_replication_config_with_runtime` produces, so its
-    // no-op check matches and the bucket metadata is written once per broadcast, not twice.
-    let mut rules: Vec<ReplicationRule> = incoming
-        .into_iter()
-        .flat_map(|config| config.rules)
-        .filter(|rule| !is_site_replication_rule(rule))
-        .collect();
-    rules.extend(
-        local
-            .into_iter()
-            .flat_map(|config| config.rules)
-            .filter(is_site_replication_rule),
-    );
-
-    if rules.is_empty() {
-        return None;
-    }
-
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
-
-    // A site-replication ARN in `role` is the sender's, and `site_replication_target_arns_by_peer`
-    // reads it — carrying it over would pin the receiver's targets to the sender's identity.
-    let role = match replication_target_arn_deployment_id(&incoming_role) {
-        Some(_) => String::new(),
-        None => incoming_role,
-    };
-
-    Some(ReplicationConfiguration { role, rules })
 }
 
 /// Merge a peer's ILM expiry document into the local lifecycle config.

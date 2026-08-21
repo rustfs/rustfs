@@ -47,7 +47,8 @@ pub use replication_config_boundary::{
     ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
     REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
     ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationTargetValidationError,
-    invalid_replication_config_status_field, replication_target_arns, should_remove_replication_target,
+    invalid_replication_config_status_field, is_site_replication_rule, merge_incoming_replication_config,
+    replication_target_arn_deployment_id, replication_target_arns, should_remove_replication_target,
     unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
 };
 pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;

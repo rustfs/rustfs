@@ -265,6 +265,78 @@ pub fn active_replication_rule_destination_arns(config: &ReplicationConfiguratio
     arns
 }
 
+/// Deployment id extracted from a site-replication target ARN
+/// (`arn:{rustfs|minio}:replication::<deployment-id>:<bucket>`), or `None`
+/// for an operator-authored ARN.
+pub fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
+    let parts: Vec<_> = arn.split(':').collect();
+    if parts.len() == 6
+        && parts[0] == "arn"
+        && matches!(parts[1], "rustfs" | "minio")
+        && parts[2] == "replication"
+        && !parts[4].is_empty()
+    {
+        return Some(parts[4].to_string());
+    }
+
+    None
+}
+
+/// Whether `rule` is a site-replication rule (`site-repl-*` id) owned by the
+/// local site's reconciler rather than authored by an operator.
+pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
+    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
+}
+
+/// Merge an incoming replication config into the local one.
+///
+/// `site-repl-*` rules encode the *holder's* outbound direction — their
+/// destination ARN names another site — so applying an external rule set
+/// verbatim replaces the local reverse rule with one this site can never
+/// satisfy (no bucket target backs it) and replication silently stops. Only
+/// operator-authored rules travel: the site-replication peer ingestion path
+/// and the S3 put/delete-bucket-replication path both keep the local site's
+/// `site-repl-*` rules through this merge. `incoming == None` models a
+/// delete of the operator-authored rules.
+pub fn merge_incoming_replication_config(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+) -> Option<ReplicationConfiguration> {
+    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
+    // Operator rules first, then the local site rules — the same order the
+    // site-replication reconciler produces, so its no-op check matches and
+    // the bucket metadata is written once per broadcast, not twice.
+    let mut rules: Vec<ReplicationRule> = incoming
+        .into_iter()
+        .flat_map(|config| config.rules)
+        .filter(|rule| !is_site_replication_rule(rule))
+        .collect();
+    rules.extend(
+        local
+            .into_iter()
+            .flat_map(|config| config.rules)
+            .filter(is_site_replication_rule),
+    );
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    for (index, rule) in rules.iter_mut().enumerate() {
+        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
+    }
+
+    // A site-replication ARN in `role` is the sender's, and the reconciler's
+    // per-peer target lookup reads it — carrying it over would pin the
+    // receiver's targets to the sender's identity.
+    let role = match replication_target_arn_deployment_id(&incoming_role) {
+        Some(_) => String::new(),
+        None => incoming_role,
+    };
+
+    Some(ReplicationConfiguration { role, rules })
+}
+
 pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
     let role = config.role.trim();
     if !role.is_empty() {

@@ -38,9 +38,9 @@ use super::storage_api::bucket_usecase::bucket::{
     metadata_sys,
     policy_sys::PolicySys,
     replication::{
-        ReplicationTargetValidationError, invalid_replication_config_status_field, replication_target_arns,
-        should_remove_replication_target, unsupported_replication_config_field, validate_replication_config_structure,
-        validate_replication_config_target_arns,
+        ReplicationTargetValidationError, invalid_replication_config_status_field, is_site_replication_rule,
+        merge_incoming_replication_config, replication_target_arns, should_remove_replication_target,
+        unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -623,11 +623,50 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
     validate_replication_config_targets(&targets, config)
 }
 
-async fn replication_targets_without_config_targets(
+/// Defense in depth for site-replication-managed buckets (issue #1948): an S3
+/// PutBucketReplication replaces the operator-authored rules but must not wipe
+/// the local `site-repl-*` rules the reconciler owns — until its next pass
+/// (600s period) every peer link on this bucket would be silently dead. The
+/// same merge also drops incoming `site-repl-*` impostor rules, matching the
+/// peer bucket-meta ingestion path. Buckets without site-replication rules
+/// keep the verbatim overwrite semantics.
+fn merge_user_replication_config_update(
+    incoming: ReplicationConfiguration,
+    existing: Option<ReplicationConfiguration>,
+) -> ReplicationConfiguration {
+    let has_site_rules = existing
+        .as_ref()
+        .is_some_and(|config| config.rules.iter().any(is_site_replication_rule));
+    if !has_site_rules {
+        return incoming;
+    }
+    // `existing` holds at least one site-replication rule the merge keeps, so
+    // the merged rule set is non-empty; the fallback only guards the type.
+    merge_incoming_replication_config(Some(incoming.clone()), existing).unwrap_or(incoming)
+}
+
+/// Split of an S3 DeleteBucketReplication on the stored config (issue #1948):
+/// the operator-authored rules are removed, the local `site-repl-*` rules
+/// survive (`None` means nothing survives and the config is deleted), and the
+/// returned ARNs are the ones whose bucket targets may be garbage-collected —
+/// never an ARN a surviving site-replication rule still points at.
+fn split_replication_config_for_user_delete(
+    config: ReplicationConfiguration,
+) -> (Option<ReplicationConfiguration>, HashSet<String>) {
+    let mut removable_arns = replication_target_arns(&config);
+    let remaining = merge_incoming_replication_config(None, Some(config));
+    if let Some(remaining) = remaining.as_ref() {
+        for rule in &remaining.rules {
+            removable_arns.remove(rule.destination.bucket.trim());
+        }
+    }
+    (remaining, removable_arns)
+}
+
+async fn replication_targets_without_arns(
     bucket: &str,
-    config: &ReplicationConfiguration,
+    target_arns: &HashSet<String>,
 ) -> S3Result<Option<(BucketTargets, usize)>> {
-    let target_arns = replication_target_arns(config);
     if target_arns.is_empty() {
         return Ok(None);
     }
@@ -638,7 +677,7 @@ async fn replication_targets_without_config_targets(
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+    let removed = remove_replication_targets_from_config_targets(&mut targets, target_arns);
     if removed == 0 {
         return Ok(None);
     }
@@ -1604,15 +1643,29 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
-        let updated_targets = if let Some(config) = replication_config.as_ref() {
-            replication_targets_without_config_targets(&bucket, config).await?
+        let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
+            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone());
+            let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
+            (remaining, targets)
         } else {
-            None
+            (None, None)
         };
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
+        match remaining_config {
+            // Site-replication rules and the targets backing them survive the
+            // S3 delete (issue #1948); only the operator-authored rules go.
+            Some(remaining) => {
+                let data = serialize_config(&remaining)?;
+                update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            None => {
+                delete_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+        }
         if let Some((targets, removed)) = updated_targets
             && let Err(err) =
                 write_replication_targets_after_config_delete(&bucket, &targets, removed, expected_incarnation_id).await
@@ -2485,6 +2538,12 @@ impl DefaultBucketUsecase {
 
         let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         validate_bucket_replication_update(&bucket, &replication_configuration).await?;
+        let existing_config = match metadata_sys::get_replication_config(&bucket).await {
+            Ok((config, _)) => Some(config),
+            Err(StorageError::ConfigNotFound) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
+        let replication_configuration = merge_user_replication_config_update(replication_configuration, existing_config);
         let data = serialize_config(&replication_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -3112,6 +3171,127 @@ mod tests {
         let arns = replication_target_arns(&config);
 
         assert!(arns.contains(destination));
+    }
+
+    fn replication_rule_with_id(arn: &str, id: &str, priority: i32) -> ReplicationRule {
+        let mut rule = replication_rule_for_target(arn);
+        rule.id = Some(id.to_string());
+        rule.priority = Some(priority);
+        rule
+    }
+
+    #[test]
+    fn put_replication_merge_preserves_site_replication_rules() {
+        let existing = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id("arn:rustfs:replication::peer-dep:bucket", "site-repl-peer-dep", 1),
+                replication_rule_with_id("arn:rustfs:replication:us-east-1:old:bucket", "old-user-rule", 2),
+            ],
+        };
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id("arn:rustfs:replication:us-east-1:new:bucket", "new-user-rule", 1),
+                replication_rule_with_id("arn:rustfs:replication::forged-dep:bucket", "site-repl-forged", 2),
+            ],
+        };
+
+        let merged = merge_user_replication_config_update(incoming, Some(existing));
+
+        let ids: Vec<_> = merged
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["new-user-rule", "site-repl-peer-dep"],
+            "user rules replaced, local site-replication rule preserved, forged incoming site-repl rule dropped"
+        );
+    }
+
+    #[test]
+    fn put_replication_merge_returns_incoming_verbatim_without_site_rules() {
+        let existing = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(
+                "arn:rustfs:replication:us-east-1:old:bucket",
+                "old-user-rule",
+                7,
+            )],
+        };
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(
+                "arn:rustfs:replication:us-east-1:new:bucket",
+                "new-user-rule",
+                5,
+            )],
+        };
+
+        let merged = merge_user_replication_config_update(incoming.clone(), Some(existing));
+
+        assert_eq!(merged.role, incoming.role);
+        assert_eq!(merged.rules, incoming.rules, "non-SR buckets keep the verbatim overwrite semantics");
+    }
+
+    #[test]
+    fn delete_replication_split_keeps_site_rules_and_their_targets() {
+        let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(user_arn, "user-rule", 1),
+                replication_rule_with_id(sr_arn, "site-repl-peer-dep", 2),
+            ],
+        };
+
+        let (remaining, removable) = split_replication_config_for_user_delete(config);
+
+        let remaining = remaining.expect("site-replication rules must survive a user delete");
+        let ids: Vec<_> = remaining
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["site-repl-peer-dep"]);
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
+    }
+
+    #[test]
+    fn delete_replication_split_protects_targets_shared_with_site_rules() {
+        let sr_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(sr_arn, "user-rule-on-sr-target", 1),
+                replication_rule_with_id(sr_arn, "site-repl-peer-dep", 2),
+            ],
+        };
+
+        let (remaining, removable) = split_replication_config_for_user_delete(config);
+
+        assert!(remaining.is_some());
+        assert!(
+            removable.is_empty(),
+            "a target still referenced by a surviving site-replication rule must not be removed"
+        );
+    }
+
+    #[test]
+    fn delete_replication_split_removes_everything_without_site_rules() {
+        let user_arn = "arn:rustfs:replication:us-east-1:user:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
+        };
+
+        let (remaining, removable) = split_replication_config_for_user_delete(config);
+
+        assert!(remaining.is_none(), "without site-replication rules the whole config is deleted");
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
     }
 
     fn replication_targets_with_arn(arns: &[&str]) -> BucketTargets {
