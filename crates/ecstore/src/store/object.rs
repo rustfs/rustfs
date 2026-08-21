@@ -1842,6 +1842,25 @@ impl ECStore {
             .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))
     }
 
+    pub(super) fn apply_decommission_target_mutation_fence(
+        &self,
+        target_pool_idx: usize,
+        object: &str,
+        opts: &mut ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
+    ) {
+        let Some(mutation_fence) = mutation_fence else {
+            return;
+        };
+
+        mutation_fence.add_namespace_lock_fence(opts);
+        let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first());
+        let target_set = self.pools.get(target_pool_idx).map(|pool| pool.get_disks_by_key(object));
+        // The fixed read fence can replace the target write acquisition only
+        // when both names resolve to the exact same SetDisks namespace.
+        opts.no_lock = matches!((fixed_set, target_set), (Some(fixed), Some(target)) if Arc::ptr_eq(fixed, &target));
+    }
+
     pub(crate) async fn acquire_decommission_source_cleanup_fence(
         &self,
         bucket: &str,
@@ -2324,14 +2343,16 @@ impl ECStore {
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(usize, Result<ObjectInfo>)> {
         if !opts.data_movement {
             return Err(Error::other("data movement PUT requires data_movement options"));
         }
-        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let (object, mut opts) = self.prepare_put_object(bucket, object, opts).await?;
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
+        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence);
         let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
