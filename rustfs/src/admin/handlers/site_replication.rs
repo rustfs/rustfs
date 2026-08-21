@@ -41,7 +41,7 @@ use crate::admin::storage_api::config::save_admin_config;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
-use crate::admin::storage_api::error::Error as StorageError;
+use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::constant_time_eq;
@@ -10472,6 +10472,19 @@ impl Operation for SRPeerJoinHandler {
     }
 }
 
+/// Outcome of a peer-driven `purge-deleted-bucket` replay. A bucket that is
+/// already gone means the purge raced an earlier replay or a local delete —
+/// that is success — but any other failure must reach the sender like the
+/// sibling delete branches do: swallowing it answered 200 while the bucket
+/// survived on this site.
+fn purge_deleted_bucket_result(result: Result<(), StorageError>) -> S3Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_err_bucket_not_found(&err) => Ok(()),
+        Err(err) => Err(ApiError::from(err).into()),
+    }
+}
+
 pub struct SRPeerBucketOpsHandler {}
 
 #[async_trait::async_trait]
@@ -10571,16 +10584,18 @@ impl Operation for SRPeerBucketOpsHandler {
                     .map_err(ApiError::from)?;
             }
             "purge-deleted-bucket" => {
-                let _ = store
-                    .delete_bucket(
-                        &bucket,
-                        &DeleteBucketOptions {
-                            force: true,
-                            srdelete_op: SRBucketDeleteOp::Purge,
-                            ..Default::default()
-                        },
-                    )
-                    .await;
+                purge_deleted_bucket_result(
+                    store
+                        .delete_bucket(
+                            &bucket,
+                            &DeleteBucketOptions {
+                                force: true,
+                                srdelete_op: SRBucketDeleteOp::Purge,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                )?;
             }
             _ => return Err(s3_error!(InvalidRequest, "unsupported site replication bucket operation")),
         }
@@ -13924,6 +13939,19 @@ mod tests {
 
         assert!(query_flag(&uri, "lockEnabled"));
         assert!(!query_flag(&uri, "missing"));
+    }
+
+    /// A5 red-light: a `purge-deleted-bucket` replay must report success when
+    /// the bucket is already gone, and must propagate every other failure —
+    /// the swallowed error answered 200 while the bucket survived.
+    #[test]
+    fn test_purge_deleted_bucket_result_tolerates_only_missing_bucket() {
+        assert!(purge_deleted_bucket_result(Ok(())).is_ok());
+        assert!(purge_deleted_bucket_result(Err(StorageError::BucketNotFound("photos".to_string()))).is_ok());
+        assert!(purge_deleted_bucket_result(Err(StorageError::VolumeNotFound)).is_ok());
+        let err = purge_deleted_bucket_result(Err(StorageError::StorageFull))
+            .expect_err("non-not-found delete failures must propagate");
+        assert_ne!(*err.code(), S3ErrorCode::NoSuchBucket);
     }
 
     /// A3 red-light: `versioningEnabled` must travel on every outbound
