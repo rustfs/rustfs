@@ -142,16 +142,23 @@ async fn put_sse_kms(client: &Client, key: &str, kms_key_id: &str) -> S3Operatio
         .send()
         .await
         .map(|_| ())
-        .map_err(|err| Box::new(aws_sdk_s3::Error::from(err)))
+        .map_err(|error| Box::new(aws_sdk_s3::Error::from(error)))
 }
 
 /// Assert the operation failed with `AccessDenied` rather than any other error.
 ///
 /// A bare `is_err` would also accept `KMSKeyDisabled` or an internal error, which
 /// would hide both a leak of key state and an outage masquerading as a denial.
-fn assert_access_denied<T: std::fmt::Debug>(result: S3OperationResult<T>, what: &str) {
+fn assert_access_denied<T: std::fmt::Debug, E: std::fmt::Debug + std::borrow::Borrow<aws_sdk_s3::Error>>(
+    result: Result<T, E>,
+    what: &str,
+) {
     let error = result.expect_err(&format!("{what} must be denied"));
-    assert_eq!(error.code(), Some("AccessDenied"), "{what} must fail with AccessDenied: {error:?}");
+    assert_eq!(
+        error.borrow().code(),
+        Some("AccessDenied"),
+        "{what} must fail with AccessDenied: {error:?}"
+    );
 }
 
 /// Retry an SSE-KMS write until the identity's policy has reached the request path.

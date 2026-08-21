@@ -1500,7 +1500,7 @@ where
         return write_body_chunks_to_writer(body, writer).await;
     };
 
-    let expected_size = (!query.append && query.size >= 0)
+    let expected_size = (!query.append && query.size > 0)
         .then(|| {
             u64::try_from(query.size)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "put_file auth size cannot be represented"))
@@ -2323,6 +2323,39 @@ mod tests {
 
         assert_eq!(copied, 11);
         assert_eq!(writer, b"append-data");
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_zero_size_create_uses_trailing_auth_record() {
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_string());
+        let nonce = uuid::Uuid::parse_str("43434343-4444-4555-8666-777777777777").expect("nonce");
+        let url = concat!(
+            "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
+            "&append=false&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=43434343-4444-4555-8666-777777777777"
+        );
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"unknown-size-data"), hex_simd::AsciiCase::Lower);
+        let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
+        let query = PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append: false,
+            size: 0,
+            put_file_auth: Some("digest-trailer-v1".to_string()),
+            put_file_nonce: Some(nonce),
+            put_file_server_epoch: Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH),
+        };
+        let mut payload = b"unknown-size-data".to_vec();
+        payload.extend_from_slice(&trailer);
+        let body = iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]);
+        let mut writer = Vec::new();
+
+        let copied = write_put_file_body_chunks_to_writer(body, &mut writer, &query, Some(nonce), url)
+            .await
+            .expect("zero-size create body should verify");
+
+        assert_eq!(copied, 17);
+        assert_eq!(writer, b"unknown-size-data");
     }
 
     #[tokio::test]

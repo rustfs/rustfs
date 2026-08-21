@@ -3683,6 +3683,13 @@ where
 
     let authorization_headers = pax_headers.clone();
 
+    if let Some(value) = pax_headers.remove("x-amz-tagging") {
+        let value = value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball object tagging value"))?;
+        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), value.to_owned());
+    }
+
     let object_lock_mode = pax_headers
         .remove(AMZ_OBJECT_LOCK_MODE_LOWER)
         .map(|value| {
@@ -10740,6 +10747,7 @@ mod tests {
         let mut record = pax_record("minio.metadata.Content-Type", b"text/plain");
         record.extend(pax_record("minio.metadata.X-Amz-Meta-Owner", b"alice"));
         record.extend(pax_record("minio.metadata.project", b"alpha-demo"));
+        record.extend(pax_record("minio.metadata.x-amz-tagging", b"classification=public"));
         record.extend(pax_record("minio.versionId", Uuid::nil().to_string().as_bytes()));
         record.extend(pax_record("minio.metadata.x-amz-replication-status", b"REPLICA"));
         record.extend(pax_record("minio.metadata.X-Amz-Object-Lock-Mode", b"GOVERNANCE"));
@@ -10778,6 +10786,8 @@ mod tests {
         assert_eq!(metadata.get("content-type").map(String::as_str), Some("text/plain"));
         assert_eq!(metadata.get("owner").map(String::as_str), Some("alice"));
         assert_eq!(metadata.get("project").map(String::as_str), Some("alpha-demo"));
+        assert_eq!(metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some("classification=public"));
+        assert!(!metadata.contains_key("x-amz-tagging"));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
         assert_eq!(
             metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str),

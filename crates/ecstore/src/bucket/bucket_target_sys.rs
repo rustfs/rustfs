@@ -1987,8 +1987,7 @@ impl TargetClient {
         // object with an identical ETag, and the worker concludes the object
         // already converged — so it never actually replicates it.
         insert_header(&mut headers, SUFFIX_SOURCE_PROXY_REQUEST, "false");
-        match self
-            .client
+        self.client
             .head_object()
             .bucket(bucket)
             .key(object)
@@ -2005,10 +2004,7 @@ impl TargetClient {
             })
             .send()
             .await
-        {
-            Ok(res) => Ok(res),
-            Err(e) => Err(Box::new(e)),
-        }
+            .map_err(Box::new)
     }
 
     /// HEAD used by the read-proxy path (GET/HEAD of an object not yet
