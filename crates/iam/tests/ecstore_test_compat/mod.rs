@@ -17,11 +17,11 @@
 //! All direct `rustfs_ecstore` facade imports used by tests in this crate
 //! must go through this module (architecture migration rule:
 //! `check_architecture_migration_rules.sh`). Keep the surface minimal —
-//! only what the tests actually need to build a temp-disk ECStore fixture
-//! and to flip the erasure setup type for lock-quorum fault injection.
+//! only what the tests actually need to run storage-backed IAM scenarios.
 
 #[allow(unused_imports)]
 pub(crate) mod fixture {
+    pub(crate) use rustfs_ecstore::api::bucket::migration::try_migrate_iam_config;
     pub(crate) use rustfs_ecstore::api::layout::SetupType;
 
     // `update_erasure_type` is a write-side global facade entry. Its use is
