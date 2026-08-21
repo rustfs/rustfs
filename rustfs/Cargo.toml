@@ -288,7 +288,6 @@ zstd.workspace = true
 # Cryptography and Security
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
-rustix = { workspace = true, features = ["fs"] }
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }

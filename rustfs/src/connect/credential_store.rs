@@ -139,16 +139,7 @@ impl CredentialStore {
                 source,
             })?;
             check_mode(&path)?;
-            #[cfg(not(unix))]
-            return Err(CredentialStoreError::Io {
-                path,
-                source: io::Error::new(io::ErrorKind::Unsupported, "Connect state locking requires flock support"),
-            });
-            #[cfg(unix)]
-            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|source| CredentialStoreError::Io {
-                path,
-                source: source.into(),
-            })?;
+            file.lock().map_err(|source| CredentialStoreError::Io { path, source })?;
             Ok(CredentialLock { _file: file })
         })
         .await

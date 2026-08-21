@@ -142,9 +142,23 @@ impl ConnectClient {
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
         let _lock = credential_store.lock().await?;
-        let (credential, _) = self
+        let pending_before = credential_store.load_pending_registration()?.filter(|pending| {
+            pending.token_uid == token.registration_token_uid
+                && pending.previous_credential_fingerprint.is_some()
+                && pending.next_public_key_sha256.is_some()
+        });
+        let (credential, identity) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
+        if let Some(pending) = pending_before {
+            let fingerprint = certificate_fingerprint(&credential.certificate)?;
+            let public_key_fingerprint = public_key_fingerprint(&identity);
+            if pending.previous_credential_fingerprint.as_deref() != Some(&fingerprint)
+                && pending.next_public_key_sha256.as_deref() == Some(&public_key_fingerprint)
+            {
+                return Ok(credential);
+            }
+        }
         credential_store.clear_pending_rotation()?;
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         let next = identity_store.load_or_create_next()?;

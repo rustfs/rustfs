@@ -724,10 +724,12 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
     write_stored_credential(&temp.path().join("credential/device.crt.json"), &enrolled);
 
     let idle = server(&pki, vec![]).await;
-    client(&idle, &pki, Duration::from_secs(2))
-        .register(&identity_store, &credential_store, &token())
+    let idle_client = client(&idle, &pki, Duration::from_secs(2));
+    let recovered = idle_client
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
         .await
         .expect("recover after reenrollment credential save");
+    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
     assert_eq!(
         identity_store
             .load()
@@ -739,11 +741,13 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
 
     fs::write(&pending_path, pending).expect("restore pending after key commit");
     set_owner_only(&pending_path);
-    client(&idle, &pki, Duration::from_secs(2))
-        .register(&identity_store, &credential_store, &token())
+    let recovered = idle_client
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
         .await
         .expect("recover after reenrollment key commit");
+    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
     assert!(!pending_path.exists());
+    assert!(idle.seen.lock().expect("seen lock").is_empty());
 }
 
 #[test]
