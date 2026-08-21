@@ -27,6 +27,8 @@
 
 pub mod identity;
 pub mod identity_store;
+pub mod offline;
 
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};
 pub use identity_store::{IdentityStore, StoreError};
+pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
