@@ -32,7 +32,10 @@ use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
     rebalance_delete_marker_opts,
 };
-use super::runtime::{should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt};
+use super::runtime::{
+    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation, should_fail_repeated_rebalance_bucket_defer,
+    source_cleanup_defer_attempt,
+};
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
     parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
@@ -2706,6 +2709,43 @@ async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
         .expect_err("staged start must not restart stopped metadata");
 
     assert!(err.to_string().contains("was stopped before start"));
+}
+
+#[tokio::test]
+async fn test_stop_at_activation_barrier_prevents_worker_token_commit() {
+    let meta = Arc::new(tokio::sync::RwLock::new(RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    let fence_reached = Arc::new(tokio::sync::Barrier::new(2));
+    let stop_committed = Arc::new(tokio::sync::Barrier::new(2));
+
+    let stop_meta = Arc::clone(&meta);
+    let stop_fence_reached = Arc::clone(&fence_reached);
+    let stop_committed_signal = Arc::clone(&stop_committed);
+    let stop = tokio::spawn(async move {
+        stop_fence_reached.wait().await;
+        stop_meta.write().await.stopped_at = Some(OffsetDateTime::now_utc());
+        stop_committed_signal.wait().await;
+    });
+
+    fence_reached.wait().await;
+    stop_committed.wait().await;
+    stop.await.expect("stop barrier task should finish");
+
+    let mut meta = meta.write().await;
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", tokio_util::sync::CancellationToken::new())
+        .expect("stopped metadata should produce a non-start outcome");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
 }
 
 fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {

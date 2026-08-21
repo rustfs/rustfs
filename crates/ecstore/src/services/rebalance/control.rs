@@ -16,7 +16,9 @@ use super::{
     RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
     encode_rebalance_stop_propagation_record,
 };
-use crate::core::pools::{PoolMeta, acquire_pool_rebalance_activation_locks, pool_meta_has_active_decommission};
+use crate::core::pools::{
+    PoolMeta, PoolRebalanceActivationFence, acquire_pool_rebalance_activation_locks, pool_meta_has_active_decommission,
+};
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
 use crate::set_disk::get_lock_acquire_timeout;
@@ -38,9 +40,20 @@ fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> 
     Ok(())
 }
 
-async fn merge_and_save_rebalance_meta_no_lock<S>(pool: Arc<S>, local_snapshot: &RebalanceMeta, stage: &str) -> Result<()>
+pub(super) enum RebalanceWorkerActivationFence {
+    Ready(PoolRebalanceActivationFence),
+    NotStartedTerminal,
+}
+
+async fn merge_and_save_rebalance_meta_no_lock<S, F>(
+    pool: Arc<S>,
+    local_snapshot: &RebalanceMeta,
+    stage: &str,
+    before_save: F,
+) -> Result<()>
 where
     S: EcstoreObjectIO,
+    F: FnOnce() -> Result<()>,
 {
     let opts = ObjectOptions {
         no_lock: true,
@@ -59,6 +72,7 @@ where
         Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
     }
 
+    before_save()?;
     merged.save_with_opts(pool, opts).await
 }
 
@@ -123,7 +137,7 @@ impl ECStore {
             .await
             .map_err(rebalance_meta_lock_error)?;
 
-        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage).await
+        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, || Ok(())).await
     }
 
     async fn save_rebalance_activation_meta_with_merge<S>(
@@ -135,19 +149,23 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
-        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
+        let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
         let mut pool_meta = PoolMeta::default();
         pool_meta.load_no_lock(pool.clone()).await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
 
-        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage).await
+        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, || activation_fence.ensure_held()).await
     }
 
-    pub(super) async fn fence_rebalance_worker_activation<S>(&self, pool: Arc<S>, expected_id: &str) -> Result<bool>
+    pub(super) async fn fence_rebalance_worker_activation<S>(
+        &self,
+        pool: Arc<S>,
+        expected_id: &str,
+    ) -> Result<RebalanceWorkerActivationFence>
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
-        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
+        let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
         let mut pool_meta = PoolMeta::default();
         pool_meta.load_no_lock(pool.clone()).await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
@@ -169,7 +187,12 @@ impl ECStore {
             )));
         }
 
-        Ok(is_rebalance_conflicting_with_decommission(&persisted))
+        activation_fence.ensure_held()?;
+        if !is_rebalance_conflicting_with_decommission(&persisted) {
+            return Ok(RebalanceWorkerActivationFence::NotStartedTerminal);
+        }
+
+        Ok(RebalanceWorkerActivationFence::Ready(activation_fence))
     }
 
     #[tracing::instrument(skip_all)]

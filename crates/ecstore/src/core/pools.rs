@@ -870,9 +870,26 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     }
 }
 
-pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
-    pool: Arc<S>,
-) -> Result<(rustfs_lock::NamespaceLockGuard, rustfs_lock::NamespaceLockGuard)>
+pub(crate) struct PoolRebalanceActivationFence {
+    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
+    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+}
+
+impl PoolRebalanceActivationFence {
+    pub(crate) fn ensure_held(&self) -> Result<()> {
+        ensure_activation_locks_held(self.pool_meta_guard.is_lock_lost(), self.rebalance_meta_guard.is_lock_lost())
+    }
+}
+
+fn ensure_activation_locks_held(pool_lock_lost: bool, rebalance_lock_lost: bool) -> Result<()> {
+    if pool_lock_lost || rebalance_lock_lost {
+        return Err(Error::other("activation lock lost before metadata commit or worker admission"));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(pool: Arc<S>) -> Result<PoolRebalanceActivationFence>
 where
     S: crate::storage_api_contracts::namespace::NamespaceLocking<
             Error = Error,
@@ -891,7 +908,10 @@ where
         .await
         .map_err(activation_rebalance_meta_lock_error)?;
 
-    Ok((pool_meta_guard, rebalance_meta_guard))
+    Ok(PoolRebalanceActivationFence {
+        pool_meta_guard,
+        rebalance_meta_guard,
+    })
 }
 
 fn rollback_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
@@ -2525,7 +2545,7 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
-        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
+        let activation_fence = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
         match rebalance_meta
@@ -2570,6 +2590,7 @@ impl ECStore {
             latest_pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
+        activation_fence.ensure_held()?;
         latest_pool_meta.save_no_lock(self.pools.clone()).await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
@@ -5285,7 +5306,7 @@ mod pools_tests {
         apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
-        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
+        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency, ensure_activation_locks_held,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
         ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
@@ -5429,6 +5450,16 @@ mod pools_tests {
                 .expect("activation lock recorder should not be poisoned"),
             vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
         );
+    }
+
+    #[test]
+    fn test_activation_fence_rejects_either_lost_guard_before_commit() {
+        assert!(ensure_activation_locks_held(false, false).is_ok());
+        for (pool_lost, rebalance_lost) in [(true, false), (false, true), (true, true)] {
+            let err = ensure_activation_locks_held(pool_lost, rebalance_lost)
+                .expect_err("either lost activation guard must fence the commit");
+            assert!(err.to_string().contains("activation lock lost"));
+        }
     }
 
     #[test]
