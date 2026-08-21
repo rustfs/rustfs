@@ -21,12 +21,12 @@
 use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
-    BucketReplicationRuntimeStats, BucketReplicationMetricsSnapshot, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
-    BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
-    ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
-    DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmBackpressureStats,
-    IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType,
-    ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
+    BucketReplicationMetricsSnapshot, BucketReplicationRuntimeStats, BucketReplicationTargetBacklogStats,
+    BucketReplicationTargetFlowStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats,
+    ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats,
+    DriveDetailedStats, DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats,
+    IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats,
+    ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{

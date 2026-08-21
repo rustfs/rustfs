@@ -9803,6 +9803,7 @@ dependencies = [
  "rustfs-replication",
  "rustfs-storage-api",
  "s3s",
+ "serial_test",
  "temp-env",
  "time",
  "tokio",
