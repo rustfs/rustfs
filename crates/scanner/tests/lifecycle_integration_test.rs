@@ -540,11 +540,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    temp_env::async_with_vars(
-        [(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, Some("1"))],
-        test_fn(),
-    )
-    .await;
+    temp_env::async_with_vars([(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, Some("1"))], test_fn()).await;
 }
 
 mod serial_tests {
