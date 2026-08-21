@@ -612,7 +612,7 @@ mod tests {
     use rustfs_config::server_config::KVS;
     #[cfg(feature = "test-util")]
     use rustfs_filemeta::{FileInfo, FileMeta};
-    use rustfs_filemeta::{FileInfoVersions, ObjectPartInfo};
+    use rustfs_filemeta::{FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use rustfs_rio::{Checksum, ChecksumType};
@@ -2827,21 +2827,30 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn delete_waits_for_decommission_commit_then_removes_every_copy() {
+    async fn decommission_entry_carries_migration_and_cleanup_mutation_fences() {
         let temp_dir = tempfile::tempdir().expect("create decommission delete-fence store dir");
-        let (_ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-delete-fence", &[4, 4])).await;
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "decommission-delete-fence",
+            &[(2, 4), (1, 4)],
+            CancellationToken::new(),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
         let bucket = format!("decommission-delete-fence-{}", uuid::Uuid::new_v4());
-        let object = "object.bin";
+        let object = (0..128)
+            .map(|index| format!("object-{index}.bin"))
+            .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == 1)
+            .expect("the deterministic object search should select source set 1");
+        let source_body = b"source generation".to_vec();
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("create decommission delete-fence bucket");
-        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        let mut source = PutObjReader::from_vec(source_body.clone());
         store.pools[0]
-            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .put_object(&bucket, &object, &mut source, &ObjectOptions::default())
             .await
             .expect("write source object to the pool being decommissioned");
         {
@@ -2855,77 +2864,219 @@ mod tests {
 
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
             &bucket,
-            object,
+            &object,
             crate::set_disk::PutObjectCommitPause::BeforeNamespace,
         );
-        let migration_store = Arc::clone(&store);
-        let migration_bucket = bucket.clone();
-        let migration = tokio::spawn(async move {
-            let source_reader = migration_store.pools[0]
-                .get_object_reader(
-                    &migration_bucket,
-                    object,
-                    None,
-                    HeaderMap::new(),
-                    &ObjectOptions {
-                        no_lock: true,
-                        data_movement: true,
-                        raw_data_movement_read: true,
+        let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, &object);
+        let source_set = store.pools[0].get_disks_by_key(&object);
+        assert_eq!(source_set.set_index, 1, "the source entry must exercise the non-fixed set cleanup lock");
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker_object = object.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: worker_object,
                         ..Default::default()
                     },
+                    worker_bucket,
+                    source_set,
                 )
-                .await?;
-            crate::data_movement::migrate_decommission_object(
-                migration_store,
-                0,
-                migration_bucket,
-                source_reader,
-                None,
-                "test_decommission_delete_fence",
-            )
-            .await
+                .await
         });
         barrier.wait_until_paused().await;
 
         let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
         let delete_store = Arc::clone(&store);
         let delete_bucket = bucket.clone();
+        let delete_object = object.clone();
         let delete = tokio::spawn(async move {
             delete_store
-                .delete_object(&delete_bucket, object, ObjectOptions::default())
+                .delete_object(&delete_bucket, &delete_object, ObjectOptions::default())
                 .await
         });
         delete_barrier.wait_until_paused().await;
         delete_barrier.release_and_wait_until_namespace_pending().await;
         assert!(
-            !delete.is_finished(),
-            "DELETE must wait while the decommission source generation is being committed"
+            !delete_barrier.namespace_acquired() && !delete.is_finished(),
+            "DELETE must remain before namespace acquisition behind the decommission worker's target-commit mutation fence"
+        );
+        delete.abort();
+        assert!(
+            delete
+                .await
+                .expect_err("the blocked DELETE should be canceled")
+                .is_cancelled(),
+            "the competing DELETE must remain cancelable while blocked"
         );
 
         barrier.release();
-        migration
-            .await
-            .expect("decommission migration task should join")
-            .expect("decommission migration should commit before DELETE");
-        delete
-            .await
-            .expect("DELETE task should join")
-            .expect("DELETE should remove the committed migration generation");
+        cleanup_barrier.wait_until_paused().await;
+        drop(barrier);
 
-        for pool in &store.pools {
-            let err = pool
-                .get_object_info(&bucket, object, &ObjectOptions::default())
+        let fixed_set = Arc::clone(&store.pools[0].disk_set[0]);
+        let fixed_mutation_barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let mutation_bucket = bucket.clone();
+        let mutation_object = object.clone();
+        let fixed_mutation = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"fixed-domain replacement".to_vec());
+            fixed_set
+                .put_object(&mutation_bucket, &mutation_object, &mut reader, &ObjectOptions::default())
                 .await
-                .expect_err("DELETE must remove the source and migrated target copies");
-            assert!(
-                matches!(err, StorageError::ObjectNotFound(_, _)),
-                "unexpected post-delete pool result: {err:?}"
-            );
-        }
-        store
-            .get_object_info(&bucket, object, &ObjectOptions::default())
+        });
+        fixed_mutation_barrier.wait_until_paused().await;
+        fixed_mutation_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !fixed_mutation_barrier.namespace_acquired() && !fixed_mutation.is_finished(),
+            "the source cleanup must retain the fixed mutation fence before the set-0 mutation acquires its namespace"
+        );
+        fixed_mutation.abort();
+        assert!(
+            fixed_mutation
+                .await
+                .expect_err("the fixed-domain mutation should be canceled")
+                .is_cancelled(),
+            "the competing fixed-domain mutation must remain cancelable while blocked"
+        );
+        drop(fixed_mutation_barrier);
+
+        cleanup_barrier.release();
+        worker
             .await
-            .expect_err("the migrated source generation must not become visible again");
+            .expect("decommission entry worker should join")
+            .expect("decommission entry should migrate and clean its source");
+
+        store.pools[0]
+            .get_object_info(&bucket, &object, &ObjectOptions::default())
+            .await
+            .expect_err("the real decommission entry must clean the source generation");
+        let mut target = store.pools[1]
+            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the real decommission entry must commit the target generation");
+        let mut actual = Vec::new();
+        target
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read the migrated target generation");
+        assert_eq!(actual, source_body, "the decommission worker must preserve the migrated object body");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_delete_real_path_preserves_source_pool_errors_in_any_pool_order() {
+        let temp_dir = tempfile::tempdir().expect("create batch delete pool-error store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-delete-pool-errors", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        for source_pool_idx in [0, 1] {
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                for pool in &mut pool_meta.pools {
+                    pool.decommission = None;
+                }
+            }
+
+            let bucket = format!("batch-delete-pool-errors-{source_pool_idx}-{}", uuid::Uuid::new_v4());
+            let object_names = vec![
+                format!("third-{source_pool_idx}.bin"),
+                format!("first-{source_pool_idx}.bin"),
+                format!("second-{source_pool_idx}.bin"),
+            ];
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create batch delete pool-error bucket");
+            for pool in &store.pools {
+                for object_name in &object_names {
+                    let mut reader = PutObjReader::from_vec(format!("pool {} {object_name}", pool.pool_idx).into_bytes());
+                    pool.put_object(&bucket, object_name, &mut reader, &ObjectOptions::default())
+                        .await
+                        .expect("seed each object in both the source and active pools");
+                }
+            }
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                pool_meta.pools[source_pool_idx].decommission = Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                });
+            }
+            assert!(
+                store.is_suspended(source_pool_idx).await,
+                "the injected error pool must be the decommission source"
+            );
+
+            let expected_errors = vec![
+                StorageError::ErasureWriteQuorum,
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "delete_objects_commit",
+                    bucket: bucket.clone(),
+                    object: object_names[1].clone(),
+                    required: 3,
+                    achieved: 2,
+                },
+                StorageError::ErasureWriteQuorum,
+            ];
+            let injection = crate::store::object::BatchDeletePoolErrorInjection::install(
+                &bucket,
+                source_pool_idx,
+                object_names.iter().cloned().zip(expected_errors.iter().cloned()).collect(),
+            );
+            let requests = object_names
+                .iter()
+                .map(|object_name| ObjectToDelete {
+                    object_name: object_name.clone(),
+                    ..Default::default()
+                })
+                .collect();
+
+            let (deleted, errors) = store.delete_objects(&bucket, requests, ObjectOptions::default()).await;
+
+            assert_eq!(
+                injection.observed(),
+                object_names.len(),
+                "the source pool must first complete every real delete"
+            );
+            assert_eq!(
+                errors,
+                expected_errors.iter().cloned().map(Some).collect::<Vec<_>>(),
+                "a successful pool must not clear a source pool failure at any request index"
+            );
+            assert_eq!(
+                deleted.iter().map(|object| object.object_name.as_str()).collect::<Vec<_>>(),
+                object_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                "DeleteObjects must preserve request index mapping while aggregating pool failures"
+            );
+            assert!(
+                deleted.iter().all(|object| object.found),
+                "the injected source results must retain real delete success data"
+            );
+
+            for pool in &store.pools {
+                for object_name in &object_names {
+                    let error = pool
+                        .get_object_info(&bucket, object_name, &ObjectOptions::default())
+                        .await
+                        .expect_err("both the active and source pool delete calls must execute");
+                    assert!(
+                        matches!(error, StorageError::ObjectNotFound(_, _)),
+                        "unexpected residual object: {error:?}"
+                    );
+                }
+            }
+            drop(injection);
+        }
 
         shutdown.cancel();
     }

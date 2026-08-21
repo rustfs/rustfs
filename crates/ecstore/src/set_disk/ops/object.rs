@@ -2483,6 +2483,7 @@ impl SetDisks {
                         })
                         .await?,
                     );
+                    notify_put_object_commit_namespace_acquired(bucket, object);
                 }
                 #[cfg(not(any(test, feature = "test-util")))]
                 {
@@ -4630,6 +4631,7 @@ struct PutObjectCommitBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
     namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -4651,6 +4653,7 @@ impl PutObjectCommitBarrier {
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -4684,6 +4687,10 @@ impl PutObjectCommitBarrier {
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
             .await
             .expect("put object should wait for the namespace lock after leaving the commit barrier");
+    }
+
+    pub fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -4738,6 +4745,22 @@ fn notify_put_object_commit_namespace_pending(bucket: &str, object: &str) {
         .cloned();
     if let Some(barrier) = barrier {
         barrier.namespace_pending.notify_one();
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == PutObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 

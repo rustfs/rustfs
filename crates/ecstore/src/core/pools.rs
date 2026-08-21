@@ -3532,6 +3532,22 @@ impl ECStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn decommission_entry_for_test(
+        self: &Arc<Self>,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+    ) -> Result<()> {
+        let worker_permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .map_err(|err| Error::other(format!("decommission test worker permit acquire failed: {err}")))?;
+        self.decommission_entry(CancellationToken::new(), idx, entry, bucket, set, worker_permit, None, None, None, None)
+            .await
+    }
+
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_pool(
         self: &Arc<Self>,

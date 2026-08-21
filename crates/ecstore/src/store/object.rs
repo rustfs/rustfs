@@ -838,6 +838,7 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
     namespace_pending: tokio::sync::Notify,
+    namespace_acquired: AtomicBool,
 }
 
 #[cfg(test)]
@@ -858,6 +859,7 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: AtomicBool::new(false),
         });
         let mut slot = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -882,6 +884,10 @@ impl DeleteAfterObjectLockSnapshotBarrier {
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
             .await
             .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(Ordering::Acquire)
     }
 }
 
@@ -911,6 +917,20 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
         state.arrived.notify_one();
         state.release.notified().await;
         state.namespace_pending.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_namespace_acquired(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.namespace_acquired.store(true, Ordering::Release);
     }
 }
 
@@ -1046,6 +1066,88 @@ fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_sna
 
 fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
     !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
+}
+
+#[cfg(test)]
+struct BatchDeletePoolErrorInjectionState {
+    bucket: String,
+    pool_idx: usize,
+    errors: std::collections::HashMap<String, Error>,
+    observed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) struct BatchDeletePoolErrorInjection {
+    state: Arc<BatchDeletePoolErrorInjectionState>,
+}
+
+#[cfg(test)]
+static BATCH_DELETE_POOL_ERROR_INJECTION: std::sync::OnceLock<std::sync::Mutex<Option<Arc<BatchDeletePoolErrorInjectionState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl BatchDeletePoolErrorInjection {
+    pub(crate) fn install(bucket: &str, pool_idx: usize, errors: Vec<(String, Error)>) -> Self {
+        let state = Arc::new(BatchDeletePoolErrorInjectionState {
+            bucket: bucket.to_string(),
+            pool_idx,
+            errors: errors.into_iter().collect(),
+            observed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        assert!(slot.is_none(), "batch delete pool error injection must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn observed(&self) -> usize {
+        self.state.observed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BatchDeletePoolErrorInjection {
+    fn drop(&mut self) {
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn inject_batch_delete_pool_errors(
+    bucket: &str,
+    pool_idx: usize,
+    object_names: &[String],
+    result: &mut (Vec<DeletedObject>, Vec<Option<Error>>),
+) {
+    let state = BATCH_DELETE_POOL_ERROR_INJECTION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("batch delete pool error injection mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.pool_idx == pool_idx)
+        .cloned();
+    let Some(state) = state else {
+        return;
+    };
+
+    for (idx, object_name) in object_names.iter().enumerate() {
+        let Some(error) = state.errors.get(object_name) else {
+            continue;
+        };
+        if result.1[idx].is_none() && result.0[idx].found {
+            result.1[idx] = Some(error.clone());
+            state.observed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 fn resolve_batch_delete_pool_results<'a>(
@@ -2674,6 +2776,10 @@ impl ECStore {
         } else {
             None
         };
+        #[cfg(test)]
+        if _object_lock_guard.is_some() {
+            notify_delete_namespace_acquired(bucket);
+        }
         if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
             let configs = delete_all_configs.as_ref().ok_or(StorageError::PreconditionFailed)?;
             let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
@@ -3006,6 +3112,10 @@ impl ECStore {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
         };
+        #[cfg(test)]
+        if !_object_lock_guards.is_empty() {
+            notify_delete_namespace_acquired(bucket);
+        }
 
         let delete_config_snapshot = opts
             .delete_replication_config_snapshot
@@ -3057,7 +3167,18 @@ impl ECStore {
 
             let pool_opts = opts.clone();
             futures.push(async move {
+                #[cfg(test)]
+                let pool_object_names = pool_objects
+                    .iter()
+                    .map(|object| object.object_name.clone())
+                    .collect::<Vec<_>>();
                 let result = pool.delete_objects(bucket, pool_objects, pool_opts).await;
+                #[cfg(test)]
+                let result = {
+                    let mut result = result;
+                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, &mut result);
+                    result
+                };
                 (object_indices, result)
             });
         }
