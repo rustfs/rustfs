@@ -1226,12 +1226,12 @@ pub(crate) async fn make_local_two_set_sets() -> (Vec<tempfile::TempDir>, Arc<Se
     make_local_two_set_sets_with_ctx(bootstrap_ctx()).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
     make_local_two_set_sets_for_pool_with_ctx(ctx, 0).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
     ctx: Arc<InstanceContext>,
     pool_idx: usize,

@@ -1062,7 +1062,7 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     ensure_source_cleanup_versions_match(expected, &current, allowed_missing)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct SourceCleanupDeleteBarrierState {
     bucket: String,
     object: String,
@@ -1070,7 +1070,7 @@ struct SourceCleanupDeleteBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
@@ -1079,11 +1079,11 @@ pub(crate) struct SourceCleanupDeleteBarrier {
     state: Arc<SourceCleanupDeleteBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SourceCleanupDeleteBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
@@ -1116,7 +1116,7 @@ impl SourceCleanupDeleteBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for SourceCleanupDeleteBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -1130,7 +1130,7 @@ impl Drop for SourceCleanupDeleteBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
     let barrier = SOURCE_CLEANUP_DELETE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1172,7 +1172,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pause_source_cleanup_before_delete(bucket, object).await;
 
     let mut opts = ObjectOptions {

@@ -872,6 +872,34 @@ impl Operation for RebalanceStatus {
     }
 }
 
+async fn stop_rebalance_admission_first(
+    store: &Arc<ECStore>,
+    notification_sys: Option<&NotificationSys>,
+    expected_rebalance_id: &str,
+) -> S3Result<Vec<String>> {
+    store
+        .cancel_rebalance_admission_for_id(expected_rebalance_id)
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to close rebalance admission before stop: {}", e))?;
+
+    if let Some(notification_sys) = notification_sys {
+        return notification_sys
+            .stop_rebalance_failures(Some(expected_rebalance_id))
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e));
+    }
+
+    store
+        .stop_rebalance_for_id(Some(expected_rebalance_id))
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
+    store
+        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id)
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
+    Ok(Vec::new())
+}
+
 // RebalanceStop
 pub struct RebalanceStop {}
 
@@ -919,10 +947,6 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
-        store
-            .load_rebalance_meta()
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to load rebalance metadata before stop: {}", e))?;
         let expected_rebalance_id = store.current_rebalance_id().await;
 
         if !store.is_rebalance_conflicting_with_decommission().await {
@@ -935,23 +959,8 @@ impl Operation for RebalanceStop {
 
         let notification_sys = current_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
-        let mut stop_failures = Vec::new();
-        if let Some(notification_sys) = notification_sys.as_ref() {
-            stop_failures = notification_sys
-                .stop_rebalance_failures(Some(expected_rebalance_id.as_str()))
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
-        } else {
-            store
-                .stop_rebalance_for_id(Some(expected_rebalance_id.as_str()))
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
-
-            store
-                .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id.as_str())
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
-        }
+        let stop_failures =
+            stop_rebalance_admission_first(&store, notification_sys.as_deref(), expected_rebalance_id.as_str()).await?;
 
         info!(
             event = EVENT_ADMIN_REBALANCE_STATE,
@@ -1088,13 +1097,37 @@ mod rebalance_handler_tests {
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_used_pct,
-        rollback_result_label,
+        rollback_result_label, stop_rebalance_admission_first,
     };
     use crate::admin::storage_api::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_cancels_paused_entry_before_waiting_for_activation_gate() {
+        const REBALANCE_ID: &str = "admin-stop-paused-entry";
+        let mut fixture = rustfs_ecstore::api::rebalance::test_util::PausedRebalanceEntryTestFixture::new(REBALANCE_ID).await;
+        fixture.wait_until_entry_paused().await;
+
+        let stop_store = fixture.store();
+        let mut stop_task = tokio::spawn(async move { stop_rebalance_admission_first(&stop_store, None, REBALANCE_ID).await });
+        fixture.wait_until_admission_cancelled().await;
+        fixture.wait_until_stop_waiting_for_entry().await;
+        assert!(!stop_task.is_finished(), "admin stop must wait for the paused entry guard to drain");
+
+        fixture.release_entry();
+        fixture.assert_entry_cancelled().await;
+        let stop_failures = tokio::time::timeout(std::time::Duration::from_secs(5), &mut stop_task)
+            .await
+            .expect("admin stop should finish after the entry guard drains")
+            .expect("admin stop task should not panic")
+            .expect("admin stop should persist the terminal state");
+        assert!(stop_failures.is_empty());
+        assert!(!fixture.store().is_rebalance_conflicting_with_decommission().await);
+    }
 
     #[test]
     fn test_calculate_rebalance_progress_running() {

@@ -2500,6 +2500,85 @@ fn lifecycle_action_skips_heal_version(action: IlmAction) -> bool {
     action.delete()
 }
 
+#[cfg(test)]
+struct LifecycleDataMovementMutationBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct LifecycleDataMovementMutationBarrier {
+    state: Arc<LifecycleDataMovementMutationBarrierState>,
+}
+
+#[cfg(test)]
+static LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<LifecycleDataMovementMutationBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl LifecycleDataMovementMutationBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(LifecycleDataMovementMutationBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lifecycle data movement mutation barrier should not be poisoned");
+        assert!(slot.is_none(), "lifecycle data movement mutation barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("lifecycle data movement should reach its mutation boundary");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for LifecycleDataMovementMutationBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lifecycle data movement mutation barrier should not be poisoned");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
+    if !has_run_fence_signal {
+        return;
+    }
+    let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lifecycle data movement mutation barrier should not be poisoned")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
     if !apply_actions || applied {
         return Ok(true);
@@ -2548,6 +2627,8 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             Ok(false)
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
+            #[cfg(test)]
+            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }

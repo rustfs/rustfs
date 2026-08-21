@@ -786,19 +786,266 @@ impl ECStore {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util {
+    use super::super::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
+    use super::*;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::ObjectOperations as _;
+    use rustfs_filemeta::FileMeta;
+
+    pub struct PausedRebalanceEntryTestFixture {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        cancel: CancellationToken,
+        barrier: crate::data_movement::SourceCleanupDeleteBarrier,
+        stop_probe: super::super::control::RebalanceStopWaitProbe,
+        entry_task: Option<tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>>,
+    }
+
+    impl PausedRebalanceEntryTestFixture {
+        pub async fn new(rebalance_id: &'static str) -> Self {
+            let cancel = CancellationToken::new();
+            let (_temp_dirs, store) = super::super::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+                id: rebalance_id.to_string(),
+                percent_free_goal: 1.0,
+                cancel: Some(cancel.clone()),
+                pool_stats: vec![RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    buckets: vec!["bucket".to_string()],
+                    info: RebalanceInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await;
+            let bucket = "bucket";
+            let object = "delete-marker";
+            let set = store.pools[0].get_disks_by_key(object);
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("source bucket should be created");
+            set.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source delete marker should be created");
+            let source_versions = set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata should be readable")
+                .expect("source delete marker should exist");
+            assert_eq!(source_versions.versions.len(), 1);
+            assert!(source_versions.versions[0].deleted);
+            let mut file_meta = FileMeta::new();
+            for version in source_versions.versions {
+                file_meta
+                    .add_version(version)
+                    .expect("source version should encode into a metacache entry");
+            }
+            let entry = MetaCacheEntry {
+                name: object.to_string(),
+                metadata: file_meta.marshal_msg().expect("source metadata should marshal"),
+                cached: Some(file_meta),
+                reusable: false,
+            };
+            let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+            let entry_store = Arc::clone(&store);
+            let entry_set = Arc::clone(&set);
+            let entry_cancel = cancel.clone();
+            let entry_task = tokio::spawn(async move {
+                entry_store
+                    .rebalance_entry(
+                        bucket.to_string(),
+                        0,
+                        entry,
+                        entry_set,
+                        Arc::new(RebalanceBucketConfigs::default()),
+                        Arc::from(rebalance_id),
+                        entry_cancel,
+                    )
+                    .await
+            });
+
+            Self {
+                _temp_dirs,
+                store,
+                cancel,
+                barrier,
+                stop_probe: super::super::control::RebalanceStopWaitProbe::install(rebalance_id),
+                entry_task: Some(entry_task),
+            }
+        }
+
+        pub fn store(&self) -> Arc<ECStore> {
+            Arc::clone(&self.store)
+        }
+
+        pub async fn wait_until_entry_paused(&self) {
+            self.barrier.wait_until_paused().await;
+        }
+
+        pub async fn wait_until_admission_cancelled(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.cancel.cancelled())
+                .await
+                .expect("admin stop should close admission before waiting for the entry guard");
+        }
+
+        pub async fn wait_until_stop_waiting_for_entry(&self) {
+            self.stop_probe.wait_until_attempted().await;
+        }
+
+        pub fn release_entry(&self) {
+            self.barrier.release();
+        }
+
+        pub async fn assert_entry_cancelled(&mut self) {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.entry_task.take().expect("entry task should still be available"),
+            )
+            .await
+            .expect("the cancelled entry should finish")
+            .expect("entry task should not panic")
+            .expect_err("the entry must observe stop cancellation");
+            assert!(matches!(error, Error::OperationCanceled));
+        }
+    }
+
+    impl Drop for PausedRebalanceEntryTestFixture {
+        fn drop(&mut self) {
+            self.barrier.release();
+            if let Some(task) = self.entry_task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+    use crate::client::api_s3_datatypes::CompletePart;
     use crate::object_api::PutObjReader;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
-    use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
-    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::set_disk::{
+        DeleteObjectCommitBarrier, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
+        TieredMetadataCommitBarrier,
+    };
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::ObjectOperations as _;
     use http::HeaderMap;
-    use rustfs_filemeta::{FileInfo, FileMeta};
+    use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
+    use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
+
+    fn active_rebalance_meta(rebalance_id: &str) -> RebalanceMeta {
+        RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 1.0,
+            cancel: Some(CancellationToken::new()),
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    buckets: vec![crate::disk::RUSTFS_META_BUCKET.to_string()],
+                    info: RebalanceInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats::default(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn expired_delete_marker_lifecycle() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    expired_object_delete_marker: Some(true),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expired-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    async fn metacache_entry_from_source(set: &SetDisks, bucket: &str, object: &str) -> MetaCacheEntry {
+        let source_versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source metadata should be readable")
+            .expect("source version should exist");
+        let mut file_meta = FileMeta::new();
+        for version in source_versions.versions {
+            file_meta
+                .add_version(version)
+                .expect("source version should encode into a metacache entry");
+        }
+        MetaCacheEntry {
+            name: object.to_string(),
+            metadata: file_meta.marshal_msg().expect("source metadata should marshal"),
+            cached: Some(file_meta),
+            reusable: false,
+        }
+    }
+
+    fn spawn_real_rebalance_entry(
+        store: Arc<ECStore>,
+        set: Arc<SetDisks>,
+        entry: MetaCacheEntry,
+        rebalance_id: &'static str,
+        bucket_configs: Arc<RebalanceBucketConfigs>,
+    ) -> tokio::task::JoinHandle<Result<RebalanceEntryOutcome>> {
+        tokio::spawn(async move {
+            store
+                .rebalance_entry(
+                    crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    0,
+                    entry,
+                    set,
+                    bucket_configs,
+                    Arc::from(rebalance_id),
+                    CancellationToken::new(),
+                )
+                .await
+        })
+    }
+
+    async fn assert_real_entry_rejected_after_run_fence_loss(task: tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>) {
+        let error = tokio::time::timeout(StdDuration::from_secs(5), task)
+            .await
+            .expect("fenced real rebalance entry should finish")
+            .expect("rebalance entry task should not panic")
+            .expect_err("lost run fence must reject the entry commit");
+        assert!(error.to_string().contains("run fence lost"), "unexpected fence error: {error}");
+    }
 
     #[tokio::test]
     async fn rebalance_stats_wait_for_source_cleanup_result() {
@@ -942,118 +1189,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn stop_cancels_real_rebalance_entry_before_waiting_for_cleanup_guard() {
-        let rebalance_id = "rebalance-stop-entry";
-        let cancel = CancellationToken::new();
-        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
-            id: rebalance_id.to_string(),
-            percent_free_goal: 1.0,
-            cancel: Some(cancel.clone()),
-            pool_stats: vec![RebalanceStats {
-                participating: true,
-                init_capacity: 100,
-                buckets: vec!["bucket".to_string()],
-                info: RebalanceInfo {
-                    start_time: Some(OffsetDateTime::now_utc()),
-                    status: RebalStatus::Started,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
-        })
-        .await;
-        let bucket = "bucket";
-        let object = "delete-marker";
-        let set = store.pools[0].get_disks_by_key(object);
-        set.make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("source bucket should be created");
-        set.delete_object(
-            bucket,
-            object,
-            ObjectOptions {
-                versioned: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("source delete marker should be created");
-        let source_versions = set
-            .load_file_info_versions_exact(bucket, object)
-            .await
-            .expect("source metadata should be readable")
-            .expect("source delete marker should exist");
-        assert_eq!(source_versions.versions.len(), 1);
-        assert!(source_versions.versions[0].deleted);
-        let mut file_meta = FileMeta::new();
-        for version in &source_versions.versions {
-            file_meta
-                .add_version(version.clone())
-                .expect("source version should encode into a metacache entry");
-        }
-        let entry = MetaCacheEntry {
-            name: object.to_string(),
-            metadata: file_meta.marshal_msg().expect("source metadata should marshal"),
-            cached: Some(file_meta),
-            reusable: false,
-        };
-        let barrier = data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
-        let entry_store = Arc::clone(&store);
-        let entry_set = Arc::clone(&set);
-        let entry_cancel = cancel.clone();
-        let mut entry_task = tokio::spawn(async move {
-            entry_store
-                .rebalance_entry(
-                    bucket.to_string(),
-                    0,
-                    entry,
-                    entry_set,
-                    Arc::new(RebalanceBucketConfigs::default()),
-                    Arc::from(rebalance_id),
-                    entry_cancel,
-                )
-                .await
-        });
-        barrier.wait_until_paused().await;
-
-        let stop_store = Arc::clone(&store);
-        let mut stop_task = tokio::spawn(async move { stop_store.stop_rebalance_for_id(Some(rebalance_id)).await });
-        tokio::time::timeout(StdDuration::from_secs(1), cancel.cancelled())
-            .await
-            .expect("stop must cancel the in-flight entry before waiting for its guard");
-        assert!(
-            tokio::time::timeout(StdDuration::from_millis(50), &mut stop_task)
-                .await
-                .is_err(),
-            "stop must wait for the real entry cleanup guard to drain"
-        );
-
-        barrier.release();
-        let entry_error = tokio::time::timeout(StdDuration::from_secs(5), &mut entry_task)
-            .await
-            .expect("the cancelled entry should finish in bounded time")
-            .expect("entry task should not panic")
-            .expect_err("the entry must observe stop cancellation");
-        assert!(matches!(entry_error, Error::OperationCanceled));
-        tokio::time::timeout(StdDuration::from_secs(5), &mut stop_task)
-            .await
-            .expect("stop should finish after the entry guard drains")
-            .expect("stop task should not panic")
-            .expect("stop should persist the terminal state");
-        assert!(
-            store
-                .rebalance_meta
-                .read()
-                .await
-                .as_ref()
-                .is_some_and(|meta| meta.stopped_at.is_some()),
-            "stop should publish the terminal state after entry cleanup drains"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
     async fn real_rebalance_run_fence_loss_before_target_commit_preserves_target_and_source() {
         let rebalance_id = "rebalance-target-commit-fence";
         let (_temp_dirs, store, _unused_store) = crate::services::rebalance::test_two_pool_stores(Some(RebalanceMeta {
@@ -1184,5 +1319,324 @@ mod tests {
             .await
             .expect("source body should drain");
         assert_eq!(source_body, payload, "source version must remain byte-identical");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_blocks_multipart_completion() {
+        const REBALANCE_ID: &str = "rebalance-multipart-commit-fence";
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-multipart-commit-fence-object";
+        let (_temp_dirs, store, _unused_store) =
+            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let upload = source_set
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("source multipart upload should be created");
+        let mut reader = PutObjReader::from_vec(b"multipart source payload".repeat(1024));
+        let part = source_set
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source multipart part should be written");
+        source_set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source multipart object should commit");
+
+        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeQuotaRename);
+        let task = spawn_real_rebalance_entry(
+            Arc::clone(&store),
+            Arc::clone(&source_set),
+            entry,
+            REBALANCE_ID,
+            Arc::new(RebalanceBucketConfigs::default()),
+        );
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+        assert!(
+            target_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("target metadata lookup should succeed")
+                .is_none(),
+            "lost run fence must not publish the target multipart object"
+        );
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata lookup should succeed")
+                .is_some(),
+            "lost run fence must preserve the source multipart object"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_blocks_remote_tier_metadata_commit() {
+        const REBALANCE_ID: &str = "rebalance-tiered-commit-fence";
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-tiered-commit-fence-object";
+        let (_temp_dirs, store, _unused_store) =
+            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let version_id = uuid::Uuid::new_v4();
+        let source = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 32,
+            parts: vec![ObjectPartInfo {
+                number: 1,
+                size: 32,
+                actual_size: 32,
+                etag: "tiered-part".to_string(),
+                ..Default::default()
+            }],
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/rebalance-tiered-commit-fence-object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: TransitionVersionState::Exact,
+            fresh: true,
+            ..Default::default()
+        };
+        source_set
+            .decommission_tiered_object(
+                bucket,
+                object,
+                &source,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source tiered metadata should be written");
+
+        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+        let barrier = TieredMetadataCommitBarrier::install(bucket, object);
+        let task = spawn_real_rebalance_entry(
+            Arc::clone(&store),
+            Arc::clone(&source_set),
+            entry,
+            REBALANCE_ID,
+            Arc::new(RebalanceBucketConfigs::default()),
+        );
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+        assert!(
+            target_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("target metadata lookup should succeed")
+                .is_none(),
+            "lost run fence must not publish target tier metadata"
+        );
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata lookup should succeed")
+                .is_some(),
+            "lost run fence must preserve source tier metadata"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_blocks_delete_marker_commit() {
+        const REBALANCE_ID: &str = "rebalance-delete-marker-commit-fence";
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-delete-marker-commit-fence-object";
+        let (_temp_dirs, store, _unused_store) =
+            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let mut reader = PutObjReader::from_vec(b"source version beneath delete marker".to_vec());
+        source_set
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source version should be written");
+        source_set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source delete marker should be written");
+
+        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+        let barrier = DeleteObjectCommitBarrier::install(bucket, object);
+        let task = spawn_real_rebalance_entry(
+            Arc::clone(&store),
+            Arc::clone(&source_set),
+            entry,
+            REBALANCE_ID,
+            Arc::new(RebalanceBucketConfigs::default()),
+        );
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+        assert!(
+            target_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("target metadata lookup should succeed")
+                .is_none(),
+            "lost run fence must not publish the target delete marker"
+        );
+        assert_eq!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata lookup should succeed")
+                .expect("source versions should remain")
+                .versions
+                .len(),
+            2,
+            "lost run fence must preserve both source versions"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_blocks_lifecycle_mutation_dispatch() {
+        const REBALANCE_ID: &str = "rebalance-lifecycle-mutation-fence";
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-lifecycle-mutation-fence-object";
+        let (_temp_dirs, store, _unused_store) =
+            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        source_set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source delete marker should be written");
+
+        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+        let barrier = crate::core::pools::LifecycleDataMovementMutationBarrier::install(bucket, object);
+        let task = spawn_real_rebalance_entry(
+            Arc::clone(&store),
+            Arc::clone(&source_set),
+            entry,
+            REBALANCE_ID,
+            Arc::new(RebalanceBucketConfigs {
+                lifecycle_config: Some(expired_delete_marker_lifecycle()),
+                ..Default::default()
+            }),
+        );
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata lookup should succeed")
+                .is_some(),
+            "lost run fence must preserve the source before lifecycle mutation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_blocks_source_cleanup_delete() {
+        const REBALANCE_ID: &str = "rebalance-source-cleanup-fence";
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-source-cleanup-fence-object";
+        let (_temp_dirs, store, _unused_store) =
+            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        source_set
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source delete marker should be written");
+
+        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+        let barrier = data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+        let task = spawn_real_rebalance_entry(
+            Arc::clone(&store),
+            Arc::clone(&source_set),
+            entry,
+            REBALANCE_ID,
+            Arc::new(RebalanceBucketConfigs::default()),
+        );
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source metadata lookup should succeed")
+                .is_some(),
+            "lost run fence must preserve the source during cleanup"
+        );
     }
 }

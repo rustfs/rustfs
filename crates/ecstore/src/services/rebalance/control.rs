@@ -82,6 +82,75 @@ pub(super) struct RebalanceRunGuard {
     persisted_guard: rustfs_lock::NamespaceLockGuard,
 }
 
+#[cfg(any(test, feature = "test-util"))]
+struct RebalanceStopWaitProbeState {
+    expected_id: String,
+    attempted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+static REBALANCE_STOP_WAIT_PROBES: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<RebalanceStopWaitProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-util"))]
+pub(super) struct RebalanceStopWaitProbe {
+    state: Arc<RebalanceStopWaitProbeState>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl RebalanceStopWaitProbe {
+    pub(super) fn install(expected_id: &str) -> Self {
+        let state = Arc::new(RebalanceStopWaitProbeState {
+            expected_id: expected_id.to_string(),
+            attempted: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        REBALANCE_STOP_WAIT_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("rebalance stop wait probe should not be poisoned")
+            .push(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(super) async fn wait_until_attempted(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !self.state.attempted.load(std::sync::atomic::Ordering::Acquire) {
+                self.state.notify.notified().await;
+            }
+        })
+        .await
+        .expect("rebalance stop should reach the deterministic activation wait probe");
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for RebalanceStopWaitProbe {
+    fn drop(&mut self) {
+        let mut probes = REBALANCE_STOP_WAIT_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("rebalance stop wait probe should not be poisoned");
+        probes.retain(|state| !Arc::ptr_eq(state, &self.state));
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn observe_rebalance_stop_wait_attempt(expected_id: Option<&str>) {
+    let probes = REBALANCE_STOP_WAIT_PROBES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("rebalance stop wait probe should not be poisoned")
+        .clone();
+    for state in probes {
+        if expected_id == Some(state.expected_id.as_str()) {
+            state.attempted.store(true, std::sync::atomic::Ordering::Release);
+            state.notify.notify_one();
+        }
+    }
+}
+
 impl RebalanceRunGuard {
     pub(super) fn ensure_held(&self, stage: &str) -> Result<()> {
         #[cfg(test)]
@@ -945,6 +1014,24 @@ impl ECStore {
             .and_then(|meta| (!meta.id.is_empty()).then(|| meta.id.clone()))
     }
 
+    pub async fn cancel_rebalance_admission_for_id(&self, expected_id: &str) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "cancel rebalance admission")?;
+        let meta = rebalance_meta
+            .as_mut()
+            .ok_or_else(|| rebalance_metadata_not_initialized_error("cancel rebalance admission"))?;
+        if meta.stopped_at.is_some() || !is_rebalance_conflicting_with_decommission(meta) {
+            return Err(Error::other(format!(
+                "inactive rebalance rejected while cancelling admission: {expected_id}"
+            )));
+        }
+        meta.cancel
+            .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+            .cancel();
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance(self: &Arc<Self>) -> Result<()> {
         self.stop_rebalance_for_id(None).await
@@ -965,7 +1052,11 @@ impl ECStore {
             })
         };
         let _activation_guard = match activation_gate {
-            Some(gate) => Some(gate.write_owned().await),
+            Some(gate) => {
+                #[cfg(any(test, feature = "test-util"))]
+                observe_rebalance_stop_wait_attempt(expected_id);
+                Some(gate.write_owned().await)
+            }
             None => None,
         };
         let meta_to_save = {
@@ -1060,6 +1151,46 @@ mod tests {
     use crate::core::pools::{PoolActivationStartKind, PoolActivationStartProbe};
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
+
+    #[tokio::test]
+    async fn cancel_rebalance_admission_is_id_checked_and_idempotent() {
+        let rebalance_id = "rebalance-admission-current";
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 1.0,
+            cancel: Some(cancel.clone()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                init_capacity: 100,
+                info: RebalanceInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+
+        let error = store
+            .cancel_rebalance_admission_for_id("rebalance-admission-replacement")
+            .await
+            .expect_err("a stale admin stop must not cancel the current run");
+        assert!(error.to_string().contains("expected rebalance-admission-replacement"));
+        assert!(!cancel.is_cancelled());
+
+        store
+            .cancel_rebalance_admission_for_id(rebalance_id)
+            .await
+            .expect("the current run admission should close");
+        store
+            .cancel_rebalance_admission_for_id(rebalance_id)
+            .await
+            .expect("retrying admission cancellation should be idempotent");
+        assert!(cancel.is_cancelled());
+    }
 
     async fn assert_real_activation_start_race(paused_kind: PoolActivationStartKind) {
         let (_temp_dirs, rebalance_store, decommission_store) = crate::services::rebalance::test_two_pool_stores(None).await;
