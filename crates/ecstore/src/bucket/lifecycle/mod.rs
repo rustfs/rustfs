@@ -31,3 +31,5 @@ pub mod tier_free_version_recovery;
 pub mod tier_last_day_stats;
 pub mod tier_sweeper;
 pub mod transition_transaction;
+
+pub(crate) const ILM_META_PREFIX: &str = "ilm";
