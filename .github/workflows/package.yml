@@ -189,6 +189,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - arch: x86_64
@@ -510,14 +511,12 @@ jobs:
 
           CHECKSUM_DIR="$(mktemp -d)"
           gh release download "$TAG" -p 'SHA256SUMS' -p 'SHA512SUMS' \
-            -D "$CHECKSUM_DIR" --clobber 2>/dev/null || true
+            -D "$CHECKSUM_DIR" --clobber
 
           for spec in "SHA256SUMS:sha256sum" "SHA512SUMS:sha512sum"; do
             asset="${spec%%:*}"
             checksum_cmd="${spec##*:}"
             checksum_file="${CHECKSUM_DIR}/${asset}"
-
-            touch "$checksum_file"
 
             for f in "$DEB_FILE" "$RPM_FILE"; do
               if [[ -n "$f" && -f "$f" ]]; then
@@ -531,7 +530,8 @@ jobs:
                 grep -Fv -- "$base" "$checksum_file" > "${checksum_file}.tmp" || true
                 grep -Fv -- "$github_base" "${checksum_file}.tmp" > "${checksum_file}.tmp2" || true
                 mv "${checksum_file}.tmp2" "$checksum_file"
-                (cd "$(dirname "$f")" && "$checksum_cmd" -- "$github_base") >> "$checksum_file"
+                digest=$("$checksum_cmd" -- "$f" | awk '{print $1}')
+                printf '%s  %s\n' "$digest" "$github_base" >> "$checksum_file"
               fi
             done
 
