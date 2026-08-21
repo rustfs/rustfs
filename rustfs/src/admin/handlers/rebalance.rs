@@ -177,12 +177,15 @@ async fn rollback_cluster_rebalance_start(
                 terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
                 terminal_reload_failures: terminal_reload_failures.clone(),
             };
-            store.record_rebalance_stop_propagation(record).await.map_err(|err| {
-                format!(
-                    "cluster rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; {}",
-                    rebalance_rollback_failure_message(rebalance_id, &stop_failures, &terminal_reload_failures)
-                )
-            })?;
+            store
+                .record_rebalance_stop_propagation(rebalance_id, record)
+                .await
+                .map_err(|err| {
+                    format!(
+                        "cluster rebalance rollback for {rebalance_id} partial; failed to persist stop propagation: {err}; {}",
+                        rebalance_rollback_failure_message(rebalance_id, &stop_failures, &terminal_reload_failures)
+                    )
+                })?;
             return Err(rebalance_rollback_failure_message(
                 rebalance_id,
                 &stop_failures,
@@ -197,7 +200,7 @@ async fn rollback_cluster_rebalance_start(
         .await
         .map_err(|err| format!("local stop_rebalance rollback for {rebalance_id} failed: {err}"))?;
     store
-        .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
+        .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, rebalance_id)
         .await
         .map_err(|err| format!("local rollback stop metadata save for {rebalance_id} failed: {err}"))?;
     Ok(())
@@ -679,7 +682,7 @@ impl Operation for RebalanceStart {
                                     terminal_reload_attempt_at: Some(terminal_reload_attempt_at),
                                     terminal_reload_failures: terminal_reload_failures.clone(),
                                 };
-                                store.record_rebalance_stop_propagation(record).await.map_err(|err| {
+                                store.record_rebalance_stop_propagation(&id, record).await.map_err(|err| {
                                     rebalance_internal_error(format!(
                                         "failed to persist rebalance local-start rollback propagation metadata: {err}"
                                     ))
@@ -926,23 +929,26 @@ impl Operation for RebalanceStop {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
+        let Some(expected_rebalance_id) = expected_rebalance_id else {
+            return Err(s3_error!(InternalError, "active rebalance metadata has no activation id"));
+        };
 
         let notification_sys = current_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
         let mut stop_failures = Vec::new();
         if let Some(notification_sys) = notification_sys.as_ref() {
             stop_failures = notification_sys
-                .stop_rebalance_failures(expected_rebalance_id.as_deref())
+                .stop_rebalance_failures(Some(expected_rebalance_id.as_str()))
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to stop rebalance via notification system: {}", e))?;
         } else {
             store
-                .stop_rebalance_for_id(expected_rebalance_id.as_deref())
+                .stop_rebalance_for_id(Some(expected_rebalance_id.as_str()))
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to stop rebalance: {}", e))?;
 
             store
-                .save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt)
+                .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_rebalance_id.as_str())
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop metadata: {}", e))?;
         }
@@ -1007,7 +1013,7 @@ impl Operation for RebalanceStop {
                 terminal_reload_failures: terminal_reload_failures.clone(),
             };
             store
-                .record_rebalance_stop_propagation(record)
+                .record_rebalance_stop_propagation(expected_rebalance_id.as_str(), record)
                 .await
                 .map_err(|e| s3_error!(InternalError, "failed to persist rebalance stop propagation metadata: {}", e))?;
 

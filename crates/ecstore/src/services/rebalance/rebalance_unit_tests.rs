@@ -2775,6 +2775,10 @@ async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
             .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, "rebalance-a")
             .await
             .expect_err("old save task must not persist replacement metadata"),
+        store
+            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, "rebalance-a")
+            .await
+            .expect_err("old stop path must not persist replacement metadata"),
     ] {
         assert!(err.to_string().contains("stale rebalance worker rejected"));
     }
@@ -2785,10 +2789,11 @@ async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
     assert!(meta.pool_stats[0].rebalanced_buckets.is_empty());
     assert_eq!(meta.pool_stats[0].bytes, 0);
     assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+    assert!(meta.stopped_at.is_none());
 }
 
 #[tokio::test]
-async fn test_stop_waits_for_active_rebalance_side_effect_guard() {
+async fn test_stop_waits_for_active_rebalance_migration_guard() {
     let meta = RebalanceMeta {
         id: "rebalance-a".to_string(),
         pool_stats: vec![RebalanceStats {
@@ -2803,9 +2808,9 @@ async fn test_stop_waits_for_active_rebalance_side_effect_guard() {
     };
     let store = test_store_with_rebalance_meta(meta);
     let run_guard = store
-        .rebalance_run_guard("rebalance-a", "test side effect")
+        .rebalance_run_guard("rebalance-a", "rebalance remote-tier migration")
         .await
-        .expect("active run should admit the side effect");
+        .expect("active run should admit the remote-tier migration");
     let mut stop = Box::pin(store.stop_rebalance_for_id(Some("rebalance-a")));
     let mut context = Context::from_waker(futures::task::noop_waker_ref());
 
@@ -2832,6 +2837,52 @@ async fn test_stop_waits_for_active_rebalance_side_effect_guard() {
             .is_some_and(|meta| meta.stopped_at.is_some()),
         "stop should commit after the production side-effect fence is released"
     );
+}
+
+#[tokio::test]
+async fn test_rebalance_metadata_reload_under_start_gate_does_not_reacquire_gate() {
+    let store = test_store_with_rebalance_meta(RebalanceMeta::default());
+    let _start_guard = store.start_gate.lock().await;
+
+    let err = store
+        .load_rebalance_meta_under_start_gate()
+        .await
+        .expect_err("empty test store should reach the metadata load without waiting on start_gate again");
+
+    assert!(err.to_string().contains("no pools available"));
+}
+
+#[tokio::test]
+async fn test_stale_stop_propagation_cannot_mutate_replacement_rebalance() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let record = RebalanceStopPropagationRecord {
+        stop_failures: vec!["old rebalance stop failed".to_string()],
+        ..Default::default()
+    };
+
+    let err = store
+        .record_rebalance_stop_propagation("rebalance-a", record)
+        .await
+        .expect_err("old propagation failure must not mutate replacement metadata");
+
+    assert!(err.to_string().contains("stale rebalance worker rejected"));
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.last_refreshed_at.is_none());
+    assert!(meta.pool_stats[0].info.last_error.is_none());
 }
 
 fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {

@@ -2639,6 +2639,11 @@ impl ECStore {
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
     }
 
+    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self) -> Result<()> {
+        self.load_rebalance_meta_under_start_gate().await?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
+    }
+
     pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
         let space_info = self.get_decommission_pool_space_info(idx).await?;
 
@@ -4148,7 +4153,8 @@ impl ECStore {
         }
 
         let _start_guard = self.start_gate.lock().await;
-        self.ensure_decommission_rebalance_idle_after_refresh().await?;
+        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate()
+            .await?;
 
         let all_space_infos = self.get_decommission_all_pool_space_infos().await?;
         {

@@ -330,6 +330,10 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
         let _start_guard = self.start_gate.lock().await;
+        self.load_rebalance_meta_under_start_gate().await
+    }
+
+    pub(crate) async fn load_rebalance_meta_under_start_gate(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
         debug!(
             event = EVENT_REBALANCE_STATE,
@@ -867,27 +871,31 @@ impl ECStore {
         Ok(())
     }
 
-    pub async fn record_rebalance_stop_propagation(self: &Arc<Self>, record: RebalanceStopPropagationRecord) -> Result<()> {
+    pub async fn record_rebalance_stop_propagation(
+        self: &Arc<Self>,
+        expected_id: &str,
+        record: RebalanceStopPropagationRecord,
+    ) -> Result<()> {
         if !record.has_failures() {
             return Ok(());
         }
 
+        let _start_guard = self.start_gate.lock().await;
+        let _activation_guard = self
+            .rebalance_activation_write_guard(Some(expected_id), "record rebalance stop propagation")
+            .await?;
         let encoded_error = encode_rebalance_stop_propagation_record(&record);
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
+            ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "record rebalance stop propagation")?;
             record_rebalance_stop_propagation_snapshot(rebalance_meta.as_mut(), encoded_error, OffsetDateTime::now_utc())
         };
 
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "record_rebalance_stop_propagation: no pools available")?;
             resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_for_id_with_merge(
-                    pool,
-                    &meta_to_save,
-                    "record_rebalance_stop_propagation",
-                    meta_to_save.id.as_str(),
-                )
-                .await,
+                self.save_rebalance_meta_for_id_with_merge(pool, &meta_to_save, "record_rebalance_stop_propagation", expected_id)
+                    .await,
                 "record_rebalance_stop_propagation",
             )?;
         }

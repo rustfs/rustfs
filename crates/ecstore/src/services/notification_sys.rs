@@ -1121,15 +1121,19 @@ impl NotificationSys {
             }
         }
 
-        match store.stop_rebalance_for_id(expected_rebalance_id).await {
+        let local_rebalance_id = match expected_rebalance_id {
+            Some(expected_id) => Some(expected_id.to_owned()),
+            None => store.current_rebalance_id().await,
+        };
+        match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
             Ok(_) => {
-                let save_result = match expected_rebalance_id {
+                let save_result = match local_rebalance_id.as_deref() {
                     Some(expected_id) => {
                         store
                             .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
                             .await
                     }
-                    None => store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await,
+                    None => Ok(()),
                 };
                 if let Err(err) = save_result {
                     error!(

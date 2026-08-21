@@ -220,33 +220,22 @@ impl ECStore {
             let expected_bucket_incarnation_id = bucket_configs.bucket_incarnation_id;
             let mut transfer = |src_pool_idx: usize, bucket: String, rd: GetObjectReader| {
                 let store = self.clone();
-                let rebalance_id = Arc::clone(&rebalance_id);
                 async move {
-                    let run_guard = store
-                        .rebalance_run_guard(rebalance_id.as_ref(), "rebalance object migration")
-                        .await?;
-                    let result = store
+                    store
                         .clone()
                         .rebalance_object(src_pool_idx, bucket, rd, expected_bucket_incarnation_id)
-                        .await;
-                    drop(run_guard);
-                    result
+                        .await
                 }
             };
             // Route delete-marker migration through the store layer so it lands on the
             // cross-pool target (excluding the source pool), not back onto the source set.
             let mut delete_marker = |bucket: String, object: String, opts: ObjectOptions| {
                 let store = self.clone();
-                let rebalance_id = Arc::clone(&rebalance_id);
-                async move {
-                    let run_guard = store
-                        .rebalance_run_guard(rebalance_id.as_ref(), "rebalance delete-marker migration")
-                        .await?;
-                    let result = store.delete_object(&bucket, &object, opts).await;
-                    drop(run_guard);
-                    result
-                }
+                async move { store.delete_object(&bucket, &object, opts).await }
             };
+            let run_guard = self
+                .rebalance_run_guard(rebalance_id.as_ref(), "rebalance version migration")
+                .await?;
             let result = migrate_entry_version(
                 &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref()),
                 bucket.clone(),
@@ -260,6 +249,7 @@ impl ECStore {
                 &mut delete_marker,
             )
             .await;
+            drop(run_guard);
 
             if result.ignored {
                 if should_count_rebalance_version_complete(&result) {

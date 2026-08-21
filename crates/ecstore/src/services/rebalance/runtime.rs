@@ -673,7 +673,7 @@ impl ECStore {
         self.save_rebalance_stats_inner(pool_idx, opt, None).await
     }
 
-    pub(crate) async fn save_rebalance_stats_for_id(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: &str) -> Result<()> {
+    pub async fn save_rebalance_stats_for_id(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: &str) -> Result<()> {
         self.save_rebalance_stats_inner(pool_idx, opt, Some(expected_id)).await
     }
 
