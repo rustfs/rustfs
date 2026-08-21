@@ -4588,11 +4588,11 @@ fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
 }
 
 fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool {
-    opts.delete_marker || (opts.versioned && opts.version_id.is_none() && !opts.data_movement)
+    opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
-    let mut mark_delete = goi.version_id.is_some() || (opts.versioned && opts.version_id.is_none());
+    let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
     if opts.version_id.is_some() {

@@ -416,7 +416,8 @@ impl ECStore {
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         if self.single_pool() {
-            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence);
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
+                .await;
             return self.pools[0]
                 .new_multipart_upload(bucket, object, &opts)
                 .await
@@ -432,7 +433,8 @@ impl ECStore {
                     opts.version_id.clone().unwrap_or_default(),
                 ));
             }
-            self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+            self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+                .await;
             let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
@@ -456,7 +458,8 @@ impl ECStore {
             .await?;
 
             if !res.uploads.is_empty() {
-                self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+                self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+                    .await;
                 let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
                 return Ok((res, idx, opts.expected_bucket_incarnation_id));
             }
@@ -470,7 +473,8 @@ impl ECStore {
             ));
         }
 
-        self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+        self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+            .await;
         let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
         Ok((res, idx, opts.expected_bucket_incarnation_id))
     }
@@ -744,7 +748,8 @@ impl ECStore {
             snapshot.add_lock_fences(&mut opts);
             opts.object_lock_config_snapshot = Some(snapshot);
         }
-        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence);
+        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence)
+            .await;
         #[cfg(test)]
         pause_data_movement_multipart_before_selected_completion(bucket).await;
         let pool = self

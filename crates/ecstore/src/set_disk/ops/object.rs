@@ -5900,6 +5900,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if dobj.version_id.is_none() && (version_suspended || versioned) {
                 vr.mod_time = Some(OffsetDateTime::now_utc());
                 vr.deleted = true;
+                vr.mark_deleted = true;
                 if versioned {
                     vr.version_id = Some(Uuid::new_v4());
                 }

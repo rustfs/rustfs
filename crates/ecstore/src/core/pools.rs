@@ -4484,15 +4484,20 @@ impl ECStore {
     ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
-        let result = data_movement::migrate_decommission_object(
+        let mut migration = tokio::task::JoinSet::new();
+        migration.spawn(data_movement::migrate_decommission_object(
             self,
             pool_idx,
             bucket.clone(),
             rd,
             expected_bucket_incarnation_id,
             "decommission_object",
-        )
-        .await;
+        ));
+        let result = migration
+            .join_next()
+            .await
+            .ok_or_else(|| Error::other("decommission migration task was not started"))?
+            .map_err(|err| Error::other(format!("decommission migration task join error: {err}")))?;
         if result.is_ok() {
             warn!("decommission_object: migrated {} {}", &bucket, &object_name);
         }
