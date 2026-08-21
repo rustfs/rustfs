@@ -1243,7 +1243,7 @@ fn resolve_batch_delete_pool_results<'a>(
 ) -> (Option<DeletedObject>, Option<Error>, bool) {
     let mut failure = initial_error.map(|err| (None, err));
     let mut deleted = None;
-    let mut fallback = None;
+    let mut fallback: Option<(DeletedObject, Option<Error>)> = None;
     let mut attempted = false;
 
     for (pool_delete, pool_error) in pool_results {
