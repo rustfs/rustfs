@@ -2932,6 +2932,110 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn decommission_source_cleanup_holds_hashed_set_lock_across_preflight() {
+        let temp_dir = tempfile::tempdir().expect("create multi-set decommission cleanup store dir");
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "multi-set-decommission-source-cleanup",
+            &[(2, 4)],
+            CancellationToken::new(),
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("multi-set-decommission-source-cleanup-{}", uuid::Uuid::new_v4());
+        let object = (0..128)
+            .map(|index| format!("object-{index}.bin"))
+            .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == 1)
+            .expect("the deterministic object search should select source set 1");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create multi-set decommission cleanup bucket");
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        store.pools[0]
+            .put_object(&bucket, &object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write the source generation to set 1");
+        let source_set = store.pools[0].get_disks_by_key(&object);
+        assert_eq!(source_set.set_index, 1, "the source must not share the fixed set-0 namespace");
+        let expected_source_versions = source_set
+            .load_file_info_versions_exact(&bucket, &object)
+            .await
+            .expect("source versions should be readable")
+            .expect("the source generation should exist");
+
+        let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, &object);
+        let cleanup_store = Arc::clone(&store);
+        let cleanup_bucket = bucket.clone();
+        let cleanup_object = object.clone();
+        let cleanup = tokio::spawn(async move {
+            let mutation_fence = cleanup_store
+                .acquire_decommission_source_cleanup_fence(&cleanup_bucket, &cleanup_object, source_set.as_ref())
+                .await?;
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                source_set,
+                &cleanup_bucket,
+                &cleanup_object,
+                &expected_source_versions,
+                &[],
+                crate::data_movement::SourceCleanupBucketFence {
+                    object_mutation_fence: Some(&mutation_fence),
+                    ..Default::default()
+                },
+                "test_multi_set_decommission_source_cleanup",
+            )
+            .await
+        });
+        cleanup_barrier.wait_until_paused().await;
+
+        let put_barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            &object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let mutation_pool = Arc::clone(&store.pools[0]);
+        let mutation_bucket = bucket.clone();
+        let mutation_object = object.clone();
+        let replacement = b"replacement generation".to_vec();
+        let expected_replacement = replacement.clone();
+        let mutation = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(replacement);
+            mutation_pool
+                .put_object(&mutation_bucket, &mutation_object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        put_barrier.wait_until_paused().await;
+        put_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(!mutation.is_finished(), "a source mutation must wait behind cleanup's set-1 write lock");
+
+        cleanup_barrier.release();
+        cleanup
+            .await
+            .expect("source cleanup task should join")
+            .expect("source cleanup should remove only the preflight generation");
+        mutation
+            .await
+            .expect("source mutation task should join")
+            .expect("source mutation should commit after cleanup releases the set lock");
+
+        let mut reader = store.pools[0]
+            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the replacement generation must remain readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read the replacement generation");
+        assert_eq!(actual, expected_replacement, "cleanup must not delete the replacement generation");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn versioned_delete_marker_survives_decommission_source_cleanup() {
         let temp_dir = tempfile::tempdir().expect("create versioned decommission delete-fence store dir");
         let (_ctx, store, shutdown) =

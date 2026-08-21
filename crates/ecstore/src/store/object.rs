@@ -1753,9 +1753,10 @@ impl ECStore {
         #[cfg(test)]
         crate::data_movement::notify_source_cleanup_mutation_fence_pending(bucket, object);
         let object = encode_dir_object(object);
-        let distributed = self.ctx.is_dist_erasure().await;
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
-        let source_lock_covered = !distributed || same_distributed_lock_domain(&fixed_set.lockers, &source_set.lockers);
+        // SetDisks namespaces include pool/set identity, so only the canonical
+        // fixed set is covered by the fixed mutation guard.
+        let source_lock_covered = std::ptr::eq(fixed_set.as_ref(), source_set);
         // Lock order: fixed store mutation domain first; source cleanup takes its
         // hashed source-domain lock second only when this guard does not cover it.
         let guard = self
