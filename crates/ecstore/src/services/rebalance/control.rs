@@ -907,7 +907,6 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::{DiskAPI as _, RUSTFS_META_BUCKET};
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::hermetic_set_disks_isolated;
 
@@ -938,12 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebalance_merge_save_does_not_commit_after_namespace_fence_loss() {
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_isolated(4).await;
-        for disk in &disk_stores {
-            disk.make_volume(RUSTFS_META_BUCKET)
-                .await
-                .expect("metadata volume should be created");
-        }
+        let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks_isolated(4).await;
 
         let persisted = RebalanceMeta {
             id: "rebalance-a".to_string(),
