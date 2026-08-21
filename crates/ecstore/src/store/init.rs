@@ -2971,6 +2971,196 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn reverse_decommission_reuses_fixed_target_fence_for_put_and_multipart() {
+        let temp_dir = tempfile::tempdir().expect("create reverse decommission store dir");
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "reverse-decommission-fixed-target",
+            &[(1, 4), (1, 4)],
+            CancellationToken::new(),
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("reverse-decommission-fixed-target-{}", uuid::Uuid::new_v4());
+        let object = "ordinary.bin";
+        let object_body = b"reverse ordinary generation".to_vec();
+        let multipart_object = "multipart.bin";
+        let first_part = vec![b'm'; 5 * 1024 * 1024];
+        let second_part = b"reverse multipart tail".to_vec();
+        let mut multipart_body = first_part.clone();
+        multipart_body.extend_from_slice(&second_part);
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create reverse decommission bucket");
+        let mut source = PutObjReader::from_vec(object_body.clone());
+        store.pools[1]
+            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write ordinary source object to pool 1");
+
+        let upload = store.pools[1]
+            .new_multipart_upload(&bucket, multipart_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload in pool 1");
+        let mut completed_parts = Vec::with_capacity(2);
+        for (part_number, bytes) in [(1, first_part.as_slice()), (2, second_part.as_slice())] {
+            let mut reader = PutObjReader::from_vec(bytes.to_vec());
+            let part = store.pools[1]
+                .put_object_part(
+                    &bucket,
+                    multipart_object,
+                    &upload.upload_id,
+                    part_number,
+                    &mut reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("write source multipart part");
+            completed_parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        store.pools[1]
+            .clone()
+            .complete_multipart_upload(&bucket, multipart_object, &upload.upload_id, completed_parts, &ObjectOptions::default())
+            .await
+            .expect("complete source multipart object in pool 1");
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[1].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+        }
+        assert!(store.is_suspended(1).await, "pool 1 must be the reverse decommission source");
+
+        let commit_barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let source_set = store.pools[1].get_disks_by_key(object);
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    1,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    worker_bucket,
+                    source_set,
+                )
+                .await
+        });
+        commit_barrier.wait_until_paused().await;
+
+        let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(&delete_bucket, object, ObjectOptions::default())
+                .await
+        });
+        delete_barrier.wait_until_paused().await;
+        delete_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !delete_barrier.namespace_acquired() && !delete.is_finished(),
+            "the reverse target commit must keep DELETE behind the fixed read fence"
+        );
+        delete.abort();
+        assert!(
+            delete
+                .await
+                .expect_err("the blocked DELETE should be canceled")
+                .is_cancelled(),
+            "canceling the blocked DELETE must not mutate either pool"
+        );
+        drop(delete_barrier);
+
+        commit_barrier.release();
+        drop(commit_barrier);
+        tokio::time::timeout(Duration::from_secs(60), worker)
+            .await
+            .expect("reverse ordinary decommission must not self-deadlock on the fixed target set")
+            .expect("reverse ordinary decommission worker should join")
+            .expect("reverse ordinary decommission should complete");
+
+        let mut ordinary_reader = store.pools[0]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read the ordinary object from the fixed target set");
+        let mut ordinary_target_body = Vec::new();
+        ordinary_reader
+            .stream
+            .read_to_end(&mut ordinary_target_body)
+            .await
+            .expect("drain the ordinary target body");
+        assert_eq!(ordinary_target_body, object_body, "ordinary migration must preserve the full body");
+        let ordinary_source_err = store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("ordinary source generation must be cleaned after migration");
+        assert!(matches!(ordinary_source_err, StorageError::ObjectNotFound(_, _)));
+
+        let multipart_source_set = store.pools[1].get_disks_by_key(multipart_object);
+        let multipart_store = Arc::clone(&store);
+        let multipart_bucket = bucket.clone();
+        let multipart_worker = tokio::spawn(async move {
+            multipart_store
+                .decommission_entry_for_test(
+                    1,
+                    MetaCacheEntry {
+                        name: multipart_object.to_string(),
+                        ..Default::default()
+                    },
+                    multipart_bucket,
+                    multipart_source_set,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), multipart_worker)
+            .await
+            .expect("reverse multipart decommission must not self-deadlock on new or complete")
+            .expect("reverse multipart decommission worker should join")
+            .expect("reverse multipart decommission should complete");
+
+        let target_info = store.pools[0]
+            .get_object_info(&bucket, multipart_object, &ObjectOptions::default())
+            .await
+            .expect("read migrated multipart metadata from the fixed target set");
+        assert!(target_info.is_multipart(), "migration must retain multipart identity");
+        let mut multipart_reader = store.pools[0]
+            .get_object_reader(&bucket, multipart_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read migrated multipart object from the fixed target set");
+        let mut multipart_target_body = Vec::new();
+        multipart_reader
+            .stream
+            .read_to_end(&mut multipart_target_body)
+            .await
+            .expect("drain the multipart target body");
+        assert_eq!(multipart_target_body, multipart_body, "multipart migration must preserve the full body");
+        let multipart_source_err = store.pools[1]
+            .get_object_info(&bucket, multipart_object, &ObjectOptions::default())
+            .await
+            .expect_err("multipart source generation must be cleaned after migration");
+        assert!(matches!(multipart_source_err, StorageError::ObjectNotFound(_, _)));
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn batch_delete_real_path_preserves_source_pool_errors_in_any_pool_order() {
         let temp_dir = tempfile::tempdir().expect("create batch delete pool-error store dir");
         let (_ctx, store, shutdown) =

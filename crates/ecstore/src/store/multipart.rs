@@ -400,7 +400,7 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartUploadResult> {
-        self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts)
+        self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts, None)
             .await
             .map(|(res, _, _)| res)
     }
@@ -410,20 +410,21 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
         check_new_multipart_args(bucket, object)?;
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        let opts = &opts;
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         if self.single_pool() {
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence);
             return self.pools[0]
-                .new_multipart_upload(bucket, object, opts)
+                .new_multipart_upload(bucket, object, &opts)
                 .await
                 .map(|res| (res, 0, opts.expected_bucket_incarnation_id));
         }
 
         if opts.data_movement && opts.version_id.is_some() {
-            let idx = self.select_data_movement_pool_idx(bucket, object, -1, opts, false).await?;
+            let idx = self.select_data_movement_pool_idx(bucket, object, -1, &opts, false).await?;
             if idx == opts.src_pool_idx {
                 return Err(StorageError::DataMovementOverwriteErr(
                     bucket.to_owned(),
@@ -431,7 +432,8 @@ impl ECStore {
                     opts.version_id.clone().unwrap_or_default(),
                 ));
             }
-            let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+            self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+            let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
 
@@ -454,7 +456,8 @@ impl ECStore {
             .await?;
 
             if !res.uploads.is_empty() {
-                let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+                self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+                let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
                 return Ok((res, idx, opts.expected_bucket_incarnation_id));
             }
         }
@@ -467,7 +470,8 @@ impl ECStore {
             ));
         }
 
-        let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
+        self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence);
+        let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
         Ok((res, idx, opts.expected_bucket_incarnation_id))
     }
 
@@ -710,6 +714,7 @@ impl ECStore {
         upload_id: &str,
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
         if !opts.data_movement {
@@ -739,6 +744,7 @@ impl ECStore {
             snapshot.add_lock_fences(&mut opts);
             opts.object_lock_config_snapshot = Some(snapshot);
         }
+        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence);
         #[cfg(test)]
         pause_data_movement_multipart_before_selected_completion(bucket).await;
         let pool = self

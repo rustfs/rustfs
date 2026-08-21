@@ -1447,11 +1447,8 @@ async fn migrate_object_inner(
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
         new_multipart_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-        if let Some(fence) = mutation_fence {
-            fence.add_namespace_lock_fence(&mut new_multipart_opts);
-        }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
-            .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts)
+            .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts, mutation_fence)
             .await
         {
             Ok(res) => res,
@@ -1546,9 +1543,6 @@ async fn migrate_object_inner(
                     )
                 })?;
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
-            if let Some(fence) = mutation_fence {
-                fence.add_namespace_lock_fence(&mut complete_multipart_opts);
-            }
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement(
@@ -1558,6 +1552,7 @@ async fn migrate_object_inner(
                     &res.upload_id,
                     parts,
                     &complete_multipart_opts,
+                    mutation_fence,
                 )
                 .await
             {
@@ -1712,11 +1707,8 @@ async fn migrate_object_inner(
 
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-    if let Some(fence) = mutation_fence {
-        fence.add_namespace_lock_fence(&mut put_opts);
-    }
     let (target_pool_idx, put_result) = store
-        .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts)
+        .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts, mutation_fence)
         .await
         .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", &bucket, &object_info.name, err))?;
     if let Err(err) = put_result {
