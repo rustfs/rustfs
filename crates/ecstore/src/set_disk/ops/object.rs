@@ -7613,7 +7613,7 @@ mod object_encryption_resolver_wiring_tests {
 }
 
 #[cfg(test)]
-pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
+pub(crate) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
@@ -7678,9 +7678,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     /// for tests that never touch context-resolved services registered on the
     /// ambient context (tier config manager, expiry state, ...), because the
     /// isolated context starts every one of those cells fresh.
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_isolated(
-        disk_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
     }
 

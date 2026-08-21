@@ -877,21 +877,17 @@ pub(crate) struct PoolRebalanceActivationFence {
 
 impl PoolRebalanceActivationFence {
     pub(crate) fn ensure_held(&self) -> Result<()> {
-        ensure_activation_locks_held(self.pool_meta_guard.is_lock_lost(), self.rebalance_meta_guard.is_lock_lost())
+        if self.pool_meta_guard.is_lock_lost() || self.rebalance_meta_guard.is_lock_lost() {
+            return Err(Error::other("activation lock lost before metadata commit or worker admission"));
+        }
+
+        Ok(())
     }
 
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
         opts.add_namespace_lock_guard(&self.pool_meta_guard);
         opts.add_namespace_lock_guard(&self.rebalance_meta_guard);
     }
-}
-
-fn ensure_activation_locks_held(pool_lock_lost: bool, rebalance_lock_lost: bool) -> Result<()> {
-    if pool_lock_lost || rebalance_lock_lost {
-        return Err(Error::other("activation lock lost before metadata commit or worker admission"));
-    }
-
-    Ok(())
 }
 
 pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(pool: Arc<S>) -> Result<PoolRebalanceActivationFence>
@@ -5346,7 +5342,7 @@ mod pools_tests {
         apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
-        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency, ensure_activation_locks_held,
+        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
         ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
@@ -5490,16 +5486,6 @@ mod pools_tests {
                 .expect("activation lock recorder should not be poisoned"),
             vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
         );
-    }
-
-    #[test]
-    fn test_activation_fence_rejects_either_lost_guard_before_commit() {
-        assert!(ensure_activation_locks_held(false, false).is_ok());
-        for (pool_lost, rebalance_lost) in [(true, false), (false, true), (true, true)] {
-            let err = ensure_activation_locks_held(pool_lost, rebalance_lost)
-                .expect_err("either lost activation guard must fence the commit");
-            assert!(err.to_string().contains("activation lock lost"));
-        }
     }
 
     #[test]

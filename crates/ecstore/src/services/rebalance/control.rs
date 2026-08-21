@@ -907,6 +907,9 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::{DiskAPI as _, RUSTFS_META_BUCKET};
+    use crate::object_api::NamespaceLockFence;
+    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
 
     #[test]
     fn rebalance_activation_rejects_persisted_decommission_despite_idle_local_snapshot() {
@@ -931,6 +934,60 @@ mod tests {
     #[test]
     fn rebalance_activation_allows_persisted_idle_pool_meta() {
         assert!(ensure_rebalance_activation_pool_meta_allowed(&PoolMeta::default()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rebalance_merge_save_does_not_commit_after_namespace_fence_loss() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_isolated(4).await;
+        for disk in &disk_stores {
+            disk.make_volume(RUSTFS_META_BUCKET)
+                .await
+                .expect("metadata volume should be created");
+        }
+
+        let persisted = RebalanceMeta {
+            id: "rebalance-a".to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                bytes: 1,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        persisted
+            .save(set_disks.clone())
+            .await
+            .expect("baseline rebalance metadata should be saved");
+
+        let mut update = persisted.clone();
+        update.pool_stats[0].bytes = 999;
+        let err = merge_and_save_rebalance_meta_no_lock(
+            set_disks.clone(),
+            &update,
+            "lost namespace fence test",
+            ObjectOptions {
+                no_lock: true,
+                namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                ..Default::default()
+            },
+            None,
+            Some(persisted.id.as_str()),
+        )
+        .await
+        .expect_err("lost namespace fence must reject the metadata commit");
+        assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+
+        let mut after = RebalanceMeta::new();
+        after
+            .load(set_disks)
+            .await
+            .expect("baseline rebalance metadata should remain readable");
+        assert_eq!(after.id, persisted.id);
+        assert_eq!(after.pool_stats[0].bytes, 1);
     }
 
     #[test]
