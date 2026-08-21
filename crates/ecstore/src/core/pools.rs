@@ -3416,6 +3416,9 @@ impl ECStore {
             )
             .await?;
 
+            let source_cleanup_mutation_fence = self
+                .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
+                .await?;
             let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
                 set.clone(),
                 bucket.as_str(),
@@ -3427,6 +3430,7 @@ impl ECStore {
                     lifecycle_guard: bucket_incarnation_fence
                         .as_ref()
                         .and_then(|guard| guard.namespace_lock_guard()),
+                    object_mutation_fence: Some(&source_cleanup_mutation_fence),
                 },
                 "decommission",
             )

@@ -11804,6 +11804,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    ..Default::default()
                 },
                 "test_data_movement",
             )
