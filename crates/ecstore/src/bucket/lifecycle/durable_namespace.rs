@@ -387,17 +387,13 @@ fn manual_job_cursor_reaches(
         (None, Some(next_token)) => next.scanned > previous.scanned && manual_job_cursor_is_valid(Some(next_token)),
         (Some(_), None) => next_scan_completed,
         (Some(previous_token), Some(next_token)) if next.scanned > previous.scanned => {
-            let (Ok((Some(previous_marker), previous_version)), Ok((Some(next_marker), next_version))) = (
+            let (Ok((Some(previous_marker), _)), Ok((Some(next_marker), _))) = (
                 decode_manual_transition_continuation_token(previous_token),
                 decode_manual_transition_continuation_token(next_token),
             ) else {
                 return false;
             };
             next_marker > previous_marker
-                || (next_marker == previous_marker
-                    && previous_version.is_some()
-                    && next_version.is_some()
-                    && previous_version != next_version)
         }
         _ => false,
     }
@@ -665,10 +661,14 @@ mod tests {
             .checkpoint
     }
 
-    fn continuation_token(marker: &str) -> String {
-        let encoded = serde_json::to_vec(&serde_json::json!({ "marker": marker, "version_marker": null }))
+    fn continuation_token_with_version(marker: &str, version_marker: Option<&str>) -> String {
+        let encoded = serde_json::to_vec(&serde_json::json!({ "marker": marker, "version_marker": version_marker }))
             .expect("continuation token should encode");
         base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encoded)
+    }
+
+    fn continuation_token(marker: &str) -> String {
+        continuation_token_with_version(marker, None)
     }
 
     #[test]
@@ -765,6 +765,22 @@ mod tests {
             previous_checkpoint
                 .validate_successor(&manual_job_checkpoint(&cursor_rollback))
                 .is_err()
+        );
+
+        let mut same_marker_version_previous = previous.clone();
+        same_marker_version_previous.report.continuation_token =
+            Some(continuation_token_with_version("logs/b", Some("opaque-newer-version")));
+        let same_marker_version_previous_checkpoint = manual_job_checkpoint(&same_marker_version_previous);
+        let mut same_marker_version_rollback = same_marker_version_previous.clone();
+        same_marker_version_rollback.updated_at_unix_nanos += 1;
+        same_marker_version_rollback.report.scanned += 1;
+        same_marker_version_rollback.report.continuation_token =
+            Some(continuation_token_with_version("logs/b", Some("opaque-stale-version")));
+        assert!(
+            same_marker_version_previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&same_marker_version_rollback))
+                .is_err(),
+            "opaque version markers must not be treated as ordered progress"
         );
 
         let mut worker_result_rollback = next.clone();
