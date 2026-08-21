@@ -1114,6 +1114,7 @@ mod tests {
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use s3s::dto::{LifecycleRuleFilter, TransitionStorageClass};
+    use serial_test::serial;
     use std::sync::Arc;
     use time::macros::datetime;
 
@@ -1898,6 +1899,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_latest_object_after_days_due() {
         let base_time = datetime!(2025-01-15 10:30:45 UTC);
         let lc = BucketLifecycleConfiguration {
@@ -2113,6 +2115,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_does_not_panic_on_many_equal_due_events() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         // Many enabled rules that all yield a DeleteAction with an identical `due`.
