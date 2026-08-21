@@ -2096,6 +2096,18 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
             format!("invalid site replication metainfo from `{}`: {e}", site.endpoint),
         )
     })?;
+    if info.deployment_id.is_empty() {
+        // The peer will be tracked under a locally derived fallback ID
+        // (deployment_id_for_endpoint) instead of its real deployment ID.
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "peer_deployment_id_missing",
+            peer_endpoint = %site.endpoint,
+            "admin site replication state"
+        );
+    }
 
     let idp_body = send_peer_admin_get_request_with_client(
         &client,
