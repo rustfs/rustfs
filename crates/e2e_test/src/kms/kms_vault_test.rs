@@ -46,12 +46,7 @@ impl VaultKmsTestContext {
         start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
         // Wait for KMS to finish initialising.
-        super::common::wait_for_kms_ready(
-            &env.base_env.url,
-            &env.base_env.access_key,
-            &env.base_env.secret_key,
-        )
-        .await?;
+        super::common::wait_for_kms_ready(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
         Ok(Self { env })
     }
