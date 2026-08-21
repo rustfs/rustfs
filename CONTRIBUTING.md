@@ -91,8 +91,9 @@ A green `make pre-commit` is not enough to open a pull request.
 `make pre-pr` is the **full** gate: it runs all of the guard checks above,
 then `clippy-check` (`cargo clippy --all-targets --all-features -- -D warnings`)
 and `test` (shell script tests, workspace tests excluding `e2e_test`, and doc
-tests). Run `make pre-pr` before opening or updating a pull request — this is
-what CI enforces.
+tests). Complete the applicable multi-role adversarial review described in
+`AGENTS.md` before running `make pre-pr`; then run the gate before opening or
+updating a pull request. This is what CI enforces.
 
 ### 🔒 Git Pre-commit Hooks (optional)
 
@@ -150,8 +151,9 @@ Example output when formatting fails:
 2. **Format your code**: `make fmt` or `cargo fmt --all`
 3. **Run the fast gate**: `make pre-commit` (no clippy, no tests)
 4. **Commit your changes**: `git commit -m "your message"`
-5. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
-6. **Push to your branch**: `git push`
+5. **Complete the applicable multi-role adversarial review** for non-exempt changes (see `AGENTS.md`)
+6. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
+7. **Push to your branch**: `git push`
 
 ### 🛠️ IDE Integration
 
