@@ -24,6 +24,10 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
 };
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::durable_namespace::{
+    MANUAL_TRANSITION_JOB_NAMESPACE, MANUAL_TRANSITION_SCOPE_NAMESPACE, MANUAL_TRANSITION_TASK_NAMESPACE,
+    MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE,
+};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::object_api::ObjectOptions;
@@ -34,10 +38,10 @@ use crate::store::ECStore;
 pub const MANUAL_TRANSITION_JOB_SCHEMA: &str = "rustfs-manual-transition-job-v1";
 pub const MANUAL_TRANSITION_TASK_SCHEMA: &str = "rustfs-manual-transition-task-v1";
 pub const MANUAL_TRANSITION_WORKER_RESULT_SCHEMA: &str = "rustfs-manual-transition-worker-result-v1";
-pub const MANUAL_TRANSITION_JOB_RECORD_PREFIX: &str = "ilm/manual-transition/jobs";
-pub const MANUAL_TRANSITION_SCOPE_RECORD_PREFIX: &str = "ilm/manual-transition/scopes";
-pub const MANUAL_TRANSITION_TASK_PREFIX: &str = "ilm/manual-transition/tasks";
-pub const MANUAL_TRANSITION_WORKER_RESULT_PREFIX: &str = "ilm/manual-transition/results";
+pub const MANUAL_TRANSITION_JOB_RECORD_PREFIX: &str = MANUAL_TRANSITION_JOB_NAMESPACE.prefix;
+pub const MANUAL_TRANSITION_SCOPE_RECORD_PREFIX: &str = MANUAL_TRANSITION_SCOPE_NAMESPACE.prefix;
+pub const MANUAL_TRANSITION_TASK_PREFIX: &str = MANUAL_TRANSITION_TASK_NAMESPACE.prefix;
+pub const MANUAL_TRANSITION_WORKER_RESULT_PREFIX: &str = MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE.prefix;
 pub const MAX_MANUAL_TRANSITION_JOB_RECORD_SIZE: usize = 64 * 1024;
 pub const MAX_MANUAL_TRANSITION_TASK_RECORD_SIZE: usize = 16 * 1024;
 pub const MAX_MANUAL_TRANSITION_WORKER_RESULT_RECORD_SIZE: usize = 8 * 1024;
