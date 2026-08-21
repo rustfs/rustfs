@@ -320,7 +320,7 @@ impl ManualTransitionJobRecord {
             }
         }
         self.queue_snapshot = queue_snapshot;
-        self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.advance_updated_at();
         self.mark_terminal_if_worker_drained();
     }
 
@@ -363,14 +363,14 @@ impl ManualTransitionJobRecord {
         self.report.tier_failure = scan_tier_failure.saturating_add(transition_failed);
         self.report.tier_failure_by_reason = scan_tier_failure_by_reason;
         self.queue_snapshot = queue_snapshot;
-        self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.advance_updated_at();
         self.mark_terminal_if_worker_drained();
         true
     }
 
     pub fn mark_cancel_requested(&mut self) {
         self.cancel_requested = true;
-        self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.advance_updated_at();
     }
 
     pub fn claim_recovery_lease(&mut self, owner_id: impl Into<String>, queue_snapshot: ManualTransitionQueueSnapshot) {
@@ -384,7 +384,7 @@ impl ManualTransitionJobRecord {
     pub fn abandon_recovery_lease(&mut self, lease_id: Uuid) {
         if self.state == ManualTransitionJobState::Running && self.lease_id == lease_id {
             self.lease_expires_at_unix_nanos = 0;
-            self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+            self.advance_updated_at();
         }
     }
 
@@ -402,7 +402,7 @@ impl ManualTransitionJobRecord {
 
     pub fn renew_lease(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        self.updated_at_unix_nanos = now;
+        self.updated_at_unix_nanos = self.updated_at_unix_nanos.saturating_add(1).max(now);
         self.lease_expires_at_unix_nanos = manual_transition_job_lease_expires_at(now);
         self.queue_snapshot = queue_snapshot;
     }
@@ -467,9 +467,13 @@ impl ManualTransitionJobRecord {
     }
 
     fn mark_updated_terminal(&mut self) {
+        self.advance_updated_at();
+        self.completed_at_unix_nanos = Some(self.updated_at_unix_nanos);
+    }
+
+    fn advance_updated_at(&mut self) {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        self.updated_at_unix_nanos = now;
-        self.completed_at_unix_nanos = Some(now);
+        self.updated_at_unix_nanos = self.updated_at_unix_nanos.saturating_add(1).max(now);
     }
 
     fn mark_terminal_if_worker_drained(&mut self) {
@@ -1113,7 +1117,8 @@ pub fn manual_transition_scope_record_object_name(scope_key: &str) -> Result<Str
 pub async fn save_manual_transition_job_record(api: Arc<ECStore>, job: &ManualTransitionJobRecord) -> EcstoreResult<()> {
     let object = manual_transition_job_record_object_name(job.job_id).map_err(manual_transition_job_store_error)?;
     let data = job.encode().map_err(manual_transition_job_store_error)?;
-    config_boundary::save_config(api, &object, data).await
+    config_boundary::save_config(api.clone(), &object, data.clone()).await?;
+    api.record_durable_ilm_decommission_progress(&object, &data).await
 }
 
 pub async fn load_manual_transition_job_record(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionJobRecord> {
@@ -1146,9 +1151,9 @@ pub async fn save_manual_transition_job_record_if_current(
     let object = manual_transition_job_record_object_name(job.job_id).map_err(manual_transition_job_store_error)?;
     let data = job.encode().map_err(manual_transition_job_store_error)?;
     config_boundary::save_config_with_opts_quiet(
-        api,
+        api.clone(),
         &object,
-        data,
+        data.clone(),
         &ObjectOptions {
             max_parity: true,
             http_preconditions: Some(HTTPPreconditions {
@@ -1158,7 +1163,8 @@ pub async fn save_manual_transition_job_record_if_current(
             ..Default::default()
         },
     )
-    .await
+    .await?;
+    api.record_durable_ilm_decommission_progress(&object, &data).await
 }
 
 /// Applies a job-record mutation with optimistic concurrency control.
@@ -1596,9 +1602,9 @@ pub async fn save_manual_transition_scope_admission_if_absent(
     let object = manual_transition_scope_record_object_name(&admission.scope_key).map_err(manual_transition_job_store_error)?;
     let data = serde_json::to_vec(admission).map_err(Error::other)?;
     config_boundary::save_config_with_opts(
-        api,
+        api.clone(),
         &object,
-        data,
+        data.clone(),
         &ObjectOptions {
             max_parity: true,
             http_preconditions: Some(HTTPPreconditions {
@@ -1608,7 +1614,8 @@ pub async fn save_manual_transition_scope_admission_if_absent(
             ..Default::default()
         },
     )
-    .await
+    .await?;
+    api.record_durable_ilm_decommission_progress(&object, &data).await
 }
 
 pub async fn load_manual_transition_scope_admission(
@@ -1646,9 +1653,9 @@ pub async fn save_manual_transition_scope_admission_if_current(
     let object = manual_transition_scope_record_object_name(&admission.scope_key).map_err(manual_transition_job_store_error)?;
     let data = serde_json::to_vec(admission).map_err(Error::other)?;
     match config_boundary::save_config_with_opts(
-        api,
+        api.clone(),
         &object,
-        data,
+        data.clone(),
         &ObjectOptions {
             max_parity: true,
             http_preconditions: Some(HTTPPreconditions {
@@ -1664,7 +1671,8 @@ pub async fn save_manual_transition_scope_admission_if_current(
             Err(Error::PreconditionFailed)
         }
         result => result,
-    }
+    }?;
+    api.record_durable_ilm_decommission_progress(&object, &data).await
 }
 
 pub async fn claim_manual_transition_scope_admission(
@@ -1957,13 +1965,15 @@ pub async fn delete_manual_transition_scope_admission_if_current(
     job_id: Uuid,
     lease_id: Uuid,
 ) -> EcstoreResult<bool> {
-    let etag = match load_manual_transition_scope_admission_with_etag(api.clone(), scope_key).await {
-        Ok((admission, etag)) if admission.job_id == job_id && admission.lease_id == lease_id => etag,
+    let (admission, etag) = match load_manual_transition_scope_admission_with_etag(api.clone(), scope_key).await {
+        Ok((admission, etag)) if admission.job_id == job_id && admission.lease_id == lease_id => (admission, etag),
         Ok(_) => return Ok(false),
         Err(Error::ConfigNotFound) => return Ok(true),
         Err(err) => return Err(err),
     };
     let object = manual_transition_scope_record_object_name(scope_key).map_err(manual_transition_job_store_error)?;
+    let data = serde_json::to_vec(&admission).map_err(Error::other)?;
+    api.record_durable_ilm_decommission_terminal(&object, &data).await?;
     match config_boundary::delete_config_if_match(api, &object, &etag).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(true),
         Err(Error::PreconditionFailed) => Ok(false),

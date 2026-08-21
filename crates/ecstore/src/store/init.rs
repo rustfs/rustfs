@@ -4405,7 +4405,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-decommission", &[4, 4])).await;
 
         let tier_name = "DECOMMISSION-ILM";
-        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
         let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
             .await
             .expect("tier lease should resolve")
@@ -4423,7 +4423,7 @@ mod tests {
         let tier_path = tier_delete_journal_object_name(&tier_entry);
         let tier_bytes = encode_tier_delete_journal_entry(&tier_entry).expect("tier journal should encode");
 
-        let transaction = TransitionTransaction::new(TransitionTransactionInit {
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
             deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
             transaction_id: uuid::Uuid::new_v4(),
             owner_epoch: uuid::Uuid::new_v4(),
@@ -4443,6 +4443,10 @@ mod tests {
             not_after_unix_nanos: 1_780_000_000_000_000_000,
         })
         .expect("transition transaction should build");
+        let regressed_transaction = transaction.clone();
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("transition transaction should advance before migration");
         let transaction_path = transition_transaction_record_object_name(transaction.transaction_id)
             .expect("transition transaction path should build");
         let transaction_bytes = transaction.encode().expect("transition transaction should encode");
@@ -4562,6 +4566,25 @@ mod tests {
                 *expected
             );
         }
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("no receipt should exist before the final sweep"),
+            0
+        );
+        let isolated_tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("tier recovery should retain a terminal record until its receipt is committed");
+        assert!(isolated_tier_stats.scanned >= 1);
+        assert_eq!(isolated_tier_stats.deleted, 0);
+        assert!(isolated_tier_stats.failed >= 1);
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &tier_path)
+                .await
+                .expect("receipt isolation must retain the target tier journal"),
+            tier_bytes
+        );
 
         com::delete_config(store.pools[1].clone(), &manual_job_path)
             .await
@@ -4754,6 +4777,161 @@ mod tests {
             .await
             .expect("post-crash target transaction should restore");
 
+        let mut wrong_manual_job = manual_job.clone();
+        wrong_manual_job.job_id = uuid::Uuid::new_v4();
+        com::save_config(
+            store.pools[1].clone(),
+            &manual_job_path,
+            wrong_manual_job.encode().expect("wrong-id job should encode"),
+        )
+        .await
+        .expect("post-crash target manual job should accept the wrong-id fixture");
+        let wrong_id_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a target record with the wrong id")
+            .to_string();
+        assert!(wrong_id_after_crash.contains(&manual_job_path));
+        assert!(wrong_id_after_crash.contains(&manual_job_id.to_string()));
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("post-crash target manual job should restore after the wrong-id check");
+
+        com::save_config(
+            store.pools[1].clone(),
+            &transaction_path,
+            regressed_transaction
+                .encode()
+                .expect("regressed transition transaction should encode"),
+        )
+        .await
+        .expect("post-crash target transaction should accept the regression fixture");
+        let regression_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a lower transition transaction revision")
+            .to_string();
+        assert!(regression_after_crash.contains("generation mismatch"));
+        assert!(regression_after_crash.contains(&transaction_path));
+        assert!(regression_after_crash.contains(&transaction.transaction_id.to_string()));
+        com::save_config(store.pools[1].clone(), &transaction_path, transaction_bytes.clone())
+            .await
+            .expect("post-crash target transaction should restore after the regression check");
+
+        let (manual_task_receipt_pool, manual_task_receipt_path) = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("durable ILM receipt paths should be listable")
+            .into_iter()
+            .find(|(_, path)| path.contains(&manual_task_path))
+            .expect("manual task receipt should retain its reversible source path");
+        let manual_task_receipt_bytes =
+            com::read_config(store.pools[manual_task_receipt_pool].clone(), &manual_task_receipt_path)
+                .await
+                .expect("manual task receipt should be readable before corruption");
+        com::save_config(
+            store.pools[manual_task_receipt_pool].clone(),
+            &manual_task_receipt_path,
+            b"{corrupt".to_vec(),
+        )
+        .await
+        .expect("manual task receipt should corrupt deterministically");
+        let corrupt_receipt = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must fail closed on a corrupt receipt")
+            .to_string();
+        assert!(corrupt_receipt.contains(&manual_task_path));
+        assert!(corrupt_receipt.contains(&manual_job_id.to_string()));
+        com::save_config(
+            store.pools[manual_task_receipt_pool].clone(),
+            &manual_task_receipt_path,
+            manual_task_receipt_bytes,
+        )
+        .await
+        .expect("manual task receipt should restore after the corruption check");
+
+        let tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("tier journal recovery should consume the migrated record before completion");
+        assert_eq!((tier_stats.scanned, tier_stats.deleted, tier_stats.failed), (1, 1, 0));
+        assert!(matches!(com::read_config(store.clone(), &tier_path).await, Err(Error::ConfigNotFound)));
+
+        let recovered_transition_version = "recovered-transition-version".to_string();
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
+                recovered_transition_version.clone(),
+            )))
+            .await;
+        let transaction_stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition recovery should advance and consume the migrated transaction before completion");
+        backend.set_transition_candidate_probe_override(None).await;
+        assert_eq!(
+            (
+                transaction_stats.scanned,
+                transaction_stats.recovered,
+                transaction_stats.retained,
+                transaction_stats.failed,
+            ),
+            (1, 1, 0, 0)
+        );
+        assert!(matches!(
+            com::read_config(store.clone(), &transaction_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        com::save_config(
+            store.pools[1].clone(),
+            &transaction_path,
+            regressed_transaction
+                .encode()
+                .expect("post-terminal transition rollback should encode"),
+        )
+        .await
+        .expect("target should accept the post-terminal rollback fixture");
+        let post_terminal_regression = store
+            .complete_decommission(0)
+            .await
+            .expect_err("terminal proof must not mask a lower transition revision")
+            .to_string();
+        assert!(post_terminal_regression.contains("generation mismatch"));
+        assert!(post_terminal_regression.contains(&transaction_path));
+        assert!(post_terminal_regression.contains(&transaction.transaction_id.to_string()));
+        com::delete_config(store.pools[1].clone(), &transaction_path)
+            .await
+            .expect("post-terminal rollback fixture should be removed");
+
+        let manual_stats = recover_manual_transition_jobs_once(store.clone(), 100, None)
+            .await
+            .expect("manual recovery should advance the migrated job and consume its scope before completion");
+        assert_eq!(
+            (manual_stats.scanned, manual_stats.resumed, manual_stats.skipped, manual_stats.failed,),
+            (1, 1, 0, 0)
+        );
+        assert!(matches!(
+            com::read_config(store.clone(), &manual_scope_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        let recovered_manual_job_bytes = com::read_config(store.pools[1].clone(), &manual_job_path)
+            .await
+            .expect("manual recovery should retain the advanced job record");
+        assert_ne!(recovered_manual_job_bytes, manual_job_bytes);
+
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("target manual job should accept the rollback fixture");
+        let manual_regression = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a manual job generation rollback")
+            .to_string();
+        assert!(manual_regression.contains("generation mismatch"));
+        assert!(manual_regression.contains(&manual_job_path));
+        assert!(manual_regression.contains(&manual_job_id.to_string()));
+        com::save_config(store.pools[1].clone(), &manual_job_path, recovered_manual_job_bytes)
+            .await
+            .expect("target manual job should restore its recovered generation");
+
         store
             .complete_decommission(0)
             .await
@@ -4776,38 +4954,9 @@ mod tests {
             .cleanup_decommission_durable_ilm_receipts_for_test(0)
             .await
             .expect("receipt cleanup should be idempotent");
-
-        let tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
-            .await
-            .expect("tier journal recovery should consume the migrated record");
-        assert_eq!((tier_stats.scanned, tier_stats.deleted, tier_stats.failed), (1, 1, 0));
-        assert_eq!(
-            backend.remove_versions().await,
-            vec![(tier_entry.obj_name.clone(), tier_entry.version_id.clone())]
-        );
-        let transaction_stats = recover_transition_transaction_records(store.clone(), 100, None)
-            .await
-            .expect("transition transaction recovery should read the migrated record");
-        assert_eq!(
-            (
-                transaction_stats.scanned,
-                transaction_stats.recovered,
-                transaction_stats.retained,
-                transaction_stats.failed,
-            ),
-            (1, 0, 1, 0)
-        );
-        let manual_stats = recover_manual_transition_jobs_once(store.clone(), 100, None)
-            .await
-            .expect("manual recovery should reconcile migrated job, scope, task, and result records");
-        assert_eq!(
-            (manual_stats.scanned, manual_stats.resumed, manual_stats.skipped, manual_stats.failed,),
-            (1, 1, 0, 0)
-        );
-        assert!(matches!(
-            com::read_config(store.clone(), &manual_scope_path).await,
-            Err(Error::ConfigNotFound)
-        ));
+        let removed_versions = backend.remove_versions().await;
+        assert!(removed_versions.contains(&(tier_entry.obj_name.clone(), tier_entry.version_id.clone())));
+        assert!(removed_versions.contains(&(transaction.remote_object.clone(), recovered_transition_version)));
     }
 
     #[cfg(feature = "test-util")]
