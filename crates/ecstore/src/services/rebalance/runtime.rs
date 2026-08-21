@@ -42,6 +42,11 @@ pub(super) fn source_cleanup_defer_attempt(deferred_attempts: &mut HashMap<Strin
 impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        self.start_rebalance_under_gate().await
+    }
+
+    pub(super) async fn start_rebalance_under_gate(self: &Arc<Self>) -> Result<()> {
         info!(
             event = EVENT_REBALANCE_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -49,8 +54,16 @@ impl ECStore {
             state = "starting",
             "Starting rebalance"
         );
+        let expected_id = {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            rebalance_meta.as_ref().ok_or(Error::ConfigNotFound)?.id.clone()
+        };
+        let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
+        if !self.fence_rebalance_worker_activation(pool, &expected_id).await? {
+            return Ok(());
+        }
+
         let decommission_running = self.is_decommission_running().await;
-        // let rebalance_meta = self.rebalance_meta.read().await;
 
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();

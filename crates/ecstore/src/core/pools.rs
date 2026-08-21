@@ -840,7 +840,7 @@ fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Res
     resolve_decommission_pool_meta_reload_result(result, "start_decommission")
 }
 
-fn decommission_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+fn activation_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -850,12 +850,12 @@ fn decommission_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error 
             achieved,
         },
         other => Error::other(format!(
-            "failed to acquire rebalance metadata write lock before decommission start on {RUSTFS_META_BUCKET}/{REBAL_META_NAME}: {other}"
+            "failed to acquire rebalance activation lock on {RUSTFS_META_BUCKET}/{REBAL_META_NAME}: {other}"
         )),
     }
 }
 
-fn decommission_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -865,9 +865,33 @@ fn decommission_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
             achieved,
         },
         other => Error::other(format!(
-            "failed to acquire pool metadata write lock before decommission start on {RUSTFS_META_BUCKET}/{POOL_META_NAME}: {other}"
+            "failed to acquire pool activation lock on {RUSTFS_META_BUCKET}/{POOL_META_NAME}: {other}"
         )),
     }
+}
+
+pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
+    pool: Arc<S>,
+) -> Result<(rustfs_lock::NamespaceLockGuard, rustfs_lock::NamespaceLockGuard)>
+where
+    S: crate::storage_api_contracts::namespace::NamespaceLocking<
+            Error = Error,
+            NamespaceLock = rustfs_lock::NamespaceLockWrapper,
+        >,
+{
+    // Activation lock order is always pool.bin -> rebalance.bin.
+    let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+    let pool_meta_guard = pool_meta_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(activation_pool_meta_lock_error)?;
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(activation_rebalance_meta_lock_error)?;
+
+    Ok((pool_meta_guard, rebalance_meta_guard))
 }
 
 fn rollback_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
@@ -1675,7 +1699,7 @@ impl PoolMeta {
         self.load_no_lock(pool).await
     }
 
-    async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
+    pub(crate) async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
     where
         S: EcstoreObjectIO,
     {
@@ -2501,16 +2525,7 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
-        let pool_meta_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let _pool_meta_guard = pool_meta_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(decommission_pool_meta_lock_error)?;
-        let ns_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-        let _guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(decommission_rebalance_meta_lock_error)?;
+        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
         match rebalance_meta
@@ -5265,8 +5280,9 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo,
-        DecommissionStartPoolState, DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo,
-        PoolStatus, apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        DecommissionStartPoolState, DecommissionTerminalState, ListCallback, POOL_META_NAME, PoolDecommissionInfo, PoolMeta,
+        PoolSpaceInfo, PoolStatus, REBAL_META_NAME, acquire_pool_rebalance_activation_locks,
+        apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
@@ -5304,14 +5320,44 @@ mod pools_tests {
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_rio::Index;
+    use std::future::Future;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use std::task::{Context, Poll};
     use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct ActivationLockRecorder {
+        lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+        owner: &'static str,
+        resources: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::namespace::NamespaceLocking for ActivationLockRecorder {
+        type Error = Error;
+        type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
+
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> crate::error::Result<Self::NamespaceLock> {
+            self.resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned")
+                .push(object.to_string());
+            Ok(rustfs_lock::NamespaceLockWrapper::new(
+                rustfs_lock::NamespaceLock::with_local_manager(
+                    "activation-lock-test".to_string(),
+                    Arc::clone(&self.lock_manager),
+                ),
+                rustfs_lock::ObjectKey::new(bucket, object),
+                self.owner.to_string(),
+            ))
+        }
+    }
 
     fn noop_decommission_list_callback() -> ListCallback {
         Arc::new(|_| Box::pin(async {}))
@@ -5341,6 +5387,48 @@ mod pools_tests {
             last_update: OffsetDateTime::now_utc(),
             decommission,
         }
+    }
+
+    #[tokio::test]
+    async fn test_activation_fence_uses_one_lock_order_and_serializes_callers() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let first = Arc::new(ActivationLockRecorder {
+            lock_manager: Arc::clone(&manager),
+            owner: "first",
+            resources: Mutex::new(Vec::new()),
+        });
+        let second = Arc::new(ActivationLockRecorder {
+            lock_manager: manager,
+            owner: "second",
+            resources: Mutex::new(Vec::new()),
+        });
+
+        let first_guards = acquire_pool_rebalance_activation_locks(first.clone())
+            .await
+            .expect("first activation should acquire both locks");
+        assert_eq!(
+            *first
+                .resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned"),
+            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+        );
+
+        let mut second_acquire = Box::pin(acquire_pool_rebalance_activation_locks(second.clone()));
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(second_acquire.as_mut().poll(&mut context), Poll::Pending));
+
+        drop(first_guards);
+        second_acquire
+            .await
+            .expect("second activation should acquire both locks after the first releases them");
+        assert_eq!(
+            *second
+                .resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned"),
+            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::{
     RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
     encode_rebalance_stop_propagation_record,
 };
+use crate::core::pools::{PoolMeta, acquire_pool_rebalance_activation_locks, pool_meta_has_active_decommission};
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
 use crate::set_disk::get_lock_acquire_timeout;
@@ -28,6 +29,38 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> {
+    if pool_meta_has_active_decommission(meta) {
+        return Err(Error::DecommissionAlreadyRunning);
+    }
+
+    Ok(())
+}
+
+async fn merge_and_save_rebalance_meta_no_lock<S>(pool: Arc<S>, local_snapshot: &RebalanceMeta, stage: &str) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let mut merged = RebalanceMeta::new();
+    match merged.load_with_opts(pool.clone(), opts.clone()).await {
+        Ok(()) => {
+            if merge_rebalance_meta(&mut merged, local_snapshot) == RebalanceMetaMergeOutcome::RejectedActiveConflict {
+                return Err(Error::RebalanceAlreadyRunning);
+            }
+        }
+        Err(Error::ConfigNotFound) => {
+            merged = local_snapshot.clone();
+        }
+        Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
+    }
+
+    merged.save_with_opts(pool, opts).await
+}
 
 pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) -> Result<()> {
     for (idx, disk_stat) in disk_stats.iter().enumerate() {
@@ -90,24 +123,53 @@ impl ECStore {
             .await
             .map_err(rebalance_meta_lock_error)?;
 
-        let opts = ObjectOptions {
-            no_lock: true,
-            ..Default::default()
-        };
-        let mut merged = RebalanceMeta::new();
-        match merged.load_with_opts(pool.clone(), opts.clone()).await {
-            Ok(()) => {
-                if merge_rebalance_meta(&mut merged, local_snapshot) == RebalanceMetaMergeOutcome::RejectedActiveConflict {
-                    return Err(Error::RebalanceAlreadyRunning);
-                }
-            }
-            Err(Error::ConfigNotFound) => {
-                merged = local_snapshot.clone();
-            }
-            Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
+        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage).await
+    }
+
+    async fn save_rebalance_activation_meta_with_merge<S>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
+        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
+        let mut pool_meta = PoolMeta::default();
+        pool_meta.load_no_lock(pool.clone()).await?;
+        ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
+
+        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage).await
+    }
+
+    pub(super) async fn fence_rebalance_worker_activation<S>(&self, pool: Arc<S>, expected_id: &str) -> Result<bool>
+    where
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
+        let (_pool_meta_guard, _rebalance_meta_guard) = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
+        let mut pool_meta = PoolMeta::default();
+        pool_meta.load_no_lock(pool.clone()).await?;
+        ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
+
+        let mut persisted = RebalanceMeta::new();
+        persisted
+            .load_with_opts(
+                pool,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if persisted.id != expected_id {
+            return Err(Error::other(format!(
+                "rebalance metadata changed before worker activation: expected {expected_id}, found {}",
+                persisted.id
+            )));
         }
 
-        merged.save_with_opts(pool, opts).await
+        Ok(is_rebalance_conflicting_with_decommission(&persisted))
     }
 
     #[tracing::instrument(skip_all)]
@@ -301,7 +363,8 @@ impl ECStore {
 
         let pool = clone_first_arc(&self.pools, "init_rebalance_meta: no pools available")?;
         resolve_rebalance_meta_save_result(
-            self.save_rebalance_meta_with_merge(pool, &meta, "init_rebalance_meta").await,
+            self.save_rebalance_activation_meta_with_merge(pool, &meta, "init_rebalance_meta")
+                .await,
             "init_rebalance_meta",
         )?;
 
@@ -379,7 +442,7 @@ impl ECStore {
             }
         }
 
-        self.start_rebalance().await
+        self.start_rebalance_under_gate().await
     }
 
     pub async fn rollback_rebalance_start_for_id(self: &Arc<Self>, expected_id: Option<&str>, start_error: String) -> Result<()> {
@@ -619,6 +682,31 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebalance_activation_rejects_persisted_decommission_despite_idle_local_snapshot() {
+        let persisted = PoolMeta {
+            pools: vec![crate::core::pools::PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(crate::core::pools::PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let err = ensure_rebalance_activation_pool_meta_allowed(&persisted)
+            .expect_err("persisted decommission must block a stale rebalance admission");
+        assert!(matches!(err, Error::DecommissionAlreadyRunning));
+    }
+
+    #[test]
+    fn rebalance_activation_allows_persisted_idle_pool_meta() {
+        assert!(ensure_rebalance_activation_pool_meta_allowed(&PoolMeta::default()).is_ok());
+    }
 
     #[test]
     fn pool_rebalance_status_ignores_non_participating_pool_state() {
