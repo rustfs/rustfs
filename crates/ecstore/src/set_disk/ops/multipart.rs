@@ -2253,6 +2253,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
                     crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
                 }
+                // Version absent: first replication of this version, nothing
+                // local to compare — the normal path, not a degraded one.
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                 Err(err) => {
                     // Degraded path: without the stored state the inbound
                     // metadata is applied unchanged — exactly the overwrite
