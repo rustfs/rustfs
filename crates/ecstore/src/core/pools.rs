@@ -943,12 +943,19 @@ impl DecommissionDurableIlmReceipt {
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
-        self.validate()?;
-        let receipt_bytes = serde_json::to_vec(self)?;
+        let mut receipt = self.clone();
+        receipt.checkpoint = receipt.checkpoint.compacted()?;
+        receipt.terminal_checkpoint = receipt
+            .terminal_checkpoint
+            .as_ref()
+            .map(DurableIlmRecordCheckpoint::compacted)
+            .transpose()?;
+        receipt.validate()?;
+        let receipt_bytes = serde_json::to_vec(&receipt)?;
         let persisted = PersistedDecommissionDurableIlmReceipt {
             schema: DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA.to_string(),
             content_sha256: hex_sha256(&receipt_bytes, ToOwned::to_owned),
-            receipt: self.clone(),
+            receipt,
         };
         let encoded = serde_json::to_vec(&persisted)?;
         if encoded.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE {
@@ -5643,6 +5650,30 @@ impl ECStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn persist_decommission_durable_ilm_receipt_for_test(
+        &self,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        source_path: &str,
+        record: &ValidatedDurableIlmRecord,
+        terminal: bool,
+    ) -> Result<String> {
+        let mut receipt = DecommissionDurableIlmReceipt::new(source_path, record);
+        if terminal {
+            receipt.terminal_checkpoint = Some(record.checkpoint.clone());
+        }
+        self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+            .await?;
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        Ok(decommission_durable_ilm_receipt_path(&run_token, source_path, record.id_kind, &record.id))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_decommission_durable_ilm_manifest_for_test(&self, source_pool_idx: usize) -> Result<()> {
+        self.persist_decommission_durable_ilm_manifest(source_pool_idx).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn cleanup_decommission_durable_ilm_receipts_for_test(&self, source_pool_idx: usize) -> Result<()> {
         self.cleanup_decommission_durable_ilm_receipts(source_pool_idx).await
     }
@@ -6828,12 +6859,12 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DECOMMISSION_META_PREFIXES, DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
-        DecomBucketInfo, DecommissionDurableIlmReceipt, DecommissionStartPoolState, DecommissionTerminalState, ListCallback,
-        PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, apply_decommission_status_space_info,
-        bind_decommission_cancelers, bind_missing_decommission_cancelers, cancel_decommission_canceler,
-        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
-        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
+        DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_META_PREFIXES, DECOMMISSION_PROGRESS_SAVE_INTERVAL,
+        DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionDurableIlmReceipt, DecommissionStartPoolState,
+        DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
+        apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
+        decommission_cancel_signal_result, decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
         decommission_durable_ilm_receipt_run_token, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
@@ -6862,7 +6893,12 @@ mod pools_tests {
         track_decommission_current_object, track_decommission_current_object_stage, validate_start_decommission_request,
         wait_decommission_listing_retry, wait_decommission_worker_drain, with_decommission_entry_context,
     };
-    use crate::bucket::lifecycle::DurableIlmRecordCheckpoint;
+    use crate::bucket::lifecycle::{
+        DurableIlmRecordCheckpoint,
+        bucket_lifecycle_ops::{ManualTransitionQueueSnapshot, ManualTransitionRunOptions},
+        manual_transition_job::{ManualTransitionJobRecord, manual_transition_job_record_object_name},
+        validate_durable_ilm_record,
+    };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
     use crate::error::{Error, StorageError};
@@ -6962,6 +6998,38 @@ mod pools_tests {
 
         assert_eq!(merged.checkpoint, checkpoint);
         assert_eq!(merged.terminal_checkpoint, Some(terminal_checkpoint));
+    }
+
+    #[test]
+    fn decommission_manual_job_receipt_compacts_large_progress() {
+        let prefix = "p".repeat(12 * 1024);
+        let options = ManualTransitionRunOptions {
+            prefix: prefix.clone(),
+            ..Default::default()
+        };
+        let mut job = ManualTransitionJobRecord::new(uuid::Uuid::new_v4(), "bounded-receipt-bucket", &options, "owner");
+        let token_bytes = serde_json::to_vec(&serde_json::json!({
+            "marker": "m".repeat(12 * 1024),
+            "version_marker": "opaque-version"
+        }))
+        .expect("large continuation token should encode");
+        let mut report = job.report.clone();
+        report.scanned = 1;
+        report.continuation_token = Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&token_bytes));
+        job.update_running_progress(report, ManualTransitionQueueSnapshot::default());
+        let path = manual_transition_job_record_object_name(job.job_id).expect("manual job path should build");
+        let job_bytes = job.encode().expect("large manual job should remain within its record limit");
+        assert!(job_bytes.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
+        let record = validate_durable_ilm_record(&path, &job_bytes).expect("large manual job should validate");
+        let mut receipt = DecommissionDurableIlmReceipt::new(&path, &record);
+        receipt.terminal_checkpoint = Some(record.checkpoint);
+
+        let encoded = receipt.encode().expect("bounded progress proof should fit the receipt limit");
+        let decoded = DecommissionDurableIlmReceipt::decode(&encoded).expect("bounded receipt should round trip");
+
+        assert!(encoded.len() <= DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
+        assert_eq!(decoded.source_path, path);
+        assert!(decoded.terminal_checkpoint.is_some());
     }
 
     #[test]

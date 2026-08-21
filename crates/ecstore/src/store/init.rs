@@ -555,7 +555,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::{
         bucket::lifecycle::{
-            ILM_META_PREFIX,
+            DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord,
             bucket_lifecycle_ops::{ManualTransitionRunOptions, recover_manual_transition_jobs_once},
             lifecycle::{TRANSITION_PENDING, TransitionOptions},
             manual_transition_job::{
@@ -619,6 +619,8 @@ mod tests {
             range::HTTPRangeSpec,
         },
     };
+    #[cfg(feature = "test-util")]
+    use futures::{StreamExt as _, TryStreamExt as _};
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
     use rustfs_filemeta::ObjectPartInfo;
@@ -3220,6 +3222,108 @@ mod tests {
             Err(Error::ConfigNotFound)
         ));
         assert!(backend.remove_versions().await.contains(&(entry.obj_name, entry.version_id)));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page() {
+        const RECEIPT_COUNT: usize = 1001;
+
+        let temp_dir = tempfile::tempdir().expect("create paginated receipt store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-receipt-pages", &[4, 4])).await;
+        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+
+        futures::stream::iter(0..RECEIPT_COUNT)
+            .map(|index| {
+                let store = store.clone();
+                async move {
+                    let id = format!("{index:064x}");
+                    let source_path = format!("ilm/tier-delete-journal/{id}.json");
+                    let record = ValidatedDurableIlmRecord {
+                        namespace: "tier-delete-journal",
+                        id_kind: "operation_id",
+                        id,
+                        checkpoint: DurableIlmRecordCheckpoint::TierDeleteJournal {
+                            content_sha256: format!("{:064x}", index + RECEIPT_COUNT),
+                            identity_sha256: "f".repeat(64),
+                            committed: false,
+                        },
+                    };
+                    store
+                        .persist_decommission_durable_ilm_receipt_for_test(0, 0, &source_path, &record, true)
+                        .await?;
+                    store
+                        .persist_decommission_durable_ilm_receipt_for_test(0, 1, &source_path, &record, true)
+                        .await?;
+                    Ok::<(), Error>(())
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("more than one receipt page should persist");
+        store
+            .persist_decommission_durable_ilm_manifest_for_test(0)
+            .await
+            .expect("paginated source receipts should produce a manifest");
+
+        let target_receipts = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("paginated target receipts should list");
+        assert_eq!(target_receipts.len(), RECEIPT_COUNT);
+        let (target_pool_idx, second_page_path) = target_receipts
+            .get(1000)
+            .cloned()
+            .expect("the real 1000-item page boundary should expose a second page receipt");
+        let receipt_bytes = com::read_config(store.pools[target_pool_idx].clone(), &second_page_path)
+            .await
+            .expect("second page receipt should be readable");
+
+        com::delete_config(store.pools[target_pool_idx].clone(), &second_page_path)
+            .await
+            .expect("second page receipt should delete");
+        let missing = store
+            .complete_decommission(0)
+            .await
+            .expect_err("a missing second page receipt must block completion")
+            .to_string();
+        assert!(missing.contains(&second_page_path));
+        assert!(
+            !store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source pool should remain in decommission")
+                .complete
+        );
+        assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
+
+        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+            .await
+            .expect("second page receipt should restore");
+        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+            .await
+            .expect("second page receipt should corrupt deterministically");
+        let corrupt = store
+            .complete_decommission(0)
+            .await
+            .expect_err("a corrupt second page receipt must block completion")
+            .to_string();
+        assert!(corrupt.contains(&second_page_path));
+        assert!(corrupt.contains("invalid"));
+        assert!(
+            !store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source pool should remain in decommission")
+                .complete
+        );
+        assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
     }
 
     #[cfg(feature = "test-util")]
