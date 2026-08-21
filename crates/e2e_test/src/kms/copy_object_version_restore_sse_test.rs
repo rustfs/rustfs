@@ -56,7 +56,7 @@ async fn test_self_copy_of_historical_sse_s3_version_is_readable() {
         )
         .await
         .expect("failed to start RustFS with local KMS");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let client = kms_env.base_env.create_s3_client();
     let bucket = "copy-object-version-restore-sse-test";

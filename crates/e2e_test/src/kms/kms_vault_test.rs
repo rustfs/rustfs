@@ -19,7 +19,7 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use tokio::time::{Duration, sleep};
+use serial_test::serial;
 use tracing::{error, info};
 
 use super::common::{
@@ -45,8 +45,13 @@ impl VaultKmsTestContext {
 
         start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
-        // Allow Vault to finish initialising token auth and transit engine.
-        sleep(Duration::from_secs(2)).await;
+        // Wait for KMS to finish initialising.
+        super::common::wait_for_kms_ready(
+            &env.base_env.url,
+            &env.base_env.access_key,
+            &env.base_env.secret_key,
+        )
+        .await?;
 
         Ok(Self { env })
     }
