@@ -43,6 +43,13 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+fn ensure_rebalance_entry_active(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::OperationCanceled);
+    }
+    Ok(())
+}
+
 impl ECStore {
     async fn finish_rebalance_entry_after_cleanup(
         &self,
@@ -52,11 +59,14 @@ impl ECStore {
         object: &str,
         stats_updates: &[&FileInfo],
         expected_id: &str,
+        cancel: &CancellationToken,
         cleanup: impl std::future::Future<Output = std::result::Result<ObjectInfo, data_movement::SourceCleanupError>>,
     ) -> Result<RebalanceEntryCleanupResult> {
         // Persisted stats can complete a pool on restart, so source cleanup must resolve first.
+        ensure_rebalance_entry_active(cancel)?;
         run_guard.ensure_held("rebalance source cleanup")?;
         let cleanup_result = cleanup.await;
+        ensure_rebalance_entry_active(cancel)?;
         run_guard.ensure_held("rebalance source cleanup")?;
         let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup_result, bucket, object);
         let RebalanceEntryCleanupResult::Completed { warning } = cleanup_result else {
@@ -103,6 +113,7 @@ impl ECStore {
         set: Arc<SetDisks>,
         bucket_configs: Arc<RebalanceBucketConfigs>,
         rebalance_id: Arc<str>,
+        cancel: CancellationToken,
         // wk: Arc<Workers>,
     ) -> Result<RebalanceEntryOutcome> {
         debug!(
@@ -165,13 +176,16 @@ impl ECStore {
 
         // Entry lock order is bucket incarnation -> activation_gate -> rebalance.bin.
         // Stop waits for in-flight entries through cleanup, but not for entries admitted later.
+        ensure_rebalance_entry_active(&cancel)?;
         let run_guard = self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry").await?;
+        let lock_lost_signal = run_guard.lock_lost_signal();
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
+            ensure_rebalance_entry_active(&cancel)?;
             run_guard.ensure_held("rebalance lifecycle mutation")?;
             let lifecycle_result = crate::core::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
@@ -181,8 +195,10 @@ impl ECStore {
                 bucket_configs.object_lock_config.as_ref(),
                 true,
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
+                lock_lost_signal.clone(),
             )
             .await;
+            ensure_rebalance_entry_active(&cancel)?;
             run_guard.ensure_held("rebalance lifecycle mutation")?;
             let expired_by_lifecycle = lifecycle_result?;
             if expired_by_lifecycle {
@@ -224,23 +240,29 @@ impl ECStore {
 
             let version_id = version.version_id.map(|v| v.to_string());
             let expected_bucket_incarnation_id = bucket_configs.bucket_incarnation_id;
+            let transfer_lock_lost_signal = lock_lost_signal.clone();
             let mut transfer = |src_pool_idx: usize, bucket: String, rd: GetObjectReader| {
                 let store = self.clone();
+                let lock_lost_signal = transfer_lock_lost_signal.clone();
                 async move {
                     store
-                        .rebalance_object(src_pool_idx, bucket, rd, expected_bucket_incarnation_id)
+                        .rebalance_object(src_pool_idx, bucket, rd, expected_bucket_incarnation_id, lock_lost_signal)
                         .await
                 }
             };
             // Route delete-marker migration through the store layer so it lands on the
             // cross-pool target (excluding the source pool), not back onto the source set.
-            let mut delete_marker = |bucket: String, object: String, opts: ObjectOptions| {
+            let delete_marker_lock_lost_signal = lock_lost_signal.clone();
+            let mut delete_marker = |bucket: String, object: String, mut opts: ObjectOptions| {
                 let store = self.clone();
+                if let Some(signal) = delete_marker_lock_lost_signal.as_ref() {
+                    opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                }
                 async move { store.delete_object(&bucket, &object, opts).await }
             };
             run_guard.ensure_held("rebalance version migration")?;
             let result = migrate_entry_version(
-                &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref()),
+                &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref(), lock_lost_signal.clone()),
                 bucket.clone(),
                 pool_index,
                 version,
@@ -252,6 +274,7 @@ impl ECStore {
                 &mut delete_marker,
             )
             .await;
+            ensure_rebalance_entry_active(&cancel)?;
             run_guard.ensure_held("rebalance version migration")?;
 
             if result.ignored {
@@ -355,6 +378,7 @@ impl ECStore {
                     entry.name.as_str(),
                     stats_updates.as_slice(),
                     rebalance_id.as_ref(),
+                    &cancel,
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
@@ -366,6 +390,7 @@ impl ECStore {
                             lifecycle_guard: bucket_incarnation_fence
                                 .as_ref()
                                 .and_then(|guard| guard.namespace_lock_guard()),
+                            namespace_lock_lost_signal: lock_lost_signal.clone(),
                         },
                         "rebalance",
                     ),
@@ -441,6 +466,7 @@ impl ECStore {
             resolve_rebalance_stats_update_result(stats_result, pool_index, bucket.as_str(), entry.name.as_str())?;
         }
 
+        ensure_rebalance_entry_active(&cancel)?;
         run_guard.ensure_held("rebalance entry completion")?;
         Ok(RebalanceEntryOutcome::Completed)
     }
@@ -452,8 +478,18 @@ impl ECStore {
         bucket: String,
         rd: GetObjectReader,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     ) -> Result<()> {
-        data_movement::migrate_object(self, pool_idx, bucket, rd, expected_bucket_incarnation_id, "rebalance_object").await
+        data_movement::migrate_object_with_lock_lost_signal(
+            self,
+            pool_idx,
+            bucket,
+            rd,
+            expected_bucket_incarnation_id,
+            "rebalance_object",
+            lock_lost_signal,
+        )
+        .await
     }
 
     async fn update_rebalance_last_error(&self, pool_idx: usize, message: String, expected_id: &str) -> Result<()> {
@@ -576,7 +612,15 @@ impl ECStore {
                                 "Started rebalance entry task"
                             );
                             let result = this
-                                .rebalance_entry(bucket, pool_index, entry, set, bucket_configs, rebalance_id)
+                                .rebalance_entry(
+                                    bucket,
+                                    pool_index,
+                                    entry,
+                                    set,
+                                    bucket_configs,
+                                    rebalance_id,
+                                    callback_rx.clone(),
+                                )
                                 .await;
                             if let Err(err) = &result {
                                 error!("rebalance_entry: rebalance entry failed: {err}");
@@ -682,7 +726,10 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
-    use rustfs_filemeta::FileInfo;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::ObjectOperations as _;
+    use rustfs_filemeta::{FileInfo, FileMeta};
+    use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
 
     #[tokio::test]
@@ -708,6 +755,7 @@ mod tests {
         version.is_latest = true;
         let warning_version = version.clone();
         let (release_cleanup, cleanup_released) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
 
         let finish_store = Arc::clone(&store);
         let finish = tokio::spawn(async move {
@@ -723,6 +771,7 @@ mod tests {
                     "object.bin",
                     &[&version],
                     rebalance_id,
+                    &cancel,
                     async move {
                         cleanup_released.await.expect("cleanup release sender should remain alive");
                         Ok(ObjectInfo::default())
@@ -782,6 +831,7 @@ mod tests {
                 "object.bin",
                 &[&warning_version],
                 rebalance_id,
+                &CancellationToken::new(),
                 async { Err(Error::SlowDown.into()) },
             )
             .await
@@ -810,6 +860,7 @@ mod tests {
                 "object.bin",
                 &[&warning_version],
                 rebalance_id,
+                &CancellationToken::new(),
                 async { Err(data_movement::SourceCleanupError::SourceChanged) },
             )
             .await
@@ -819,5 +870,117 @@ mod tests {
         let pool_stats = &meta.as_ref().expect("rebalance metadata should exist").pool_stats[0];
         assert_eq!(pool_stats.bytes, 0, "deferred cleanup must not commit completion stats");
         assert_eq!(pool_stats.cleanup_warnings.count, 1, "deferred cleanup must not add a permanent warning");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_cancels_real_rebalance_entry_before_waiting_for_cleanup_guard() {
+        let rebalance_id = "rebalance-stop-entry";
+        let cancel = CancellationToken::new();
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 1.0,
+            cancel: Some(cancel.clone()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                init_capacity: 100,
+                buckets: vec!["bucket".to_string()],
+                info: RebalanceInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        let bucket = "bucket";
+        let object = "delete-marker";
+        let set = store.pools[0].get_disks_by_key(object);
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        set.delete_object(
+            bucket,
+            object,
+            ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source delete marker should be created");
+        let source_versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source metadata should be readable")
+            .expect("source delete marker should exist");
+        assert_eq!(source_versions.versions.len(), 1);
+        assert!(source_versions.versions[0].deleted);
+        let mut file_meta = FileMeta::new();
+        for version in &source_versions.versions {
+            file_meta
+                .add_version(version.clone())
+                .expect("source version should encode into a metacache entry");
+        }
+        let entry = MetaCacheEntry {
+            name: object.to_string(),
+            metadata: file_meta.marshal_msg().expect("source metadata should marshal"),
+            cached: Some(file_meta),
+            reusable: false,
+        };
+        let barrier = data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+        let entry_store = Arc::clone(&store);
+        let entry_set = Arc::clone(&set);
+        let entry_cancel = cancel.clone();
+        let mut entry_task = tokio::spawn(async move {
+            entry_store
+                .rebalance_entry(
+                    bucket.to_string(),
+                    0,
+                    entry,
+                    entry_set,
+                    Arc::new(RebalanceBucketConfigs::default()),
+                    Arc::from(rebalance_id),
+                    entry_cancel,
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let stop_store = Arc::clone(&store);
+        let mut stop_task = tokio::spawn(async move { stop_store.stop_rebalance_for_id(Some(rebalance_id)).await });
+        tokio::time::timeout(StdDuration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("stop must cancel the in-flight entry before waiting for its guard");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut stop_task)
+                .await
+                .is_err(),
+            "stop must wait for the real entry cleanup guard to drain"
+        );
+
+        barrier.release();
+        let entry_error = tokio::time::timeout(StdDuration::from_secs(5), &mut entry_task)
+            .await
+            .expect("the cancelled entry should finish in bounded time")
+            .expect("entry task should not panic")
+            .expect_err("the entry must observe stop cancellation");
+        assert!(matches!(entry_error, Error::OperationCanceled));
+        tokio::time::timeout(StdDuration::from_secs(5), &mut stop_task)
+            .await
+            .expect("stop should finish after the entry guard drains")
+            .expect("stop task should not panic")
+            .expect("stop should persist the terminal state");
+        assert!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|meta| meta.stopped_at.is_some()),
+            "stop should publish the terminal state after entry cleanup drains"
+        );
     }
 }

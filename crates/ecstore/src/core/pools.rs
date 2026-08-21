@@ -19,7 +19,7 @@ use crate::bucket::{
         LifecycleExpiryConfigs,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
-            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
+            LifecycleOps, apply_expiry_rule_for_data_movement, apply_expiry_rule_in, eval_action_from_lifecycle,
             lifecycle_delete_all_versions_blocked_by_replication,
         },
         get_expiry_configs,
@@ -2446,6 +2446,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> Result<bool> {
     let Some(lifecycle_config) = lifecycle_config else {
         return Ok(false);
@@ -2461,8 +2462,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 let Ok(bucket_incarnation_id) = store.bucket_incarnation_id_from_disk(bucket).await else {
                     return Ok(false);
                 };
-                let _ =
-                    apply_expiry_on_transitioned_object(store, &object_info, &event, event_source, bucket_incarnation_id).await;
+                let _ = apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, lock_lost_signal).await;
             }
             Ok(false)
         }
@@ -2470,7 +2470,8 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
-            let applied = !apply_actions || apply_expiry_rule_in(store, &event, event_source, &object_info).await;
+            let applied = !apply_actions
+                || apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, lock_lost_signal).await;
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
         _ => Ok(false),
@@ -3044,6 +3045,7 @@ impl ECStore {
                 object_lock_config.as_ref(),
                 true,
                 &LcEventSrc::Decom,
+                None,
             )
             .await
             .map_err(|err| with_decommission_entry_context("lifecycle_expiry", bucket.as_str(), version.name.as_str(), err))?
@@ -3356,6 +3358,7 @@ impl ECStore {
                     lifecycle_guard: bucket_incarnation_fence
                         .as_ref()
                         .and_then(|guard| guard.namespace_lock_guard()),
+                    namespace_lock_lost_signal: None,
                 },
                 "decommission",
             )
@@ -4333,6 +4336,7 @@ impl ECStore {
                                 object_lock_config.as_ref(),
                                 false,
                                 &LcEventSrc::Decom,
+                                None,
                             )
                             .await
                             {

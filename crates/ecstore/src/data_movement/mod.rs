@@ -1024,10 +1024,11 @@ pub(crate) enum SourceCleanupError {
     Storage(#[from] Error),
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
     pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    pub(crate) namespace_lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 }
 
 fn ensure_source_cleanup_versions_match(
@@ -1186,6 +1187,9 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);
     }
+    if let Some(signal) = bucket_fence.namespace_lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
+    }
     let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
@@ -1338,6 +1342,19 @@ pub(crate) async fn migrate_object(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
 ) -> Result<()> {
+    migrate_object_with_lock_lost_signal(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn migrate_object_with_lock_lost_signal(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> Result<()> {
     let object_info = rd.object_info.clone();
     let has_part_checksums = object_info
         .parts
@@ -1349,6 +1366,9 @@ pub(crate) async fn migrate_object(
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
         new_multipart_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+        if let Some(signal) = lock_lost_signal.as_ref() {
+            new_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
             .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts)
             .await
@@ -1393,7 +1413,7 @@ pub(crate) async fn migrate_object(
                             err,
                         )
                     })?;
-                let part_opts = ObjectOptions {
+                let mut part_opts = ObjectOptions {
                     part_number: Some(part.number),
                     preserve_etag: Some(part.etag.clone()),
                     data_movement: true,
@@ -1401,6 +1421,9 @@ pub(crate) async fn migrate_object(
                     expected_bucket_incarnation_id,
                     ..Default::default()
                 };
+                if let Some(signal) = lock_lost_signal.as_ref() {
+                    part_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                }
                 let pi = match store
                     .put_object_part_for_data_movement(
                         target_pool_idx,
@@ -1445,6 +1468,9 @@ pub(crate) async fn migrate_object(
                     )
                 })?;
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
+            if let Some(signal) = lock_lost_signal.as_ref() {
+                complete_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+            }
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement(
@@ -1493,18 +1519,18 @@ pub(crate) async fn migrate_object(
 
         if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
             let abort_result = store
-                .abort_multipart_upload_for_data_movement(
-                    target_pool_idx,
-                    &bucket,
-                    &object_info.name,
-                    &res.upload_id,
-                    &ObjectOptions {
+                .abort_multipart_upload_for_data_movement(target_pool_idx, &bucket, &object_info.name, &res.upload_id, &{
+                    let mut opts = ObjectOptions {
                         data_movement: true,
                         src_pool_idx: pool_idx,
                         expected_bucket_incarnation_id,
                         ..Default::default()
-                    },
-                )
+                    };
+                    if let Some(signal) = lock_lost_signal.as_ref() {
+                        opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                    }
+                    opts
+                })
                 .await;
             match abort_result {
                 Ok(()) => return Ok(()),
@@ -1562,18 +1588,18 @@ pub(crate) async fn migrate_object(
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
                 return match store
-                    .abort_multipart_upload_for_data_movement(
-                        target_pool_idx,
-                        &bucket,
-                        &object_info.name,
-                        &res.upload_id,
-                        &ObjectOptions {
+                    .abort_multipart_upload_for_data_movement(target_pool_idx, &bucket, &object_info.name, &res.upload_id, &{
+                        let mut opts = ObjectOptions {
                             data_movement: true,
                             src_pool_idx: pool_idx,
                             expected_bucket_incarnation_id,
                             ..Default::default()
-                        },
-                    )
+                        };
+                        if let Some(signal) = lock_lost_signal.as_ref() {
+                            opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                        }
+                        opts
+                    })
                     .await
                 {
                     Ok(()) => Err(primary_err),
@@ -1608,6 +1634,9 @@ pub(crate) async fn migrate_object(
 
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+    if let Some(signal) = lock_lost_signal {
+        put_opts.add_namespace_lock_lost_signal(signal);
+    }
     let (target_pool_idx, put_result) = store
         .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts)
         .await

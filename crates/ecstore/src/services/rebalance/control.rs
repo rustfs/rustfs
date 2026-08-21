@@ -32,6 +32,16 @@ use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+#[cfg(test)]
+static FAIL_NEXT_REBALANCE_ACTIVATION_SAVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn fail_next_rebalance_activation_save_for_test(rebalance_id: &str) {
+    *FAIL_NEXT_REBALANCE_ACTIVATION_SAVE
+        .lock()
+        .expect("rebalance activation save failure hook should not be poisoned") = Some(rebalance_id.to_string());
+}
+
 fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> {
     if pool_meta_has_active_decommission(meta) {
         return Err(Error::DecommissionAlreadyRunning);
@@ -56,6 +66,10 @@ impl RebalanceRunGuard {
             return Err(Error::other(format!("rebalance distributed run fence lost during {stage}")));
         }
         Ok(())
+    }
+
+    pub(super) fn lock_lost_signal(&self) -> Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>> {
+        self.persisted_guard.lock_lost_signal()
     }
 }
 
@@ -145,7 +159,13 @@ pub(super) fn ensure_rebalance_worker_active(meta: Option<&RebalanceMeta>, expec
     let Some(meta) = meta else {
         return Err(rebalance_metadata_not_initialized_error(stage));
     };
-    if meta.stopped_at.is_some() || !is_rebalance_conflicting_with_decommission(meta) {
+    if meta.stopped_at.is_some()
+        || meta
+            .cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        || !is_rebalance_conflicting_with_decommission(meta)
+    {
         return Err(Error::other(format!("inactive rebalance worker rejected during {stage}: {expected_id}")));
     }
     Ok(())
@@ -287,6 +307,16 @@ impl ECStore {
     where
         S: EcstoreObjectIO,
     {
+        #[cfg(test)]
+        {
+            let mut fail_id = FAIL_NEXT_REBALANCE_ACTIVATION_SAVE
+                .lock()
+                .expect("rebalance activation save failure hook should not be poisoned");
+            if fail_id.as_deref() == Some(local_snapshot.id.as_str()) {
+                fail_id.take();
+                return Err(Error::other("injected rebalance activation save failure"));
+            }
+        }
         merge_and_save_rebalance_meta_no_lock(
             pool,
             local_snapshot,
@@ -885,7 +915,21 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance_for_id(self: &Arc<Self>, expected_id: Option<&str>) -> Result<()> {
         let _start_guard = self.start_gate.lock().await;
-        let _activation_guard = self.rebalance_activation_write_guard(expected_id, "stop rebalance").await?;
+        let activation_gate = {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            if let Some(expected_id) = expected_id {
+                ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "stop rebalance")?;
+            }
+            rebalance_meta.as_mut().map(|meta| {
+                let cancel = meta.cancel.get_or_insert_with(tokio_util::sync::CancellationToken::new);
+                cancel.cancel();
+                Arc::clone(&meta.activation_gate)
+            })
+        };
+        let _activation_guard = match activation_gate {
+            Some(gate) => Some(gate.write_owned().await),
+            None => None,
+        };
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
