@@ -3029,6 +3029,16 @@ pub struct SetDisks {
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
 }
 
+// DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
+// each endpoint's canonical Arc, so an exact Arc set identifies the lock domain.
+pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {
+    left.iter()
+        .all(|left_client| right.iter().any(|right_client| Arc::ptr_eq(left_client, right_client)))
+        && right
+            .iter()
+            .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
+}
+
 const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3608,7 +3618,7 @@ impl SetDisks {
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
             (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
-            (true, true) => Arc::ptr_eq(&self.ctx, &other.ctx) && self.set_lock_namespace == other.set_lock_namespace,
+            (true, true) => same_distributed_lock_domain(&self.lockers, &other.lockers),
             _ => false,
         }
     }

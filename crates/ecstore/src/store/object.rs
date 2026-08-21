@@ -38,7 +38,7 @@ use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
     SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_lock_optimization_enabled, is_object_lock_diag_enabled,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled, same_distributed_lock_domain,
 };
 use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
@@ -799,16 +799,6 @@ impl SelectObjectSnapshotLockLossWake {
             }
         }
     }
-}
-
-// LockRegistry clones its canonical client Arc for each endpoint host, so an
-// exact Arc set identifies one distributed namespace-lock quorum domain.
-fn same_distributed_lock_domain(left: &[Arc<dyn rustfs_lock::LockClient>], right: &[Arc<dyn rustfs_lock::LockClient>]) -> bool {
-    left.iter()
-        .all(|left_client| right.iter().any(|right_client| Arc::ptr_eq(left_client, right_client)))
-        && right
-            .iter()
-            .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
 }
 
 impl AsyncRead for SelectObjectSnapshotReader {
@@ -3954,7 +3944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decommission_fence_keeps_dist_set_locks_when_clients_match_but_namespaces_differ() {
+    async fn decommission_fence_covers_dist_sets_with_same_clients_despite_different_namespaces() {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_dirs, original_sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
         let mut second_set = (*original_sets.disk_set[1]).clone();
@@ -3984,18 +3974,27 @@ mod tests {
             .acquire_decommission_object_mutation_fence("bucket", &object)
             .await
             .expect("the fixed distributed mutation fence should be acquired");
+        let target_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &object)
+            .await
+            .expect("the hashed-set namespace lock should be created");
+        let target_err = target_lock
+            .get_write_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed read fence must conflict through the shared clients");
+        assert!(matches!(target_err, rustfs_lock::LockError::Timeout { .. }));
 
         let mut put_opts = ObjectOptions::default();
         store
             .apply_decommission_target_mutation_fence(0, &object, &mut put_opts, Some(&mutation_fence))
             .await;
-        assert!(!put_opts.no_lock, "migration target PUT must retain the hashed-set lock");
+        assert!(put_opts.no_lock, "migration target PUT must reuse the covering fixed fence");
 
         let mut multipart_opts = ObjectOptions::default();
         store
             .apply_decommission_target_mutation_fence(0, &object, &mut multipart_opts, Some(&mutation_fence))
             .await;
-        assert!(!multipart_opts.no_lock, "migration target multipart must retain the hashed-set lock");
+        assert!(multipart_opts.no_lock, "migration target multipart must reuse the covering fixed fence");
         drop(mutation_fence);
 
         let cleanup_object = (0..1_000)
@@ -4006,10 +4005,16 @@ mod tests {
             .acquire_decommission_source_cleanup_fence("bucket", &cleanup_object, sets.disk_set[1].as_ref())
             .await
             .expect("the fixed distributed cleanup fence should be acquired");
-        assert!(
-            !source_fence.source_lock_covered(),
-            "source cleanup must retain its distinct distributed set lock"
-        );
+        assert!(source_fence.source_lock_covered(), "source cleanup must reuse the covering fixed fence");
+        let source_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &cleanup_object)
+            .await
+            .expect("the source-set namespace lock should be created");
+        let source_err = source_lock
+            .get_read_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed write fence must conflict through the shared clients");
+        assert!(matches!(source_err, rustfs_lock::LockError::Timeout { .. }));
     }
 
     #[test]
