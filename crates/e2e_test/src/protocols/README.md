@@ -11,9 +11,16 @@ test process directly.
 
 ## Running Tests
 
+Use the canonical CI-equivalent protocol command in the parent
+[`e2e_test` README](../../README.md#troubleshooting).
+
+For targeted debugging of the core suite only:
+
 ```bash
 RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
+
+This targeted command does not cover the full `e2e-protocols` profile.
 
 `RUSTFS_BUILD_FEATURES` controls which features the test rustfs binary is
 built with. When this variable is set, the protocol test runner schedules
@@ -133,4 +140,3 @@ property without consulting any external doc.
 Bind ports 9023 (SFTP) and 9100 (S3). Spawns rustfs with
 `RUSTFS_SFTP_IDLE_TIMEOUT=5`, sleeps 10 s past the timeout, then issues an
 SFTP request and asserts the server has closed the session.
-

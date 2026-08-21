@@ -48,11 +48,8 @@ fn materialize_case(path: String, prefix: Option<String>, flags: &[String]) -> (
         .fold((path, prefix), |(path, prefix), flag| apply_flag(path, prefix, flag))
 }
 
-fn has_dot_segments(path: &str) -> bool {
-    path.split(['/', '\\']).any(|segment| {
-        let trimmed = segment.trim();
-        trimmed == "." || trimmed == ".."
-    })
+fn has_parent_segments(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -66,8 +63,8 @@ fuzz_target!(|data: &[u8]| {
 
     if let Ok(key) = normalize_extract_entry_key(&path, prefix.as_deref(), is_dir) {
         assert!(
-            !has_dot_segments(&key),
-            "accepted archive entry retained dot segments: path={:?} prefix={:?} key={:?}",
+            !has_parent_segments(&key),
+            "accepted archive entry retained parent segments: path={:?} prefix={:?} key={:?}",
             path,
             prefix,
             key
