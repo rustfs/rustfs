@@ -2996,7 +2996,9 @@ mod tests {
     fn replication_target_deserialization_preserves_large_historical_maps() {
         let mut stats = ReplicationAllStats::default();
         for index in 0..=1024 {
-            stats.targets.insert(format!("target-{index}"), ReplicationTargetUsage::default());
+            stats
+                .targets
+                .insert(format!("target-{index}"), ReplicationTargetUsage::default());
         }
         let encoded = rmp_serde::to_vec_named(&stats).expect("large replication target fixture should encode");
         let decoded = rmp_serde::from_slice::<ReplicationAllStats>(&encoded)
@@ -3026,8 +3028,7 @@ mod tests {
         };
 
         let buf = rmp_serde::to_vec_named(&original).expect("encode ReplicationTargetUsage to msgpack");
-        let decoded: ReplicationTargetUsage =
-            rmp_serde::from_slice(&buf).expect("decode ReplicationTargetUsage from msgpack");
+        let decoded: ReplicationTargetUsage = rmp_serde::from_slice(&buf).expect("decode ReplicationTargetUsage from msgpack");
         assert_eq!(original, decoded, "round-trip through rmp must preserve every field");
 
         // Also verify that encoding as an unnamed sequence and then decoding
@@ -3037,8 +3038,14 @@ mod tests {
         let named_str = String::from_utf8_lossy(&named_buf);
         assert!(named_str.contains("pending_size"), "field 'pending_size' must survive the rename");
         assert!(named_str.contains("replicated_size"), "field 'replicated_size' must survive the rename");
-        assert!(named_str.contains("missed_threshold_size"), "field 'missed_threshold_size' must survive the rename");
-        assert!(named_str.contains("after_threshold_count"), "field 'after_threshold_count' must survive the rename");
+        assert!(
+            named_str.contains("missed_threshold_size"),
+            "field 'missed_threshold_size' must survive the rename"
+        );
+        assert!(
+            named_str.contains("after_threshold_count"),
+            "field 'after_threshold_count' must survive the rename"
+        );
     }
 
     #[test]
