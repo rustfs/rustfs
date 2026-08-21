@@ -2255,6 +2255,7 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
     hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "1");
     hot.set_env("RUSTFS_TRANSITION_QUEUE_CAPACITY", "1");
+    hot.set_env("RUSTFS_TRANSITION_QUEUE_SEND_TIMEOUT_MS", "1");
     hot.start().await?;
 
     let hot_client = hot.create_s3_client(0)?;
@@ -2271,7 +2272,7 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(payload(64 * KIB, index)))
+            .body(ByteStream::from(payload(1024 * KIB, index)))
             .send()
             .await?;
     }

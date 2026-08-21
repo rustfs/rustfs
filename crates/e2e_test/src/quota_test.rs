@@ -634,6 +634,7 @@ mod integration_tests {
         let env = QuotaTestEnv::new().await?;
 
         env.create_bucket().await?;
+        env.wait_for_quota_usage_for(&env.bucket_name).await?;
 
         // Test 1: GET quota for bucket without quota config
         let url = format!("{}/rustfs/admin/v3/quota/{}", env.env.url, env.bucket_name);
