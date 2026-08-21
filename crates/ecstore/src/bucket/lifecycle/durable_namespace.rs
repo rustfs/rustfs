@@ -16,7 +16,12 @@ use rustfs_utils::crypto::hex_sha256;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{manual_transition_job, tier_delete_journal, transition_transaction};
+use super::{
+    bucket_lifecycle_ops::{
+        ManualTransitionQueueSnapshot, ManualTransitionRunReport, decode_manual_transition_continuation_token,
+    },
+    manual_transition_job, tier_delete_journal, transition_transaction,
+};
 use crate::error::{Error, Result};
 
 pub(crate) const ILM_META_PREFIX: &str = "ilm";
@@ -94,6 +99,13 @@ pub(crate) struct ValidatedDurableIlmRecord {
     pub(crate) checkpoint: DurableIlmRecordCheckpoint,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManualTransitionJobProgressCheckpoint {
+    report: ManualTransitionRunReport,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+}
+
 impl ValidatedDurableIlmRecord {
     pub(crate) fn context(&self) -> String {
         format!("namespace `{}` {} `{}`", self.namespace, self.id_kind, self.id)
@@ -123,6 +135,8 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         state: manual_transition_job::ManualTransitionJobState,
         scan_completed: bool,
         cancel_requested: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<Box<ManualTransitionJobProgressCheckpoint>>,
     },
     ManualTransitionScope {
         content_sha256: String,
@@ -151,6 +165,14 @@ impl DurableIlmRecordCheckpoint {
 
     pub(crate) fn validate_successor(&self, next: &Self) -> Result<()> {
         if self == next {
+            if let Self::ManualTransitionJob {
+                progress: Some(progress),
+                ..
+            } = self
+                && !manual_job_progress_is_valid(progress)
+            {
+                return Err(Error::other("durable ILM manual transition checkpoint is invalid"));
+            }
             return Ok(());
         }
 
@@ -200,6 +222,7 @@ impl DurableIlmRecordCheckpoint {
                     state: previous_state,
                     scan_completed: previous_scan_completed,
                     cancel_requested: previous_cancel_requested,
+                    progress: previous_progress,
                     ..
                 },
                 Self::ManualTransitionJob {
@@ -208,6 +231,7 @@ impl DurableIlmRecordCheckpoint {
                     state: next_state,
                     scan_completed: next_scan_completed,
                     cancel_requested: next_cancel_requested,
+                    progress: next_progress,
                     ..
                 },
             ) => {
@@ -216,6 +240,7 @@ impl DurableIlmRecordCheckpoint {
                     && manual_job_state_reaches(*previous_state, *next_state)
                     && (!previous_scan_completed || *next_scan_completed)
                     && (!previous_cancel_requested || *next_cancel_requested)
+                    && manual_job_progress_reaches(previous_progress.as_deref(), next_progress.as_deref(), *next_scan_completed)
             }
             (
                 Self::ManualTransitionScope {
@@ -267,6 +292,129 @@ fn manual_job_state_reaches(
     to: manual_transition_job::ManualTransitionJobState,
 ) -> bool {
     from == to || from == manual_transition_job::ManualTransitionJobState::Running
+}
+
+fn manual_job_progress_reaches(
+    previous: Option<&ManualTransitionJobProgressCheckpoint>,
+    next: Option<&ManualTransitionJobProgressCheckpoint>,
+    next_scan_completed: bool,
+) -> bool {
+    let (previous, next) = match (previous, next) {
+        (None, Some(next)) => return manual_job_progress_is_valid(next),
+        (Some(previous), Some(next)) => (previous, next),
+        _ => return false,
+    };
+    let previous_report = &previous.report;
+    let next_report = &next.report;
+
+    macro_rules! counters_do_not_regress {
+        ($($field:ident),+ $(,)?) => {
+            $(previous_report.$field <= next_report.$field)&&+
+        };
+    }
+
+    let counters_monotonic = counters_do_not_regress!(
+        scanned,
+        eligible,
+        enqueued,
+        dry_run_eligible,
+        skipped_not_transition,
+        skipped_tier,
+        skipped_delete_marker,
+        skipped_directory,
+        skipped_replication,
+        skipped_already_transitioned,
+        skipped_already_in_flight,
+        skipped_queue_full,
+        skipped_queue_closed,
+        skipped_queue_timeout,
+        transition_completed,
+        transition_failed,
+        tier_failure,
+    );
+    let failure_reasons_monotonic = previous_report.tier_failure_by_reason.iter().all(|(reason, previous_count)| {
+        next_report
+            .tier_failure_by_reason
+            .get(reason)
+            .is_some_and(|next_count| next_count >= previous_count)
+    });
+    let flags_monotonic = (!previous_report.lifecycle_config_found || next_report.lifecycle_config_found)
+        && (!previous_report.truncated_by_limit || next_report.truncated_by_limit)
+        && (!previous_report.truncated_by_duration || next_report.truncated_by_duration)
+        && (!previous_report.cancelled || next_report.cancelled);
+    let cursor_monotonic = manual_job_cursor_reaches(previous_report, next_report, next_scan_completed);
+    let progress_valid = manual_job_progress_is_valid(previous) && manual_job_progress_is_valid(next);
+
+    previous_report.bucket == next_report.bucket
+        && previous_report.prefix == next_report.prefix
+        && previous_report.tier == next_report.tier
+        && previous_report.dry_run == next_report.dry_run
+        && counters_monotonic
+        && failure_reasons_monotonic
+        && flags_monotonic
+        && cursor_monotonic
+        && progress_valid
+}
+
+fn manual_job_progress_is_valid(progress: &ManualTransitionJobProgressCheckpoint) -> bool {
+    manual_job_worker_results_are_valid(&progress.report)
+        && manual_job_queue_snapshot_is_valid(&progress.queue_snapshot)
+        && manual_job_cursor_is_valid(progress.report.continuation_token.as_deref())
+}
+
+fn manual_job_worker_results_are_valid(report: &ManualTransitionRunReport) -> bool {
+    let reason_total = report
+        .tier_failure_by_reason
+        .values()
+        .try_fold(0u64, |total, count| total.checked_add(*count));
+    report
+        .transition_completed
+        .checked_add(report.transition_failed)
+        .is_some_and(|total| total <= report.enqueued)
+        && report.transition_failed <= report.tier_failure
+        && reason_total.is_some_and(|total| total <= report.tier_failure)
+}
+
+fn manual_job_cursor_reaches(
+    previous: &ManualTransitionRunReport,
+    next: &ManualTransitionRunReport,
+    next_scan_completed: bool,
+) -> bool {
+    if previous.continuation_token == next.continuation_token {
+        return manual_job_cursor_is_valid(previous.continuation_token.as_deref());
+    }
+    match (&previous.continuation_token, &next.continuation_token) {
+        (None, Some(next_token)) => next.scanned > previous.scanned && manual_job_cursor_is_valid(Some(next_token)),
+        (Some(_), None) => next_scan_completed,
+        (Some(previous_token), Some(next_token)) if next.scanned > previous.scanned => {
+            let (Ok((Some(previous_marker), previous_version)), Ok((Some(next_marker), next_version))) = (
+                decode_manual_transition_continuation_token(previous_token),
+                decode_manual_transition_continuation_token(next_token),
+            ) else {
+                return false;
+            };
+            next_marker > previous_marker
+                || (next_marker == previous_marker
+                    && previous_version.is_some()
+                    && next_version.is_some()
+                    && previous_version != next_version)
+        }
+        _ => false,
+    }
+}
+
+fn manual_job_cursor_is_valid(token: Option<&str>) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+    matches!(decode_manual_transition_continuation_token(token), Ok((Some(_), _)))
+}
+
+fn manual_job_queue_snapshot_is_valid(snapshot: &ManualTransitionQueueSnapshot) -> bool {
+    (snapshot.queue_capacity > 0 || snapshot.queued == 0)
+        && (snapshot.queue_capacity == 0 || snapshot.queued <= snapshot.queue_capacity)
+        && (snapshot.workers > 0 || snapshot.active == 0)
+        && (snapshot.workers == 0 || snapshot.active <= snapshot.workers)
 }
 
 fn checkpoint_hash<T: Serialize>(value: &T) -> Result<String> {
@@ -429,6 +577,10 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                     state: job.state,
                     scan_completed: job.scan_completed,
                     cancel_requested: job.cancel_requested,
+                    progress: Some(Box::new(ManualTransitionJobProgressCheckpoint {
+                        report: job.report,
+                        queue_snapshot: job.queue_snapshot,
+                    })),
                 },
             )
         }
@@ -504,6 +656,21 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
 mod tests {
     use super::*;
 
+    fn manual_job_checkpoint(job: &manual_transition_job::ManualTransitionJobRecord) -> DurableIlmRecordCheckpoint {
+        let path =
+            manual_transition_job::manual_transition_job_record_object_name(job.job_id).expect("manual job path should build");
+        let encoded = job.encode().expect("manual job should encode");
+        validate_durable_ilm_record(&path, &encoded)
+            .expect("manual job checkpoint should validate")
+            .checkpoint
+    }
+
+    fn continuation_token(marker: &str) -> String {
+        let encoded = serde_json::to_vec(&serde_json::json!({ "marker": marker, "version_marker": null }))
+            .expect("continuation token should encode");
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encoded)
+    }
+
     #[test]
     fn unknown_ilm_record_requires_namespace_registration() {
         let err = classify_durable_ilm_record("ilm/future-durable/jobs/one.json")
@@ -523,5 +690,120 @@ mod tests {
                 assert!(!path_is_in_namespace(other.prefix, namespace));
             }
         }
+    }
+
+    #[test]
+    fn manual_transition_job_checkpoint_rejects_progress_poison() {
+        let options = super::super::bucket_lifecycle_ops::ManualTransitionRunOptions::default();
+        let mut initial =
+            manual_transition_job::ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-checkpoint-bucket", &options, "owner");
+        let initial_checkpoint = manual_job_checkpoint(&initial);
+        initial.updated_at_unix_nanos += 1;
+        initial.report.scanned = 1;
+        initial.report.continuation_token = Some(continuation_token("logs/a"));
+        let first_page_checkpoint = manual_job_checkpoint(&initial);
+        initial_checkpoint
+            .validate_successor(&first_page_checkpoint)
+            .expect("the first durable cursor should advance from no cursor");
+
+        let mut legacy_checkpoint = initial_checkpoint;
+        let DurableIlmRecordCheckpoint::ManualTransitionJob { progress, .. } = &mut legacy_checkpoint else {
+            panic!("manual job should produce a manual checkpoint");
+        };
+        *progress = None;
+        legacy_checkpoint
+            .validate_successor(&first_page_checkpoint)
+            .expect("legacy checkpoints should upgrade to validated progress");
+
+        let mut previous = initial;
+        previous.updated_at_unix_nanos += 1;
+        previous.report.scanned = 10;
+        previous.report.eligible = 8;
+        previous.report.enqueued = 2;
+        previous.report.transition_completed = 1;
+        previous.report.continuation_token = Some(continuation_token("logs/b"));
+        previous.queue_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 10,
+            queued: 1,
+            active: 1,
+            workers: 2,
+            queue_full: 2,
+            queue_send_timeout: 1,
+            ..Default::default()
+        };
+        let previous_checkpoint = manual_job_checkpoint(&previous);
+
+        let mut next = previous.clone();
+        next.updated_at_unix_nanos += 1;
+        next.report.scanned = 11;
+        next.report.eligible = 9;
+        next.report.transition_completed = 2;
+        next.report.continuation_token = Some(continuation_token("logs/c"));
+        next.queue_snapshot.queued = 0;
+        next.queue_snapshot.active = 0;
+        next.queue_snapshot.queue_full = 3;
+        let next_checkpoint = manual_job_checkpoint(&next);
+        previous_checkpoint
+            .validate_successor(&next_checkpoint)
+            .expect("forward job progress should validate");
+
+        let mut counter_rollback = next.clone();
+        counter_rollback.updated_at_unix_nanos += 1;
+        counter_rollback.report.scanned = 9;
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&counter_rollback))
+                .is_err()
+        );
+
+        let mut cursor_rollback = next.clone();
+        cursor_rollback.updated_at_unix_nanos += 1;
+        cursor_rollback.report.scanned = previous.report.scanned;
+        cursor_rollback.report.scanned += 1;
+        cursor_rollback.report.continuation_token = Some(continuation_token("logs/a"));
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&cursor_rollback))
+                .is_err()
+        );
+
+        let mut worker_result_rollback = next.clone();
+        worker_result_rollback.updated_at_unix_nanos += 1;
+        worker_result_rollback.report.transition_completed = 0;
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&worker_result_rollback))
+                .is_err()
+        );
+
+        let mut worker_result_overflow = next.clone();
+        worker_result_overflow.updated_at_unix_nanos += 1;
+        worker_result_overflow.report.enqueued = u64::MAX;
+        worker_result_overflow.report.transition_completed = u64::MAX;
+        worker_result_overflow.report.transition_failed = 1;
+        worker_result_overflow.report.tier_failure = 1;
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&worker_result_overflow))
+                .is_err()
+        );
+
+        let mut invalid_cursor = next.clone();
+        invalid_cursor.updated_at_unix_nanos += 1;
+        invalid_cursor.report.continuation_token = Some("not-base64".to_string());
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&invalid_cursor))
+                .is_err()
+        );
+
+        let mut queue_state_poison = next;
+        queue_state_poison.updated_at_unix_nanos += 1;
+        queue_state_poison.queue_snapshot.queued = queue_state_poison.queue_snapshot.queue_capacity + 1;
+        assert!(
+            previous_checkpoint
+                .validate_successor(&manual_job_checkpoint(&queue_state_poison))
+                .is_err()
+        );
     }
 }

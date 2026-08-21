@@ -585,6 +585,7 @@ mod tests {
         client::transition_api::ReaderImpl,
         config::com,
         core::pools::DecomBucketInfo,
+        data_movement::SourceCleanupDeleteBarrier,
         disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
@@ -4394,6 +4395,181 @@ mod tests {
             unexpected_version,
             StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)
         ));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-target-read-error", &[4, 4, 4]))
+                .await;
+        let job_id = uuid::Uuid::new_v4();
+        let job =
+            ManualTransitionJobRecord::new(job_id, "manual-target-read-error", &ManualTransitionRunOptions::default(), "owner");
+        let path = manual_transition_job_record_object_name(job_id).expect("manual job path should build");
+        let data = job.encode().expect("manual job should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("manual job fixture should persist in every pool");
+        }
+        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+
+        let failing_target = store.pools[2].get_disks_by_key(&path);
+        let original_disks = {
+            let mut disks = failing_target.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(3) {
+                *disk = None;
+            }
+            original
+        };
+        let error = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, store.pools[0].get_disks_by_key(&path), &path)
+            .await
+            .expect_err("one target read-quorum error must fail closed despite another target success")
+            .to_string();
+        *failing_target.disks.write().await = original_disks;
+
+        assert!(error.contains(&path));
+        assert!(error.contains("pool 2"));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("target read error must retain the source"),
+            data
+        );
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("failed target verification should not create a receipt"),
+            0
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-terminal-receipt", &[4, 4])).await;
+        let tier_name = "DECOMMISSION-RECEIPT";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let entry = Jentry {
+            obj_name: "receipt-recovery-object".to_string(),
+            version_id: "receipt-recovery-version".to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+        };
+        let path = tier_delete_journal_object_name(&entry);
+        let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
+        com::save_config(store.pools[0].clone(), &path, data.clone())
+            .await
+            .expect("source tier journal should persist");
+        com::save_config(store.pools[1].clone(), &path, data.clone())
+            .await
+            .expect("target tier journal should persist");
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active decommission run identity should persist");
+
+        let source_set = store.pools[0].get_disks_by_key(&path);
+        let barrier = SourceCleanupDeleteBarrier::install(RUSTFS_META_BUCKET, &path);
+        let cleanup_store = store.clone();
+        let cleanup_set = source_set.clone();
+        let cleanup_path = path.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_store
+                .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, cleanup_set, &cleanup_path)
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let original_source_disks = {
+            let mut disks = source_set.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(3) {
+                *disk = None;
+            }
+            original
+        };
+        barrier.release();
+        let cleanup_error = cleanup
+            .await
+            .expect("source cleanup task should not panic")
+            .expect_err("injected source delete quorum failure must fail cleanup")
+            .to_string();
+        *source_set.disks.write().await = original_source_disks;
+        drop(barrier);
+
+        assert!(cleanup_error.contains("source durable ILM cleanup failed"));
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("receipt should persist before source cleanup"),
+            1
+        );
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("failed cleanup must retain the source"),
+            data
+        );
+
+        let mut restarted_pool_meta = PoolMeta::default();
+        restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("decommission run identity should reload after restart");
+        *store.pool_meta.write().await = restarted_pool_meta;
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("target recovery should commit terminal proof and delete the target");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        assert!(matches!(
+            com::read_config(store.pools[1].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("target recovery must not delete the decommission source"),
+            data
+        );
+
+        store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, source_set, &path)
+            .await
+            .expect("terminal receipt should authorize cleanup after target deletion");
+        assert!(matches!(
+            com::read_config(store.pools[0].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert!(backend.remove_versions().await.contains(&(entry.obj_name, entry.version_id)));
     }
 
     #[cfg(feature = "test-util")]
