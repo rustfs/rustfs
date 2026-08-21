@@ -1675,6 +1675,264 @@ async fn future_resume_and_checkpoint_schemas_are_rejected() {
     temp_dir.close().expect("remove schema test directory");
 }
 
+#[tokio::test]
+async fn checkpoint_save_does_not_replace_a_non_empty_truncated_snapshot() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint manager");
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let truncated = b"{\"schema_version\":5,\"task_id\":";
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, truncated.as_slice().into())
+        .await
+        .expect("write truncated checkpoint fixture");
+
+    let error = manager
+        .update_position(2, 7)
+        .await
+        .expect_err("a truncated checkpoint must fail closed during save");
+    assert!(error.to_string().contains("Existing checkpoint is corrupt"));
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path)
+            .await
+            .expect("read truncated checkpoint fixture"),
+        truncated.as_slice()
+    );
+    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
+    temp_dir.close().expect("remove checkpoint save test directory");
+}
+
+#[tokio::test]
+async fn checkpoint_save_does_not_replace_a_future_schema_snapshot() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint manager");
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let mut future = ResumeCheckpoint::new(task_id.clone());
+    future.schema_version = CURRENT_CHECKPOINT_SCHEMA + 1;
+    let future_bytes = serde_json::to_vec(&future).expect("serialize future checkpoint fixture");
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, future_bytes.clone().into())
+        .await
+        .expect("write future checkpoint fixture");
+
+    let error = manager
+        .update_position(2, 7)
+        .await
+        .expect_err("a future schema must fail closed during save");
+    assert!(error.to_string().contains("Existing checkpoint schema"));
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path)
+            .await
+            .expect("read future checkpoint fixture"),
+        future_bytes
+    );
+    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
+    temp_dir.close().expect("remove future schema test directory");
+}
+
+#[tokio::test]
+async fn new_checkpoint_manager_rebuilds_an_empty_snapshot() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, EcstoreDiskBytes::new())
+        .await
+        .expect("write empty checkpoint fixture");
+
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("a new manager must rebuild an empty checkpoint");
+    manager
+        .update_position(3, 11)
+        .await
+        .expect("rebuilt checkpoint must remain writable");
+    assert!(CheckpointManager::has_checkpoint(&disk, &task_id).await);
+    temp_dir.close().expect("remove empty checkpoint test directory");
+}
+
+#[tokio::test]
+async fn deleted_checkpoint_is_not_recreated_by_an_old_manager() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint manager");
+    manager.cleanup().await.expect("delete checkpoint fixture");
+
+    let error = manager
+        .update_position(1, 2)
+        .await
+        .expect_err("an old manager must not resurrect a deleted checkpoint");
+    assert!(error.to_string().contains("removed after this manager saved it"));
+    assert!(!CheckpointManager::has_checkpoint(&disk, &task_id).await);
+    temp_dir.close().expect("remove deleted checkpoint test directory");
+}
+
+#[tokio::test]
+async fn an_empty_blocked_marker_still_blocks_resume_selection() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint manager");
+    let blocked_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &blocked_path, EcstoreDiskBytes::new())
+        .await
+        .expect("write empty blocked marker fixture");
+
+    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
+    assert!(!CheckpointManager::is_resumable(&disk, &task_id).await);
+    // Recovery requires replacing/cleaning the snapshot, then removing the
+    // marker; ordinary selector retries are intentionally not an unlock path.
+    manager.cleanup().await.expect("clean blocked checkpoint");
+    assert!(!CheckpointManager::is_blocked(&disk, &task_id).await);
+    temp_dir.close().expect("remove empty blocked marker test directory");
+}
+
+#[tokio::test]
+async fn resumable_selector_skips_healthy_tasks_with_blocked_markers() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let tasks = [
+        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::new()),
+        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::from_static(b"blocked")),
+    ];
+    for (task_id, marker) in &tasks {
+        ResumeManager::new(
+            disk.clone(),
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        )
+        .await
+        .expect("create healthy resume state");
+        CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create healthy checkpoint");
+        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let checkpoint_bytes = disk
+            .read_all(RUSTFS_META_BUCKET, &checkpoint_path)
+            .await
+            .expect("read healthy checkpoint before blocking");
+        let marker_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &marker_path, marker.clone())
+            .await
+            .expect("write blocked marker");
+
+        assert!(
+            ResumeUtils::get_resumable_tasks(&disk)
+                .await
+                .expect("filter blocked healthy task")
+                .is_empty()
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path)
+                .await
+                .expect("read healthy checkpoint after blocking"),
+            checkpoint_bytes
+        );
+    }
+    temp_dir.close().expect("remove blocked selector test directory");
+}
+
+#[tokio::test]
+async fn stale_checkpoint_manager_cannot_overwrite_newer_progress() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let first = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create first checkpoint manager");
+    let second = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("load second checkpoint manager");
+
+    second
+        .update_position(4, 20)
+        .await
+        .expect("persist newer checkpoint progress");
+    let error = first
+        .update_position(1, 3)
+        .await
+        .expect_err("stale checkpoint manager must not overwrite newer progress");
+    assert!(error.to_string().contains("newer progress"));
+
+    let persisted = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("load newer checkpoint progress")
+        .get_checkpoint()
+        .await;
+    assert_eq!(persisted.current_bucket_index, 4);
+    assert_eq!(persisted.current_object_index, 20);
+    temp_dir.close().expect("remove stale manager test directory");
+}
+
+#[tokio::test]
+async fn resumable_selector_isolates_future_and_corrupt_checkpoints() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let future_task = ResumeUtils::generate_task_id();
+    let corrupt_task = ResumeUtils::generate_task_id();
+    for task_id in [&future_task, &corrupt_task] {
+        ResumeManager::new(
+            disk.clone(),
+            task_id.to_string(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            vec!["bucket".to_string()],
+        )
+        .await
+        .expect("create resumable state fixture");
+    }
+
+    let future_path = format!("{BUCKET_META_PREFIX}/{future_task}_{RESUME_CHECKPOINT_FILE}");
+    let mut future = ResumeCheckpoint::new(future_task.clone());
+    future.schema_version = CURRENT_CHECKPOINT_SCHEMA + 1;
+    let future_bytes = serde_json::to_vec(&future).expect("serialize future checkpoint fixture");
+    disk.write_all(RUSTFS_META_BUCKET, &future_path, future_bytes.clone().into())
+        .await
+        .expect("write future checkpoint fixture");
+    let corrupt_path = format!("{BUCKET_META_PREFIX}/{corrupt_task}_{RESUME_CHECKPOINT_FILE}");
+    let corrupt_bytes = b"{truncated";
+    disk.write_all(RUSTFS_META_BUCKET, &corrupt_path, corrupt_bytes.as_slice().into())
+        .await
+        .expect("write corrupt checkpoint fixture");
+
+    assert!(
+        ResumeUtils::get_resumable_tasks(&disk)
+            .await
+            .expect("filter malformed resumable tasks")
+            .is_empty()
+    );
+    assert!(
+        ResumeUtils::get_resumable_tasks(&disk)
+            .await
+            .expect("filter blocked resumable tasks")
+            .is_empty()
+    );
+    for (task_id, path, bytes) in [
+        (&future_task, future_path, future_bytes),
+        (&corrupt_task, corrupt_path, corrupt_bytes.to_vec()),
+    ] {
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("read isolated checkpoint bytes"),
+            bytes
+        );
+        let blocked_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
+        assert!(
+            !disk
+                .read_all(RUSTFS_META_BUCKET, &blocked_path)
+                .await
+                .expect("read checkpoint blocked marker")
+                .is_empty()
+        );
+    }
+    temp_dir.close().expect("remove selector isolation test directory");
+}
+
 #[test]
 fn test_persist_throttle_batches_until_threshold() {
     let mut throttle = PersistThrottle::new();
