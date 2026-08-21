@@ -34,5 +34,6 @@ pub mod tier_sweeper;
 pub mod transition_transaction;
 
 pub(crate) use durable_namespace::{
-    ILM_META_PREFIX, ValidatedDurableIlmRecord, classify_durable_ilm_record, validate_durable_ilm_record,
+    DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord, classify_durable_ilm_record,
+    validate_durable_ilm_record,
 };
