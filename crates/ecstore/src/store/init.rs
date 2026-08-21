@@ -2958,7 +2958,7 @@ mod tests {
             .expect_err("suspended delete must remove the requested UUID version");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_entry_carries_migration_and_cleanup_mutation_fences() {
         let temp_dir = tempfile::tempdir().expect("create decommission delete-fence store dir");
@@ -2971,7 +2971,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("decommission-delete-fence-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decom-delete-fence-{}", uuid::Uuid::new_v4());
         let object = (0..128)
             .map(|index| format!("object-{index}.bin"))
             .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == 1)
@@ -3102,7 +3102,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_outer_fence_loss_blocks_target_put_commit() {
         let temp_dir = tempfile::tempdir().expect("create decommission PUT fence-loss store dir");
@@ -3110,7 +3110,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-put-fence-loss", &[4, 4])).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("decommission-put-fence-loss-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decom-put-fence-loss-{}", uuid::Uuid::new_v4());
         let object = "ordinary.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -3164,7 +3164,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_outer_fence_loss_blocks_multipart_commits() {
         let temp_dir = tempfile::tempdir().expect("create decommission multipart fence-loss store dir");
@@ -3173,7 +3173,7 @@ mod tests {
                 .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("decommission-multipart-fence-loss-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decom-mpu-fence-loss-{}", uuid::Uuid::new_v4());
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
@@ -3239,7 +3239,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_outer_fence_loss_blocks_source_cleanup_delete_commit() {
         let temp_dir = tempfile::tempdir().expect("create decommission cleanup fence-loss store dir");
@@ -3248,7 +3248,7 @@ mod tests {
                 .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("decommission-cleanup-fence-loss-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decom-cleanup-fence-loss-{}", uuid::Uuid::new_v4());
         let object = "cleanup.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -3302,7 +3302,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn reverse_decommission_reuses_fixed_target_fence_for_put_and_multipart() {
         let temp_dir = tempfile::tempdir().expect("create reverse decommission store dir");
@@ -3315,7 +3315,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("reverse-decommission-fixed-target-{}", uuid::Uuid::new_v4());
+        let bucket = format!("reverse-decom-fixed-target-{}", uuid::Uuid::new_v4());
         let object = "ordinary.bin";
         let object_body = b"reverse ordinary generation".to_vec();
         let multipart_object = "multipart.bin";
@@ -3508,7 +3508,7 @@ mod tests {
                 }
             }
 
-            let bucket = format!("batch-delete-pool-errors-{source_pool_idx}-{}", uuid::Uuid::new_v4());
+            let bucket = format!("batch-del-pool-error-{source_pool_idx}-{}", uuid::Uuid::new_v4());
             let object_names = vec![
                 format!("third-{source_pool_idx}.bin"),
                 format!("first-{source_pool_idx}.bin"),
@@ -3615,7 +3615,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("multi-set-decommission-source-cleanup-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decom-source-cleanup-lock-{}", uuid::Uuid::new_v4());
         let object = (0..128)
             .map(|index| format!("object-{index}.bin"))
             .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == 1)
@@ -3706,7 +3706,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn versioned_delete_marker_survives_decommission_source_cleanup() {
         let temp_dir = tempfile::tempdir().expect("create versioned decommission delete-fence store dir");
@@ -3715,7 +3715,7 @@ mod tests {
                 .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("versioned-decommission-delete-fence-{}", uuid::Uuid::new_v4());
+        let bucket = format!("versioned-decom-delete-{}", uuid::Uuid::new_v4());
         let object = "object.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -3846,7 +3846,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn versioned_batch_delete_marker_skips_decommission_source() {
         let temp_dir = tempfile::tempdir().expect("create versioned batch decommission store dir");
@@ -3858,7 +3858,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("versioned-batch-decommission-delete-fence-{}", uuid::Uuid::new_v4());
+        let bucket = format!("vbatch-decom-delete-{}", uuid::Uuid::new_v4());
         let object = "batch-object.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -3942,7 +3942,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn suspended_delete_marker_then_decommission_worker_converges_null_source() {
         let temp_dir = tempfile::tempdir().expect("create suspended decommission DELETE store dir");
@@ -3954,7 +3954,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("suspended-decommission-delete-convergence-{}", uuid::Uuid::new_v4());
+        let bucket = format!("suspended-decom-delete-{}", uuid::Uuid::new_v4());
         let object = "single.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -4018,7 +4018,7 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn suspended_batch_delete_marker_then_decommission_worker_converges_null_source() {
         let temp_dir = tempfile::tempdir().expect("create suspended batch decommission DELETE store dir");
@@ -4030,7 +4030,7 @@ mod tests {
         .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("suspended-batch-decommission-delete-convergence-{}", uuid::Uuid::new_v4());
+        let bucket = format!("susp-batch-decom-delete-{}", uuid::Uuid::new_v4());
         let object = "batch.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
