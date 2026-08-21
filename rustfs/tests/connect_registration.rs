@@ -569,15 +569,15 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     );
     assert!(matches!(first, Err(ClientError::Unavailable { .. })));
     assert!(matches!(second, Err(ClientError::Unavailable { .. })));
-    let seen = retries.seen.lock().expect("seen lock");
-    assert!(seen.len() >= 3, "bounded retries must reach the server");
-    for request in &seen[1..] {
-        assert_eq!(request["requestId"], seen[0]["requestId"]);
-        assert_eq!(request["certificateRequest"], seen[0]["certificateRequest"]);
-    }
-    let request_id = seen[0]["requestId"].clone();
-    let certificate_request = seen[0]["certificateRequest"].clone();
-    drop(seen);
+    let (request_id, certificate_request) = {
+        let seen = retries.seen.lock().expect("seen lock");
+        assert!(seen.len() >= 3, "bounded retries must reach the server");
+        for request in &seen[1..] {
+            assert_eq!(request["requestId"], seen[0]["requestId"]);
+            assert_eq!(request["certificateRequest"], seen[0]["certificateRequest"]);
+        }
+        (seen[0]["requestId"].clone(), seen[0]["certificateRequest"].clone())
+    };
 
     let next_der = fs::read(temp.path().join("identity/device.key.next")).expect("read staged next key");
     let next = rustfs::connect::DeviceIdentity::from_pkcs8_der(&next_der).expect("parse next key");

@@ -218,7 +218,7 @@ impl ConnectClient {
         let cluster = format!("organizations/{}/clusters/{}", token.organization_uid, token.cluster_uid);
         let credential = validate_credential(
             response,
-            &identity,
+            identity,
             &self.roots,
             &self.root_certificates,
             ExpectedDevice::Registration { cluster: &cluster },

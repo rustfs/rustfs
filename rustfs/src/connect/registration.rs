@@ -527,16 +527,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn private_key_pem(identity: &DeviceIdentity) -> Result<Zeroizing<String>, CredentialValidationError> {
-    let der = identity
-        .to_pkcs8_der()
-        .map_err(|_| CredentialValidationError::CertificateRequest)?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&der);
-    let mut pem = Zeroizing::new(String::with_capacity(encoded.len() + 64));
-    pem.push_str("-----BEGIN PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).map_err(|_| CredentialValidationError::CertificateRequest)?);
-        pem.push('\n');
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    Ok(pem)
+    identity
+        .to_pkcs8_pem()
+        .map_err(|_| CredentialValidationError::CertificateRequest)
 }
