@@ -916,7 +916,7 @@ fn resolve_latest_object_access(
 }
 
 fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
-    opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+    (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
 #[cfg(test)]
@@ -1940,7 +1940,7 @@ impl ECStore {
         Ok(guard)
     }
 
-    pub(super) fn apply_decommission_target_mutation_fence(
+    pub(super) async fn apply_decommission_target_mutation_fence(
         &self,
         target_pool_idx: usize,
         object: &str,
@@ -1952,11 +1952,16 @@ impl ECStore {
         };
 
         mutation_fence.add_namespace_lock_fence(opts);
+        let distributed = self.ctx.is_dist_erasure().await;
         let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first());
         let target_set = self.pools.get(target_pool_idx).map(|pool| pool.get_disks_by_key(object));
-        // The fixed read fence can replace the target write acquisition only
-        // when both names resolve to the exact same SetDisks namespace.
-        opts.no_lock = matches!((fixed_set, target_set), (Some(fixed), Some(target)) if Arc::ptr_eq(fixed, &target));
+        // Local locks share one manager without set-qualified resource keys.
+        // Distributed locks overlap when both sets use the same client domain.
+        opts.no_lock = matches!(
+            (fixed_set, target_set),
+            (Some(fixed), Some(target))
+                if !distributed || same_distributed_lock_domain(&fixed.lockers, &target.lockers)
+        );
     }
 
     pub(crate) async fn acquire_decommission_source_cleanup_fence(
@@ -1975,10 +1980,9 @@ impl ECStore {
         let test_namespace_lock_fence =
             decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::SourceCleanup);
         let object = encode_dir_object(object);
+        let distributed = self.ctx.is_dist_erasure().await;
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
-        // SetDisks namespaces include pool/set identity, so only the canonical
-        // fixed set is covered by the fixed mutation guard.
-        let source_lock_covered = std::ptr::eq(fixed_set.as_ref(), source_set);
+        let source_lock_covered = !distributed || same_distributed_lock_domain(&fixed_set.lockers, &source_set.lockers);
         // Lock order: fixed store mutation domain first; source cleanup takes its
         // hashed source-domain lock second only when this guard does not cover it.
         let guard = self
@@ -2459,7 +2463,8 @@ impl ECStore {
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
-        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence);
+        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence)
+            .await;
         let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
