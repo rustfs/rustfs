@@ -4464,7 +4464,7 @@ impl ECStore {
     ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
-        let result = data_movement::migrate_object(
+        let result = data_movement::migrate_decommission_object(
             self,
             pool_idx,
             bucket.clone(),
