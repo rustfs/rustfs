@@ -21,12 +21,12 @@
 use crate::metrics::collectors::scanner::{ScannerActiveBucketDriveStats, ScannerBucketDriveResultStats, ScannerSourceWorkStats};
 use crate::metrics::collectors::{
     ApiRequestMetricSupport, ApiRequestStats, BucketReplicationBacklogStats, BucketReplicationBandwidthStats,
-    BucketReplicationRuntimeStats, BucketReplicationStats, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
+    BucketReplicationRuntimeStats, BucketReplicationMetricsSnapshot, BucketReplicationTargetBacklogStats, BucketReplicationTargetFlowStats,
     BucketReplicationTargetStats, BucketStats, BucketUsageStats, ClusterConfigStats, ClusterHealthStats, ClusterStats,
     ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats, DriveDetailedStats,
     DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats, IlmBackpressureStats,
     IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats, ProcessStats, ProcessStatusType,
-    ReplicationStats, ResourceStats, ScannerRuntimeStats, ScannerStats,
+    ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -266,7 +266,7 @@ fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnaps
 
     BucketReplicationRuntimeStats {
         target_flows,
-        stats: BucketReplicationStats {
+        stats: BucketReplicationMetricsSnapshot {
             bucket,
             total_failed_bytes: stats.total_failed_bytes,
             total_failed_count: stats.total_failed_count,
@@ -298,7 +298,7 @@ fn bucket_replication_detail_from_snapshot(stats: ObsBucketReplicationStatsSnaps
     }
 }
 
-async fn obs_site_replication_stats() -> ReplicationStats {
+async fn obs_site_replication_stats() -> ReplicationMetricsSnapshot {
     let current_data_transfer_rate = obs_bucket_replication_bandwidth_stats()
         .into_iter()
         .flatten()
@@ -306,7 +306,7 @@ async fn obs_site_replication_stats() -> ReplicationStats {
         .sum::<f64>();
     let stats = obs_replication_site_stats_snapshot(current_data_transfer_rate).await;
 
-    ReplicationStats {
+    ReplicationMetricsSnapshot {
         average_active_workers: stats.average_active_workers,
         average_queued_bytes: stats.average_queued_bytes,
         average_queued_count: stats.average_queued_count,
@@ -648,7 +648,7 @@ pub fn collect_bucket_replication_bandwidth_stats() -> Vec<BucketReplicationBand
 }
 
 /// Collect bucket and target level replication stats from the global replication runtime.
-pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
+pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationMetricsSnapshot> {
     obs_bucket_replication_stats_snapshot()
         .await
         .into_iter()
@@ -662,7 +662,7 @@ pub(crate) async fn collect_bucket_replication_stats_bundle()
 }
 
 /// Collect site-level replication stats from the global replication runtime.
-pub async fn collect_replication_stats() -> ReplicationStats {
+pub async fn collect_replication_stats() -> ReplicationMetricsSnapshot {
     obs_site_replication_stats().await
 }
 
