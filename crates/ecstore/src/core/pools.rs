@@ -47,7 +47,6 @@ use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
-    namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};

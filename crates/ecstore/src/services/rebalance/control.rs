@@ -909,7 +909,7 @@ mod tests {
     use super::*;
     use crate::disk::{DiskAPI as _, RUSTFS_META_BUCKET};
     use crate::object_api::NamespaceLockFence;
-    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
+    use crate::set_disk::hermetic_set_disks_isolated;
 
     #[test]
     fn rebalance_activation_rejects_persisted_decommission_despite_idle_local_snapshot() {

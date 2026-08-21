@@ -7613,7 +7613,7 @@ mod object_encryption_resolver_wiring_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod hermetic_set_disks_support {
+pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no

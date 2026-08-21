@@ -735,6 +735,9 @@ pub(crate) use core::io_primitives::disk_call_counters;
 mod ctx;
 mod metadata;
 mod ops;
+
+#[cfg(test)]
+pub(crate) use ops::hermetic_set_disks_isolated;
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(feature = "test-util")]
