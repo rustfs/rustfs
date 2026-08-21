@@ -353,6 +353,8 @@ impl fmt::Display for ObjectLockDiagMode {
 
 pub(crate) struct ObjectLockDiagGuard {
     guard: rustfs_lock::NamespaceLockGuard,
+    #[cfg(test)]
+    test_namespace_lock_fence: Option<NamespaceLockFence>,
     enabled: bool,
     op: &'static str,
     bucket: Option<String>,
@@ -374,6 +376,8 @@ impl ObjectLockDiagGuard {
     ) -> Self {
         Self {
             guard,
+            #[cfg(test)]
+            test_namespace_lock_fence: None,
             enabled,
             op,
             bucket,
@@ -400,7 +404,90 @@ impl ObjectLockDiagGuard {
         if let Some(signal) = self.lock_lost_signal() {
             opts.add_namespace_lock_lost_signal(signal);
         }
+        #[cfg(test)]
+        if let Some(fence) = self.test_namespace_lock_fence.as_ref() {
+            opts.add_namespace_lock_fence_for_test(fence);
+        }
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecommissionMutationFenceTestPhase {
+    Migration,
+    SourceCleanup,
+}
+
+#[cfg(test)]
+struct DecommissionMutationFenceLossState {
+    bucket: String,
+    object: String,
+    phase: DecommissionMutationFenceTestPhase,
+    fence: NamespaceLockFence,
+    loss_handle: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionMutationFenceLossHook {
+    state: Arc<DecommissionMutationFenceLossState>,
+}
+
+#[cfg(test)]
+static DECOMMISSION_MUTATION_FENCE_LOSS_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DecommissionMutationFenceLossState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DecommissionMutationFenceLossHook {
+    pub(crate) fn install(bucket: &str, object: &str, phase: DecommissionMutationFenceTestPhase) -> Self {
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let state = Arc::new(DecommissionMutationFenceLossState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            phase,
+            fence,
+            loss_handle,
+        });
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        assert!(slot.is_none(), "decommission mutation fence loss hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn mark_lost(&self) {
+        self.state.loss_handle.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionMutationFenceLossHook {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        if slot.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn decommission_mutation_fence_for_test(
+    bucket: &str,
+    object: &str,
+    phase: DecommissionMutationFenceTestPhase,
+) -> Option<NamespaceLockFence> {
+    DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission mutation fence loss hooks should not poison")
+        .as_ref()
+        .filter(|hook| hook.bucket == bucket && hook.object == object && hook.phase == phase)
+        .map(|hook| hook.fence.clone())
 }
 
 pub(crate) struct SourceCleanupMutationFence {
@@ -1835,11 +1922,22 @@ impl ECStore {
             return Err(Error::other("decommission object migration requires namespace locking"));
         }
 
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::Migration);
         let object = encode_dir_object(object);
         let mut opts = ObjectOptions::default();
-        self.acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
+        let guard = self
+            .acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
             .await?
-            .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))
+            .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
+        Ok(guard)
     }
 
     pub(super) fn apply_decommission_target_mutation_fence(
@@ -1873,6 +1971,9 @@ impl ECStore {
 
         #[cfg(test)]
         crate::data_movement::notify_source_cleanup_mutation_fence_pending(bucket, object);
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::SourceCleanup);
         let object = encode_dir_object(object);
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
         // SetDisks namespaces include pool/set identity, so only the canonical
@@ -1883,6 +1984,12 @@ impl ECStore {
         let guard = self
             .acquire_object_write_lock("decommission_source_cleanup", bucket, &object)
             .await?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
 
         Ok(SourceCleanupMutationFence {
             guard,
