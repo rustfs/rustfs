@@ -27,6 +27,7 @@ use crate::storage_api_contracts::{
     object::{HTTPPreconditions, ObjectOperations as _},
 };
 use crate::store::ECStore;
+use crate::store::ObjectLockDiagGuard;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
@@ -1330,6 +1331,37 @@ fn data_movement_part_upload_failure_stage(err: &Error) -> &'static str {
     }
 }
 
+pub(crate) async fn migrate_decommission_object(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+) -> Result<()> {
+    let source = rd.object_info.clone();
+    let _mutation_fence = store
+        .acquire_decommission_object_mutation_fence(&bucket, &source.name)
+        .await?;
+    let current = find_data_movement_target_info(store.as_ref(), pool_idx, &bucket, &source)
+        .await?
+        .ok_or(Error::FileNotFound)?;
+    if !is_equivalent_data_movement_object_identity(&source, &current, true, false) {
+        return Err(Error::FileNotFound);
+    }
+
+    migrate_object_inner(
+        store,
+        pool_idx,
+        bucket,
+        rd,
+        source_bucket_incarnation_id,
+        op_label,
+        Some(&_mutation_fence),
+    )
+    .await
+}
+
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1337,6 +1369,18 @@ pub(crate) async fn migrate_object(
     rd: GetObjectReader,
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
+) -> Result<()> {
+    migrate_object_inner(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
+}
+
+async fn migrate_object_inner(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+    mutation_fence: Option<&ObjectLockDiagGuard>,
 ) -> Result<()> {
     let object_info = rd.object_info.clone();
     let has_part_checksums = object_info
@@ -1349,6 +1393,9 @@ pub(crate) async fn migrate_object(
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
         new_multipart_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+        if let Some(fence) = mutation_fence {
+            fence.add_namespace_lock_fence(&mut new_multipart_opts);
+        }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
             .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts)
             .await
@@ -1445,6 +1492,9 @@ pub(crate) async fn migrate_object(
                     )
                 })?;
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
+            if let Some(fence) = mutation_fence {
+                fence.add_namespace_lock_fence(&mut complete_multipart_opts);
+            }
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement(
@@ -1608,6 +1658,9 @@ pub(crate) async fn migrate_object(
 
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+    if let Some(fence) = mutation_fence {
+        fence.add_namespace_lock_fence(&mut put_opts);
+    }
     let (target_pool_idx, put_result) = store
         .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts)
         .await

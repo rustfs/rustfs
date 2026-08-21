@@ -2752,6 +2752,111 @@ mod tests {
             .expect_err("suspended delete must remove the requested UUID version");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_waits_for_decommission_commit_then_removes_every_copy() {
+        let temp_dir = tempfile::tempdir().expect("create decommission delete-fence store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-delete-fence", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("decommission-delete-fence-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create decommission delete-fence bucket");
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        store.pools[0]
+            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write source object to the pool being decommissioned");
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+        }
+        assert!(store.is_suspended(0).await, "pool 0 must be a suspended decommission source");
+
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let migration_store = Arc::clone(&store);
+        let migration_bucket = bucket.clone();
+        let migration = tokio::spawn(async move {
+            let source_reader = migration_store.pools[0]
+                .get_object_reader(
+                    &migration_bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        no_lock: true,
+                        data_movement: true,
+                        raw_data_movement_read: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            crate::data_movement::migrate_decommission_object(
+                migration_store,
+                0,
+                migration_bucket,
+                source_reader,
+                None,
+                "test_decommission_delete_fence",
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+
+        let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let mut delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(&delete_bucket, object, ObjectOptions::default())
+                .await
+        });
+        delete_barrier.wait_until_paused().await;
+        delete_barrier.release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            "DELETE must wait while the decommission source generation is being committed"
+        );
+
+        barrier.release();
+        migration
+            .await
+            .expect("decommission migration task should join")
+            .expect("decommission migration should commit before DELETE");
+        delete
+            .await
+            .expect("DELETE task should join")
+            .expect("DELETE should remove the committed migration generation");
+
+        for pool in &store.pools {
+            let err = pool
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("DELETE must remove the source and migrated target copies");
+            assert!(
+                matches!(err, StorageError::ObjectNotFound(_, _)),
+                "unexpected post-delete pool result: {err:?}"
+            );
+        }
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the migrated source generation must not become visible again");
+
+        shutdown.cancel();
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]

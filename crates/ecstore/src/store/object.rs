@@ -393,6 +393,14 @@ impl ObjectLockDiagGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.guard.is_lock_lost()
     }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.no_lock = true;
+        opts.ensure_namespace_lock_fence();
+        if let Some(signal) = self.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+    }
 }
 
 /// Opaque write-lock guard for the RestoreObject accept path; see
@@ -410,10 +418,7 @@ impl RestoreAcceptGuard {
     }
 
     pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.ensure_namespace_lock_fence();
-        if let Some(signal) = self.0.lock_lost_signal() {
-            opts.add_namespace_lock_lost_signal(signal);
-        }
+        self.0.add_namespace_lock_fence(opts);
     }
 }
 
@@ -911,6 +916,16 @@ fn writer_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions
     lookup_opts.skip_rebalancing = true;
 
     lookup_opts
+}
+
+fn delete_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = writer_pool_lookup_opts(opts, no_lock);
+    lookup_opts.skip_decommissioned = opts.data_movement;
+    lookup_opts
+}
+
+fn should_delete_from_all_pools(opts: &ObjectOptions, pool_count: usize) -> bool {
+    pool_count > 0 && (!opts.versioned && !opts.version_suspended || opts.version_id.is_some())
 }
 
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
@@ -1531,6 +1546,22 @@ impl ECStore {
             owner,
             ObjectLockDiagMode::Read,
         )))
+    }
+
+    pub(crate) async fn acquire_decommission_object_mutation_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<ObjectLockDiagGuard> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission object migration requires namespace locking"));
+        }
+
+        let object = encode_dir_object(object);
+        let mut opts = ObjectOptions::default();
+        self.acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
+            .await?
+            .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))
     }
 
     pub(crate) async fn acquire_all_object_read_locks(
@@ -2479,7 +2510,7 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let gopts = writer_pool_lookup_opts(&opts, true);
+        let gopts = delete_pool_lookup_opts(&opts, true);
 
         if opts.data_movement {
             let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
@@ -2622,7 +2653,7 @@ impl ECStore {
             None
         };
 
-        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
+        if should_delete_from_all_pools(&opts, errs.len()) {
             let mut obj = match self.delete_object_from_all_pools(bucket, object, &opts, errs).await {
                 Ok(obj) => obj,
                 Err(err) => {
@@ -2640,7 +2671,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
 
@@ -4431,6 +4462,36 @@ mod tests {
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
         assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn ordinary_delete_lookup_includes_decommission_source_and_skips_rebalance_source() {
+        let lookup_opts = delete_pool_lookup_opts(&ObjectOptions::default(), true);
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+    }
+
+    #[test]
+    fn delete_fans_out_for_unversioned_and_explicit_version_mutations() {
+        assert!(should_delete_from_all_pools(&ObjectOptions::default(), 1));
+        assert!(should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            2,
+        ));
+        assert!(!should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+            1,
+        ));
+        assert!(!should_delete_from_all_pools(&ObjectOptions::default(), 0));
     }
 
     #[test]
