@@ -22,7 +22,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::credential_store::{CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration, PendingRotation};
+use super::credential_store::{
+    CompletedRegistration, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration, PendingRotation,
+};
 use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
 use super::registration::{
@@ -142,25 +144,16 @@ impl ConnectClient {
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
         let _lock = credential_store.lock().await?;
-        let pending_before = credential_store.load_pending_registration()?.filter(|pending| {
-            pending.token_uid == token.registration_token_uid
-                && pending.previous_credential_fingerprint.is_some()
-                && pending.next_public_key_sha256.is_some()
-        });
-        let (credential, identity) = self
+        let (credential, _) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
-        if let Some(pending) = pending_before {
-            let fingerprint = certificate_fingerprint(&credential.certificate)?;
-            let public_key_fingerprint = public_key_fingerprint(&identity);
-            if pending.previous_credential_fingerprint.as_deref() != Some(&fingerprint)
-                && pending.next_public_key_sha256.as_deref() == Some(&public_key_fingerprint)
-            {
-                return Ok(credential);
-            }
+        let fingerprint = certificate_fingerprint(&credential.certificate)?;
+        if credential_store.load_completed_registration()?.is_some_and(|completed| {
+            completed.token_uid == token.registration_token_uid && completed.credential_fingerprint == fingerprint
+        }) {
+            return Ok(credential);
         }
         credential_store.clear_pending_rotation()?;
-        let fingerprint = certificate_fingerprint(&credential.certificate)?;
         let next = identity_store.load_or_create_next()?;
         let next_fingerprint = public_key_fingerprint(&next);
         let candidate = PendingRegistration {
@@ -190,6 +183,10 @@ impl ConnectClient {
         };
         credential_store.save(&enrolled)?;
         identity_store.commit_next(&next)?;
+        credential_store.save_completed_registration(&CompletedRegistration {
+            token_uid: token.registration_token_uid.clone(),
+            credential_fingerprint: certificate_fingerprint(&enrolled.certificate)?,
+        })?;
         credential_store.clear_pending_registration()?;
         Ok(enrolled)
     }
@@ -347,6 +344,10 @@ impl ConnectClient {
                 validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
                 identity_store.commit_next(&next)?;
             }
+            credential_store.save_completed_registration(&CompletedRegistration {
+                token_uid: pending.token_uid,
+                credential_fingerprint: fingerprint,
+            })?;
             credential_store.clear_pending_registration()?;
             let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
             return Ok(Some((credential, current)));

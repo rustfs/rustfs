@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 const CREDENTIAL_FILE: &str = "device.crt.json";
+const REGISTRATION_COMPLETED_FILE: &str = "registration.completed.json";
 const REGISTRATION_PENDING_FILE: &str = "registration.pending.json";
 const ROTATION_PENDING_FILE: &str = "rotation.pending.json";
 const LOCK_FILE: &str = ".state.lock";
@@ -65,6 +66,14 @@ pub(crate) struct PendingRegistration {
     pub previous_credential_fingerprint: Option<String>,
     #[serde(default)]
     pub next_public_key_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompletedRegistration {
+    pub token_uid: String,
+    pub credential_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +175,14 @@ impl CredentialStore {
 
     pub(crate) fn clear_pending_registration(&self) -> Result<(), CredentialStoreError> {
         self.remove(REGISTRATION_PENDING_FILE)
+    }
+
+    pub(crate) fn load_completed_registration(&self) -> Result<Option<CompletedRegistration>, CredentialStoreError> {
+        self.read(REGISTRATION_COMPLETED_FILE)
+    }
+
+    pub(crate) fn save_completed_registration(&self, completed: &CompletedRegistration) -> Result<(), CredentialStoreError> {
+        self.write(REGISTRATION_COMPLETED_FILE, completed)
     }
 
     pub(crate) fn load_pending_rotation(&self) -> Result<Option<PendingRotation>, CredentialStoreError> {

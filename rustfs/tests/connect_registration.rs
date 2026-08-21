@@ -739,6 +739,7 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         next.public_key_der()
     );
 
+    fs::remove_file(temp.path().join("credential/registration.completed.json")).expect("remove completed receipt");
     fs::write(&pending_path, pending).expect("restore pending after key commit");
     set_owner_only(&pending_path);
     let recovered = idle_client
@@ -747,6 +748,11 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         .expect("recover after reenrollment key commit");
     assert_eq!(recovered.certificate_serial, "0e".repeat(16));
     assert!(!pending_path.exists());
+    let recovered = idle_client
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .await
+        .expect("completed reenrollment is idempotent after pending cleanup");
+    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
     assert!(idle.seen.lock().expect("seen lock").is_empty());
 }
 
