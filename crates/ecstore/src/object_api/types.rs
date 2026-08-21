@@ -24,7 +24,7 @@ use crate::storage_api_contracts::{
 pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
     #[cfg(test)]
-    forced_lost: Arc<std::sync::atomic::AtomicBool>,
+    forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Debug for NamespaceLockFence {
@@ -40,13 +40,17 @@ impl NamespaceLockFence {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
-            forced_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         #[cfg(test)]
-        if self.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .forced_lost
+            .iter()
+            .any(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+        {
             return true;
         }
         self.signals.iter().any(|signal| signal.is_lost())
@@ -62,23 +66,78 @@ impl NamespaceLockFence {
         }
         Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         #[cfg(test)]
-        if other.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
-            self.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
+            Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
         }
     }
 
     #[cfg(test)]
     pub(crate) fn lost_for_test() -> Self {
         let fence = Self::new();
-        fence.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        fence.forced_lost[0].store(true, std::sync::atomic::Ordering::Release);
         fence
     }
 
     #[cfg(test)]
     pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
         let fence = Self::new();
-        (fence.clone(), Arc::clone(&fence.forced_lost))
+        (fence.clone(), Arc::clone(&fence.forced_lost[0]))
     }
+}
+
+#[cfg(test)]
+static NAMESPACE_LOCK_SIGNAL_TEST_FENCES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, NamespaceLockFence)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct NamespaceLockSignalTestFence {
+    signal_key: usize,
+}
+
+#[cfg(test)]
+impl NamespaceLockSignalTestFence {
+    pub(crate) fn install_with_loss_handle(
+        signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+        loss_handle: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let fence = NamespaceLockFence {
+            signals: Arc::default(),
+            forced_lost: Arc::new(vec![loss_handle]),
+        };
+        let signal_key = Arc::as_ptr(signal) as usize;
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        assert!(
+            !fences.iter().any(|(key, _)| *key == signal_key),
+            "namespace lock signal test fence must be unique"
+        );
+        fences.push((signal_key, fence));
+        Self { signal_key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamespaceLockSignalTestFence {
+    fn drop(&mut self) {
+        let mut fences = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned");
+        fences.retain(|(key, _)| *key != self.signal_key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>) -> bool {
+    NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("namespace lock signal test fence should not be poisoned")
+        .iter()
+        .find(|(key, _)| *key == Arc::as_ptr(signal) as usize)
+        .is_some_and(|(_, fence)| fence.is_lock_lost())
 }
 
 #[derive(Debug)]
@@ -402,9 +461,23 @@ impl ObjectOptions {
     }
 
     pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+        #[cfg(test)]
+        let test_fence = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("namespace lock signal test fence should not be poisoned")
+            .iter()
+            .find(|(key, _)| *key == Arc::as_ptr(&signal) as usize)
+            .map(|(_, fence)| fence.clone());
         self.namespace_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)
             .add_signal(signal);
+        #[cfg(test)]
+        if let Some(test_fence) = test_fence {
+            self.namespace_lock_fence
+                .get_or_insert_with(NamespaceLockFence::new)
+                .extend(&test_fence);
+        }
     }
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {

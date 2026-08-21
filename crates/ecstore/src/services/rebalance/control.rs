@@ -36,10 +36,32 @@ use uuid::Uuid;
 static FAIL_NEXT_REBALANCE_ACTIVATION_SAVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static REBALANCE_DISK_STATS_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, Vec<DiskStat>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 pub(super) fn fail_next_rebalance_activation_save_for_test(rebalance_id: &str) {
     *FAIL_NEXT_REBALANCE_ACTIVATION_SAVE
         .lock()
         .expect("rebalance activation save failure hook should not be poisoned") = Some(rebalance_id.to_string());
+}
+
+#[cfg(test)]
+fn set_rebalance_disk_stats_override_for_test(store_id: Uuid, disk_stats: Vec<DiskStat>) {
+    REBALANCE_DISK_STATS_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("rebalance disk stats override should not be poisoned")
+        .insert(store_id, disk_stats);
+}
+
+#[cfg(test)]
+fn take_rebalance_disk_stats_override_for_test(store_id: Uuid) -> Option<Vec<DiskStat>> {
+    REBALANCE_DISK_STATS_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("rebalance disk stats override should not be poisoned")
+        .remove(&store_id)
 }
 
 fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> {
@@ -62,7 +84,14 @@ pub(super) struct RebalanceRunGuard {
 
 impl RebalanceRunGuard {
     pub(super) fn ensure_held(&self, stage: &str) -> Result<()> {
-        if self.persisted_guard.is_lock_lost() {
+        #[cfg(test)]
+        let forced_lost = self
+            .persisted_guard
+            .lock_lost_signal()
+            .is_some_and(|signal| crate::object_api::namespace_lock_signal_test_fence_is_lost(&signal));
+        #[cfg(not(test))]
+        let forced_lost = false;
+        if self.persisted_guard.is_lock_lost() || forced_lost {
             return Err(Error::other(format!("rebalance distributed run fence lost during {stage}")));
         }
         Ok(())
@@ -368,6 +397,8 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
+        #[cfg(test)]
+        crate::core::pools::observe_pool_activation_start_attempt(crate::core::pools::PoolActivationStartKind::Rebalance);
         let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone()).await?;
         let mut pool_meta = PoolMeta::default();
         pool_meta.load_no_lock(pool.clone()).await?;
@@ -589,6 +620,13 @@ impl ECStore {
 
             disk_stats[disk.pool_index as usize].total_space += disk.total_space;
             disk_stats[disk.pool_index as usize].available_space += disk.available_space;
+        }
+
+        #[cfg(test)]
+        if let Some(overridden) = take_rebalance_disk_stats_override_for_test(self.id) {
+            disk_stats = overridden;
+            total_cap = disk_stats.iter().map(|stat| stat.total_space).sum();
+            total_free = disk_stats.iter().map(|stat| stat.available_space).sum();
         }
 
         let percent_free_goal = percent_free_ratio(total_free, total_cap);
@@ -1019,8 +1057,153 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::pools::{PoolActivationStartKind, PoolActivationStartProbe};
     use crate::object_api::NamespaceLockFence;
-    use crate::set_disk::hermetic_set_disks_isolated;
+    use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
+
+    async fn assert_real_activation_start_race(paused_kind: PoolActivationStartKind) {
+        let (_temp_dirs, rebalance_store, decommission_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        set_rebalance_disk_stats_override_for_test(
+            rebalance_store.id,
+            vec![
+                DiskStat {
+                    total_space: 100,
+                    available_space: 0,
+                },
+                DiskStat {
+                    total_space: 100,
+                    available_space: 100,
+                },
+            ],
+        );
+        let (first_object, competing_object, competing_kind) = match paused_kind {
+            PoolActivationStartKind::Rebalance => {
+                (REBAL_META_NAME, crate::core::pools::POOL_META_NAME, PoolActivationStartKind::Decommission)
+            }
+            PoolActivationStartKind::Decommission => {
+                (crate::core::pools::POOL_META_NAME, REBAL_META_NAME, PoolActivationStartKind::Rebalance)
+            }
+        };
+        let first_barrier = PutObjectCommitBarrier::install(
+            crate::disk::RUSTFS_META_BUCKET,
+            first_object,
+            PutObjectCommitPause::BeforeQuotaRename,
+        );
+        let competing_barrier = PutObjectCommitBarrier::install(
+            crate::disk::RUSTFS_META_BUCKET,
+            competing_object,
+            PutObjectCommitPause::BeforeQuotaRename,
+        );
+
+        let mut rebalance_task;
+        let mut decommission_task;
+        if paused_kind == PoolActivationStartKind::Rebalance {
+            let store = Arc::clone(&rebalance_store);
+            rebalance_task =
+                tokio::spawn(async move { store.init_rebalance_start(vec!["bucket".to_string()]).await.map(|_| ()) });
+            first_barrier.wait_until_paused().await;
+            let probe = PoolActivationStartProbe::install(competing_kind);
+            let store = Arc::clone(&decommission_store);
+            decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
+            tokio::time::timeout(std::time::Duration::from_secs(15), probe.wait_until_attempted())
+                .await
+                .expect("real decommission start should reach activation lock acquisition");
+        } else {
+            let store = Arc::clone(&decommission_store);
+            decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
+            first_barrier.wait_until_paused().await;
+            let probe = PoolActivationStartProbe::install(competing_kind);
+            let store = Arc::clone(&rebalance_store);
+            rebalance_task =
+                tokio::spawn(async move { store.init_rebalance_start(vec!["bucket".to_string()]).await.map(|_| ()) });
+            tokio::time::timeout(std::time::Duration::from_secs(15), probe.wait_until_attempted())
+                .await
+                .expect("real rebalance start should reach activation lock acquisition");
+        }
+
+        let mut observed_rebalance_result = None;
+        let mut observed_decommission_result = None;
+        let competing_reached_commit = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            if paused_kind == PoolActivationStartKind::Rebalance {
+                tokio::select! {
+                    _ = competing_barrier.wait_until_paused() => true,
+                    result = &mut decommission_task => {
+                        observed_decommission_result = Some(result.expect("decommission activation task should not panic"));
+                        false
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = competing_barrier.wait_until_paused() => true,
+                    result = &mut rebalance_task => {
+                        observed_rebalance_result = Some(result.expect("rebalance activation task should not panic"));
+                        false
+                    }
+                }
+            }
+        })
+        .await
+        .expect("competing activation should either block to timeout or reach its commit");
+        if competing_reached_commit {
+            competing_barrier.release();
+        }
+        drop(competing_barrier);
+        first_barrier.release();
+        drop(first_barrier);
+
+        let rebalance_result = match observed_rebalance_result {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(15), &mut rebalance_task)
+                .await
+                .expect("real rebalance activation should finish")
+                .expect("rebalance activation task should not panic"),
+        };
+        let decommission_result = match observed_decommission_result {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(15), &mut decommission_task)
+                .await
+                .expect("real decommission activation should finish")
+                .expect("decommission activation task should not panic"),
+        };
+        assert!(
+            !competing_reached_commit,
+            "the competing real start reached its commit while the other activation lock was held"
+        );
+        assert_ne!(
+            rebalance_result.is_ok(),
+            decommission_result.is_ok(),
+            "exactly one real activation entry may commit"
+        );
+
+        let mut persisted_rebalance = RebalanceMeta::new();
+        let rebalance_committed = persisted_rebalance
+            .load(rebalance_store.pools[0].clone())
+            .await
+            .is_ok_and(|_| is_rebalance_conflicting_with_decommission(&persisted_rebalance));
+        let mut persisted_pool = PoolMeta::default();
+        persisted_pool
+            .load_no_lock(rebalance_store.pools[0].clone())
+            .await
+            .expect("persisted pool metadata should remain readable");
+        let decommission_committed = pool_meta_has_active_decommission(&persisted_pool);
+        assert_eq!(
+            usize::from(rebalance_committed) + usize::from(decommission_committed),
+            1,
+            "at most one persisted activation state may be active"
+        );
+        assert_eq!(rebalance_committed, paused_kind == PoolActivationStartKind::Rebalance);
+        assert_eq!(decommission_committed, paused_kind == PoolActivationStartKind::Decommission);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_and_decommission_starts_commit_at_most_one_side() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            assert_real_activation_start_race(PoolActivationStartKind::Rebalance).await;
+            assert_real_activation_start_race(PoolActivationStartKind::Decommission).await;
+        })
+        .await;
+    }
 
     #[test]
     fn rebalance_activation_rejects_persisted_decommission_despite_idle_local_snapshot() {

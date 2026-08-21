@@ -19,8 +19,8 @@ use crate::bucket::{
         LifecycleExpiryConfigs,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
-            LifecycleOps, apply_expiry_rule_for_data_movement, apply_expiry_rule_in, eval_action_from_lifecycle,
-            lifecycle_delete_all_versions_blocked_by_replication,
+            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_for_data_movement, apply_expiry_rule_in,
+            eval_action_from_lifecycle, lifecycle_delete_all_versions_blocked_by_replication,
         },
         get_expiry_configs,
         lifecycle::IlmAction,
@@ -912,6 +912,79 @@ where
         pool_meta_guard,
         rebalance_meta_guard,
     })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PoolActivationStartKind {
+    Rebalance,
+    Decommission,
+}
+
+#[cfg(test)]
+struct PoolActivationStartProbeState {
+    kind: PoolActivationStartKind,
+    attempted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static POOL_ACTIVATION_START_PROBES: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<PoolActivationStartProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct PoolActivationStartProbe {
+    state: Arc<PoolActivationStartProbeState>,
+}
+
+#[cfg(test)]
+impl PoolActivationStartProbe {
+    pub(crate) fn install(kind: PoolActivationStartKind) -> Self {
+        let state = Arc::new(PoolActivationStartProbeState {
+            kind,
+            attempted: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        POOL_ACTIVATION_START_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("pool activation start probe should not be poisoned")
+            .push(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_attempted(&self) {
+        while !self.state.attempted.load(Ordering::Acquire) {
+            self.state.notify.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolActivationStartProbe {
+    fn drop(&mut self) {
+        let mut probes = POOL_ACTIVATION_START_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("pool activation start probe should not be poisoned");
+        probes.retain(|state| !Arc::ptr_eq(state, &self.state));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_pool_activation_start_attempt(kind: PoolActivationStartKind) {
+    let probes = POOL_ACTIVATION_START_PROBES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("pool activation start probe should not be poisoned")
+        .iter()
+        .filter(|state| state.kind == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    for state in probes {
+        state.attempted.store(true, Ordering::Release);
+        state.notify.notify_one();
+    }
 }
 
 fn rollback_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
@@ -2462,7 +2535,15 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 let Ok(bucket_incarnation_id) = store.bucket_incarnation_id_from_disk(bucket).await else {
                     return Ok(false);
                 };
-                let _ = apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, lock_lost_signal).await;
+                let _ = match lock_lost_signal {
+                    Some(signal) => {
+                        apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    None => {
+                        apply_expiry_on_transitioned_object(store, &object_info, &event, event_source, bucket_incarnation_id)
+                            .await
+                    }
+                };
             }
             Ok(false)
         }
@@ -2471,7 +2552,12 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 return Ok(false);
             }
             let applied = !apply_actions
-                || apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, lock_lost_signal).await;
+                || match lock_lost_signal {
+                    Some(signal) => {
+                        apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
+                };
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
         _ => Ok(false),
@@ -2573,6 +2659,8 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
+        #[cfg(test)]
+        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
         let activation_fence = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
@@ -4116,7 +4204,11 @@ impl ECStore {
         validate_start_decommission_request(&indices, self.single_pool())?;
 
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
-        ensure_decommission_start_local_leader(&self.endpoints(), &indices)?;
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
+        let endpoints = self.endpoints();
+        ensure_decommission_start_local_leader(&endpoints, &indices)?;
 
         for idx in indices.iter().copied() {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;

@@ -50,6 +50,66 @@ fn ensure_rebalance_entry_active(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+static REBALANCE_RUN_SIGNAL_TEST_FENCES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct RebalanceRunSignalTestFence {
+    rebalance_id: String,
+    loss_handle: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl RebalanceRunSignalTestFence {
+    fn install(rebalance_id: &str) -> Self {
+        let loss_handle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let previous = REBALANCE_RUN_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("rebalance run signal test fence should not be poisoned")
+            .insert(rebalance_id.to_string(), Arc::clone(&loss_handle));
+        assert!(previous.is_none(), "rebalance run signal test fence must be unique");
+        Self {
+            rebalance_id: rebalance_id.to_string(),
+            loss_handle,
+        }
+    }
+
+    fn mark_lost(&self) {
+        self.loss_handle.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for RebalanceRunSignalTestFence {
+    fn drop(&mut self) {
+        REBALANCE_RUN_SIGNAL_TEST_FENCES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("rebalance run signal test fence should not be poisoned")
+            .remove(&self.rebalance_id);
+    }
+}
+
+#[cfg(test)]
+fn attach_rebalance_run_signal_test_fence(
+    rebalance_id: &str,
+    signal: &Arc<rustfs_lock::distributed_lock::LockLostSignal>,
+) -> Option<crate::object_api::NamespaceLockSignalTestFence> {
+    let loss_handle = REBALANCE_RUN_SIGNAL_TEST_FENCES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("rebalance run signal test fence should not be poisoned")
+        .get(rebalance_id)
+        .cloned()?;
+    Some(crate::object_api::NamespaceLockSignalTestFence::install_with_loss_handle(
+        signal,
+        loss_handle,
+    ))
+}
+
 impl ECStore {
     async fn finish_rebalance_entry_after_cleanup(
         &self,
@@ -179,6 +239,10 @@ impl ECStore {
         ensure_rebalance_entry_active(&cancel)?;
         let run_guard = self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry").await?;
         let lock_lost_signal = run_guard.lock_lost_signal();
+        #[cfg(test)]
+        let _run_signal_test_fence = lock_lost_signal
+            .as_ref()
+            .and_then(|signal| attach_rebalance_run_signal_test_fence(rebalance_id.as_ref(), signal));
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
@@ -725,12 +789,16 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_api::PutObjReader;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
+    use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::ObjectOperations as _;
+    use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn rebalance_stats_wait_for_source_cleanup_result() {
@@ -982,5 +1050,139 @@ mod tests {
                 .is_some_and(|meta| meta.stopped_at.is_some()),
             "stop should publish the terminal state after entry cleanup drains"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_run_fence_loss_before_target_commit_preserves_target_and_source() {
+        let rebalance_id = "rebalance-target-commit-fence";
+        let (_temp_dirs, store, _unused_store) = crate::services::rebalance::test_two_pool_stores(Some(RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 1.0,
+            cancel: Some(CancellationToken::new()),
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    buckets: vec![crate::disk::RUSTFS_META_BUCKET.to_string()],
+                    info: RebalanceInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats::default(),
+            ],
+            ..Default::default()
+        }))
+        .await;
+        let bucket = crate::disk::RUSTFS_META_BUCKET;
+        let object = "rebalance-commit-fence-object";
+        let version_id = uuid::Uuid::new_v4();
+        let payload = b"rebalance target commit must not survive its run fence".repeat(1024);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        let source_before = source_set
+            .put_object(
+                bucket,
+                object,
+                &mut writer,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source version should be written");
+        let source_versions = source_set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source metadata should be readable")
+            .expect("source version should exist");
+        let mut file_meta = FileMeta::new();
+        for version in &source_versions.versions {
+            file_meta
+                .add_version(version.clone())
+                .expect("source version should encode into a metacache entry");
+        }
+        let entry = MetaCacheEntry {
+            name: object.to_string(),
+            metadata: file_meta.marshal_msg().expect("source metadata should marshal"),
+            cached: Some(file_meta),
+            reusable: false,
+        };
+        let run_signal_fence = RebalanceRunSignalTestFence::install(rebalance_id);
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeQuotaRename);
+        let entry_store = Arc::clone(&store);
+        let entry_set = Arc::clone(&source_set);
+        let mut entry_task = tokio::spawn(async move {
+            entry_store
+                .rebalance_entry(
+                    bucket.to_string(),
+                    0,
+                    entry,
+                    entry_set,
+                    Arc::new(RebalanceBucketConfigs::default()),
+                    Arc::from(rebalance_id),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        run_signal_fence.mark_lost();
+        barrier.release();
+        drop(barrier);
+        let entry_error = tokio::time::timeout(StdDuration::from_secs(5), &mut entry_task)
+            .await
+            .expect("fenced real rebalance entry should finish")
+            .expect("rebalance entry task should not panic")
+            .expect_err("lost run fence must reject the target commit");
+        assert!(entry_error.to_string().contains("run fence lost"));
+        let target_error = target_set
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("target version must remain absent after the lost commit fence");
+        assert!(
+            crate::error::is_err_object_not_found(&target_error) || crate::error::is_err_version_not_found(&target_error),
+            "target version must remain absent after the lost commit fence"
+        );
+        let mut source_body = Vec::new();
+        let mut source_after = source_set
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source version must remain readable");
+        assert_eq!(source_after.object_info.version_id, source_before.version_id);
+        assert_eq!(source_after.object_info.data_dir, source_before.data_dir);
+        assert_eq!(source_after.object_info.mod_time, source_before.mod_time);
+        assert_eq!(source_after.object_info.size, source_before.size);
+        assert_eq!(source_after.object_info.etag, source_before.etag);
+        source_after
+            .stream
+            .read_to_end(&mut source_body)
+            .await
+            .expect("source body should drain");
+        assert_eq!(source_body, payload, "source version must remain byte-identical");
     }
 }

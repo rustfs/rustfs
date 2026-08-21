@@ -1228,6 +1228,14 @@ pub(crate) async fn make_local_two_set_sets() -> (Vec<tempfile::TempDir>, Arc<Se
 
 #[cfg(test)]
 pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_for_pool_with_ctx(ctx, 0).await
+}
+
+#[cfg(test)]
+pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
+    ctx: Arc<InstanceContext>,
+    pool_idx: usize,
+) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
     use crate::layout::endpoint::Endpoint;
     use rustfs_lock::client::local::LocalClient;
 
@@ -1243,7 +1251,7 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
             let temp_dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
                 .expect("endpoint should parse");
-            endpoint.set_pool_index(0);
+            endpoint.set_pool_index(pool_idx);
             endpoint.set_set_index(set_index);
             endpoint.set_disk_index(disk_index);
             let disk = new_disk(
@@ -1279,7 +1287,7 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
                 2,
                 1,
                 set_index,
-                0,
+                pool_idx,
                 endpoints,
                 format.clone(),
                 lockers,
@@ -1292,7 +1300,7 @@ pub(crate) async fn make_local_two_set_sets_with_ctx(ctx: Arc<InstanceContext>) 
     let sets = Arc::new(Sets {
         id: format.id,
         disk_set: disk_sets,
-        pool_idx: 0,
+        pool_idx,
         endpoints: PoolEndpoints {
             legacy: false,
             set_count: 2,
