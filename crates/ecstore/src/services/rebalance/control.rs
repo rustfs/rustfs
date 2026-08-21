@@ -41,7 +41,7 @@ fn ensure_rebalance_activation_pool_meta_allowed(meta: &PoolMeta) -> Result<()> 
 }
 
 pub(super) enum RebalanceWorkerActivationFence {
-    Ready(PoolRebalanceActivationFence),
+    Ready(Box<PoolRebalanceActivationFence>),
     NotStartedTerminal,
 }
 
@@ -324,7 +324,7 @@ impl ECStore {
             return Ok(RebalanceWorkerActivationFence::NotStartedTerminal);
         }
 
-        Ok(RebalanceWorkerActivationFence::Ready(activation_fence))
+        Ok(RebalanceWorkerActivationFence::Ready(Box::new(activation_fence)))
     }
 
     #[tracing::instrument(skip_all)]

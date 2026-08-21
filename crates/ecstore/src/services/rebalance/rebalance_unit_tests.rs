@@ -2752,8 +2752,10 @@ async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
         ..Default::default()
     };
     let store = test_store_with_rebalance_meta(meta);
-    let mut fi = FileInfo::default();
-    fi.size = 128;
+    let fi = FileInfo {
+        size: 128,
+        ..Default::default()
+    };
 
     for err in [
         store
