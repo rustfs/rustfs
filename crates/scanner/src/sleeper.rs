@@ -258,7 +258,6 @@ impl SleepTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use temp_env::{with_var, with_var_unset};
 
     struct ScannerDefaultSpeedGuard;
@@ -326,7 +325,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_refresh_from_env_applies_speed_and_idle_mode_for_next_cycle() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
@@ -346,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_refresh_from_env_uses_default_speed_override_when_speed_unset() {
         let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
         let s = DynamicSleeper::new(ScannerSpeed::Default);
@@ -362,7 +359,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_fastest_never_sleeps() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(true, Ordering::Relaxed);
@@ -376,7 +372,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[serial]
     async fn test_idle_mode_off_skips_sleep() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);
