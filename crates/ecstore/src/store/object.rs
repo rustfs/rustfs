@@ -395,7 +395,6 @@ impl ObjectLockDiagGuard {
     }
 
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.no_lock = true;
         opts.ensure_namespace_lock_fence();
         if let Some(signal) = self.lock_lost_signal() {
             opts.add_namespace_lock_lost_signal(signal);
@@ -818,6 +817,7 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -837,6 +837,7 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             bucket: bucket.to_string(),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
         });
         let mut slot = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -853,6 +854,14 @@ impl DeleteAfterObjectLockSnapshotBarrier {
 
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
+    }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        let namespace_pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), namespace_pending)
+            .await
+            .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
     }
 }
 
@@ -881,6 +890,7 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     if let Some(state) = state {
         state.arrived.notify_one();
         state.release.notified().await;
+        state.namespace_pending.notify_one();
     }
 }
 

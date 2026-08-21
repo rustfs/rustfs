@@ -2817,15 +2817,15 @@ mod tests {
         let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
         let delete_store = Arc::clone(&store);
         let delete_bucket = bucket.clone();
-        let mut delete = tokio::spawn(async move {
+        let delete = tokio::spawn(async move {
             delete_store
                 .delete_object(&delete_bucket, object, ObjectOptions::default())
                 .await
         });
         delete_barrier.wait_until_paused().await;
-        delete_barrier.release();
+        delete_barrier.release_and_wait_until_namespace_pending().await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            !delete.is_finished(),
             "DELETE must wait while the decommission source generation is being committed"
         );
 
@@ -2853,6 +2853,147 @@ mod tests {
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
             .expect_err("the migrated source generation must not become visible again");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn versioned_delete_waits_for_decommission_commit_then_publishes_marker() {
+        let temp_dir = tempfile::tempdir().expect("create versioned decommission delete-fence store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "versioned-decommission-delete-fence", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("versioned-decommission-delete-fence-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create versioned decommission delete-fence bucket");
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        let source_info = store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write source version to the pool being decommissioned");
+        let source_version = source_info.version_id.expect("versioned source must have a version ID");
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+        }
+
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+        );
+        let migration_store = Arc::clone(&store);
+        let migration_bucket = bucket.clone();
+        let migration = tokio::spawn(async move {
+            let source_reader = migration_store.pools[0]
+                .get_object_reader(
+                    &migration_bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(source_version.to_string()),
+                        no_lock: true,
+                        data_movement: true,
+                        raw_data_movement_read: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            crate::data_movement::migrate_decommission_object(
+                migration_store,
+                0,
+                migration_bucket,
+                source_reader,
+                None,
+                "test_versioned_decommission_delete_fence",
+            )
+            .await
+        });
+        barrier.wait_until_paused().await;
+
+        let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(
+                    &delete_bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        delete_barrier.wait_until_paused().await;
+        delete_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !delete.is_finished(),
+            "versioned DELETE must wait while the source version is being committed"
+        );
+
+        barrier.release();
+        migration
+            .await
+            .expect("versioned decommission migration task should join")
+            .expect("versioned decommission migration should commit before DELETE");
+        let marker = delete
+            .await
+            .expect("versioned DELETE task should join")
+            .expect("versioned DELETE should publish a delete marker after migration");
+        assert!(marker.delete_marker, "versioned DELETE must publish a delete marker");
+        assert!(
+            marker.version_id.is_some_and(|version_id| !version_id.is_nil()),
+            "the delete marker must have a non-nil version ID"
+        );
+
+        let err = store
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the post-migration delete marker must hide the migrated version");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _)),
+            "unexpected latest-version result: {err:?}"
+        );
+        store
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(source_version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the migrated source version must remain addressable below the delete marker");
 
         shutdown.cancel();
     }
