@@ -9257,6 +9257,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "x509-parser",
  "zeroize",
  "zip",
  "zstd",
