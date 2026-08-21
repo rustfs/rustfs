@@ -1323,71 +1323,90 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn real_rebalance_run_fence_loss_blocks_multipart_completion() {
+    async fn real_rebalance_run_fence_loss_blocks_multipart_publication() {
         const REBALANCE_ID: &str = "rebalance-multipart-commit-fence";
         let bucket = crate::disk::RUSTFS_META_BUCKET;
-        let object = "rebalance-multipart-commit-fence-object";
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
-        let source_set = store.pools[0].get_disks_by_key(object);
-        let target_set = store.pools[1].get_disks_by_key(object);
-        let upload = source_set
-            .new_multipart_upload(bucket, object, &ObjectOptions::default())
-            .await
-            .expect("source multipart upload should be created");
-        let mut reader = PutObjReader::from_vec(b"multipart source payload".repeat(1024));
-        let part = source_set
-            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("source multipart part should be written");
-        source_set
-            .clone()
-            .complete_multipart_upload(
-                bucket,
-                object,
-                &upload.upload_id,
-                vec![CompletePart {
-                    part_num: part.part_num,
-                    etag: part.etag,
-                    ..Default::default()
-                }],
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("source multipart object should commit");
-
-        let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
-        let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
-        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeQuotaRename);
-        let task = spawn_real_rebalance_entry(
-            Arc::clone(&store),
-            Arc::clone(&source_set),
-            entry,
-            REBALANCE_ID,
-            Arc::new(RebalanceBucketConfigs::default()),
-        );
-        barrier.wait_until_paused().await;
-        run_signal_fence.mark_lost();
-        barrier.release();
-        drop(barrier);
-        assert_real_entry_rejected_after_run_fence_loss(task).await;
-
-        assert!(
-            target_set
-                .load_file_info_versions_exact(bucket, object)
+        for (object, pause, staged_commit) in [
+            (
+                "rebalance-multipart-new-upload-fence",
+                MultipartCommitPause::NewUploadBeforeLockLost,
+                Some("upload metadata"),
+            ),
+            (
+                "rebalance-multipart-part-fence",
+                MultipartCommitPause::PutPartBeforeLockLost,
+                Some("part"),
+            ),
+            ("rebalance-multipart-completion-fence", MultipartCommitPause::BeforeQuotaRename, None),
+        ] {
+            let source_set = store.pools[0].get_disks_by_key(object);
+            let target_set = store.pools[1].get_disks_by_key(object);
+            let upload = source_set
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
                 .await
-                .expect("target metadata lookup should succeed")
-                .is_none(),
-            "lost run fence must not publish the target multipart object"
-        );
-        assert!(
+                .expect("source multipart upload should be created");
+            let mut reader = PutObjReader::from_vec(b"multipart source payload".repeat(1024));
+            let part = source_set
+                .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("source multipart part should be written");
             source_set
-                .load_file_info_versions_exact(bucket, object)
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &ObjectOptions::default(),
+                )
                 .await
-                .expect("source metadata lookup should succeed")
-                .is_some(),
-            "lost run fence must preserve the source multipart object"
-        );
+                .expect("source multipart object should commit");
+
+            let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
+            let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
+            let barrier = MultipartCommitBarrier::install(bucket, object, pause);
+            let task = spawn_real_rebalance_entry(
+                Arc::clone(&store),
+                Arc::clone(&source_set),
+                entry,
+                REBALANCE_ID,
+                Arc::new(RebalanceBucketConfigs::default()),
+            );
+            barrier.wait_until_paused().await;
+            run_signal_fence.mark_lost();
+            barrier.release();
+            assert_real_entry_rejected_after_run_fence_loss(task).await;
+
+            if let Some(staged_commit) = staged_commit {
+                assert!(
+                    !barrier.commit_observed(),
+                    "lost run fence must not publish target multipart {staged_commit}"
+                );
+            }
+            drop(barrier);
+            assert!(
+                target_set
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("target metadata lookup should succeed")
+                    .is_none(),
+                "lost run fence must not publish the target multipart object"
+            );
+            assert!(
+                source_set
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("source metadata lookup should succeed")
+                    .is_some(),
+                "lost run fence must preserve the source multipart object"
+            );
+        }
     }
 
     #[tokio::test]
