@@ -41,6 +41,7 @@ const IAM_FORMAT_FILE_PATH: &str = "config/iam/format.json";
 const IAM_USERS_PREFIX: &str = "config/iam/users/";
 const IAM_SERVICE_ACCOUNTS_PREFIX: &str = "config/iam/service-accounts/";
 const IAM_STS_PREFIX: &str = "config/iam/sts/";
+const MINIO_GO_ZERO_TIME: OffsetDateTime = time::macros::datetime!(0001-01-01 00:00 UTC);
 const IAM_GROUPS_PREFIX: &str = "config/iam/groups/";
 const IAM_POLICIES_PREFIX: &str = "config/iam/policies/";
 const IAM_POLICY_DB_PREFIX: &str = "config/iam/policydb/";
@@ -120,6 +121,15 @@ fn normalize_iam_config_blob(path: &str, data: &[u8]) -> std::result::Result<Opt
     if is_identity_path(path) {
         let mut identity: UserIdentity =
             serde_json::from_slice(data).map_err(|err| format!("parse IAM identity failed: {err}"))?;
+        if (path.starts_with(IAM_USERS_PREFIX) || path.starts_with(IAM_SERVICE_ACCOUNTS_PREFIX))
+            && identity
+                .credentials
+                .expiration
+                .as_ref()
+                .is_some_and(|expiration| *expiration == MINIO_GO_ZERO_TIME || *expiration == OffsetDateTime::UNIX_EPOCH)
+        {
+            identity.credentials.expiration = None;
+        }
         if identity.update_at.is_none() {
             identity.update_at = Some(OffsetDateTime::now_utc());
         }
@@ -441,7 +451,10 @@ mod tests {
     use crate::bucket::replication::{
         BucketReplicationResyncStatus, ReplicationMigrationBridge, ResyncStatusType, TargetReplicationResyncStatus,
     };
+    use rustfs_policy::auth::UserIdentity;
     use std::collections::HashMap;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
 
     #[test]
     fn test_normalize_policy_mapping_legacy_timestamp_and_fields() {
@@ -491,6 +504,54 @@ mod tests {
             .expect("identity path should be supported");
         let v: serde_json::Value = serde_json::from_slice(&normalized).expect("output should be valid JSON");
         assert!(v.get("updatedAt").is_some(), "normalize should backfill updatedAt");
+    }
+
+    #[test]
+    fn test_normalize_minio_permanent_credential_expiration() {
+        let cases = [
+            ("config/iam/users/alice/identity.json", "0001-01-01T00:00:00Z", true),
+            ("config/iam/users/alice/identity.json", "1970-01-01T00:00:00Z", true),
+            ("config/iam/service-accounts/svc/identity.json", "0001-01-01T00:00:00Z", true),
+            ("config/iam/service-accounts/svc/identity.json", "1970-01-01T00:00:00Z", true),
+            ("config/iam/service-accounts/svc/identity.json", "1970-01-01T00:00:00.000000001Z", false),
+            ("config/iam/sts/temp/identity.json", "0001-01-01T00:00:00Z", false),
+            ("config/iam/sts/temp/identity.json", "1970-01-01T00:00:00Z", false),
+            ("config/iam/users/alice/identity.json", "1969-12-31T23:59:59Z", false),
+            ("config/iam/users/alice/identity.json", "1970-01-01T00:00:00.000000001Z", false),
+            ("config/iam/users/alice/identity.json", "0001-01-01T00:00:00.000000001Z", false),
+            ("config/iam/users/alice/identity.json", "2030-01-01T00:00:00Z", false),
+        ];
+
+        for (path, expiration, should_clear) in cases {
+            let input = serde_json::json!({
+                "version": 1,
+                "credentials": {
+                    "accessKey": "test-access",
+                    "secretKey": "test-secret",
+                    "sessionToken": "test-session-token",
+                    "parentUser": "test-parent",
+                    "expiration": expiration,
+                }
+            });
+            let output = normalize_iam_config_blob(path, &serde_json::to_vec(&input).expect("serialize identity fixture"))
+                .expect("normalize should succeed")
+                .expect("identity path should be supported");
+            let identity: UserIdentity = serde_json::from_slice(&output).expect("deserialize normalized identity");
+
+            assert_eq!(identity.credentials.access_key, "test-access");
+            assert_eq!(identity.credentials.secret_key, "test-secret");
+            assert_eq!(identity.credentials.session_token, "test-session-token");
+            assert_eq!(identity.credentials.parent_user, "test-parent");
+            if should_clear {
+                assert_eq!(identity.credentials.expiration, None, "path: {path}, expiration: {expiration}");
+            } else {
+                assert_eq!(
+                    identity.credentials.expiration,
+                    Some(OffsetDateTime::parse(expiration, &Rfc3339).expect("parse expected expiration")),
+                    "path: {path}, expiration: {expiration}"
+                );
+            }
+        }
     }
 
     #[test]
