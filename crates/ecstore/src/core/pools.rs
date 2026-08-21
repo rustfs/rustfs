@@ -1013,20 +1013,24 @@ fn merge_decommission_durable_ilm_receipts(
             incoming.checkpoint.clone()
         };
     let terminal_checkpoint = match (&existing.terminal_checkpoint, &incoming.terminal_checkpoint) {
-        (Some(existing), Some(incoming)) if existing == incoming => Some(existing.clone()),
-        (Some(existing), Some(incoming)) if incoming.validate_successor(existing).is_ok() => Some(existing.clone()),
-        (Some(existing), Some(incoming)) => {
-            existing.validate_successor(incoming).map_err(|err| {
+        (Some(existing_terminal), Some(incoming_terminal)) if existing_terminal == incoming_terminal => {
+            Some(existing_terminal.clone())
+        }
+        (Some(existing_terminal), Some(incoming_terminal)) if incoming_terminal.validate_successor(existing_terminal).is_ok() => {
+            Some(existing_terminal.clone())
+        }
+        (Some(existing_terminal), Some(incoming_terminal)) => {
+            existing_terminal.validate_successor(incoming_terminal).map_err(|err| {
                 Error::other(format!(
                     "durable ILM receipt terminal checkpoint conflict for source path `{}` {}: {err}",
                     existing.source_path,
                     existing.context()
                 ))
             })?;
-            Some(incoming.clone())
+            Some(incoming_terminal.clone())
         }
-        (Some(existing), None) => Some(existing.clone()),
-        (None, Some(incoming)) => Some(incoming.clone()),
+        (Some(existing_terminal), None) => Some(existing_terminal.clone()),
+        (None, Some(incoming_terminal)) => Some(incoming_terminal.clone()),
         (None, None) => None,
     };
     let merged = DecommissionDurableIlmReceipt {
