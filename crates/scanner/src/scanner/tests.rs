@@ -15,12 +15,13 @@
 use super::*;
 use crate::EcstoreResult;
 use crate::{
-    Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerGetObjectReader as GetObjectReader,
-    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
-    init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
+    DATA_USAGE_BLOOM_RECOVERY_PATH, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
+    ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
+    ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
+    init_local_disks_with_instance_ctx,
 };
 use serial_test::serial;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::task::Poll;
 use temp_env::{with_var, with_var_unset};
@@ -152,6 +153,7 @@ impl Drop for ScannerDefaultCycleGuard {
 struct MemoryConfigStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     revisions: Mutex<HashMap<String, u64>>,
+    non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
     object_not_found_put_number: Mutex<HashMap<String, usize>>,
     error_after_commit_put_number: Mutex<HashMap<String, usize>>,
@@ -192,12 +194,16 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             .get(&key)
             .cloned()
             .ok_or(EcstoreError::FileNotFound)?;
-        let revision = *self.revisions.lock().await.entry(key).or_insert(1);
+        let data_len = i64::try_from(data.len()).expect("memory test object length should fit in i64");
+        let revision = *self.revisions.lock().await.entry(key.clone()).or_insert(1);
+        let is_dir = self.non_regular_objects.lock().await.contains(&key);
 
         Ok(GetObjectReader {
             stream: Box::new(Cursor::new(data)),
             object_info: ObjectInfo {
                 etag: Some(format!("memory-{revision}")),
+                size: data_len,
+                is_dir,
                 ..Default::default()
             },
             buffered_body: None,
@@ -835,6 +841,327 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
         ..Default::default()
     };
     assert!(encode_scanner_cycle_state(&exhausted, 7).is_err());
+}
+
+#[tokio::test]
+#[serial]
+async fn corrupt_cycle_state_is_quarantined_once() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.objects.lock().await.insert(state_key.clone(), vec![1]);
+    store.revisions.lock().await.insert(state_key.clone(), 7);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store.clone()).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    let marker_data = store
+        .objects
+        .lock()
+        .await
+        .get(&marker_key)
+        .cloned()
+        .expect("corrupt state must leave a durable recovery marker");
+    let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(&marker_data).expect("marker should be valid JSON");
+    assert_eq!(marker.primary_revision, "memory-7");
+    assert_eq!(marker.path, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    assert_eq!(marker.quarantine_path, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    assert_eq!(marker.classification, "corrupt");
+
+    // A second startup sees the matching marker before consuming the poison body.
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store.clone()).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+
+    // Replacing the primary object advances its revision; the stale marker must
+    // not quarantine the newer, valid state.
+    let cycle = CurrentCycle {
+        next: 9,
+        ..Default::default()
+    };
+    let encoded = encode_scanner_cycle_state(&cycle, 3).expect("valid state should encode");
+    store.objects.lock().await.insert(state_key.clone(), encoded);
+    store.revisions.lock().await.insert(state_key, 8);
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Ready {
+            cycle: CurrentCycle { next: 9, .. },
+            leader_epoch: 3,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn empty_cycle_state_object_is_quarantined_as_corrupt() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.objects.lock().await.insert(state_key.clone(), Vec::new());
+    store.revisions.lock().await.insert(state_key, 6);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    assert_eq!(scanner_cycle_recovery_status().classification.as_deref(), Some("corrupt"));
+    assert!(
+        scanner_cycle_recovery_status()
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("empty"))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn future_cycle_state_schema_is_recovery_required() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    let mut future = 17_u64.to_le_bytes().to_vec();
+    future.extend_from_slice(b"RSCYC999");
+    future.extend_from_slice(&4_u64.to_le_bytes());
+    future.extend_from_slice(&[0x90]);
+    store.objects.lock().await.insert(state_key.clone(), future);
+    store.revisions.lock().await.insert(state_key, 13);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    assert_eq!(scanner_cycle_recovery_status().classification.as_deref(), Some("future_schema"));
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.objects.lock().await.insert(state_key.clone(), vec![1]);
+    store.revisions.lock().await.insert(state_key, 4);
+
+    let (first, second) = tokio::join!(
+        load_scanner_cycle_state_for_startup(store.clone()),
+        load_scanner_cycle_state_for_startup(store.clone()),
+    );
+    assert!(matches!(first, ScannerCycleStateStartup::Blocked));
+    assert!(matches!(second, ScannerCycleStateStartup::Blocked));
+
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    let marker_data = store
+        .objects
+        .lock()
+        .await
+        .get(&marker_key)
+        .cloned()
+        .expect("one contender must publish the recovery marker");
+    let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(&marker_data).expect("marker should decode");
+    assert_eq!(marker.primary_revision, "memory-4");
+}
+
+#[tokio::test]
+#[serial]
+async fn cleanup_pending_marker_blocks_a_rewritten_primary_after_restart() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    let encoded = encode_scanner_cycle_state(
+        &CurrentCycle {
+            next: 12,
+            ..Default::default()
+        },
+        8,
+    )
+    .expect("valid state should encode");
+    store.objects.lock().await.insert(state_key.clone(), encoded);
+    store.revisions.lock().await.insert(state_key, 22);
+    let marker = ScannerCycleRecoveryMarker {
+        schema_version: 1,
+        primary_revision: "memory-21".to_string(),
+        generation: 11,
+        leader_epoch: 7,
+        classification: "corrupt".to_string(),
+        first_detected_at_unix_secs: 1,
+        last_attempt_at_unix_secs: 2,
+        retry_count: 1,
+        reason: "reset in progress".to_string(),
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: DATA_USAGE_BLOOM_RECOVERY_PATH.clone(),
+        state: "cleanup-pending".to_string(),
+    };
+    store
+        .objects
+        .lock()
+        .await
+        .insert(marker_key.clone(), serde_json::to_vec(&marker).expect("marker should encode"));
+    store.revisions.lock().await.insert(marker_key, 3);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    assert_eq!(scanner_cycle_recovery_status().state, "cleanup-pending");
+}
+
+#[test]
+fn full_rescan_reset_accepts_unknown_marker_fields_without_trusting_cursor() {
+    let marker = br#"{
+        "schema_version": 99,
+        "primary_revision": "memory-7",
+        "generation": 9000,
+        "leader_epoch": 9000,
+        "classification": "new-future-classification",
+        "first_detected_at_unix_secs": 1,
+        "last_attempt_at_unix_secs": 2,
+        "retry_count": 9,
+        "reason": "future marker",
+        "path": "buckets/.bloomcycle.bin",
+        "quarantine_path": "buckets/.bloomcycle.bin.recovery-required.json",
+        "future_field": {"cursor": "untrusted"}
+    }"#;
+    let decoded =
+        super::cycle_state::decode_recovery_marker_for_reset(marker, &DataUsageCacheRevision::Etag("memory-3".to_string()))
+            .expect("full-rescan compatibility decoder should accept additive fields");
+    assert_eq!(decoded.primary_revision, "memory-7");
+    assert_eq!(decoded.classification, "future_schema");
+    assert_eq!(decoded.generation, 0);
+    assert_eq!(decoded.leader_epoch, 0);
+    assert_eq!(decoded.state, "blocked");
+
+    let malformed =
+        super::cycle_state::decode_recovery_marker_for_reset(b"{not-json", &DataUsageCacheRevision::Etag("memory-4".to_string()))
+            .expect("a full-rescan reset must recover even when the marker is malformed");
+    assert!(malformed.primary_revision.is_empty());
+    assert_eq!(malformed.classification, "future_schema");
+}
+
+#[tokio::test]
+#[serial]
+async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_cursor() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
+        .await
+        .expect("corrupt cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), br#"{not-json"#.to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("full-rescan reset should recover malformed marker");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(cycle.next, 0, "reset must use the verified usage floor, not marker cursor");
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let marker = ScannerCycleRecoveryMarker {
+        schema_version: 1,
+        primary_revision: "memory-missing".to_string(),
+        generation: u64::MAX,
+        leader_epoch: u64::MAX,
+        classification: "corrupt".to_string(),
+        first_detected_at_unix_secs: 1,
+        last_attempt_at_unix_secs: 2,
+        retry_count: 0,
+        reason: "missing primary".to_string(),
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: DATA_USAGE_BLOOM_RECOVERY_PATH.clone(),
+        state: "blocked".to_string(),
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("marker should encode"),
+    )
+    .await
+    .expect("marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("full-rescan reset should recreate missing primary");
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("missing primary should be rebuilt");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(cycle.next, 0);
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn corrupt_cycle_state_rename_or_marker_failure_stays_recovery_required() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    store.objects.lock().await.insert(state_key.clone(), vec![1]);
+    store.revisions.lock().await.insert(state_key, 9);
+    store.fail_put_number.lock().await.insert(marker_key, 1);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store.clone()).await,
+        ScannerCycleStateStartup::Transient(_)
+    ));
+    let status = scanner_cycle_recovery_status();
+    assert_eq!(status.state, "recovery-required");
+    assert!(status.retryable);
+    assert!(
+        store
+            .objects
+            .lock()
+            .await
+            .contains_key(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str()))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn oversized_or_symlinked_cycle_state_is_rejected() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.objects.lock().await.insert(key.clone(), vec![0; 1024 * 1024 + 1]);
+    store.revisions.lock().await.insert(key.clone(), 11);
+
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store.clone()).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    assert_eq!(scanner_cycle_recovery_status().classification.as_deref(), Some("corrupt"));
+    assert!(
+        scanner_cycle_recovery_status()
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("oversized"))
+    );
+
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+    store.objects.lock().await.remove(&marker_key);
+    store.objects.lock().await.insert(key.clone(), vec![1]);
+    store.revisions.lock().await.insert(key.clone(), 12);
+    store.non_regular_objects.lock().await.insert(key);
+    // The object contract exposes a non-regular object as `is_dir`; local
+    // backends reject symlink/reparse entries before they become an object.
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Blocked
+    ));
 }
 
 #[tokio::test]
@@ -3004,6 +3331,24 @@ fn superseded_retry_backoff_grows_from_the_default_cycle() {
         backoff.record_retryable_cycle(true);
         assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(expected)));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn corrupt_cycle_state_backoff_uses_virtual_clock() {
+    let mut backoff = ScannerRetryBackoff::default();
+    backoff.record_retryable_cycle(true);
+    let first_delay = backoff
+        .retry_interval(Duration::from_secs(60))
+        .expect("the first recovery retry should be scheduled");
+    assert_eq!(first_delay, Duration::from_secs(5));
+
+    let deadline = Instant::now() + first_delay;
+    assert!(Instant::now() < deadline);
+    tokio::time::advance(first_delay).await;
+    assert!(Instant::now() >= deadline);
+
+    backoff.record_retryable_cycle(true);
+    assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(10)));
 }
 
 #[test]

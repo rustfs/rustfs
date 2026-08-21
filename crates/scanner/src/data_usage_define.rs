@@ -146,6 +146,11 @@ pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));
 
+/// Durable companion object for a cycle-state object which cannot be decoded.
+/// The primary object is deliberately never replaced or deleted by recovery.
+pub static DATA_USAGE_BLOOM_RECOVERY_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{}.recovery-required.json", DATA_USAGE_BLOOM_NAME_PATH.as_str()));
+
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
