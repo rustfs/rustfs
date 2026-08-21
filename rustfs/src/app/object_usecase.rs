@@ -3969,6 +3969,14 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
+/// `DeleteObjects` is idempotent. A raw filesystem `NotFound` can cross the
+/// distributed delete path instead of its usual typed missing-object error.
+fn is_delete_objects_not_found(error: &EcstoreError) -> bool {
+    is_err_object_not_found(error)
+        || is_err_version_not_found(error)
+        || matches!(error, StorageError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Bounded concurrency for the per-object pre-delete stat fanout in
 /// `execute_delete_objects` (backlog#929 / HP-8). Keeps the metadata reads for
 /// a 1000-key batch from serializing while capping the disk fanout pressure.
@@ -8476,11 +8484,7 @@ impl DefaultObjectUsecase {
         for (i, err) in errs.iter().enumerate() {
             let didx = object_to_delete_idx[i];
 
-            if err.is_none()
-                || err
-                    .clone()
-                    .is_some_and(|v| is_err_object_not_found(&v) || is_err_version_not_found(&v))
-            {
+            if err.as_ref().is_none_or(is_delete_objects_not_found) {
                 delete_results[didx].delete_object = Some(dobjs[i].clone());
                 let (versioned, version_suspended) = object_versioning[i];
                 let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
@@ -17690,6 +17694,18 @@ mod tests {
             normalize_delete_objects_version_id(Some(" \t ".to_string())).expect("empty version marker should normalize");
         assert_eq!(wire_version_id, None);
         assert_eq!(internal_version_id, None);
+    }
+
+    #[test]
+    fn delete_objects_treats_raw_io_not_found_as_idempotent() {
+        assert!(is_delete_objects_not_found(&StorageError::FileNotFound));
+        assert!(is_delete_objects_not_found(&StorageError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        ))));
+        assert!(!is_delete_objects_not_found(&StorageError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))));
+        assert!(!is_delete_objects_not_found(&StorageError::DiskNotFound));
     }
 
     #[test]
