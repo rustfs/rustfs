@@ -17,14 +17,15 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
-use crate::storage_api::owner::{EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats};
+use crate::storage_api::owner::{
+    EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
+};
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
     DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
     ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
-use rustfs_ecstore::api::capacity::PoolDecommissionInfo;
 use rustfs_filemeta::FileInfo;
 use serial_test::serial;
 use temp_env::with_var;
@@ -188,11 +189,11 @@ async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
 async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     for decommission in [
-        PoolDecommissionInfo {
+        EcstorePoolDecommissionInfo {
             failed: true,
             ..Default::default()
         },
-        PoolDecommissionInfo {
+        EcstorePoolDecommissionInfo {
             canceled: true,
             ..Default::default()
         },
