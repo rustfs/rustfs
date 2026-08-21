@@ -86,7 +86,7 @@ where
     Ok(guard)
 }
 
-async fn merge_and_save_rebalance_meta_no_lock<S>(
+pub(super) async fn merge_and_save_rebalance_meta_no_lock<S>(
     pool: Arc<S>,
     local_snapshot: &RebalanceMeta,
     stage: &str,
@@ -274,6 +274,31 @@ impl ECStore {
     {
         self.save_rebalance_meta_with_merge_for_id(pool, local_snapshot, stage, Some(expected_id))
             .await
+    }
+
+    pub(super) async fn save_rebalance_meta_under_activation_fence<S>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+        activation_fence: &PoolRebalanceActivationFence,
+        expected_id: &str,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        merge_and_save_rebalance_meta_no_lock(
+            pool,
+            local_snapshot,
+            stage,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+            Some(activation_fence),
+            Some(expected_id),
+        )
+        .await
     }
 
     async fn save_rebalance_meta_with_merge_for_id<S>(

@@ -64,6 +64,47 @@ pub(super) fn commit_local_rebalance_worker_activation(
     Ok(RebalanceLocalActivationOutcome::Started)
 }
 
+pub(super) fn stage_local_rebalance_worker_activation(
+    meta: &super::RebalanceMeta,
+    expected_id: &str,
+    cancel: CancellationToken,
+    now: OffsetDateTime,
+) -> Result<(super::RebalanceMeta, RebalanceLocalActivationOutcome, bool)> {
+    let mut candidate = meta.clone();
+    let completed_at_goal = complete_rebalance_pools_at_goal(&mut candidate, now);
+    let completed_empty_queue = complete_rebalance_pools_with_empty_queue(&mut candidate, now);
+    let outcome = commit_local_rebalance_worker_activation(&mut candidate, expected_id, cancel)?;
+    let must_persist =
+        completed_at_goal || completed_empty_queue || outcome == RebalanceLocalActivationOutcome::NotStartedTerminal;
+    Ok((candidate, outcome, must_persist))
+}
+
+pub(super) fn commit_local_rebalance_worker_activation_candidate(
+    current: &mut super::RebalanceMeta,
+    expected_id: &str,
+    expected_cancel: Option<&CancellationToken>,
+    candidate: super::RebalanceMeta,
+) -> Result<()> {
+    if current.id != expected_id || candidate.id != expected_id {
+        return Err(Error::other(format!(
+            "rebalance metadata changed before local worker activation commit: expected {expected_id}, found {}",
+            current.id
+        )));
+    }
+    if !Arc::ptr_eq(&current.activation_gate, &candidate.activation_gate) {
+        return Err(Error::other(format!(
+            "rebalance activation gate changed before local worker activation commit: {expected_id}"
+        )));
+    }
+    if current.cancel.as_ref() != expected_cancel {
+        return Err(Error::other(format!(
+            "rebalance worker token changed before local worker activation commit: {expected_id}"
+        )));
+    }
+    *current = candidate;
+    Ok(())
+}
+
 pub(super) fn rollback_local_rebalance_worker_activation(
     meta: Option<&mut super::RebalanceMeta>,
     expected_id: &str,
@@ -80,18 +121,6 @@ pub(super) fn rollback_local_rebalance_worker_activation(
         return true;
     }
     false
-}
-
-pub(super) fn resolve_rebalance_pre_spawn_result(
-    meta: Option<&mut super::RebalanceMeta>,
-    expected_id: &str,
-    activation_token: &CancellationToken,
-    result: Result<()>,
-) -> Result<()> {
-    if result.is_err() {
-        rollback_local_rebalance_worker_activation(meta, expected_id, activation_token);
-    }
-    result
 }
 
 impl ECStore {
@@ -126,8 +155,10 @@ impl ECStore {
 
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();
-        let mut meta_to_save = None;
         let activation_outcome;
+        let candidate;
+        let expected_cancel;
+        let must_persist;
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -147,31 +178,71 @@ impl ECStore {
                 );
                 return Ok(());
             }
-            let now = OffsetDateTime::now_utc();
-            if complete_rebalance_pools_at_goal(meta, now) {
-                meta_to_save = Some(meta.clone());
+            expected_cancel = meta.cancel.clone();
+            (candidate, activation_outcome, must_persist) = stage_local_rebalance_worker_activation(
+                meta,
+                expected_id.as_ref(),
+                cancel_tx.clone(),
+                OffsetDateTime::now_utc(),
+            )?;
+            if let Err(err) = activation_fence.ensure_held() {
+                cancel_tx.cancel();
+                return Err(err);
             }
-            if complete_rebalance_pools_with_empty_queue(meta, now) {
-                meta_to_save = Some(meta.clone());
+            if !must_persist {
+                if let Err(err) = commit_local_rebalance_worker_activation_candidate(
+                    meta,
+                    expected_id.as_ref(),
+                    expected_cancel.as_ref(),
+                    candidate.clone(),
+                ) {
+                    cancel_tx.cancel();
+                    return Err(err);
+                }
             }
-            activation_fence.ensure_held()?;
-            activation_outcome = commit_local_rebalance_worker_activation(meta, expected_id.as_ref(), cancel_tx)?;
+        }
 
-            drop(rebalance_meta);
+        if must_persist {
+            let save_result = resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_under_activation_fence(
+                    pool,
+                    &candidate,
+                    "start_rebalance persist activation candidate",
+                    activation_fence.as_ref(),
+                    expected_id.as_ref(),
+                )
+                .await,
+                "start_rebalance persist activation candidate",
+            );
+            if let Err(err) = save_result {
+                cancel_tx.cancel();
+                return Err(err);
+            }
+            if let Err(err) = activation_fence.ensure_held() {
+                cancel_tx.cancel();
+                return Err(err);
+            }
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            let Some(meta) = rebalance_meta.as_mut() else {
+                cancel_tx.cancel();
+                return Err(Error::ConfigNotFound);
+            };
+            if let Err(err) = commit_local_rebalance_worker_activation_candidate(
+                meta,
+                expected_id.as_ref(),
+                expected_cancel.as_ref(),
+                candidate,
+            ) {
+                cancel_tx.cancel();
+                return Err(err);
+            }
+        }
+        if let Err(err) = activation_fence.ensure_held() {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
+            return Err(err);
         }
         drop(activation_fence);
-
-        if let Some(meta) = meta_to_save {
-            let save_result = resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta, "start_rebalance complete pools at goal")
-                    .await,
-                "start_rebalance complete pools at goal",
-            );
-            if save_result.is_err() {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
-                return resolve_rebalance_pre_spawn_result(rebalance_meta.as_mut(), expected_id.as_ref(), &rx, save_result);
-            }
-        }
 
         if activation_outcome != RebalanceLocalActivationOutcome::Started {
             return Ok(());

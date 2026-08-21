@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::control::validate_rebalance_disk_stats_coverage;
+use super::control::{merge_and_save_rebalance_meta_no_lock, validate_rebalance_disk_stats_coverage};
 use super::meta::{
     RebalanceMetaMergeOutcome, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
     apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
@@ -33,8 +33,9 @@ use super::migration::{
     rebalance_delete_marker_opts,
 };
 use super::runtime::{
-    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation, resolve_rebalance_pre_spawn_result,
-    should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt,
+    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation,
+    commit_local_rebalance_worker_activation_candidate, should_fail_repeated_rebalance_bucket_defer,
+    source_cleanup_defer_attempt, stage_local_rebalance_worker_activation,
 };
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
@@ -2737,10 +2738,139 @@ fn test_stopped_activation_state_prevents_worker_token_commit() {
 }
 
 #[test]
-fn test_rebalance_start_save_failure_rolls_back_local_worker_token() {
-    let activation_token = tokio_util::sync::CancellationToken::new();
-    let observer = activation_token.clone();
-    let mut meta = RebalanceMeta {
+fn test_rebalance_activation_candidate_does_not_clobber_replacement_token() {
+    let mut local = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (candidate, outcome, must_persist) =
+        stage_local_rebalance_worker_activation(&local, "rebalance-a", CancellationToken::new(), OffsetDateTime::UNIX_EPOCH)
+            .expect("active activation candidate should be staged");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::Started);
+    assert!(!must_persist);
+
+    let replacement = CancellationToken::new();
+    local.cancel = Some(replacement.clone());
+    let err = commit_local_rebalance_worker_activation_candidate(&mut local, "rebalance-a", None, candidate)
+        .expect_err("a replacement token must reject the stale activation candidate");
+    assert!(err.to_string().contains("worker token changed"));
+    assert_eq!(local.cancel.as_ref(), Some(&replacement));
+}
+
+#[tokio::test]
+async fn test_rebalance_start_save_failure_retries_persisted_completed_state() {
+    let (_temp_dirs, _disk_stores, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+    let mut local = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            init_free_space: 400,
+            init_capacity: 1_000,
+            bytes: 100,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    local.save(pool.clone()).await.expect("active metadata should be persisted");
+
+    let (failed_candidate, outcome, must_persist) = stage_local_rebalance_worker_activation(
+        &local,
+        "rebalance-a",
+        CancellationToken::new(),
+        OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid"),
+    )
+    .expect("terminal activation candidate should be staged");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(must_persist);
+    assert_eq!(failed_candidate.pool_stats[0].info.status, RebalStatus::Completed);
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Started);
+
+    let err = merge_and_save_rebalance_meta_no_lock(
+        pool.clone(),
+        &failed_candidate,
+        "failed completed candidate",
+        ObjectOptions {
+            no_lock: true,
+            namespace_lock_fence: Some(crate::object_api::NamespaceLockFence::lost_for_test()),
+            ..Default::default()
+        },
+        None,
+        Some(local.id.as_str()),
+    )
+    .await
+    .expect_err("lost namespace quorum must reject the terminal candidate save");
+
+    assert!(matches!(
+        err,
+        Error::NamespaceLockQuorumUnavailable {
+            required: 3,
+            achieved: 2,
+            ..
+        }
+    ));
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Started);
+    assert!(local.cancel.is_none(), "failed persistence must not publish a worker token");
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(pool.clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+
+    let expected_cancel = local.cancel.clone();
+    let (retry_candidate, retry_outcome, retry_must_persist) = stage_local_rebalance_worker_activation(
+        &local,
+        "rebalance-a",
+        CancellationToken::new(),
+        OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid"),
+    )
+    .expect("retry terminal activation candidate should be staged");
+    assert_eq!(retry_outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(retry_must_persist);
+    merge_and_save_rebalance_meta_no_lock(
+        pool.clone(),
+        &retry_candidate,
+        "retry completed candidate",
+        ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+        None,
+        Some(local.id.as_str()),
+    )
+    .await
+    .expect("retry must persist the completed candidate");
+    commit_local_rebalance_worker_activation_candidate(&mut local, "rebalance-a", expected_cancel.as_ref(), retry_candidate)
+        .expect("successful persistence should publish the completed candidate locally");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(pool)
+        .await
+        .expect("retry-persisted completed metadata should be readable");
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Completed);
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Completed);
+    assert!(local.cancel.is_none());
+}
+
+#[tokio::test]
+async fn test_rebalance_start_save_failure_retries_persisted_stopped_state() {
+    let (_temp_dirs, _disk_stores, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+    let active = RebalanceMeta {
         id: "rebalance-a".to_string(),
         pool_stats: vec![RebalanceStats {
             participating: true,
@@ -2752,36 +2882,71 @@ fn test_rebalance_start_save_failure_rolls_back_local_worker_token() {
         }],
         ..Default::default()
     };
-    assert_eq!(
-        commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", activation_token.clone())
-            .expect("active metadata should accept the worker token"),
-        RebalanceLocalActivationOutcome::Started
-    );
+    active.save(pool.clone()).await.expect("active metadata should be persisted");
+    let stopped_at = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+    let mut local = active.clone();
+    local.stopped_at = Some(stopped_at);
+    local.pool_stats[0].info.status = RebalStatus::Stopped;
+    local.pool_stats[0].info.end_time = Some(stopped_at);
 
-    let err = resolve_rebalance_pre_spawn_result(
-        Some(&mut meta),
-        "rebalance-a",
-        &activation_token,
-        Err(Error::NamespaceLockQuorumUnavailable {
-            mode: "write",
-            bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
-            object: super::REBAL_META_NAME.to_string(),
-            required: 3,
-            achieved: 2,
-        }),
+    let (failed_candidate, outcome, must_persist) =
+        stage_local_rebalance_worker_activation(&local, "rebalance-a", CancellationToken::new(), stopped_at)
+            .expect("stopped activation candidate should be staged");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(must_persist, "an already-terminal local state must still be persisted on retry");
+    let err = merge_and_save_rebalance_meta_no_lock(
+        pool.clone(),
+        &failed_candidate,
+        "failed stopped candidate",
+        ObjectOptions {
+            no_lock: true,
+            namespace_lock_fence: Some(crate::object_api::NamespaceLockFence::lost_for_test()),
+            ..Default::default()
+        },
+        None,
+        Some(local.id.as_str()),
     )
-    .expect_err("metadata save failure must abort local worker activation");
+    .await
+    .expect_err("lost namespace quorum must reject the stopped candidate save");
+    assert!(matches!(err, Error::NamespaceLockQuorumUnavailable { .. }));
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(pool.clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
 
-    assert!(matches!(
-        err,
-        Error::NamespaceLockQuorumUnavailable {
-            required: 3,
-            achieved: 2,
-            ..
-        }
-    ));
-    assert!(observer.is_cancelled(), "the failed activation token must be canceled");
-    assert!(meta.cancel.is_none(), "a retry must not see a phantom active worker token");
+    let expected_cancel = local.cancel.clone();
+    let (retry_candidate, retry_outcome, retry_must_persist) =
+        stage_local_rebalance_worker_activation(&local, "rebalance-a", CancellationToken::new(), stopped_at)
+            .expect("retry stopped activation candidate should be staged");
+    assert_eq!(retry_outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(retry_must_persist);
+    merge_and_save_rebalance_meta_no_lock(
+        pool.clone(),
+        &retry_candidate,
+        "retry stopped candidate",
+        ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+        None,
+        Some(local.id.as_str()),
+    )
+    .await
+    .expect("retry must persist the stopped candidate");
+    commit_local_rebalance_worker_activation_candidate(&mut local, "rebalance-a", expected_cancel.as_ref(), retry_candidate)
+        .expect("successful persistence should preserve the stopped candidate locally");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(pool)
+        .await
+        .expect("retry-persisted stopped metadata should be readable");
+    assert_eq!(persisted.stopped_at, Some(stopped_at));
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Stopped);
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
 }
 
 #[tokio::test]
