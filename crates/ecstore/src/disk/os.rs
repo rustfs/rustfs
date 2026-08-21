@@ -23,7 +23,7 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::fs;
 use tokio::sync::{
@@ -328,6 +328,9 @@ const ENV_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE: &str = "RUSTFS_EXPERIMENTAL_DST_DIR
 const DEFAULT_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE: bool = false;
 const ENV_FILE_FDATASYNC_GROUP_COMMIT_ENABLE: &str = "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE";
 const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE: bool = false;
+const ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: &str = "RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS";
+const DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 0;
+const MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS: u64 = 1_000;
 #[cfg(not(test))]
 const MAX_DST_DIR_FSYNC_GROUPS: usize = 1024;
 #[cfg(test)]
@@ -353,6 +356,15 @@ static DST_DIR_FSYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 });
 static FILE_FDATASYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(ENV_FILE_FDATASYNC_GROUP_COMMIT_ENABLE, DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE)
+});
+static FILE_FDATASYNC_GROUP_COMMIT_WAIT: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_micros(
+        rustfs_utils::get_env_u64(
+            ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
+            DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
+        )
+        .min(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS),
+    )
 });
 
 #[cfg(test)]
@@ -400,8 +412,10 @@ fn dst_dir_fsync_group_commit_enabled() -> bool {
 #[cfg(test)]
 mod file_fdatasync_group_commit_override {
     use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+    use std::time::Duration;
 
     static OVERRIDE: RwLock<Option<bool>> = RwLock::new(None);
+    static WAIT_OVERRIDE: RwLock<Option<Duration>> = RwLock::new(None);
     static SERIAL: Mutex<()> = Mutex::new(());
 
     pub(crate) fn get() -> Option<bool> {
@@ -415,6 +429,7 @@ mod file_fdatasync_group_commit_override {
     impl Drop for OverrideGuard {
         fn drop(&mut self) {
             *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *WAIT_OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
@@ -423,11 +438,24 @@ mod file_fdatasync_group_commit_override {
         *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = Some(enabled);
         OverrideGuard { _serial: serial }
     }
+
+    pub(crate) fn set_wait(wait: Duration) {
+        *WAIT_OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = Some(wait);
+    }
+
+    pub(crate) fn wait() -> Option<Duration> {
+        *WAIT_OVERRIDE.read().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn set_file_fdatasync_group_commit_for_test(enabled: bool) -> file_fdatasync_group_commit_override::OverrideGuard {
     file_fdatasync_group_commit_override::set(enabled)
+}
+
+#[cfg(test)]
+fn set_file_fdatasync_group_commit_wait_for_test(wait: Duration) {
+    file_fdatasync_group_commit_override::set_wait(wait);
 }
 
 fn file_fdatasync_group_commit_enabled() -> bool {
@@ -437,6 +465,15 @@ fn file_fdatasync_group_commit_enabled() -> bool {
     }
 
     *FILE_FDATASYNC_GROUP_COMMIT_ENABLED
+}
+
+fn file_fdatasync_group_commit_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = file_fdatasync_group_commit_override::wait() {
+        return wait;
+    }
+
+    *FILE_FDATASYNC_GROUP_COMMIT_WAIT
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -934,6 +971,10 @@ async fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) {
         #[cfg(test)]
         file_sync_probe::run_before_group_batch();
         tokio::task::yield_now().await;
+        let wait = file_fdatasync_group_commit_wait();
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
         let (batch, batch_file_count): (Vec<FileFdatasyncWaiter>, usize) = {
             let mut group_state = group.inner.lock();
             let batch_file_count = group_state.pending_files;
@@ -6075,6 +6116,7 @@ mod tests {
         use std::sync::mpsc;
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(Duration::ZERO);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
@@ -6143,10 +6185,81 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(file_sync_probe)]
+    async fn file_fdatasync_group_commit_wait_budget_batches_late_follower() {
+        use std::sync::mpsc;
+
+        let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(Duration::from_millis(50));
+        clear_file_fdatasync_group_commit_for_test();
+        let temp_dir = tempdir().expect("create temp dir");
+        let first_dir = temp_dir.path().join("first");
+        let second_dir = temp_dir.path().join("second");
+        std::fs::create_dir(&first_dir).expect("create first dir");
+        std::fs::create_dir(&second_dir).expect("create second dir");
+        std::fs::write(first_dir.join("part.1"), b"first").expect("write first part");
+        std::fs::write(second_dir.join("part.1"), b"second").expect("write second part");
+        let _probe = file_sync_probe::set_blocking(temp_dir.path());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        file_sync_probe::set_before_group_batch(move || {
+            entered_tx.send(()).expect("signal first file fdatasync group worker");
+        });
+
+        let limiter = file_sync_limiter();
+        let first_limiter = limiter.clone();
+        let first_path = first_dir.clone();
+        let first = tokio::spawn(async move { sync_dir_files_with_limiter(first_path, first_limiter).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("group worker hook waiter should run")
+            .expect("first file fdatasync group worker should start");
+
+        let second_limiter = limiter.clone();
+        let second_path = second_dir.clone();
+        let second = tokio::spawn(async move { sync_dir_files_with_limiter(second_path, second_limiter).await });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if file_fdatasync_group_commit_counts_for_test().1 == 2 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second waiter should enqueue during the configured wait budget");
+        file_sync_probe::wait_for_active(1).await;
+
+        assert_eq!(
+            file_sync_probe::group_batches(),
+            vec![2],
+            "configured wait budget should let a follower join the leader's batch"
+        );
+        file_sync_probe::release();
+        first
+            .await
+            .expect("join first wait-budget file sync")
+            .expect("first wait-budget file sync must succeed");
+        second
+            .await
+            .expect("join second wait-budget file sync")
+            .expect("second wait-budget file sync must succeed");
+        assert!(
+            fsync_dir_recorder::was_fsynced(&first_dir),
+            "first source directory must still be fsynced"
+        );
+        assert!(
+            fsync_dir_recorder::was_fsynced(&second_dir),
+            "second source directory must still be fsynced"
+        );
+        assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(file_sync_probe)]
     async fn file_fdatasync_group_commit_failure_fails_all_waiters_before_dir_fsync() {
         use std::sync::mpsc;
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
+        set_file_fdatasync_group_commit_wait_for_test(Duration::ZERO);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
