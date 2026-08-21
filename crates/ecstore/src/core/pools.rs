@@ -94,6 +94,9 @@ const DECOMMISSION_BUCKET_CONCURRENCY_DEFAULT_CAP: usize = 4;
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Background decommission walks must tolerate slow object migrations; the
+/// stall timeout is the drive-health bound, not the total listing duration.
+const DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -5047,6 +5050,8 @@ impl SetDisks {
                 path: bucket_info.prefix.clone(),
                 recursive: true,
                 min_disks: listing_quorum,
+                skip_walkdir_total_timeout: true,
+                walkdir_stall_timeout: Some(DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT),
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     let resolver = resolver.clone();
