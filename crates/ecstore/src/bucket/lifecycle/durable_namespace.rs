@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_utils::crypto::hex_sha256;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{manual_transition_job, tier_delete_journal, transition_transaction};
@@ -89,12 +91,187 @@ pub(crate) struct ValidatedDurableIlmRecord {
     pub(crate) namespace: &'static str,
     pub(crate) id_kind: &'static str,
     pub(crate) id: String,
+    pub(crate) checkpoint: DurableIlmRecordCheckpoint,
 }
 
 impl ValidatedDurableIlmRecord {
     pub(crate) fn context(&self) -> String {
         format!("namespace `{}` {} `{}`", self.namespace, self.id_kind, self.id)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DurableIlmRecordCheckpoint {
+    TierDeleteJournal {
+        content_sha256: String,
+        identity_sha256: String,
+        committed: bool,
+    },
+    TransitionTransaction {
+        content_sha256: String,
+        identity_sha256: String,
+        remote_version_sha256: String,
+        remote_version_known: bool,
+        revision: u64,
+        state: transition_transaction::TransitionTransactionState,
+    },
+    ManualTransitionJob {
+        content_sha256: String,
+        identity_sha256: String,
+        updated_at_unix_nanos: i128,
+        state: manual_transition_job::ManualTransitionJobState,
+        scan_completed: bool,
+        cancel_requested: bool,
+    },
+    ManualTransitionScope {
+        content_sha256: String,
+        identity_sha256: String,
+        updated_at_unix_nanos: i128,
+    },
+    ManualTransitionTask {
+        content_sha256: String,
+    },
+    ManualTransitionWorkerResult {
+        content_sha256: String,
+    },
+}
+
+impl DurableIlmRecordCheckpoint {
+    pub(crate) fn content_sha256(&self) -> &str {
+        match self {
+            Self::TierDeleteJournal { content_sha256, .. }
+            | Self::TransitionTransaction { content_sha256, .. }
+            | Self::ManualTransitionJob { content_sha256, .. }
+            | Self::ManualTransitionScope { content_sha256, .. }
+            | Self::ManualTransitionTask { content_sha256 }
+            | Self::ManualTransitionWorkerResult { content_sha256 } => content_sha256,
+        }
+    }
+
+    pub(crate) fn validate_successor(&self, next: &Self) -> Result<()> {
+        if self == next {
+            return Ok(());
+        }
+
+        let valid = match (self, next) {
+            (
+                Self::TierDeleteJournal {
+                    identity_sha256: previous_identity,
+                    committed: previous_committed,
+                    ..
+                },
+                Self::TierDeleteJournal {
+                    identity_sha256: next_identity,
+                    committed: next_committed,
+                    ..
+                },
+            ) => {
+                previous_identity == next_identity
+                    && (previous_committed == next_committed || (!previous_committed && *next_committed))
+            }
+            (
+                Self::TransitionTransaction {
+                    identity_sha256: previous_identity,
+                    remote_version_sha256: previous_remote_version,
+                    remote_version_known: previous_remote_version_known,
+                    revision: previous_revision,
+                    state: previous_state,
+                    ..
+                },
+                Self::TransitionTransaction {
+                    identity_sha256: next_identity,
+                    remote_version_sha256: next_remote_version,
+                    revision: next_revision,
+                    state: next_state,
+                    ..
+                },
+            ) => {
+                previous_identity == next_identity
+                    && transition_state_distance(*previous_state, *next_state)
+                        .and_then(|distance| previous_revision.checked_add(distance))
+                        .is_some_and(|expected_revision| *next_revision == expected_revision)
+                    && (!previous_remote_version_known || previous_remote_version == next_remote_version)
+            }
+            (
+                Self::ManualTransitionJob {
+                    identity_sha256: previous_identity,
+                    updated_at_unix_nanos: previous_updated_at,
+                    state: previous_state,
+                    scan_completed: previous_scan_completed,
+                    cancel_requested: previous_cancel_requested,
+                    ..
+                },
+                Self::ManualTransitionJob {
+                    identity_sha256: next_identity,
+                    updated_at_unix_nanos: next_updated_at,
+                    state: next_state,
+                    scan_completed: next_scan_completed,
+                    cancel_requested: next_cancel_requested,
+                    ..
+                },
+            ) => {
+                previous_identity == next_identity
+                    && next_updated_at > previous_updated_at
+                    && manual_job_state_reaches(*previous_state, *next_state)
+                    && (!previous_scan_completed || *next_scan_completed)
+                    && (!previous_cancel_requested || *next_cancel_requested)
+            }
+            (
+                Self::ManualTransitionScope {
+                    identity_sha256: previous_identity,
+                    updated_at_unix_nanos: previous_updated_at,
+                    ..
+                },
+                Self::ManualTransitionScope {
+                    identity_sha256: next_identity,
+                    updated_at_unix_nanos: next_updated_at,
+                    ..
+                },
+            ) => previous_identity == next_identity && next_updated_at > previous_updated_at,
+            _ => false,
+        };
+
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::other("durable ILM record generation is not a monotonic successor"))
+        }
+    }
+}
+
+fn transition_state_distance(
+    from: transition_transaction::TransitionTransactionState,
+    to: transition_transaction::TransitionTransactionState,
+) -> Option<u64> {
+    use transition_transaction::TransitionTransactionState::{
+        AbortedNoRemote, CleanupPending, Committed, LocalCommitStarted, UploadOutcomeUnknown, UploadStarted, Uploaded,
+    };
+
+    match (from, to) {
+        (UploadStarted, UploadOutcomeUnknown | AbortedNoRemote | Uploaded) => Some(1),
+        (UploadStarted, LocalCommitStarted | CleanupPending) => Some(2),
+        (UploadStarted, Committed) => Some(3),
+        (UploadOutcomeUnknown, Uploaded | CleanupPending) => Some(1),
+        (UploadOutcomeUnknown, LocalCommitStarted) => Some(2),
+        (UploadOutcomeUnknown, Committed) => Some(3),
+        (Uploaded, LocalCommitStarted | CleanupPending) => Some(1),
+        (Uploaded, Committed) => Some(2),
+        (LocalCommitStarted, Committed | CleanupPending) => Some(1),
+        _ => None,
+    }
+}
+
+fn manual_job_state_reaches(
+    from: manual_transition_job::ManualTransitionJobState,
+    to: manual_transition_job::ManualTransitionJobState,
+) -> bool {
+    from == to || from == manual_transition_job::ManualTransitionJobState::Running
+}
+
+fn checkpoint_hash<T: Serialize>(value: &T) -> Result<String> {
+    let encoded = serde_json::to_vec(value).map_err(Error::other)?;
+    Ok(hex_sha256(&encoded, ToOwned::to_owned))
 }
 
 fn path_is_in_namespace(path: &str, namespace: &DurableIlmNamespace) -> bool {
@@ -163,7 +340,8 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
         )));
     }
 
-    let (id_kind, id) = match namespace.kind {
+    let content_sha256 = hex_sha256(data, ToOwned::to_owned);
+    let (id_kind, id, checkpoint) = match namespace.kind {
         DurableIlmRecordKind::TierDeleteJournal => {
             let entry = tier_delete_journal::decode_tier_delete_journal_entry(data)?;
             if tier_delete_journal::tier_delete_journal_object_name(&entry) != path {
@@ -173,12 +351,52 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 .strip_prefix(namespace.prefix)
                 .and_then(|suffix| suffix.strip_suffix(".json"))
                 .ok_or_else(|| Error::other("tier delete journal path is invalid"))?;
-            ("operation_id", operation_id.to_string())
+            let identity_sha256 = checkpoint_hash(&(
+                &entry.obj_name,
+                &entry.version_id,
+                &entry.tier_name,
+                entry.backend_identity,
+                entry.version_id_exact,
+                entry.version_state,
+                &entry.source,
+            ))?;
+            (
+                "operation_id",
+                operation_id.to_string(),
+                DurableIlmRecordCheckpoint::TierDeleteJournal {
+                    content_sha256,
+                    identity_sha256,
+                    committed: entry.state == super::tier_sweeper::TierDeleteJournalState::Committed,
+                },
+            )
         }
         DurableIlmRecordKind::TransitionTransaction => {
             let transaction = transition_transaction::decode_transition_transaction_record(path, data)
                 .map_err(|err| Error::other(err.to_string()))?;
-            ("transaction_id", transaction.transaction_id.to_string())
+            let identity_sha256 = checkpoint_hash(&(
+                transaction.deployment_id,
+                transaction.transaction_id,
+                transaction.owner_epoch,
+                transaction.write_id,
+                &transaction.source,
+                &transaction.tier_name,
+                transaction.backend_fingerprint,
+                &transaction.remote_object,
+                transaction.not_after_unix_nanos,
+            ))?;
+            let remote_version_sha256 = checkpoint_hash(&transaction.remote_version)?;
+            (
+                "transaction_id",
+                transaction.transaction_id.to_string(),
+                DurableIlmRecordCheckpoint::TransitionTransaction {
+                    content_sha256,
+                    identity_sha256,
+                    remote_version_sha256,
+                    remote_version_known: !transaction.remote_version.is_unknown(),
+                    revision: transaction.revision,
+                    state: transaction.state,
+                },
+            )
         }
         DurableIlmRecordKind::ManualTransitionJob => {
             let job_id = manual_transition_job::manual_transition_job_id_from_record_object_name(path)
@@ -188,9 +406,31 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             if canonical != path {
                 return Err(Error::other("manual transition job path is not canonical"));
             }
-            manual_transition_job::ManualTransitionJobRecord::decode(job_id, data)
+            let job = manual_transition_job::ManualTransitionJobRecord::decode(job_id, data)
                 .map_err(|err| Error::other(err.to_string()))?;
-            ("job_id", job_id.to_string())
+            let identity_sha256 = checkpoint_hash(&(
+                job.job_id,
+                &job.scope_key,
+                &job.bucket,
+                &job.prefix,
+                &job.tier,
+                job.dry_run,
+                job.max_objects,
+                job.max_duration,
+                job.created_at_unix_nanos,
+            ))?;
+            (
+                "job_id",
+                job_id.to_string(),
+                DurableIlmRecordCheckpoint::ManualTransitionJob {
+                    content_sha256,
+                    identity_sha256,
+                    updated_at_unix_nanos: job.updated_at_unix_nanos,
+                    state: job.state,
+                    scan_completed: job.scan_completed,
+                    cancel_requested: job.cancel_requested,
+                },
+            )
         }
         DurableIlmRecordKind::ManualTransitionScope => {
             let admission: manual_transition_job::ManualTransitionScopeAdmission =
@@ -201,7 +441,24 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             if canonical != path {
                 return Err(Error::other("manual transition scope content does not match its path"));
             }
-            ("job_id", admission.job_id.to_string())
+            let identity_sha256 = checkpoint_hash(&(
+                &admission.schema,
+                &admission.scope_key,
+                admission.job_id,
+                &admission.bucket,
+                &admission.prefix,
+                &admission.tier,
+                admission.dry_run,
+            ))?;
+            (
+                "job_id",
+                admission.job_id.to_string(),
+                DurableIlmRecordCheckpoint::ManualTransitionScope {
+                    content_sha256,
+                    identity_sha256,
+                    updated_at_unix_nanos: admission.updated_at_unix_nanos,
+                },
+            )
         }
         DurableIlmRecordKind::ManualTransitionTask => {
             let (job_id, task_key) = parse_manual_sharded_record(path, namespace.prefix)?;
@@ -212,7 +469,11 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             }
             manual_transition_job::ManualTransitionTaskRecord::decode(job_id, &task_key, data)
                 .map_err(|err| Error::other(err.to_string()))?;
-            ("job_id", job_id.to_string())
+            (
+                "job_id",
+                job_id.to_string(),
+                DurableIlmRecordCheckpoint::ManualTransitionTask { content_sha256 },
+            )
         }
         DurableIlmRecordKind::ManualTransitionWorkerResult => {
             let (job_id, task_key) = parse_manual_sharded_record(path, namespace.prefix)?;
@@ -223,7 +484,11 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             }
             manual_transition_job::ManualTransitionWorkerResultRecord::decode(job_id, &task_key, data)
                 .map_err(|err| Error::other(err.to_string()))?;
-            ("job_id", job_id.to_string())
+            (
+                "job_id",
+                job_id.to_string(),
+                DurableIlmRecordCheckpoint::ManualTransitionWorkerResult { content_sha256 },
+            )
         }
     };
 
@@ -231,6 +496,7 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
         namespace: namespace.name,
         id_kind,
         id,
+        checkpoint,
     })
 }
 
