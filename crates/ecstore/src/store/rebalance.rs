@@ -385,7 +385,7 @@ impl ECStore {
     }
 
     pub(super) async fn is_suspended(&self, idx: usize) -> bool {
-        // TODO: LOCK
+        // TODO(backlog): acquire pool metadata lock for consistent suspension check
 
         let pool_meta = self.pool_meta.read().await;
 

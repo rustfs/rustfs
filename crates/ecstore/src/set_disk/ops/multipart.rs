@@ -1575,7 +1575,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let parts_metadata = vec![fi.clone(); disks.len()];
 
         if !user_defined.contains_key("content-type") {
-            // TODO: get content-type
+            // TODO(backlog): detect content-type from part data when header is missing
         }
 
         if let Some(sc) = user_defined.get(AMZ_STORAGE_CLASS)
@@ -1971,7 +1971,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 return Err(Error::InvalidPart(p.part_num, ext_part.etag.clone(), p.etag.clone().unwrap_or_default()));
             }
 
-            // TODO: crypto
+            // TODO(backlog): integrate encryption verification during complete multipart
 
             if (i < uploaded_parts.len() - 1)
                 && !(opts.data_movement && ext_part.actual_size < 0)
