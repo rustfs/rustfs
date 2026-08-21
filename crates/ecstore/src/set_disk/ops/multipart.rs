@@ -2254,7 +2254,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
                 }
                 Err(err) => {
-                    debug!(
+                    // Degraded path: without the stored state the inbound
+                    // metadata is applied unchanged — exactly the overwrite
+                    // LWW exists to prevent — so this must be operator-visible.
+                    warn!(
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
                         bucket,
@@ -2262,7 +2265,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         version_id = %version_id,
                         error = %err,
                         state = "replication_lww_read_unavailable",
-                        "SetDisk multipart replication LWW read skipped"
+                        "SetDisk multipart replication LWW read skipped; inbound metadata applied without comparison"
                     );
                 }
             }
