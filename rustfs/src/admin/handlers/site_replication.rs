@@ -137,6 +137,11 @@ const SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE: usize = 100;
 const SITE_REPL_RESYNC_MAX_PAGE_SIZE: usize = 1000;
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on waiting for the lifecycle lock (below). 3x the peer request
+/// timeout: outlives one full peer round of a healthy concurrent lifecycle
+/// operation, while converting a holder wedged on unreachable peers into a
+/// retryable 503 for the waiter instead of an unbounded hang.
+const SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT: usize = 32;
 const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
@@ -387,9 +392,17 @@ struct SiteReplicationLifecycleGuard {
 }
 
 impl SiteReplicationLifecycleGuard {
-    async fn acquire() -> Self {
-        Self {
-            _guard: SITE_REPLICATION_LIFECYCLE_LOCK.lock().await,
+    /// Bounded acquire: a holder wedged on unreachable peers (each probe
+    /// costs up to [`SITE_REPLICATION_PEER_REQUEST_TIMEOUT`]) must not hang
+    /// every other lifecycle operation indefinitely, so waiters get a
+    /// retryable 503 after [`SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT`].
+    async fn acquire() -> S3Result<Self> {
+        match tokio::time::timeout(SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT, SITE_REPLICATION_LIFECYCLE_LOCK.lock()).await {
+            Ok(guard) => Ok(Self { _guard: guard }),
+            Err(_) => Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "another site replication lifecycle operation is in progress; retry later".to_string(),
+            )),
         }
     }
 
@@ -2113,6 +2126,27 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
     })?;
 
     add_preflight_info_from_sr_info(site, info, idp_settings)
+}
+
+/// Preflight every site in an add request while the lifecycle lock is held.
+/// Probes run concurrently (matching the other peer fan-outs in this file):
+/// k unreachable sites cost roughly one peer request timeout, not k of them.
+/// Results (and the first error, if any) are reported in request order.
+async fn add_preflight_infos(
+    sites: &[PeerSite],
+    current_state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+) -> S3Result<Vec<SiteReplicationAddPreflightInfo>> {
+    futures::future::join_all(sites.iter().map(|site| async move {
+        if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
+            local_add_preflight_info(current_state, local_peer, site).await
+        } else {
+            remote_add_preflight_info(site).await
+        }
+    }))
+    .await
+    .into_iter()
+    .collect()
 }
 
 fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
@@ -9858,7 +9892,7 @@ impl Operation for SiteReplicationAddHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
-        let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         // Everything up to the commit below is preflight: peer probes, IAM
         // work and the join fan-out all talk to the network, so none of it may
         // run inside the state transaction. The snapshot read here is what the
@@ -9873,14 +9907,7 @@ impl Operation for SiteReplicationAddHandler {
         // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
         ensure_local_site_present(&mut sites, &local_peer);
         validate_add_sites(&sites, &local_peer)?;
-        let mut preflight_infos = Vec::with_capacity(sites.len());
-        for site in &sites {
-            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
-                preflight_infos.push(local_add_preflight_info(&current_state, &local_peer, site).await?);
-            } else {
-                preflight_infos.push(remote_add_preflight_info(site).await?);
-            }
-        }
+        let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
         validate_add_preflight_topology(&preflight_infos, &local_peer)?;
         let expected_updated_at = current_state.updated_at;
         require_add_peer_tls_capability(&sites, &local_peer).await?;
@@ -10088,7 +10115,7 @@ impl Operation for SiteReplicationRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         // The request body is read before the bucket-op guard and the state
         // transaction: a client that stalls mid-body must hold neither the
         // state-object lock nor the write half of the bucket-op RwLock (which
@@ -10286,7 +10313,7 @@ where
     F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
 {
-    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
     admit_peer_join_across_nodes(local_endpoint, join_req, defer_sync_state_enable, apply_iam).await
 }
 
@@ -11101,7 +11128,7 @@ impl Operation for SRPeerRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
         let removed_deployment_ids = update_site_replication_state(move |state| {
             if pending_endpoint_refresh(state).is_some() {
@@ -11145,7 +11172,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         let operation = query.get("operation").cloned().unwrap_or_default();
         let resolved_store = object_store_from_req(&req);
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let (peer, existing_status) = {
             let state = load_site_replication_state().await?;
             let local_peer = current_local_runtime_peer(&state);
@@ -11437,7 +11464,7 @@ impl Operation for SRRotateServiceAccountHandler {
         // mid-repair and race its own IAM write against the reconciler's
         // stale one. (The removed process mutex used to provide this
         // exclusion as a side effect.)
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let rotation_parent = cred.access_key.clone();
         let (pending_rotation, local_peer, previous_access_key) = update_site_replication_state_when_changed(move |state| {
@@ -13930,7 +13957,9 @@ mod tests {
     async fn test_add_bootstrap_scope_only_allows_expected_bucket_setup_until_guard_drops() {
         let token;
         {
-            let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let lifecycle = SiteReplicationLifecycleGuard::acquire()
+                .await
+                .expect("acquire lifecycle guard");
             let guard = SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::from(["legacy-bucket".to_string()]))
                 .expect("start site replication add guard");
             token = guard.token.to_string();
@@ -13986,14 +14015,18 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_add_lifecycle_allows_callback_before_remove_writer() {
-        let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+        let lifecycle = SiteReplicationLifecycleGuard::acquire()
+            .await
+            .expect("acquire lifecycle guard");
         let add_guard =
             SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
         let remove = tokio::spawn(async move {
             let _ = started_tx.send(());
-            let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let _lifecycle = SiteReplicationLifecycleGuard::acquire()
+                .await
+                .expect("acquire lifecycle guard");
             let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             let _ = entered_tx.send(());
         });
@@ -14011,6 +14044,111 @@ mod tests {
             .expect("remove should enter after add finishes")
             .expect("remove task should finish");
         entered_rx.await.expect("remove entered lifecycle");
+    }
+
+    /// Deleting either constant (or "simplifying" the client builders to
+    /// inline values) removes the only bound on how long a lifecycle
+    /// operation can be wedged per unreachable peer (#1889 C1 / #1952 C2).
+    #[test]
+    fn test_peer_timeout_constants_bound_unreachable_peer_probes() {
+        assert_eq!(SITE_REPLICATION_PEER_REQUEST_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(SITE_REPLICATION_PEER_CONNECT_TIMEOUT, Duration::from_secs(3));
+        assert!(
+            SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT >= SITE_REPLICATION_PEER_REQUEST_TIMEOUT,
+            "a waiter must not give up before the holder's single wedged peer probe can finish"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_lifecycle_guard_acquire_times_out_with_retryable_503() {
+        let holder = SiteReplicationLifecycleGuard::acquire().await.expect("first acquire");
+        let err =
+            match tokio::time::timeout(SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT * 2, SiteReplicationLifecycleGuard::acquire())
+                .await
+                .expect("bounded acquire must not hang while the lock is held")
+            {
+                Ok(_) => panic!("acquire while the lock is held should time out"),
+                Err(err) => err,
+            };
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(1), SiteReplicationLifecycleGuard::acquire())
+            .await
+            .expect("acquire after release must not wait")
+            .expect("acquire after release");
+    }
+
+    #[derive(Clone)]
+    struct PreflightFanoutTestState {
+        metainfo_barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    async fn preflight_fanout_test_handler(State(state): State<PreflightFanoutTestState>, uri: Uri) -> (StatusCode, String) {
+        if uri.path().ends_with("/site-replication/metainfo") {
+            state.metainfo_barrier.wait().await;
+        }
+        (StatusCode::OK, "{}".to_string())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_add_preflight_probes_sites_concurrently() {
+        temp_env::async_with_vars(
+            [(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))],
+            add_preflight_probes_sites_concurrently_inner(),
+        )
+        .await;
+    }
+
+    async fn add_preflight_probes_sites_concurrently_inner() {
+        const REMOTE_SITES: usize = 3;
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind preflight test server: {err}"),
+        };
+        let endpoint = format!("http://{}", listener.local_addr().expect("preflight test address"));
+        let state = PreflightFanoutTestState {
+            metainfo_barrier: Arc::new(tokio::sync::Barrier::new(REMOTE_SITES)),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(any(preflight_fanout_test_handler)).with_state(state))
+                .await
+                .expect("serve preflight test requests");
+        });
+
+        let sites: Vec<PeerSite> = (0..REMOTE_SITES)
+            .map(|index| PeerSite {
+                name: format!("site-{index}"),
+                endpoint: endpoint.clone(),
+                access_key: "test-access".to_string(),
+                secret_key: "test-secret".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let local_peer = PeerInfo {
+            deployment_id: "local".to_string(),
+            endpoint: "http://192.0.2.1:9000".to_string(),
+            ..Default::default()
+        };
+        let current_state = SiteReplicationState::default();
+
+        // Each site's metainfo request parks on a barrier that only releases
+        // once every site's request has arrived: serial probing never sends
+        // the second request and dies on the peer request timeout, so
+        // finishing well inside that timeout proves the probes overlap —
+        // which is what caps k unreachable sites at one timeout, not k.
+        let infos = tokio::time::timeout(
+            SITE_REPLICATION_PEER_REQUEST_TIMEOUT / 2,
+            add_preflight_infos(&sites, &current_state, &local_peer),
+        )
+        .await
+        .expect("preflight probes must fan out concurrently, not serially")
+        .expect("preflight infos");
+        assert_eq!(infos.len(), REMOTE_SITES);
+        server.abort();
     }
 
     #[test]
