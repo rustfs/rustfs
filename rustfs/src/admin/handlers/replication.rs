@@ -374,13 +374,21 @@ impl RemoteTargetRequest {
 /// Admin-response encoding of a remote target: the persisted bucket-targets
 /// format keeps `healthCheckDuration`/`totalDowntime` in seconds and the
 /// `latency` stats in milliseconds, but madmin decodes all of them as Go
-/// `time.Duration` (nanoseconds) — re-encode just those fields without
-/// touching the persistence wire format.
+/// `time.Duration` (nanoseconds) — and it looks the fields up under its own
+/// JSON tags (`bandwidth`, `storageclass`, `resetID`, `deploymentID`,
+/// `credentials.sessionToken`), not the persisted snake_case keys. Re-encode
+/// just those fields here without touching the persistence wire format.
 fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, serde_json::Error> {
     fn go_duration_nanos(duration: Duration) -> serde_json::Value {
         // Saturate instead of truncating: >u64::MAX nanoseconds (~584 years)
         // is unrepresentable for a Go time.Duration reader anyway.
         u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX).into()
+    }
+
+    fn rename_key(value: &mut serde_json::Value, from: &str, to: &str) {
+        if let Some(moved) = value.as_object_mut().and_then(|object| object.remove(from)) {
+            value[to] = moved;
+        }
     }
 
     let mut value = serde_json::to_value(target)?;
@@ -391,6 +399,11 @@ fn remote_target_admin_json(target: &BucketTarget) -> Result<serde_json::Value, 
         "avg": go_duration_nanos(target.latency.avg),
         "max": go_duration_nanos(target.latency.max),
     });
+    rename_key(&mut value, "bandwidth_limit", "bandwidth");
+    rename_key(&mut value, "storage_class", "storageclass");
+    rename_key(&mut value, "reset_id", "resetID");
+    rename_key(&mut value, "deployment_id", "deploymentID");
+    rename_key(&mut value["credentials"], "session_token", "sessionToken");
     Ok(value)
 }
 
@@ -1473,7 +1486,7 @@ mod tests {
         parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff, unique_replication_peers,
         validate_remote_target_tls_settings,
     };
-    use crate::admin::storage_api::bucket::target::{BucketTarget, LatencyStat};
+    use crate::admin::storage_api::bucket::target::{BucketTarget, Credentials as TargetCredentials, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
     use http::Uri;
 
@@ -2266,6 +2279,44 @@ mod tests {
         assert_eq!(persisted["latency"]["curr"], 12);
         assert_eq!(persisted["latency"]["avg"], 34);
         assert_eq!(persisted["latency"]["max"], 250);
+    }
+
+    #[test]
+    fn list_remote_targets_response_uses_madmin_key_names() {
+        // madmin's BucketTarget JSON tags are `bandwidth`, `storageclass`,
+        // `resetID`, `deploymentID`, and `credentials.sessionToken`
+        // (backlog#1946); the persisted snake_case keys decode to zero values
+        // in mc, blanking the bandwidth and reset-id columns of
+        // `mc replicate ls`.
+        let target = BucketTarget {
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target".to_string(),
+            credentials: Some(TargetCredentials {
+                access_key: "access".to_string(),
+                secret_key: String::new(),
+                session_token: Some("session-token".to_string()),
+                expiration: None,
+            }),
+            bandwidth_limit: 107_374_182_400,
+            storage_class: "STANDARD".to_string(),
+            reset_id: "reset-123".to_string(),
+            deployment_id: "deploy-456".to_string(),
+            ..Default::default()
+        };
+
+        let value = super::remote_target_admin_json(&target).expect("admin response should serialize");
+
+        assert_eq!(value["bandwidth"], 107_374_182_400i64);
+        assert_eq!(value["storageclass"], "STANDARD");
+        assert_eq!(value["resetID"], "reset-123");
+        assert_eq!(value["deploymentID"], "deploy-456");
+        assert_eq!(value["credentials"]["sessionToken"], "session-token");
+        // The madmin keys replace the snake_case ones rather than duplicating
+        // them next to each other.
+        for stale in ["bandwidth_limit", "storage_class", "reset_id", "deployment_id"] {
+            assert!(value.get(stale).is_none(), "admin response must not carry `{stale}`");
+        }
+        assert!(value["credentials"].get("session_token").is_none());
     }
 
     #[test]

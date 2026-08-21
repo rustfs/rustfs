@@ -32,6 +32,10 @@ pub struct Credentials {
     pub access_key: String,
     #[serde(rename = "secretKey")]
     pub secret_key: String,
+    // The aliases accept madmin's JSON tags (MinIO-written bucket-targets
+    // metadata and mc request bodies) without changing the snake_case
+    // persisted/peer wire format this struct serializes to.
+    #[serde(alias = "sessionToken")]
     pub session_token: Option<String>,
     pub expiration: Option<Timestamp>,
 }
@@ -207,7 +211,7 @@ pub struct BucketTarget {
 
     #[serde(rename = "replicationSync", default)]
     pub replication_sync: bool,
-    #[serde(default)]
+    #[serde(alias = "storageclass", default)]
     pub storage_class: String,
     #[serde(rename = "skipTlsVerify", default)]
     pub skip_tls_verify: bool,
@@ -220,7 +224,7 @@ pub struct BucketTarget {
 
     #[serde(rename = "resetBeforeDate", with = "time::serde::rfc3339::option", default)]
     pub reset_before_date: Option<OffsetDateTime>,
-    #[serde(default)]
+    #[serde(alias = "resetID", default)]
     pub reset_id: String,
     #[serde(rename = "totalDowntime", with = "duration_seconds", default)]
     pub total_downtime: Duration,
@@ -233,7 +237,7 @@ pub struct BucketTarget {
     #[serde(default)]
     pub latency: LatencyStat,
 
-    #[serde(default)]
+    #[serde(alias = "deploymentID", default)]
     pub deployment_id: String,
 
     #[serde(default)]
@@ -529,6 +533,84 @@ mod tests {
         let value = serde_json::to_value(&target).expect("target should serialize");
         assert_eq!(value["healthCheckDuration"], 60);
         assert_eq!(value["totalDowntime"], 90);
+    }
+
+    #[test]
+    fn bucket_target_persisted_wire_keys_stay_snake_case() {
+        // bucket-targets.json (persisted via `serde_json::to_vec(&BucketTargets)`
+        // in the admin set/remove handlers) and the msgpack struct-map form
+        // (`BucketTargets::marshal_msg`) both come straight from this struct's
+        // serde field names. madmin naming is applied only in the admin
+        // response layer (`remote_target_admin_json`); renaming here would
+        // silently break every existing deployment's persisted metadata.
+        let targets = BucketTargets {
+            targets: vec![BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "ak".to_string(),
+                    secret_key: "sk".to_string(),
+                    session_token: Some("token".to_string()),
+                    expiration: None,
+                }),
+                bandwidth_limit: 5,
+                storage_class: "STANDARD".to_string(),
+                reset_id: "reset-1".to_string(),
+                deployment_id: "deploy-1".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let json = serde_json::to_value(&targets).expect("targets should serialize to JSON");
+        let msgpack: serde_json::Value =
+            rmp_serde::from_slice(&targets.marshal_msg().expect("targets should marshal to msgpack"))
+                .expect("msgpack struct map should decode into a JSON value");
+
+        for (wire, entry) in [("JSON", &json["targets"][0]), ("msgpack", &msgpack["targets"][0])] {
+            assert_eq!(entry["bandwidth_limit"], 5, "{wire} key `bandwidth_limit` must stay");
+            assert_eq!(entry["storage_class"], "STANDARD", "{wire} key `storage_class` must stay");
+            assert_eq!(entry["reset_id"], "reset-1", "{wire} key `reset_id` must stay");
+            assert_eq!(entry["deployment_id"], "deploy-1", "{wire} key `deployment_id` must stay");
+            assert_eq!(entry["credentials"]["session_token"], "token", "{wire} key `session_token` must stay");
+        }
+    }
+
+    #[test]
+    fn minio_written_bucket_targets_json_populates_madmin_named_fields() {
+        // A MinIO-written bucket-targets.json carries madmin's JSON tags
+        // (`bandwidth`, `storageclass`, `resetID`, `deploymentID`,
+        // `credentials.sessionToken`). On migration these must land in the
+        // matching fields instead of silently defaulting (backlog#1946).
+        let targets: BucketTargets = serde_json::from_value(serde_json::json!({
+            "targets": [{
+                "sourcebucket": "src",
+                "endpoint": "minio.example:9000",
+                "credentials": {
+                    "accessKey": "ak",
+                    "secretKey": "sk",
+                    "sessionToken": "minio-session-token"
+                },
+                "targetbucket": "dst",
+                "type": "replication",
+                "replicationSync": true,
+                "bandwidth": 107374182400i64,
+                "storageclass": "STANDARD",
+                "resetID": "reset-789",
+                "deploymentID": "deploy-123"
+            }]
+        }))
+        .expect("MinIO-written bucket-targets.json must deserialize");
+
+        let target = &targets.targets[0];
+        assert_eq!(target.bandwidth_limit, 107374182400);
+        assert_eq!(target.storage_class, "STANDARD");
+        assert_eq!(target.reset_id, "reset-789");
+        assert_eq!(target.deployment_id, "deploy-123");
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("minio-session-token")
+        );
     }
 
     #[test]
