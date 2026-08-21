@@ -1210,48 +1210,51 @@ async fn run_data_scanner_cycle(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
-    if let DataUsagePersistOutcome::Deferred(reason) = usage_persist_outcome {
-        info!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_CYCLE_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            cycle = cycle_info.current,
-            reason = reason.as_str(),
-            state = "deferred",
-            "Scanner cycle deferred before data usage publication"
-        );
-        emit_scan_cycle_deferred(cycle_start.elapsed());
-        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
-        return ScannerCycleOutcome::Deferred(reason);
-    }
-    if let Some(required_cycle) = scan_cycle_result.required_cycle_floor() {
-        warn!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_CYCLE_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            cycle = cycle_info.current,
-            required_cycle,
-            state = "cache_cycle_ahead",
-            "Scanner cycle is recovering to a newer durable cache generation"
-        );
-        emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-        return if persist_required_scanner_cycle_floor(
-            ctx,
-            storeapi.clone(),
-            cycle_info,
-            cycle_revision,
-            leader_epoch,
-            required_cycle,
-            &mut cycle_metrics_guard,
-        )
-        .await
-        {
-            ScannerCycleOutcome::Partial
-        } else {
-            ScannerCycleOutcome::Failed
-        };
+    match scanner_cycle_pre_commit_outcome(scan_cycle_result.required_cycle_floor(), &usage_persist_outcome) {
+        Some(ScannerCyclePreCommitOutcome::RecoverCacheCycle(required_cycle)) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                required_cycle,
+                state = "cache_cycle_ahead",
+                "Scanner cycle is recovering to a newer durable cache generation"
+            );
+            emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+            return if persist_required_scanner_cycle_floor(
+                ctx,
+                storeapi.clone(),
+                cycle_info,
+                cycle_revision,
+                leader_epoch,
+                required_cycle,
+                &mut cycle_metrics_guard,
+            )
+            .await
+            {
+                ScannerCycleOutcome::Partial
+            } else {
+                ScannerCycleOutcome::Failed
+            };
+        }
+        Some(ScannerCyclePreCommitOutcome::Deferred(reason)) => {
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                reason = reason.as_str(),
+                state = "deferred",
+                "Scanner cycle deferred before data usage publication"
+            );
+            emit_scan_cycle_deferred(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(reason);
+        }
+        None => {}
     }
     if usage_persist_outcome == DataUsagePersistOutcome::Failed {
         error!(
@@ -2062,6 +2065,25 @@ async fn final_data_usage_publication_defer_reason(
         // decision permissive so existing partial-cycle handling remains
         // unchanged if a future scanner path emits a bookkeeping update.
         ScannerCycleStatus::Incomplete => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCyclePreCommitOutcome {
+    RecoverCacheCycle(u64),
+    Deferred(ScannerCycleDeferReason),
+}
+
+fn scanner_cycle_pre_commit_outcome(
+    required_cycle_floor: Option<u64>,
+    usage_persist_outcome: &DataUsagePersistOutcome,
+) -> Option<ScannerCyclePreCommitOutcome> {
+    // Keep the publication barrier fail-closed: `.bloomcycle.bin` uses the
+    // same routed writer and its floor must remain pending while data movement
+    // hides the source pool.
+    match usage_persist_outcome {
+        DataUsagePersistOutcome::Deferred(reason) => Some(ScannerCyclePreCommitOutcome::Deferred(*reason)),
+        _ => required_cycle_floor.map(ScannerCyclePreCommitOutcome::RecoverCacheCycle),
     }
 }
 

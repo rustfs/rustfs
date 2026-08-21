@@ -2599,6 +2599,33 @@ fn test_scanner_cycle_completion_prioritizes_persist_failure() {
 }
 
 #[test]
+fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
+    for reason in [
+        ScannerCycleDeferReason::DataMovement,
+        ScannerCycleDeferReason::ActivityBaselineUnavailable,
+    ] {
+        let deferred = DataUsagePersistOutcome::Deferred(reason);
+        assert_eq!(
+            scanner_cycle_pre_commit_outcome(Some(19), &deferred),
+            Some(ScannerCyclePreCommitOutcome::Deferred(reason)),
+            "a blocked publication must not persist the routed scanner cycle floor"
+        );
+        assert_eq!(
+            scanner_cycle_pre_commit_outcome(None, &deferred),
+            Some(ScannerCyclePreCommitOutcome::Deferred(reason))
+        );
+    }
+    assert_eq!(
+        scanner_cycle_pre_commit_outcome(Some(19), &DataUsagePersistOutcome::Saved),
+        Some(ScannerCyclePreCommitOutcome::RecoverCacheCycle(19))
+    );
+    assert_eq!(
+        scanner_cycle_pre_commit_outcome(Some(19), &DataUsagePersistOutcome::Failed),
+        Some(ScannerCyclePreCommitOutcome::RecoverCacheCycle(19))
+    );
+}
+
+#[test]
 #[serial]
 fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
