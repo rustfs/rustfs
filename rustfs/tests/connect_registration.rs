@@ -542,7 +542,13 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     let (identity_store, credential_store) = stores(&temp);
     let current = identity_store.load_or_create().expect("create identity");
     let pki = TestPki::new();
-    let issued = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 5);
+    let mut issued = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 5);
+    issued["certificateChain"] = json!(
+        issued["certificateChain"]
+            .as_str()
+            .expect("certificate chain")
+            .trim_end_matches('\n')
+    );
     let registration = server(&pki, vec![Reply::Json(StatusCode::CREATED, issued)]).await;
     let registered = client(&registration, &pki, Duration::from_secs(2))
         .register(&identity_store, &credential_store, &token())

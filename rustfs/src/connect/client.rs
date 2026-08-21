@@ -29,7 +29,7 @@ use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
 use super::registration::{
     CredentialResponse, CredentialValidationError, ExpectedDevice, RegistrationRequest, RegistrationToken, RotationRequest,
-    certificate_fingerprint, certificate_request_matches, private_key_pem, public_key_fingerprint, validate_credential,
+    certificate_fingerprint, certificate_request_matches, public_key_fingerprint, validate_credential,
     validate_stored_credential,
 };
 
@@ -268,9 +268,10 @@ impl ConnectClient {
             &pending.request_id,
             &pending.certificate_request,
         )?;
-        let private_key = private_key_pem(&identity)?;
-        let mut identity_pem = Zeroizing::new(Vec::with_capacity(credential.certificate_chain.len() + private_key.len()));
+        let private_key = identity.to_pkcs8_pem()?;
+        let mut identity_pem = Zeroizing::new(Vec::with_capacity(credential.certificate_chain.len() + private_key.len() + 1));
         identity_pem.extend_from_slice(credential.certificate_chain.as_bytes());
+        identity_pem.push(b'\n');
         identity_pem.extend_from_slice(private_key.as_bytes());
         let tls_identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| ClientError::IdentityCertificate)?;
         let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity))?;

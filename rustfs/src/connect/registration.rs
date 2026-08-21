@@ -525,9 +525,3 @@ fn hex_lower(bytes: &[u8]) -> String {
         output
     })
 }
-
-pub(crate) fn private_key_pem(identity: &DeviceIdentity) -> Result<Zeroizing<String>, CredentialValidationError> {
-    identity
-        .to_pkcs8_pem()
-        .map_err(|_| CredentialValidationError::CertificateRequest)
-}
