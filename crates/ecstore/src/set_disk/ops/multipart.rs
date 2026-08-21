@@ -2223,6 +2223,51 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             fi.set_data_moved();
         }
 
+        // Receiver-side LWW (rustfs/backlog#1953): the multipart replication
+        // transport carries the category values at CreateMultipartUpload (in
+        // the staged upload metadata) and the source category timestamps on
+        // the complete request. Read the destination version under the held
+        // object write lock and keep any category this site modified more
+        // recently. Read failures (version absent on first replication, quorum
+        // errors) keep today's overwrite semantics: failing the complete would
+        // loop through MRF, re-delivering the stale value forever.
+        if crate::set_disk::ops::object::replication_lww_applicable(opts)
+            && let Some(version_id) = fi.version_id
+        {
+            match self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: opts.versioned,
+                        version_suspended: opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(existing) => {
+                    let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
+                    crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
+                }
+                Err(err) => {
+                    debug!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        version_id = %version_id,
+                        error = %err,
+                        state = "replication_lww_read_unavailable",
+                        "SetDisk multipart replication LWW read skipped"
+                    );
+                }
+            }
+        }
+
         for meta in parts_metadatas.iter_mut() {
             if meta.has_valid_erasure_geometry() {
                 meta.size = fi.size;
@@ -6958,6 +7003,97 @@ mod tests {
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, parts, &ObjectOptions::default())
                 .await
+        }
+
+        /// Receiver-side LWW on the multipart replication transport
+        /// (rustfs/backlog#1953): a metadata-only replication of a multipart
+        /// source object rides CreateMultipartUpload (category values in the
+        /// upload metadata) + CompleteMultipartUpload (category timestamps in
+        /// the complete options). A stale inbound tagging timestamp must not
+        /// overwrite a newer locally-tagged destination version.
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_stale_replication_tags_keep_local() {
+            use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+            use rustfs_utils::http::{SUFFIX_TAGGING_TIMESTAMP, get_str};
+            use time::format_description::well_known::Rfc3339;
+
+            const T_OLD: &str = "2026-01-01T00:00:00Z";
+            const T_LOCAL: &str = "2026-02-01T00:00:00Z";
+
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-replication-lww-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            // Local destination version with newer tags.
+            let version_id = Uuid::new_v4();
+            let mut local_metadata = HashMap::new();
+            local_metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string());
+            rustfs_utils::http::insert_str(&mut local_metadata, SUFFIX_TAGGING_TIMESTAMP, T_LOCAL.to_string());
+            let mut local_reader = PutObjReader::from_vec(b"local body".to_vec());
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut local_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        user_defined: local_metadata,
+                        // Explicit-version PUTs require the bucket Object Lock snapshot.
+                        object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("local versioned put should commit");
+
+            // Inbound replication upload carrying older tags for the same version.
+            let mut inbound_metadata = HashMap::new();
+            inbound_metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "site=remote".to_string());
+            rustfs_utils::http::insert_str(&mut inbound_metadata, SUFFIX_TAGGING_TIMESTAMP, T_OLD.to_string());
+            let create_opts = ObjectOptions {
+                versioned: true,
+                user_defined: inbound_metadata,
+                ..Default::default()
+            };
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &payload(0x5a), &create_opts).await;
+            rewrite_staged_upload_version_id(&set_disks, bucket, object, &upload_id, Some(version_id)).await;
+
+            let complete_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                replication_tagging_timestamp: Some(OffsetDateTime::parse(T_OLD, &Rfc3339).expect("test timestamp should parse")),
+                ..Default::default()
+            };
+            set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("replication multipart completion should succeed even when a category keeps local values");
+
+            let info = set_disks
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("completed version should be readable");
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=local",
+                "older inbound multipart tags must not overwrite newer local tags"
+            );
+            assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_LOCAL));
         }
 
         #[tokio::test]
