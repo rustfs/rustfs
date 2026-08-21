@@ -357,14 +357,15 @@ static DST_DIR_FSYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 static FILE_FDATASYNC_GROUP_COMMIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(ENV_FILE_FDATASYNC_GROUP_COMMIT_ENABLE, DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_ENABLE)
 });
+fn file_fdatasync_group_commit_wait_duration(wait_micros: u64) -> Duration {
+    Duration::from_micros(wait_micros.min(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS))
+}
+
 static FILE_FDATASYNC_GROUP_COMMIT_WAIT: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_micros(
-        rustfs_utils::get_env_u64(
-            ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
-            DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
-        )
-        .min(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS),
-    )
+    file_fdatasync_group_commit_wait_duration(rustfs_utils::get_env_u64(
+        ENV_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
+        DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS,
+    ))
 });
 
 #[cfg(test)]
@@ -412,10 +413,9 @@ fn dst_dir_fsync_group_commit_enabled() -> bool {
 #[cfg(test)]
 mod file_fdatasync_group_commit_override {
     use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
-    use std::time::Duration;
 
     static OVERRIDE: RwLock<Option<bool>> = RwLock::new(None);
-    static WAIT_OVERRIDE: RwLock<Option<Duration>> = RwLock::new(None);
+    static WAIT_OVERRIDE_MICROS: RwLock<Option<u64>> = RwLock::new(None);
     static SERIAL: Mutex<()> = Mutex::new(());
 
     pub(crate) fn get() -> Option<bool> {
@@ -429,7 +429,7 @@ mod file_fdatasync_group_commit_override {
     impl Drop for OverrideGuard {
         fn drop(&mut self) {
             *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
-            *WAIT_OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
+            *WAIT_OVERRIDE_MICROS.write().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
@@ -439,12 +439,12 @@ mod file_fdatasync_group_commit_override {
         OverrideGuard { _serial: serial }
     }
 
-    pub(crate) fn set_wait(wait: Duration) {
-        *WAIT_OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = Some(wait);
+    pub(crate) fn set_wait_micros(wait_micros: u64) {
+        *WAIT_OVERRIDE_MICROS.write().unwrap_or_else(PoisonError::into_inner) = Some(wait_micros);
     }
 
-    pub(crate) fn wait() -> Option<Duration> {
-        *WAIT_OVERRIDE.read().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn wait_micros() -> Option<u64> {
+        *WAIT_OVERRIDE_MICROS.read().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -454,8 +454,8 @@ pub(crate) fn set_file_fdatasync_group_commit_for_test(enabled: bool) -> file_fd
 }
 
 #[cfg(test)]
-fn set_file_fdatasync_group_commit_wait_for_test(wait: Duration) {
-    file_fdatasync_group_commit_override::set_wait(wait);
+fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
+    file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
 }
 
 fn file_fdatasync_group_commit_enabled() -> bool {
@@ -469,8 +469,8 @@ fn file_fdatasync_group_commit_enabled() -> bool {
 
 fn file_fdatasync_group_commit_wait() -> Duration {
     #[cfg(test)]
-    if let Some(wait) = file_fdatasync_group_commit_override::wait() {
-        return wait;
+    if let Some(wait_micros) = file_fdatasync_group_commit_override::wait_micros() {
+        return file_fdatasync_group_commit_wait_duration(wait_micros);
     }
 
     *FILE_FDATASYNC_GROUP_COMMIT_WAIT
@@ -6116,7 +6116,7 @@ mod tests {
         use std::sync::mpsc;
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
-        set_file_fdatasync_group_commit_wait_for_test(Duration::ZERO);
+        set_file_fdatasync_group_commit_wait_for_test(0);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
@@ -6183,13 +6183,33 @@ mod tests {
         assert_eq!(file_fdatasync_group_commit_counts_for_test(), (0, 0, 0));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
+    fn file_fdatasync_group_commit_wait_duration_uses_default_and_cap() {
+        assert_eq!(DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS, 0);
+        assert_eq!(
+            file_fdatasync_group_commit_wait_duration(DEFAULT_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS),
+            Duration::ZERO
+        );
+        assert_eq!(file_fdatasync_group_commit_wait_duration(250), Duration::from_micros(250));
+        assert_eq!(
+            file_fdatasync_group_commit_wait_duration(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS),
+            Duration::from_micros(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS)
+        );
+        assert_eq!(
+            file_fdatasync_group_commit_wait_duration(u64::MAX),
+            Duration::from_micros(MAX_FILE_FDATASYNC_GROUP_COMMIT_WAIT_MICROS)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     #[serial_test::serial(file_sync_probe)]
     async fn file_fdatasync_group_commit_wait_budget_batches_late_follower() {
         use std::sync::mpsc;
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
-        set_file_fdatasync_group_commit_wait_for_test(Duration::from_millis(50));
+        let wait_budget_micros = 1_000;
+        let wait_budget = file_fdatasync_group_commit_wait_duration(wait_budget_micros);
+        set_file_fdatasync_group_commit_wait_for_test(wait_budget_micros);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
@@ -6226,6 +6246,8 @@ mod tests {
         })
         .await
         .expect("second waiter should enqueue during the configured wait budget");
+        tokio::time::advance(wait_budget).await;
+        tokio::task::yield_now().await;
         file_sync_probe::wait_for_active(1).await;
 
         assert_eq!(
@@ -6259,7 +6281,7 @@ mod tests {
         use std::sync::mpsc;
 
         let _group_commit = set_file_fdatasync_group_commit_for_test(true);
-        set_file_fdatasync_group_commit_wait_for_test(Duration::ZERO);
+        set_file_fdatasync_group_commit_wait_for_test(0);
         clear_file_fdatasync_group_commit_for_test();
         let temp_dir = tempdir().expect("create temp dir");
         let first_dir = temp_dir.path().join("first");
