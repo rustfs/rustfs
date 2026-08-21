@@ -24,6 +24,7 @@ use crate::{
     ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
+use rustfs_ecstore::api::capacity::PoolDecommissionInfo;
 use rustfs_filemeta::FileInfo;
 use serial_test::serial;
 use temp_env::with_var;
@@ -180,6 +181,39 @@ async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
 
     assert_eq!(result.status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement));
     assert!(receiver.recv().await.is_none(), "rebalance-deferred cycle must not publish usage");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    for decommission in [
+        PoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        },
+        PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        },
+    ] {
+        store.pool_meta.write().await.pools[0].decommission = Some(decommission);
+        assert!(store.scanner_data_usage_publication_blocked().await);
+
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            ScannerIOCycle::nsscanner_with_status(store.as_ref(), ctx, budget, updates, 1, 1, HealScanMode::Normal),
+        )
+        .await
+        .expect("terminal-decommission-deferred scanner cycle should finish")
+        .expect("terminal-decommission-deferred scanner cycle should succeed");
+
+        assert_eq!(result.status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement));
+        assert!(receiver.recv().await.is_none(), "blocked cycle must not publish usage");
+    }
 }
 
 #[tokio::test]

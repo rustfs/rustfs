@@ -1534,6 +1534,7 @@ async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_usage_route_barrier_precedes_durable_reconciliation() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -1558,6 +1559,44 @@ async fn test_usage_route_barrier_precedes_durable_reconciliation() {
 
     assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
     assert_eq!(store.put_counts.lock().await.get(&key), None);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_deferred_usage_save_keeps_last_real_save_metric() {
+    let metrics = global_metrics();
+    metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+    let before = metrics.report().await.usage_freshness;
+
+    let store = Arc::new(MemoryConfigStore::default());
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            1,
+        ))
+        .await
+        .expect("usage snapshot should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store,
+        receiver,
+        None,
+        Some(DataUsagePersistBaseline {
+            data: None,
+            revision: DataUsageCacheRevision::Missing,
+        }),
+        || async { true },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    let after = metrics.report().await.usage_freshness;
+    assert_eq!(after.last_usage_save_result, before.last_usage_save_result);
+    assert_eq!(after.last_usage_save_result_code, before.last_usage_save_result_code);
+    assert_eq!(after.last_usage_save_unix_secs, before.last_usage_save_unix_secs);
 }
 
 #[tokio::test]

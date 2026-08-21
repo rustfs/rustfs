@@ -450,7 +450,9 @@ where
                 continue;
             }
             DataUsagePersistOutcome::Deferred(reason) => {
-                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+                // A deferred publication is an intentional retryable state, not a
+                // failed save. Keep the last real save result so admin freshness
+                // reporting does not turn a pool-recovery fence into a false error.
                 outcome = DataUsagePersistOutcome::Deferred(reason);
                 break 'updates;
             }
