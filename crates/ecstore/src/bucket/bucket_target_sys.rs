@@ -90,6 +90,12 @@ use uuid::Uuid;
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
+pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
+pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
+pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
+pub type PutObjectTaggingSdkError = Box<SdkError<PutObjectTaggingError>>;
+pub type DeleteObjectTaggingSdkError = Box<SdkError<DeleteObjectTaggingError>>;
+
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
 
 fn replication_target_versioning_enabled(versioning: Option<&BucketVersioningStatus>) -> bool {
@@ -1968,7 +1974,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>> {
+    ) -> Result<HeadObjectOutput, HeadObjectSdkError> {
         // Announce the replication check so a RustFS target returns SSE-C
         // object metadata (etag/size) without the customer key the replication
         // worker cannot hold; otherwise SSE-C replicas never converge on HEAD.
@@ -2019,7 +2025,7 @@ impl TargetClient {
         range: Option<String>,
         part_number: Option<i32>,
         extra_headers: HeaderMap,
-    ) -> Result<HeadObjectOutput, Box<SdkError<HeadObjectError>>> {
+    ) -> Result<HeadObjectOutput, HeadObjectSdkError> {
         let headers = proxy_outbound_headers(extra_headers);
         self.client
             .head_object()
@@ -2048,7 +2054,7 @@ impl TargetClient {
         range: Option<String>,
         part_number: Option<i32>,
         extra_headers: HeaderMap,
-    ) -> Result<GetObjectOutput, Box<SdkError<GetObjectError>>> {
+    ) -> Result<GetObjectOutput, GetObjectSdkError> {
         let headers = proxy_outbound_headers(extra_headers);
         self.client
             .get_object()
@@ -2071,7 +2077,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<GetObjectTaggingOutput, Box<SdkError<GetObjectTaggingError>>> {
+    ) -> Result<GetObjectTaggingOutput, GetObjectTaggingSdkError> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .get_object_tagging()
@@ -2093,7 +2099,7 @@ impl TargetClient {
         object: &str,
         version_id: Option<String>,
         tagging: SdkTagging,
-    ) -> Result<PutObjectTaggingOutput, Box<SdkError<PutObjectTaggingError>>> {
+    ) -> Result<PutObjectTaggingOutput, PutObjectTaggingSdkError> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .put_object_tagging()
@@ -2115,7 +2121,7 @@ impl TargetClient {
         bucket: &str,
         object: &str,
         version_id: Option<String>,
-    ) -> Result<DeleteObjectTaggingOutput, Box<SdkError<DeleteObjectTaggingError>>> {
+    ) -> Result<DeleteObjectTaggingOutput, DeleteObjectTaggingSdkError> {
         let headers = proxy_outbound_headers(HeaderMap::new());
         self.client
             .delete_object_tagging()

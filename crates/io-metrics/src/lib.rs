@@ -121,6 +121,16 @@ pub const PUT_STAGE_SET_DISK_RENAME_BACKUP_DIR_FSYNC: &str = "set_disk_rename_ba
 pub const PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC: &str = "set_disk_rename_ancestor_dir_fsync";
 pub const PUT_STAGE_SET_DISK_RENAME_RENAME_SYSCALL: &str = "set_disk_rename_rename_syscall";
 
+pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED: &str = "disabled";
+pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS: &str = "le_250ms";
+pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS: &str = "le_500ms";
+pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_1000MS: &str = "le_1000ms";
+pub const PUT_COMMIT_LOCK_ADMISSION_BUDGET_GT_1000MS: &str = "gt_1000ms";
+
+pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED: &str = "acquired";
+pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN: &str = "timeout_slowdown";
+pub const PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR: &str = "lock_error";
+
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL: &str = "serial";
 pub const PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL: &str = "parallel";
 pub const PUT_RENAME_FDATASYNC_GROUP_WAIT_ROLE_LEADER: &str = "leader";
@@ -2061,6 +2071,14 @@ pub fn record_put_object_stage_duration_from(stage: &'static str, started_at: Op
 }
 
 #[inline(always)]
+pub fn record_put_object_commit_lock_admission(budget: &'static str, outcome: &'static str) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_s3_put_object_commit_namespace_lock_admission_total", "budget" => budget, "outcome" => outcome).increment(1);
+}
+
+#[inline(always)]
 fn put_stage_count_value(value: usize) -> f64 {
     match u32::try_from(value) {
         Ok(value) => f64::from(value),
@@ -3202,6 +3220,83 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(recorded.len(), stages.len());
         assert!(stages.iter().all(|stage| recorded.contains(*stage)));
+    }
+
+    #[test]
+    fn put_commit_lock_admission_labels_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let budgets = [
+            PUT_COMMIT_LOCK_ADMISSION_BUDGET_DISABLED,
+            PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+            PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS,
+            PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_1000MS,
+            PUT_COMMIT_LOCK_ADMISSION_BUDGET_GT_1000MS,
+        ];
+        let outcomes = [
+            PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED,
+            PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN,
+            PUT_COMMIT_LOCK_ADMISSION_OUTCOME_LOCK_ERROR,
+        ];
+        assert_eq!(budgets.iter().copied().collect::<HashSet<_>>().len(), budgets.len());
+        assert_eq!(outcomes.iter().copied().collect::<HashSet<_>>().len(), outcomes.len());
+        assert!(budgets.iter().chain(outcomes.iter()).all(|label| {
+            !label.contains('/')
+                && !label.contains('{')
+                && !label.contains('}')
+                && !label.contains(' ')
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        }));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_put_object_commit_lock_admission(
+                PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN,
+            );
+
+            set_put_stage_metrics_enabled(true);
+            record_put_object_commit_lock_admission(
+                PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS,
+                PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN,
+            );
+            record_put_object_commit_lock_admission(
+                PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS,
+                PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED,
+            );
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_total(&rows, "rustfs_s3_put_object_commit_namespace_lock_admission_total"),
+            Some(2)
+        );
+        let label_sets = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Counter
+                    && composite.key().name() == "rustfs_s3_put_object_commit_namespace_lock_admission_total"
+            })
+            .map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect::<HashSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(label_sets.contains(&HashSet::from([
+            ("budget".to_string(), PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_250MS.to_string()),
+            ("outcome".to_string(), PUT_COMMIT_LOCK_ADMISSION_OUTCOME_TIMEOUT_SLOWDOWN.to_string(),),
+        ])));
+        assert!(label_sets.contains(&HashSet::from([
+            ("budget".to_string(), PUT_COMMIT_LOCK_ADMISSION_BUDGET_LE_500MS.to_string()),
+            ("outcome".to_string(), PUT_COMMIT_LOCK_ADMISSION_OUTCOME_ACQUIRED.to_string()),
+        ])));
     }
 
     #[test]
