@@ -55,6 +55,7 @@ use crate::storage::storage_api::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -10219,13 +10220,25 @@ impl Operation for SiteReplicationStatusHandler {
     }
 }
 
+/// `POST /v3/site-replication/devnull` — peer link-check upload drain.
+/// MinIO streams multi-megabyte probe bodies here during site netperf link
+/// checks and expects an unbounded discard (its handler copies to io.Discard);
+/// buffering through the 1MB admin body cap turned any larger probe into a
+/// 400 and a false link failure. Stream and discard instead — no size cap.
+async fn drain_site_replication_devnull(mut input: Body) -> S3Result<()> {
+    while let Some(chunk) = input.next().await {
+        chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+    }
+    Ok(())
+}
+
 pub struct SiteReplicationDevNullHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let _ = read_plain_admin_body(req.input).await?;
+        drain_site_replication_devnull(req.input).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
@@ -13964,6 +13977,17 @@ mod tests {
         let err = purge_deleted_bucket_result(Err(StorageError::StorageFull))
             .expect_err("non-not-found delete failures must propagate");
         assert_ne!(*err.code(), S3ErrorCode::NoSuchBucket);
+    }
+
+    /// C5 red-light: the site-replication devnull drain must accept bodies
+    /// beyond the 1MB admin body cap — MinIO's link check streams large
+    /// probe bodies and treats a 400 as a broken link.
+    #[tokio::test]
+    async fn test_site_replication_devnull_drains_body_beyond_admin_cap() {
+        let body = Body::from(vec![0u8; MAX_ADMIN_REQUEST_BODY_SIZE + 1]);
+        drain_site_replication_devnull(body)
+            .await
+            .expect("devnull must drain bodies larger than the admin body cap");
     }
 
     /// A3 red-light: `versioningEnabled` must travel on every outbound
