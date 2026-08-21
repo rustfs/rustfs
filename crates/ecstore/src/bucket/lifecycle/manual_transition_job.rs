@@ -199,6 +199,8 @@ pub struct ManualTransitionJobRecord {
     pub updated_at_unix_nanos: i128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_revision: Option<u64>,
     pub report: ManualTransitionRunReport,
     pub queue_snapshot: ManualTransitionQueueSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +230,7 @@ impl ManualTransitionJobRecord {
             created_at_unix_nanos: now,
             updated_at_unix_nanos: now,
             completed_at_unix_nanos: None,
+            cursor_revision: Some(0),
             report: ManualTransitionRunReport {
                 bucket: bucket.to_string(),
                 prefix: options.prefix.clone(),
@@ -242,7 +245,7 @@ impl ManualTransitionJobRecord {
 
     pub fn complete(&mut self, report: ManualTransitionRunReport, queue_snapshot: ManualTransitionQueueSnapshot) {
         self.scan_completed = true;
-        self.report.merge_scan_report_preserving_worker(&report);
+        self.merge_scan_report(&report);
         self.queue_snapshot = queue_snapshot;
         self.error = None;
         self.mark_terminal_if_worker_drained();
@@ -442,9 +445,16 @@ impl ManualTransitionJobRecord {
 
     pub fn update_running_progress(&mut self, report: ManualTransitionRunReport, queue_snapshot: ManualTransitionQueueSnapshot) {
         if self.state == ManualTransitionJobState::Running {
-            self.report.merge_scan_report_preserving_worker(&report);
+            self.merge_scan_report(&report);
             self.renew_lease(queue_snapshot);
         }
+    }
+
+    fn merge_scan_report(&mut self, report: &ManualTransitionRunReport) {
+        if self.report.continuation_token != report.continuation_token {
+            self.cursor_revision = Some(self.cursor_revision.unwrap_or(0).saturating_add(1));
+        }
+        self.report.merge_scan_report_preserving_worker(report);
     }
 
     pub fn mark_unknown_if_unowned(&mut self) {
@@ -2589,6 +2599,25 @@ mod tests {
 
         assert_eq!(decoded.state, ManualTransitionJobState::Running);
         assert!(decoded.report.tier_failure_by_reason.is_empty());
+    }
+
+    #[test]
+    fn manual_transition_job_record_decodes_legacy_cursor_without_revision() {
+        let options = ManualTransitionRunOptions::default();
+        let record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let encoded = record.encode().expect("job record should encode");
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).expect("encoded job should be json");
+        value["job"]
+            .as_object_mut()
+            .expect("job should be object")
+            .remove("cursor_revision");
+        let record_bytes = serde_json::to_vec(&value["job"]).expect("legacy job should encode");
+        value["content_sha256"] = serde_json::Value::String(hex_sha256(&record_bytes, ToOwned::to_owned));
+        let legacy = serde_json::to_vec(&value).expect("legacy envelope should encode");
+
+        let decoded = ManualTransitionJobRecord::decode(record.job_id, &legacy).expect("legacy job should decode");
+
+        assert_eq!(decoded.cursor_revision, None);
     }
 
     #[test]

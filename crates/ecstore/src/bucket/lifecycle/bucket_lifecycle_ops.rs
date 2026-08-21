@@ -9136,6 +9136,7 @@ mod tests {
         assert_eq!(loaded.report.scanned, 37);
         assert_eq!(loaded.report.eligible, 11);
         assert_eq!(loaded.report.enqueued, 5);
+        assert_eq!(loaded.cursor_revision, Some(1));
         assert!(loaded.lease_expires_at_unix_nanos > 0);
         let token = loaded
             .report
@@ -9153,6 +9154,30 @@ mod tests {
         assert_eq!(admission.job_id, job_id);
         assert_eq!(admission.lease_id, loaded.lease_id);
         assert_eq!(admission.lease_expires_at_unix_nanos, loaded.lease_expires_at_unix_nanos);
+
+        let mut same_marker_report = report.clone();
+        same_marker_report.scanned += 1;
+        persist_manual_transition_page_checkpoint(
+            &checkpoint_options,
+            &same_marker_report,
+            Some("logs/page-end".to_string()),
+            Some("opaque-next-version".to_string()),
+        )
+        .await
+        .expect("same-marker version checkpoint should persist through the durable progress sink");
+        let same_marker_checkpointed = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("same-marker version checkpoint should reload");
+        assert_eq!(same_marker_checkpointed.cursor_revision, Some(2));
+        let (_, version_marker) = decode_manual_transition_continuation_token(
+            same_marker_checkpointed
+                .report
+                .continuation_token
+                .as_deref()
+                .expect("same-marker version checkpoint should persist a cursor"),
+        )
+        .expect("same-marker version cursor should decode");
+        assert_eq!(version_marker.as_deref(), Some("opaque-next-version"));
 
         create_test_bucket(&ecstore, &bucket).await;
         let lifecycle_xml = format!(
@@ -9210,6 +9235,7 @@ mod tests {
         assert_eq!(checkpointed.report.scanned, 1000);
         assert_eq!(checkpointed.report.eligible, 1000);
         assert_eq!(checkpointed.report.dry_run_eligible, 1000);
+        assert_eq!(checkpointed.cursor_revision, Some(3));
         let token = checkpointed
             .report
             .continuation_token
