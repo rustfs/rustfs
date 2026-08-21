@@ -979,6 +979,65 @@ impl DecommissionDurableIlmReceipt {
     }
 }
 
+fn merge_decommission_durable_ilm_receipts(
+    existing: &DecommissionDurableIlmReceipt,
+    incoming: &DecommissionDurableIlmReceipt,
+) -> Result<DecommissionDurableIlmReceipt> {
+    if existing.source_path != incoming.source_path
+        || existing.namespace != incoming.namespace
+        || existing.id_kind != incoming.id_kind
+        || existing.id != incoming.id
+    {
+        return Err(Error::other(format!(
+            "durable ILM receipt identity conflict for source path `{}` {}; incoming {}",
+            existing.source_path,
+            existing.context(),
+            incoming.context()
+        )));
+    }
+
+    let checkpoint =
+        if existing.checkpoint == incoming.checkpoint || incoming.checkpoint.validate_successor(&existing.checkpoint).is_ok() {
+            existing.checkpoint.clone()
+        } else {
+            existing.checkpoint.validate_successor(&incoming.checkpoint).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM receipt checkpoint conflict for source path `{}` {}: {err}",
+                    existing.source_path,
+                    existing.context()
+                ))
+            })?;
+            incoming.checkpoint.clone()
+        };
+    let terminal_checkpoint = match (&existing.terminal_checkpoint, &incoming.terminal_checkpoint) {
+        (Some(existing), Some(incoming)) if existing == incoming => Some(existing.clone()),
+        (Some(existing), Some(incoming)) if incoming.validate_successor(existing).is_ok() => Some(existing.clone()),
+        (Some(existing), Some(incoming)) => {
+            existing.validate_successor(incoming).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM receipt terminal checkpoint conflict for source path `{}` {}: {err}",
+                    existing.source_path,
+                    existing.context()
+                ))
+            })?;
+            Some(incoming.clone())
+        }
+        (Some(existing), None) => Some(existing.clone()),
+        (None, Some(incoming)) => Some(incoming.clone()),
+        (None, None) => None,
+    };
+    let merged = DecommissionDurableIlmReceipt {
+        source_path: existing.source_path.clone(),
+        namespace: existing.namespace.clone(),
+        id_kind: existing.id_kind.clone(),
+        id: existing.id.clone(),
+        checkpoint,
+        terminal_checkpoint,
+    };
+    merged.validate()?;
+    Ok(merged)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedDecommissionDurableIlmReceipt {
@@ -1001,8 +1060,9 @@ impl DecommissionDurableIlmReceiptLocator {
     }
 }
 
-fn decommission_durable_ilm_receipt_run_token(cmd_line: &str) -> String {
-    hex_sha256(cmd_line.as_bytes(), ToOwned::to_owned)
+fn decommission_durable_ilm_receipt_run_token(cmd_line: &str, start_time: OffsetDateTime) -> String {
+    let identity = format!("{cmd_line}\0{}", start_time.unix_timestamp_nanos());
+    hex_sha256(identity.as_bytes(), ToOwned::to_owned)
 }
 
 fn decommission_durable_ilm_receipt_run_prefix(run_token: &str) -> String {
@@ -4625,13 +4685,16 @@ impl ECStore {
 
     async fn durable_ilm_receipt_run_token(&self, source_pool_idx: usize) -> Result<String> {
         let pool_meta = self.pool_meta.read().await;
-        let cmd_line = pool_meta
+        let pool = pool_meta
             .pools
             .get(source_pool_idx)
-            .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), source_pool_idx))?
-            .cmd_line
-            .clone();
-        Ok(decommission_durable_ilm_receipt_run_token(&cmd_line))
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), source_pool_idx))?;
+        let start_time = pool
+            .decommission
+            .as_ref()
+            .and_then(|info| info.start_time)
+            .ok_or_else(|| Error::other(format!("decommission run identity is missing for pool {source_pool_idx}")))?;
+        Ok(decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time))
     }
 
     async fn load_decommissioned_durable_ilm_target(
@@ -4672,11 +4735,10 @@ impl ECStore {
             }
         }
 
-        match (target, first_read_error) {
-            (Some(target), _) => Ok(Some(target)),
-            (None, Some(err)) => Err(err),
-            (None, None) => Ok(None),
+        if let Some(err) = first_read_error {
+            return Err(err);
         }
+        Ok(target)
     }
 
     async fn list_decommission_durable_ilm_receipt_paths_in_pool(&self, pool_idx: usize, prefix: &str) -> Result<Vec<String>> {
@@ -4741,22 +4803,98 @@ impl ECStore {
     ) -> Result<()> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
         let receipt_path = decommission_durable_ilm_receipt_path(&run_token, &receipt.source_path, &receipt.id_kind, &receipt.id);
-        let encoded = receipt.encode().map_err(|err| {
-            Error::other(format!(
-                "failed to encode durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
-                receipt.source_path,
-                receipt.context()
-            ))
-        })?;
-        save_config(self.pools[target_pool_idx].clone(), &receipt_path, encoded)
+        let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+        let mut attempt = 1;
+        loop {
+            let (merged, http_preconditions) = match read_config_limited_preserve_empty_with_metadata(
+                self.pools[target_pool_idx].clone(),
+                &receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
             .await
-            .map_err(|err| {
+            {
+                Ok((existing_data, metadata)) => {
+                    let existing = DecommissionDurableIlmReceipt::decode(&existing_data).map_err(|err| {
+                        Error::other(format!(
+                            "durable ILM decommission receipt `{receipt_path}` in pool {target_pool_idx} for {} is invalid: {err}",
+                            locator.context()
+                        ))
+                    })?;
+                    Self::validate_decommission_durable_ilm_receipt_locator(&receipt_path, &locator, &existing)?;
+                    let merged = merge_decommission_durable_ilm_receipts(&existing, receipt)?;
+                    if merged == existing {
+                        return Ok(());
+                    }
+                    let etag = metadata.etag.filter(|etag| !etag.trim().is_empty()).ok_or_else(|| {
+                        Error::other(format!(
+                            "durable ILM decommission receipt `{receipt_path}` in pool {target_pool_idx} is missing an ETag"
+                        ))
+                    })?;
+                    (
+                        merged,
+                        HTTPPreconditions {
+                            if_match: Some(etag),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) =>
+                {
+                    (
+                        receipt.clone(),
+                        HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read durable ILM decommission receipt `{receipt_path}` from pool {target_pool_idx} for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            };
+            let encoded = merged.encode().map_err(|err| {
                 Error::other(format!(
-                    "failed to persist durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
+                    "failed to encode durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
                     receipt.source_path,
                     receipt.context()
                 ))
-            })
+            })?;
+            match save_config_with_opts(
+                self.pools[target_pool_idx].clone(),
+                &receipt_path,
+                encoded,
+                &ObjectOptions {
+                    max_parity: true,
+                    http_preconditions: Some(http_preconditions),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(Error::PreconditionFailed) if attempt < DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS => {
+                    attempt += 1;
+                }
+                Err(Error::PreconditionFailed) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM decommission receipt `{receipt_path}` for {} after concurrent updates",
+                        locator.context()
+                    )));
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM decommission receipt `{receipt_path}` for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            }
+        }
     }
 
     fn validate_decommission_durable_ilm_receipt_locator(
@@ -4800,6 +4938,78 @@ impl ECStore {
         })?;
         Self::validate_decommission_durable_ilm_receipt_locator(receipt_path, &locator, &receipt)?;
         Ok(receipt)
+    }
+
+    async fn load_decommission_durable_ilm_terminal_receipt(
+        &self,
+        source_pool_idx: usize,
+        path: &str,
+        source_record: &ValidatedDurableIlmRecord,
+    ) -> Result<Option<DecommissionDurableIlmReceipt>> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, source_record.id_kind, &source_record.id);
+        let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+        let mut proof = None::<DecommissionDurableIlmReceipt>;
+        for pool_idx in 0..self.pools.len() {
+            if pool_idx == source_pool_idx {
+                continue;
+            }
+            let data = match read_config_limited_preserve_empty(
+                self.pools[pool_idx].clone(),
+                &receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
+            .await
+            {
+                Ok(data) => data,
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) =>
+                {
+                    continue;
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read terminal durable ILM decommission receipt `{receipt_path}` from pool {pool_idx} for {}: {err}",
+                        source_record.context()
+                    )));
+                }
+            };
+            let receipt = DecommissionDurableIlmReceipt::decode(&data).map_err(|err| {
+                Error::other(format!(
+                    "terminal durable ILM decommission receipt `{receipt_path}` in pool {pool_idx} for {} is invalid: {err}",
+                    source_record.context()
+                ))
+            })?;
+            Self::validate_decommission_durable_ilm_receipt_locator(&receipt_path, &locator, &receipt)?;
+            if receipt.namespace != source_record.namespace
+                || receipt.id_kind != source_record.id_kind
+                || receipt.id != source_record.id
+            {
+                return Err(Error::other(format!(
+                    "terminal durable ILM decommission receipt identity mismatch at path `{path}` {}; receipt {}",
+                    source_record.context(),
+                    receipt.context()
+                )));
+            }
+            source_record
+                .checkpoint
+                .validate_successor(&receipt.checkpoint)
+                .map_err(|err| {
+                    Error::other(format!(
+                        "terminal durable ILM decommission receipt does not cover source at path `{path}` {}: {err}",
+                        source_record.context()
+                    ))
+                })?;
+            if receipt.terminal_checkpoint.is_some() {
+                proof = Some(match proof {
+                    Some(existing) => merge_decommission_durable_ilm_receipts(&existing, &receipt)?,
+                    None => receipt,
+                });
+            }
+        }
+        Ok(proof)
     }
 
     async fn verify_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
@@ -5000,12 +5210,13 @@ impl ECStore {
                 .pools
                 .iter()
                 .enumerate()
-                .filter(|(_, pool)| {
+                .filter_map(|(pool_idx, pool)| {
                     pool.decommission
                         .as_ref()
-                        .is_some_and(|info| info.has_decommission_state() && !info.complete)
+                        .filter(|info| info.has_decommission_state() && !info.complete)
+                        .and_then(|info| info.start_time)
+                        .map(|start_time| (pool_idx, decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time)))
                 })
-                .map(|(pool_idx, pool)| (pool_idx, decommission_durable_ilm_receipt_run_token(&pool.cmd_line)))
                 .collect::<Vec<_>>()
         };
         if active_runs.is_empty() {
@@ -5076,19 +5287,24 @@ impl ECStore {
             .map_err(|err| Error::other(format!("failed to read source durable ILM record at path `{path}`: {err}")))?;
         let source_record = validate_durable_ilm_record(path, &source)
             .map_err(|err| Error::other(format!("source durable ILM record is invalid at path `{path}`: {err}")))?;
-        let (target_pool_idx, target) = self
+        let target = self
             .load_decommissioned_durable_ilm_target(source_pool_idx, path, namespace.max_record_size, &source_record.context())
-            .await?
-            .ok_or_else(|| {
-                Error::other(format!(
-                    "target durable ILM record is missing at path `{path}` {}",
-                    source_record.context()
-                ))
-            })?;
-        let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
-        let receipt = DecommissionDurableIlmReceipt::new(path, &target_record);
-        self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
             .await?;
+        if let Some((target_pool_idx, target)) = target {
+            let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
+            let receipt = DecommissionDurableIlmReceipt::new(path, &target_record);
+            self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+                .await?;
+        } else {
+            self.load_decommission_durable_ilm_terminal_receipt(source_pool_idx, path, &source_record)
+                .await?
+                .ok_or_else(|| {
+                    Error::other(format!(
+                        "target durable ILM record is missing at path `{path}` {} without a matching terminal receipt",
+                        source_record.context()
+                    ))
+                })?;
+        }
 
         let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
             source_set,
@@ -6319,10 +6535,12 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DECOMMISSION_META_PREFIXES, DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
-        DecomBucketInfo, DecommissionStartPoolState, DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta,
-        PoolSpaceInfo, PoolStatus, apply_decommission_status_space_info, bind_decommission_cancelers,
-        bind_missing_decommission_cancelers, cancel_decommission_canceler, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        DecomBucketInfo, DecommissionDurableIlmReceipt, DecommissionStartPoolState, DecommissionTerminalState, ListCallback,
+        PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, apply_decommission_status_space_info,
+        bind_decommission_cancelers, bind_missing_decommission_cancelers, cancel_decommission_canceler,
+        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
+        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
+        decommission_durable_ilm_receipt_run_token, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
@@ -6332,9 +6550,9 @@ mod pools_tests {
         ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices, get_by_index,
         has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
-        merge_pool_status_refresh, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
-        pool_meta_has_active_decommission, reconcile_decommission_meta_buckets, require_decommission_store,
-        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        merge_decommission_durable_ilm_receipts, merge_pool_status_refresh, missing_decommission_worker_prefix,
+        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, reconcile_decommission_meta_buckets,
+        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
         resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
@@ -6350,6 +6568,7 @@ mod pools_tests {
         track_decommission_current_object, track_decommission_current_object_stage, validate_start_decommission_request,
         wait_decommission_listing_retry, wait_decommission_worker_drain, with_decommission_entry_context,
     };
+    use crate::bucket::lifecycle::DurableIlmRecordCheckpoint;
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
     use crate::error::{Error, StorageError};
@@ -6396,6 +6615,59 @@ mod pools_tests {
             last_update: OffsetDateTime::now_utc(),
             decommission,
         }
+    }
+
+    #[test]
+    fn decommission_receipt_run_token_changes_with_persisted_start_time() {
+        let first = OffsetDateTime::from_unix_timestamp(1_000).expect("first run timestamp should be valid");
+        let second = OffsetDateTime::from_unix_timestamp(2_000).expect("second run timestamp should be valid");
+        let first_token = decommission_durable_ilm_receipt_run_token("pool-0", first);
+        let second_token = decommission_durable_ilm_receipt_run_token("pool-0", second);
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(first_token, decommission_durable_ilm_receipt_run_token("pool-0", first));
+        let operation_id = "a".repeat(64);
+        let old_receipt = decommission_durable_ilm_receipt_path(
+            &first_token,
+            &format!("ilm/tier-delete-journal/{operation_id}.json"),
+            "operation_id",
+            &operation_id,
+        );
+        assert!(!old_receipt.starts_with(&decommission_durable_ilm_receipt_run_prefix(&second_token)));
+    }
+
+    #[test]
+    fn decommission_receipt_merge_preserves_terminal_proof() {
+        let operation_id = "a".repeat(64);
+        let source_path = format!("ilm/tier-delete-journal/{operation_id}.json");
+        let checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: "b".repeat(64),
+            identity_sha256: "c".repeat(64),
+            committed: false,
+        };
+        let terminal_checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: "d".repeat(64),
+            identity_sha256: "c".repeat(64),
+            committed: true,
+        };
+        let incoming = DecommissionDurableIlmReceipt {
+            source_path,
+            namespace: "tier-delete-journal".to_string(),
+            id_kind: "operation_id".to_string(),
+            id: operation_id,
+            checkpoint: checkpoint.clone(),
+            terminal_checkpoint: None,
+        };
+        let existing = DecommissionDurableIlmReceipt {
+            terminal_checkpoint: Some(terminal_checkpoint.clone()),
+            ..incoming.clone()
+        };
+
+        let merged = merge_decommission_durable_ilm_receipts(&existing, &incoming)
+            .expect("retry receipt must merge with a terminal receipt");
+
+        assert_eq!(merged.checkpoint, checkpoint);
+        assert_eq!(merged.terminal_checkpoint, Some(terminal_checkpoint));
     }
 
     #[test]

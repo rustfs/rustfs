@@ -78,10 +78,10 @@ test-group = 'embedded-test-ports'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
-# The durable ILM decommission regression builds an isolated 8-disk store and
-# deliberately takes target disks offline while checking read-quorum fencing.
+# The durable ILM decommission regressions build isolated multi-pool stores and
+# deliberately take source or target disks offline while checking fencing.
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & test(decommission_migrates_and_verifies_registered_durable_ilm_records)'
+filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
@@ -197,7 +197,7 @@ filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persi
 test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(decommission_migrates_and_verifies_registered_durable_ilm_records)'
+filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
