@@ -53,7 +53,8 @@ pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
 pub const TEST_BUCKET: &str = "e2e-test-bucket";
 const RUSTFS_FULL_FEATURE: &str = "full";
 const TEST_PORT_MIN: u16 = 20_000;
-const TEST_PORT_RANGE: u16 = 40_000;
+// Keep allocator ports below the ephemeral range used by bind(..., 0) test helpers.
+const TEST_PORT_RANGE: u16 = 10_000;
 const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
 const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
 const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
