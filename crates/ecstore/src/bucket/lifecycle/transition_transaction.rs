@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::durable_namespace::TRANSITION_TRANSACTION_NAMESPACE;
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::lifecycle::tier_sweeper::{
     delete_confirmed_transition_candidate_exact_with_lease_idempotent,
@@ -42,7 +43,7 @@ const TRANSITION_TRANSACTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(6
 const TRANSITION_TRANSACTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const TRANSITION_TRANSACTION_SCHEMA: &str = "rustfs-transition-transaction-v1";
 pub const TRANSITION_TRANSACTION_PREFIX: &str = "ilm/transition-transactions";
-pub const TRANSITION_TRANSACTION_RECORD_PREFIX: &str = "ilm/transition-transactions/records";
+pub const TRANSITION_TRANSACTION_RECORD_PREFIX: &str = TRANSITION_TRANSACTION_NAMESPACE.prefix;
 pub const MAX_TRANSITION_TRANSACTION_SIZE: usize = 64 * 1024;
 
 pub type Result<T> = std::result::Result<T, TransitionTransactionError>;

@@ -16,19 +16,23 @@ use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
-        ILM_META_PREFIX, LifecycleExpiryConfigs,
+        ILM_META_PREFIX, LifecycleExpiryConfigs, ValidatedDurableIlmRecord,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
             lifecycle_delete_all_versions_blocked_by_replication,
         },
-        get_expiry_configs,
+        classify_durable_ilm_record, get_expiry_configs,
         lifecycle::IlmAction,
+        validate_durable_ilm_record,
     },
     metadata_sys,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
-use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
+use crate::config::com::{
+    CONFIG_PREFIX, delete_config, read_config, read_config_limited_preserve_empty, read_config_no_lock, save_config,
+    save_config_with_opts,
+};
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -48,6 +52,7 @@ use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
+    list::ListOperations as _,
     namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, ObjectIO as _, ObjectOperations as _},
 };
@@ -61,6 +66,7 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
@@ -97,6 +103,9 @@ const DECOMMISSION_META_PREFIXES: [&str; 3] = [CONFIG_PREFIX, BUCKET_META_PREFIX
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
+const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v1";
+const DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE: usize = 16 * 1024;
 /// Background decommission walks must tolerate slow object migrations; the
 /// stall timeout is the drive-health bound, not the total listing duration.
 const DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -843,6 +852,135 @@ async fn record_decommission_entry_error(
         *first_err = Some(err);
         rx.cancel();
     }
+}
+
+fn validate_decommission_durable_ilm_copy(
+    path: &str,
+    source_record: &ValidatedDurableIlmRecord,
+    source: &[u8],
+    target: &[u8],
+) -> Result<()> {
+    validate_durable_ilm_record(path, target).map_err(|err| {
+        Error::other(format!(
+            "target durable ILM record is invalid at path `{path}` {}: {err}",
+            source_record.context()
+        ))
+    })?;
+    if source != target {
+        return Err(Error::other(format!(
+            "target durable ILM record content mismatch at path `{path}` {}",
+            source_record.context()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecommissionDurableIlmReceipt {
+    source_path: String,
+    namespace: String,
+    id_kind: String,
+    id: String,
+    target_content_sha256: String,
+}
+
+impl DecommissionDurableIlmReceipt {
+    fn new(path: &str, record: &ValidatedDurableIlmRecord, target: &[u8]) -> Self {
+        Self {
+            source_path: path.to_string(),
+            namespace: record.namespace.to_string(),
+            id_kind: record.id_kind.to_string(),
+            id: record.id.clone(),
+            target_content_sha256: hex_sha256(target, ToOwned::to_owned),
+        }
+    }
+
+    fn context(&self) -> String {
+        format!("namespace `{}` {} `{}`", self.namespace, self.id_kind, self.id)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let namespace = classify_durable_ilm_record(&self.source_path)?
+            .ok_or_else(|| Error::other(format!("receipt source path `{}` is not a durable ILM record", self.source_path)))?;
+        if namespace.name != self.namespace {
+            return Err(Error::other(format!(
+                "receipt namespace `{}` does not match source path `{}`",
+                self.namespace, self.source_path
+            )));
+        }
+        if self.id_kind.is_empty() || self.id.is_empty() {
+            return Err(Error::other(format!(
+                "receipt identity is missing for source path `{}`",
+                self.source_path
+            )));
+        }
+        if !is_sha256_checksum(&self.target_content_sha256) {
+            return Err(Error::other(format!(
+                "receipt target checksum is invalid for source path `{}` {}",
+                self.source_path,
+                self.context()
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let receipt_bytes = serde_json::to_vec(self)?;
+        let persisted = PersistedDecommissionDurableIlmReceipt {
+            schema: DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA.to_string(),
+            content_sha256: hex_sha256(&receipt_bytes, ToOwned::to_owned),
+            receipt: self.clone(),
+        };
+        let encoded = serde_json::to_vec(&persisted)?;
+        if encoded.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE {
+            return Err(Error::other(format!(
+                "durable ILM receipt exceeds maximum size for source path `{}` {}",
+                self.source_path,
+                self.context()
+            )));
+        }
+        Ok(encoded)
+    }
+
+    fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE {
+            return Err(Error::other("durable ILM receipt exceeds maximum size"));
+        }
+        let persisted: PersistedDecommissionDurableIlmReceipt = serde_json::from_slice(data)?;
+        if persisted.schema != DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA {
+            return Err(Error::other(format!("unsupported durable ILM receipt schema `{}`", persisted.schema)));
+        }
+        if !is_sha256_checksum(&persisted.content_sha256) {
+            return Err(Error::other("durable ILM receipt checksum is invalid"));
+        }
+        let receipt_bytes = serde_json::to_vec(&persisted.receipt)?;
+        let actual_checksum = hex_sha256(&receipt_bytes, ToOwned::to_owned);
+        if persisted.content_sha256 != actual_checksum {
+            return Err(Error::other("durable ILM receipt checksum mismatch"));
+        }
+        persisted.receipt.validate()?;
+        Ok(persisted.receipt)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedDecommissionDurableIlmReceipt {
+    schema: String,
+    content_sha256: String,
+    receipt: DecommissionDurableIlmReceipt,
+}
+
+fn decommission_durable_ilm_receipt_prefix(cmd_line: &str) -> String {
+    let pool_key = hex_sha256(cmd_line.as_bytes(), ToOwned::to_owned);
+    format!("{DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT}/{pool_key}/")
+}
+
+fn decommission_durable_ilm_receipt_path(prefix: &str, source_path: &str) -> String {
+    let source_key = hex_sha256(source_path.as_bytes(), ToOwned::to_owned);
+    format!("{prefix}{source_key}.json")
 }
 
 fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
@@ -2916,6 +3054,11 @@ impl ECStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn promote_queued_decommission_for_test(&self, idx: usize) -> Result<()> {
+        self.promote_queued_decommission(idx).await
+    }
+
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
         let changed = {
             let mut pool_meta = self.pool_meta.write().await;
@@ -3103,6 +3246,12 @@ impl ECStore {
             );
             return Ok(());
         }
+        let durable_ilm_record = if bucket == RUSTFS_META_BUCKET {
+            classify_durable_ilm_record(&entry.name)
+                .map_err(|err| with_decommission_entry_context("durable_ilm_namespace", &bucket, &entry.name, err))?
+        } else {
+            None
+        };
         if self.decommission_cancel_requested(idx, &rx).await {
             rx.cancel();
         }
@@ -3415,7 +3564,8 @@ impl ECStore {
             }
         }
 
-        if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+        if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) && durable_ilm_record.is_none()
+        {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(Error::other("decommission bucket incarnation fence was lost before source cleanup"));
             }
@@ -3460,6 +3610,17 @@ impl ECStore {
                 data_movement::SourceCleanupError::Storage(err) => err,
             });
             resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
+        } else if durable_ilm_record.is_some() {
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                state = "retained_for_final_verification",
+                "Decommission durable ILM source retained for final verification"
+            );
         } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(
                 event = EVENT_DECOMMISSION_ENTRY,
@@ -3787,6 +3948,17 @@ impl ECStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn decommission_pool_for_test(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        pool: Arc<Sets>,
+        bucket: DecomBucketInfo,
+    ) -> Result<()> {
+        self.decommission_pool(rx, idx, pool, bucket).await
+    }
+
     #[tracing::instrument(skip(self, rx))]
     pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
         defer!(|| async {
@@ -3935,7 +4107,6 @@ impl ECStore {
                         "failed to finalize decommission for pool {cmd_line}: post-check failed: {err}"
                     )));
                 }
-
                 info!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -3945,7 +4116,10 @@ impl ECStore {
                     state = "marking_completed",
                     "Decommission marking completed state"
                 );
-                resolve_decommission_terminal_mark_result(self.complete_decommission(idx).await, "completed", &cmd_line)?;
+                if let Err(err) = self.complete_decommission(idx).await {
+                    resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
+                    return Err(Error::other(format!("failed to finalize decommission for pool {cmd_line}: {err}")));
+                }
             }
             DecommissionFinalState::Failed => {
                 warn!(
@@ -4041,12 +4215,19 @@ impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
+        ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
+        self.verify_decommission_durable_ilm_receipts(idx).await?;
 
-        let (should_reload_pool_meta, previous_pool_meta) = {
+        let (should_reload_pool_meta, completed, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
             let previous_pool_meta = pool_meta.clone();
             let changed = pool_meta.decommission_complete(idx);
-            (changed, changed.then_some(previous_pool_meta))
+            let completed = pool_meta
+                .pools
+                .get(idx)
+                .and_then(|pool| pool.decommission.as_ref())
+                .is_some_and(|decommission| decommission.complete);
+            (changed, completed, changed.then_some(previous_pool_meta))
         };
 
         {
@@ -4098,6 +4279,18 @@ impl ECStore {
                     );
                 }
             }
+        }
+
+        if completed && let Err(err) = self.cleanup_decommission_durable_ilm_receipts(idx).await {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "receipt_cleanup_failed",
+                error = %err,
+                "Decommission durable ILM receipt cleanup failed"
+            );
         }
 
         Ok(())
@@ -4350,6 +4543,268 @@ impl ECStore {
         Ok(ret)
     }
 
+    async fn durable_ilm_receipt_prefix(&self, source_pool_idx: usize) -> Result<String> {
+        let pool_meta = self.pool_meta.read().await;
+        let cmd_line = pool_meta
+            .pools
+            .get(source_pool_idx)
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), source_pool_idx))?
+            .cmd_line
+            .clone();
+        Ok(decommission_durable_ilm_receipt_prefix(&cmd_line))
+    }
+
+    async fn load_decommissioned_durable_ilm_target(
+        &self,
+        source_pool_idx: usize,
+        path: &str,
+        max_record_size: usize,
+        record_context: &str,
+    ) -> Result<(usize, Vec<u8>)> {
+        let mut target = None::<(usize, Vec<u8>)>;
+        let mut first_read_error = None;
+        for (target_pool_idx, pool) in self.pools.iter().enumerate() {
+            if target_pool_idx == source_pool_idx {
+                continue;
+            }
+            match read_config_limited_preserve_empty(pool.clone(), path, max_record_size).await {
+                Ok(data) => {
+                    if let Some((existing_pool_idx, existing)) = target.as_ref()
+                        && existing != &data
+                    {
+                        return Err(Error::other(format!(
+                            "divergent target durable ILM records at path `{path}` {record_context} in pools {existing_pool_idx} and {target_pool_idx}"
+                        )));
+                    }
+                    target = Some((target_pool_idx, data));
+                }
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    first_read_error.get_or_insert_with(|| {
+                        Error::other(format!(
+                            "failed to read target durable ILM record at path `{path}` {record_context} from pool {target_pool_idx}: {err}"
+                        ))
+                    });
+                }
+            }
+        }
+
+        target.ok_or_else(|| {
+            first_read_error.unwrap_or_else(|| {
+                Error::other(format!("target durable ILM record is missing at path `{path}` {record_context}"))
+            })
+        })
+    }
+
+    async fn list_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<Vec<(usize, String)>> {
+        let prefix = self.durable_ilm_receipt_prefix(source_pool_idx).await?;
+        let mut receipts = Vec::new();
+        for (pool_idx, pool) in self.pools.iter().enumerate() {
+            if pool_idx == source_pool_idx {
+                continue;
+            }
+            let mut continuation = None;
+            loop {
+                let page = pool
+                    .clone()
+                    .list_objects_v2(RUSTFS_META_BUCKET, &prefix, continuation, None, 1000, false, None, false)
+                    .await
+                    .map_err(|err| {
+                        Error::other(format!(
+                            "failed to list durable ILM decommission receipts under `{prefix}` in pool {pool_idx}: {err}"
+                        ))
+                    })?;
+                receipts.extend(page.objects.into_iter().map(|object| (pool_idx, object.name)));
+                if !page.is_truncated {
+                    break;
+                }
+                continuation = Some(page.next_continuation_token.ok_or_else(|| {
+                    Error::other(format!(
+                        "durable ILM decommission receipt listing under `{prefix}` in pool {pool_idx} was truncated without a continuation token"
+                    ))
+                })?);
+            }
+        }
+        Ok(receipts)
+    }
+
+    async fn persist_decommission_durable_ilm_receipt(
+        &self,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        receipt: &DecommissionDurableIlmReceipt,
+    ) -> Result<()> {
+        let prefix = self.durable_ilm_receipt_prefix(source_pool_idx).await?;
+        let receipt_path = decommission_durable_ilm_receipt_path(&prefix, &receipt.source_path);
+        let encoded = receipt.encode().map_err(|err| {
+            Error::other(format!(
+                "failed to encode durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
+                receipt.source_path,
+                receipt.context()
+            ))
+        })?;
+        save_config(self.pools[target_pool_idx].clone(), &receipt_path, encoded)
+            .await
+            .map_err(|err| {
+                Error::other(format!(
+                    "failed to persist durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
+                    receipt.source_path,
+                    receipt.context()
+                ))
+            })
+    }
+
+    async fn verify_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
+        let prefix = self.durable_ilm_receipt_prefix(source_pool_idx).await?;
+        for (receipt_pool_idx, receipt_path) in self.list_decommission_durable_ilm_receipts(source_pool_idx).await? {
+            let data = read_config_limited_preserve_empty(
+                self.pools[receipt_pool_idx].clone(),
+                &receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
+            .await
+            .map_err(|err| {
+                Error::other(format!(
+                    "failed to read durable ILM decommission receipt `{receipt_path}` from pool {receipt_pool_idx}: {err}"
+                ))
+            })?;
+            let receipt = DecommissionDurableIlmReceipt::decode(&data).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM decommission receipt `{receipt_path}` in pool {receipt_pool_idx} is invalid: {err}"
+                ))
+            })?;
+            let expected_receipt_path = decommission_durable_ilm_receipt_path(&prefix, &receipt.source_path);
+            if receipt_path != expected_receipt_path {
+                return Err(Error::other(format!(
+                    "durable ILM decommission receipt path `{receipt_path}` does not match source path `{}` {}",
+                    receipt.source_path,
+                    receipt.context()
+                )));
+            }
+            let namespace = classify_durable_ilm_record(&receipt.source_path)?
+                .ok_or_else(|| Error::other(format!("path `{}` is not a durable ILM record", receipt.source_path)))?;
+            let (_, target) = self
+                .load_decommissioned_durable_ilm_target(
+                    source_pool_idx,
+                    &receipt.source_path,
+                    namespace.max_record_size,
+                    &receipt.context(),
+                )
+                .await?;
+            let target_record = validate_durable_ilm_record(&receipt.source_path, &target).map_err(|err| {
+                Error::other(format!(
+                    "target durable ILM record is invalid at path `{}` {}: {err}",
+                    receipt.source_path,
+                    receipt.context()
+                ))
+            })?;
+            if target_record.namespace != receipt.namespace
+                || target_record.id_kind != receipt.id_kind
+                || target_record.id != receipt.id
+            {
+                return Err(Error::other(format!(
+                    "target durable ILM record identity mismatch at path `{}` {}; decoded {}",
+                    receipt.source_path,
+                    receipt.context(),
+                    target_record.context()
+                )));
+            }
+            let target_content_sha256 = hex_sha256(&target, ToOwned::to_owned);
+            if target_content_sha256 != receipt.target_content_sha256 {
+                return Err(Error::other(format!(
+                    "target durable ILM record content mismatch at path `{}` {}",
+                    receipt.source_path,
+                    receipt.context()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
+        for (pool_idx, receipt_path) in self.list_decommission_durable_ilm_receipts(source_pool_idx).await? {
+            match delete_config(self.pools[pool_idx].clone(), &receipt_path).await {
+                Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to clean durable ILM decommission receipt `{receipt_path}` from pool {pool_idx}: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_and_cleanup_decommissioned_durable_ilm_record(
+        &self,
+        source_pool_idx: usize,
+        source_set: Arc<SetDisks>,
+        path: &str,
+    ) -> Result<()> {
+        let namespace = classify_durable_ilm_record(path)?
+            .ok_or_else(|| Error::other(format!("path `{path}` is not a durable ILM record")))?;
+        let source_versions = source_set
+            .load_file_info_versions_exact(RUSTFS_META_BUCKET, path)
+            .await
+            .map_err(|err| Error::other(format!("failed to load source durable ILM versions at path `{path}`: {err}")))?
+            .ok_or_else(|| Error::other(format!("source durable ILM record is missing at path `{path}`")))?;
+        let source = read_config_limited_preserve_empty(source_set.clone(), path, namespace.max_record_size)
+            .await
+            .map_err(|err| Error::other(format!("failed to read source durable ILM record at path `{path}`: {err}")))?;
+        let source_record = validate_durable_ilm_record(path, &source)
+            .map_err(|err| Error::other(format!("source durable ILM record is invalid at path `{path}`: {err}")))?;
+        let (target_pool_idx, target) = self
+            .load_decommissioned_durable_ilm_target(source_pool_idx, path, namespace.max_record_size, &source_record.context())
+            .await?;
+        validate_decommission_durable_ilm_copy(path, &source_record, &source, &target)?;
+        let receipt = DecommissionDurableIlmReceipt::new(path, &source_record, &target);
+        self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+            .await?;
+
+        let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
+            source_set,
+            RUSTFS_META_BUCKET,
+            path,
+            &source_versions,
+            &[],
+            data_movement::SourceCleanupBucketFence::default(),
+            "decommission durable ILM final sweep",
+        )
+        .await
+        .map_err(|err| {
+            Error::other(format!(
+                "source durable ILM cleanup failed at path `{path}` {}: {err}",
+                source_record.context()
+            ))
+        });
+        resolve_decommission_entry_cleanup_delete_result(cleanup_result, RUSTFS_META_BUCKET, path)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+        &self,
+        source_pool_idx: usize,
+        source_set: Arc<SetDisks>,
+        path: &str,
+    ) -> Result<()> {
+        self.verify_and_cleanup_decommissioned_durable_ilm_record(source_pool_idx, source_set, path)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_durable_ilm_receipt_count_for_test(&self, source_pool_idx: usize) -> Result<usize> {
+        Ok(self.list_decommission_durable_ilm_receipts(source_pool_idx).await?.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cleanup_decommission_durable_ilm_receipts_for_test(&self, source_pool_idx: usize) -> Result<()> {
+        self.cleanup_decommission_durable_ilm_receipts(source_pool_idx).await
+    }
+
     async fn check_after_decommission(self: &Arc<Self>, idx: usize) -> Result<()> {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
@@ -4366,22 +4821,27 @@ impl ECStore {
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
                 let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+                let first_remaining_path = Arc::new(tokio::sync::Mutex::new(None::<String>));
                 let callback_rx = CancellationToken::new();
                 let versions_found_cb = versions_found.clone();
                 let entry_error_cb = entry_error.clone();
+                let first_remaining_path_cb = first_remaining_path.clone();
                 let bucket_name = bucket_info.name.clone();
                 let lifecycle_config_cb = lifecycle_config.clone();
                 let object_lock_config_cb = object_lock_config.clone();
                 let store = Arc::clone(self);
+                let source_set = set.clone();
                 let callback_rx_cb = callback_rx.clone();
 
                 let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
                     let versions_found = versions_found_cb.clone();
                     let entry_error = entry_error_cb.clone();
+                    let first_remaining_path = first_remaining_path_cb.clone();
                     let bucket_name = bucket_name.clone();
                     let lifecycle_config = lifecycle_config_cb.clone();
                     let object_lock_config = object_lock_config_cb.clone();
                     let store = Arc::clone(&store);
+                    let source_set = source_set.clone();
                     let callback_rx = callback_rx_cb.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
@@ -4393,6 +4853,41 @@ impl ECStore {
                         }
 
                         if bucket_name == RUSTFS_META_BUCKET && entry.name.contains(DATA_USAGE_CACHE_NAME) {
+                            return;
+                        }
+
+                        let durable_ilm_record = if bucket_name == RUSTFS_META_BUCKET {
+                            match classify_durable_ilm_record(&entry.name) {
+                                Ok(record) => record,
+                                Err(err) => {
+                                    let mut first_err = entry_error.lock().await;
+                                    if first_err.is_none() {
+                                        *first_err = Some(with_decommission_entry_context(
+                                            "check_after_decommission.durable_ilm_namespace",
+                                            &bucket_name,
+                                            &entry.name,
+                                            err,
+                                        ));
+                                        callback_rx.cancel();
+                                    }
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        if durable_ilm_record.is_some() {
+                            if let Err(err) = store
+                                .verify_and_cleanup_decommissioned_durable_ilm_record(idx, source_set, &entry.name)
+                                .await
+                            {
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err);
+                                    callback_rx.cancel();
+                                }
+                            }
                             return;
                         }
 
@@ -4444,6 +4939,13 @@ impl ECStore {
                             remaining += 1;
                         }
 
+                        if remaining > 0 {
+                            let mut first_path = first_remaining_path.lock().await;
+                            if first_path.is_none() {
+                                *first_path = Some(format!("{bucket_name}/{}", entry.name));
+                            }
+                        }
+
                         versions_found.fetch_add(remaining, Ordering::Relaxed);
                     })
                 });
@@ -4456,15 +4958,27 @@ impl ECStore {
 
                 let versions_found = versions_found.load(Ordering::Relaxed);
                 if versions_found > 0 {
+                    let first_remaining_path = first_remaining_path
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| format!("{}/<unknown>", bucket_info.name));
                     return Err(Error::other(format!(
-                        "at least {versions_found} object(s)/version(s) were found in bucket `{}` after decommissioning",
-                        bucket_info.name
+                        "at least {versions_found} object(s)/version(s) were found in bucket `{}` after decommissioning; first remaining path `{first_remaining_path}`",
+                        bucket_info.name,
                     )));
                 }
             }
         }
 
+        self.verify_decommission_durable_ilm_receipts(idx).await?;
+
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn check_after_decommission_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
+        self.check_after_decommission(idx).await
     }
 
     #[tracing::instrument(skip(self, rd))]
@@ -5774,25 +6288,6 @@ mod pools_tests {
                 crate::disk::BUCKET_META_PREFIX,
                 crate::bucket::lifecycle::ILM_META_PREFIX,
             ]
-        );
-    }
-
-    #[test]
-    fn test_decommission_meta_prefixes_cover_durable_ilm_records() {
-        let ilm_prefix = format!("{}/", crate::bucket::lifecycle::ILM_META_PREFIX);
-        let durable_prefixes = [
-            crate::bucket::lifecycle::tier_delete_journal::TIER_DELETE_JOURNAL_PREFIX,
-            crate::bucket::lifecycle::transition_transaction::TRANSITION_TRANSACTION_RECORD_PREFIX,
-            crate::bucket::lifecycle::manual_transition_job::MANUAL_TRANSITION_JOB_RECORD_PREFIX,
-            crate::bucket::lifecycle::manual_transition_job::MANUAL_TRANSITION_SCOPE_RECORD_PREFIX,
-            crate::bucket::lifecycle::manual_transition_job::MANUAL_TRANSITION_TASK_PREFIX,
-            crate::bucket::lifecycle::manual_transition_job::MANUAL_TRANSITION_WORKER_RESULT_PREFIX,
-        ];
-
-        assert!(DECOMMISSION_META_PREFIXES.contains(&crate::bucket::lifecycle::ILM_META_PREFIX));
-        assert!(
-            durable_prefixes.iter().all(|prefix| prefix.starts_with(&ilm_prefix)),
-            "every durable ILM record must stay under the decommissioned ILM namespace"
         );
     }
 

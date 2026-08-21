@@ -78,6 +78,12 @@ test-group = 'embedded-test-ports'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
+# The durable ILM decommission regression builds an isolated 8-disk store and
+# deliberately takes target disks offline while checking read-quorum fencing.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(decommission_migrates_and_verifies_registered_durable_ilm_records)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
 # init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
 # OnceLock state that serial_test's #[serial] cannot protect across nextest's
@@ -188,6 +194,10 @@ test-group = 'embedded-test-ports'
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(decommission_migrates_and_verifies_registered_durable_ilm_records)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
