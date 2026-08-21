@@ -26,8 +26,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{HTTPPreconditions, ObjectOperations as _},
 };
-use crate::store::ECStore;
-use crate::store::ObjectLockDiagGuard;
+use crate::store::{ECStore, ObjectLockDiagGuard, SourceCleanupMutationFence};
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
@@ -1029,6 +1028,7 @@ pub(crate) enum SourceCleanupError {
 pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
     pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    pub(crate) object_mutation_fence: Option<&'a SourceCleanupMutationFence>,
 }
 
 fn ensure_source_cleanup_versions_match(
@@ -1066,7 +1066,9 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
 struct SourceCleanupDeleteBarrierState {
     bucket: String,
     object: String,
+    fence_pending: tokio::sync::Notify,
     arrived: tokio::sync::Notify,
+    is_paused: AtomicBool,
     release: tokio::sync::Notify,
 }
 
@@ -1080,7 +1082,7 @@ pub(crate) struct SourceCleanupDeleteBarrier {
 }
 
 #[cfg(test)]
-static SOURCE_CLEANUP_DELETE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<SourceCleanupDeleteBarrierState>>>> =
+static SOURCE_CLEANUP_DELETE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<SourceCleanupDeleteBarrierState>>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -1093,15 +1095,22 @@ impl SourceCleanupDeleteBarrier {
         let state = Arc::new(SourceCleanupDeleteBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
+            fence_pending: tokio::sync::Notify::new(),
             arrived: tokio::sync::Notify::new(),
+            is_paused: AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
         });
-        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
-            .get_or_init(|| std::sync::Mutex::new(None))
+        let mut barriers = SOURCE_CLEANUP_DELETE_BARRIERS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
             .lock()
             .expect("source cleanup delete barrier mutex should not poison");
-        assert!(slot.is_none(), "source cleanup delete barrier must be unique");
-        *slot = Some(Arc::clone(&state));
+        assert!(
+            !barriers
+                .iter()
+                .any(|barrier| barrier.bucket == bucket && barrier.object == object),
+            "source cleanup delete barrier must be unique per object"
+        );
+        barriers.push(Arc::clone(&state));
         Self { state }
     }
 
@@ -1111,8 +1120,32 @@ impl SourceCleanupDeleteBarrier {
             .expect("source cleanup should reach the pre-delete barrier");
     }
 
+    pub(crate) async fn wait_until_fence_pending(&self) {
+        tokio::time::timeout(StdDuration::from_secs(30), self.state.fence_pending.notified())
+            .await
+            .expect("source cleanup should attempt the fixed mutation fence");
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.state.is_paused.load(Ordering::Acquire)
+    }
+
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn notify_source_cleanup_mutation_fence_pending(bucket: &str, object: &str) {
+    let barrier = SOURCE_CLEANUP_DELETE_BARRIERS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("source cleanup delete barrier mutex should not poison")
+        .iter()
+        .find(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.fence_pending.notify_one();
     }
 }
 
@@ -1120,26 +1153,25 @@ impl SourceCleanupDeleteBarrier {
 impl Drop for SourceCleanupDeleteBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
-        let mut slot = SOURCE_CLEANUP_DELETE_BARRIER
-            .get_or_init(|| std::sync::Mutex::new(None))
+        let mut barriers = SOURCE_CLEANUP_DELETE_BARRIERS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
             .lock()
             .expect("source cleanup delete barrier mutex should not poison");
-        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
-            *slot = None;
-        }
+        barriers.retain(|state| !Arc::ptr_eq(state, &self.state));
     }
 }
 
 #[cfg(test)]
 async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
-    let barrier = SOURCE_CLEANUP_DELETE_BARRIER
-        .get_or_init(|| std::sync::Mutex::new(None))
+    let barrier = SOURCE_CLEANUP_DELETE_BARRIERS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
         .lock()
         .expect("source cleanup delete barrier mutex should not poison")
-        .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .iter()
+        .find(|barrier| barrier.bucket == bucket && barrier.object == object)
         .cloned();
     if let Some(barrier) = barrier {
+        barrier.is_paused.store(true, Ordering::Release);
         barrier.arrived.notify_one();
         barrier.release.notified().await;
     }
@@ -1155,11 +1187,20 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     op_label: &str,
 ) -> std::result::Result<ObjectInfo, SourceCleanupError> {
     let cleanup_key = encode_dir_object(object);
-    let ns_lock = set.new_ns_lock(bucket, cleanup_key.as_str()).await?;
-    let _guard = ns_lock
-        .get_write_lock(get_lock_acquire_timeout())
-        .await
-        .map_err(Error::from)?;
+    let source_guard = if bucket_fence
+        .object_mutation_fence
+        .is_some_and(SourceCleanupMutationFence::source_lock_covered)
+    {
+        None
+    } else {
+        let ns_lock = set.new_ns_lock(bucket, cleanup_key.as_str()).await?;
+        Some(
+            ns_lock
+                .get_write_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(Error::from)?,
+        )
+    };
 
     if bucket_fence
         .lifecycle_guard
@@ -1167,6 +1208,14 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     {
         return Err(SourceCleanupError::Storage(Error::other(format!(
             "{op_label}: bucket incarnation fence was lost before source cleanup"
+        ))));
+    }
+    if bucket_fence
+        .object_mutation_fence
+        .is_some_and(SourceCleanupMutationFence::is_lock_lost)
+    {
+        return Err(SourceCleanupError::Storage(Error::other(format!(
+            "{op_label}: object mutation fence was lost before source cleanup"
         ))));
     }
 
@@ -1183,7 +1232,12 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         expected_bucket_incarnation_id: bucket_fence.expected_incarnation_id,
         ..Default::default()
     };
-    opts.add_namespace_lock_guard(&_guard);
+    if let Some(source_guard) = source_guard.as_ref() {
+        opts.add_namespace_lock_guard(source_guard);
+    }
+    if let Some(object_mutation_fence) = bucket_fence.object_mutation_fence {
+        object_mutation_fence.add_namespace_lock_fence(&mut opts);
+    }
     if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);
     }

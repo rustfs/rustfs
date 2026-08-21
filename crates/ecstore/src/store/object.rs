@@ -36,7 +36,7 @@ use crate::bucket::replication::ReplicationObjectBridge;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
-    get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
+    SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
 use crate::storage_api_contracts::{
@@ -399,6 +399,25 @@ impl ObjectLockDiagGuard {
         if let Some(signal) = self.lock_lost_signal() {
             opts.add_namespace_lock_lost_signal(signal);
         }
+    }
+}
+
+pub(crate) struct SourceCleanupMutationFence {
+    guard: ObjectLockDiagGuard,
+    source_lock_covered: bool,
+}
+
+impl SourceCleanupMutationFence {
+    pub(crate) fn source_lock_covered(&self) -> bool {
+        self.source_lock_covered
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        self.guard.add_namespace_lock_fence(opts);
     }
 }
 
@@ -891,6 +910,82 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
         state.arrived.notify_one();
         state.release.notified().await;
         state.namespace_pending.notify_one();
+    }
+}
+
+#[cfg(test)]
+struct VersionedDeleteMarkerCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct VersionedDeleteMarkerCommitBarrier {
+    state: Arc<VersionedDeleteMarkerCommitBarrierState>,
+}
+
+#[cfg(test)]
+static VERSIONED_DELETE_MARKER_COMMIT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<VersionedDeleteMarkerCommitBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl VersionedDeleteMarkerCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(VersionedDeleteMarkerCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        assert!(slot.is_none(), "versioned delete-marker commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("versioned DELETE should reach the post-marker-commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for VersionedDeleteMarkerCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_versioned_delete_marker_after_commit(bucket: &str, object: &str) {
+    let state = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("versioned delete-marker commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
     }
 }
 
@@ -1572,6 +1667,34 @@ impl ECStore {
         self.acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
             .await?
             .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))
+    }
+
+    pub(crate) async fn acquire_decommission_source_cleanup_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_set: &SetDisks,
+    ) -> Result<SourceCleanupMutationFence> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission source cleanup requires namespace locking"));
+        }
+
+        #[cfg(test)]
+        crate::data_movement::notify_source_cleanup_mutation_fence_pending(bucket, object);
+        let object = encode_dir_object(object);
+        let distributed = self.ctx.is_dist_erasure().await;
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let source_lock_covered = !distributed || same_distributed_lock_domain(&fixed_set.lockers, &source_set.lockers);
+        // Lock order: fixed store mutation domain first; source cleanup takes its
+        // hashed source-domain lock second only when this guard does not cover it.
+        let guard = self
+            .acquire_object_write_lock("decommission_source_cleanup", bucket, &object)
+            .await?;
+
+        Ok(SourceCleanupMutationFence {
+            guard,
+            source_lock_covered,
+        })
     }
 
     pub(crate) async fn acquire_all_object_read_locks(
@@ -2681,12 +2804,14 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_pool_rebalancing(pool.pool_idx).await {
+            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
 
             match pool.delete_object(bucket, object, opts.clone()).await {
                 Ok(res) => {
+                    #[cfg(test)]
+                    pause_versioned_delete_marker_after_commit(bucket, object).await;
                     if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
                         commit_prepared_tier_delete_journal_entry(api, je).await;
                     }
@@ -4481,6 +4606,16 @@ mod tests {
         assert!(lookup_opts.no_lock);
         assert!(!lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
+
+        let explicit_version = delete_pool_lookup_opts(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(!explicit_version.skip_decommissioned);
     }
 
     #[test]

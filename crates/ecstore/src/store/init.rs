@@ -2859,7 +2859,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn versioned_delete_waits_for_decommission_commit_then_publishes_marker() {
+    async fn versioned_delete_marker_survives_decommission_source_cleanup() {
         let temp_dir = tempfile::tempdir().expect("create versioned decommission delete-fence store dir");
         let (_ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "versioned-decommission-delete-fence", &[4, 4]))
@@ -2886,6 +2886,12 @@ mod tests {
             .await
             .expect("write source version to the pool being decommissioned");
         let source_version = source_info.version_id.expect("versioned source must have a version ID");
+        let expected_source_versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("source versions should be readable before migration")
+            .expect("source versions should exist before migration");
         {
             let mut pool_meta = store.pool_meta.write().await;
             pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
@@ -2929,8 +2935,13 @@ mod tests {
             .await
         });
         barrier.wait_until_paused().await;
+        barrier.release();
+        migration
+            .await
+            .expect("versioned decommission migration task should join")
+            .expect("versioned decommission migration should commit before DELETE");
 
-        let delete_barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete_barrier = crate::store::object::VersionedDeleteMarkerCommitBarrier::install(&bucket, object);
         let delete_store = Arc::clone(&store);
         let delete_bucket = bucket.clone();
         let delete = tokio::spawn(async move {
@@ -2946,17 +2957,46 @@ mod tests {
                 .await
         });
         delete_barrier.wait_until_paused().await;
-        delete_barrier.release_and_wait_until_namespace_pending().await;
+        let cleanup_set = store.pools[0].get_disks_by_key(object);
+        crate::data_movement::ensure_source_cleanup_versions_unchanged(
+            Arc::clone(&cleanup_set),
+            &bucket,
+            object,
+            &expected_source_versions,
+            &[],
+            "test_versioned_decommission_delete_fence",
+        )
+        .await
+        .expect("the committed delete marker must not be published to the suspended source pool");
+
+        let cleanup_delete_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
+        let cleanup_store = Arc::clone(&store);
+        let cleanup_bucket = bucket.clone();
+        let cleanup = tokio::spawn(async move {
+            let mutation_fence = cleanup_store
+                .acquire_decommission_source_cleanup_fence(&cleanup_bucket, object, cleanup_set.as_ref())
+                .await?;
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                cleanup_set,
+                &cleanup_bucket,
+                object,
+                &expected_source_versions,
+                &[],
+                crate::data_movement::SourceCleanupBucketFence {
+                    object_mutation_fence: Some(&mutation_fence),
+                    ..Default::default()
+                },
+                "test_versioned_decommission_delete_fence",
+            )
+            .await
+        });
+        cleanup_delete_barrier.wait_until_fence_pending().await;
         assert!(
-            !delete.is_finished(),
-            "versioned DELETE must wait while the source version is being committed"
+            !cleanup_delete_barrier.is_paused(),
+            "source cleanup must wait for the versioned DELETE mutation fence"
         );
 
-        barrier.release();
-        migration
-            .await
-            .expect("versioned decommission migration task should join")
-            .expect("versioned decommission migration should commit before DELETE");
+        delete_barrier.release();
         let marker = delete
             .await
             .expect("versioned DELETE task should join")
@@ -2966,6 +3006,13 @@ mod tests {
             marker.version_id.is_some_and(|version_id| !version_id.is_nil()),
             "the delete marker must have a non-nil version ID"
         );
+
+        cleanup_delete_barrier.wait_until_paused().await;
+        cleanup_delete_barrier.release();
+        cleanup
+            .await
+            .expect("source cleanup task should join")
+            .expect("source cleanup should preserve the active-pool delete marker");
 
         let err = store
             .get_object_info(
@@ -2994,6 +3041,18 @@ mod tests {
             )
             .await
             .expect("the migrated source version must remain addressable below the delete marker");
+        store.pools[0]
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(source_version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("source cleanup must remove the decommissioned source versions");
 
         shutdown.cancel();
     }
