@@ -45,35 +45,73 @@ pub(super) enum RebalanceWorkerActivationFence {
     NotStartedTerminal,
 }
 
-async fn merge_and_save_rebalance_meta_no_lock<S, F>(
+pub(super) struct RebalanceRunGuard {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+async fn merge_and_save_rebalance_meta_no_lock<S>(
     pool: Arc<S>,
     local_snapshot: &RebalanceMeta,
     stage: &str,
-    before_save: F,
+    mut opts: ObjectOptions,
+    activation_fence: Option<&PoolRebalanceActivationFence>,
+    expected_id: Option<&str>,
 ) -> Result<()>
 where
     S: EcstoreObjectIO,
-    F: FnOnce() -> Result<()>,
 {
-    let opts = ObjectOptions {
-        no_lock: true,
-        ..Default::default()
-    };
     let mut merged = RebalanceMeta::new();
     match merged.load_with_opts(pool.clone(), opts.clone()).await {
         Ok(()) => {
+            if let Some(expected_id) = expected_id {
+                ensure_rebalance_run_id(Some(&merged), expected_id, stage)?;
+            }
             if merge_rebalance_meta(&mut merged, local_snapshot) == RebalanceMetaMergeOutcome::RejectedActiveConflict {
                 return Err(Error::RebalanceAlreadyRunning);
             }
         }
         Err(Error::ConfigNotFound) => {
+            if expected_id.is_some() {
+                return Err(rebalance_metadata_not_initialized_error(stage));
+            }
             merged = local_snapshot.clone();
         }
         Err(err) => return Err(Error::other(format!("rebalance meta load before save failed during {stage}: {err}"))),
     }
 
-    before_save()?;
-    merged.save_with_opts(pool, opts).await
+    if let Some(fence) = activation_fence {
+        fence.add_namespace_lock_fence(&mut opts);
+        fence.ensure_held()?;
+    }
+    merged.save_with_opts(pool, opts).await?;
+    if let Some(fence) = activation_fence {
+        fence.ensure_held()?;
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_rebalance_run_id(meta: Option<&RebalanceMeta>, expected_id: &str, stage: &str) -> Result<()> {
+    let Some(meta) = meta else {
+        return Err(rebalance_metadata_not_initialized_error(stage));
+    };
+    if meta.id != expected_id {
+        return Err(Error::other(format!(
+            "stale rebalance worker rejected during {stage}: expected {expected_id}, found {}",
+            meta.id
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_rebalance_worker_active(meta: Option<&RebalanceMeta>, expected_id: &str, stage: &str) -> Result<()> {
+    ensure_rebalance_run_id(meta, expected_id, stage)?;
+    let Some(meta) = meta else {
+        return Err(rebalance_metadata_not_initialized_error(stage));
+    };
+    if meta.stopped_at.is_some() || !is_rebalance_conflicting_with_decommission(meta) {
+        return Err(Error::other(format!("inactive rebalance worker rejected during {stage}: {expected_id}")));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) -> Result<()> {
@@ -122,6 +160,52 @@ fn clear_rebalance_status_refresh(current: &mut Option<RebalanceMeta>) {
 }
 
 impl ECStore {
+    // Transition order is start_gate -> activation_gate -> rebalance_meta; the probe read below is released before the gate.
+    async fn rebalance_activation_write_guard(
+        &self,
+        expected_id: Option<&str>,
+        stage: &str,
+    ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
+        let activation_gate = {
+            let meta = self.rebalance_meta.read().await;
+            if let Some(expected_id) = expected_id {
+                ensure_rebalance_run_id(meta.as_ref(), expected_id, stage)?;
+            }
+            meta.as_ref().map(|meta| Arc::clone(&meta.activation_gate))
+        };
+        Ok(match activation_gate {
+            Some(gate) => Some(gate.write_owned().await),
+            None => None,
+        })
+    }
+
+    pub(super) async fn rebalance_run_guard(&self, expected_id: &str, stage: &str) -> Result<RebalanceRunGuard> {
+        let activation_gate = {
+            let meta = self.rebalance_meta.read().await;
+            ensure_rebalance_worker_active(meta.as_ref(), expected_id, stage)?;
+            Arc::clone(
+                &meta
+                    .as_ref()
+                    .ok_or_else(|| rebalance_metadata_not_initialized_error(stage))?
+                    .activation_gate,
+            )
+        };
+        let guard = Arc::clone(&activation_gate).read_owned().await;
+        let meta = self.rebalance_meta.read().await;
+        ensure_rebalance_worker_active(meta.as_ref(), expected_id, stage)?;
+        let current_gate = &meta
+            .as_ref()
+            .ok_or_else(|| rebalance_metadata_not_initialized_error(stage))?
+            .activation_gate;
+        if !Arc::ptr_eq(&activation_gate, current_gate) {
+            return Err(Error::other(format!(
+                "stale rebalance activation gate rejected during {stage}: {expected_id}"
+            )));
+        }
+        drop(meta);
+        Ok(RebalanceRunGuard { _guard: guard })
+    }
+
     pub(super) async fn save_rebalance_meta_with_merge<S>(
         &self,
         pool: Arc<S>,
@@ -131,13 +215,50 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
+        self.save_rebalance_meta_with_merge_for_id(pool, local_snapshot, stage, None)
+            .await
+    }
+
+    pub(super) async fn save_rebalance_meta_for_id_with_merge<S>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+        expected_id: &str,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
+        self.save_rebalance_meta_with_merge_for_id(pool, local_snapshot, stage, Some(expected_id))
+            .await
+    }
+
+    async fn save_rebalance_meta_with_merge_for_id<S>(
+        &self,
+        pool: Arc<S>,
+        local_snapshot: &RebalanceMeta,
+        stage: &str,
+        expected_id: Option<&str>,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
+    {
         let ns_lock = pool.new_ns_lock(crate::disk::RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-        let _guard = ns_lock
+        let guard = ns_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(rebalance_meta_lock_error)?;
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        opts.add_namespace_lock_guard(&guard);
 
-        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, || Ok(())).await
+        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, opts, None, expected_id).await?;
+        if guard.is_lock_lost() {
+            return Err(Error::other("rebalance metadata lock lost during metadata commit"));
+        }
+        Ok(())
     }
 
     async fn save_rebalance_activation_meta_with_merge<S>(
@@ -154,7 +275,18 @@ impl ECStore {
         pool_meta.load_no_lock(pool.clone()).await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
 
-        merge_and_save_rebalance_meta_no_lock(pool, local_snapshot, stage, || activation_fence.ensure_held()).await
+        merge_and_save_rebalance_meta_no_lock(
+            pool,
+            local_snapshot,
+            stage,
+            ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+            Some(&activation_fence),
+            None,
+        )
+        .await
     }
 
     pub(super) async fn fence_rebalance_worker_activation<S>(
@@ -197,6 +329,7 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
         let mut meta = RebalanceMeta::new();
         debug!(
             event = EVENT_REBALANCE_STATE,
@@ -206,7 +339,9 @@ impl ECStore {
             "Loading rebalance metadata"
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
-        if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
+        let loaded = resolve_rebalance_meta_load_result(meta.load(pool).await)?;
+        let _activation_guard = self.rebalance_activation_write_guard(None, "load rebalance metadata").await?;
+        if loaded {
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
 
@@ -243,9 +378,14 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn refresh_rebalance_status_meta(&self) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
         let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
         let mut persisted = RebalanceMeta::new();
-        match persisted.load(pool).await {
+        let loaded = persisted.load(pool).await;
+        let _activation_guard = self
+            .rebalance_activation_write_guard(None, "refresh rebalance metadata")
+            .await?;
+        match loaded {
             Ok(()) => {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
                 merge_rebalance_status_refresh(&mut rebalance_meta, persisted);
@@ -311,7 +451,7 @@ impl ECStore {
             if let Some(meta) = rebalance_meta.as_ref() {
                 let pool = clone_first_arc(&self.pools, "update_rebalance_stats: no pools available")?;
                 resolve_rebalance_meta_save_result(
-                    self.save_rebalance_meta_with_merge(pool, meta, "update_rebalance_stats")
+                    self.save_rebalance_meta_for_id_with_merge(pool, meta, "update_rebalance_stats", meta.id.as_str())
                         .await,
                     "update_rebalance_stats",
                 )?;
@@ -436,11 +576,14 @@ impl ECStore {
     pub async fn init_rebalance_start(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
         let _start_guard = self.start_gate.lock().await;
 
-        let decommission_running = self.is_decommission_running().await;
         {
+            let decommission_running = self.is_decommission_running().await;
             let rebalance_meta = self.rebalance_meta.read().await;
             validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
         }
+        let _activation_guard = self
+            .rebalance_activation_write_guard(None, "initialize replacement rebalance")
+            .await?;
 
         self.init_rebalance_meta(bucktes).await
     }
@@ -480,11 +623,35 @@ impl ECStore {
 
     #[tracing::instrument(skip(self, versions))]
     pub async fn update_pool_stats_batch(&self, pool_index: usize, bucket: String, versions: &[&FileInfo]) -> Result<()> {
+        self.update_pool_stats_batch_for_id(pool_index, bucket, versions, None).await
+    }
+
+    pub(super) async fn update_pool_stats_batch_for_rebalance(
+        &self,
+        pool_index: usize,
+        bucket: String,
+        versions: &[&FileInfo],
+        expected_id: &str,
+    ) -> Result<()> {
+        self.update_pool_stats_batch_for_id(pool_index, bucket, versions, Some(expected_id))
+            .await
+    }
+
+    async fn update_pool_stats_batch_for_id(
+        &self,
+        pool_index: usize,
+        bucket: String,
+        versions: &[&FileInfo],
+        expected_id: Option<&str>,
+    ) -> Result<()> {
         if versions.is_empty() {
             return Ok(());
         }
 
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        if let Some(expected_id) = expected_id {
+            ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "update rebalance pool stats")?;
+        }
         if let Some(meta) = rebalance_meta.as_mut() {
             if !should_accept_rebalance_stats_update(meta, pool_index) {
                 return Ok(());
@@ -499,8 +666,9 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn next_rebal_bucket(&self, pool_index: usize) -> Result<Option<String>> {
+    pub async fn next_rebal_bucket(&self, pool_index: usize, expected_id: &str) -> Result<Option<String>> {
         let rebalance_meta = self.rebalance_meta.read().await;
+        ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "next rebalance bucket")?;
         debug!(
             event = EVENT_REBALANCE_BUCKET,
             component = LOG_COMPONENT_ECSTORE,
@@ -514,8 +682,9 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String) -> Result<()> {
+    pub async fn bucket_rebalance_done(&self, pool_index: usize, bucket: String, expected_id: &str) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "mark rebalance bucket done")?;
         mark_rebalance_bucket_done(rebalance_meta.as_mut(), pool_index, &bucket)
     }
 
@@ -525,8 +694,10 @@ impl ECStore {
         bucket: &str,
         object: &str,
         message: String,
+        expected_id: &str,
     ) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "record rebalance cleanup warning")?;
         record_rebalance_cleanup_warning_in_meta(
             rebalance_meta.as_mut(),
             pool_index,
@@ -537,8 +708,15 @@ impl ECStore {
         )
     }
 
-    pub(super) async fn defer_rebalance_bucket(&self, pool_index: usize, bucket: String, last_error: String) -> Result<()> {
+    pub(super) async fn defer_rebalance_bucket(
+        &self,
+        pool_index: usize,
+        bucket: String,
+        last_error: String,
+        expected_id: &str,
+    ) -> Result<()> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "defer rebalance bucket")?;
         let Some(meta) = rebalance_meta.as_mut() else {
             return Err(rebalance_metadata_not_initialized_error("defer rebalance bucket"));
         };
@@ -634,6 +812,8 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance_for_id(self: &Arc<Self>, expected_id: Option<&str>) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        let _activation_guard = self.rebalance_activation_write_guard(expected_id, "stop rebalance").await?;
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
@@ -642,7 +822,7 @@ impl ECStore {
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "stop_rebalance: no pools available")?;
             resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "stop_rebalance")
+                self.save_rebalance_meta_for_id_with_merge(pool, &meta_to_save, "stop_rebalance", meta_to_save.id.as_str())
                     .await,
                 "stop_rebalance",
             )?;
@@ -656,6 +836,10 @@ impl ECStore {
         expected_id: Option<&str>,
         start_error: String,
     ) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        let _activation_guard = self
+            .rebalance_activation_write_guard(expected_id, "rollback rebalance start")
+            .await?;
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             rollback_rebalance_start_meta_snapshot_for_id(
@@ -669,8 +853,13 @@ impl ECStore {
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "rollback_rebalance_start: no pools available")?;
             resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "rollback_rebalance_start")
-                    .await,
+                self.save_rebalance_meta_for_id_with_merge(
+                    pool,
+                    &meta_to_save,
+                    "rollback_rebalance_start",
+                    meta_to_save.id.as_str(),
+                )
+                .await,
                 "rollback_rebalance_start",
             )?;
         }
@@ -692,8 +881,13 @@ impl ECStore {
         if let Some(meta_to_save) = meta_to_save {
             let pool = clone_first_arc(self.pools.as_slice(), "record_rebalance_stop_propagation: no pools available")?;
             resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta_to_save, "record_rebalance_stop_propagation")
-                    .await,
+                self.save_rebalance_meta_for_id_with_merge(
+                    pool,
+                    &meta_to_save,
+                    "record_rebalance_stop_propagation",
+                    meta_to_save.id.as_str(),
+                )
+                .await,
                 "record_rebalance_stop_propagation",
             )?;
         }

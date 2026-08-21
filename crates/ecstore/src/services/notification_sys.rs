@@ -1123,7 +1123,15 @@ impl NotificationSys {
 
         match store.stop_rebalance_for_id(expected_rebalance_id).await {
             Ok(_) => {
-                if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+                let save_result = match expected_rebalance_id {
+                    Some(expected_id) => {
+                        store
+                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
+                            .await
+                    }
+                    None => store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await,
+                };
+                if let Err(err) = save_result {
                     error!(
                         event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                         component = LOG_COMPONENT_ECSTORE,

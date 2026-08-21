@@ -879,6 +879,11 @@ impl PoolRebalanceActivationFence {
     pub(crate) fn ensure_held(&self) -> Result<()> {
         ensure_activation_locks_held(self.pool_meta_guard.is_lock_lost(), self.rebalance_meta_guard.is_lock_lost())
     }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.add_namespace_lock_guard(&self.pool_meta_guard);
+        opts.add_namespace_lock_guard(&self.rebalance_meta_guard);
+    }
 }
 
 fn ensure_activation_locks_held(pool_lock_lost: bool, rebalance_lock_lost: bool) -> Result<()> {
@@ -1793,6 +1798,33 @@ impl PoolMeta {
         Ok(())
     }
 
+    async fn save_no_lock_with_activation_fence<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        activation_fence: &PoolRebalanceActivationFence,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        let data = self.encode_config_data()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        for pool in pools {
+            let mut opts = ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            };
+            activation_fence.add_namespace_lock_fence(&mut opts);
+            activation_fence.ensure_held()?;
+            save_config_with_opts(pool, POOL_META_NAME, data.clone(), &opts).await?;
+            activation_fence.ensure_held()?;
+        }
+
+        Ok(())
+    }
+
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
         if let Some(stats) = self.pools.get_mut(idx) {
             if let Some(d) = &stats.decommission {
@@ -2591,7 +2623,9 @@ impl ECStore {
         }
 
         activation_fence.ensure_held()?;
-        latest_pool_meta.save_no_lock(self.pools.clone()).await?;
+        latest_pool_meta
+            .save_no_lock_with_activation_fence(self.pools.clone(), &activation_fence)
+            .await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
             *pool_meta = latest_pool_meta;

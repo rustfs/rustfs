@@ -66,10 +66,12 @@ use rustfs_filemeta::{FileInfo, MetaCacheEntry};
 use rustfs_rio::Index;
 use s3s::dto::ReplicationConfiguration;
 use serde::Serialize;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -2711,9 +2713,83 @@ async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
     assert!(err.to_string().contains("was stopped before start"));
 }
 
+#[test]
+fn test_stopped_activation_state_prevents_worker_token_commit() {
+    let mut meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        stopped_at: Some(OffsetDateTime::now_utc()),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", tokio_util::sync::CancellationToken::new())
+        .expect("stopped metadata should produce a non-start outcome");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
+}
+
 #[tokio::test]
-async fn test_stop_at_activation_barrier_prevents_worker_token_commit() {
-    let meta = Arc::new(tokio::sync::RwLock::new(RebalanceMeta {
+async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let mut fi = FileInfo::default();
+    fi.size = 128;
+
+    for err in [
+        store
+            .next_rebal_bucket(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not read replacement work"),
+        store
+            .bucket_rebalance_done(0, "bucket-a".to_string(), "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement bucket"),
+        store
+            .update_pool_stats_batch_for_rebalance(0, "bucket-a".to_string(), &[&fi], "rebalance-a")
+            .await
+            .expect_err("old worker must not update replacement stats"),
+        store
+            .check_if_rebalance_done(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement pool"),
+        store
+            .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, "rebalance-a")
+            .await
+            .expect_err("old save task must not persist replacement metadata"),
+    ] {
+        assert!(err.to_string().contains("stale rebalance worker rejected"));
+    }
+
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.pool_stats[0].rebalanced_buckets.is_empty());
+    assert_eq!(meta.pool_stats[0].bytes, 0);
+    assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+}
+
+#[tokio::test]
+async fn test_stop_waits_for_active_rebalance_side_effect_guard() {
+    let meta = RebalanceMeta {
         id: "rebalance-a".to_string(),
         pool_stats: vec![RebalanceStats {
             participating: true,
@@ -2724,28 +2800,38 @@ async fn test_stop_at_activation_barrier_prevents_worker_token_commit() {
             ..Default::default()
         }],
         ..Default::default()
-    }));
-    let fence_reached = Arc::new(tokio::sync::Barrier::new(2));
-    let stop_committed = Arc::new(tokio::sync::Barrier::new(2));
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let run_guard = store
+        .rebalance_run_guard("rebalance-a", "test side effect")
+        .await
+        .expect("active run should admit the side effect");
+    let mut stop = Box::pin(store.stop_rebalance_for_id(Some("rebalance-a")));
+    let mut context = Context::from_waker(futures::task::noop_waker_ref());
 
-    let stop_meta = Arc::clone(&meta);
-    let stop_fence_reached = Arc::clone(&fence_reached);
-    let stop_committed_signal = Arc::clone(&stop_committed);
-    let stop = tokio::spawn(async move {
-        stop_fence_reached.wait().await;
-        stop_meta.write().await.stopped_at = Some(OffsetDateTime::now_utc());
-        stop_committed_signal.wait().await;
-    });
+    assert!(matches!(stop.as_mut().poll(&mut context), Poll::Pending));
+    assert!(
+        store
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|meta| meta.stopped_at.is_none()),
+        "stop must not change run state while a fenced side effect is active"
+    );
 
-    fence_reached.wait().await;
-    stop_committed.wait().await;
-    stop.await.expect("stop barrier task should finish");
-
-    let mut meta = meta.write().await;
-    let outcome = commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", tokio_util::sync::CancellationToken::new())
-        .expect("stopped metadata should produce a non-start outcome");
-    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
-    assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
+    drop(run_guard);
+    stop.await
+        .expect_err("empty test store should fail only after committing the local stop state");
+    assert!(
+        store
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|meta| meta.stopped_at.is_some()),
+        "stop should commit after the production side-effect fence is released"
+    );
 }
 
 fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {

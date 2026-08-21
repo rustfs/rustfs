@@ -79,12 +79,12 @@ impl ECStore {
             state = "starting",
             "Starting rebalance"
         );
-        let expected_id = {
+        let expected_id: Arc<str> = {
             let rebalance_meta = self.rebalance_meta.read().await;
-            rebalance_meta.as_ref().ok_or(Error::ConfigNotFound)?.id.clone()
+            Arc::from(rebalance_meta.as_ref().ok_or(Error::ConfigNotFound)?.id.as_str())
         };
         let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
-        let activation_fence = match self.fence_rebalance_worker_activation(pool, &expected_id).await? {
+        let activation_fence = match self.fence_rebalance_worker_activation(pool, expected_id.as_ref()).await? {
             RebalanceWorkerActivationFence::Ready(fence) => fence,
             RebalanceWorkerActivationFence::NotStartedTerminal => return Ok(()),
         };
@@ -122,7 +122,7 @@ impl ECStore {
                 meta_to_save = Some(meta.clone());
             }
             activation_fence.ensure_held()?;
-            activation_outcome = commit_local_rebalance_worker_activation(meta, &expected_id, cancel_tx)?;
+            activation_outcome = commit_local_rebalance_worker_activation(meta, expected_id.as_ref(), cancel_tx)?;
 
             drop(rebalance_meta);
         }
@@ -198,9 +198,10 @@ impl ECStore {
             let pool_idx = idx;
             let store = self.clone();
             let rx_clone = rx.clone();
+            let worker_id = Arc::clone(&expected_id);
             workers_started += 1;
             tokio::spawn(async move {
-                if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
+                if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx, worker_id).await {
                     error!(
                         event = EVENT_REBALANCE_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -247,13 +248,14 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn rebalance_buckets(self: &Arc<Self>, rx: CancellationToken, pool_index: usize) -> Result<()> {
+    async fn rebalance_buckets(self: &Arc<Self>, rx: CancellationToken, pool_index: usize, rebalance_id: Arc<str>) -> Result<()> {
         ensure_valid_rebalance_pool_index(self.pools.len(), pool_index)?;
 
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Result<()>>(1);
 
         // Save rebalance metadata periodically
         let store = self.clone();
+        let save_rebalance_id = Arc::clone(&rebalance_id);
         let save_task = tokio::spawn(async move {
             let mut timer = tokio::time::interval_at(Instant::now() + Duration::from_secs(30), Duration::from_secs(10));
             let mut msg: String;
@@ -267,6 +269,11 @@ impl ECStore {
                         let terminal_event = classify_rebalance_terminal_event(result, now);
                         msg = terminal_event.message().to_string();
                         let mut rebalance_meta = store.rebalance_meta.write().await;
+                        super::control::ensure_rebalance_run_id(
+                            rebalance_meta.as_ref(),
+                            save_rebalance_id.as_ref(),
+                            "apply rebalance terminal event",
+                        )?;
                         if let Some(meta) = rebalance_meta.as_mut() {
                             let meta_stopped = meta.stopped_at.is_some();
                             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
@@ -315,7 +322,10 @@ impl ECStore {
                     }
                 }
 
-                if let Err(err) = store.save_rebalance_stats(pool_index, RebalSaveOpt::Stats).await {
+                if let Err(err) = store
+                    .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
+                    .await
+                {
                     let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
                     error!("{} err: {:?}", msg, wrapped);
                     if quit {
@@ -381,7 +391,7 @@ impl ECStore {
                 break;
             }
 
-            let next_bucket = match self.next_rebal_bucket(pool_index).await {
+            let next_bucket = match self.next_rebal_bucket(pool_index, rebalance_id.as_ref()).await {
                 Ok(bucket) => bucket,
                 Err(err) => {
                     error!(
@@ -413,7 +423,8 @@ impl ECStore {
                 );
 
                 let outcome = match resolve_rebalance_bucket_result(
-                    self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await,
+                    self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index, Arc::clone(&rebalance_id))
+                        .await,
                     pool_index,
                     &bucket,
                 ) {
@@ -476,7 +487,7 @@ impl ECStore {
                         "Deferred rebalance bucket after transient object failures"
                     );
                     if let Err(err) = self
-                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone())
+                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref())
                         .await
                     {
                         error!(
@@ -540,7 +551,7 @@ impl ECStore {
                     "Completed rebalance bucket"
                 );
                 source_cleanup_deferred_attempts.remove(&bucket);
-                if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
+                if let Err(err) = self.bucket_rebalance_done(pool_index, bucket, rebalance_id.as_ref()).await {
                     error!(
                         event = EVENT_REBALANCE_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -601,8 +612,9 @@ impl ECStore {
         final_result
     }
 
-    pub(super) async fn check_if_rebalance_done(&self, pool_index: usize) -> bool {
+    pub(super) async fn check_if_rebalance_done(&self, pool_index: usize, expected_id: &str) -> Result<bool> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        super::control::ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "check rebalance completion")?;
 
         if let Some(meta) = rebalance_meta.as_mut()
             && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
@@ -617,7 +629,7 @@ impl ECStore {
                     state = "already_completed",
                     "Rebalance pool is already completed"
                 );
-                return true;
+                return Ok(true);
             }
 
             // Mark pool rebalance as done only after it reaches the PercentFreeGoal.
@@ -647,19 +659,30 @@ impl ECStore {
                     percent_free = pfi,
                     "Marked rebalance pool completed"
                 );
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 }
 
 impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
+        self.save_rebalance_stats_inner(pool_idx, opt, None).await
+    }
+
+    pub(crate) async fn save_rebalance_stats_for_id(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: &str) -> Result<()> {
+        self.save_rebalance_stats_inner(pool_idx, opt, Some(expected_id)).await
+    }
+
+    async fn save_rebalance_stats_inner(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: Option<&str>) -> Result<()> {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
+            if let Some(expected_id) = expected_id {
+                super::control::ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "save rebalance stats")?;
+            }
             let Some(meta) = rebalance_meta.as_mut() else {
                 return Ok(());
             };
@@ -681,10 +704,14 @@ impl ECStore {
             "Rebalance metadata save requested"
         );
         let stage = format!("save_rebalance_stats for pool {pool_idx} opt {opt:?}");
-        resolve_rebalance_meta_save_result(
-            self.save_rebalance_meta_with_merge(pool, &meta_to_save, stage.as_str()).await,
-            stage.as_str(),
-        )?;
+        let save_result = match expected_id {
+            Some(expected_id) => {
+                self.save_rebalance_meta_for_id_with_merge(pool, &meta_to_save, stage.as_str(), expected_id)
+                    .await
+            }
+            None => self.save_rebalance_meta_with_merge(pool, &meta_to_save, stage.as_str()).await,
+        };
+        resolve_rebalance_meta_save_result(save_result, stage.as_str())?;
 
         Ok(())
     }
