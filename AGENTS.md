@@ -127,8 +127,9 @@ the broadest gate. Inspect only the final task-owned diff, classify it by
 behavioral impact rather than line count or path alone, and run the smallest
 set of checks that provides meaningful coverage. Do not let unrelated
 worktree changes or a generic contributor checklist expand the scope.
-Non-exempt changes must also pass Adversarial Validation (next section) before
-the checks below count as completion.
+For non-exempt changes, complete the applicable multi-role adversarial review
+before running `make pre-pr` (or an equivalent full gate). Resolve or rebut
+every finding first, then run the gate against the reviewed final diff.
 
 ### Validation floor
 
@@ -166,8 +167,9 @@ the checks below count as completion.
    dependency set is identifiable, validate those packages and known
    dependents instead of the whole workspace. Use `make pre-commit` only when
    a repository-wide fast gate adds useful confidence beyond those checks.
-4. **Broad or high-risk change:** Run `make pre-pr` only when targeted coverage
-   cannot bound the impact, including:
+4. **Broad or high-risk change:** After the applicable adversarial review has
+   completed, run `make pre-pr` only when targeted coverage cannot bound the
+   impact, including:
    - dependency, feature, build-script, procedural-macro, code-generation,
      toolchain, or CI changes that alter compilation or the test matrix;
    - cross-crate public APIs, shared foundational code, or broad refactors with
@@ -287,8 +289,9 @@ High risk: all seven roles.
 - Every testable behavior change has a focused regression check. Exceptions
   follow the validation floor and state why a check is impractical and what
   risk remains.
-- The Verification Before PR gates pass — adversarial review supplements
-  those gates, never replaces them.
+- After the applicable adversarial review has completed, the Verification
+  Before PR gates pass; adversarial review supplements those gates, never
+  replaces them.
 - High risk only: record a one-line verdict per role in the PR description.
 
 ## Git and PR Baseline
