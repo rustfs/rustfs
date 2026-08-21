@@ -236,6 +236,10 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
     assert_eq!(bucket_usage.size, 11);
     assert_eq!(usage.objects_total_count, 2);
     assert_eq!(usage.objects_total_size, 11);
+    assert!(
+        receiver.recv().await.is_none(),
+        "a scanner cycle must publish at most one terminal usage snapshot"
+    );
 }
 
 #[tokio::test]

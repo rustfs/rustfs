@@ -153,6 +153,7 @@ struct MemoryConfigStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     revisions: Mutex<HashMap<String, u64>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
+    object_not_found_put_number: Mutex<HashMap<String, usize>>,
     error_after_commit_put_number: Mutex<HashMap<String, usize>>,
     interleaving_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
     cancel_after_interleaving_puts: Mutex<HashMap<String, CancellationToken>>,
@@ -223,6 +224,9 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
 
         if self.fail_put_number.lock().await.get(&key) == Some(&put_count) {
             return Err(EcstoreError::other("injected put failure"));
+        }
+        if self.object_not_found_put_number.lock().await.get(&key) == Some(&put_count) {
+            return Err(EcstoreError::ObjectNotFound(bucket.to_string(), object.to_string()));
         }
 
         let interleaving_data = {
@@ -1432,6 +1436,131 @@ async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
 }
 
 #[tokio::test]
+async fn test_usage_save_object_not_found_defers_only_with_a_fresh_route_barrier() {
+    for (route_blocked, expected) in [
+        (true, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement)),
+        (false, DataUsagePersistOutcome::Failed),
+    ] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let baseline = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 1);
+        let baseline_data = serde_json::to_vec(&baseline).expect("baseline usage snapshot should encode");
+        store.objects.lock().await.insert(key.clone(), baseline_data.clone());
+        store.revisions.lock().await.insert(key.clone(), 1);
+        store.object_not_found_put_number.lock().await.insert(key.clone(), 1);
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(complete_usage_with_bucket_count(
+                Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+                2,
+            ))
+            .await
+            .expect("new usage snapshot should enqueue");
+        drop(sender);
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_probe_calls = probe_calls.clone();
+
+        let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            None,
+            Some(DataUsagePersistBaseline {
+                data: Some(Bytes::from(baseline_data.clone())),
+                revision: DataUsageCacheRevision::Etag("memory-1".to_string()),
+            }),
+            move || {
+                let probe_calls = route_probe_calls.clone();
+                async move {
+                    let call = probe_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    route_blocked && call > 1
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, expected);
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "ObjectNotFound must be followed by a fresh route-barrier probe"
+        );
+        assert_eq!(
+            store.objects.lock().await.get(&key),
+            Some(&baseline_data),
+            "a route failure must not replace the authoritative baseline"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
+    for observational in [false, true] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let target_path = if observational {
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
+        } else {
+            DATA_USAGE_OBJ_NAME_PATH.as_str()
+        };
+        let target_key = memory_config_key(RUSTFS_META_BUCKET, target_path);
+        let mut incoming = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+        incoming.usage_snapshot_converged = Some(!observational);
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(incoming).await.expect("usage snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            None,
+            Some(DataUsagePersistBaseline {
+                data: None,
+                revision: DataUsageCacheRevision::Missing,
+            }),
+            || async { true },
+        )
+        .await;
+
+        assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+        assert!(!store.objects.lock().await.contains_key(&target_key));
+        assert_eq!(
+            store.put_counts.lock().await.get(&target_key),
+            None,
+            "the final pool-state fence must run before the first PUT"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_usage_route_barrier_precedes_durable_reconciliation() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let snapshot = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+    let snapshot_data = serde_json::to_vec(&snapshot).expect("usage snapshot should encode");
+    let (sender, receiver) = mpsc::channel(1);
+    sender.send(snapshot).await.expect("usage snapshot should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        Some(DataUsagePersistBaseline {
+            data: Some(Bytes::from(snapshot_data)),
+            revision: DataUsageCacheRevision::Etag("memory-1".to_string()),
+        }),
+        || async { true },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert_eq!(store.put_counts.lock().await.get(&key), None);
+}
+
+#[tokio::test]
 async fn test_store_data_usage_in_backend_fences_interleaving_newer_writer() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -2327,6 +2456,15 @@ async fn test_store_data_usage_in_backend_reports_missing_snapshot() {
 fn test_scanner_cycle_completion_prioritizes_persist_failure() {
     assert_eq!(
         scanner_cycle_completion_outcome(
+            ScannerCycleStatus::Complete,
+            DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement),
+            true,
+            false,
+        ),
+        ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
+    );
+    assert_eq!(
+        scanner_cycle_completion_outcome(
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
             DataUsagePersistOutcome::NoUpdate,
             false,
@@ -2446,6 +2584,23 @@ fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
     assert_eq!(outcome, ScannerCycleOutcome::Completed);
     assert_eq!(acknowledgements, vec![remote_acknowledgement]);
     assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+}
+
+#[test]
+#[serial]
+fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let deferred = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
+
+    let (outcome, _, acknowledgements) =
+        finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+
+    assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert!(acknowledgements.is_empty());
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
 #[tokio::test]

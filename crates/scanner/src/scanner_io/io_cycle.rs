@@ -49,6 +49,25 @@ impl ScannerIOCycle for ECStore {
     ) -> Result<ScannerCycleResult> {
         let child_token = ctx.child_token();
 
+        // Check the local pool metadata before listing buckets. A failed or
+        // canceled decommission remains suspended after its worker exits, so
+        // starting a scan in that state could build a snapshot that cannot be
+        // routed to the authoritative metadata object.
+        if self.scanner_data_usage_publication_blocked().await {
+            debug!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_SET_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "cycle_data_usage_route_blocked",
+                "Scanner cycle deferred while data usage metadata remains hidden by data movement"
+            );
+            return Ok(ScannerCycleResult::new(
+                ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                None,
+            ));
+        }
+
         let distributed = self.setup_is_dist_erasure().await;
         let activity_before = match scanner_activity_preflight(crate::scanner::probe_scanner_activity(self, distributed).await) {
             ScannerActivityPreflight::Ready(snapshot) => snapshot,

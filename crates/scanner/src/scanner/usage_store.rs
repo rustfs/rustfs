@@ -22,6 +22,10 @@ pub(super) enum DataUsagePersistOutcome {
     AlreadyDurable,
     PriorCycleDurable,
     Saved,
+    /// The metadata route is temporarily unavailable (for example while a
+    /// terminal decommission state keeps the source pool suspended).  The
+    /// caller must retry without acknowledging dirty usage.
+    Deferred(ScannerCycleDeferReason),
     Failed,
 }
 
@@ -92,10 +96,33 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch(
 pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
     ctx: CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
 ) -> DataUsagePersistOutcome {
+    store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        ctx,
+        storeapi,
+        receiver,
+        leader_epoch,
+        initial_baseline,
+        || async { false },
+    )
+    .await
+}
+
+pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe<F, Fut>(
+    ctx: CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    leader_epoch: Option<u64>,
+    initial_baseline: Option<DataUsagePersistBaseline>,
+    route_probe: F,
+) -> DataUsagePersistOutcome
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = bool> + Send,
+{
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
     let mut next_baseline = initial_baseline;
 
@@ -113,6 +140,19 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
         } else {
             DATA_USAGE_OBJ_NAME_PATH.as_str()
         };
+        if route_probe().await {
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %target_path,
+                state = "publication_blocked_before_reconcile",
+                "Scanner data usage publication deferred by the pool-state fence"
+            );
+            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            break;
+        }
 
         if observational && data_usage_info.usage_snapshot_authoritative_baseline.is_none() {
             let authoritative_data = match next_baseline.as_ref() {
@@ -275,6 +315,18 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
             if ctx.is_cancelled() {
                 break 'updates;
             }
+            if route_probe().await {
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %target_path,
+                    state = "publication_blocked_before_save",
+                    "Scanner data usage publication deferred by the final pool-state fence"
+                );
+                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            }
 
             let done_save = Metrics::time(Metric::SaveUsage);
             let save_result = save_config_shared_with_preconditions(
@@ -312,6 +364,33 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
                         retry = cas_retry,
                         "Scanner data usage CAS conflict will be reconciled"
                     );
+                }
+                Err(e @ EcstoreError::ObjectNotFound(_, _)) => {
+                    let route_blocked = route_probe().await;
+                    if route_blocked {
+                        warn!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %target_path,
+                            state = "publication_deferred",
+                            error = %e,
+                            "Scanner data usage route is blocked by data movement; retrying later"
+                        );
+                        break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                    }
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %target_path,
+                        state = "save_failed",
+                        error = %e,
+                        "Scanner data usage save failed"
+                    );
+                    break DataUsagePersistOutcome::Failed;
                 }
                 Err(e) => {
                     error!(
@@ -369,6 +448,11 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
                 outcome = DataUsagePersistOutcome::Failed;
                 continue;
+            }
+            DataUsagePersistOutcome::Deferred(reason) => {
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+                outcome = DataUsagePersistOutcome::Deferred(reason);
+                break 'updates;
             }
             DataUsagePersistOutcome::Saved => {
                 if observational {

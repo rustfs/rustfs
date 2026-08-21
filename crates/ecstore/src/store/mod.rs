@@ -343,6 +343,23 @@ impl ECStore {
         let (decommission, rebalance) = tokio::join!(self.is_decommission_running(), self.is_rebalance_started());
         decommission || rebalance
     }
+
+    /// Returns whether scanner metadata may still be hidden by a local
+    /// data-movement state. Terminal failed/canceled decommission entries
+    /// remain suspended until an operator clears or retries them, so they are
+    /// a publication barrier even after the worker has stopped.
+    pub async fn scanner_data_usage_publication_blocked(&self) -> bool {
+        if self.scanner_data_movement_active().await {
+            return true;
+        }
+
+        let pool_meta = self.pool_meta.read().await;
+        pool_meta.pools.iter().any(|pool| {
+            pool.decommission
+                .as_ref()
+                .is_some_and(|info| !info.queued && (info.failed || info.canceled))
+        })
+    }
 }
 
 // impl Clone for ECStore {
@@ -875,6 +892,7 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints, SetupType};
     use crate::runtime::global::reset_local_disk_test_state;
     use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
@@ -909,6 +927,72 @@ mod tests {
             ctx,
             bucket_fence_registry: Arc::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn scanner_data_usage_publication_blocks_active_and_unqueued_terminal_decommission() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let cases = [
+            (
+                "active",
+                PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "failed",
+                PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "canceled",
+                PoolDecommissionInfo {
+                    canceled: true,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "queued_failed",
+                PoolDecommissionInfo {
+                    failed: true,
+                    queued: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "complete",
+                PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            ("idle", PoolDecommissionInfo::default(), false),
+        ];
+
+        for (name, decommission, expected) in cases {
+            *store.pool_meta.write().await = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: format!("scanner-publication-{name}"),
+                    last_update: OffsetDateTime::now_utc(),
+                    decommission: Some(decommission),
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                store.scanner_data_usage_publication_blocked().await,
+                expected,
+                "unexpected scanner publication barrier state for {name}"
+            );
+        }
     }
 
     // The object graph is the isolation carrier: two ECStore instances holding
