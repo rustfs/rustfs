@@ -272,6 +272,11 @@ impl ECStore {
             return Ok(());
         }
 
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
+        let endpoints = self.endpoints();
+
         let mut workers_started = 0usize;
         for (idx, participating) in participants.iter().enumerate() {
             if !*participating {
@@ -287,7 +292,7 @@ impl ECStore {
                 continue;
             }
 
-            if !runtime_sources::endpoint_pool_is_local(idx) {
+            if !runtime_sources::endpoint_pool_is_local(&endpoints, idx) {
                 debug!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,

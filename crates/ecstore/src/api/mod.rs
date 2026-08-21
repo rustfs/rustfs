@@ -444,6 +444,7 @@ pub mod rebalance {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::services::rebalance::entry::test_util::PausedRebalanceEntryTestFixture;
+        pub use crate::services::rebalance::test_store_with_persisted_rebalance_meta;
     }
 }
 

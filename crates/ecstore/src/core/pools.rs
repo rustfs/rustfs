@@ -28,7 +28,9 @@ use crate::bucket::{
     metadata_sys,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
-use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
+use crate::config::com::{
+    CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts, save_config_with_opts_quiet,
+};
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -1997,9 +1999,10 @@ impl PoolMeta {
 
         // Pool zero is canonical. Once its save succeeds, later writes only
         // replicate committed state and must not reuse the admission fence.
+        // Failed replicas remain repairable by the next full pool metadata save.
         drop(activation_fence);
-        for pool in pools {
-            save_config_with_opts(
+        for (pool_index, pool) in pools.enumerate() {
+            if let Err(err) = save_config_with_opts_quiet(
                 pool,
                 POOL_META_NAME,
                 data.clone(),
@@ -2009,7 +2012,18 @@ impl PoolMeta {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_index + 1,
+                    state = "activation_replica_repair_pending",
+                    error = %err,
+                    "Decommission activation replica repair pending"
+                );
+            }
         }
 
         Ok(())
@@ -4753,6 +4767,65 @@ mod tests {
                 "every pool must adopt the canonical committed activation"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_activation_adopts_canonical_commit_after_replica_failure() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
+        let start_store = Arc::clone(&store);
+        let start_task = tokio::spawn(async move { start_store.start_decommission(vec![0]).await });
+
+        barrier.wait_until_paused().await;
+        let mut replica_disks = Vec::new();
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let saved = std::mem::take(&mut *disks);
+            *disks = vec![None; saved.len()];
+            replica_disks.push(saved);
+        }
+        barrier.release_after_fence_loss();
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+            .await
+            .expect("decommission activation should finish after its canonical commit")
+            .expect("decommission activation task should not panic")
+            .expect("a replica save failure must not report the committed activation as failed");
+
+        for (set, disks) in store.pools[1].disk_set.iter().zip(replica_disks) {
+            *set.disks.write().await = disks;
+        }
+
+        let local = store.pool_meta.read().await;
+        assert!(pool_meta_has_active_decommission(&local));
+        drop(local);
+
+        let mut canonical = PoolMeta::default();
+        canonical
+            .load_no_lock(store.pools[0].clone())
+            .await
+            .expect("the canonical committed decommission metadata should remain readable");
+        assert!(pool_meta_has_active_decommission(&canonical));
+
+        let mut replica = PoolMeta::default();
+        replica
+            .load_no_lock(store.pools[1].clone())
+            .await
+            .expect("the stale replica metadata should remain readable after disks recover");
+        assert!(!pool_meta_has_active_decommission(&replica));
+
+        let worker_cancel = CancellationToken::new();
+        store
+            .spawn_decommission_routines(Arc::clone(&store), worker_cancel.clone(), vec![0])
+            .await
+            .expect("the committed activation should admit its decommission worker");
+        let admitted_cancel = store.decommission_cancelers.read().await[0]
+            .clone()
+            .expect("the admitted decommission worker should have a cancellation token");
+        assert!(!admitted_cancel.is_cancelled());
+        worker_cancel.cancel();
+        assert!(admitted_cancel.is_cancelled());
     }
 
     #[test]

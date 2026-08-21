@@ -536,6 +536,41 @@ impl ECStore {
         self.load_rebalance_meta_under_start_gate().await
     }
 
+    /// Cancels local admission before refreshing the persisted stop target under the start gate.
+    pub async fn prepare_rebalance_stop(&self) -> Result<Option<String>> {
+        let _start_guard = self.start_gate.lock().await;
+
+        {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            if let Some(meta) = rebalance_meta.as_mut()
+                && is_rebalance_conflicting_with_decommission(meta)
+            {
+                meta.cancel
+                    .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+                    .cancel();
+                #[cfg(any(test, feature = "test-util"))]
+                observe_rebalance_stop_wait_attempt(Some(meta.id.as_str()));
+            }
+        }
+
+        self.load_rebalance_meta_under_start_gate().await?;
+
+        let mut rebalance_meta = self.rebalance_meta.write().await;
+        let Some(meta) = rebalance_meta.as_mut() else {
+            return Ok(None);
+        };
+        if !is_rebalance_conflicting_with_decommission(meta) {
+            return Ok(None);
+        }
+        if meta.id.is_empty() {
+            return Err(Error::other("active rebalance metadata has no activation id"));
+        }
+        meta.cancel
+            .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+            .cancel();
+        Ok(Some(meta.id.clone()))
+    }
+
     pub(crate) async fn load_rebalance_meta_under_start_gate(&self) -> Result<()> {
         let mut meta = RebalanceMeta::new();
         debug!(
@@ -1298,10 +1333,18 @@ mod tests {
             .expect("the committed worker candidate should remain installed locally");
         assert_eq!(local.id, rebalance_id);
         assert_eq!(local.pool_stats[0].info.status, RebalStatus::Completed);
-        if let Some(cancel) = local.cancel.as_ref() {
-            cancel.cancel();
-        }
+        let admitted_cancel = local
+            .cancel
+            .clone()
+            .expect("the committed worker candidate should install its cancellation token");
+        assert!(!admitted_cancel.is_cancelled());
         drop(local_meta);
+
+        store
+            .cancel_rebalance_admission_for_id(rebalance_id)
+            .await
+            .expect("the installed token should cancel the admitted worker");
+        assert!(admitted_cancel.is_cancelled());
 
         let mut persisted = RebalanceMeta::new();
         persisted

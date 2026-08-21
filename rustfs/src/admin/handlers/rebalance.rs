@@ -872,6 +872,13 @@ impl Operation for RebalanceStatus {
     }
 }
 
+async fn rebalance_stop_target_id(store: &Arc<ECStore>) -> S3Result<Option<String>> {
+    store
+        .prepare_rebalance_stop()
+        .await
+        .map_err(|e| s3_error!(InternalError, "failed to prepare rebalance metadata for stop: {}", e))
+}
+
 async fn stop_rebalance_admission_first(
     store: &Arc<ECStore>,
     notification_sys: Option<&NotificationSys>,
@@ -947,14 +954,9 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
-        let expected_rebalance_id = store.current_rebalance_id().await;
-
-        if !store.is_rebalance_conflicting_with_decommission().await {
+        let Some(expected_rebalance_id) = rebalance_stop_target_id(&store).await? else {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
-        }
-        let Some(expected_rebalance_id) = expected_rebalance_id else {
-            return Err(s3_error!(InternalError, "active rebalance metadata has no activation id"));
         };
 
         let notification_sys = current_notification_system();
@@ -1096,14 +1098,30 @@ mod rebalance_handler_tests {
         RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStartStep, RebalanceStopPropagationStatus,
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
-        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_used_pct,
-        rollback_result_label, stop_rebalance_admission_first,
+        rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id,
+        rebalance_used_pct, rollback_result_label, stop_rebalance_admission_first,
     };
     use crate::admin::storage_api::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
+
+    fn started_rebalance_meta(id: &str) -> RebalanceMeta {
+        RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    start_time: Some(OffsetDateTime::now_utc()),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -1113,7 +1131,13 @@ mod rebalance_handler_tests {
         fixture.wait_until_entry_paused().await;
 
         let stop_store = fixture.store();
-        let mut stop_task = tokio::spawn(async move { stop_rebalance_admission_first(&stop_store, None, REBALANCE_ID).await });
+        let mut stop_task = tokio::spawn(async move {
+            let expected_rebalance_id = rebalance_stop_target_id(&stop_store)
+                .await
+                .expect("admin stop target resolution should succeed")
+                .expect("the active rebalance should remain stoppable");
+            stop_rebalance_admission_first(&stop_store, None, expected_rebalance_id.as_str()).await
+        });
         fixture.wait_until_admission_cancelled().await;
         fixture.wait_until_stop_waiting_for_entry().await;
         assert!(!stop_task.is_finished(), "admin stop must wait for the paused entry guard to drain");
@@ -1127,6 +1151,75 @@ mod rebalance_handler_tests {
             .expect("admin stop should persist the terminal state");
         assert!(stop_failures.is_empty());
         assert!(!fixture.store().is_rebalance_conflicting_with_decommission().await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_loads_persisted_active_rebalance_from_cold_memory() {
+        const REBALANCE_ID: &str = "admin-stop-cold-memory";
+        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
+            started_rebalance_meta(REBALANCE_ID),
+        )
+        .await;
+        *store.rebalance_meta.write().await = None;
+        assert!(store.current_rebalance_id().await.is_none());
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop should load persisted rebalance metadata")
+            .expect("persisted active rebalance should be stoppable");
+        assert_eq!(expected_rebalance_id, REBALANCE_ID);
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("admin stop should persist the terminal state after a cold load");
+        assert!(stop_failures.is_empty());
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the persisted terminal rebalance metadata should remain readable");
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_refreshes_persisted_active_over_stale_inactive_memory() {
+        const PERSISTED_REBALANCE_ID: &str = "admin-stop-persisted-active";
+        const STALE_REBALANCE_ID: &str = "admin-stop-stale-terminal";
+        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
+            started_rebalance_meta(PERSISTED_REBALANCE_ID),
+        )
+        .await;
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: STALE_REBALANCE_ID.to_string(),
+            stopped_at: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(STALE_REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop should refresh stale inactive local metadata")
+            .expect("persisted active rebalance should replace the stale local terminal state");
+        assert_eq!(expected_rebalance_id, PERSISTED_REBALANCE_ID);
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("admin stop should persist the refreshed run's terminal state");
+        assert!(stop_failures.is_empty());
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the refreshed run's persisted terminal metadata should remain readable");
+        assert_eq!(store.current_rebalance_id().await.as_deref(), Some(PERSISTED_REBALANCE_ID));
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
     }
 
     #[test]

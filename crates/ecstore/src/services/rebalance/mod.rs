@@ -54,7 +54,7 @@ pub use types::{
 use types::{RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome};
 
 #[cfg(any(test, feature = "test-util"))]
-pub(crate) async fn test_store_with_persisted_rebalance_meta(
+pub async fn test_store_with_persisted_rebalance_meta(
     meta: RebalanceMeta,
 ) -> (Vec<tempfile::TempDir>, std::sync::Arc<crate::store::ECStore>) {
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
