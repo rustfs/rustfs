@@ -334,17 +334,17 @@ fn validate_credential_at(
         return Err(CredentialValidationError::Identity);
     }
 
-    let leafs = CertificateDer::pem_slice_iter(response.certificate.as_bytes())
+    let leaves = CertificateDer::pem_slice_iter(response.certificate.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| CredentialValidationError::Certificate)?;
-    if leafs.len() != 1 {
+    if leaves.len() != 1 {
         return Err(CredentialValidationError::Certificate);
     }
     let chain = CertificateDer::pem_slice_iter(response.certificate_chain.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| CredentialValidationError::Certificate)?;
     if chain.is_empty()
-        || chain[0].as_ref() != leafs[0].as_ref()
+        || chain[0].as_ref() != leaves[0].as_ref()
         || chain
             .iter()
             .skip(1)
@@ -354,7 +354,7 @@ fn validate_credential_at(
     }
 
     let (remaining, certificate) =
-        X509Certificate::from_der(leafs[0].as_ref()).map_err(|_| CredentialValidationError::Certificate)?;
+        X509Certificate::from_der(leaves[0].as_ref()).map_err(|_| CredentialValidationError::Certificate)?;
     if !remaining.is_empty() {
         return Err(CredentialValidationError::Certificate);
     }
@@ -439,7 +439,7 @@ fn validate_credential_at(
         .build()
         .map_err(|_| CredentialValidationError::Chain)?;
     verifier
-        .verify_client_cert(&leafs[0], &chain[1..], verify_unix)
+        .verify_client_cert(&leaves[0], &chain[1..], verify_unix)
         .map_err(|_| CredentialValidationError::Chain)?;
     if not_before != certificate.validity().not_before.timestamp()
         || not_after != certificate.validity().not_after.timestamp()
