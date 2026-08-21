@@ -52,6 +52,7 @@ use rustfs_config::{
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_data_usage::observed_data_usage_is_newer;
+use rustfs_lock::NamespaceLockGuard;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 #[cfg(test)]
@@ -983,20 +984,116 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
+#[cfg(not(test))]
+const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_millis(50);
+
+async fn fence_scanner_epoch_after_cycle_timeout<Store, LockLost>(
+    ctx: &CancellationToken,
+    storeapi: Arc<Store>,
+    cycle_info: &mut CurrentCycle,
+    cycle_revision: &mut DataUsageCacheRevision,
+    leader_epoch: &mut u64,
+    lock_lost: LockLost,
+) -> bool
+where
+    Store: ScannerObjectIO,
+    LockLost: Future<Output = ()>,
+{
+    let fence_ctx = ctx.child_token();
+    let claim = claim_scanner_leadership(&fence_ctx, storeapi, cycle_info, cycle_revision, leader_epoch);
+    tokio::pin!(claim);
+    tokio::pin!(lock_lost);
+    tokio::select! {
+        biased;
+        _ = &mut lock_lost => {
+            fence_ctx.cancel();
+            false
+        }
+        result = tokio::time::timeout(SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT, &mut claim) => {
+            result.unwrap_or(false) && !fence_ctx.is_cancelled()
+        }
+    }
+}
+
+struct ScannerCycleDeadlineState<'a> {
+    cycle_info: &'a mut CurrentCycle,
+    cycle_revision: &'a mut DataUsageCacheRevision,
+    leader_epoch: &'a mut u64,
+    cycle_budget: &'a ScannerCycleBudget,
+}
+
+fn cycle_timeout_requires_recovery(worker_stopped: bool, cycle_state_persisted: bool, generation_fenced: bool) -> bool {
+    !worker_stopped || !cycle_state_persisted || !generation_fenced
+}
+
+async fn handle_scanner_cycle_deadline<Store>(
+    ctx: &CancellationToken,
+    storeapi: Arc<Store>,
+    state: ScannerCycleDeadlineState<'_>,
+    worker_stopped: bool,
+    guard: &mut NamespaceLockGuard,
+) where
+    Store: ScannerObjectIO,
+{
+    let fenced = fence_scanner_epoch_after_cycle_timeout(
+        ctx,
+        storeapi,
+        state.cycle_info,
+        state.cycle_revision,
+        state.leader_epoch,
+        guard.lock_lost_notified(),
+    )
+    .await;
+    let cycle_state_persisted = state.cycle_budget.cycle_state_persisted();
+    let recovery_required = cycle_timeout_requires_recovery(worker_stopped, cycle_state_persisted, fenced);
+    warn!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_CYCLE_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "cycle_timeout",
+        worker_stopped,
+        cycle_state_persisted,
+        generation_fenced = fenced,
+        recovery_required,
+        "Scanner cycle deadline expired; durable cursor/generation fencing completed when possible"
+    );
+    global_metrics().record_scanner_cycle_timeout(recovery_required, state.cycle_budget.progress_age());
+    // Stop renewing before releasing the lease. A new leader can then claim the
+    // higher persisted generation instead of inheriting the expired worker.
+    guard.release();
+    global_metrics().set_cycle(None).await;
+}
+
 async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard: &mut ScannerCycleMetricsGuard) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
     cycle_metrics_guard.finish(cycle_info.clone()).await;
 }
 
-#[instrument(skip_all)]
-#[hotpath::measure]
+#[cfg(test)]
 async fn run_data_scanner_cycle(
     ctx: &CancellationToken,
     storeapi: &Arc<ECStore>,
     cycle_info: &mut CurrentCycle,
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
+) -> ScannerCycleOutcome {
+    let cycle_budget = ScannerCycleBudget::new(ctx, scanner_cycle_budget_config());
+    run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget).await
+}
+
+#[instrument(skip_all)]
+#[hotpath::measure]
+async fn run_data_scanner_cycle_with_budget(
+    ctx: &CancellationToken,
+    storeapi: &Arc<ECStore>,
+    cycle_info: &mut CurrentCycle,
+    cycle_revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    cycle_budget: Arc<ScannerCycleBudget>,
 ) -> ScannerCycleOutcome {
     let _activity_guard = ScannerActivityGuard::new();
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
@@ -1012,7 +1109,11 @@ async fn run_data_scanner_cycle(
     }
     let configured_cycle_interval = scanner_cycle_interval();
     let configured_bitrot_cycle = scanner_bitrot_cycle();
-    let cycle_budget_config = scanner_cycle_budget_config();
+    let cycle_budget_config = ScannerCycleBudgetConfig {
+        max_duration: cycle_budget.max_duration(),
+        max_objects: cycle_budget.max_objects(),
+        max_directories: cycle_budget.max_directories(),
+    };
     let usage_persist_timeout = data_usage_persist_timeout();
     global_metrics().record_scanner_cycle_config(
         configured_cycle_interval,
@@ -1083,7 +1184,6 @@ async fn run_data_scanner_cycle(
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
     let scan_result = storeapi
         .clone()
         .nsscanner_with_status(
@@ -1223,7 +1323,7 @@ async fn run_data_scanner_cycle(
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            return if persist_required_scanner_cycle_floor(
+            let persisted = persist_required_scanner_cycle_floor(
                 ctx,
                 storeapi.clone(),
                 cycle_info,
@@ -1232,8 +1332,9 @@ async fn run_data_scanner_cycle(
                 required_cycle,
                 &mut cycle_metrics_guard,
             )
-            .await
-            {
+            .await;
+            return if persisted {
+                cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
             } else {
                 ScannerCycleOutcome::Failed
@@ -1291,7 +1392,7 @@ async fn run_data_scanner_cycle(
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        return if finalize_partial_scan_cycle(
+        let persisted = finalize_partial_scan_cycle(
             ctx,
             storeapi.clone(),
             cycle_info,
@@ -1299,8 +1400,9 @@ async fn run_data_scanner_cycle(
             leader_epoch,
             &mut cycle_metrics_guard,
         )
-        .await
-        {
+        .await;
+        return if persisted {
+            cycle_budget.mark_cycle_state_persisted();
             ScannerCycleOutcome::Partial
         } else {
             ScannerCycleOutcome::Failed
@@ -1375,7 +1477,7 @@ async fn run_data_scanner_cycle(
                 );
             }
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            return if finalize_partial_scan_cycle(
+            let persisted = finalize_partial_scan_cycle(
                 ctx,
                 storeapi.clone(),
                 cycle_info,
@@ -1383,8 +1485,9 @@ async fn run_data_scanner_cycle(
                 leader_epoch,
                 &mut cycle_metrics_guard,
             )
-            .await
-            {
+            .await;
+            return if persisted {
+                cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
             } else {
                 ScannerCycleOutcome::Failed
@@ -1425,6 +1528,7 @@ async fn run_data_scanner_cycle(
             )
             .await
             {
+                cycle_budget.mark_cycle_state_persisted();
                 emit_scan_cycle_superseded(cycle_start.elapsed());
                 return ScannerCycleOutcome::Superseded;
             }
@@ -1457,6 +1561,7 @@ async fn run_data_scanner_cycle(
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
     }
+    cycle_budget.mark_cycle_state_persisted();
 
     done_cycle();
     emit_scan_cycle_complete(true, cycle_start.elapsed());
@@ -1521,7 +1626,7 @@ async fn run_data_scanner_with_maintenance_state(
 ) -> Result<(), ScannerError> {
     reset_scanner_cycle_schedule();
     // Acquire leader lock (write lock) to ensure only one scanner runs
-    let guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
+    let mut guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
                 record_scanner_leader_lock_state("acquired");
@@ -1704,13 +1809,49 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
         let cycle_ctx = ctx.child_token();
-        let initial_outcome = await_scanner_cycle_with_lock_fence(
+        let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        let initial_outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
-            run_data_scanner_cycle(&cycle_ctx, &storeapi, &mut cycle_info, &mut cycle_revision, leader_epoch),
+            &cycle_budget,
+            run_data_scanner_cycle_with_budget(
+                &cycle_ctx,
+                &storeapi,
+                &mut cycle_info,
+                &mut cycle_revision,
+                leader_epoch,
+                cycle_budget.clone(),
+            ),
             guard.lock_lost_notified(),
         )
         .await
-        .unwrap_or(ScannerCycleOutcome::Failed);
+        {
+            ScannerCycleWaitOutcome::Completed(outcome) => outcome,
+            ScannerCycleWaitOutcome::LockLost => {
+                record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
+                global_metrics().set_cycle(None).await;
+                return Ok(());
+            }
+            ScannerCycleWaitOutcome::Cancelled => {
+                global_metrics().set_cycle(None).await;
+                return Ok(());
+            }
+            ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
+                handle_scanner_cycle_deadline(
+                    &ctx,
+                    storeapi.clone(),
+                    ScannerCycleDeadlineState {
+                        cycle_info: &mut cycle_info,
+                        cycle_revision: &mut cycle_revision,
+                        leader_epoch: &mut leader_epoch,
+                        cycle_budget: &cycle_budget,
+                    },
+                    worker_stopped,
+                    &mut guard,
+                )
+                .await;
+                return Ok(());
+            }
+        };
         superseded_backoff.record_retryable_cycle(initial_outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(initial_outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -1916,13 +2057,49 @@ async fn run_data_scanner_with_maintenance_state(
         }
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
-        let outcome = await_scanner_cycle_with_lock_fence(
+        let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        let outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
-            run_data_scanner_cycle(&cycle_ctx, &storeapi, &mut cycle_info, &mut cycle_revision, leader_epoch),
+            &cycle_budget,
+            run_data_scanner_cycle_with_budget(
+                &cycle_ctx,
+                &storeapi,
+                &mut cycle_info,
+                &mut cycle_revision,
+                leader_epoch,
+                cycle_budget.clone(),
+            ),
             guard.lock_lost_notified(),
         )
         .await
-        .unwrap_or(ScannerCycleOutcome::Failed);
+        {
+            ScannerCycleWaitOutcome::Completed(outcome) => outcome,
+            ScannerCycleWaitOutcome::LockLost => {
+                record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;
+                global_metrics().set_cycle(None).await;
+                return Ok(());
+            }
+            ScannerCycleWaitOutcome::Cancelled => {
+                global_metrics().set_cycle(None).await;
+                return Ok(());
+            }
+            ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
+                handle_scanner_cycle_deadline(
+                    &ctx,
+                    storeapi.clone(),
+                    ScannerCycleDeadlineState {
+                        cycle_info: &mut cycle_info,
+                        cycle_revision: &mut cycle_revision,
+                        leader_epoch: &mut leader_epoch,
+                        cycle_budget: &cycle_budget,
+                    },
+                    worker_stopped,
+                    &mut guard,
+                )
+                .await;
+                return Ok(());
+            }
+        };
         superseded_backoff.record_retryable_cycle(outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
