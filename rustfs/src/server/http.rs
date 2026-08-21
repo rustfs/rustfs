@@ -1537,7 +1537,7 @@ fn process_connection(
                 None
             }
         };
-        // ── Canonical Middleware Stack Order (outermost → innermost) ──
+        // ── Canonical External Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
         // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
         //
@@ -1565,6 +1565,8 @@ fn process_connection(
         // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
         // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // The internode lane below intentionally keeps only the shared
+        // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
         let build_external_stack = |service| {
             ServiceBuilder::new()
@@ -1747,16 +1749,9 @@ fn process_connection(
                 .layer(PropagateRequestIdLayer::x_request_id())
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
                 .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-                .layer(S3ErrorMessageCompatLayer)
-                .layer(IcebergRestErrorCompatLayer)
-                .layer(ObjectAttributesEtagFixLayer)
-                .layer(ConditionalCorsLayer::new())
-                .option_layer(if is_console { Some(RedirectLayer) } else { None })
-                .layer(BodylessStatusFixLayer)
-                .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(Arc::clone(&server_ctx)))
-                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-                .layer(DoubleSlashListBucketsCompatLayer)
+                // The internode lane only serves `/rustfs/rpc/...` gRPC requests.
+                // Keep safety/observability layers above, but leave S3/REST
+                // compatibility rewrites on the external lane.
                 .service(service)
         };
         let external_stack_service = build_external_stack(external_service);
