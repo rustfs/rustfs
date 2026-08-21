@@ -3604,6 +3604,15 @@ impl SetDisks {
         &self.ctx
     }
 
+    /// Whether both sets' namespace-lock implementations cover the same object key.
+    pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
+        match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
+            (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
+            (true, true) => Arc::ptr_eq(&self.ctx, &other.ctx) && self.set_lock_namespace == other.set_lock_namespace,
+            _ => false,
+        }
+    }
+
     /// The lock manager this set actually uses (test-only; Phase 5 Slice 3).
     #[cfg(test)]
     pub(crate) fn local_lock_manager_for_test(&self) -> &Arc<rustfs_lock::GlobalLockManager> {

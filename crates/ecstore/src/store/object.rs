@@ -1952,16 +1952,12 @@ impl ECStore {
         };
 
         mutation_fence.add_namespace_lock_fence(opts);
-        let distributed = self.ctx.is_dist_erasure().await;
         let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first());
         let target_set = self.pools.get(target_pool_idx).map(|pool| pool.get_disks_by_key(object));
-        // Local locks share one manager without set-qualified resource keys.
-        // Distributed locks overlap when both sets use the same client domain.
-        opts.no_lock = matches!(
-            (fixed_set, target_set),
-            (Some(fixed), Some(target))
-                if !distributed || same_distributed_lock_domain(&fixed.lockers, &target.lockers)
-        );
+        opts.no_lock = match (fixed_set, target_set) {
+            (Some(fixed), Some(target)) => fixed.shares_namespace_lock_domain(&target).await,
+            _ => false,
+        };
     }
 
     pub(crate) async fn acquire_decommission_source_cleanup_fence(
@@ -1980,9 +1976,8 @@ impl ECStore {
         let test_namespace_lock_fence =
             decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::SourceCleanup);
         let object = encode_dir_object(object);
-        let distributed = self.ctx.is_dist_erasure().await;
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
-        let source_lock_covered = !distributed || same_distributed_lock_domain(&fixed_set.lockers, &source_set.lockers);
+        let source_lock_covered = fixed_set.shares_namespace_lock_domain(source_set).await;
         // Lock order: fixed store mutation domain first; source cleanup takes its
         // hashed source-domain lock second only when this guard does not cover it.
         let guard = self
@@ -3956,6 +3951,65 @@ mod tests {
             &[Arc::clone(&second), Arc::clone(&first)]
         ));
         assert!(!same_distributed_lock_domain(&[first, second], &[other]));
+    }
+
+    #[tokio::test]
+    async fn decommission_fence_keeps_dist_set_locks_when_clients_match_but_namespaces_differ() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original_sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        let mut second_set = (*original_sets.disk_set[1]).clone();
+        second_set.lockers = original_sets.disk_set[0].lockers.clone();
+        let mut sets = (*original_sets).clone();
+        sets.disk_set[1] = Arc::new(second_set);
+        let sets = Arc::new(sets);
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+
+        assert!(
+            sets.disk_set[0]
+                .lockers
+                .iter()
+                .zip(&sets.disk_set[1].lockers)
+                .all(|(fixed, hashed)| Arc::ptr_eq(fixed, hashed)),
+            "the regression requires identical distributed lock clients"
+        );
+        assert_ne!(sets.disk_set[0].set_index, sets.disk_set[1].set_index);
+
+        let pool_config = sets.endpoints.clone();
+        let store = new_prepared_reader_test_store_from_pools(vec![Arc::clone(&sets)], vec![pool_config], ctx);
+        let object = (0..1_000)
+            .map(|index| format!("decommission-dist-domain-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a key should hash to the second set namespace");
+        let mutation_fence = store
+            .acquire_decommission_object_mutation_fence("bucket", &object)
+            .await
+            .expect("the fixed distributed mutation fence should be acquired");
+
+        let mut put_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut put_opts, Some(&mutation_fence))
+            .await;
+        assert!(!put_opts.no_lock, "migration target PUT must retain the hashed-set lock");
+
+        let mut multipart_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut multipart_opts, Some(&mutation_fence))
+            .await;
+        assert!(!multipart_opts.no_lock, "migration target multipart must retain the hashed-set lock");
+        drop(mutation_fence);
+
+        let cleanup_object = (0..1_000)
+            .map(|index| format!("decommission-dist-cleanup-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a cleanup key should hash to the second set namespace");
+        let source_fence = store
+            .acquire_decommission_source_cleanup_fence("bucket", &cleanup_object, sets.disk_set[1].as_ref())
+            .await
+            .expect("the fixed distributed cleanup fence should be acquired");
+        assert!(
+            !source_fence.source_lock_covered(),
+            "source cleanup must retain its distinct distributed set lock"
+        );
     }
 
     #[test]
