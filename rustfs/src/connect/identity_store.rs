@@ -226,6 +226,18 @@ impl IdentityStore {
         }
     }
 
+    pub(crate) fn clear_next(&self) -> Result<(), StoreError> {
+        let path = self.directory.join(NEXT_KEY_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                path: self.directory.clone(),
+                source,
+            }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io { path, source }),
+        }
+    }
+
     /// Write, seal, fsync, then link into place and fsync the directory. The
     /// key is durable before it is reachable, and it is reachable only once.
     fn publish(&self, file: &str, der: &[u8]) -> Result<(), StoreError> {

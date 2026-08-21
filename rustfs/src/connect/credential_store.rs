@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 const CREDENTIAL_FILE: &str = "device.crt.json";
 const REGISTRATION_PENDING_FILE: &str = "registration.pending.json";
 const ROTATION_PENDING_FILE: &str = "rotation.pending.json";
+const LOCK_FILE: &str = ".state.lock";
 
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
@@ -60,6 +61,10 @@ pub(crate) struct PendingRegistration {
     pub token_uid: String,
     pub request_id: String,
     pub certificate_request: String,
+    #[serde(default)]
+    pub previous_credential_fingerprint: Option<String>,
+    #[serde(default)]
+    pub next_public_key_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,6 +104,10 @@ pub struct CredentialStore {
     directory: PathBuf,
 }
 
+pub(crate) struct CredentialLock {
+    _file: fs::File,
+}
+
 impl CredentialStore {
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
@@ -106,8 +115,47 @@ impl CredentialStore {
         }
     }
 
-    pub fn load(&self) -> Result<Option<DeviceCredential>, CredentialStoreError> {
+    pub(crate) fn load(&self) -> Result<Option<DeviceCredential>, CredentialStoreError> {
         self.read(CREDENTIAL_FILE)
+    }
+
+    pub(crate) async fn lock(&self) -> Result<CredentialLock, CredentialStoreError> {
+        let directory = self.directory.clone();
+        tokio::task::spawn_blocking(move || {
+            fs::create_dir_all(&directory).map_err(|source| CredentialStoreError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = directory.join(LOCK_FILE);
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(false).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(FILE_MODE);
+            }
+            let file = options.open(&path).map_err(|source| CredentialStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            check_mode(&path)?;
+            #[cfg(not(unix))]
+            return Err(CredentialStoreError::Io {
+                path,
+                source: io::Error::new(io::ErrorKind::Unsupported, "Connect state locking requires flock support"),
+            });
+            #[cfg(unix)]
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(|source| CredentialStoreError::Io {
+                path,
+                source: source.into(),
+            })?;
+            Ok(CredentialLock { _file: file })
+        })
+        .await
+        .map_err(|source| CredentialStoreError::Io {
+            path: self.directory.join(LOCK_FILE),
+            source: io::Error::other(source),
+        })?
     }
 
     pub(crate) fn save(&self, credential: &DeviceCredential) -> Result<(), CredentialStoreError> {
@@ -119,6 +167,10 @@ impl CredentialStore {
         pending: &PendingRegistration,
     ) -> Result<PendingRegistration, CredentialStoreError> {
         self.claim(REGISTRATION_PENDING_FILE, pending)
+    }
+
+    pub(crate) fn load_pending_registration(&self) -> Result<Option<PendingRegistration>, CredentialStoreError> {
+        self.read(REGISTRATION_PENDING_FILE)
     }
 
     pub(crate) fn clear_pending_registration(&self) -> Result<(), CredentialStoreError> {

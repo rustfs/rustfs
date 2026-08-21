@@ -98,7 +98,9 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
+        let _lock = credential_store.lock().await?;
         if let Some((credential, _)) = self.load_valid_credential(identity_store, credential_store)? {
+            ensure_credential_time(&credential, unix_now())?;
             return Ok(credential);
         }
 
@@ -107,15 +109,83 @@ impl ConnectClient {
             token_uid: token.registration_token_uid.clone(),
             request_id: Uuid::new_v4().to_string(),
             certificate_request: identity.certificate_request_base64()?,
+            previous_credential_fingerprint: None,
+            next_public_key_sha256: None,
         };
         let pending = credential_store.claim_pending_registration(&candidate)?;
         if pending.token_uid != token.registration_token_uid
+            || pending.previous_credential_fingerprint.is_some()
+            || pending.next_public_key_sha256.is_some()
             || !is_request_id(&pending.request_id)
             || !certificate_request_matches(&pending.certificate_request, &identity)?
         {
             return Err(ClientError::PendingRegistration);
         }
 
+        let credential = match self.exchange_registration(token, &pending, &identity).await {
+            Ok(credential) => credential,
+            Err(error @ (ClientError::AccessRevoked { .. } | ClientError::Rejected { .. })) => {
+                credential_store.clear_pending_registration()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        credential_store.save(&credential)?;
+        credential_store.clear_pending_registration()?;
+        Ok(credential)
+    }
+
+    pub async fn reenroll(
+        &self,
+        identity_store: &IdentityStore,
+        credential_store: &CredentialStore,
+        token: &RegistrationToken,
+    ) -> Result<DeviceCredential, ClientError> {
+        let _lock = credential_store.lock().await?;
+        let (credential, _) = self
+            .load_valid_credential(identity_store, credential_store)?
+            .ok_or(ClientError::NotRegistered)?;
+        credential_store.clear_pending_rotation()?;
+        let fingerprint = certificate_fingerprint(&credential.certificate)?;
+        let next = identity_store.load_or_create_next()?;
+        let next_fingerprint = public_key_fingerprint(&next);
+        let candidate = PendingRegistration {
+            token_uid: token.registration_token_uid.clone(),
+            request_id: Uuid::new_v4().to_string(),
+            certificate_request: next.certificate_request_base64()?,
+            previous_credential_fingerprint: Some(fingerprint.clone()),
+            next_public_key_sha256: Some(next_fingerprint.clone()),
+        };
+        let pending = credential_store.claim_pending_registration(&candidate)?;
+        if pending.token_uid != token.registration_token_uid
+            || pending.previous_credential_fingerprint.as_deref() != Some(&fingerprint)
+            || pending.next_public_key_sha256.as_deref() != Some(&next_fingerprint)
+            || !is_request_id(&pending.request_id)
+            || !certificate_request_matches(&pending.certificate_request, &next)?
+        {
+            return Err(ClientError::PendingRegistration);
+        }
+        let enrolled = match self.exchange_registration(token, &pending, &next).await {
+            Ok(credential) => credential,
+            Err(error @ (ClientError::AccessRevoked { .. } | ClientError::Rejected { .. })) => {
+                credential_store.clear_pending_registration()?;
+                identity_store.clear_next()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        credential_store.save(&enrolled)?;
+        identity_store.commit_next(&next)?;
+        credential_store.clear_pending_registration()?;
+        Ok(enrolled)
+    }
+
+    async fn exchange_registration(
+        &self,
+        token: &RegistrationToken,
+        pending: &PendingRegistration,
+        identity: &super::identity::DeviceIdentity,
+    ) -> Result<DeviceCredential, ClientError> {
         let csr_der = base64::engine::general_purpose::STANDARD
             .decode(&pending.certificate_request)
             .map_err(|_| ClientError::PendingRegistration)?;
@@ -142,8 +212,6 @@ impl ConnectClient {
             &self.root_certificates,
             ExpectedDevice::Registration { cluster: &cluster },
         )?;
-        credential_store.save(&credential)?;
-        credential_store.clear_pending_registration()?;
         Ok(credential)
     }
 
@@ -153,12 +221,11 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<Option<DeviceCredential>, ClientError> {
+        let _lock = credential_store.lock().await?;
         let (credential, identity) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
-        if credential.not_after_unix <= now_unix {
-            return Err(ClientError::CredentialExpired);
-        }
+        ensure_credential_time(&credential, now_unix)?;
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
             return Ok(None);
         }
@@ -221,9 +288,57 @@ impl ConnectClient {
             return Ok(None);
         };
         let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
+        if let Some(pending) = credential_store.load_pending_registration()? {
+            let Some(previous) = pending.previous_credential_fingerprint.as_deref() else {
+                if pending.next_public_key_sha256.is_some()
+                    || !is_request_id(&pending.request_id)
+                    || !certificate_request_matches(&pending.certificate_request, &current)?
+                {
+                    return Err(ClientError::PendingRegistration);
+                }
+                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                credential_store.clear_pending_registration()?;
+                return Ok(Some((credential, current)));
+            };
+            let next_fingerprint = pending
+                .next_public_key_sha256
+                .as_deref()
+                .ok_or(ClientError::PendingRegistration)?;
+            if !is_request_id(&pending.request_id) {
+                return Err(ClientError::PendingRegistration);
+            }
+            let fingerprint = certificate_fingerprint(&credential.certificate)?;
+            if fingerprint == previous {
+                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
+                if public_key_fingerprint(&next) != next_fingerprint
+                    || !certificate_request_matches(&pending.certificate_request, &next)?
+                {
+                    return Err(ClientError::PendingRegistration);
+                }
+                return Ok(Some((credential, current)));
+            }
+            if public_key_fingerprint(&current) == next_fingerprint {
+                if !certificate_request_matches(&pending.certificate_request, &current)? {
+                    return Err(ClientError::PendingRegistration);
+                }
+                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            } else {
+                let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
+                if public_key_fingerprint(&next) != next_fingerprint
+                    || !certificate_request_matches(&pending.certificate_request, &next)?
+                {
+                    return Err(ClientError::PendingRegistration);
+                }
+                validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+                identity_store.commit_next(&next)?;
+            }
+            credential_store.clear_pending_registration()?;
+            let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
+            return Ok(Some((credential, current)));
+        }
         let Some(pending) = credential_store.load_pending_rotation()? else {
             validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
-            credential_store.clear_pending_registration()?;
             return Ok(Some((credential, current)));
         };
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
@@ -310,6 +425,22 @@ fn is_request_id(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random) && uuid.to_string() == value)
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+fn ensure_credential_time(credential: &DeviceCredential, now_unix: i64) -> Result<(), ClientError> {
+    if credential.not_before_unix > now_unix {
+        return Err(ClientError::CredentialNotYetValid);
+    }
+    if credential.not_after_unix <= now_unix {
+        return Err(ClientError::CredentialExpired);
+    }
+    Ok(())
+}
+
 fn build_client(
     roots: &[CertificateDer<'static>],
     timeout: Duration,
@@ -385,12 +516,14 @@ pub enum ClientError {
     NotRegistered,
     #[error("the Connect device private key is missing; restore device.key before using the stored certificate")]
     IdentityMissing,
-    #[error("the Connect device certificate has expired; create a new registration token and re-enrol this device")]
+    #[error("the Connect device certificate has expired; call ConnectClient::reenroll with a fresh registration token")]
     CredentialExpired,
+    #[error("the Connect device certificate is not yet valid; fix local clock skew or call ConnectClient::reenroll")]
+    CredentialNotYetValid,
     #[error("the stored Connect certificate and device private key cannot form a TLS identity")]
     IdentityCertificate,
     #[error(
-        "Connect rejected the device credential with HTTP {status}; reason={reason:?}; verify revocation and registration state in Connect"
+        "Connect rejected the device credential with HTTP {status}; reason={reason:?}; call ConnectClient::reenroll with a fresh registration token if revoked"
     )]
     AccessRevoked { status: StatusCode, reason: Option<String> },
     #[error("Connect rejected the request with HTTP {status}; reason={reason:?}")]
