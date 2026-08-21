@@ -4773,7 +4773,7 @@ struct DeleteObjectCommitBarrierState {
 }
 
 #[cfg(test)]
-struct DeleteObjectCommitBarrier {
+pub(crate) struct DeleteObjectCommitBarrier {
     state: Arc<DeleteObjectCommitBarrierState>,
 }
 
@@ -4783,7 +4783,7 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
-    fn install(bucket: &str, object: &str) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
@@ -4799,13 +4799,13 @@ impl DeleteObjectCommitBarrier {
         Self { state }
     }
 
-    async fn wait_until_paused(&self) {
+    pub(crate) async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("delete object should reach the deterministic commit barrier");
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
 }

@@ -24,7 +24,7 @@ use crate::storage_api_contracts::{
 pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
     #[cfg(test)]
-    forced_lost: Arc<std::sync::atomic::AtomicBool>,
+    forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Debug for NamespaceLockFence {
@@ -40,13 +40,17 @@ impl NamespaceLockFence {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
-            forced_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         #[cfg(test)]
-        if self.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .forced_lost
+            .iter()
+            .any(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+        {
             return true;
         }
         self.signals.iter().any(|signal| signal.is_lost())
@@ -57,27 +61,26 @@ impl NamespaceLockFence {
     }
 
     fn extend(&mut self, other: &Self) {
-        if Arc::ptr_eq(&self.signals, &other.signals) {
-            return;
+        if !Arc::ptr_eq(&self.signals, &other.signals) {
+            Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         }
-        Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         #[cfg(test)]
-        if other.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
-            self.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
+            Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
         }
     }
 
     #[cfg(test)]
     pub(crate) fn lost_for_test() -> Self {
         let fence = Self::new();
-        fence.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        fence.forced_lost[0].store(true, std::sync::atomic::Ordering::Release);
         fence
     }
 
     #[cfg(test)]
     pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
         let fence = Self::new();
-        (fence.clone(), Arc::clone(&fence.forced_lost))
+        (fence.clone(), Arc::clone(&fence.forced_lost[0]))
     }
 }
 
@@ -409,6 +412,13 @@ impl ObjectOptions {
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(fence);
     }
 
     pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {

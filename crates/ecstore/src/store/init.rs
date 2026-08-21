@@ -1299,6 +1299,139 @@ mod tests {
         (source_version, expected_source_versions)
     }
 
+    async fn mark_test_pool_decommissioning(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
+        let mut pool_meta = store.pool_meta.write().await;
+        pool_meta.pools[pool_idx].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+    }
+
+    async fn write_decommission_test_multipart_source(
+        store: &Arc<crate::store::ECStore>,
+        pool_idx: usize,
+        bucket: &str,
+        object: &str,
+    ) {
+        let pool = &store.pools[pool_idx];
+        let upload = pool
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create decommission multipart source upload");
+        let first_part = vec![b'm'; 5 * 1024 * 1024];
+        let second_part = b"decommission multipart tail".to_vec();
+        let mut completed_parts = Vec::with_capacity(2);
+        for (part_number, body) in [(1, first_part), (2, second_part)] {
+            let mut reader = PutObjReader::from_vec(body);
+            let part = pool
+                .put_object_part(bucket, object, &upload.upload_id, part_number, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("write decommission multipart source part");
+            completed_parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        pool.clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &ObjectOptions::default())
+            .await
+            .expect("complete decommission multipart source object");
+    }
+
+    async fn assert_pool_object_present(pool: &Arc<crate::core::sets::Sets>, bucket: &str, object: &str) {
+        pool.get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("expected object generation must remain present");
+    }
+
+    async fn assert_pool_object_absent(pool: &Arc<crate::core::sets::Sets>, bucket: &str, object: &str) {
+        let err = pool
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("fenced decommission target must remain absent");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)),
+            "unexpected fenced target result: {err:?}"
+        );
+    }
+
+    async fn write_suspended_decommission_source(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let mut reader = PutObjReader::from_vec(b"suspended source generation".to_vec());
+        let source = store.pools[0]
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write suspended null source version");
+        assert!(
+            source.version_id.is_none_or(|version_id| version_id.is_nil()),
+            "suspended source must use the null version identity"
+        );
+    }
+
+    async fn assert_suspended_null_source_present(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("suspended source versions should be readable")
+            .expect("suspended source must exist before worker convergence");
+        assert!(
+            versions
+                .versions
+                .iter()
+                .any(|version| !version.deleted && version.version_id.is_none_or(|version_id| version_id.is_nil())),
+            "the source pool must retain its null data version while DELETE owns the fixed fence"
+        );
+    }
+
+    async fn assert_suspended_decommission_converged(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let source_versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source versions should remain readable after suspended convergence");
+        assert!(
+            source_versions.is_none_or(|versions| versions.versions.is_empty()),
+            "worker convergence must remove only the decommissioned source null version"
+        );
+
+        let target_versions = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("active target versions should be readable")
+            .expect("active target must retain the suspended DELETE marker");
+        assert!(
+            matches!(target_versions.versions.as_slice(), [marker] if marker.deleted && marker.version_id.is_none_or(|version_id| version_id.is_nil())),
+            "active target must contain only its null delete marker: {target_versions:?}"
+        );
+
+        let err = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the active null delete marker must hide the migrated source generation");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _)),
+            "unexpected suspended latest-object result: {err:?}"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn tag_updates_skip_active_rebalance_source_pool() {
@@ -2971,6 +3104,206 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn decommission_outer_fence_loss_blocks_target_put_commit() {
+        let temp_dir = tempfile::tempdir().expect("create decommission PUT fence-loss store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-put-fence-loss", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("decommission-put-fence-loss-{}", uuid::Uuid::new_v4());
+        let object = "ordinary.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create decommission PUT fence-loss bucket");
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        store.pools[0]
+            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write decommission PUT source");
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
+            &bucket,
+            object,
+            crate::store::object::DecommissionMutationFenceTestPhase::Migration,
+        );
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::PutObjectCommitPause::BeforeQuotaRename,
+        );
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    worker_bucket,
+                    source_set,
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        loss_hook.mark_lost();
+        barrier.release();
+        drop(barrier);
+        worker
+            .await
+            .expect("decommission PUT fence-loss worker should join")
+            .expect("a fenced migration failure should remain retryable at entry scope");
+
+        assert_pool_object_absent(&store.pools[1], &bucket, object).await;
+        assert_pool_object_present(&store.pools[0], &bucket, object).await;
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_outer_fence_loss_blocks_multipart_commits() {
+        let temp_dir = tempfile::tempdir().expect("create decommission multipart fence-loss store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-multipart-fence-loss", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("decommission-multipart-fence-loss-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create decommission multipart fence-loss bucket");
+        for object in ["new-upload.bin", "complete.bin"] {
+            write_decommission_test_multipart_source(&store, 0, &bucket, object).await;
+        }
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        for (object, pause) in [
+            ("new-upload.bin", crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost),
+            ("complete.bin", crate::set_disk::MultipartCommitPause::BeforeLockLost),
+        ] {
+            let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
+                &bucket,
+                object,
+                crate::store::object::DecommissionMutationFenceTestPhase::Migration,
+            );
+            let commit_observation = (pause == crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost)
+                .then(|| crate::set_disk::NewMultipartUploadCommitObservation::install(&bucket, object));
+            let barrier = crate::set_disk::MultipartCommitBarrier::install(&bucket, object, pause);
+            let source_set = store.pools[0].get_disks_by_key(object);
+            let worker_store = Arc::clone(&store);
+            let worker_bucket = bucket.clone();
+            let worker = tokio::spawn(async move {
+                worker_store
+                    .decommission_entry_for_test(
+                        0,
+                        MetaCacheEntry {
+                            name: object.to_string(),
+                            ..Default::default()
+                        },
+                        worker_bucket,
+                        source_set,
+                    )
+                    .await
+            });
+
+            barrier.wait_until_paused().await;
+            loss_hook.mark_lost();
+            barrier.release();
+            drop(barrier);
+            worker
+                .await
+                .expect("decommission multipart fence-loss worker should join")
+                .expect("a fenced multipart migration failure should remain retryable at entry scope");
+
+            if let Some(commit_observation) = commit_observation {
+                assert!(
+                    !commit_observation.committed(),
+                    "new multipart upload metadata must not commit after the outer fence is lost"
+                );
+            }
+            assert_pool_object_absent(&store.pools[1], &bucket, object).await;
+            assert_pool_object_present(&store.pools[0], &bucket, object).await;
+            let uploads = store.pools[1]
+                .list_multipart_uploads(&bucket, object, None, None, None, 100)
+                .await
+                .expect("list target multipart uploads after fenced migration");
+            assert!(uploads.uploads.is_empty(), "fenced multipart migration must not retain target staging");
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_outer_fence_loss_blocks_source_cleanup_delete_commit() {
+        let temp_dir = tempfile::tempdir().expect("create decommission cleanup fence-loss store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-cleanup-fence-loss", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("decommission-cleanup-fence-loss-{}", uuid::Uuid::new_v4());
+        let object = "cleanup.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create decommission cleanup fence-loss bucket");
+        let mut source = PutObjReader::from_vec(b"source generation".to_vec());
+        store.pools[0]
+            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write decommission cleanup source");
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
+            &bucket,
+            object,
+            crate::store::object::DecommissionMutationFenceTestPhase::SourceCleanup,
+        );
+        let barrier = crate::set_disk::DeleteObjectCommitBarrier::install(&bucket, object);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    worker_bucket,
+                    source_set,
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        loss_hook.mark_lost();
+        barrier.release();
+        drop(barrier);
+        let err = worker
+            .await
+            .expect("decommission cleanup fence-loss worker should join")
+            .expect_err("source cleanup must fail after its outer fence is lost");
+        assert!(
+            err.to_string().contains("delete_object_commit"),
+            "cleanup failure must come from the delete commit fence: {err:?}"
+        );
+
+        assert_pool_object_present(&store.pools[0], &bucket, object).await;
+        assert_pool_object_present(&store.pools[1], &bucket, object).await;
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn reverse_decommission_reuses_fixed_target_fence_for_put_and_multipart() {
         let temp_dir = tempfile::tempdir().expect("create reverse decommission store dir");
         let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
@@ -3606,6 +3939,166 @@ mod tests {
         }
         assert_eq!(active_marker_count, 1, "batch DELETE must publish exactly one active-pool marker");
 
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn suspended_delete_marker_then_decommission_worker_converges_null_source() {
+        let temp_dir = tempfile::tempdir().expect("create suspended decommission DELETE store dir");
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "suspended-decommission-delete-convergence",
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("suspended-decommission-delete-convergence-{}", uuid::Uuid::new_v4());
+        let object = "single.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create suspended decommission DELETE bucket");
+        write_suspended_decommission_source(&store, &bucket, object).await;
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let delete_barrier = crate::store::object::VersionedDeleteMarkerCommitBarrier::install(&bucket, object);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object(
+                    &delete_bucket,
+                    object,
+                    ObjectOptions {
+                        version_suspended: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        delete_barrier.wait_until_paused().await;
+        assert_suspended_null_source_present(&store, &bucket, object).await;
+
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    worker_bucket,
+                    source_set,
+                )
+                .await
+        });
+
+        delete_barrier.release();
+        let marker = delete
+            .await
+            .expect("suspended DELETE task should join")
+            .expect("suspended DELETE should commit its active-pool marker");
+        drop(delete_barrier);
+        assert!(marker.delete_marker, "suspended DELETE must create a marker");
+        assert!(
+            marker.version_id.is_none_or(|version_id| version_id.is_nil()),
+            "suspended DELETE marker must keep the null version identity"
+        );
+        worker
+            .await
+            .expect("suspended decommission worker should join")
+            .expect("worker must treat the newer active null marker as a completed migration");
+
+        assert_suspended_decommission_converged(&store, &bucket, object).await;
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn suspended_batch_delete_marker_then_decommission_worker_converges_null_source() {
+        let temp_dir = tempfile::tempdir().expect("create suspended batch decommission DELETE store dir");
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "suspended-batch-decommission-delete-convergence",
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("suspended-batch-decommission-delete-convergence-{}", uuid::Uuid::new_v4());
+        let object = "batch.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create suspended batch decommission DELETE bucket");
+        write_suspended_decommission_source(&store, &bucket, object).await;
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let delete_config_snapshot =
+            Arc::new(crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
+                s3s::dto::VersioningConfiguration {
+                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                    ..Default::default()
+                },
+                None,
+            ));
+        let delete_barrier = crate::store::object::VersionedDeleteMarkerCommitBarrier::install(&bucket, object);
+        let delete_store = Arc::clone(&store);
+        let delete_bucket = bucket.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_objects(
+                    &delete_bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions {
+                        delete_replication_config_snapshot: Some(delete_config_snapshot),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        delete_barrier.wait_until_paused().await;
+        assert_suspended_null_source_present(&store, &bucket, object).await;
+
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let worker_store = Arc::clone(&store);
+        let worker_bucket = bucket.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    worker_bucket,
+                    source_set,
+                )
+                .await
+        });
+
+        delete_barrier.release();
+        let (deleted, errors) = delete.await.expect("suspended batch DELETE task should join");
+        drop(delete_barrier);
+        assert!(errors.iter().all(Option::is_none), "suspended batch DELETE should succeed: {errors:?}");
+        assert!(
+            matches!(deleted.as_slice(), [marker] if marker.delete_marker && marker.delete_marker_version_id.is_none_or(|version_id| version_id.is_nil())),
+            "suspended batch DELETE must create one null marker: {deleted:?}"
+        );
+        worker
+            .await
+            .expect("suspended batch decommission worker should join")
+            .expect("worker must treat the newer batch null marker as a completed migration");
+
+        assert_suspended_decommission_converged(&store, &bucket, object).await;
         shutdown.cancel();
     }
 

@@ -856,7 +856,6 @@ fn is_equivalent_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) 
 fn is_superseding_unversioned_data_movement_object(source: &ObjectInfo, target: &ObjectInfo) -> bool {
     is_unversioned_data_movement_object(source)
         && is_unversioned_data_movement_object(target)
-        && !target.delete_marker
         && source
             .mod_time
             .zip(target.mod_time)
@@ -3640,25 +3639,47 @@ mod tests {
     }
 
     #[test]
-    fn test_precondition_conflict_rejects_newer_delete_marker() {
-        let source = ObjectInfo {
-            size: 128,
-            etag: Some("etag-source".to_string()),
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            delete_marker: true,
-            etag: None,
-            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
-            ..source.clone()
-        };
+    fn test_precondition_conflict_accepts_only_newer_null_delete_marker() {
+        for version_id in [None, Some(Uuid::nil())] {
+            let source = ObjectInfo {
+                version_id,
+                size: 128,
+                etag: Some("etag-source".to_string()),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            };
+            let target = ObjectInfo {
+                delete_marker: true,
+                etag: None,
+                mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+                ..source.clone()
+            };
 
-        let should_resume =
-            resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(target)), &source, 0, 1)
-                .expect("delete marker conflict should be evaluated");
+            assert!(
+                resolve_data_movement_overwrite_resume_result(
+                    &Error::PreconditionFailed,
+                    Ok(Some(target.clone())),
+                    &source,
+                    0,
+                    1,
+                )
+                .expect("newer null delete marker should be evaluated")
+            );
 
-        assert!(!should_resume);
+            let mut same_time = target.clone();
+            same_time.mod_time = source.mod_time;
+            assert!(
+                !resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(same_time)), &source, 0, 1,)
+                    .expect("same-generation null delete marker should be rejected")
+            );
+
+            let mut versioned = target;
+            versioned.version_id = Some(Uuid::new_v4());
+            assert!(
+                !resolve_data_movement_overwrite_resume_result(&Error::PreconditionFailed, Ok(Some(versioned)), &source, 0, 1,)
+                    .expect("a UUID delete marker must not erase a null source version")
+            );
+        }
     }
 
     #[test]
