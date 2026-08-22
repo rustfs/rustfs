@@ -315,7 +315,7 @@ pub async fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
     #[cfg(unix)]
     {
         let dir = dir.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || fsync_dir_std(dir)).await?
+        fsync_spawn_blocking(move || fsync_dir_std(dir)).await?
     }
 
     #[cfg(not(unix))]
@@ -683,7 +683,7 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup) -> io::Result<()> {
     #[cfg(test)]
     let dir = group.dir.clone();
     let dir_file = group.dir_file.clone();
-    tokio::task::spawn_blocking(move || {
+    fsync_spawn_blocking(move || {
         #[cfg(test)]
         {
             if let Some(kind) = fsync_dir_recorder::take_grouped_failure(&dir) {
@@ -1080,6 +1080,44 @@ const TEST_GLOBAL_FILE_SYNCS: usize = 64;
 
 static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(global_file_sync_limit()));
 static DISK_FILE_SYNC_LIMITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Dedicated tokio runtime for fsync/fdatasync blocking operations. When
+/// configured with >1 threads, isolates device-bound fsync from the main
+/// blocking pool so reads (pread/stat/open) are not starved. `None` means
+/// fall back to the main runtime (zero behavior change).
+static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(|| {
+    let threads =
+        rustfs_utils::get_env_usize(rustfs_config::ENV_FSYNC_BLOCKING_THREADS, rustfs_config::DEFAULT_FSYNC_BLOCKING_THREADS);
+    if threads <= 1 {
+        return None;
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .worker_threads(num_cpus::get().min(8))
+        .max_blocking_threads(threads)
+        .thread_name("rustfs-fsync")
+        .thread_stack_size(512 * 1024)
+        .enable_all();
+    match builder.build() {
+        Ok(rt) => {
+            tracing::info!(threads, "fsync dedicated blocking pool enabled");
+            Some(rt)
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to build fsync runtime, falling back to main pool");
+            None
+        }
+    }
+});
+
+/// Spawn a blocking task on the fsync-dedicated runtime if configured,
+/// otherwise fall back to the main tokio blocking pool.
+fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
+    match FSYNC_RUNTIME.as_ref() {
+        Some(rt) => rt.spawn_blocking(f),
+        None => tokio::task::spawn_blocking(f),
+    }
+}
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 type NamespaceMutationLock = AsyncMutex<()>;
@@ -1217,7 +1255,7 @@ where
     F: FnOnce() -> io::Result<T> + Send + 'static,
 {
     let (disk_permit, global_permit) = acquire_file_sync_permits(disk_permits).await?;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = fsync_spawn_blocking(move || {
         let _disk_permit = disk_permit;
         work()
     })
@@ -2146,7 +2184,7 @@ async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'stati
         wait_started,
     );
     let disk_permit = admission.disk_permit.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = fsync_spawn_blocking(move || {
         let _lease = lease;
         let _disk_permit = disk_permit;
         operation()
