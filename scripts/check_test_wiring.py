@@ -444,6 +444,7 @@ class SelfTests(unittest.TestCase):
                 mock.patch(__name__ + ".check_fuzz_targets", return_value=[]),
                 mock.patch(__name__ + ".check_runner_selection", return_value=[]),
                 mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
+                mock.patch(__name__ + ".check_scheduled_alerts", return_value=[]),
             ):
                 self.assertEqual(len(validate(root)), 1)
 
