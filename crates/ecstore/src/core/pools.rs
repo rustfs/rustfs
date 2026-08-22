@@ -462,18 +462,15 @@ pub(crate) fn local_decommission_queue_prefix(endpoints: &EndpointServerPools, i
     Ok(local)
 }
 
-fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
+fn resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
     let mut indices = Vec::new();
     for (idx, pool) in meta.pools.iter().enumerate() {
         if let Some(decommission) = &pool.decommission {
             if !decommission.has_decommission_state() {
                 continue;
             }
-            if decommission.complete {
+            if decommission.complete || decommission.failed || decommission.canceled {
                 continue;
-            }
-            if decommission.failed || decommission.canceled {
-                break;
             }
             indices.push(idx);
         }
@@ -2406,24 +2403,10 @@ impl PoolMeta {
     }
 
     pub fn return_resumable_pools(&self) -> Vec<PoolStatus> {
-        let mut new_pools = Vec::new();
-        for pool in &self.pools {
-            if let Some(decommission) = &pool.decommission {
-                if !decommission.has_decommission_state() {
-                    continue;
-                }
-                if decommission.complete || decommission.failed || decommission.canceled {
-                    // Recovery is not required when:
-                    // - Decommissioning completed
-                    // - Decommissioning failed and must be explicitly restarted or cleared
-                    // - Decommissioning was cancelled
-                    continue;
-                }
-                // All other scenarios require recovery
-                new_pools.push(pool.clone());
-            }
-        }
-        new_pools
+        resumable_decommission_queue_indices(self)
+            .into_iter()
+            .map(|idx| self.pools[idx].clone())
+            .collect()
     }
 }
 
@@ -3332,7 +3315,7 @@ impl ECStore {
         let _start_guard = self.start_gate.lock().await;
         let indices = {
             let pool_meta = self.pool_meta.read().await;
-            first_resumable_decommission_queue_indices(&pool_meta)
+            resumable_decommission_queue_indices(&pool_meta)
                 .into_iter()
                 .filter(|idx| indices.contains(idx))
                 .collect::<Vec<_>>()
@@ -3377,7 +3360,7 @@ impl ECStore {
     pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
         let indices = {
             let pool_meta = self.pool_meta.read().await;
-            first_resumable_decommission_queue_indices(&pool_meta)
+            resumable_decommission_queue_indices(&pool_meta)
         };
         let indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
         if indices.is_empty() {
@@ -6363,12 +6346,12 @@ mod pools_tests {
         ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
-        get_by_index, guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_requested, load_decommission_entry_versions, local_decommission_queue_prefix,
-        mark_decommission_bucket_done, merge_pool_status_refresh, missing_decommission_worker_prefix,
-        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, require_decommission_store,
-        reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index, guard_decommission_cancelers,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
+        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
+        merge_pool_status_refresh, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
+        pool_meta_has_active_decommission, require_decommission_store, reserve_decommission_start_cancelers,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
         resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
@@ -6376,9 +6359,9 @@ mod pools_tests {
         resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
         resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
         resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
-        run_decommission_listing_with_retry_and_drain, run_decommission_side_effect, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
+        resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
+        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_side_effect,
+        should_cleanup_decommission_source_entry, should_continue_decommission_queue, should_count_decommission_version_complete,
         should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
         should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
         spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
@@ -9387,7 +9370,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state() {
+    fn test_resumable_decommission_queue_indices_skip_terminal_predecessors() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9423,11 +9406,11 @@ mod pools_tests {
             ..Default::default()
         };
 
-        assert!(first_resumable_decommission_queue_indices(&meta).is_empty());
+        assert_eq!(resumable_decommission_queue_indices(&meta), vec![3]);
     }
 
     #[test]
-    fn test_first_resumable_decommission_queue_indices_allows_after_completed_prefix() {
+    fn test_resumable_decommission_queue_indices_preserve_active_predecessor_order() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9440,7 +9423,7 @@ mod pools_tests {
                 decommission_test_pool_status(
                     1,
                     Some(PoolDecommissionInfo {
-                        queued: true,
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
                         ..Default::default()
                     }),
                 ),
@@ -9455,11 +9438,11 @@ mod pools_tests {
             ..Default::default()
         };
 
-        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![1, 2]);
+        assert_eq!(resumable_decommission_queue_indices(&meta), vec![1, 2]);
     }
 
     #[test]
-    fn test_return_resumable_pools_skips_failed_decommission() {
+    fn test_runtime_and_startup_use_the_same_resumable_queue() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9472,6 +9455,20 @@ mod pools_tests {
                 decommission_test_pool_status(
                     1,
                     Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    3,
+                    Some(PoolDecommissionInfo {
                         queued: true,
                         ..Default::default()
                     }),
@@ -9480,10 +9477,15 @@ mod pools_tests {
             ..Default::default()
         };
 
-        let resumable = meta.return_resumable_pools();
+        let runtime_indices = resumable_decommission_queue_indices(&meta);
+        let startup_ids = meta
+            .return_resumable_pools()
+            .into_iter()
+            .map(|pool| pool.id)
+            .collect::<Vec<_>>();
 
-        assert_eq!(resumable.len(), 1);
-        assert_eq!(resumable[0].id, 1);
+        assert_eq!(runtime_indices, vec![2, 3]);
+        assert_eq!(startup_ids, vec![2, 3]);
     }
 
     #[test]
