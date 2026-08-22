@@ -61,10 +61,9 @@ impl NamespaceLockFence {
     }
 
     fn extend(&mut self, other: &Self) {
-        if Arc::ptr_eq(&self.signals, &other.signals) {
-            return;
+        if !Arc::ptr_eq(&self.signals, &other.signals) {
+            Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         }
-        Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         #[cfg(test)]
         if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
             Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
@@ -482,6 +481,13 @@ impl ObjectOptions {
 
     pub(crate) fn ensure_namespace_lock_fence(&mut self) {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(fence);
     }
 
     pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {

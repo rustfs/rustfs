@@ -464,6 +464,7 @@ impl ECStore {
                                 .as_ref()
                                 .and_then(|guard| guard.namespace_lock_guard()),
                             namespace_lock_lost_signal: lock_lost_signal.clone(),
+                            ..Default::default()
                         },
                         "rebalance",
                     ),

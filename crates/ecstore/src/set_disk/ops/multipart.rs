@@ -168,6 +168,72 @@ impl Drop for MultipartCommitBarrier {
     }
 }
 
+#[cfg(test)]
+struct NewMultipartUploadCommitObservationState {
+    bucket: String,
+    object: String,
+    committed: AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) struct NewMultipartUploadCommitObservation {
+    state: Arc<NewMultipartUploadCommitObservationState>,
+}
+
+#[cfg(test)]
+static NEW_MULTIPART_UPLOAD_COMMIT_OBSERVATION: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<NewMultipartUploadCommitObservationState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl NewMultipartUploadCommitObservation {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(NewMultipartUploadCommitObservationState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            committed: AtomicBool::new(false),
+        });
+        let mut slot = NEW_MULTIPART_UPLOAD_COMMIT_OBSERVATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("new multipart upload commit observation mutex should not poison");
+        assert!(slot.is_none(), "new multipart upload commit observation must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn committed(&self) -> bool {
+        self.state.committed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for NewMultipartUploadCommitObservation {
+    fn drop(&mut self) {
+        let mut slot = NEW_MULTIPART_UPLOAD_COMMIT_OBSERVATION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("new multipart upload commit observation mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn observe_new_multipart_upload_commit(bucket: &str, object: &str) {
+    let state = NEW_MULTIPART_UPLOAD_COMMIT_OBSERVATION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("new multipart upload commit observation mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.committed.store(true, Ordering::Release);
+    }
+}
+
 #[cfg(any(test, feature = "test-util"))]
 async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
     let barrier = {
@@ -1692,7 +1758,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         .await
         .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
         #[cfg(test)]
-        observe_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost);
+        {
+            observe_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost);
+            observe_new_multipart_upload_commit(bucket, object);
+        }
 
         // evalDisks
 

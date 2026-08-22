@@ -73,7 +73,7 @@ pub(super) fn resolve_rebalance_delete_from_all_pools_result(
     object: &str,
 ) -> Result<ObjectInfo> {
     result.map_err(|err| {
-        if err == Error::PreconditionFailed {
+        if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
             err
         } else {
             Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}"))
@@ -86,7 +86,7 @@ fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
 }
 
 fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    if err == Error::PreconditionFailed {
+    if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
         err
     } else {
         Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
@@ -192,6 +192,18 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_delete_result_preserves_prefix_access_denied() {
+        let err = resolve_rebalance_delete_from_all_pools_result(
+            Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
+            "bucket",
+            "object",
+        )
+        .expect_err("prefix access denial should remain structured");
+
+        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
+    }
+
+    #[test]
     fn rebalance_delete_pool_result_preserves_precondition_failed() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![RebalanceDeletePoolResult {
@@ -204,5 +216,20 @@ mod tests {
         .expect_err("precondition failure should remain structured");
 
         assert_eq!(err, Error::PreconditionFailed);
+    }
+
+    #[test]
+    fn rebalance_delete_pool_result_preserves_prefix_access_denied() {
+        let err = resolve_rebalance_delete_from_all_pools_results(
+            vec![RebalanceDeletePoolResult {
+                pool_idx: 0,
+                result: Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
+            }],
+            "bucket",
+            "object",
+        )
+        .expect_err("prefix access denial should remain structured");
+
+        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
     }
 }

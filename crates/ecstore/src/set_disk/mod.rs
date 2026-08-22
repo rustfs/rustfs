@@ -738,6 +738,8 @@ mod ops;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;
+#[cfg(test)]
+pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(test)]
@@ -3045,6 +3047,16 @@ pub struct SetDisks {
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
 }
 
+// DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
+// each endpoint's canonical Arc, so an exact Arc set identifies the lock domain.
+pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {
+    left.iter()
+        .all(|left_client| right.iter().any(|right_client| Arc::ptr_eq(left_client, right_client)))
+        && right
+            .iter()
+            .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
+}
+
 const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3618,6 +3630,15 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    /// Whether both sets' namespace-lock implementations cover the same object key.
+    pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
+        match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
+            (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
+            (true, true) => same_distributed_lock_domain(&self.lockers, &other.lockers),
+            _ => false,
+        }
     }
 
     /// The lock manager this set actually uses (test-only; Phase 5 Slice 3).
@@ -4604,11 +4625,11 @@ fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
 }
 
 fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool {
-    opts.delete_marker || (opts.versioned && opts.version_id.is_none() && !opts.data_movement)
+    opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
-    let mut mark_delete = goi.version_id.is_some() || (opts.versioned && opts.version_id.is_none());
+    let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
     if opts.version_id.is_some() {
