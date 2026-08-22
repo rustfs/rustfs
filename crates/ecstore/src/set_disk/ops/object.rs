@@ -1294,7 +1294,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             (prepared.snapshot, prepared.object_info)
         } else {
             match self
-                .get_object_fileinfo(
+                .get_object_fileinfo_for_get_object_reader(
                     bucket,
                     object,
                     opts,
