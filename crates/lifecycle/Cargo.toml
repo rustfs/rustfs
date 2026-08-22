@@ -69,7 +69,7 @@ uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnos
 [dev-dependencies]
 metrics-util = { workspace = true, features = ["debugging"] }
 proptest = "1"
-serial_test.workspace = true
+serial_test = { workspace = true }
 temp-env.workspace = true
 tokio = { workspace = true, features = ["macros", "fs", "rt-multi-thread"] }
 

@@ -22,7 +22,7 @@ use crate::metrics::schema::replication::*;
 
 /// Replication statistics.
 #[derive(Debug, Clone, Default)]
-pub struct ReplicationStats {
+pub struct ReplicationMetricsSnapshot {
     /// Average number of active replication workers
     pub average_active_workers: f64,
     /// Average queued bytes since server start
@@ -54,13 +54,13 @@ pub struct ReplicationStats {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReplicationRuntimeStats {
     pub(crate) server: String,
-    pub(crate) stats: ReplicationStats,
+    pub(crate) stats: ReplicationMetricsSnapshot,
 }
 
 /// Collects replication metrics from the given stats.
 ///
 /// Returns a vector of Prometheus metrics for replication statistics.
-pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMetric> {
+pub fn collect_replication_metrics(stats: &ReplicationMetricsSnapshot) -> Vec<PrometheusMetric> {
     vec![
         PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_ACTIVE_WORKERS_MD, stats.average_active_workers),
         PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_BYTES_MD, stats.average_queued_bytes as f64),
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_collect_replication_metrics() {
-        let stats = ReplicationStats {
+        let stats = ReplicationMetricsSnapshot {
             average_active_workers: 8.5,
             average_queued_bytes: 1024 * 1024 * 40,
             average_queued_count: 240,
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_collect_replication_metrics_default() {
-        let stats = ReplicationStats::default();
+        let stats = ReplicationMetricsSnapshot::default();
         let metrics = collect_replication_metrics(&stats);
 
         assert_eq!(metrics.len(), 13);
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn replication_stats_struct_literal_keeps_legacy_fields() {
-        let stats = ReplicationStats {
+        let stats = ReplicationMetricsSnapshot {
             average_active_workers: 1.0,
             average_queued_bytes: 2,
             average_queued_count: 3,

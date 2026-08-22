@@ -20,7 +20,6 @@ use crate::{
     ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx,
 };
-use serial_test::serial;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::task::Poll;
@@ -368,7 +367,6 @@ fn test_initial_scanner_delay_uses_configured_start_delay() {
 }
 
 #[test]
-#[serial]
 fn test_initial_scanner_delay_uses_cycle_without_explicit_start_delay() {
     with_var(ENV_SCANNER_CYCLE, Some("120"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -415,7 +413,6 @@ fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_cycle_max_duration_uses_env() {
     with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("42"), || {
         assert_eq!(scanner_cycle_max_duration(), Some(Duration::from_secs(42)));
@@ -423,7 +420,6 @@ fn test_scanner_cycle_max_duration_uses_env() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_cycle_max_duration_default_is_disabled() {
     with_var_unset(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, || {
         assert_eq!(scanner_cycle_max_duration(), None);
@@ -467,7 +463,6 @@ async fn test_scanner_cycle_budget_drop_cancels_child_without_elapsed() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_cycle_budget_config_uses_work_budget_env() {
     with_var(ENV_SCANNER_CYCLE_MAX_OBJECTS, Some("100"), || {
         with_var(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, Some("25"), || {
@@ -479,7 +474,6 @@ fn test_scanner_cycle_budget_config_uses_work_budget_env() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_cycle_budget_config_disables_zero_work_budgets() {
     with_var(ENV_SCANNER_CYCLE_MAX_OBJECTS, Some("0"), || {
         with_var(ENV_SCANNER_CYCLE_MAX_DIRECTORIES, Some("0"), || {
@@ -522,7 +516,6 @@ fn test_scan_cycle_partial_source_maps_budget_reason() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
     let mut cycle_info = CurrentCycle {
         current: 12,
@@ -551,7 +544,6 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
     let cycle_started = Utc::now() - chrono::Duration::seconds(5);
     let mut cycle_info = CurrentCycle {
@@ -578,7 +570,6 @@ async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finalization() {
     let mut cycle_info = CurrentCycle {
         current: 12,
@@ -603,7 +594,6 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_metrics_guard_drop_clears_activity() {
     let guard = ScannerCycleMetricsGuard::new(CurrentCycle {
         current: 12,
@@ -621,7 +611,6 @@ async fn scanner_cycle_metrics_guard_drop_clears_activity() {
 }
 
 #[tokio::test]
-#[serial]
 async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let ctx = CancellationToken::new();
@@ -672,7 +661,6 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -708,7 +696,6 @@ async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -748,7 +735,6 @@ async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_rejects_invalid_cache_floor() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -844,7 +830,6 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
 }
 
 #[tokio::test]
-#[serial]
 async fn corrupt_cycle_state_is_quarantined_once() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -895,7 +880,6 @@ async fn corrupt_cycle_state_is_quarantined_once() {
 }
 
 #[tokio::test]
-#[serial]
 async fn empty_cycle_state_object_is_quarantined_as_corrupt() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -916,7 +900,6 @@ async fn empty_cycle_state_object_is_quarantined_as_corrupt() {
 }
 
 #[tokio::test]
-#[serial]
 async fn future_cycle_state_schema_is_recovery_required() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -935,7 +918,6 @@ async fn future_cycle_state_schema_is_recovery_required() {
 }
 
 #[tokio::test]
-#[serial]
 async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -962,7 +944,6 @@ async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
 }
 
 #[tokio::test]
-#[serial]
 async fn cleanup_pending_marker_blocks_a_rewritten_primary_after_restart() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1038,7 +1019,6 @@ fn full_rescan_reset_accepts_unknown_marker_fields_without_trusting_cursor() {
 }
 
 #[tokio::test]
-#[serial]
 async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_cursor() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
@@ -1065,7 +1045,6 @@ async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_curs
 }
 
 #[tokio::test]
-#[serial]
 async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let marker = ScannerCycleRecoveryMarker {
@@ -1106,7 +1085,6 @@ async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
 }
 
 #[tokio::test]
-#[serial]
 async fn corrupt_cycle_state_rename_or_marker_failure_stays_recovery_required() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1132,7 +1110,6 @@ async fn corrupt_cycle_state_rename_or_marker_failure_stays_recovery_required() 
 }
 
 #[tokio::test]
-#[serial]
 async fn oversized_or_symlinked_cycle_state_is_rejected() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1340,7 +1317,6 @@ async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() 
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_usage_backup_uses_durable_cycle_cadence_across_tasks() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -1414,7 +1390,6 @@ fn scanner_cycle_advance_fails_before_reserved_exhausted_value() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -1438,7 +1413,6 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_persist_scanner_cycle_state_reconciles_newer_winner() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -1861,7 +1835,6 @@ async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_usage_route_barrier_precedes_durable_reconciliation() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -1889,7 +1862,6 @@ async fn test_usage_route_barrier_precedes_durable_reconciliation() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_deferred_usage_save_keeps_last_real_save_metric() {
     let metrics = global_metrics();
     metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
@@ -2953,7 +2925,6 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
 }
 
 #[test]
-#[serial]
 fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -2980,7 +2951,6 @@ fn finalizing_a_saved_cycle_acknowledges_its_exact_dirty_snapshot() {
 }
 
 #[test]
-#[serial]
 fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3023,7 +2993,6 @@ async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
 }
 
 #[test]
-#[serial]
 fn finalizing_an_already_durable_cycle_acknowledges_its_exact_dirty_snapshot() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3038,7 +3007,6 @@ fn finalizing_an_already_durable_cycle_acknowledges_its_exact_dirty_snapshot() {
 }
 
 #[test]
-#[serial]
 fn finalizing_a_prior_same_cycle_snapshot_keeps_new_dirty_work_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3054,7 +3022,6 @@ fn finalizing_a_prior_same_cycle_snapshot_keeps_new_dirty_work_pending() {
 }
 
 #[test]
-#[serial]
 fn finalizing_a_durable_superseded_snapshot_keeps_dirty_work_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3070,7 +3037,6 @@ fn finalizing_a_durable_superseded_snapshot_keeps_dirty_work_pending() {
 }
 
 #[test]
-#[serial]
 fn data_usage_persist_wait_covers_cache_retries_and_backup() {
     with_var(rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -3123,7 +3089,6 @@ async fn maintenance_feature_inspection_preserves_base_cycle_after_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn stable_maintenance_detection_preserves_base_cycle_after_timeout() {
     let ctx = CancellationToken::new();
 
@@ -3189,7 +3154,6 @@ async fn maintenance_feature_inspection_stops_on_cancellation() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_prefers_explicit_cycle_override() {
     with_var(ENV_SCANNER_SPEED, Some("slowest"), || {
         with_var(ENV_SCANNER_CYCLE, Some("42"), || {
@@ -3199,7 +3163,6 @@ fn test_cycle_interval_prefers_explicit_cycle_override() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
     let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
@@ -3209,7 +3172,6 @@ fn test_cycle_interval_prefers_explicit_cycle_over_default_cycle() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_uses_scanner_default_speed_override_when_unconfigured() {
     let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
 
@@ -3219,7 +3181,6 @@ fn test_cycle_interval_uses_scanner_default_speed_override_when_unconfigured() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_prefers_explicit_speed_over_default_speed_override() {
     let _guard = ScannerDefaultSpeedGuard::set(ScannerSpeed::Slowest);
 
@@ -3237,7 +3198,6 @@ fn test_cycle_interval_prefers_explicit_speed_over_default_speed_override() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_uses_default_cycle_override_when_unconfigured() {
     let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
@@ -3419,7 +3379,6 @@ fn scanner_cycle_wait_plan_drives_growth_resets_and_bitrot_cap() {
 }
 
 #[test]
-#[serial]
 fn scanner_cycle_schedule_status_reports_effective_backoff() {
     record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, 2_048, true, 7);
 
@@ -3699,7 +3658,6 @@ fn dirty_usage_wakes_are_disabled_for_explicit_cycle_policy() {
 }
 
 #[test]
-#[serial]
 fn clean_idle_cap_preserves_default_bitrot_coverage_window() {
     let config = ScannerRuntimeConfig {
         bitrot_cycle: Some(Duration::from_secs(30 * 24 * 60 * 60)),
@@ -3729,7 +3687,6 @@ fn clean_idle_cap_allows_policy_max_when_bitrot_is_disabled() {
 }
 
 #[test]
-#[serial]
 fn clean_idle_cap_never_shortens_the_base_cycle() {
     let config = ScannerRuntimeConfig {
         bitrot_cycle: Some(Duration::from_secs(60)),
@@ -3743,7 +3700,6 @@ fn clean_idle_cap_never_shortens_the_base_cycle() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_keeps_default_cycle_with_explicit_speed() {
     let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
@@ -3761,7 +3717,6 @@ fn test_cycle_interval_keeps_default_cycle_with_explicit_speed() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
     let _guard = ScannerDefaultCycleGuard::set(TEST_DEFAULT_SCANNER_CYCLE_SECS);
 
@@ -3775,7 +3730,6 @@ fn test_cycle_interval_prefers_explicit_start_delay_over_default_cycle() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_supports_minio_speed_alias() {
     with_var_unset(ENV_SCANNER_SPEED, || {
         with_var_unset(ENV_SCANNER_CYCLE, || {
@@ -3789,7 +3743,6 @@ fn test_cycle_interval_supports_minio_speed_alias() {
 }
 
 #[test]
-#[serial]
 fn test_cycle_interval_supports_minio_cycle_alias() {
     with_var_unset(ENV_SCANNER_CYCLE, || {
         with_var_unset(ENV_SCANNER_START_DELAY_SECS, || {
@@ -3809,7 +3762,6 @@ fn test_randomized_cycle_delay_handles_small_start_delay() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_wakes_for_dirty_usage() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 
@@ -3835,7 +3787,6 @@ async fn test_wait_for_next_scanner_cycle_wakes_for_dirty_usage() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_sees_unattempted_dirty_usage() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let dirty_generation = crate::scanner_io::dirty_usage_generation();
@@ -3857,7 +3808,6 @@ async fn test_wait_for_next_scanner_cycle_sees_unattempted_dirty_usage() {
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_retries_stable_dirty_usage_on_timer() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3879,7 +3829,6 @@ async fn test_wait_for_next_scanner_cycle_retries_stable_dirty_usage_on_timer() 
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_can_defer_dirty_wakes_until_timer() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -3898,7 +3847,6 @@ async fn test_wait_for_next_scanner_cycle_can_defer_dirty_wakes_until_timer() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_wakes_for_repeated_dirty_bucket() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     crate::scanner_io::record_dirty_usage_bucket("photos");
@@ -3924,7 +3872,6 @@ async fn test_wait_for_next_scanner_cycle_wakes_for_repeated_dirty_bucket() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let observed_generation = crate::runtime_config::scanner_runtime_config_generation();
@@ -3952,7 +3899,6 @@ async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_wait_for_next_scanner_cycle_reschedules_for_maintenance_change() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let observed_generation = crate::scanner_io::scanner_maintenance_generation();
@@ -4196,7 +4142,6 @@ fn scanner_activity_after_a_cycle_restores_the_base_interval() {
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn distributed_clean_idle_wait_wakes_at_base_interval_for_remote_activity() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4224,7 +4169,6 @@ async fn distributed_clean_idle_wait_wakes_at_base_interval_for_remote_activity(
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn superseded_retry_wait_defers_dirty_cluster_activity_until_timer() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4252,7 +4196,6 @@ async fn superseded_retry_wait_defers_dirty_cluster_activity_until_timer() {
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn distributed_clean_idle_wait_blocks_backoff_for_unpropagated_maintenance() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4279,7 +4222,6 @@ async fn distributed_clean_idle_wait_blocks_backoff_for_unpropagated_maintenance
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn distributed_clean_idle_wait_fails_closed_when_a_peer_is_unverifiable() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4306,7 +4248,6 @@ async fn distributed_clean_idle_wait_fails_closed_when_a_peer_is_unverifiable() 
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn distributed_clean_idle_wait_keeps_the_extended_deadline_when_peers_are_clean() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4334,7 +4275,6 @@ async fn distributed_clean_idle_wait_keeps_the_extended_deadline_when_peers_are_
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn scanner_activity_probe_wait_is_cancellation_aware() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4365,7 +4305,6 @@ async fn scanner_activity_probe_wait_is_cancellation_aware() {
 }
 
 #[tokio::test(start_paused = true)]
-#[serial]
 async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let ctx = CancellationToken::new();
@@ -4397,7 +4336,6 @@ async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
 }
 
 #[test]
-#[serial]
 fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
         let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), bitrot_scan_cycle());
@@ -4406,7 +4344,6 @@ fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
 }
 
 #[test]
-#[serial]
 fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
         let recent = Utc::now() - chrono::Duration::minutes(30);
@@ -4418,7 +4355,6 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
 }
 
 #[test]
-#[serial]
 fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
         assert_eq!(get_cycle_scan_mode(1, 0, None, bitrot_scan_cycle()), HealScanMode::Normal);
@@ -4426,7 +4362,6 @@ fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
 }
 
 #[test]
-#[serial]
 fn test_background_heal_info_for_scan_start_marks_deep_active() {
     let now = Utc::now();
     let info =
@@ -4439,7 +4374,6 @@ fn test_background_heal_info_for_scan_start_marks_deep_active() {
 }
 
 #[test]
-#[serial]
 fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
     with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
         let started_at = Utc::now();

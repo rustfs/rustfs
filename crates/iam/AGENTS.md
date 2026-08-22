@@ -24,4 +24,3 @@ Applies to `crates/iam/`.
 ## Suggested Validation
 
 - `cargo test -p rustfs-iam`
-- Full gate before commit: `make pre-commit`

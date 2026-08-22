@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // KMS-specific constants
 pub const TEST_BUCKET: &str = "kms-test-bucket";
@@ -175,6 +175,49 @@ pub async fn get_kms_status(
         kms_admin_request(base_url, http::Method::GET, "/rustfs/admin/v3/kms/status", None, access_key, secret_key).await?;
     info!("KMS status retrieved: {}", status);
     Ok(status)
+}
+
+/// Poll the KMS status endpoint until the backend reports ready or the timeout
+/// expires.  Replaces hard-coded `sleep(Duration::from_secs(3))` startup waits
+/// with an active readiness probe so tests start as soon as KMS is usable
+/// (typically < 1 s) instead of always waiting the full 3 s.
+///
+/// Uses exponential back-off starting at 200 ms (doubling each attempt, capped
+/// at 1 s) up to a total wall-clock budget of 5 s.
+pub async fn wait_for_kms_ready(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let total_deadline = Duration::from_secs(5);
+    let start = tokio::time::Instant::now();
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(1);
+    let mut first_attempt = true;
+
+    loop {
+        if !first_attempt {
+            if start.elapsed() >= total_deadline {
+                return Err("KMS failed to become ready within 5 seconds".into());
+            }
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+        first_attempt = false;
+
+        match get_kms_status(base_url, access_key, secret_key).await {
+            Ok(status) => {
+                info!("KMS is ready (status: {})", status);
+                return Ok(());
+            }
+            Err(e) => {
+                if start.elapsed() >= total_deadline {
+                    return Err(format!("KMS did not become ready within 5 s: last error: {e}").into());
+                }
+                warn!(error = %e, elapsed_ms = start.elapsed().as_millis() as u64, "KMS not ready yet, retrying…");
+            }
+        }
+    }
 }
 
 /// Create a default KMS key for testing and return the created key ID
@@ -859,6 +902,13 @@ impl LocalKMSTestEnvironment {
             .start_rustfs_server_with_env(extra_args, &[("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true")])
             .await?;
         Ok(default_key_id.to_string())
+    }
+
+    /// Poll the KMS status endpoint until the backend reports ready.
+    ///
+    /// Prefer this over a fixed `sleep` after calling `start_rustfs_for_local_kms`.
+    pub async fn wait_for_kms_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_kms_ready(&self.base_env.url, &self.base_env.access_key, &self.base_env.secret_key).await
     }
 
     /// Configure Local KMS backend with a predefined default key

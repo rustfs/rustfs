@@ -57,6 +57,13 @@ pub const DEFAULT_MAX_IO_EVENTS_PER_TICK: usize = 1024;
 pub const DEFAULT_EVENT_INTERVAL: u32 = 61;
 pub const DEFAULT_RNG_SEED: Option<u64> = None; // None means random
 
+/// Dedicated blocking thread pool for fsync/fdatasync operations.
+/// When > 1, fsync operations are isolated from the main blocking pool to
+/// prevent device-bound fsync from starving read operations (pread/stat/open).
+/// Default 0 means auto (no isolation, use main runtime).
+pub const ENV_FSYNC_BLOCKING_THREADS: &str = "RUSTFS_RUNTIME_FSYNC_BLOCKING_THREADS";
+pub const DEFAULT_FSYNC_BLOCKING_THREADS: usize = 0;
+
 // Dial9 Tokio Telemetry Default values
 pub const DEFAULT_RUNTIME_DIAL9_ENABLED: bool = false; // Disabled by default
 pub const DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR: &str = "/var/log/rustfs/telemetry";

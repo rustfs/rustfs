@@ -50,4 +50,3 @@ crate.
   - `cargo test -p rustfs-audit`
   - Focused: `cargo test -p rustfs-audit --test pipeline_layer_test`
   - Focused: `cargo test -p rustfs-audit pipeline`
-- Full gate before commit: `make pre-commit`

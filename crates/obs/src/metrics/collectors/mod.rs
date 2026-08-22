@@ -48,7 +48,7 @@ pub(crate) use bucket_replication::{
     BucketReplicationTargetFlowStats, collect_bucket_replication_backlog_metrics, collect_bucket_replication_runtime_metrics,
 };
 pub use bucket_replication::{
-    BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats,
+    BucketReplicationBandwidthStats, BucketReplicationMetricsSnapshot, BucketReplicationTargetStats,
     collect_bucket_replication_bandwidth_metrics, collect_bucket_replication_metrics,
 };
 pub use cluster::{ClusterStats, collect_cluster_metrics};
@@ -68,8 +68,8 @@ pub(crate) use notification::collect_notification_runtime_metrics;
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
+pub use replication::{ReplicationMetricsSnapshot, collect_replication_metrics};
 pub(crate) use replication::{ReplicationRuntimeStats, collect_replication_runtime_metrics};
-pub use replication::{ReplicationStats, collect_replication_metrics};
 pub(crate) use request::{ApiRequestMetricSupport, ApiRequestStats, collect_request_metrics};
 pub use resource::{ResourceStats, collect_resource_metrics};
 pub(crate) use scanner::{ScannerRuntimeStats, collect_scanner_runtime_metrics};
