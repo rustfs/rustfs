@@ -259,8 +259,31 @@ impl SetDisks {
         read_data: bool,
         caller_allows_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        self.get_object_fileinfo_gated(bucket, object, opts, read_data, caller_allows_early_stop)
+        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, caller_allows_early_stop, false)
             .await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    #[hotpath::measure(impl_type = "SetDisks")]
+    pub(super) async fn get_object_fileinfo_for_get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        caller_allows_early_stop: bool,
+    ) -> Result<GetObjectFileInfo> {
+        let allow_read_version_coalescing = !crate::bucket::utils::is_meta_bucketname(bucket)
+            && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            read_data,
+            caller_allows_early_stop,
+            allow_read_version_coalescing,
+        )
+        .await
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
@@ -275,6 +298,20 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         allow_early_stop: bool,
+    ) -> Result<GetObjectFileInfo> {
+        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, allow_early_stop, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_object_fileinfo_gated_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        allow_early_stop: bool,
+        allow_read_version_coalescing: bool,
     ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
@@ -337,19 +374,34 @@ impl SetDisks {
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
         // core/io_primitives.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
-            &disks,
-            "",
-            bucket,
-            object,
-            vid.as_str(),
-            read_data,
-            false,
-            opts.incl_free_versions,
-            allow_early_stop,
-            self.default_parity_count,
-        )
-        .await?;
+        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = if allow_read_version_coalescing {
+            Self::read_all_fileinfo_observed_for_get_object(
+                &disks,
+                "",
+                bucket,
+                object,
+                vid.as_str(),
+                read_data,
+                opts.incl_free_versions,
+                allow_early_stop,
+                self.default_parity_count,
+            )
+            .await?
+        } else {
+            Self::read_all_fileinfo_observed(
+                &disks,
+                "",
+                bucket,
+                object,
+                vid.as_str(),
+                read_data,
+                false,
+                opts.incl_free_versions,
+                allow_early_stop,
+                self.default_parity_count,
+            )
+            .await?
+        };
         let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
             GET_OBJECT_PATH_INTERNAL_META
         } else {

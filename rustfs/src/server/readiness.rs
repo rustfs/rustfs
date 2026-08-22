@@ -20,6 +20,7 @@ use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
 use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
 use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
+use crate::storage_api::startup::shutdown::mark_get_metadata_read_version_coalescing_service_ready;
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
@@ -212,6 +213,9 @@ where
             if readiness_gate_blocks_path(path, &readiness) {
                 return Ok(service_not_ready_response(readiness.current_stage()));
             }
+            if !is_probe_path(path) && readiness.is_ready() {
+                mark_get_metadata_read_version_coalescing_service_ready();
+            }
             let resp = inner.call(req).await?;
             // System is ready, forward to the actual S3/RPC handlers
             // Transparently converts any response body into a BoxBody, and then Trace/Cors/Compression continues to work
@@ -232,6 +236,7 @@ pub async fn publish_ready_when_runtime_ready(
         collect_node_readiness,
         |dependency_readiness| {
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            mark_get_metadata_read_version_coalescing_service_ready();
             if let Some(state_manager) = state_manager {
                 state_manager.update(ServiceState::Ready);
             }

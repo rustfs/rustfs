@@ -81,6 +81,14 @@ pub fn shutdown_background_monitors() {
     cluster::rpc::shutdown_background_monitors();
 }
 
+/// Publish that the process is ready to serve user-object GET traffic.
+///
+/// Experimental metadata coalescing is allowed to run only after this point so
+/// startup and internal metadata reads keep the original per-disk path.
+pub fn mark_get_metadata_read_version_coalescing_service_ready() {
+    runtime::global::mark_get_metadata_read_version_coalescing_service_ready();
+}
+
 #[cfg(test)]
 mod rio_tests {
     #[test]

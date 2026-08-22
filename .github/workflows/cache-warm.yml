@@ -94,6 +94,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Swatinem/rust-cache hashes every RUST* variable. Keep this aligned with
+  # ci.yml or the writer and readers use disjoint cache keys.
+  RUST_BACKTRACE: 1
 
 jobs:
   # Readers: test-and-lint, test-ilm-integration-serial, build-rustfs-debug-binary,
@@ -101,7 +104,7 @@ jobs:
   warm-ci-dev:
     name: Warm ci-dev
     runs-on: sm-standard-4
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -191,7 +194,7 @@ jobs:
   warm-ci-feat-rio:
     name: Warm ci-feat-rio
     runs-on: sm-standard-4
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -219,7 +222,7 @@ jobs:
   warm-ci-feat-proto:
     name: Warm ci-feat-proto
     runs-on: sm-standard-4
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:

@@ -143,9 +143,12 @@ pub const ENV_SCANNER_MAX_WAIT_SECS: &str = "RUSTFS_SCANNER_MAX_WAIT_SECS";
 /// Default scanner speed preset.
 pub const DEFAULT_SCANNER_SPEED: &str = "default";
 
-/// Default scanner cycle runtime budget.
-/// `0` keeps the existing unbounded per-cycle behavior.
-pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 0;
+/// Default scanner cycle runtime budget when no override is configured.
+///
+/// An explicit `0` remains the compatibility escape hatch for an unbounded
+/// cycle. Keeping the unset default finite prevents a stalled scanner I/O
+/// operation from holding the leader lease forever.
+pub const DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS: u64 = 30 * 60;
 
 /// Default scanner per-cycle object budget.
 /// `0` keeps the existing unbounded per-cycle behavior.
