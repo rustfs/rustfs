@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
-    replication_fast_env, rustfs_binary_path,
+    RustFSTestEnvironment, admin_create_user, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging,
+    local_http_client, replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client,
+    signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -35,7 +36,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
-use http::header::{CONTENT_ENCODING, CONTENT_TYPE, HOST};
+use http::header::CONTENT_ENCODING;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -56,9 +57,6 @@ use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use s3s::header::X_AMZ_REPLICATION_STATUS;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -385,116 +383,6 @@ struct ReplicationResetStatusTarget {
     replicated_count: i64,
     #[serde(rename = "object", default)]
     object: String,
-}
-
-async fn signed_request(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn signed_request_with_client(
-    client: &reqwest::Client,
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn signed_request_with_session_token(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    session_token: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if !session_token.is_empty() {
-        request = request.header("x-amz-security-token", session_token);
-    }
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
-        access_key,
-        secret_key,
-        session_token,
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
 }
 
 fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -1014,35 +902,6 @@ fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_k
         .behavior_version_latest()
         .build();
     Client::from_conf(config)
-}
-
-async fn admin_create_user(
-    env: &RustFSTestEnvironment,
-    username: &str,
-    secret_key: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
-        &env.access_key,
-        &env.secret_key,
-        Some(body.to_string().into_bytes()),
-        Some("application/json"),
-    )
-    .await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("create user failed: {status} {body}").into());
-    }
-
-    Ok(())
 }
 
 async fn admin_add_canned_policy(

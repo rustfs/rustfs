@@ -18,7 +18,6 @@ use super::*;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
 use rustfs_filemeta::{FileInfo, FileMeta};
-use serial_test::serial;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -356,7 +355,6 @@ impl Drop for TestGuard {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_should_skip_failed_respects_ttl() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
@@ -378,7 +376,6 @@ async fn test_should_skip_failed_respects_ttl() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_record_failed_ttl_zero_noop() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(0, 100, &mut scanner, temp_dir);
@@ -467,7 +464,6 @@ fn test_should_account_replication_stats_only_for_live_object_versions() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_heal_replication_only_queues_pending_null_deletes() {
     async fn replication_skipped_count() -> u64 {
         global_metrics()
@@ -716,7 +712,6 @@ async fn test_scanner_heal_admission_accounting_maps_deep_scan_to_bitrot() {
 }
 
 #[test]
-#[serial]
 fn test_excessive_version_alert_thresholds_use_env() {
     with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSIONS, Some("3"), || {
         with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, Some("100"), || {
@@ -731,7 +726,6 @@ fn test_excessive_version_alert_thresholds_use_env() {
 }
 
 #[test]
-#[serial]
 fn test_excessive_folders_threshold_uses_env() {
     with_var(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, Some("3"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -741,7 +735,6 @@ fn test_excessive_folders_threshold_uses_env() {
 }
 
 #[test]
-#[serial]
 fn test_excessive_folders_threshold_default_supports_pbs_layout() {
     with_var_unset(rustfs_config::ENV_SCANNER_ALERT_EXCESS_FOLDERS, || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -751,7 +744,6 @@ fn test_excessive_folders_threshold_default_supports_pbs_layout() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_yield_every_n_objects_uses_env() {
     with_var(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("32"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -761,7 +753,6 @@ fn test_scanner_yield_every_n_objects_uses_env() {
 }
 
 #[test]
-#[serial]
 fn test_scanner_yield_every_n_objects_uses_default() {
     with_var_unset(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -888,7 +879,6 @@ fn test_order_folders_for_resume_reports_stale_hint() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_record_failed_prunes_to_max_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(1000, 2, &mut scanner, temp_dir);
@@ -920,7 +910,6 @@ async fn test_record_failed_prunes_to_max_entries() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_prune_failed_objects_cache_drops_expired() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(5, 10, &mut scanner, temp_dir);
@@ -944,7 +933,6 @@ async fn test_prune_failed_objects_cache_drops_expired() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_prune_failed_objects_max_zero_keeps_fresh() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir);
@@ -1701,7 +1689,6 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
 }
 
 #[tokio::test]
-#[serial]
 #[cfg(unix)]
 async fn test_scan_folder_skips_unreadable_child_directory() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
@@ -1734,7 +1721,6 @@ async fn test_scan_folder_skips_unreadable_child_directory() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -1813,7 +1799,6 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -1859,7 +1844,6 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[serial]
 async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -2021,7 +2005,6 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2099,7 +2082,6 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2161,7 +2143,6 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2203,7 +2184,6 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_folder_compacted_parent_sends_partial_update() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2245,7 +2225,6 @@ async fn test_scan_folder_compacted_parent_sends_partial_update() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2290,7 +2269,6 @@ async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
@@ -2346,7 +2324,6 @@ async fn test_scan_data_folder_returns_partial_cache_on_budget_cancel() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2391,7 +2368,6 @@ async fn test_scan_data_folder_reports_invalid_checkpoint_ignored_once() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2465,7 +2441,6 @@ async fn test_scan_data_folder_resume_hint_prioritizes_next_existing_folder() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scan_data_folder_missing_bucket_returns_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2517,7 +2492,6 @@ async fn scan_data_folder_missing_bucket_returns_partial() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scan_data_folder_missing_scan_root_returns_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     tokio::fs::remove_dir_all(&temp_dir)
@@ -2563,7 +2537,6 @@ async fn scan_data_folder_missing_scan_root_returns_partial() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folders() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2632,7 +2605,6 @@ async fn test_scan_data_folder_resume_hint_orders_across_new_and_existing_folder
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2715,7 +2687,6 @@ async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_partial_compacted_entry_does_not_carry_children() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2761,7 +2732,6 @@ async fn test_partial_compacted_entry_does_not_carry_children() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_partial_entry_does_not_carry_missing_old_child() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2794,7 +2764,6 @@ async fn test_partial_entry_does_not_carry_missing_old_child() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2861,7 +2830,6 @@ async fn test_legacy_windows_cache_rebuilds_and_round_trips_portable_keys() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_success_clears_resume_hint() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2904,7 +2872,6 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
@@ -2951,7 +2918,6 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
 }
 
 #[tokio::test]
-#[serial]
 #[cfg(unix)]
 async fn test_scan_folder_ignores_symlinked_child_directory() {
     let (mut scanner, temp_dir) = build_test_scanner().await;

@@ -6161,7 +6161,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         join_all(rollback_futures).await;
 
-        // TODO: add_partial
+        // TODO(backlog): support partial object deletion for multi-part objects
 
         if let Some(api) = opts.tier_delete_journal_api.as_ref() {
             for (idx, je) in persisted_journal_entries {
@@ -6371,7 +6371,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        // TODO: Lifecycle
+        // TODO(backlog): integrate lifecycle evaluation before object deletion
 
         let mut version_found = true;
         // delete_object_version below derives its own majority quorum from the
@@ -6465,7 +6465,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 mark_deleted: mark_delete,
                 mod_time: Some(mod_time),
                 replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
-                ..Default::default() // TODO: Transition
+                ..Default::default() // TODO(backlog): populate transition state on delete markers
             };
 
             fi.set_tier_free_version_id(&find_vid.to_string());
