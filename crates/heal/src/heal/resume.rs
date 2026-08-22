@@ -501,6 +501,7 @@ impl ResumeState {
         if let Some(pos) = self.pending_buckets.iter().position(|b| b == bucket) {
             self.pending_buckets.remove(pos);
         }
+        self.resume_cursor = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -1007,7 +1008,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.complete_bucket(bucket);
         drop(state);
-        self.save_state_throttled().await
+        self.save_state().await
     }
 
     /// mark task completed

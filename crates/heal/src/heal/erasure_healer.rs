@@ -561,6 +561,8 @@ impl ErasureSetHealer {
         for (bucket_idx, bucket) in buckets.iter().enumerate().skip(current_bucket_index) {
             // check if completed
             if state.completed_buckets.contains(bucket) {
+                checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
+                current_object_index = 0;
                 continue;
             }
 
@@ -643,6 +645,7 @@ impl ErasureSetHealer {
             match bucket_result {
                 Ok(_) => {
                     resume_manager.complete_bucket(bucket).await?;
+                    checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
                     debug!(
                         target: "rustfs::heal::erasure_healer",
                         event = EVENT_HEAL_ERASURE_BUCKET_STATE,
@@ -876,7 +879,10 @@ impl ErasureSetHealer {
 
                 // Per-version dedup identity — the single canonical key.
                 let key = compose_key(&item.name, item.version_id.as_deref());
-                if checkpoint.processed_objects.contains(&key) || checkpoint.skipped_objects.contains(&key) {
+                if checkpoint.processed_objects.contains(&key)
+                    || checkpoint.failed_objects.contains(&key)
+                    || checkpoint.skipped_objects.contains(&key)
+                {
                     continue;
                 }
 
@@ -1222,14 +1228,13 @@ impl ErasureSetHealer {
             // Persist the checkpoint ledger and page position before exposing
             // the next resume cursor. A crash before cursor publication keeps
             // the page identities available for exact-once replay.
-            let next_cursor = if is_truncated { next_token.clone() } else { None };
             checkpoint_manager.advance_page(bucket_index, *current_object_index).await?;
-            resume_manager.set_resume_cursor(next_cursor.clone()).await?;
-            checkpoint_manager.prune_completed_page().await?;
             // Check if there are more pages
             if !is_truncated {
                 break;
             }
+            resume_manager.set_resume_cursor(next_token.clone()).await?;
+            checkpoint_manager.prune_completed_page().await?;
 
             // Anti-loop guard: an empty page reported as truncated cannot advance
             // the cursor (there is no last identity to move past), so treat it as a
@@ -1499,8 +1504,8 @@ mod resume_loop_tests {
     };
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
-        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
-        compose_key,
+        CheckpointManager, CheckpointObjectOutcome, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure,
+        ResumeManager, ResumeUtils, compose_key,
     };
     use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
@@ -2342,8 +2347,142 @@ mod resume_loop_tests {
         let mut names: Vec<String> = env.storage.calls().into_iter().map(|(n, _)| n).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b", "c", "d"], "every object exactly once, none dropped/doubled");
-        // Final page not truncated => cursor cleared.
-        assert_eq!(env.resume.resume_cursor().await, None);
+        // Keep the final page cursor until the outer loop durably completes the
+        // bucket, so a crash can replay only this page against its identities.
+        assert_eq!(env.resume.resume_cursor().await, Some("t1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn persisted_failure_waits_for_the_bounded_retry_after_page_replay() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.checkpoint
+            .record_object_outcome(
+                compose_key("object", Some("v1")),
+                CheckpointObjectOutcome::Failed,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        env.checkpoint.advance_page(0, 1).await.unwrap();
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect_err("the persisted failure must schedule a bounded retry");
+        assert!(
+            env.storage.calls().is_empty(),
+            "the failed identity must not be repeated in the same pass"
+        );
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("the bounded retry must heal the object");
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 1);
+        assert_eq!(state.failed_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn final_page_crash_replays_only_the_retained_page_identities() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("first", Some("v1"), false)],
+                next: Some("final-page".to_string()),
+                truncated: true,
+            },
+        );
+        env.storage.set_page(
+            Some("final-page"),
+            Page {
+                items: vec![item("last", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("the bucket pass must finish before the simulated crash");
+        assert_eq!((processed, successful, failed, skipped), (2, 2, 0, 0));
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("the retained final-page ledger must make recovery exact");
+
+        assert_eq!(
+            env.storage.calls(),
+            vec![
+                ("first".to_string(), Some("v1".to_string())),
+                ("last".to_string(), Some("v1".to_string()))
+            ]
+        );
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 2);
+        assert_eq!(state.processed_objects, 2);
+    }
+
+    #[tokio::test]
+    async fn completed_bucket_reconciles_its_final_page_checkpoint_after_crash() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let (_, _, _, _, result) = run(&env).await;
+        result.expect("the bucket pass must finish before the simulated crash");
+        env.resume.complete_bucket("b").await.unwrap();
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("recovery must finish the checkpoint transition without replaying the bucket");
+
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let checkpoint = checkpoint.get_checkpoint().await;
+        assert_eq!(checkpoint.current_bucket_index, 1);
+        assert!(checkpoint.processed_objects.is_empty());
     }
 
     #[tokio::test]

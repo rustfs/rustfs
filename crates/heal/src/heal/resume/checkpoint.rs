@@ -345,6 +345,15 @@ impl CheckpointManager {
         self.save_checkpoint().await
     }
 
+    /// Advance to the next bucket and clear the final page identities after the
+    /// resume state has durably recorded the completed bucket.
+    pub async fn complete_bucket(&self, next_bucket_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.complete_page(next_bucket_index, 0);
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
     /// Reset the checkpoint to the start of the scan for a retry, then persist.
     pub async fn reset_for_retry(&self) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
