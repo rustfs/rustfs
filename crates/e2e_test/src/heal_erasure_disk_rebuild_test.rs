@@ -380,10 +380,24 @@ mod tests {
         cluster.start_node(1).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
-        let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
-        assert!(
-            !status_body.contains("MissingContentLength"),
-            "background heal status should not fail without an explicit Content-Length: {status_body}"
+        let mut recovered = serde_json::Value::Null;
+        for _ in 0..60 {
+            let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+            assert!(
+                !status_body.contains("MissingContentLength"),
+                "background heal status should not fail without an explicit Content-Length: {status_body}"
+            );
+            recovered = serde_json::from_str(&status_body)
+                .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
+            if recovered["clusterStatusComplete"] == serde_json::Value::Bool(true) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            recovered["clusterStatusComplete"],
+            serde_json::Value::Bool(true),
+            "cluster heal status should recover before root heal starts: {recovered}"
         );
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;

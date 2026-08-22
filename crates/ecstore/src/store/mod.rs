@@ -33,7 +33,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::PoolMeta;
+use crate::core::pools::{DecommissionCanceler, PoolMeta};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -176,7 +176,7 @@ pub struct ECStore {
     // pub local_disks: Vec<DiskStore>,
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
-    pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+    pub decommission_cancelers: RwLock<Vec<Option<DecommissionCanceler>>>,
     /// Serializes rebalance/decommission start transitions.
     ///
     /// Lock order: acquire `start_gate` before `pool_meta`, `rebalance_meta`,

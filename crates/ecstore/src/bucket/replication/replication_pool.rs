@@ -2855,7 +2855,7 @@ fn replicate_object_info_from_object_info(
         .map(|v| OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
-    let asz = oi.get_actual_size().unwrap_or_default();
+    let asz = oi.get_actual_size_or_physical();
     let ssec = replication_object_is_ssec_encrypted(&oi.user_defined);
     let checksum = if ssec { oi.checksum.clone() } else { None };
 
