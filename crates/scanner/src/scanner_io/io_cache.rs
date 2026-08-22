@@ -314,7 +314,7 @@ impl ScannerIOCache for SetDisks {
         let ctx_clone = ctx.clone();
         let completed_bucket_count = Arc::new(AtomicUsize::new(0));
         let completed_bucket_count_clone = completed_bucket_count.clone();
-        let collect_bucket_results_fut = tokio::spawn(async move {
+        let collect_bucket_results_fut = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut cancelled = false;
 
             loop {
@@ -333,7 +333,7 @@ impl ScannerIOCache for SetDisks {
                     }
                 }
             }
-        });
+        }));
 
         let mut futs = Vec::new();
 
@@ -365,7 +365,7 @@ impl ScannerIOCache for SetDisks {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
             };
-            futs.push(tokio::spawn(async move {
+            futs.push(AbortOnDropHandle::new(tokio::spawn(async move {
                 let remote_session_id = uuid::Uuid::new_v4();
                 let mut remote_session_sequence = 0_u64;
                 loop {
@@ -1038,7 +1038,7 @@ impl ScannerIOCache for SetDisks {
                         );
                     }
                 }
-            }));
+            })));
         }
         drop(bucket_tx);
         drop(bucket_result_tx);

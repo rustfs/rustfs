@@ -255,7 +255,7 @@ impl ScannerCycleBudget {
             }
             if self
                 .max_directories
-                .is_some_and(|max_directories| directories > max_directories)
+                .is_some_and(|max_directories| directory_budget_exhausted(directories, max_directories))
             {
                 self.cancel_for(ScannerCycleBudgetReason::Directories);
             }
@@ -281,7 +281,7 @@ impl ScannerCycleBudget {
         }
         if self
             .max_directories
-            .is_some_and(|max_directories| directories > max_directories)
+            .is_some_and(|max_directories| directory_budget_exhausted(directories, max_directories))
         {
             self.cancel_for(ScannerCycleBudgetReason::Directories);
             return false;
@@ -327,6 +327,13 @@ fn saturating_fetch_add(value: &AtomicU64, delta: u64) -> u64 {
             Err(observed) => current = observed,
         }
     }
+}
+
+fn directory_budget_exhausted(directories: u64, max_directories: u64) -> bool {
+    // Saturation hides a remote max+1 update when the configured limit is the
+    // largest representable counter. Treat that boundary as exhausted rather
+    // than allowing work to continue indefinitely.
+    directories > max_directories || (directories == u64::MAX && max_directories == u64::MAX)
 }
 
 impl Drop for ScannerCycleBudget {
@@ -469,6 +476,35 @@ mod tests {
         assert!(!directory_budget.budget_elapsed());
         directory_budget.record_remote_progress(0, 1);
         assert_eq!(directory_budget.reason(), Some(ScannerCycleBudgetReason::Directories));
+    }
+
+    #[test]
+    fn directory_budget_fails_closed_when_progress_saturates() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_directories: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+
+        budget.record_remote_progress(0, u64::MAX);
+
+        assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Directories));
+        assert!(budget.token().is_cancelled());
+
+        let local_budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_directories: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+        local_budget.record_remote_progress(0, u64::MAX - 1);
+        assert!(!local_budget.budget_elapsed());
+        assert!(!local_budget.try_start_directory());
+        assert_eq!(local_budget.reason(), Some(ScannerCycleBudgetReason::Directories));
     }
 
     #[test]
