@@ -58,7 +58,7 @@
 | heal_erasure_disk_rebuild_test | 4 | 🌙 |
 | inline_fast_path_cluster_test | 16 |  |
 | internode_rpc_signature_e2e_test | 5 |  |
-| kms | 46 |  |
+| kms | 47 |  |
 | leading_slash_key_test | 2 | ✅ |
 | lifecycle_regression_test | 4 |  |
 | list_buckets_auth_test | 1 | ✅ |
@@ -99,4 +99,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 575 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 453 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 576 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 454 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
