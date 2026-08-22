@@ -1032,3 +1032,37 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs:
+      - typos
+      - quick-checks
+      - test-and-lint
+      - test-ilm-integration-serial
+      - test-and-lint-rio-v2
+      - test-and-lint-protocols
+      - build-rustfs-debug-binary
+      - build-rustfs-debug-binary-rio-v2
+      - uring-integration
+      - e2e-tests
+      - e2e-full
+      - e2e-tests-rio-v2
+      - s3-implemented-tests
+      - s3-lifecycle-behavior-tests
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

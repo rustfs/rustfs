@@ -15,6 +15,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCHEDULED_ALERT_WORKFLOWS = (
+    ".github/workflows/audit.yml",
+    ".github/workflows/build.yml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/coverage.yml",
+    ".github/workflows/e2e-replication-nightly.yml",
+    ".github/workflows/e2e-s3tests.yml",
+    ".github/workflows/fuzz.yml",
+    ".github/workflows/mint.yml",
+    ".github/workflows/nightly-gnu.yml",
+    ".github/workflows/performance-ab.yml",
+    ".github/workflows/runner-hygiene.yml",
+)
 
 
 def words(value: str) -> set[str]:
@@ -252,6 +265,69 @@ def check_profile_definitions(root: Path) -> list[str]:
     return errors
 
 
+def check_scheduled_alerts(root: Path) -> list[str]:
+    errors: list[str] = []
+    for relative in SCHEDULED_ALERT_WORKFLOWS:
+        path = root / relative
+        try:
+            lines = path.read_text().splitlines()
+        except FileNotFoundError:
+            errors.append(f"{relative}: missing scheduled validation workflow")
+            continue
+
+        try:
+            start = lines.index("  alert-on-failure:") + 1
+        except ValueError:
+            errors.append(f"{relative}: missing alert-on-failure job")
+            continue
+        end = next(
+            (index for index in range(start, len(lines)) if re.fullmatch(r"  [A-Za-z0-9_-]+:", lines[index])),
+            len(lines),
+        )
+        job = "\n".join(line.split("#", 1)[0] for line in lines[start:end])
+        required = (
+            "always()",
+            "github.event_name == 'schedule'",
+            "contains(needs.*.result, 'failure')",
+        )
+        missing = [token for token in required if token not in job]
+        if missing:
+            errors.append(f"{relative}: alert-on-failure missing {', '.join(missing)}")
+
+    watchdog_path = root / ".github/workflows/scheduled-validation-watchdog.yml"
+    try:
+        watchdog = "\n".join(
+            line.split("#", 1)[0] for line in watchdog_path.read_text().splitlines()
+        )
+    except FileNotFoundError:
+        errors.append(".github/workflows/scheduled-validation-watchdog.yml: missing completion watchdog")
+        return errors
+    for relative in SCHEDULED_ALERT_WORKFLOWS:
+        path = root / relative
+        if not path.is_file():
+            continue
+        source = path.read_text()
+        match = re.search(r"^name:\s*[\"']?([^\"'\n]+)", source, re.MULTILINE)
+        if not match:
+            errors.append(f"{relative}: missing workflow name")
+        elif f'- "{match.group(1).strip()}"' not in watchdog:
+            errors.append(f"{relative}: missing from scheduled completion watchdog")
+    required = (
+        "github.event.workflow_run.event == 'schedule'",
+        "github.event.workflow_run.conclusion != 'success'",
+        "github.event.workflow_run.conclusion != 'failure'",
+        "workflow-name: ${{ github.event.workflow_run.name }}",
+        "source-run-id: ${{ github.event.workflow_run.id }}",
+        "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}",
+    )
+    missing = [token for token in required if token not in watchdog]
+    if missing:
+        errors.append(
+            ".github/workflows/scheduled-validation-watchdog.yml: missing " + ", ".join(missing)
+        )
+    return errors
+
+
 def check_profile_listing(root: Path, profile: str, listing: Path) -> list[str]:
     try:
         expected_digest = profile_selection(root, profile)
@@ -281,6 +357,7 @@ def validate(root: Path) -> list[str]:
     errors.extend(check_runner_selection(root))
     errors.extend(check_s3_tests_runner(root))
     errors.extend(check_profile_definitions(root))
+    errors.extend(check_scheduled_alerts(root))
     return errors
 
 
@@ -413,6 +490,40 @@ class SelfTests(unittest.TestCase):
             with mock.patch.object(sys, "platform", "linux"):
                 self.assertEqual(len(check_profile_listing(root, "e2e-full", listing)), 1)
 
+    def test_scheduled_alerts_require_completion_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alert = (
+                "  alert-on-failure:\n"
+                "    if: always() && github.event_name == 'schedule' && "
+                "contains(needs.*.result, 'failure')\n"
+            )
+            names: list[str] = []
+            for relative in SCHEDULED_ALERT_WORKFLOWS:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                names.append(path.stem)
+                path.write_text(f'name: "{path.stem}"\n{alert}')
+            watchdog = root / ".github/workflows/scheduled-validation-watchdog.yml"
+            watchdog.write_text(
+                "\n".join(f'- "{name}"' for name in names)
+                + "\ngithub.event.workflow_run.event == 'schedule'\n"
+                + "github.event.workflow_run.conclusion != 'success'\n"
+                + "github.event.workflow_run.conclusion != 'failure'\n"
+                + "workflow-name: ${{ github.event.workflow_run.name }}\n"
+                + "source-run-id: ${{ github.event.workflow_run.id }}\n"
+                + "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}\n"
+            )
+            self.assertEqual(check_scheduled_alerts(root), [])
+
+            first = root / SCHEDULED_ALERT_WORKFLOWS[0]
+            first.write_text(first.read_text().replace("contains(needs.*.result, 'failure')", "false"))
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(first.read_text().replace("false", "contains(needs.*.result, 'failure')"))
+
+            watchdog.write_text(watchdog.read_text().replace(f'- "{names[0]}"\n', ""))
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+
 def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
@@ -436,7 +547,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("OK: e2e modules, runner selection, fuzz matrices, profiles, and bounded diagnostics are wired")
+    print("OK: e2e modules, runner selection, fuzz matrices, profiles, and scheduled alerts are wired")
     return 0
 
 
