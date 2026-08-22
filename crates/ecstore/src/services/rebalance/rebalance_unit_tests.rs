@@ -68,7 +68,6 @@ use rustfs_filemeta::{FileInfo, MetaCacheEntry};
 use rustfs_rio::Index;
 use s3s::dto::ReplicationConfiguration;
 use serde::Serialize;
-use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;

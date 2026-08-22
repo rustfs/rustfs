@@ -5014,7 +5014,7 @@ async fn apply_expiry_on_transitioned_object_with_lock_lost_signal(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
-    src: &LcEventSrc,
+    _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {

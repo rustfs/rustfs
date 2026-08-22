@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use tokio::time::Duration;

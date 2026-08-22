@@ -791,7 +791,6 @@ pub mod test_util {
     use super::super::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use super::*;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
-    use crate::storage_api_contracts::object::ObjectOperations as _;
     use rustfs_filemeta::FileMeta;
 
     pub struct PausedRebalanceEntryTestFixture {
@@ -936,7 +935,6 @@ pub mod test_util {
 mod tests {
     use super::*;
     use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
-    use crate::client::api_s3_datatypes::CompletePart;
     use crate::object_api::PutObjReader;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use crate::set_disk::{
@@ -944,9 +942,10 @@ mod tests {
         TieredMetadataCommitBarrier,
     };
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
-    use crate::storage_api_contracts::object::ObjectOperations as _;
+    use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
+    use rustfs_storage_api::CompletePart;
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
