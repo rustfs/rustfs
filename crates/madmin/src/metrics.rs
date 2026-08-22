@@ -689,6 +689,14 @@ pub struct ScannerMetrics {
     pub cycle_max_objects: u64,
     #[serde(rename = "cycle_max_directories", default)]
     pub cycle_max_directories: u64,
+    #[serde(rename = "cycle_timeout_total", default)]
+    pub cycle_timeout_total: u64,
+    #[serde(rename = "cycle_recovery_required_total", default)]
+    pub cycle_recovery_required_total: u64,
+    #[serde(rename = "cycle_last_progress_age", default)]
+    pub cycle_last_progress_age: u64,
+    #[serde(rename = "leader_lease_without_progress", default)]
+    pub leader_lease_without_progress: bool,
     #[serde(rename = "bitrot_cycle_enabled", default)]
     pub bitrot_cycle_enabled: bool,
     #[serde(rename = "bitrot_cycle_seconds", default)]
@@ -764,6 +772,8 @@ impl ScannerMetrics {
             self.cycle_max_duration_seconds = other.cycle_max_duration_seconds;
             self.cycle_max_objects = other.cycle_max_objects;
             self.cycle_max_directories = other.cycle_max_directories;
+            self.cycle_last_progress_age = other.cycle_last_progress_age;
+            self.leader_lease_without_progress = other.leader_lease_without_progress;
             self.bitrot_cycle_enabled = other.bitrot_cycle_enabled;
             self.bitrot_cycle_seconds = other.bitrot_cycle_seconds;
         }
@@ -857,6 +867,12 @@ impl ScannerMetrics {
             .saturating_add(other.last_cycle_replication_checks);
         self.last_cycle_usage_saves = self.last_cycle_usage_saves.saturating_add(other.last_cycle_usage_saves);
         self.failed_cycles = self.failed_cycles.saturating_add(other.failed_cycles);
+        self.cycle_timeout_total = self.cycle_timeout_total.saturating_add(other.cycle_timeout_total);
+        self.cycle_recovery_required_total = self
+            .cycle_recovery_required_total
+            .saturating_add(other.cycle_recovery_required_total);
+        self.cycle_last_progress_age = self.cycle_last_progress_age.max(other.cycle_last_progress_age);
+        self.leader_lease_without_progress |= other.leader_lease_without_progress;
         self.superseded_cycles = self.superseded_cycles.saturating_add(other.superseded_cycles);
         self.partial_cycles_unknown = self.partial_cycles_unknown.saturating_add(other.partial_cycles_unknown);
         self.partial_cycles_runtime = self.partial_cycles_runtime.saturating_add(other.partial_cycles_runtime);

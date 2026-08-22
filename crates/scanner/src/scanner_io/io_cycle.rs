@@ -242,7 +242,7 @@ impl ScannerIOCycle for ECStore {
                         results[results_index_clone] = result;
                     }
                 });
-                wait_futs.push(receiver_fut);
+                wait_futs.push(AbortOnDropHandle::new(receiver_fut));
 
                 let scan_plan = ScannerBucketScanPlan {
                     buckets: set_buckets,
@@ -318,7 +318,7 @@ impl ScannerIOCycle for ECStore {
                         record_set_scan_failure(&mut first_err, e);
                     }
                 });
-                wait_futs.push(scanner_fut);
+                wait_futs.push(AbortOnDropHandle::new(scanner_fut));
             }
         }
 

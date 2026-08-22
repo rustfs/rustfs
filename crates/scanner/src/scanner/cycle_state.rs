@@ -1581,3 +1581,63 @@ where
         output = &mut cycle => Some(output),
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ScannerCycleWaitOutcome<T> {
+    Completed(T),
+    LockLost,
+    Cancelled,
+    Deadline { worker_stopped: bool },
+}
+
+pub(super) async fn await_scanner_cycle_with_budget_fence<Cycle, LockLost>(
+    cycle_ctx: &CancellationToken,
+    budget: &ScannerCycleBudget,
+    cycle: Cycle,
+    lock_lost: LockLost,
+) -> ScannerCycleWaitOutcome<Cycle::Output>
+where
+    Cycle: Future,
+    LockLost: Future<Output = ()>,
+{
+    tokio::pin!(cycle);
+    tokio::pin!(lock_lost);
+    let deadline = async {
+        if let Some(deadline) = budget.deadline() {
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(deadline);
+    tokio::select! {
+        biased;
+        _ = &mut lock_lost => {
+            cycle_ctx.cancel();
+            let _ = tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle).await;
+            ScannerCycleWaitOutcome::LockLost
+        }
+        _ = &mut deadline => {
+            budget.cancel_for_runtime();
+            // Let the budget cancellation reach the scanner first so it can
+            // persist a partial cursor. Only an uncooperative worker gets the
+            // parent cancellation, and it is dropped after the bounded window;
+            // the caller fences its epoch next.
+            let worker_stopped = if tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle)
+                .await
+                .is_ok()
+            {
+                true
+            } else {
+                cycle_ctx.cancel();
+                false
+            };
+            ScannerCycleWaitOutcome::Deadline { worker_stopped }
+        }
+        _ = cycle_ctx.cancelled() => {
+            let _ = tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle).await;
+            ScannerCycleWaitOutcome::Cancelled
+        }
+        output = &mut cycle => ScannerCycleWaitOutcome::Completed(output),
+    }
+}
