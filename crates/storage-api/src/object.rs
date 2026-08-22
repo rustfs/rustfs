@@ -218,6 +218,17 @@ pub struct DeletedObject {
     pub force_delete_generation: Option<i64>,
 }
 
+/// Accounting identity returned by the internal commit-time delete path.
+///
+/// This is carried separately from [`DeletedObject`] so adding quota details
+/// does not change the source shape of the public S3 delete result contract.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeleteAccounting {
+    pub size: Option<u64>,
+    pub version_id: Option<Uuid>,
+    pub removed_current_object: bool,
+}
+
 impl DeletedObject {
     pub fn version_purge_status(&self) -> VersionPurgeStatusType {
         self.replication_state
@@ -341,6 +352,19 @@ pub trait ObjectOperations: Send + Sync + fmt::Debug {
         objects: Vec<Self::ObjectToDelete>,
         opts: Self::ObjectOptions,
     ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>);
+    /// Delete objects and optionally return commit-time accounting identities.
+    /// The default preserves the ordinary delete contract for implementations
+    /// that do not expose storage-level accounting details.
+    async fn delete_objects_with_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<Self::ObjectToDelete>,
+        opts: Self::ObjectOptions,
+    ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>, Vec<Option<DeleteAccounting>>) {
+        let object_count = objects.len();
+        let (deleted, errors) = self.delete_objects(bucket, objects, opts).await;
+        (deleted, errors, vec![None; object_count])
+    }
     async fn put_object_metadata(
         &self,
         bucket: &str,
