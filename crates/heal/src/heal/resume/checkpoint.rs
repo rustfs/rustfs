@@ -29,10 +29,10 @@ use super::{
 
 const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 
-/// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
-/// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
-/// to the new `compose_key` identities, so a stale checkpoint is discarded.
-pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 5;
+/// Current on-disk schema version for `ResumeCheckpoint`. Schema 5 could
+/// persist dedup identities without the aggregate counters needed to restore
+/// them safely, so stale checkpoints are discarded and replayed.
+pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 6;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CheckpointObjectOutcome {
@@ -252,10 +252,9 @@ impl CheckpointManager {
             });
         }
 
-        // A checkpoint from an older schema stored latest-only dedup identities
-        // that are not comparable to the new per-version `compose_key`
-        // identities. Discard the stale sets and position, then stamp the
-        // current schema so the scan restarts cleanly.
+        // Older checkpoints can contain identities that are not comparable to
+        // the current keys or lack their corresponding aggregate counters.
+        // Discard the stale sets and position so the scan restarts cleanly.
         if checkpoint.schema_version > CURRENT_CHECKPOINT_SCHEMA {
             return Err(Error::TaskExecutionFailed {
                 message: format!(

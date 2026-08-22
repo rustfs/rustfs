@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 use super::super::storage_api::status::BucketInfo;
+use crate::heal::progress::HealProgressState;
 
 #[tokio::test]
 async fn retry_request_carries_remaining_timeout_budget() {
@@ -2152,6 +2153,49 @@ async fn erasure_set_heal_applies_usage_baseline_to_progress() {
     assert!(progress.baseline_known);
     assert_eq!(progress.bytes_processed, 2);
     assert!((progress.progress_percentage - 25.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn erasure_set_disk_walk_keeps_cluster_usage_baseline_indeterminate() {
+    for (scan_mode, source) in [
+        (HealScanMode::Deep, HealRequestSource::Admin),
+        (HealScanMode::Normal, HealRequestSource::AutoHeal),
+    ] {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            resume_disk: Mutex::new(Some(disk)),
+            usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
+                objects_count: 10,
+                bytes: 8,
+                generation: Some(1),
+            })),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                scan_mode,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = source;
+        let task = HealTask::from_request(request, storage);
+
+        task.heal_erasure_set(vec!["bucket-a".to_string()], "pool_0_set_0".to_string())
+            .await
+            .expect("erasure set heal should complete");
+
+        let progress = task.get_progress().await;
+        assert!(!progress.baseline_known);
+        assert_eq!(progress.baseline_generation, None);
+        assert_eq!(progress.progress_state, HealProgressState::Indeterminate);
+    }
 }
 
 #[tokio::test]

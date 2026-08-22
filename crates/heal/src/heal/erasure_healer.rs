@@ -892,7 +892,7 @@ impl ErasureSetHealer {
                     let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_new_versions_total").increment(1);
-                    let (skipped_new, skipped_ilm, counter_unknown) = {
+                    let progress = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_new_version();
                         progress.set_current_object(Some(format!("skipped_new: {bucket}/{}", item.name)));
@@ -906,22 +906,22 @@ impl ErasureSetHealer {
                         if !counter_ok {
                             progress.mark_unknown();
                         }
-                        (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
+                        progress.clone()
                     };
                     checkpoint_manager
                         .record_object_outcome(CheckpointObjectOutcomeRecord {
                             object: key,
                             outcome: CheckpointObjectOutcome::Processed,
-                            successful: *successful_objects,
-                            failed: *failed_objects,
-                            skipped: *skipped_objects,
-                            bytes: bytes_processed,
-                            skipped_new_versions: skipped_new,
-                            skipped_ilm_expired: skipped_ilm,
-                            counter_unknown: !counter_ok || counter_unknown,
+                            successful: progress.objects_healed,
+                            failed: progress.objects_failed,
+                            skipped: progress.skipped_objects,
+                            bytes: progress.bytes_processed,
+                            skipped_new_versions: progress.skipped_new_versions,
+                            skipped_ilm_expired: progress.skipped_ilm_expired,
+                            counter_unknown: progress.counter_unknown,
                         })
                         .await?;
-                    if !counter_ok || counter_unknown {
+                    if progress.counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
@@ -957,7 +957,7 @@ impl ErasureSetHealer {
                     let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_ilm_expired_total").increment(1);
-                    let (skipped_new, skipped_ilm, counter_unknown) = {
+                    let progress = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_ilm_expired();
                         progress.set_current_object(Some(format!("skipped_ilm: {bucket}/{}", item.name)));
@@ -971,22 +971,22 @@ impl ErasureSetHealer {
                         if !counter_ok {
                             progress.mark_unknown();
                         }
-                        (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
+                        progress.clone()
                     };
                     checkpoint_manager
                         .record_object_outcome(CheckpointObjectOutcomeRecord {
                             object: key,
                             outcome: CheckpointObjectOutcome::Processed,
-                            successful: *successful_objects,
-                            failed: *failed_objects,
-                            skipped: *skipped_objects,
-                            bytes: bytes_processed,
-                            skipped_new_versions: skipped_new,
-                            skipped_ilm_expired: skipped_ilm,
-                            counter_unknown: !counter_ok || counter_unknown,
+                            successful: progress.objects_healed,
+                            failed: progress.objects_failed,
+                            skipped: progress.skipped_objects,
+                            bytes: progress.bytes_processed,
+                            skipped_new_versions: progress.skipped_new_versions,
+                            skipped_ilm_expired: progress.skipped_ilm_expired,
+                            counter_unknown: progress.counter_unknown,
                         })
                         .await?;
-                    if !counter_ok || counter_unknown {
+                    if progress.counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
@@ -1188,7 +1188,7 @@ impl ErasureSetHealer {
 
                 telemetry_unknown |= !increment_counter(processed_objects);
                 completed_in_page += 1;
-                let (progress_unknown, skipped_new_versions, skipped_ilm_expired) = {
+                let progress = {
                     let mut progress = self.progress.write().await;
                     progress.set_current_object(Some(format!("{bucket}/{object}")));
                     progress.update_object_progress(
@@ -1201,22 +1201,22 @@ impl ErasureSetHealer {
                     if telemetry_unknown {
                         progress.mark_unknown();
                     }
-                    (progress.counter_unknown, progress.skipped_new_versions, progress.skipped_ilm_expired)
+                    progress.clone()
                 };
                 checkpoint_manager
                     .record_object_outcome(CheckpointObjectOutcomeRecord {
                         object: key,
                         outcome: checkpoint_outcome,
-                        successful: *successful_objects,
-                        failed: *failed_objects,
-                        skipped: *skipped_objects,
-                        bytes: bytes_processed,
-                        skipped_new_versions,
-                        skipped_ilm_expired,
-                        counter_unknown: telemetry_unknown || progress_unknown,
+                        successful: progress.objects_healed,
+                        failed: progress.objects_failed,
+                        skipped: progress.skipped_objects,
+                        bytes: progress.bytes_processed,
+                        skipped_new_versions: progress.skipped_new_versions,
+                        skipped_ilm_expired: progress.skipped_ilm_expired,
+                        counter_unknown: progress.counter_unknown,
                     })
                     .await?;
-                if telemetry_unknown || progress_unknown {
+                if progress.counter_unknown {
                     resume_manager.mark_counter_unknown().await?;
                 }
 
@@ -1506,8 +1506,8 @@ mod resume_loop_tests {
     };
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
-        CheckpointManager, CheckpointObjectOutcome, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure,
-        ResumeManager, ResumeUtils, compose_key,
+        CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, RESUME_CHECKPOINT_FILE,
+        ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils, compose_key,
     };
     use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;

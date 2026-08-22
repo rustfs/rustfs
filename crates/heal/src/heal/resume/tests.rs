@@ -1603,14 +1603,14 @@ async fn test_resumestate_schema_v0_discarded_on_load() {
 }
 
 #[tokio::test]
-async fn test_checkpoint_schema_v4_discarded_on_load() {
+async fn test_checkpoint_schema_v5_discarded_on_load() {
     let (temp_dir, disk) = schema_test_disk().await;
 
-    // The previous checkpoint schema is unsafe once its paired resume
-    // state is discarded: retaining either position would skip work.
+    // Schema v5 can persist failed identities without the aggregate counters
+    // that make those identities safe to deduplicate after an upgrade.
     let task_id = "00000000-0000-4000-8000-000000000002";
     let legacy = r#"{
-            "schema_version": 4,
+            "schema_version": 5,
             "task_id": "00000000-0000-4000-8000-000000000002",
             "checkpoint_time": 1700000000,
             "current_bucket_index": 2,

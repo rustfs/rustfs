@@ -20,7 +20,7 @@ use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
-    HealControlCoordinator, NodeHealProgress, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
+    HealControlCoordinator, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
     decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint,
 };
 use bytes::Bytes;
@@ -298,14 +298,7 @@ fn background_heal_runtime_state(
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BackgroundHealProgress {
-    objects_scanned: u64,
-    objects_healed: u64,
-    objects_failed: u64,
-    bytes_processed: u64,
-}
+type BackgroundHealProgress = rustfs_heal::HealProgress;
 
 #[derive(Debug)]
 struct ClusterHealStatusSnapshot {
@@ -344,17 +337,10 @@ fn add_operations(total: &mut rustfs_heal::HealOperationsSnapshot, next: rustfs_
     add_source_counts(&mut total.retrying_by_source, next.retrying_by_source);
 }
 
-fn add_progress(total: &mut BackgroundHealProgress, next: NodeHealProgress) {
-    total.objects_scanned = total.objects_scanned.saturating_add(next.objects_scanned);
-    total.objects_healed = total.objects_healed.saturating_add(next.objects_healed);
-    total.objects_failed = total.objects_failed.saturating_add(next.objects_failed);
-    total.bytes_processed = total.bytes_processed.saturating_add(next.bytes_processed);
-}
-
 fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> ClusterHealStatusSnapshot {
     let mut info = BackgroundHealInfo::default();
     let mut operations = rustfs_heal::HealOperationsSnapshot::default();
-    let mut progress = None;
+    let mut progress = Vec::new();
     let mut any_services_enabled = false;
     let mut any_initialized = false;
 
@@ -371,17 +357,11 @@ fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> Clus
         }
         add_operations(&mut operations, snapshot.operations);
         if let Some(next) = snapshot.progress {
-            add_progress(
-                progress.get_or_insert(BackgroundHealProgress {
-                    objects_scanned: 0,
-                    objects_healed: 0,
-                    objects_failed: 0,
-                    bytes_processed: 0,
-                }),
-                next,
-            );
+            progress.push(next);
         }
     }
+
+    let progress = rustfs_heal::aggregate_heal_progress(progress);
 
     let state = if operations.queue_length > 0 || operations.active_tasks > 0 || operations.retrying_tasks > 0 {
         HealRuntimeState::Active
@@ -2201,10 +2181,19 @@ mod tests {
         };
 
         let progress = BackgroundHealProgress {
+            kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
             objects_scanned: 7,
             objects_healed: 3,
             objects_failed: 1,
+            skipped_objects: 3,
+            objects_total_count: 10,
+            objects_total_size: 8192,
             bytes_processed: 4096,
+            progress_percentage: 50.0,
+            progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+            baseline_generation: Some(42),
+            baseline_known: true,
+            ..Default::default()
         };
 
         let encoded = encode_background_heal_status(
@@ -2220,7 +2209,14 @@ mod tests {
         assert_eq!(json["progress"]["objectsScanned"], 7);
         assert_eq!(json["progress"]["objectsHealed"], 3);
         assert_eq!(json["progress"]["objectsFailed"], 1);
+        assert_eq!(json["progress"]["skippedObjects"], 3);
+        assert_eq!(json["progress"]["objectsTotalCount"], 10);
+        assert_eq!(json["progress"]["objectsTotalSize"], 8192);
         assert_eq!(json["progress"]["bytesProcessed"], 4096);
+        assert_eq!(json["progress"]["progressState"], "running");
+        assert_eq!(json["progress"]["baselineGeneration"], 42);
+        assert_eq!(json["progress"]["baselineKnown"], true);
+        assert_eq!(json["progress"]["counterUnknown"], false);
     }
 
     #[test]
@@ -2242,10 +2238,18 @@ mod tests {
                 ..Default::default()
             },
             Some(NodeHealProgress {
+                kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
                 objects_scanned: 3,
                 objects_healed: 1,
                 objects_failed: 0,
+                skipped_objects: 2,
+                objects_total_count: 6,
+                objects_total_size: 400,
                 bytes_processed: 100,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_generation: Some(9),
+                baseline_known: true,
+                ..Default::default()
             }),
         );
         let peer = NodeHealStatusSnapshot::for_test(
@@ -2265,10 +2269,17 @@ mod tests {
                 ..Default::default()
             },
             Some(NodeHealProgress {
+                kind: rustfs_heal::heal::progress::HealProgressKind::ObjectSweep,
                 objects_scanned: 5,
                 objects_healed: 4,
                 objects_failed: 1,
+                objects_total_count: 4,
+                objects_total_size: 1600,
                 bytes_processed: 900,
+                progress_state: rustfs_heal::heal::progress::HealProgressState::Running,
+                baseline_generation: Some(9),
+                baseline_known: true,
+                ..Default::default()
             }),
         );
 
@@ -2287,7 +2298,15 @@ mod tests {
         assert_eq!(progress.objects_scanned, 8);
         assert_eq!(progress.objects_healed, 5);
         assert_eq!(progress.objects_failed, 1);
+        assert_eq!(progress.skipped_objects, 2);
+        assert_eq!(progress.objects_total_count, 10);
+        assert_eq!(progress.objects_total_size, 2000);
         assert_eq!(progress.bytes_processed, 1000);
+        assert_eq!(progress.progress_percentage, 50.0);
+        assert_eq!(progress.progress_state, rustfs_heal::heal::progress::HealProgressState::Running);
+        assert_eq!(progress.baseline_generation, Some(9));
+        assert!(progress.baseline_known);
+        assert!(!progress.counter_unknown);
 
         assert_eq!(peer_first.state, HealRuntimeState::Active);
         assert_eq!(peer_first.operations, local_first.operations);
@@ -2327,6 +2346,7 @@ mod tests {
             objects_healed: value,
             objects_failed: value,
             bytes_processed: value,
+            ..Default::default()
         };
         let saturated = NodeHealStatusSnapshot::for_test(
             true,

@@ -445,6 +445,9 @@ impl HealTask {
     }
 
     pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String], set_disk_id: &str) -> Result<()> {
+        if matches!(self.options.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal) {
+            return Ok(());
+        }
         let baseline = match self
             .await_with_control(self.storage.erasure_set_usage_baseline(buckets))
             .await

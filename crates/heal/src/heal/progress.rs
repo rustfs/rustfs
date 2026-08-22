@@ -65,8 +65,8 @@ pub enum HealProgressState {
     Completed,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct HealProgress {
     #[serde(default)]
     pub kind: HealProgressKind,
@@ -380,6 +380,101 @@ impl HealProgress {
             0.0
         }
     }
+}
+
+pub fn aggregate_heal_progress(progresses: impl IntoIterator<Item = HealProgress>) -> Option<HealProgress> {
+    let mut snapshot = HealProgress::default();
+    let mut found = false;
+    let mut has_object_sweep = false;
+    let mut all_object_baselines_known = true;
+    let mut baseline_generation = None;
+    let mut baseline_generation_consistent = true;
+    let mut all_ledgers_complete = true;
+    let mut counter_overflow = false;
+
+    for progress in progresses {
+        found = true;
+        let object_sweep = matches!(progress.kind, HealProgressKind::ObjectSweep);
+        has_object_sweep |= object_sweep;
+        all_ledgers_complete &= progress.ledger_complete;
+        if object_sweep {
+            all_object_baselines_known &= progress.baseline_known;
+            match baseline_generation {
+                None => baseline_generation = Some(progress.baseline_generation),
+                Some(generation) => baseline_generation_consistent &= generation == progress.baseline_generation,
+            }
+        }
+        counter_overflow |= progress.counter_unknown || matches!(progress.progress_state, HealProgressState::Unknown);
+        for (target, value) in [
+            (&mut snapshot.objects_scanned, progress.objects_scanned),
+            (&mut snapshot.objects_healed, progress.objects_healed),
+            (&mut snapshot.objects_failed, progress.objects_failed),
+            (&mut snapshot.skipped_objects, progress.skipped_objects),
+            (&mut snapshot.skipped_new_versions, progress.skipped_new_versions),
+            (&mut snapshot.skipped_ilm_expired, progress.skipped_ilm_expired),
+            (&mut snapshot.objects_total_count, progress.objects_total_count),
+            (&mut snapshot.objects_total_size, progress.objects_total_size),
+            (&mut snapshot.bytes_processed, progress.bytes_processed),
+            (&mut snapshot.stage_current, progress.stage_current),
+            (&mut snapshot.stage_total, progress.stage_total),
+        ] {
+            match target.checked_add(value) {
+                Some(sum) => *target = sum,
+                None => {
+                    *target = u64::MAX;
+                    counter_overflow = true;
+                }
+            }
+        }
+        snapshot.start_time = match (snapshot.start_time, progress.start_time) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (None, next) => next,
+            (current, None) => current,
+        };
+        snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (None, next) => next,
+            (current, None) => current,
+        };
+        if progress.current_object.is_some() {
+            snapshot.current_object = progress.current_object;
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    snapshot.kind = if has_object_sweep {
+        HealProgressKind::ObjectSweep
+    } else {
+        HealProgressKind::Stage
+    };
+    snapshot.baseline_known = has_object_sweep && all_object_baselines_known && baseline_generation_consistent;
+    snapshot.baseline_generation = if snapshot.baseline_known && baseline_generation_consistent {
+        baseline_generation.flatten()
+    } else {
+        None
+    };
+    snapshot.ledger_complete = all_ledgers_complete;
+    snapshot.counter_unknown = counter_overflow;
+    if counter_overflow {
+        snapshot.progress_state = HealProgressState::Unknown;
+        snapshot.progress_percentage = if snapshot.ledger_complete { 100.0 } else { 0.0 };
+    } else if snapshot.ledger_complete {
+        snapshot.progress_state = HealProgressState::Completed;
+        snapshot.progress_percentage = 100.0;
+    } else if has_object_sweep {
+        snapshot.refresh_progress_percentage();
+    } else if snapshot.stage_total == 0 {
+        snapshot.progress_state = HealProgressState::Indeterminate;
+        snapshot.progress_percentage = 0.0;
+    } else {
+        snapshot.progress_state = HealProgressState::Running;
+        snapshot.progress_percentage = ((snapshot.stage_current as f64 / snapshot.stage_total as f64) * 100.0).min(99.999);
+    }
+    snapshot.refresh_estimated_completion_time();
+    Some(snapshot)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,6 +820,31 @@ mod tests {
         progress.mark_completed();
         assert!(progress.is_completed());
         assert_eq!(progress.progress_state, HealProgressState::Unknown);
+
+        let aggregate = aggregate_heal_progress([progress]).expect("progress should aggregate");
+        assert!(aggregate.ledger_complete);
+        assert!(aggregate.counter_unknown);
+        assert_eq!(aggregate.progress_state, HealProgressState::Unknown);
+        assert_eq!(aggregate.progress_percentage, 100.0);
+    }
+
+    #[test]
+    fn aggregate_rejects_mixed_baseline_generations() {
+        let progress = |generation| HealProgress {
+            kind: HealProgressKind::ObjectSweep,
+            objects_scanned: 5,
+            objects_total_count: 10,
+            progress_state: HealProgressState::Running,
+            baseline_generation: Some(generation),
+            baseline_known: true,
+            ..Default::default()
+        };
+
+        let aggregate = aggregate_heal_progress([progress(1), progress(2)]).expect("progress should aggregate");
+        assert!(!aggregate.baseline_known);
+        assert_eq!(aggregate.baseline_generation, None);
+        assert_eq!(aggregate.progress_state, HealProgressState::Indeterminate);
+        assert_eq!(aggregate.progress_percentage, 0.0);
     }
 
     #[test]
