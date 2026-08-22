@@ -52,9 +52,6 @@ fn create_user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key:
 #[tokio::test]
 async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !crate::common::awscurl_available() {
-        return Err("awscurl is required for test_bucket_policy_authenticated_user".into());
-    }
     info!("Starting test_bucket_policy_authenticated_user...");
 
     let mut env = RustFSTestEnvironment::new().await?;

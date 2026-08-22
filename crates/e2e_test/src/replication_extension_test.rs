@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::common::{
-    RustFSTestEnvironment, admin_create_user, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging,
-    local_http_client, replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client,
-    signed_request_with_session_token,
+    RustFSTestEnvironment, admin_create_user, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
+    replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -7280,11 +7279,6 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
 #[tokio::test]
 async fn test_site_replication_replicates_service_accounts_created_from_sts_session_real_dual_node() -> TestResult {
     init_logging();
-
-    if !awscurl_available() {
-        eprintln!("Skipping STS site replication service-account test because awscurl is unavailable");
-        return Ok(());
-    }
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     source_env

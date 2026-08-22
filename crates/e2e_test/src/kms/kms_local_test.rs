@@ -20,8 +20,7 @@
 //! - Complete encryption/decryption lifecycle
 
 use super::common::{
-    LocalKMSTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
-    test_kms_key_management, test_sse_c_encryption,
+    LocalKMSTestEnvironment, get_kms_status, sse_customer_key_md5_base64, test_kms_key_management, test_sse_c_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
 use tracing::{error, info};
@@ -29,9 +28,6 @@ use tracing::{error, info};
 #[tokio::test]
 async fn test_local_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_local_kms_end_to_end") {
-        return Ok(());
-    }
     info!("Starting Local KMS End-to-End Test");
 
     // Create LocalKMS test environment
