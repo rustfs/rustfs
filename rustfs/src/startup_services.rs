@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use crate::site_replication_reconcile::spawn_site_replication_reconcile_task;
-use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
+use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot, StorageAdminApi};
 use crate::{
     config::Config,
-    connect::{CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, spawn_heartbeat_runtime},
+    connect::{
+        CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, InventoryFlag, InventoryRuntime, InventorySchedule,
+        InventorySnapshot, spawn_heartbeat_runtime, spawn_inventory_runtime,
+    },
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
     startup_audit::init_audit_runtime,
@@ -96,7 +99,9 @@ pub(crate) async fn init_startup_runtime_services(
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
     init_observability_runtime(store.clone(), ctx.clone()).await;
-    let heartbeat = start_heartbeat_runtime(heartbeat_config, heartbeat_nodes, &ctx)?;
+    let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
+    let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, store, &ctx)?;
+    let heartbeat = heartbeat.map(|heartbeat| heartbeat.with_inventory(inventory));
 
     Ok(StartupServiceRuntime {
         optional_runtimes,
@@ -119,4 +124,33 @@ fn start_heartbeat_runtime(
         .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
         .ok_or_else(|| std::io::Error::other("Connect heartbeat node count is outside protocol bounds"))?;
     spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(std::io::Error::other)
+}
+
+fn start_inventory_runtime(
+    config: Option<HeartbeatConfig>,
+    node_count: Option<usize>,
+    store: Arc<ECStore>,
+    shutdown: &CancellationToken,
+) -> Result<Option<InventoryRuntime>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let node_count = node_count.unwrap_or_default();
+    spawn_inventory_runtime(Some(config), InventorySchedule::default(), shutdown, move || {
+        let store = store.clone();
+        async move {
+            let info = StorageAdminApi::storage_info(store.as_ref()).await;
+            let total = crate::app::storage_api::capacity::get_total_usable_capacity(&info.disks, &info) as u64;
+            let free = crate::app::storage_api::capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
+            let mut flags = Vec::with_capacity(3);
+            if info.disks.iter().any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE) {
+                flags.extend([InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]);
+            }
+            if info.disks.iter().any(|disk| disk.healing) {
+                flags.push(InventoryFlag::ClusterHealing);
+            }
+            InventorySnapshot::current(node_count, info.disks.len(), total, free, flags)
+        }
+    })
+    .map_err(std::io::Error::other)
 }
