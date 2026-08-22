@@ -160,6 +160,10 @@ pub struct InstanceContext {
     /// workers (scanner/heal/tier/lifecycle) without touching another instance.
     /// Replaces the process-global cancel-token static.
     background_cancel_token: OnceLock<CancellationToken>,
+    /// Serializes decommission data-movement operations with cancellation and
+    /// a subsequent restart. Readers are held across one object side effect;
+    /// the transition path takes the writer after cancelling the routine.
+    decommission_operation_gate: Arc<RwLock<()>>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
@@ -200,6 +204,7 @@ impl InstanceContext {
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
+            decommission_operation_gate: Arc::new(RwLock::new(())),
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -216,6 +221,10 @@ impl InstanceContext {
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
+    }
+
+    pub(crate) fn decommission_operation_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.decommission_operation_gate)
     }
 
     /// Install the application-owned object-encryption resolver once.
