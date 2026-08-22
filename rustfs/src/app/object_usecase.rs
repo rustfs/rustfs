@@ -3938,6 +3938,15 @@ pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &Object
     if put_like_write_creates_new_version(opts) {
         return Ok(());
     }
+    // An authorized replication write (ReplicateObjectAction set
+    // `replication_request`) carries the source's lock state for the replica,
+    // so the destination's current hold/retention must not reject it (MinIO
+    // `checkPutObjectLockAllowed` skips the existing-version check for
+    // replicas). The set layer's commit-lock LWW still keeps a category that
+    // was locked more recently on this site.
+    if opts.replication_request {
+        return Ok(());
+    }
 
     let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
     if legal_hold
@@ -11080,6 +11089,24 @@ mod tests {
             .expect_err("explicit version overwrite should still be blocked");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    /// The source's lock state governs the replica (rustfs/backlog#1953):
+    /// an authorized replication write may overwrite a locked version; the
+    /// set layer's LWW still decides per category.
+    #[test]
+    fn validate_existing_object_lock_allows_authorized_replication_overwrite() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            replication_request: true,
+            ..Default::default()
+        };
+
+        validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect("replication write must bypass the destination COMPLIANCE lock");
+        validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+            .expect("replication write must bypass the destination legal hold");
     }
 
     #[test]

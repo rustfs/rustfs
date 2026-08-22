@@ -2671,7 +2671,18 @@ impl SetDisks {
                         let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
                             Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
                         })?;
-                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some() {
+                        // The WORM gate protects the locked version from local
+                        // overwrites only. For an authorized replication write
+                        // (ReplicateObjectAction, `replication_request`) the
+                        // source's lock state governs the replica, as in MinIO's
+                        // `checkPutObjectLockAllowed` (`!replica` guard): a
+                        // legal-hold release or retention change reaches this
+                        // site only through this write, and rejecting it loops
+                        // through MRF forever. Receiver-side LWW below still
+                        // keeps a category locked more recently here.
+                        if !opts.replication_request
+                            && check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some()
+                        {
                             return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
                         }
                         // Receiver-side LWW (rustfs/backlog#1953): reuse this
@@ -8588,6 +8599,124 @@ mod replication_lww_tests {
             "a newer local tag deletion must not be resurrected by older inbound tags"
         );
         assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_LOCAL));
+    }
+
+    /// Destination version under an active legal hold at `hold_timestamp`,
+    /// plus an active COMPLIANCE retention (no retention timestamp).
+    async fn seed_locked_version(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str, hold_timestamp: &str) {
+        let mut local = HashMap::new();
+        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
+        insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, hold_timestamp.to_string());
+        local.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        local.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        put_version(set_disks, bucket, object, version_id, &versioned_opts(version_id, local)).await;
+    }
+
+    fn inbound_legal_hold_release_opts(version_id: &str, timestamp: &str) -> ObjectOptions {
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, timestamp.to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: Some(parse_ts(timestamp)),
+            ..versioned_opts(version_id, inbound)
+        }
+    }
+
+    /// The source's lock state governs the replica: a legal-hold release (or a
+    /// retention change) can only reach this site through the authorized
+    /// replication write, so the commit-time WORM gate must not reject it
+    /// because the destination version is currently locked.
+    #[tokio::test]
+    async fn inbound_newer_legal_hold_release_updates_locked_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-release-newer";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_OLD).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_legal_hold_release_opts(&version_id, T_NEW),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            Some("OFF"),
+            "a newer source-side legal hold release must be applied to the locked replica"
+        );
+        assert_eq!(get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(), Some(T_NEW));
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            Some("COMPLIANCE"),
+            "the untouched retention category must survive the write"
+        );
+    }
+
+    /// Skipping the WORM gate for replication writes must not weaken LWW: a
+    /// stale inbound release still loses to a hold applied more recently here.
+    #[tokio::test]
+    async fn inbound_stale_legal_hold_release_keeps_newer_local_hold() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-release-stale";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_LOCAL).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_legal_hold_release_opts(&version_id, T_OLD),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            Some("ON"),
+            "a stale inbound release must not lift a hold applied more recently on this site"
+        );
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(),
+            Some(T_LOCAL)
+        );
+    }
+
+    /// The bypass is scoped to authorized replication writes: the same
+    /// explicit-version PUT without `replication_request` stays WORM-rejected.
+    #[tokio::test]
+    async fn non_replication_overwrite_of_locked_version_is_still_rejected() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-plain-put";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_OLD).await;
+
+        let opts = ObjectOptions {
+            replication_request: false,
+            ..inbound_legal_hold_release_opts(&version_id, T_NEW)
+        };
+        let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+        let err = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect_err("a non-replication overwrite of a locked version must stay rejected");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
     }
 }
 
