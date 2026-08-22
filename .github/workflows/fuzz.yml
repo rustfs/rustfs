@@ -30,7 +30,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/fuzz.yml"
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
       profile:

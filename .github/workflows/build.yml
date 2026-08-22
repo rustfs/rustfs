@@ -52,7 +52,7 @@ on:
       - ".dockerignore"
       - "flake.lock"
   schedule:
-    - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
+    - cron: "13 1 * * 0" # Weekly on Sunday 01:13 UTC
   workflow_dispatch:
     inputs:
       build_docker:
@@ -1032,3 +1032,23 @@ jobs:
 
           echo "🎉 Released $TAG successfully!"
           echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [build-check, prepare-platform-matrix, build-rustfs, build-summary]
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
