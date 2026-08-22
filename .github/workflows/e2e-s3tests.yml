@@ -93,7 +93,7 @@ on:
   schedule:
     # Weekly full sweep (Sunday 02:00 UTC): full suite, run against BOTH the
     # single-node and the 4-node distributed topologies (matrix below).
-    - cron: "0 2 * * 0"
+    - cron: "19 2 * * 0"
 
 env:
   # main user

@@ -52,7 +52,7 @@ on:
       - ".dockerignore"
       - "flake.lock"
   schedule:
-    - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
+    - cron: "13 1 * * 0" # Weekly on Sunday 01:13 UTC
   workflow_dispatch:
     inputs:
       build_docker:

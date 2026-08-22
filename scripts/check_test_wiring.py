@@ -15,19 +15,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEDULED_ALERT_WORKFLOWS = (
-    ".github/workflows/audit.yml",
-    ".github/workflows/build.yml",
-    ".github/workflows/ci.yml",
-    ".github/workflows/coverage.yml",
-    ".github/workflows/e2e-replication-nightly.yml",
-    ".github/workflows/e2e-s3tests.yml",
-    ".github/workflows/fuzz.yml",
-    ".github/workflows/mint.yml",
-    ".github/workflows/minio-interop.yml",
-    ".github/workflows/nightly-gnu.yml",
-    ".github/workflows/performance-ab.yml",
-    ".github/workflows/runner-hygiene.yml",
+SCHEDULED_ALERT_WORKFLOWS = tuple(
+    item["workflow"]
+    for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
 )
 
 
@@ -268,6 +258,7 @@ def check_profile_definitions(root: Path) -> list[str]:
 
 def check_scheduled_alerts(root: Path) -> list[str]:
     errors: list[str] = []
+    schedule_slots: dict[tuple[int, int], list[str]] = {}
     for relative in SCHEDULED_ALERT_WORKFLOWS:
         path = root / relative
         try:
@@ -275,6 +266,19 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         except FileNotFoundError:
             errors.append(f"{relative}: missing scheduled validation workflow")
             continue
+
+        schedule = re.search(
+            r"^\s*-\s+cron:\s*[\"']?(\d+)\s+(\d+)\s+",
+            "\n".join(lines),
+            re.MULTILINE,
+        )
+        if not schedule:
+            errors.append(f"{relative}: missing simple numeric schedule")
+        else:
+            minute, hour = map(int, schedule.groups())
+            if minute == 0:
+                errors.append(f"{relative}: scheduled validation must avoid minute zero")
+            schedule_slots.setdefault((hour, minute), []).append(relative)
 
         try:
             start = lines.index("  alert-on-failure:") + 1
@@ -297,6 +301,12 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         missing = [token for token in required if token not in job]
         if missing:
             errors.append(f"{relative}: alert-on-failure missing {', '.join(missing)}")
+
+    for (hour, minute), workflows in schedule_slots.items():
+        if len(workflows) > 1:
+            errors.append(
+                f"scheduled validations share {hour:02d}:{minute:02d} UTC: {', '.join(workflows)}"
+            )
 
     watchdog_path = root / ".github/workflows/scheduled-validation-watchdog.yml"
     try:
@@ -329,6 +339,30 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         errors.append(
             ".github/workflows/scheduled-validation-watchdog.yml: missing " + ", ".join(missing)
         )
+
+    freshness_path = root / ".github/workflows/scheduled-validation-freshness.yml"
+    try:
+        freshness = "\n".join(
+            line.split("#", 1)[0] for line in freshness_path.read_text().splitlines()
+        )
+    except FileNotFoundError:
+        errors.append(".github/workflows/scheduled-validation-freshness.yml: missing freshness check")
+        return errors
+    required = (
+        "python3 scripts/check_scheduled_validation_freshness.py",
+        "actions: read",
+        "issues: write",
+        "if: failure()",
+        "uses: ./.github/actions/schedule-failure-issue",
+        "details-file: ${{ runner.temp }}/scheduled-validation-freshness.md",
+    )
+    missing = [token for token in required if token not in freshness]
+    if missing:
+        errors.append(
+            ".github/workflows/scheduled-validation-freshness.yml: missing " + ", ".join(missing)
+        )
+    if not (root / "scripts/check_scheduled_validation_freshness.py").is_file():
+        errors.append("scripts/check_scheduled_validation_freshness.py: missing freshness checker")
     return errors
 
 
@@ -510,11 +544,11 @@ class SelfTests(unittest.TestCase):
                 "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
             )
             names: list[str] = []
-            for relative in SCHEDULED_ALERT_WORKFLOWS:
+            for index, relative in enumerate(SCHEDULED_ALERT_WORKFLOWS, start=1):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 names.append(path.stem)
-                path.write_text(f'name: "{path.stem}"\n{alert}')
+                path.write_text(f'name: "{path.stem}"\n  - cron: "{index} {index} * * *"\n{alert}')
             watchdog = root / ".github/workflows/scheduled-validation-watchdog.yml"
             watchdog.write_text(
                 "\n".join(f'- "{name}"' for name in names)
@@ -525,6 +559,18 @@ class SelfTests(unittest.TestCase):
                 + "source-run-id: ${{ github.event.workflow_run.id }}\n"
                 + "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}\n"
             )
+            freshness = root / ".github/workflows/scheduled-validation-freshness.yml"
+            freshness.write_text(
+                "actions: read\n"
+                "issues: write\n"
+                "python3 scripts/check_scheduled_validation_freshness.py\n"
+                "if: failure()\n"
+                "uses: ./.github/actions/schedule-failure-issue\n"
+                "details-file: ${{ runner.temp }}/scheduled-validation-freshness.md\n"
+            )
+            checker = root / "scripts/check_scheduled_validation_freshness.py"
+            checker.parent.mkdir()
+            checker.write_text("")
             self.assertEqual(check_scheduled_alerts(root), [])
 
             first = root / SCHEDULED_ALERT_WORKFLOWS[0]
@@ -541,6 +587,22 @@ class SelfTests(unittest.TestCase):
                 first.write_text(original)
 
             watchdog.write_text(watchdog.read_text().replace(f'- "{names[0]}"\n', ""))
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+
+            watchdog.write_text(watchdog.read_text() + f'- "{names[0]}"\n')
+            original = first.read_text()
+            first.write_text(re.sub(r'- cron: "\d+ \d+', '- cron: "0 0', original, count=1))
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(original)
+
+            second = root / SCHEDULED_ALERT_WORKFLOWS[1]
+            second_original = second.read_text()
+            second.write_text(re.sub(r'- cron: "\d+ \d+', '- cron: "1 1', second_original, count=1))
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            second.write_text(second_original)
+
+            freshness_original = freshness.read_text()
+            freshness.write_text(freshness_original.replace("details-file:", "report-file:"))
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
 
 def main() -> int:

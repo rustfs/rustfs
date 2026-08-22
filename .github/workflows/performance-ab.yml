@@ -33,7 +33,7 @@ name: Performance A/B
 
 on:
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC nightly, against main
+    - cron: "31 6 * * *" # 06:31 UTC nightly, against main
   workflow_dispatch:
     inputs:
       duration:

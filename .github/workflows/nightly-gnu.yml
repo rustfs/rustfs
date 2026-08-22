@@ -16,7 +16,7 @@ name: Nightly GNU Build
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "7 0 * * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
 

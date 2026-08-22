@@ -59,6 +59,10 @@ inputs:
     description: "Commit SHA of the run being reported."
     required: false
     default: ${{ github.sha }}
+  details-file:
+    description: "Optional Markdown file appended to the issue body."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -74,6 +78,7 @@ runs:
         SOURCE_EVENT: ${{ inputs.source-event }}
         SOURCE_REF_NAME: ${{ inputs.source-ref-name }}
         SOURCE_SHA: ${{ inputs.source-sha }}
+        DETAILS_FILE: ${{ inputs.details-file }}
       run: |
         set -euo pipefail
 
@@ -92,8 +97,17 @@ runs:
           failed_jobs="- (failed job not recorded yet — see the run page)"
         fi
 
+        details=""
+        if [ -n "${DETAILS_FILE}" ]; then
+          if [ -f "${DETAILS_FILE}" ]; then
+            details="$(cat "${DETAILS_FILE}")"
+          else
+            details="Details file was not available: \`${DETAILS_FILE}\`"
+          fi
+        fi
+
         body="$(cat <<EOF
-        Scheduled run of **${WORKFLOW_NAME}** did not complete successfully.
+        Run of **${WORKFLOW_NAME}** did not complete successfully.
 
         - Run: ${run_url} (attempt ${SOURCE_RUN_ATTEMPT})
         - Event: \`${SOURCE_EVENT}\`
@@ -101,6 +115,8 @@ runs:
 
         Non-success jobs:
         ${failed_jobs}
+
+        ${details}
         EOF
         )"
 

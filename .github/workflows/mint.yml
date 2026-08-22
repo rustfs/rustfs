@@ -76,7 +76,7 @@ on:
   schedule:
     # Weekly, after the Sunday s3-tests full sweep (starts 02:00 UTC, up to
     # 3h) has finished, so the two never contend for the same runner pool.
-    - cron: "0 6 * * 0"
+    - cron: "41 6 * * 0"
 
 env:
   S3_ACCESS_KEY: rustfsadmin-ci

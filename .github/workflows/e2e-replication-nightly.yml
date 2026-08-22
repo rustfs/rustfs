@@ -40,7 +40,7 @@ on:
   schedule:
     # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00),
     # stale (01:30) and performance-ab (06:00).
-    - cron: "0 4 * * *"
+    - cron: "29 4 * * *"
 
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.

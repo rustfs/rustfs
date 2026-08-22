@@ -59,7 +59,7 @@ on:
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
   workflow_dispatch:
 
 permissions:
@@ -161,7 +161,10 @@ jobs:
         run: ./scripts/check_embedded_secrets.sh
 
       - name: Check test wiring
-        run: python3 ./scripts/check_test_wiring.py
+        run: |
+          python3 ./scripts/check_test_wiring.py --self-test
+          python3 ./scripts/check_scheduled_validation_freshness.py --self-test
+          python3 ./scripts/check_test_wiring.py
 
       - name: Check no planning docs committed
         run: ./scripts/check_no_planning_docs.sh
