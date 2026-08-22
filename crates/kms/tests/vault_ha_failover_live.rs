@@ -43,6 +43,10 @@ const OPERATION_ATTEMPTS: &str = "rustfs_kms_backend_operation_attempts";
 const IN_FLIGHT: &str = "rustfs_kms_backend_in_flight";
 const CIRCUIT_OPEN: &str = "rustfs_kms_backend_circuit_open";
 const MAX_ATTEMPTS: u32 = 10;
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTHY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+// Ten ATTEMPT_TIMEOUT attempts plus capped backoffs allow one operation to take 31.1s.
+const POST_FAILOVER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(35);
 
 type MetricEntry = (
     metrics_util::CompositeKey,
@@ -64,7 +68,7 @@ fn config(backend: KmsBackend, backend_config: BackendConfig) -> KmsConfig {
         backend,
         backend_config,
         allow_insecure_dev_defaults: true,
-        timeout: Duration::from_secs(2),
+        timeout: ATTEMPT_TIMEOUT,
         retry_attempts: MAX_ATTEMPTS,
         enable_cache: false,
         ..KmsConfig::default()
@@ -164,14 +168,24 @@ fn retryable_failures(snapshot: &[MetricEntry], operation: &str) -> u64 {
         .sum()
 }
 
-async fn wait_for_count(counter: &AtomicU64, minimum: u64, description: &str) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+async fn wait_for_count(counter: &AtomicU64, failed: &AtomicBool, minimum: u64, description: &str, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
         while counter.load(Ordering::SeqCst) < minimum {
+            assert!(
+                !failed.load(Ordering::SeqCst),
+                "{description} worker failed after {} successful decrypts",
+                counter.load(Ordering::SeqCst)
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out after {timeout:?} waiting for {description}: completed {}, expected {minimum}",
+            counter.load(Ordering::SeqCst)
+        )
+    });
 }
 
 async fn wait_for_file(path: &Path, description: &str) {
@@ -316,8 +330,8 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         stop.clone(),
     ));
 
-    wait_for_count(&kv2_completed, 2, "two healthy KV2 decrypts").await;
-    wait_for_count(&transit_completed, 2, "two healthy Transit decrypts").await;
+    wait_for_count(&kv2_completed, &failed, 2, "two healthy KV2 decrypts", HEALTHY_PROGRESS_TIMEOUT).await;
+    wait_for_count(&transit_completed, &failed, 2, "two healthy Transit decrypts", HEALTHY_PROGRESS_TIMEOUT).await;
     std::fs::write(&marker, b"ready").expect("publish failover readiness marker");
 
     wait_for_file(&elected, "the replacement Vault leader").await;
@@ -326,8 +340,22 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
 
     let kv2_after_election = kv2_completed.load(Ordering::SeqCst) + 2;
     let transit_after_election = transit_completed.load(Ordering::SeqCst) + 2;
-    wait_for_count(&kv2_completed, kv2_after_election, "post-failover KV2 decrypts").await;
-    wait_for_count(&transit_completed, transit_after_election, "post-failover Transit decrypts").await;
+    wait_for_count(
+        &kv2_completed,
+        &failed,
+        kv2_after_election,
+        "post-failover KV2 decrypts",
+        POST_FAILOVER_PROGRESS_TIMEOUT,
+    )
+    .await;
+    wait_for_count(
+        &transit_completed,
+        &failed,
+        transit_after_election,
+        "post-failover Transit decrypts",
+        POST_FAILOVER_PROGRESS_TIMEOUT,
+    )
+    .await;
 
     stop.cancel();
     kv2_worker.await.expect("KV2 decrypt worker must join");
