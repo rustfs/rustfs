@@ -377,7 +377,10 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
     }
     validate_optional_config_u64(scanner_kvs, SCANNER_START_DELAY, "")?;
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE, "")?;
-    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)?;
+    if let Some(value) = config_value(scanner_kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
+        let secs = parse_config_u64(SCANNER_CYCLE_MAX_DURATION, value)?;
+        cycle_duration_from_secs(SCANNER_CYCLE_MAX_DURATION, secs)?;
+    }
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
     if let Some(value) = config_value(heal_kvs, HEAL_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
@@ -999,6 +1002,15 @@ mod tests {
         });
         let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "not-a-duration")]);
         assert!(lookup_scanner_runtime_config(Some(&config)).is_err());
+    }
+
+    #[test]
+    fn scanner_runtime_config_validation_rejects_overflow_persisted_duration() {
+        let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "18446744073709551615")]);
+
+        let error = validate_scanner_runtime_config(&config)
+            .expect_err("persisted duration that exceeds the timer range must be rejected");
+        assert!(error.to_string().contains(SCANNER_CYCLE_MAX_DURATION));
     }
 
     #[test]
