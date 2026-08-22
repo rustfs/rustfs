@@ -40,6 +40,7 @@ use tracing::{debug, error, info, warn};
 use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
+const DISPLACED_HEAL_REASON: &str = "reason=displaced; retry_hint=submit_again";
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_DISK_SCANNER: &str = "disk_scanner";
 const LOG_SUBSYSTEM_MANAGER: &str = "manager";
@@ -120,25 +121,29 @@ struct MrfRepairNoticeTarget {
     version_id: Option<[u8; 16]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct HealAdmissionDecision {
     result: HealAdmissionResult,
-    displaced_task_id: Option<String>,
+    displaced_request: Option<HealRequest>,
 }
 
 impl HealAdmissionDecision {
     const fn new(result: HealAdmissionResult) -> Self {
         Self {
             result,
-            displaced_task_id: None,
+            displaced_request: None,
         }
     }
 
-    fn accepted_with_displacement(displaced_task_id: String) -> Self {
+    fn accepted_with_displacement(displaced_request: HealRequest) -> Self {
         Self {
             result: HealAdmissionResult::Accepted,
-            displaced_task_id: Some(displaced_task_id),
+            displaced_request: Some(displaced_request),
         }
+    }
+
+    fn displaced_task_id(&self) -> Option<&str> {
+        self.displaced_request.as_ref().map(|request| request.id.as_str())
     }
 }
 
@@ -149,6 +154,55 @@ fn lock_mrf_repair_notice_targets(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn lock_displaced_terminals(
+    registry: &StdMutex<HashMap<String, Arc<CompletedHealStatus>>>,
+) -> StdMutexGuard<'_, HashMap<String, Arc<CompletedHealStatus>>> {
+    match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn record_displaced_terminal(
+    registry: &StdMutex<HashMap<String, Arc<CompletedHealStatus>>>,
+    request: &HealRequest,
+) -> Arc<CompletedHealStatus> {
+    let terminal = Arc::new(CompletedHealStatus {
+        heal_type: request.heal_type.clone(),
+        status: HealTaskStatus::Failed {
+            error: format!("heal task displaced by a higher-priority request ({DISPLACED_HEAL_REASON})"),
+        },
+        result_items_truncated: false,
+        completed_at: SystemTime::now(),
+        seqed_items: Vec::new(),
+        next_seq: 0,
+        min_seq: 0,
+    });
+    let mut terminals = lock_displaced_terminals(registry);
+    prune_completed_heal_statuses(&mut terminals);
+    terminals.insert(request.id.clone(), Arc::clone(&terminal));
+    terminal
+}
+
+async fn remove_displaced_task_aliases(
+    aliases: &Arc<Mutex<HashMap<String, HealTaskAlias>>>,
+    terminals: &StdMutex<HashMap<String, Arc<CompletedHealStatus>>>,
+    task_id: &str,
+    terminal: &Arc<CompletedHealStatus>,
+) {
+    let mut aliases = aliases.lock().await;
+    let alias_ids = aliases
+        .iter()
+        .filter_map(|(alias_id, alias)| (alias.task_id == task_id).then_some(alias_id.clone()))
+        .collect::<Vec<_>>();
+    let mut displaced_terminals = lock_displaced_terminals(terminals);
+    prune_completed_heal_statuses(&mut displaced_terminals);
+    for alias_id in alias_ids {
+        displaced_terminals.insert(alias_id, Arc::clone(terminal));
+    }
+    aliases.retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
 }
 
 async fn remove_task_aliases_for_task(registry: &Arc<Mutex<HashMap<String, HealTaskAlias>>>, task_id: &str) {
@@ -618,6 +672,14 @@ pub struct HealManager {
     /// are shared so the lookup helper can hand a completed entry to a
     /// caller without cloning the retained result window.
     completed_heals: Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
+    /// Terminals for requests removed by priority displacement. An Accepted
+    /// task ID remains queryable for the same process lifetime and the normal
+    /// ten-minute status TTL; clients should treat `reason=displaced` as a
+    /// terminal result and submit a fresh request. This sidecar is synchronous
+    /// so admission can publish the terminal while the queue transition is
+    /// still under its lock, without awaiting another tokio lock. Queue state
+    /// is process-local, so this guarantee does not extend across restart.
+    displaced_terminals: Arc<StdMutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     /// Client tokens merged into an existing task id.
     task_aliases: Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     /// Heal tasks waiting for a retry backoff to expire.
@@ -659,6 +721,7 @@ struct HealQueueContext<'a> {
     heal_queue: &'a Arc<Mutex<PriorityHealQueue>>,
     active_heals: &'a Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     completed_heals: &'a Arc<Mutex<HashMap<String, Arc<CompletedHealStatus>>>>,
+    displaced_terminals: &'a Arc<StdMutex<HashMap<String, Arc<CompletedHealStatus>>>>,
     task_aliases: &'a Arc<Mutex<HashMap<String, HealTaskAlias>>>,
     retrying_heals: &'a Arc<Mutex<HashMap<String, RetryingHeal>>>,
     mrf_repair_notice_targets: &'a Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>,
@@ -874,7 +937,7 @@ impl HealManager {
                         result = "accepted_by_displacement",
                         "Heal queue request accepted by displacement"
                     });
-                    return HealAdmissionDecision::accepted_with_displacement(displaced.id);
+                    return HealAdmissionDecision::accepted_with_displacement(displaced);
                 }
 
                 demote_to_debug_when!(per_object_request, warn, target: "rustfs::heal::manager", {
@@ -1105,6 +1168,7 @@ impl HealManager {
             active_heals: Arc::new(Mutex::new(HashMap::new())),
             heal_queue: Arc::new(Mutex::new(PriorityHealQueue::new())),
             completed_heals: Arc::new(Mutex::new(HashMap::new())),
+            displaced_terminals: Arc::new(StdMutex::new(HashMap::new())),
             task_aliases: Arc::new(Mutex::new(HashMap::new())),
             retrying_heals: Arc::new(Mutex::new(HashMap::new())),
             mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
@@ -1209,6 +1273,10 @@ impl HealManager {
         active_heals.clear();
         publish_active_heal_count(&active_heals);
         self.completed_heals.lock().await.clear();
+        // Do not let the synchronous guard live across the following async lock.
+        {
+            lock_displaced_terminals(&self.displaced_terminals).clear();
+        }
         self.task_aliases.lock().await.clear();
         self.retrying_heals.lock().await.clear();
         lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).clear();
@@ -1459,7 +1527,11 @@ impl HealManager {
             task_id = queued_id.to_owned();
         }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
-        let displaced_task_id = admission_decision.displaced_task_id;
+        let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
+        let displaced_terminal = admission_decision
+            .displaced_request
+            .as_ref()
+            .map(|request| record_displaced_terminal(&self.displaced_terminals, request));
         if matches!(admission, HealAdmissionResult::Accepted | HealAdmissionResult::Merged)
             && let Some(target) = mrf_notice_target
         {
@@ -1473,8 +1545,12 @@ impl HealManager {
         drop(queue);
         drop(active_heals);
 
-        if let Some(displaced_task_id) = displaced_task_id {
-            self.remove_aliases_for_task(&displaced_task_id).await;
+        if let (Some(displaced_task_id), Some(displaced_terminal)) = (displaced_task_id, displaced_terminal) {
+            // The queue has already removed the displaced request, so the
+            // synchronous terminal sidecar was published before aliases and
+            // MRF ownership are cleaned up.
+            remove_displaced_task_aliases(&self.task_aliases, &self.displaced_terminals, &displaced_task_id, &displaced_terminal)
+                .await;
         }
 
         if should_notify {
@@ -1547,6 +1623,15 @@ impl HealManager {
             if queued {
                 return TaskStateLookup::Queued;
             }
+        }
+
+        if terminal_completed.is_none() {
+            let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
+            prune_completed_heal_statuses(&mut displaced_terminals);
+            terminal_completed = displaced_terminals
+                .get(canonical_task_id)
+                .filter(|terminal| matches_path(&terminal.heal_type))
+                .cloned();
         }
 
         match terminal_completed {
@@ -1669,9 +1754,19 @@ impl HealManager {
 
         let mut completed_heals = self.completed_heals.lock().await;
         prune_completed_heal_statuses(&mut completed_heals);
-        completed_heals
+        if completed_heals
             .values()
             .any(|completed| heal_type_matches_path(&completed.heal_type, heal_path))
+        {
+            return true;
+        }
+        drop(completed_heals);
+
+        let mut displaced_terminals = lock_displaced_terminals(&self.displaced_terminals);
+        prune_completed_heal_statuses(&mut displaced_terminals);
+        displaced_terminals
+            .values()
+            .any(|terminal| heal_type_matches_path(&terminal.heal_type, heal_path))
     }
 
     /// Get task progress
