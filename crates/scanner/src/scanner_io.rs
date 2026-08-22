@@ -48,6 +48,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
