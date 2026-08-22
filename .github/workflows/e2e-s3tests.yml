@@ -90,6 +90,10 @@ on:
         description: "Optional pytest -m expression"
         required: false
         default: ""
+      testexpr:
+        description: "Optional pytest -k expression"
+        required: false
+        default: ""
   schedule:
     # Weekly full sweep (Sunday 02:00 UTC): full suite, run against BOTH the
     # single-node and the 4-node distributed topologies (matrix below).
@@ -116,6 +120,7 @@ env:
   XDIST: ${{ github.event.inputs.xdist || '4' }}
   MAXFAIL: ${{ github.event.inputs.maxfail || '0' }}
   MARKEXPR: ${{ github.event.inputs.markexpr || '' }}
+  TESTEXPR: ${{ github.event.inputs.testexpr || '' }}
   S3_SHARD_COUNT: ${{ github.event_name == 'schedule' && '4' || github.event.inputs.shard-count || '1' }}
   TEST_TIMEOUT: "300"
 
@@ -269,8 +274,13 @@ jobs:
           EOF
 
           cat > haproxy.cfg <<'EOF'
+          global
+            log stdout format raw local0 info
+
           defaults
             mode http
+            log global
+            option httplog
             timeout connect 5s
             timeout client  30s
             timeout server  30s
@@ -314,6 +324,7 @@ jobs:
           XDIST="${XDIST}" \
           MAXFAIL="${MAXFAIL}" \
           MARKEXPR="${MARKEXPR}" \
+          TESTEXPR="${TESTEXPR}" \
           ./scripts/s3-tests/run.sh
 
       - name: Publish compatibility report
