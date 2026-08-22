@@ -1591,6 +1591,117 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn suspended_decommission_source_multipart_remains_operable_until_drained() {
+        let temp_dir = tempfile::tempdir().expect("create decommission multipart drain store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-multipart-drain", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("decommission-multipart-drain-{}", uuid::Uuid::new_v4());
+        let complete_object = "complete.bin";
+        let abort_object = "abort.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create decommission multipart drain bucket");
+
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_read_lock(&bucket)
+            .await
+            .expect("acquire multipart creation lifecycle fence");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let complete_upload = store.pools[0]
+            .new_multipart_upload(&bucket, complete_object, &upload_opts)
+            .await
+            .expect("create source upload to complete");
+        let abort_upload = store.pools[0]
+            .new_multipart_upload(&bucket, abort_object, &upload_opts)
+            .await
+            .expect("create source upload to abort");
+        drop(lifecycle_guard);
+
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let err = store
+            .ensure_decommission_multipart_uploads_drained_for_test(0)
+            .await
+            .expect_err("an unresolved source multipart upload must block final decommission");
+        assert!(
+            err.to_string().contains("still contains multipart upload"),
+            "unexpected drain error: {err}"
+        );
+
+        let listed = store
+            .list_multipart_uploads(&bucket, "", None, None, None, 100)
+            .await
+            .expect("list uploads from suspended decommission source");
+        assert!(
+            listed
+                .uploads
+                .iter()
+                .any(|upload| upload.upload_id.as_str() == complete_upload.upload_id.as_str()),
+            "the upload selected before suspension must remain visible"
+        );
+        store
+            .get_multipart_info(&bucket, complete_object, &complete_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("read upload metadata from suspended decommission source");
+
+        let mut part_reader = PutObjReader::from_vec(b"multipart body".to_vec());
+        let part = store
+            .put_object_part(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                1,
+                &mut part_reader,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write part to suspended decommission source");
+        let parts = store
+            .list_object_parts(&bucket, complete_object, &complete_upload.upload_id, None, 100, &ObjectOptions::default())
+            .await
+            .expect("list parts from suspended decommission source");
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag.as_deref(), part.etag.as_deref());
+
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                complete_object,
+                &complete_upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete upload on suspended decommission source");
+        store
+            .abort_multipart_upload(&bucket, abort_object, &abort_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("abort upload on suspended decommission source");
+
+        store
+            .ensure_decommission_multipart_uploads_drained_for_test(0)
+            .await
+            .expect("final decommission gate should open after all source uploads are resolved");
+        assert_pool_object_present(&store.pools[0], &bucket, complete_object).await;
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn delete_objects_skips_active_rebalance_source_pool() {
         let temp_dir = tempfile::tempdir().expect("create batch-delete writer-fencing store dir");
         let (_ctx, store, shutdown) =

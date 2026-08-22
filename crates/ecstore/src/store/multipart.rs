@@ -196,6 +196,12 @@ async fn list_pool_multipart_uploads_for_incarnation(
 }
 
 impl ECStore {
+    // Decommission drains existing UploadIDs in place; rebalance keeps its
+    // established source-exclusion behavior.
+    async fn multipart_pool_accepts_existing_upload_operations(&self, pool_idx: usize) -> bool {
+        !self.is_pool_rebalancing(pool_idx).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_multipart_uploads_for_bucket_incarnation(
         &self,
@@ -291,7 +297,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
             return match pool
@@ -354,7 +360,7 @@ impl ECStore {
         let mut source_truncated = false;
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
             let res = list_pool_multipart_uploads_for_incarnation(
@@ -524,7 +530,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
             let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
@@ -587,7 +593,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
 
@@ -625,7 +631,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
 
@@ -686,7 +692,7 @@ impl ECStore {
         }
 
         for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+            if !self.multipart_pool_accepts_existing_upload_operations(pool.pool_idx).await {
                 continue;
             }
 
