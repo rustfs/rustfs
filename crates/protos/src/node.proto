@@ -493,6 +493,9 @@ message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
   optional Error error = 3;
+  // Senders dual-write the legacy strings and typed entries. Receivers prefer typed entries
+  // when present and fall back to strings for peers that predate this field. Code zero means success.
+  repeated Error item_errors = 4;
 }
 
 message ReadMultipleRequest {
