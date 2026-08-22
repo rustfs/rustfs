@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "warp duration per round (short by default to fit the double-build budget)"
+        description: "warp duration per round"
         required: false
         default: "12s"
         type: string
@@ -39,11 +39,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    # Every main commit pre-builds and caches its release binary (perf-3) so the
-    # nightly A/B restores a ready baseline instead of paying the double build.
-    branches: [main]
-
 permissions:
   actions: read
   contents: read
@@ -53,83 +48,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # perf-3: on every push to main, build the release binary once and cache it
-  # keyed by commit SHA (rustfs-baseline-<sha>). The warp-ab measurements
-  # restore this instead of paying the ~32min-per-side source
-  # build. That double build is what pushed the expanded 24-cell nightly past its
-  # ceiling — 2026-07-11..07-14 all cancelled on the 120min timeout. Incremental
-  # builds off the shared cargo cache keep each push cheap, and building on the
-  # same sm-standard-2 runner the A/B measures on guarantees the cached binary is
-  # ABI-identical. Do NOT source this from build.yml's per-merge artifact: those
-  # are cancelled ~7/8 of the time and are not a reliable baseline.
-  build-baseline-cache:
-    name: Build + cache baseline binary
-    if: github.event_name == 'push'
-    runs-on: sm-standard-2
-    # Latest-wins: consumers only ever restore the binary for the *current*
-    # origin/main tip, so when pushes land faster than the ~65min build, a
-    # superseded build's output is dead weight — cancel it instead of stacking
-    # hour-long jobs on the shared runner pool. A skipped intermediate SHA at
-    # most costs one same-commit self-heal in the A/B job.
-    concurrency:
-      group: perf-baseline-build-main
-      cancel-in-progress: true
-    # #4806 put thin LTO + codegen-units=1 on [profile.release], pushing a
-    # single release build past 60min on this runner — every cache build on
-    # 2026-07-15 died on the old 60min ceiling ("exceeded the maximum execution
-    # time of 1h0m0s") and the cache never populated. The measured binary must
-    # keep the production profile, so the budget absorbs the build instead.
-    timeout-minutes: 100
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build release rustfs
-        run: cargo build --release --bin rustfs
-
-      - name: Stage binary for cache
-        run: |
-          set -euo pipefail
-          mkdir -p baseline-bin
-          cp target/release/rustfs baseline-bin/rustfs
-
-      - name: Cache baseline binary by SHA
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: baseline-bin/rustfs
-          key: rustfs-baseline-${{ github.sha }}
-
   warp-ab:
     name: Warp A/B budget gate
-    # Always run on schedule / manual dispatch. Never on push — that event only
-    # feeds build-baseline-cache above.
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
     runs-on: sm-standard-2
-    # With perf-3's cached baseline binary the common (cache-hit) nightly is
-    # measurement-only and finishes well under 50min. This ceiling stays
-    # generous only to absorb the same-commit cache-miss self-heal (~65min
-    # single build with the post-#4806 LTO profile + measurement). A timeout
-    # surfaces via the alert-on-failure job (it fires on cancelled/timed-out,
-    # not just failure). perf-6 recalibrates the budget once the noise study
-    # lands.
+    # A normal nightly restores the last successful binary and builds only the
+    # candidate; daily access keeps that cache warm. A cache miss may build both
+    # but remains capped and reports a timeout through the scheduled alert.
     timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          fetch-depth: 0 # baseline is built from origin/main
+          fetch-depth: 0 # baseline may be an earlier successful scheduled head
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -203,9 +134,9 @@ jobs:
           echo "baseline commit: $baseline_sha"
           echo "candidate commit: $candidate_sha"
 
-      # Exact-key restore of the baseline binary built by build-baseline-cache
-      # when origin/main last landed. A miss (binary evicted or not built yet)
-      # leaves cache-hit unset and the rig falls back to a source build.
+      # Exact-key restore of the candidate binary saved by its successful
+      # scheduled run. A miss leaves cache-hit unset and falls back to a source
+      # build of that known-good head.
       - name: Restore cached baseline binary
         id: baseline_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -386,6 +317,23 @@ jobs:
               fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage successful candidate baseline
+        if: >-
+          steps.ab.outputs.status == '0' &&
+          steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
+        run: |
+          set -euo pipefail
+          cp candidate-bin/rustfs baseline-bin/rustfs
+
+      - name: Cache successful candidate baseline
+        if: >-
+          steps.ab.outputs.status == '0' &&
+          steps.commits.outputs.baseline_sha != steps.commits.outputs.candidate_sha
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: baseline-bin/rustfs
+          key: rustfs-baseline-${{ steps.commits.outputs.candidate_sha }}
 
       # Scheduled failure alerting is handled by the alert-on-failure job below
       # (perf-2 consuming ci-8's schedule-failure-issue composite action).
