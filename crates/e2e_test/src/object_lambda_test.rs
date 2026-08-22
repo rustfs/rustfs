@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client, signed_request};
 use aws_sdk_s3::primitives::ByteStream;
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::{pre_sign_v4, sign_v4};
+use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use s3s::Body;
 use std::collections::HashMap;
@@ -225,39 +224,6 @@ async fn presigned_get_request(
     );
 
     Ok(local_http_client().get(signed.uri().to_string()).send().await?)
-}
-
-async fn signed_request(
-    method: http::Method,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let client = local_http_client();
-    let mut request_builder = client.request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
 }
 
 async fn configure_webhook_target(
