@@ -317,11 +317,18 @@ fn map_batch_read_version_responses(
             *slot = if response.success {
                 Ok(response.file_info)
             } else {
-                Err(DiskError::other(response.error))
+                Err(batch_read_version_response_error(response.error_code, response.error))
             };
         }
     }
     results
+}
+
+fn batch_read_version_response_error(error_code: u32, error: String) -> DiskError {
+    match DiskError::from_u32(error_code) {
+        Some(DiskError::Io(_)) | None => DiskError::other(error),
+        Some(error) => error,
+    }
 }
 
 pub(in crate::set_disk) fn bounded_metadata_fanout_order(
@@ -6858,6 +6865,7 @@ mod tests {
                 success: false,
                 file_info: FileInfo::default(),
                 error: "disk read failed".to_string(),
+                error_code: 0,
             },
             BatchReadVersionResp {
                 index: 0,
@@ -6866,6 +6874,7 @@ mod tests {
                 success: true,
                 file_info: ok_file_info,
                 error: String::new(),
+                error_code: 0,
             },
         ];
 
@@ -6894,6 +6903,53 @@ mod tests {
     }
 
     #[test]
+    fn batch_read_version_response_mapping_preserves_typed_not_found_errors() {
+        let expected_items = vec![
+            BatchReadVersionItem {
+                org_volume: String::new(),
+                volume: "bucket".to_string(),
+                path: "object-a".to_string(),
+                version_id: "v-a".to_string(),
+            },
+            BatchReadVersionItem {
+                org_volume: String::new(),
+                volume: "bucket".to_string(),
+                path: "object-b".to_string(),
+                version_id: "v-b".to_string(),
+            },
+        ];
+        let results = map_batch_read_version_responses(
+            &expected_items,
+            vec![
+                BatchReadVersionResp {
+                    index: 0,
+                    path: "object-a".to_string(),
+                    version_id: "v-a".to_string(),
+                    success: false,
+                    file_info: FileInfo::default(),
+                    error: DiskError::FileNotFound.to_string(),
+                    error_code: DiskError::FileNotFound.to_u32(),
+                },
+                BatchReadVersionResp {
+                    index: 1,
+                    path: "object-b".to_string(),
+                    version_id: "v-b".to_string(),
+                    success: false,
+                    file_info: FileInfo::default(),
+                    error: DiskError::FileVersionNotFound.to_string(),
+                    error_code: DiskError::FileVersionNotFound.to_u32(),
+                },
+            ],
+        );
+
+        assert!(matches!(results.first().expect("slot 0 should exist"), Err(DiskError::FileNotFound)));
+        assert!(matches!(
+            results.get(1).expect("slot 1 should exist"),
+            Err(DiskError::FileVersionNotFound)
+        ));
+    }
+
+    #[test]
     fn batch_read_version_response_mapping_rejects_identity_mismatch_and_duplicate_index() {
         let expected_items = vec![BatchReadVersionItem {
             org_volume: String::new(),
@@ -6913,6 +6969,7 @@ mod tests {
                     ..Default::default()
                 },
                 error: String::new(),
+                error_code: 0,
             }],
         )
         .pop()
@@ -6936,6 +6993,7 @@ mod tests {
                         ..Default::default()
                     },
                     error: String::new(),
+                    error_code: 0,
                 },
                 BatchReadVersionResp {
                     index: 0,
@@ -6947,6 +7005,7 @@ mod tests {
                         ..Default::default()
                     },
                     error: String::new(),
+                    error_code: 0,
                 },
             ],
         )

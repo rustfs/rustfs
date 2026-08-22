@@ -4687,6 +4687,7 @@ mod tests {
             } else {
                 "file version not found".to_string()
             },
+            error_code: if success { 0 } else { DiskError::FileVersionNotFound.to_u32() },
         }
     }
 

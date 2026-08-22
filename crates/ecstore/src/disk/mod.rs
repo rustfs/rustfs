@@ -1054,6 +1054,7 @@ where
                     success: true,
                     file_info,
                     error: String::new(),
+                    error_code: 0,
                 },
                 Err(err) => BatchReadVersionResp {
                     index,
@@ -1062,6 +1063,7 @@ where
                     success: false,
                     file_info: FileInfo::default(),
                     error: err.to_string(),
+                    error_code: err.to_u32(),
                 },
             }
         })
@@ -1342,6 +1344,8 @@ pub struct BatchReadVersionResp {
     pub success: bool,
     pub file_info: FileInfo,
     pub error: String,
+    #[serde(default)]
+    pub error_code: u32,
 }
 
 pub fn validate_batch_read_version_item_count(item_count: usize) -> Result<()> {

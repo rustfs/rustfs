@@ -1682,6 +1682,7 @@ mod tests {
         encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
         encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
+    use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::RenameDataResp;
@@ -2075,7 +2076,8 @@ mod tests {
             path: "object-a".to_string(),
             version_id: "version-a".to_string(),
             success: false,
-            error: "file version not found".to_string(),
+            error: DiskError::FileVersionNotFound.to_string(),
+            error_code: DiskError::FileVersionNotFound.to_u32(),
             ..Default::default()
         }];
 
@@ -2091,8 +2093,43 @@ mod tests {
             .expect("msgpack batch read version response should decode");
 
         assert_eq!(json_decoded.index, responses[0].index);
+        assert_eq!(json_decoded.error_code, responses[0].error_code);
         assert_eq!(msgpack_decoded.path, responses[0].path);
         assert_eq!(msgpack_decoded.error, responses[0].error);
+        assert_eq!(msgpack_decoded.error_code, responses[0].error_code);
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_accepts_legacy_payload_without_error_code() {
+        #[derive(Serialize)]
+        struct LegacyBatchReadVersionResp {
+            index: usize,
+            path: String,
+            version_id: String,
+            success: bool,
+            file_info: FileInfo,
+            error: String,
+        }
+
+        let legacy = LegacyBatchReadVersionResp {
+            index: 2,
+            path: "object-legacy".to_string(),
+            version_id: "version-legacy".to_string(),
+            success: false,
+            file_info: FileInfo::default(),
+            error: "legacy error".to_string(),
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("legacy json should encode");
+        let legacy_msgpack = encode_msgpack(&legacy, "LegacyBatchReadVersionResp").expect("legacy msgpack should encode");
+
+        let json_decoded: BatchReadVersionResp =
+            decode_msgpack_or_json(&[], &legacy_json, "BatchReadVersionResp").expect("legacy json should decode");
+        let msgpack_decoded: BatchReadVersionResp =
+            decode_msgpack_or_json(&legacy_msgpack, "", "BatchReadVersionResp").expect("legacy msgpack should decode");
+
+        assert_eq!(json_decoded.error_code, 0);
+        assert_eq!(msgpack_decoded.error_code, 0);
+        assert_eq!(msgpack_decoded.error, legacy.error);
     }
 
     #[test]
