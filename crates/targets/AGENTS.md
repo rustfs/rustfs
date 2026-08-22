@@ -75,4 +75,3 @@ run commands.
   - `cargo test -p rustfs-targets plugin`
   - `cargo test -p rustfs-targets runtime`
   - `cargo test -p rustfs-targets control_plane`
-- Full gate before commit: `make pre-commit`

@@ -75,7 +75,7 @@ pub struct BucketReplicationBandwidthStats {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct BucketReplicationStats {
+pub struct BucketReplicationMetricsSnapshot {
     pub bucket: String,
     pub total_failed_bytes: u64,
     pub total_failed_count: u64,
@@ -107,7 +107,7 @@ pub struct BucketReplicationStats {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BucketReplicationRuntimeStats {
-    pub(crate) stats: BucketReplicationStats,
+    pub(crate) stats: BucketReplicationMetricsSnapshot,
     pub(crate) target_flows: Vec<BucketReplicationTargetFlowStats>,
 }
 
@@ -182,7 +182,7 @@ fn push_proxy_request_result_metrics(
     }
 }
 
-pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> Vec<PrometheusMetric> {
+pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationMetricsSnapshot]) -> Vec<PrometheusMetric> {
     if stats.is_empty() {
         return Vec::new();
     }
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn test_collect_bucket_replication_metrics() {
         let stats = vec![BucketReplicationRuntimeStats {
-            stats: BucketReplicationStats {
+            stats: BucketReplicationMetricsSnapshot {
                 bucket: "b1".to_string(),
                 total_failed_bytes: 64,
                 total_failed_count: 2,
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_collect_bucket_replication_metrics_empty() {
-        let stats: Vec<BucketReplicationStats> = Vec::new();
+        let stats: Vec<BucketReplicationMetricsSnapshot> = Vec::new();
         let metrics = collect_bucket_replication_metrics(&stats);
         assert!(metrics.is_empty());
     }

@@ -1028,10 +1028,11 @@ else
 fi
 
 # Run tests from s3tests/functional
+# Failure locals can contain multi-MiB request bodies; keep tracebacks without expanding local values.
 set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
-    -vv -ra --showlocals --tb=long \
+    -vv -ra --tb=long \
     --maxfail="${MAXFAIL}" \
     --timeout="${TEST_TIMEOUT}" \
     --junitxml="${ARTIFACTS_DIR}/junit.xml" \

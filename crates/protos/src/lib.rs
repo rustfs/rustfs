@@ -2106,6 +2106,9 @@ pub enum ChannelClass {
     Bulk,
 }
 
+// Keep multiplexed unary RPCs below h2's per-connection small-frame budget.
+const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+
 /// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
 fn channel_isolation_enabled() -> bool {
     rustfs_utils::get_env_bool(
@@ -2188,6 +2191,7 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
+        .concurrency_limit(INTERNODE_RPC_CONCURRENCY_LIMIT)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
         // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
