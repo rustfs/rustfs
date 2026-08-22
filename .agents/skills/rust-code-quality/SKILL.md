@@ -1,11 +1,12 @@
 ---
 name: rust-code-quality
-description: Enforce Rust-specific code quality rules on every Rust change. Use before merge to catch unwrap abuse, silent truncation, unnecessary cloning, lock ordering violations, recursion risks, and error type anti-patterns.
+description: Run a focused Rust quality review when the user requests one, when reviewing a Rust PR/commit, or when another selected review workflow delegates Rust-specific checks. Do not auto-load for every implementation edit.
 ---
 
 # Rust Code Quality Gate
 
-Use this skill on every Rust code change to enforce quality rules that `cargo clippy` does not catch.
+Use this skill for a dedicated Rust review to cover rules that `cargo clippy`
+does not catch.
 
 ## Quick Start
 
@@ -45,7 +46,7 @@ rg -n 'unwrap_or_default\(\)|unwrap_or\(' <changed-files>
 
 ## Manual Review Checklist
 
-For every Rust code change, verify:
+For the Rust diff under review, verify:
 
 ### Error Handling
 - [ ] Every production `unwrap()` or `expect()` is infallible by type or a checked invariant; explain only non-obvious invariants, using an existing type, a useful `expect` message, or a concise comment

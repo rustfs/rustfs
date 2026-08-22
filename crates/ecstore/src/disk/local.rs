@@ -5215,8 +5215,8 @@ impl LocalDisk {
 
         let cache = Cache::new(update_fn, Duration::from_secs(1), Opts::default());
 
-        // TODO: DIRECT support
-        // TODD: DiskInfo
+        // TODO(backlog): add O_DIRECT I/O support for performance-critical paths
+        // TODO(backlog): populate DiskInfo in constructor
         let mut disk = Self {
             root: root.clone(),
             publication_root,
@@ -5751,7 +5751,7 @@ impl LocalDisk {
 
         // return Ok(());
 
-        // TODO: async notifications for disk space checks and trash cleanup
+        // TODO(backlog): make disk space checks and trash cleanup event-driven instead of poll-based
 
         let trash_path = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
         // if let Some(parent) = trash_path.parent() {
@@ -5997,7 +5997,7 @@ impl LocalDisk {
 
     #[hotpath::measure(impl_type = "LocalDisk")]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        // TODO: timeout support
+        // TODO(backlog): add configurable timeout for read_all_data operations
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
         Ok(data)
     }
@@ -6674,7 +6674,7 @@ impl LocalDisk {
             return Ok(());
         }
 
-        // TODO: add lock
+        // TODO(backlog): add directory listing lock to prevent concurrent enumeration
 
         let stall = opts.stall_timeout_duration();
 
@@ -8796,7 +8796,7 @@ impl DiskAPI for LocalDisk {
         Ok(entries)
     }
 
-    // FIXME: TODO: io.writer TODO cancel
+    // TODO(backlog): support io.writer cancellation and early termination in walk_dir
     #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         self.wait_for_startup_cleanup().await;
@@ -9880,7 +9880,7 @@ impl DiskAPI for LocalDisk {
                 );
                 return Err(e);
             }
-            // TODO: health check
+            // TODO(backlog): add post-setup disk health verification
         }
         Ok(())
     }

@@ -601,7 +601,7 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        // TODO: opts.cached
+        // TODO(backlog): support cached bucket listing via opts.cached
 
         let mut buckets = self.peer_sys.list_bucket(opts).await?;
 

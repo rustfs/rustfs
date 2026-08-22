@@ -41,7 +41,6 @@ use reqwest::Client;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
 use tokio::process::Command;
 use tracing::info;
 
@@ -821,7 +820,6 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_webdav_core_operations_direct() -> Result<()> {
     test_webdav_core_operations().await
 }
