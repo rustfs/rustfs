@@ -884,10 +884,7 @@ async fn stop_rebalance_admission_first(
     notification_sys: Option<&NotificationSys>,
     expected_rebalance_id: &str,
 ) -> S3Result<Vec<String>> {
-    store
-        .cancel_rebalance_admission_for_id(expected_rebalance_id)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to close rebalance admission before stop: {}", e))?;
+    // prepare_rebalance_stop already closed admission for this exact run.
 
     if let Some(notification_sys) = notification_sys {
         return notification_sys
@@ -1102,8 +1099,8 @@ mod rebalance_handler_tests {
         rebalance_used_pct, rollback_result_label, stop_rebalance_admission_first,
     };
     use crate::admin::storage_api::rebalance::{
-        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
-        RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
+        DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
 
@@ -1151,6 +1148,90 @@ mod rebalance_handler_tests {
             .expect("admin stop should persist the terminal state");
         assert!(stop_failures.is_empty());
         assert!(!fixture.store().is_rebalance_conflicting_with_decommission().await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_admin_stop_accepts_same_run_terminalization_after_prepare() {
+        const REBALANCE_ID: &str = "admin-stop-terminal-after-prepare";
+        const REPLACEMENT_ID: &str = "admin-stop-replacement";
+        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
+            started_rebalance_meta(REBALANCE_ID),
+        )
+        .await;
+        let terminal_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let worker_barrier = std::sync::Arc::clone(&terminal_barrier);
+        let worker_store = std::sync::Arc::clone(&store);
+        let terminal_task = tokio::spawn(async move {
+            worker_barrier.wait().await;
+            {
+                let mut rebalance_meta = worker_store.rebalance_meta.write().await;
+                let meta = rebalance_meta
+                    .as_mut()
+                    .expect("the prepared rebalance metadata should remain installed");
+                assert_eq!(meta.id, REBALANCE_ID);
+                let pool = meta
+                    .pool_stats
+                    .first_mut()
+                    .expect("the prepared rebalance should have a pool");
+                pool.info.status = RebalStatus::Stopped;
+                pool.info.end_time = Some(OffsetDateTime::now_utc());
+            }
+            worker_store
+                .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, REBALANCE_ID)
+                .await
+        });
+
+        let expected_rebalance_id = rebalance_stop_target_id(&store)
+            .await
+            .expect("admin stop target resolution should succeed")
+            .expect("the active rebalance should remain stoppable");
+        assert_eq!(expected_rebalance_id, REBALANCE_ID);
+        let cancel = store
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .and_then(|meta| meta.cancel.clone())
+            .expect("prepare should install the admission cancellation token");
+        assert!(cancel.is_cancelled());
+
+        terminal_barrier.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), terminal_task)
+            .await
+            .expect("worker terminalization should finish after the barrier opens")
+            .expect("worker terminalization task should not panic")
+            .expect("worker terminalization should persist");
+        assert!(!store.is_rebalance_conflicting_with_decommission().await);
+
+        *store.rebalance_meta.write().await = None;
+        store
+            .load_rebalance_meta()
+            .await
+            .expect("the worker terminal state should reload before the final stop");
+        {
+            let terminal = store.rebalance_meta.read().await;
+            let terminal = terminal.as_ref().expect("the worker terminal state should remain persisted");
+            assert_eq!(terminal.id, REBALANCE_ID);
+            assert_eq!(terminal.pool_stats[0].info.status, RebalStatus::Stopped);
+        }
+
+        let stop_failures = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect("same-run terminalization after prepare should be a successful stop");
+        assert!(stop_failures.is_empty());
+
+        *store.rebalance_meta.write().await = Some(started_rebalance_meta(REPLACEMENT_ID));
+        let error = stop_rebalance_admission_first(&store, None, expected_rebalance_id.as_str())
+            .await
+            .expect_err("the prepared stop must not mutate a replacement run");
+        assert!(error.to_string().contains(REBALANCE_ID));
+        let replacement = store.rebalance_meta.read().await;
+        let replacement = replacement.as_ref().expect("the replacement run should remain installed");
+        assert_eq!(replacement.id, REPLACEMENT_ID);
+        assert_eq!(replacement.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(replacement.cancel.is_none());
+        assert!(replacement.stopped_at.is_none());
     }
 
     #[tokio::test]
