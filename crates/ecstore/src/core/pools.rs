@@ -4988,10 +4988,7 @@ impl ECStore {
                     state = "verifying_completion",
                     "Decommission completion verification started"
                 );
-                self.ensure_decommission_generation_current(idx, generation).await?;
-                let operation_gate = self.ctx.decommission_operation_gate();
-                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || self.check_after_decommission(idx)).await
-                {
+                if let Err(err) = self.check_after_decommission(idx, &rx, generation).await {
                     if is_err_operation_canceled(&err) {
                         return Err(err);
                     }
@@ -6452,7 +6449,18 @@ impl ECStore {
         self.cleanup_decommission_durable_ilm_receipts(source_pool_idx).await
     }
 
-    async fn check_after_decommission(self: &Arc<Self>, idx: usize) -> Result<()> {
+    async fn check_after_decommission(
+        self: &Arc<Self>,
+        idx: usize,
+        rx: &CancellationToken,
+        generation: OffsetDateTime,
+    ) -> Result<()> {
+        self.ensure_decommission_generation_current(idx, generation).await?;
+        let operation_gate = self.ctx.decommission_operation_gate();
+        run_decommission_side_effect(rx, &operation_gate, || self.check_after_decommission_unfenced(idx)).await
+    }
+
+    async fn check_after_decommission_unfenced(self: &Arc<Self>, idx: usize) -> Result<()> {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
 
@@ -6626,7 +6634,9 @@ impl ECStore {
 
     #[cfg(test)]
     pub(crate) async fn check_after_decommission_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
-        self.check_after_decommission(idx).await
+        let generation = self.active_decommission_generation(idx).await?;
+        self.check_after_decommission(idx, &CancellationToken::new(), generation)
+            .await
     }
 
     #[tracing::instrument(skip(self, rd))]
