@@ -365,6 +365,7 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let completed_heals = self.completed_heals.clone();
+        let displaced_terminals = self.displaced_terminals.clone();
         let task_aliases = self.task_aliases.clone();
         let retrying_heals = self.retrying_heals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
@@ -397,6 +398,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            displaced_terminals: &displaced_terminals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
@@ -415,6 +417,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            displaced_terminals: &displaced_terminals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
@@ -442,6 +445,7 @@ impl HealManager {
             heal_queue,
             active_heals,
             completed_heals,
+            displaced_terminals,
             task_aliases,
             retrying_heals,
             mrf_repair_notice_targets,
@@ -527,6 +531,7 @@ impl HealManager {
                 let active_heals_clone = active_heals.clone();
                 let heal_queue_clone = heal_queue.clone();
                 let completed_heals_clone = completed_heals.clone();
+                let displaced_terminals_clone = displaced_terminals.clone();
                 let task_aliases_clone = task_aliases.clone();
                 let retrying_heals_clone = retrying_heals.clone();
                 let mrf_repair_notice_targets_clone = mrf_repair_notice_targets.clone();
@@ -581,11 +586,167 @@ impl HealManager {
                                     "Heal scheduler task completed"
                                 );
                             }
-                            Err(e) => {
-                                let will_retry = retry_request.is_some();
-                                if will_retry {
-                                    demote_to_debug_when!(task.heal_type.is_per_object(), warn, target: "rustfs::heal::manager", {
-                                        event = EVENT_HEAL_SCHEDULER_STATE,
+                        }
+                    }
+                    let retry_request_for_status = retry_request.as_ref().map(|(request, _, error)| HealTaskStatus::Retrying {
+                        error: error.clone(),
+                        retry_attempt: request.retry_attempts,
+                    });
+                    let retry_request_for_queue = retry_request;
+                    let retry_cancel_token = retry_request_for_queue.as_ref().map(|_| CancellationToken::new());
+                    if retry_request_for_queue.is_none() {
+                        replacement_recovery_anchors_clone
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&task_id);
+                    }
+                    let mut active_heals_guard = active_heals_clone.lock().await;
+                    // Keep retry ownership continuous: status snapshots acquire
+                    // these locks in the same active -> retrying order.
+                    let mut retrying_heals_guard = if let (Some((request, _, error)), Some(cancel_token)) =
+                        (retry_request_for_queue.as_ref(), retry_cancel_token.as_ref())
+                    {
+                        let mut retrying = retrying_heals_clone.lock().await;
+                        if active_heals_guard.contains_key(&task_id) {
+                            retrying.insert(
+                                request.id.clone(),
+                                RetryingHeal {
+                                    request: request.clone(),
+                                    error: error.clone(),
+                                    cancel_token: cancel_token.clone(),
+                                },
+                            );
+                            #[cfg(test)]
+                            pause_retry_ownership_transition(&task_id, false).await;
+                        }
+                        Some(retrying)
+                    } else {
+                        None
+                    };
+                    let completed_task = active_heals_guard.remove(&task_id);
+                    if let Some(completed_task) = completed_task.as_ref() {
+                        publish_active_heal_count(&active_heals_guard);
+                        update_task_running_metric_for_task(&active_heals_guard, completed_task.as_ref());
+                    }
+                    let active_count = active_heals_guard.len();
+                    drop(retrying_heals_guard.take());
+                    drop(active_heals_guard);
+
+                    if let Some(completed_task) = completed_task {
+                        let completed_status = if let Some(status) = retry_request_for_status {
+                            status
+                        } else {
+                            completed_task.get_status().await
+                        };
+                        let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
+                        let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
+                        let completed_progress = completed_task.get_progress().await;
+                        // Single snapshot of the retained window: the task is
+                        // finished and already off the active map, so there is
+                        // no concurrent writer to race with.
+                        let seqed_items = completed_task.get_seqed_result_items().await;
+                        let (next_seq, min_seq) = completed_task.result_seq_cursors();
+                        let completed_status_entry = CompletedHealStatus {
+                            heal_type: completed_task.heal_type.clone(),
+                            status: completed_status.clone(),
+                            result_items_truncated: completed_task.result_items_truncated(),
+                            completed_at: SystemTime::now(),
+                            seqed_items,
+                            next_seq,
+                            min_seq,
+                        };
+                        let mut completed_heals_guard = completed_heals_clone.lock().await;
+                        prune_completed_heal_statuses(&mut completed_heals_guard);
+                        completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
+                        drop(completed_heals_guard);
+                        // update statistics
+                        let mut stats = statistics_clone.write().await;
+                        match completed_status {
+                            HealTaskStatus::Completed => {
+                                stats.update_task_completion(true);
+                                stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);
+                            }
+                            HealTaskStatus::Retrying { .. } => {}
+                            _ => {
+                                stats.update_task_completion(false);
+                            }
+                        }
+                        stats.update_running_tasks(usize_to_u64_saturated(active_count));
+                        drop(stats);
+                        if terminal_completion {
+                            let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
+                            if successful_completion {
+                                emit_mrf_repaired_events(notice_targets);
+                            }
+                            task_aliases_clone
+                                .lock()
+                                .await
+                                .retain(|alias_id, alias| alias_id != &task_id && alias.task_id != task_id);
+                        }
+                    }
+
+                    if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =
+                        (retry_request_for_queue, retry_cancel_token)
+                    {
+                        let retry_request_id = retry_request.id.clone();
+                        let retry_attempt = retry_request.retry_attempts;
+                        let retry_key = PriorityHealQueue::make_dedup_key(&retry_request);
+                        let retry_priority = retry_request.priority;
+                        let retry_active_heals = active_heals_clone.clone();
+                        let retry_heal_queue = heal_queue_clone.clone();
+                        let retrying_heals_for_spawn = retrying_heals_clone.clone();
+                        let retry_task_aliases = task_aliases_clone.clone();
+                        let retry_displaced_terminals = displaced_terminals_clone.clone();
+                        let retry_mrf_repair_notice_targets = mrf_repair_notice_targets_clone.clone();
+                        let retry_completed_heals = completed_heals_clone.clone();
+                        let retry_notify = notify_clone.clone();
+                        let retry_manager_cancel_token = manager_cancel_token.clone();
+                        let retry_config = config_for_spawn.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = retry_cancel_token.cancelled() => {
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            result = "retry_cancelled",
+                                            "Heal retry admission decided"
+                                        );
+                                        return;
+                                    }
+                                    _ = retry_manager_cancel_token.cancelled() => {
+                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        return;
+                                    }
+                                    _ = sleep(retry_delay) => {}
+                                }
+
+                                {
+                                    let retrying_heals_guard = retrying_heals_for_spawn.lock().await;
+                                    if !retrying_heals_guard.contains_key(&retry_request_id) {
+                                        return;
+                                    }
+                                }
+
+                                let active_duplicate_task_id = {
+                                    let active_heals_guard = retry_active_heals.lock().await;
+                                    active_heal_for_dedup_key(&active_heals_guard, &retry_key).map(|(task_id, _)| task_id)
+                                };
+                                if let Some(active_duplicate_task_id) = active_duplicate_task_id {
+                                    retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                    move_mrf_repair_notice_targets(
+                                        &retry_mrf_repair_notice_targets,
+                                        &retry_request_id,
+                                        &active_duplicate_task_id,
+                                    );
+                                    debug!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
                                         component = LOG_COMPONENT_HEAL,
                                         subsystem = LOG_SUBSYSTEM_MANAGER,
                                         task_id,
@@ -657,120 +818,43 @@ impl HealManager {
                         drop(retrying_heals_guard.take());
                         drop(active_heals_guard);
 
-                        if let Some(completed_task) = completed_task {
-                            let completed_status = if let Some(status) = retry_request_for_status {
-                                status
-                            } else {
-                                completed_task.get_status().await
-                            };
-                            let terminal_completion = !matches!(completed_status, HealTaskStatus::Retrying { .. });
-                            let successful_completion = matches!(completed_status, HealTaskStatus::Completed);
-                            let completed_progress = completed_task.get_progress().await;
-                            // Single snapshot of the retained window: the task is
-                            // finished and already off the active map, so there is
-                            // no concurrent writer to race with.
-                            let seqed_items = completed_task.get_seqed_result_items().await;
-                            let (next_seq, min_seq) = completed_task.result_seq_cursors();
-                            let completed_status_entry = CompletedHealStatus {
-                                heal_type: completed_task.heal_type.clone(),
-                                status: completed_status.clone(),
-                                result_items_truncated: completed_task.result_items_truncated(),
-                                completed_at: SystemTime::now(),
-                                seqed_items,
-                                next_seq,
-                                min_seq,
-                            };
-                            let mut completed_heals_guard = completed_heals_clone.lock().await;
-                            prune_completed_heal_statuses(&mut completed_heals_guard);
-                            completed_heals_guard.insert(task_id.clone(), Arc::new(completed_status_entry));
-                            drop(completed_heals_guard);
-                            // update statistics
-                            let mut stats = statistics_clone.write().await;
-                            match completed_status {
-                                HealTaskStatus::Completed => {
-                                    stats.update_task_completion(true);
-                                    stats.add_healed_objects(
-                                        completed_progress.objects_healed,
-                                        completed_progress.bytes_processed,
-                                    );
-                                }
-                                HealTaskStatus::Retrying { .. } => {}
-                                _ => {
-                                    stats.update_task_completion(false);
-                                }
-                            }
-                            stats.update_running_tasks(usize_to_u64_saturated(active_count));
-                            drop(stats);
-                            #[cfg(test)]
-                            panic_if_armed(SchedulerPanicPoint::Cleanup, &task_id);
-                            if terminal_completion {
-                                let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
-                                if successful_completion {
-                                    emit_mrf_repaired_events(notice_targets);
-                                }
-                                task_aliases_clone
-                                    .lock()
-                                    .await
-                                    .retain(|alias_id, alias| alias_id != &task_id && alias.task_id != task_id);
-                            }
-                        }
-
-                        if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =
-                            (retry_request_for_queue, retry_cancel_token)
-                        {
-                            let retry_request_id = retry_request.id.clone();
-                            let retry_attempt = retry_request.retry_attempts;
-                            let retry_key = PriorityHealQueue::make_dedup_key(&retry_request);
-                            let retry_priority = retry_request.priority;
-                            let retry_panic_heal_type = retry_request.heal_type.clone();
-                            let retry_panic_set_label = heal_request_set_metric_label(&retry_request);
-                            let retry_active_heals = active_heals_clone.clone();
-                            let retry_heal_queue = heal_queue_clone.clone();
-                            let retrying_heals_for_spawn = retrying_heals_clone.clone();
-                            let retry_task_aliases = task_aliases_clone.clone();
-                            let retry_mrf_repair_notice_targets = mrf_repair_notice_targets_clone.clone();
-                            let retry_completed_heals = completed_heals_clone.clone();
-                            let retry_notify = notify_clone.clone();
-                            let retry_manager_cancel_token = manager_cancel_token.clone();
-                            let retry_config = config_for_spawn.clone();
-                            let retry_panic_id = retry_request_id.clone();
-                            let retry_panic_state = PanicCleanupState {
-                                active_heals: retry_active_heals.clone(),
-                                heal_queue: retry_heal_queue.clone(),
-                                completed_heals: retry_completed_heals.clone(),
-                                task_aliases: retry_task_aliases.clone(),
-                                retrying_heals: retrying_heals_for_spawn.clone(),
-                                mrf_repair_notice_targets: retry_mrf_repair_notice_targets.clone(),
-                                replacement_recovery_anchors: replacement_recovery_anchors_clone.clone(),
-                                statistics: statistics_clone.clone(),
-                            };
-                            let retry_panic_cancel_token = retry_cancel_token.clone();
-                            tokio::spawn(async move {
-                                let retry_child = async move {
-                                    #[cfg(test)]
-                                    panic_if_armed(SchedulerPanicPoint::RetryChild, &retry_request_id);
-                                    loop {
-                                        tokio::select! {
-                                            _ = retry_cancel_token.cancelled() => {
-                                                debug!(
-                                                    target: "rustfs::heal::manager",
-                                                    event = EVENT_HEAL_QUEUE_ADMISSION,
-                                                    component = LOG_COMPONENT_HEAL,
-                                                    subsystem = LOG_SUBSYSTEM_MANAGER,
-                                                    request_id = %retry_request_id,
-                                                    priority = ?retry_priority,
-                                                    retry_attempt,
-                                                    result = "retry_cancelled",
-                                                    "Heal retry admission decided"
-                                                );
-                                                return;
-                                            }
-                                            _ = retry_manager_cancel_token.cancelled() => {
-                                                retry_cancel_token.cancel();
-                                                retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
-                                                return;
-                                            }
-                                            _ = sleep(retry_delay) => {}
+                                let mut queue = retry_heal_queue.lock().await;
+                                let admission_decision =
+                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                let admission = admission_decision.result;
+                                let should_notify = matches!(admission, HealAdmissionResult::Accepted)
+                                    && retry_config.event_driven_scheduler_enable;
+                                // Publish the terminal synchronously while the
+                                // queue transition is protected. The subsequent
+                                // queue -> retrying handoff retains the lock order
+                                // used by operations_snapshot.
+                                let displaced_terminal = admission_decision
+                                    .displaced_request
+                                    .as_ref()
+                                    .map(|request| record_displaced_terminal(&retry_displaced_terminals, request));
+                                match admission {
+                                    HealAdmissionResult::Accepted => {
+                                        // Transfer ownership while holding queue -> retrying,
+                                        // matching operations_snapshot's lock order.
+                                        #[cfg(test)]
+                                        pause_retry_ownership_transition(&retry_request_id, true).await;
+                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
+                                        drop(queue);
+                                        if let (Some(displaced_task_id), Some(displaced_terminal)) =
+                                            (displaced_task_id, displaced_terminal)
+                                        {
+                                            remove_displaced_task_aliases(
+                                                &retry_task_aliases,
+                                                &retry_displaced_terminals,
+                                                &displaced_task_id,
+                                                &displaced_terminal,
+                                            )
+                                            .await;
+                                            remove_mrf_repair_notice_targets(
+                                                &retry_mrf_repair_notice_targets,
+                                                &displaced_task_id,
+                                            );
                                         }
 
                                         {
