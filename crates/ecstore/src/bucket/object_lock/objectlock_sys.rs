@@ -239,7 +239,12 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
         return Ok(None);
     }
 
-    if let Some(status) = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
+    // A cleared retention / legal hold is persisted as empty strings (the
+    // MinIO on-disk shape, `parse_object_lock_retention`); read it as "no lock"
+    // rather than as corrupt metadata.
+    let persisted = |key: &str| obj_info.user_defined.get(key).filter(|value| !value.is_empty());
+
+    if let Some(status) = persisted(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
         if status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::ON) {
             return Ok(Some(ObjectLockBlockReason::LegalHold));
         }
@@ -248,8 +253,8 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
         }
     }
 
-    let mode = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
-    let retain_until = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
+    let mode = persisted(X_AMZ_OBJECT_LOCK_MODE.as_str());
+    let retain_until = persisted(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
     let explicit_ret = match (mode, retain_until) {
         (None, None) => None,
         (Some(mode), Some(retain_until)) => {
@@ -483,6 +488,45 @@ mod tests {
 
             let err = check_object_lock_for_deletion_with_config(None, &obj_info, false).expect_err(case);
             assert!(err.to_string().contains(expected), "unexpected {case} error: {err}");
+        }
+    }
+
+    /// A local PutObjectRetention / PutObjectLegalHold "clear" persists the
+    /// lock keys as empty strings (the MinIO on-disk shape, see
+    /// `parse_object_lock_retention`); that is "no lock", not corruption, and
+    /// must not wedge later explicit-version PUTs or deletes
+    /// (rustfs/backlog#1953).
+    #[test]
+    fn deletion_treats_cleared_empty_lock_metadata_as_unlocked() {
+        use rustfs_utils::http::headers::{
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        };
+
+        let cases: [(&str, &[&str]); 3] = [
+            (
+                "cleared retention",
+                &[AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER],
+            ),
+            ("cleared legal hold", &[AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER]),
+            (
+                "all cleared",
+                &[
+                    AMZ_OBJECT_LOCK_MODE_LOWER,
+                    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+                    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+                ],
+            ),
+        ];
+
+        for (case, keys) in cases {
+            let user_defined = keys.iter().map(|key| (key.to_string(), String::new())).collect();
+            let obj_info = ObjectInfo {
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            };
+
+            let result = check_object_lock_for_deletion_with_config(None, &obj_info, false);
+            assert!(matches!(result, Ok(None)), "{case}: empty lock keys must read as unlocked: {result:?}");
         }
     }
 

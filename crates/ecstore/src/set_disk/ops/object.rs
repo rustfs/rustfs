@@ -14578,6 +14578,72 @@ mod put_object_tmp_cleanup_tests {
         assert_eq!(body, original_body);
     }
 
+    /// A local PutObjectRetention / PutObjectLegalHold clear persists empty
+    /// lock keys (`parse_object_lock_retention`). The commit-time WORM gate
+    /// must read that as unlocked: an explicit-version PUT (the inbound
+    /// replication transport) and a version delete both have to succeed
+    /// (rustfs/backlog#1953).
+    #[tokio::test]
+    async fn explicit_version_overwrite_and_delete_succeed_after_local_lock_clear() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-explicit-version-cleared-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(b"original".to_vec());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial version should be written");
+        let version_id = initial
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let version_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.clone()),
+            delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([
+                        (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), String::new()),
+                        (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), String::new()),
+                        (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), String::new()),
+                    ])),
+                    ..version_opts.clone()
+                },
+            )
+            .await
+            .expect("cleared lock metadata should be written");
+
+        let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement, &version_opts)
+            .await
+            .expect("explicit-version PUT must not be wedged by cleared lock metadata");
+
+        set_disks
+            .delete_object(bucket, object, version_opts)
+            .await
+            .expect("version delete must not be wedged by cleared lock metadata");
+    }
+
     #[tokio::test]
     async fn version_only_copy_checks_the_destination_version_object_lock() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
