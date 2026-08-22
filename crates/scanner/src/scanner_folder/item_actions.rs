@@ -90,6 +90,21 @@ pub(super) fn build_object_heal_request(
     }
 }
 
+/// Build the versionless inspection request used when discovery cannot prove
+/// a destructive version identity (for example an unversioned object or a
+/// bounded candidate overflow). The explicit flag is the fail-closed safety
+/// boundary; callers must not reconstruct it with the destructive default.
+pub(super) fn build_non_destructive_object_heal_request(
+    bucket: String,
+    object: String,
+    scan_mode: HealScanMode,
+    priority: HealChannelPriority,
+) -> HealChannelRequest {
+    let mut request = build_object_heal_request(bucket, object, None, scan_mode, priority);
+    request.remove_corrupted = Some(false);
+    request
+}
+
 #[cfg(test)]
 pub(super) fn resolve_object_heal_entry(
     entries: &MetaCacheEntries,

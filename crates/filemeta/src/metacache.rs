@@ -42,6 +42,9 @@ use uuid::Uuid;
 
 const SLASH_SEPARATOR: &str = "/";
 pub const MAX_META_CACHE_HEAL_CANDIDATES: usize = 1024;
+/// Keep truncation continuations bounded while still giving the scanner a
+/// safe object-level retry for versions that did not fit in the candidate set.
+pub const MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS: usize = 64;
 
 #[derive(Clone, Debug, Default)]
 pub struct MetadataResolutionParams {
@@ -102,6 +105,12 @@ impl MetaCacheHealCandidate {
 pub struct MetaCacheHealDiscovery {
     pub candidates: Vec<MetaCacheHealCandidate>,
     pub unverified_count: usize,
+    pub truncated: bool,
+    /// Object names whose validated version set exceeded the candidate cap.
+    /// The scanner retries these names without a version and with destructive
+    /// healing disabled; this is an explicit bounded continuation, not a
+    /// version claim.
+    pub truncated_objects: Vec<String>,
 }
 
 impl MetaCacheEntry {
@@ -431,6 +440,8 @@ impl MetaCacheEntries {
         let mut discovery = MetaCacheHealDiscovery {
             candidates: Vec::<MetaCacheHealCandidate>::with_capacity(limit.min(self.0.len())),
             unverified_count: 0,
+            truncated: false,
+            truncated_objects: Vec::with_capacity(MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS.min(limit)),
         };
         let mut seen: HashMap<(String, Option<Uuid>, MetaCacheHealCandidateKind), usize> =
             HashMap::with_capacity(limit.min(self.0.len()));
@@ -553,24 +564,30 @@ impl MetaCacheEntries {
                     replica_count: 1,
                 };
                 let key = (candidate.object.clone(), candidate.version_id, candidate.kind.clone());
-                if !entry_seen.contains(&key) {
-                    // Keep per-entry dedupe bounded as well as the global
-                    // candidate union. Once the cap is reached, only keys
-                    // already present in the global map may update replica
-                    // counts; novel versions are accounting-only.
-                    if entry_seen.len() >= limit && !seen.contains_key(&key) {
-                        continue;
-                    }
-                    entry_seen.insert(key.clone());
+                if entry_seen.contains(&key) {
+                    continue;
                 }
                 if let Some(index) = seen.get(&key).copied() {
+                    entry_seen.insert(key);
                     discovery.candidates[index].replica_count = discovery.candidates[index].replica_count.saturating_add(1);
+                } else if discovery.candidates.len() >= limit {
+                    // Keep the validated candidate list bounded, but retain a
+                    // bounded object-level continuation so the scanner cannot
+                    // silently lose every version of a busy object.
+                    discovery.truncated = true;
+                    if discovery.truncated_objects.len() < MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
+                        && !discovery.truncated_objects.iter().any(|object| object == &candidate.object)
+                    {
+                        discovery.truncated_objects.push(candidate.object.clone());
+                    }
+                    // The remaining versions in this raw entry cannot add a
+                    // bounded candidate; avoid parsing a very long history
+                    // after the safe continuation has been recorded.
+                    break;
                 } else {
+                    entry_seen.insert(key.clone());
                     seen.insert(key, discovery.candidates.len());
                     discovery.candidates.push(candidate);
-                    if discovery.candidates.len() >= limit {
-                        return discovery;
-                    }
                 }
             }
         }
@@ -755,20 +772,18 @@ impl MetaCacheEntries {
 }
 
 fn valid_heal_candidate_name(bucket: &str, entry: &MetaCacheEntry) -> bool {
-    if bucket.is_empty() || entry.name.is_empty() || entry.is_dir() || entry.name.contains('\0') {
+    if bucket.is_empty()
+        || entry.name.is_empty()
+        || entry.is_dir()
+        || entry.name.contains('\\')
+        || entry.name.chars().any(char::is_control)
+    {
         return false;
     }
 
-    // Validate raw key components without normalizing them. A dot component
-    // could otherwise escape the bucket when the key is later mapped back to
-    // a disk path; a final empty component is retained for valid keys ending
-    // in '/'.
-    let mut components = entry.name.split('/').peekable();
-    while let Some(component) = components.next() {
-        if component == "." || component == ".." || (component.is_empty() && components.peek().is_some()) {
-            return false;
-        }
-    }
+    // Keep the S3 key opaque. In particular, do not normalize or reject dot
+    // components or repeated separators; identity is checked against the
+    // decoded FileInfo below and the raw key must be preserved exactly.
     true
 }
 
@@ -1857,6 +1872,28 @@ mod tests {
     }
 
     #[test]
+    fn discover_heal_candidates_does_not_count_duplicate_versions_within_one_entry() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut meta = FileMeta::load(&metacache_entry_single_version(1, now, "duplicate").metadata)
+            .expect("duplicate fixture should decode");
+        meta.versions.push(meta.versions[0].clone());
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: meta.marshal_msg().expect("duplicate metadata should marshal"),
+            cached: Some(meta),
+            reusable: false,
+        };
+
+        let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 16);
+        let candidate = discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version_id == Some(Uuid::from_u128(1)))
+            .expect("duplicate fixture should be discovered");
+        assert_eq!(candidate.replica_count, 1);
+    }
+
+    #[test]
     fn discover_heal_candidates_covers_divergent_quorum_boundaries_n2_n4_n6() {
         let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
 
@@ -1917,6 +1954,35 @@ mod tests {
         assert!(discovery.candidates.iter().any(|candidate| {
             candidate.kind == MetaCacheHealCandidateKind::UnversionedObject && candidate.version_id.is_none()
         }));
+    }
+
+    #[test]
+    fn discover_heal_candidates_rejects_delete_markers_without_ids() {
+        let mut marker_meta = FileMeta::new();
+        marker_meta
+            .add_version(FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+                ..Default::default()
+            })
+            .expect("nil delete marker should be added");
+        let discovery = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: marker_meta.marshal_msg().expect("nil marker metadata should marshal"),
+            cached: Some(marker_meta),
+            reusable: false,
+        })])
+        .discover_heal_candidates("bucket", 16);
+
+        assert!(
+            !discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.kind == MetaCacheHealCandidateKind::DeleteMarker)
+        );
+        assert!(discovery.unverified_count >= 1);
     }
 
     #[test]
@@ -2056,6 +2122,11 @@ mod tests {
         );
         let discovery = entries.discover_heal_candidates("bucket", 5);
         assert!(discovery.candidates.len() <= 5);
+        assert!(discovery.truncated, "bounded discovery must expose dropped candidates");
+        assert!(
+            discovery.truncated_objects.iter().any(|object| object == "object"),
+            "bounded discovery must expose an object-level safe continuation"
+        );
         assert!(
             !discovery
                 .candidates
@@ -2082,7 +2153,7 @@ mod tests {
             "malformed and rejected metadata must remain observable during discovery"
         );
 
-        for invalid_name in ["../object", "object//", "object\0name"] {
+        for invalid_name in ["object\\name", "object\u{0001}name", "object\0name"] {
             let mut entry = metacache_entry_single_version(400, now, invalid_name);
             entry.name = invalid_name.to_string();
             let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
@@ -2090,6 +2161,13 @@ mod tests {
                 discovery.candidates.is_empty(),
                 "invalid key should not become a heal candidate: {invalid_name:?}"
             );
+        }
+
+        for valid_name in ["../object", "object//", "trailing/"] {
+            let mut entry = metacache_entry_single_version(401, now, valid_name);
+            entry.name = valid_name.to_string();
+            let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
+            assert_eq!(discovery.candidates.len(), 1, "raw S3 key should remain opaque: {valid_name:?}");
         }
     }
 

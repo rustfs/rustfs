@@ -983,6 +983,21 @@ fn test_build_object_heal_request_omits_nil_version_id() {
 }
 
 #[test]
+fn test_build_non_destructive_object_heal_request_disables_removal() {
+    let request = build_non_destructive_object_heal_request(
+        "bucket".to_string(),
+        "path/to/object".to_string(),
+        HealScanMode::Deep,
+        HealChannelPriority::High,
+    );
+
+    assert_eq!(request.object_version_id, None);
+    assert_eq!(request.remove_corrupted, Some(false));
+    assert_eq!(request.recreate_missing, Some(false));
+    assert_eq!(request.source, HealRequestSource::Scanner);
+}
+
+#[test]
 fn test_build_bucket_heal_request_disables_recreate_for_scanner() {
     let request = build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low);
 
@@ -1130,6 +1145,31 @@ fn test_pending_heal_reconstructs_unversioned_request_without_removal() {
     assert!(request.object_version_id.is_none());
     assert_eq!(request.remove_corrupted, Some(false));
     assert_eq!(request.recreate_missing, Some(false));
+}
+
+#[tokio::test]
+async fn test_pending_heal_reason_preserves_sub_quorum_discovery() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+
+    scanner.update_pending_scanner_heal_after_admission(
+        PendingScannerHealKind::Object,
+        "bucket",
+        Some("object"),
+        Some("version-a"),
+        HealScanMode::Deep,
+        HealAdmissionResult::Full,
+    );
+    scanner.mark_pending_scanner_heal_reason(
+        PendingScannerHealKind::Object,
+        "bucket",
+        Some("object"),
+        Some("version-a"),
+        "sub_quorum_metadata",
+    );
+
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].last_admission_reason, "sub_quorum_metadata");
 }
 
 #[test]

@@ -43,7 +43,10 @@ use rustfs_common::metrics::{
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
-use rustfs_filemeta::{MAX_META_CACHE_HEAL_CANDIDATES, MetaCacheEntries, MetaCacheEntry, MetaCacheHealCandidateKind};
+use rustfs_filemeta::{
+    MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
+    MetaCacheHealCandidateKind,
+};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
 use time::OffsetDateTime;
@@ -100,6 +103,7 @@ const METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL: &str = "rustfs_scanner_hea
 const METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL: &str = "rustfs_scanner_heal_discovery_sub_quorum_total";
 const METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL: &str = "rustfs_scanner_heal_discovery_unverified_total";
 const METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL: &str = "rustfs_scanner_heal_discovery_queued_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL: &str = "rustfs_scanner_heal_discovery_truncated_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
 
 // --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
@@ -1877,6 +1881,7 @@ impl FolderScanner {
                 let mut partial_closed = false;
                 let mut finished_closed = false;
                 let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
+                let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
                     if agreed_closed && partial_closed && finished_closed {
@@ -1917,8 +1922,12 @@ impl FolderScanner {
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL).increment(
                                 u64::try_from(discovery.unverified_count).unwrap_or(u64::MAX),
                             );
+                            if discovery.truncated {
+                                counter!(METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL).increment(1);
+                            }
 
                             for candidate in discovery.candidates {
+                                let sub_quorum_candidate = candidate.replica_count < disks_quorum;
                                 let version_id = candidate.validated_version().map(|id| id.to_string());
                                 let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
                                 if seen_heal_candidates.len() >= MAX_META_CACHE_HEAL_CANDIDATES
@@ -1929,25 +1938,82 @@ impl FolderScanner {
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
-                                let mut request = build_object_heal_request(
-                                    bucket.clone(),
-                                    candidate.object.clone(),
-                                    version_id.clone(),
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                );
-                                if candidate.is_unversioned() {
-                                    request.remove_corrupted = Some(false);
-                                }
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
                                 (self.update_current_path)(&candidate.object).await;
                                 let admission = self.send_required_scanner_heal_request(
                                     PendingScannerHealKind::Object,
                                     bucket.clone(),
                                     Some(candidate.object.clone()),
-                                    version_id,
+                                    version_id.clone(),
                                     request,
                                 )
                                 .await?;
+                                if admission.is_admitted() {
+                                    counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
+                                } else if sub_quorum_candidate {
+                                    self.mark_pending_scanner_heal_reason(
+                                        PendingScannerHealKind::Object,
+                                        &bucket,
+                                        Some(&candidate.object),
+                                        version_id.as_deref(),
+                                        "sub_quorum_metadata",
+                                    );
+                                }
+                                found_objects = true;
+                            }
+
+                            // A bounded candidate union may overflow for an
+                            // object with a very long version history. Keep
+                            // that overflow explicit and issue one safe,
+                            // versionless inspection request per object so
+                            // the dropped versions are not silently treated
+                            // as absent. This continuation is deliberately
+                            // outside the versioned candidate cap and always
+                            // disables destructive cleanup.
+                            for object in discovery.truncated_objects {
+                                if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
+                                    && !seen_truncated_objects.contains(&object)
+                                {
+                                    continue;
+                                }
+                                if !seen_truncated_objects.insert(object.clone()) {
+                                    continue;
+                                }
+                                let identity = (object.clone(), None, MetaCacheHealCandidateKind::UnversionedObject);
+                                if !seen_heal_candidates.insert(identity) {
+                                    continue;
+                                }
+                                let request = build_non_destructive_object_heal_request(
+                                    bucket.clone(),
+                                    object.clone(),
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                );
+                                (self.update_current_path)(&object).await;
+                                let admission = self
+                                    .send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        bucket.clone(),
+                                        Some(object.clone()),
+                                        None,
+                                        request,
+                                    )
+                                    .await?;
                                 if admission.is_admitted() {
                                     counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
                                 }

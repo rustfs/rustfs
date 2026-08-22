@@ -105,6 +105,29 @@ impl FolderScanner {
         }
     }
 
+    /// Preserve the discovery reason when a candidate could not be admitted
+    /// immediately. The existing string field is intentionally reused so the
+    /// scanner's map-encoded cache schema stays backward compatible.
+    pub(super) fn mark_pending_scanner_heal_reason(
+        &mut self,
+        kind: PendingScannerHealKind,
+        bucket: &str,
+        object: Option<&str>,
+        version_id: Option<&str>,
+        reason: &str,
+    ) {
+        if let Some(entry) = self
+            .new_cache
+            .info
+            .pending_heals
+            .iter_mut()
+            .find(|entry| pending_scanner_heal_matches(entry, kind, bucket, object, version_id))
+        {
+            entry.last_admission_reason = reason.to_string();
+            self.sync_pending_heals();
+        }
+    }
+
     pub(super) fn prune_pending_scanner_heals(&mut self) {
         let now = Self::now_secs();
         let before_expiry = self.new_cache.info.pending_heals.len();
@@ -305,17 +328,22 @@ pub(super) fn build_pending_scanner_heal_request(entry: &PendingScannerHeal) -> 
     match entry.kind {
         PendingScannerHealKind::Bucket => Some(build_bucket_heal_request(entry.bucket.clone(), HealChannelPriority::High)),
         PendingScannerHealKind::Object => entry.object.as_ref().map(|object| {
-            let mut request = build_object_heal_request(
-                entry.bucket.clone(),
-                object.clone(),
-                entry.version_id.clone(),
-                entry.scan_mode,
-                HealChannelPriority::High,
-            );
             if entry.version_id.is_none() {
-                request.remove_corrupted = Some(false);
+                build_non_destructive_object_heal_request(
+                    entry.bucket.clone(),
+                    object.clone(),
+                    entry.scan_mode,
+                    HealChannelPriority::High,
+                )
+            } else {
+                build_object_heal_request(
+                    entry.bucket.clone(),
+                    object.clone(),
+                    entry.version_id.clone(),
+                    entry.scan_mode,
+                    HealChannelPriority::High,
+                )
             }
-            request
         }),
     }
 }
