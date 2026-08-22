@@ -80,6 +80,7 @@
 | object_lambda_test | 16 | 🌙 |
 | object_lock | 34 |  |
 | overwrite_cleanup_regression_test | 1 |  |
+| policy | 6 |  |
 | presigned_negative_test | 7 | ✅ |
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |
@@ -99,4 +100,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 575 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 453 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 581 tests across 83 modules · PR smoke: 163 tests / 36 modules · merge/main full: 459 tests / 74 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
