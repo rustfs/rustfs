@@ -922,14 +922,10 @@ mod prepared_get_object_metadata_tests {
             .expect("test should find an object whose initial fanout covers both data shards")
     }
 
-    #[allow(
-        dead_code,
-        reason = "test fixture no assertion in this module uses today; the live namesake lives in io_primitives tests (backlog#1823)"
-    )]
-    fn bounded_spare_disk_index(bucket: &str, object: &str) -> usize {
+    fn bounded_initial_parity_disk_index(bucket: &str, object: &str) -> usize {
         *bounded_metadata_fanout_order(bucket, object, 4, 2)
-            .get(3)
-            .expect("4-disk test geometry should leave one bounded spare disk")
+            .get(2)
+            .expect("4-disk test geometry should schedule one parity disk initially")
     }
 
     #[tokio::test]
@@ -1087,7 +1083,7 @@ mod prepared_get_object_metadata_tests {
                         ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
                     ],
                     async {
-                        let slow_parity_disk = bounded_spare_disk_index(bucket, &object);
+                        let slow_parity_disk = bounded_initial_parity_disk_index(bucket, &object);
                         let barrier =
                             rename_fanout_barrier::arm(&object, slow_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
                         let calls = disk_call_counters::observe(&object);

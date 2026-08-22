@@ -332,7 +332,7 @@ impl ECStore {
         let expected_incarnation_id = opts.expected_bucket_incarnation_id;
 
         if request.prefix.is_empty() {
-            // TODO: return from cache
+            // TODO(backlog): return cached multipart listing when prefix is empty
         }
 
         if self.single_pool() {
@@ -610,7 +610,7 @@ impl ECStore {
         let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         let opts = &opts;
 
-        // TODO: defer DeleteUploadID
+        // TODO(backlog): defer DeleteUploadID to background for faster abort response
 
         if self.single_pool() {
             return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
