@@ -8000,10 +8000,15 @@ impl DiskAPI for LocalDisk {
             use std::io::Write as _;
 
             let file_path = self.io_get_object_path(volume, path)?;
-            let lock_path = file_path.with_extension("rustfs-cas.lock");
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             return Ok(tokio::task::spawn_blocking(move || {
+                // A persistent directory lock bounds metadata growth. Removing
+                // per-target lock files can split flock ownership across inodes.
+                let lock_path = file_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?
+                    .join(".rustfs-cas.lock");
                 let lock = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -21872,7 +21877,10 @@ mod test {
         let marker_path = disk
             .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
             .expect("marker path should resolve");
-        let lock_path = marker_path.with_extension("rustfs-cas.lock");
+        let lock_path = marker_path
+            .parent()
+            .expect("marker path should have a parent")
+            .join(".rustfs-cas.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
