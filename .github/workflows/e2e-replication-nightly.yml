@@ -196,6 +196,9 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Verify protocol socket oracle
+        run: ss -tn state CLOSE-WAIT >/dev/null
+
       # The suite owns fixed protocol ports and serializes its internal cases.
       - name: Verify protocol e2e membership
         env:
