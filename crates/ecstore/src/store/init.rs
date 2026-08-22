@@ -4637,6 +4637,10 @@ mod tests {
             .persist_decommission_durable_ilm_receipt_for_test(0, 2, &path, &record, false)
             .await
             .expect("source pool zero receipt should persist on the target");
+        store
+            .persist_decommission_durable_ilm_receipt_for_test(0, 1, &path, &record, false)
+            .await
+            .expect("source pool zero receipt may reach another active source first");
         let source_one_receipt = store
             .persist_decommission_durable_ilm_receipt_for_test(1, 2, &path, &record, false)
             .await
