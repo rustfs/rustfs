@@ -1001,6 +1001,27 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_scope_checkpoint_rejects_timestamp_outside_wire_range() {
+        let options = super::super::bucket_lifecycle_ops::ManualTransitionRunOptions::default();
+        let job = manual_transition_job::ManualTransitionJobRecord::new(
+            Uuid::new_v4(),
+            "scope-checkpoint-timestamp-bucket",
+            &options,
+            "owner",
+        );
+        let mut admission = manual_transition_job::ManualTransitionScopeAdmission::from_job(&job);
+        admission.updated_at_unix_nanos = i128::from(i64::MAX) + 1;
+        let path = manual_transition_job::manual_transition_scope_record_object_name(&admission.scope_key)
+            .expect("manual transition scope path should build");
+        let encoded = serde_json::to_vec(&admission).expect("manual transition scope should encode");
+
+        let err =
+            validate_durable_ilm_record(&path, &encoded).expect_err("out-of-range scope checkpoint timestamp must fail closed");
+
+        assert!(err.to_string().contains("updated_at exceeds durable ILM checkpoint range"));
+    }
+
+    #[test]
     fn manual_transition_job_checkpoint_rejects_progress_poison() {
         let options = super::super::bucket_lifecycle_ops::ManualTransitionRunOptions::default();
         let mut initial =
