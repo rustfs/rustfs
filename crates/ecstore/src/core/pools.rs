@@ -814,19 +814,20 @@ fn resolve_decommission_partial_listing_entry(
     set_index: usize,
 ) -> Result<MetaCacheEntry> {
     let candidate_count = entries.as_ref().iter().flatten().count();
-    let candidate = entries.as_ref().iter().flatten().map(|entry| entry.name.clone()).next();
+    if let Some(entry) = entries.resolve(resolver) {
+        return Ok(entry);
+    }
 
-    entries.resolve(resolver).ok_or_else(|| {
-        decommission_unresolved_listing_error(
-            bucket,
-            prefix,
-            candidate.as_deref(),
-            candidate_count,
-            disk_error_count,
-            pool_index,
-            set_index,
-        )
-    })
+    let candidate = entries.as_ref().iter().flatten().map(|entry| entry.name.as_str()).next();
+    Err(decommission_unresolved_listing_error(
+        bucket,
+        prefix,
+        candidate,
+        candidate_count,
+        disk_error_count,
+        pool_index,
+        set_index,
+    ))
 }
 
 async fn record_decommission_entry_error(
