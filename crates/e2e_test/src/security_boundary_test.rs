@@ -228,12 +228,8 @@ async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send 
 /// Internal/private endpoints must be rejected as remote tier backends (SSRF).
 ///
 /// This issues a real admin AddTier call (`PUT /rustfs/admin/v3/tier`) for each
-/// internal/private endpoint and asserts the server rejects it (non-2xx, so the
-/// signed request helper returns an error). An internal endpoint must never be
-/// accepted as a tier backend. The rejection may originate from explicit
-/// SSRF/internal-address filtering or from the backend connectivity/credential
-/// validation performed during AddTier; either way the security-relevant
-/// outcome — the internal endpoint is not accepted — is asserted here.
+/// internal/private endpoint and asserts the request reaches the outbound URL
+/// guard. Connectivity or credential failures do not prove SSRF protection.
 ///
 /// The admin API is exercised via signed `awscurl` requests, matching the
 /// pattern used by the other admin-API E2E tests in this crate; the test is
@@ -274,10 +270,13 @@ async fn test_tiering_url_validation() -> Result<(), Box<dyn Error + Send + Sync
         })
         .to_string();
 
-        let result = awscurl_put(&tier_url, &body, &env.access_key, &env.secret_key).await;
+        let err = awscurl_put(&tier_url, &body, &env.access_key, &env.secret_key)
+            .await
+            .expect_err("AddTier must reject internal endpoints");
+        let rendered = err.to_string();
         assert!(
-            result.is_err(),
-            "AddTier must reject internal endpoint {endpoint}, but it was accepted: {result:?}"
+            rendered.contains("TierAddFailed") && rendered.contains("tier endpoint is not allowed"),
+            "AddTier rejected {endpoint} outside the outbound URL guard: {rendered}"
         );
     }
 
