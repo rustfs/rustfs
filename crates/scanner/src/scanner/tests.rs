@@ -1420,6 +1420,77 @@ async fn full_rescan_reset_keeps_cleanup_marker_when_preserved_epoch_is_exhauste
 }
 
 #[tokio::test]
+async fn full_rescan_reset_rejects_preserved_epoch_that_would_be_terminal() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let primary = CurrentCycle {
+        next: 42,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        encode_scanner_cycle_state(&primary, u64::MAX - 1).expect("valid cycle state should encode"),
+    )
+    .await
+    .expect("valid cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    assert!(
+        reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+            .await
+            .is_err(),
+        "reset must not persist the terminal leader epoch"
+    );
+
+    let marker = read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+        .await
+        .expect("cleanup marker should remain durable");
+    assert_eq!(
+        serde_json::from_slice::<ScannerCycleRecoveryMarker>(&marker)
+            .expect("cleanup marker should decode")
+            .state,
+        "cleanup-pending"
+    );
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rejects_usage_floor_that_would_be_terminal() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
+        .await
+        .expect("corrupt cycle state should be persisted");
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&DataUsageInfo {
+            scanner_epoch: Some(u64::MAX - 1),
+            ..Default::default()
+        })
+        .expect("usage floor should encode"),
+    )
+    .await
+    .expect("usage floor should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    assert!(
+        reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+            .await
+            .is_err(),
+        "reset must not persist the terminal leader epoch"
+    );
+    assert_eq!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+            .await
+            .expect("recovery marker should remain durable"),
+        b"{not-json"
+    );
+}
+
+#[tokio::test]
 async fn full_rescan_reset_rebuilds_empty_primary_with_malformed_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), Vec::new())

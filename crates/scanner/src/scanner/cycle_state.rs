@@ -794,6 +794,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             let fence_epoch = primary_epoch
                 .max(usage_floor.leader_epoch)
                 .checked_add(1)
+                .filter(|epoch| *epoch < u64::MAX)
                 .ok_or_else(|| ScannerError::Other("scanner leader epoch is exhausted".to_string()))?;
             if guard.is_lock_lost() {
                 return Err(ScannerError::Other(
@@ -884,6 +885,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     let leader_epoch = floor
         .leader_epoch
         .checked_add(1)
+        .filter(|epoch| *epoch < u64::MAX)
         .ok_or_else(|| ScannerError::Other("scanner leader epoch is exhausted".to_string()))?;
     let cycle = CurrentCycle {
         next,
