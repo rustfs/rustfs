@@ -187,7 +187,8 @@ impl ECStore {
                 continue;
             }
 
-            let (mut result, err) = pool.heal_format(dry_run).await?;
+            let fence_lost = || pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost();
+            let (mut result, err) = pool.heal_format_with_fence(dry_run, fence_lost).await?;
             if let Some(err) = err {
                 match err {
                     StorageError::NoHealRequired => {
@@ -203,8 +204,8 @@ impl ECStore {
             r.before.drives.append(&mut result.before.drives);
             r.after.drives.append(&mut result.after.drives);
 
-            // Sets::heal_format cannot observe this guard before each disk write;
-            // fail closed after the call if the lease was lost during format IO.
+            // A lease can be lost after the final write; fail closed before
+            // reporting the pool as successfully healed.
             if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
