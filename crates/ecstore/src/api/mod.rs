@@ -161,7 +161,7 @@ pub mod bucket {
         pub mod objectlock_sys {
             pub use crate::bucket::object_lock::objectlock_sys::{
                 BucketObjectLockSys, ObjectLockBlockReason, add_years, check_object_lock_for_deletion,
-                check_retention_for_modification, is_retention_active,
+                check_retention_for_modification, is_retention_active, replication_write_may_pass_worm_gate,
             };
         }
     }

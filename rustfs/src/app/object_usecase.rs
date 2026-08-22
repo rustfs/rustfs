@@ -39,7 +39,7 @@ use super::storage_api::object_usecase::bucket::{
     metadata_sys,
     object_lock::{
         objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{check_object_lock_for_deletion, is_retention_active},
+        objectlock_sys::{check_object_lock_for_deletion, is_retention_active, replication_write_may_pass_worm_gate},
     },
     predict_lifecycle_expiration,
     quota::{QuotaCheckResult, QuotaError, QuotaOperation},
@@ -3938,13 +3938,10 @@ pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &Object
     if put_like_write_creates_new_version(opts) {
         return Ok(());
     }
-    // An authorized replication write (ReplicateObjectAction set
-    // `replication_request`) carries the source's lock state for the replica,
-    // so the destination's current hold/retention must not reject it (MinIO
-    // `checkPutObjectLockAllowed` skips the existing-version check for
-    // replicas). The set layer's commit-lock LWW still keeps a category that
-    // was locked more recently on this site.
-    if opts.replication_request {
+    // An authorized replication write may replace the locked version when the
+    // set layer's commit-lock LWW will judge every locking category; the set
+    // layer re-checks the same rule under the lock.
+    if replication_write_may_pass_worm_gate(&existing_obj_info.user_defined, opts) {
         return Ok(());
     }
 
@@ -11092,14 +11089,17 @@ mod tests {
     }
 
     /// The source's lock state governs the replica (rustfs/backlog#1953):
-    /// an authorized replication write may overwrite a locked version; the
-    /// set layer's LWW still decides per category.
+    /// an authorized replication write carrying the locking category's source
+    /// timestamp may overwrite a locked version; the set layer's LWW then
+    /// decides per category.
     #[test]
     fn validate_existing_object_lock_allows_authorized_replication_overwrite() {
         let opts = ObjectOptions {
             versioned: true,
             version_id: Some(Uuid::new_v4().to_string()),
             replication_request: true,
+            replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+            replication_legalhold_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
             ..Default::default()
         };
 
@@ -11107,6 +11107,26 @@ mod tests {
             .expect("replication write must bypass the destination COMPLIANCE lock");
         validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
             .expect("replication write must bypass the destination legal hold");
+    }
+
+    /// Without the locking category's source timestamp the LWW merge cannot
+    /// judge it, so the write stays rejected instead of lifting the lock.
+    #[test]
+    fn validate_existing_object_lock_rejects_replication_overwrite_without_lock_timestamp() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            replication_request: true,
+            replication_tagging_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+            .expect_err("COMPLIANCE lock must hold without a retention source timestamp");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        let err = validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+            .expect_err("legal hold must hold without a legal-hold source timestamp");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
     #[test]

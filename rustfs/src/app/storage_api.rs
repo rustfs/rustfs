@@ -592,6 +592,16 @@ pub(crate) mod bucket {
                     retain_until_date,
                 )
             }
+
+            pub(crate) fn replication_write_may_pass_worm_gate(
+                user_defined: &std::collections::HashMap<String, String>,
+                opts: &crate::storage::storage_api::StorageObjectOptions,
+            ) -> bool {
+                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::replication_write_may_pass_worm_gate(
+                    user_defined,
+                    opts,
+                )
+            }
         }
     }
 
