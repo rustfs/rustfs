@@ -29,7 +29,7 @@ require_absent_pattern 'permissions[[:space:]]*:[[:space:]]*write-all' "the work
 require_present_pattern 'listWorkflowRuns' "the scheduled baseline must come from workflow history"
 require_present_pattern 'status:[[:space:]]*"success"' "the scheduled baseline must be a successful run"
 require_present_pattern 'SCHEDULED_BASELINE_SHA' "the resolved scheduled baseline must reach the comparison"
-require_present_pattern 'git rev-parse HEAD\^' "the first scheduled run must have a deterministic fallback"
+require_present_pattern "SCHEDULED_BASELINE_SHA:-\\\$candidate_sha" "the first scheduled run must seed from its verified candidate"
 require_present_pattern 'git merge-base --is-ancestor' "the scheduled baseline must stay on candidate history"
 
 echo "Performance A/B workflow contract ok."

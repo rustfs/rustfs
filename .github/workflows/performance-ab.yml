@@ -178,8 +178,9 @@ jobs:
             return data.workflow_runs[0]?.head_sha ?? "";
 
       # Manual runs compare a selected ref with current main. Scheduled runs
-      # compare current main with the last successful scheduled head; the first
-      # scheduled run falls back to HEAD^ and then establishes the baseline.
+      # compare current main with the last successful scheduled head. With no
+      # history, the first run measures the candidate against itself and seeds
+      # that head only if the complete rig succeeds.
       - name: Resolve baseline / candidate commits
         id: commits
         env:
@@ -188,7 +189,7 @@ jobs:
           set -euo pipefail
           candidate_sha="$(git rev-parse HEAD)"
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            baseline_sha="${SCHEDULED_BASELINE_SHA:-$(git rev-parse HEAD^)}"
+            baseline_sha="${SCHEDULED_BASELINE_SHA:-$candidate_sha}"
             if ! git merge-base --is-ancestor "$baseline_sha" "$candidate_sha"; then
               echo "::error::scheduled baseline $baseline_sha is not an ancestor of candidate $candidate_sha" >&2
               exit 1
