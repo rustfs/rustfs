@@ -1601,6 +1601,29 @@ async fn test_checkpoint_schema_v4_discarded_on_load() {
 }
 
 #[tokio::test]
+async fn unsigned_previous_checkpoint_schema_preserves_progress() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut legacy = ResumeCheckpoint::new(task_id.clone());
+    legacy.schema_version = CURRENT_CHECKPOINT_SCHEMA - 1;
+    legacy.update_position(2, 500);
+    legacy.add_processed_object("object".to_string());
+    legacy.integrity_digest = None;
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, serde_json::to_vec(&legacy).unwrap().into())
+        .await
+        .expect("write previous-schema checkpoint");
+
+    let manager = CheckpointManager::load_from_disk(disk, &task_id).await.unwrap();
+    let checkpoint = manager.get_checkpoint().await;
+    assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+    assert_eq!(checkpoint.current_bucket_index, 2);
+    assert_eq!(checkpoint.current_object_index, 500);
+    assert!(checkpoint.processed_objects.contains("object"));
+    temp_dir.close().unwrap();
+}
+
+#[tokio::test]
 async fn current_normal_resume_schema_preserves_progress() {
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();
@@ -1801,6 +1824,33 @@ async fn checkpoint_integrity_survives_multi_object_reload() {
     CheckpointManager::load_from_disk(disk, &task_id)
         .await
         .expect("a healthy multi-object checkpoint must survive reload");
+    temp_dir.close().unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_integrity_rejects_a_removed_embedded_digest() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+    manager.update_position(2, 9).await.unwrap();
+
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let bytes = disk
+        .read_all(RUSTFS_META_BUCKET, &checkpoint_path)
+        .await
+        .expect("read checkpoint fixture");
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["current_object_index"] = serde_json::json!(10);
+    value.as_object_mut().unwrap().remove("integrity_digest");
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, serde_json::to_vec(&value).unwrap().into())
+        .await
+        .expect("write tampered checkpoint fixture");
+
+    assert!(
+        CheckpointManager::load_from_disk(disk.clone(), &task_id).await.is_err(),
+        "a current checkpoint without its embedded digest must fail closed"
+    );
+    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
     temp_dir.close().unwrap();
 }
 
