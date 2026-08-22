@@ -81,7 +81,7 @@ test-group = 'ecstore-serial-flaky'
 # The durable ILM decommission regressions build isolated multi-pool stores and
 # deliberately take source or target disks offline while checking fencing.
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page))'
+filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
@@ -197,7 +197,7 @@ filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persi
 test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page))'
+filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
