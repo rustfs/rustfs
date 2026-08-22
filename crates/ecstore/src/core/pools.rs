@@ -3150,6 +3150,8 @@ impl ECStore {
             );
         }
 
+        self.wait_for_decommission_side_effects().await;
+
         if should_save_pool_meta && let Err(err) = self.save_current_pool_meta().await {
             if let Some(previous_pool_meta) = previous_pool_meta {
                 let mut pool_meta = self.pool_meta.write().await;
@@ -3175,7 +3177,6 @@ impl ECStore {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "clear decommission")?;
         let _start_guard = self.start_gate.lock().await;
 
-        let _start_guard = self.start_gate.lock().await;
         {
             let pool_meta = self.pool_meta.read().await;
             let pool_count = pool_meta.pools.len();
@@ -3190,10 +3191,7 @@ impl ECStore {
                 .unwrap_or((false, false, false, false));
             ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled)?;
         }
-        {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
-        }
+        self.cancel_decommission_routines_and_wait(&[idx]).await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
@@ -3208,11 +3206,6 @@ impl ECStore {
                 rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
             }
             return Err(err);
-        }
-
-        {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
@@ -3312,16 +3305,18 @@ impl ECStore {
     }
 
     async fn cancel_decommission_routines_and_wait(&self, indices: &[usize]) {
-        let canceled_worker = {
+        {
             let mut cancelers = self.decommission_cancelers.write().await;
-            indices.iter().fold(false, |canceled, idx| {
-                canceled | take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), *idx)
-            })
-        };
-        if canceled_worker {
-            let operation_gate = self.ctx.decommission_operation_gate();
-            let _operation_guard = operation_gate.write().await;
+            for idx in indices {
+                take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), *idx);
+            }
         }
+        self.wait_for_decommission_side_effects().await;
+    }
+
+    async fn wait_for_decommission_side_effects(&self) {
+        let operation_gate = self.ctx.decommission_operation_gate();
+        let _operation_guard = operation_gate.write().await;
     }
 
     async fn reserve_decommission_routines(
@@ -5001,6 +4996,8 @@ impl ECStore {
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
         let all_space_infos = self.get_decommission_all_pool_space_infos().await?;
+        self.cancel_decommission_routines_and_wait(&indices).await;
+
         let index_cancelers = if let Some((rx, local_indices)) = reservation {
             // Lock order matches terminal transitions: decommission_cancelers
             // before pool_meta while start_gate excludes another start.
@@ -5014,8 +5011,6 @@ impl ECStore {
             ensure_decommission_start_target_capacity(&pool_meta, &indices, &all_space_infos)?;
             Vec::new()
         };
-
-        self.cancel_decommission_routines_and_wait(&indices).await;
 
         let mut space_infos = Vec::with_capacity(indices.len());
         for (idx, pi) in all_space_infos.iter().copied() {
@@ -6922,6 +6917,29 @@ mod pools_tests {
         .await;
         assert!(matches!(result, Err(Error::OperationCanceled)));
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_decommission_transition_waits_without_registered_canceler() {
+        let store = decommission_worker_test_store(PoolMeta::default(), vec![None]);
+        let operation_gate = store.ctx.decommission_operation_gate();
+        let operation_guard = operation_gate.read().await;
+        let transition = tokio::spawn({
+            let store = store.clone();
+            async move { store.cancel_decommission_routines_and_wait(&[0]).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !transition.is_finished(),
+            "a transition must wait for an in-flight side effect even after its canceler slot is gone"
+        );
+
+        drop(operation_guard);
+        tokio::time::timeout(StdDuration::from_secs(1), transition)
+            .await
+            .expect("transition should finish after the side effect")
+            .expect("transition task should not panic");
     }
 
     #[tokio::test(start_paused = true)]
