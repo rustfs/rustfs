@@ -3470,6 +3470,8 @@ impl ECStore {
     async fn decommission_cancel_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
         let _start_guard = self.start_gate.lock().await;
+        let operation_gate = self.ctx.decommission_operation_gate();
+        let operation_guard = operation_gate.write().await;
 
         // Lock order: decommission_cancelers before pool_meta. Holding both makes
         // owner validation and the terminal transition one atomic operation.
@@ -3528,8 +3530,6 @@ impl ECStore {
             );
         }
 
-        self.wait_for_decommission_side_effects().await;
-
         if should_save_pool_meta && let Err(err) = self.save_current_pool_meta().await {
             if let Some(previous_pool_meta) = previous_pool_meta {
                 let mut pool_meta = self.pool_meta.write().await;
@@ -3537,6 +3537,7 @@ impl ECStore {
             }
             return Err(err);
         }
+        drop(operation_guard);
 
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;

@@ -4616,11 +4616,24 @@ mod tests {
             async move { store.decommission_cancel(0).await }
         });
         assert!(
-            tokio::time::timeout(StdDuration::from_millis(100), &mut cancel)
-                .await
-                .is_err(),
+            tokio::time::timeout(Duration::from_millis(100), &mut cancel).await.is_err(),
             "cancel must wait for the final sweep source cleanup"
         );
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let decommission = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission state should remain present");
+            assert!(
+                !decommission.canceled,
+                "cancel must not publish terminal state before the final sweep drains"
+            );
+            assert!(
+                decommission.start_time.is_some(),
+                "cancel must preserve the run identity until the final sweep drains"
+            );
+        }
 
         barrier.release();
         final_sweep
@@ -4631,12 +4644,13 @@ mod tests {
             .await
             .expect("cancel task should not panic")
             .expect("cancel should complete after the final sweep releases the operation gate");
-        assert!(
-            store.pool_meta.read().await.pools[0]
-                .decommission
-                .as_ref()
-                .is_some_and(|info| info.canceled)
-        );
+        let pool_meta = store.pool_meta.read().await;
+        let decommission = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission state should remain present");
+        assert!(decommission.canceled);
+        assert!(decommission.start_time.is_none());
     }
 
     #[cfg(feature = "test-util")]
