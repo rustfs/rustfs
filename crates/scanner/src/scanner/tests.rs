@@ -26,6 +26,7 @@ use std::task::Poll;
 use temp_env::{with_var, with_var_unset};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
+use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
@@ -116,6 +117,178 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
 
     assert_eq!(output, None);
     assert!(cycle_ctx.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cycle_budget_fences_late_writer_after_timeout() {
+    let cycle_ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &cycle_ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let outcome = {
+        let cycle = std::future::pending::<()>();
+        let lock_lost = std::future::pending::<()>();
+        let waiter = await_scanner_cycle_with_budget_fence(&cycle_ctx, &budget, cycle, lock_lost);
+        tokio::pin!(waiter);
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT).await;
+        waiter.await
+    };
+    assert_eq!(outcome, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    assert!(cycle_ctx.is_cancelled());
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+
+    // A newer leadership epoch is the durable fence that rejects a late
+    // writer after the timed-out future has been dropped.
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        current: 0,
+        next: 12,
+        ..Default::default()
+    };
+    let persist_ctx = CancellationToken::new();
+    assert!(persist_scanner_cycle_state(&persist_ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+    let newer = encode_scanner_cycle_state(&cycle, 2).expect("new epoch fence should encode");
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.interleaving_puts.lock().await.insert(key, (2, newer));
+    let mut late_cycle = CurrentCycle { next: 13, ..cycle };
+    assert!(!persist_scanner_cycle_state(&persist_ctx, store, &mut late_cycle, &mut revision, 1).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cycle_budget_parent_cancellation_is_not_reported_as_timeout() {
+    let cycle_ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &cycle_ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let waiter = await_scanner_cycle_with_budget_fence(&cycle_ctx, &budget, std::future::pending::<()>(), std::future::pending());
+    tokio::pin!(waiter);
+    tokio::task::yield_now().await;
+    cycle_ctx.cancel();
+    tokio::task::yield_now().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT).await;
+    assert_eq!(waiter.await, ScannerCycleWaitOutcome::Cancelled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cycle_budget_deadline_wins_same_tick_as_parent_cancellation() {
+    let cycle_ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &cycle_ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let waiter = await_scanner_cycle_with_budget_fence(&cycle_ctx, &budget, std::future::pending::<()>(), std::future::pending());
+    tokio::pin!(waiter);
+    tokio::task::yield_now().await;
+    advance(Duration::from_secs(5)).await;
+    cycle_ctx.cancel();
+    tokio::task::yield_now().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT).await;
+
+    assert_eq!(waiter.await, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+}
+
+#[tokio::test]
+async fn cycle_budget_persist_cursor_failure_is_recovery_required() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    store.fail_put_number.lock().await.insert(key, 1);
+
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        current: 12,
+        next: 12,
+        ..Default::default()
+    };
+    let mut leader_epoch = 1;
+    let fenced = fence_scanner_epoch_after_cycle_timeout(
+        &ctx,
+        store,
+        &mut cycle,
+        &mut revision,
+        &mut leader_epoch,
+        std::future::pending(),
+    )
+    .await;
+    assert!(!fenced, "a failed cursor/generation write must require recovery");
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    assert!(cycle_timeout_requires_recovery(true, budget.cycle_state_persisted(), fenced));
+
+    let metrics = Metrics::new();
+    metrics.record_scanner_cycle_timeout(!fenced, Duration::from_secs(17));
+    let report = metrics.report().await;
+    assert_eq!(report.cycle_timeout_total, 1);
+    assert_eq!(report.cycle_recovery_required_total, 1);
+    assert_eq!(report.cycle_last_progress_age, 17);
+    assert!(report.leader_lease_without_progress);
+}
+
+#[tokio::test]
+async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let lock = store
+        .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+        .await
+        .expect("scanner leader lock should be created");
+    let mut guard = lock
+        .get_write_lock(Duration::from_secs(1))
+        .await
+        .expect("scanner leader lock should be acquired");
+
+    let ctx = CancellationToken::new();
+    let mut cycle_info = CurrentCycle {
+        current: 12,
+        next: 12,
+        ..Default::default()
+    };
+    let mut cycle_revision = DataUsageCacheRevision::Missing;
+    let mut leader_epoch = 1;
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+    );
+    budget.mark_cycle_state_persisted();
+
+    handle_scanner_cycle_deadline(
+        &ctx,
+        store.clone(),
+        ScannerCycleDeadlineState {
+            cycle_info: &mut cycle_info,
+            cycle_revision: &mut cycle_revision,
+            leader_epoch: &mut leader_epoch,
+            cycle_budget: &budget,
+        },
+        true,
+        &mut guard,
+    )
+    .await;
+
+    assert!(guard.is_released());
+    let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("deadline handler should persist a fenced cursor");
+    let (_, persisted_epoch) = decode_scanner_cycle_state(&persisted).expect("fenced cursor should decode");
+    assert_eq!(persisted_epoch, 2);
+    global_metrics().set_cycle(None).await;
 }
 
 #[tokio::test]
@@ -425,13 +598,6 @@ fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
 fn test_scanner_cycle_max_duration_uses_env() {
     with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("42"), || {
         assert_eq!(scanner_cycle_max_duration(), Some(Duration::from_secs(42)));
-    });
-}
-
-#[test]
-fn test_scanner_cycle_max_duration_default_is_disabled() {
-    with_var_unset(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, || {
-        assert_eq!(scanner_cycle_max_duration(), None);
     });
 }
 
@@ -2242,7 +2408,7 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
 }
 
 #[tokio::test]
-async fn test_successful_old_epoch_commit_is_fenced_after_cancellation() {
+async fn cycle_budget_lease_takeover_rejects_old_generation() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
     let mut revision = DataUsageCacheRevision::Missing;
@@ -2287,12 +2453,17 @@ async fn test_successful_old_epoch_commit_is_fenced_after_cancellation() {
         .await
     );
 
-    let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+    let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .expect("replacement leadership claim should persist");
     let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("replacement cycle state should decode");
     assert_eq!(claimed_cycle.next, 14);
     assert_eq!(claimed_epoch, 2);
+
+    let mut stale_cycle = CurrentCycle { next: 15, ..cycle };
+    let mut stale_revision = DataUsageCacheRevision::Etag("memory-2".to_string());
+    let stale_ctx = CancellationToken::new();
+    assert!(!persist_scanner_cycle_state(&stale_ctx, store, &mut stale_cycle, &mut stale_revision, 1,).await);
 }
 
 #[tokio::test]

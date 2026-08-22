@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_data_usage::{ReplicationAllStats, ReplicationStats};
+use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32]);
 
@@ -271,7 +271,7 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
         replication_stats: Some(ReplicationAllStats {
             targets: HashMap::from([(
                 "arn:target".to_string(),
-                ReplicationStats {
+                ReplicationTargetUsage {
                     replicated_size: 2048,
                     replicated_count: 2,
                     ..Default::default()

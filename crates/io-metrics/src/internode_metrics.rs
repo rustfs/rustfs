@@ -54,6 +54,13 @@ pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "read_versio
 pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "read_version_response_msgpack_encode";
 pub const INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP: &str = "read_version_rpc_roundtrip";
 pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE: &str = "read_version_response_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE: &str = "batch_read_version_request_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE: &str = "batch_read_version_request_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ: &str = "batch_read_version_disk_read";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "batch_read_version_response_json_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "batch_read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP: &str = "batch_read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE: &str = "batch_read_version_response_decode";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";

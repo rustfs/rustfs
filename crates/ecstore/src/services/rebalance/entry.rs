@@ -334,6 +334,7 @@ impl ECStore {
                             lifecycle_guard: bucket_incarnation_fence
                                 .as_ref()
                                 .and_then(|guard| guard.namespace_lock_guard()),
+                            ..Default::default()
                         },
                         "rebalance",
                     ),
