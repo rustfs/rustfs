@@ -1045,19 +1045,141 @@ async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_curs
 }
 
 #[tokio::test]
+async fn full_rescan_reset_ignores_epoch_from_malformed_future_primary() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let mut future_primary = vec![0; 24];
+    future_primary[8..16].copy_from_slice(b"RSCY9999");
+    future_primary[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), future_primary)
+        .await
+        .expect("future cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), br#"{not-json"#.to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("full-rescan reset should recover malformed future state");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (_, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(leader_epoch, 1, "invalid persisted bytes must not raise the recovery epoch");
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn ecstore_exact_recovery_marker_delete_honors_etag() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"marker-v1".to_vec())
+        .await
+        .expect("initial recovery marker should be persisted");
+    let (_, stale_revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+        .await
+        .expect("initial marker revision should load");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"marker-v2".to_vec())
+        .await
+        .expect("replacement recovery marker should be persisted");
+
+    let delete_result = store
+        .delete_config_object(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+            ObjectOptions {
+                http_preconditions: Some(stale_revision.preconditions()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(delete_result, Err(EcstoreError::PreconditionFailed)));
+    assert_eq!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+            .await
+            .expect("replacement marker should remain durable"),
+        b"marker-v2"
+    );
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rejects_corrupt_primary_under_stale_blocked_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let corrupt_primary = vec![0xff, 0x00, 0x01];
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), corrupt_primary.clone())
+        .await
+        .expect("corrupt cycle state should be persisted");
+    let (_, primary_revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("primary revision should load");
+    let marker = ScannerCycleRecoveryMarker {
+        schema_version: 1,
+        primary_revision: "memory-stale".to_string(),
+        generation: 1,
+        leader_epoch: 1,
+        classification: "corrupt".to_string(),
+        first_detected_at_unix_secs: 1,
+        last_attempt_at_unix_secs: 2,
+        retry_count: 1,
+        reason: "blocked primary changed".to_string(),
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: DATA_USAGE_BLOOM_RECOVERY_PATH.clone(),
+        state: "blocked".to_string(),
+    };
+    let marker_data = serde_json::to_vec(&marker).expect("blocked marker should encode");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), marker_data.clone())
+        .await
+        .expect("blocked marker should be persisted");
+
+    assert!(
+        reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+            .await
+            .is_err(),
+        "a strict marker must fail closed when its primary revision changed"
+    );
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("primary should remain readable"),
+        corrupt_primary
+    );
+    assert_eq!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+            .await
+            .expect("blocked marker should remain durable"),
+        marker_data
+    );
+    assert!(!matches!(primary_revision, DataUsageCacheRevision::Missing));
+}
+
+#[tokio::test]
 async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let primary = CurrentCycle {
         next: 42,
         ..Default::default()
     };
-    save_config(
-        store.clone(),
-        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
-        encode_scanner_cycle_state(&primary, 7).expect("valid cycle state should encode"),
-    )
-    .await
-    .expect("valid cycle state should be persisted");
+    let old_primary_data = encode_scanner_cycle_state(&primary, 7).expect("valid cycle state should encode");
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), old_primary_data.clone())
+        .await
+        .expect("valid cycle state should be persisted");
+    let (_, old_primary_revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("primary state revision should load");
+    let old_usage = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(41),
+        ..Default::default()
+    };
+    let old_usage_data = serde_json::to_vec(&old_usage).expect("usage snapshot should encode");
+    save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), old_usage_data.clone())
+        .await
+        .expect("usage snapshot should be persisted");
+    let (_, old_usage_revision) = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("usage snapshot revision should load");
     save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
         .await
         .expect("malformed marker should be persisted");
@@ -1071,7 +1193,252 @@ async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
         .expect("valid primary should remain durable");
     let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("primary cycle state should decode");
     assert_eq!(cycle.next, 42, "reset must not regress an independently fenced primary");
-    assert_eq!(leader_epoch, 7);
+    assert_eq!(leader_epoch, 8, "reset must advance the preserved primary epoch");
+    let stale_primary_save = save_config_with_preconditions(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        old_primary_data,
+        old_primary_revision.preconditions(),
+    )
+    .await;
+    assert!(matches!(stale_primary_save, Err(EcstoreError::PreconditionFailed)));
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("usage epoch fence should remain durable");
+    assert_eq!(
+        serde_json::from_slice::<DataUsageInfo>(&usage)
+            .expect("fenced usage should decode")
+            .scanner_epoch,
+        Some(8)
+    );
+    let stale_save = save_config_with_preconditions(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        old_usage_data,
+        old_usage_revision.preconditions(),
+    )
+    .await;
+    assert!(matches!(stale_save, Err(EcstoreError::PreconditionFailed)));
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_resumes_cleanup_pending_preserved_primary() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let completed_at = Utc::now();
+    let primary = CurrentCycle {
+        current: 3,
+        next: 42,
+        cycle_completed: vec![completed_at],
+        started: completed_at,
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        encode_scanner_cycle_state(&primary, 7).expect("valid cycle state should encode"),
+    )
+    .await
+    .expect("valid cycle state should be persisted");
+    let usage = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(41),
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+    )
+    .await
+    .expect("usage snapshot should be persisted");
+    let marker = ScannerCycleRecoveryMarker {
+        schema_version: 1,
+        primary_revision: "memory-old".to_string(),
+        generation: 41,
+        leader_epoch: 7,
+        classification: "corrupt".to_string(),
+        first_detected_at_unix_secs: 1,
+        last_attempt_at_unix_secs: 2,
+        retry_count: 1,
+        reason: "reset in progress".to_string(),
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: DATA_USAGE_BLOOM_RECOVERY_PATH.clone(),
+        state: "cleanup-pending".to_string(),
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("marker should encode"),
+    )
+    .await
+    .expect("cleanup marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("reset should resume a cleanup-pending preserved primary");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("preserved cycle state should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("cycle state should decode");
+    assert_eq!(cycle.current, 3, "cleanup retry must preserve the in-progress cursor");
+    assert_eq!(cycle.next, 42);
+    assert_eq!(cycle.cycle_completed, vec![completed_at]);
+    assert_eq!(cycle.started, completed_at);
+    assert_eq!(leader_epoch, 8);
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("usage epoch fence should remain durable");
+    assert_eq!(
+        serde_json::from_slice::<DataUsageInfo>(&usage)
+            .expect("usage should decode")
+            .scanner_epoch,
+        Some(8)
+    );
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rebuilds_oversized_regular_primary_with_malformed_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0; 1024 * 1024 + 1])
+        .await
+        .expect("oversized cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("explicit full-rescan reset should replace an oversized regular primary");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(cycle.next, 0);
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rebuilds_oversized_primary_after_cleanup_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0; 1024 * 1024 + 1])
+        .await
+        .expect("oversized cycle state should be persisted");
+    let (_, primary_revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("primary revision should load");
+    let marker = ScannerCycleRecoveryMarker {
+        schema_version: 1,
+        primary_revision: match primary_revision {
+            DataUsageCacheRevision::Etag(etag) => etag,
+            DataUsageCacheRevision::Missing => panic!("primary revision should be present"),
+        },
+        generation: 1,
+        leader_epoch: 1,
+        classification: "corrupt".to_string(),
+        first_detected_at_unix_secs: 1,
+        last_attempt_at_unix_secs: 2,
+        retry_count: 1,
+        reason: "reset in progress".to_string(),
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: DATA_USAGE_BLOOM_RECOVERY_PATH.clone(),
+        state: "cleanup-pending".to_string(),
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("cleanup marker should encode"),
+    )
+    .await
+    .expect("cleanup marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("cleanup retry should rebuild an oversized primary");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(cycle.next, 0);
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_keeps_cleanup_marker_when_preserved_epoch_is_exhausted() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let primary = CurrentCycle {
+        next: 42,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        encode_scanner_cycle_state(&primary, u64::MAX).expect("valid cycle state should encode"),
+    )
+    .await
+    .expect("valid cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    assert!(
+        reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+            .await
+            .is_err()
+    );
+
+    let marker = read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+        .await
+        .expect("cleanup marker should remain durable");
+    assert_eq!(
+        serde_json::from_slice::<ScannerCycleRecoveryMarker>(&marker)
+            .expect("cleanup marker should decode")
+            .state,
+        "cleanup-pending"
+    );
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rebuilds_empty_primary_with_malformed_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), Vec::new())
+        .await
+        .expect("empty cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("explicit full-rescan reset should replace an empty primary");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(cycle.next, 0);
+    assert_eq!(leader_epoch, 1);
     assert!(matches!(
         read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
         Err(EcstoreError::ConfigNotFound)
@@ -1207,6 +1574,31 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
     assert_eq!(epoch, 11);
 }
 
+#[tokio::test]
+async fn scanner_usage_floor_ignores_older_backup_after_primary_epoch_fence() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    for (path, epoch, cycle) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), 8, 100), (backup_path.as_str(), 7, 10_000)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&DataUsageInfo {
+                scanner_epoch: Some(epoch),
+                scanner_cycle: Some(cycle),
+                ..Default::default()
+            })
+            .expect("usage snapshot should encode"),
+        );
+    }
+
+    assert_eq!(
+        persisted_usage_floor(store).await.expect("usage floor should load"),
+        PersistedUsageFloor {
+            next_cycle: 101,
+            leader_epoch: 8,
+        }
+    );
+}
+
 #[test]
 fn scanner_startup_treats_incomplete_usage_snapshot_as_cold() {
     let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
@@ -1338,6 +1730,15 @@ async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() 
     );
 
     assert!(persisted_usage_floor(store.clone()).await.is_err());
+
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        br#"{}"#.to_vec(),
+    );
+    assert!(
+        persisted_usage_floor(store.clone()).await.is_err(),
+        "a structurally incomplete usage snapshot must not be treated as an empty floor"
+    );
 
     store.objects.lock().await.insert(
         memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),

@@ -758,37 +758,98 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ) => (None, DataUsageCacheRevision::Missing),
         Err(err) => return Err(ScannerError::Other(format!("failed to inspect scanner cycle state: {err}"))),
     };
-    let marker_guards_primary = marker.state == "cleanup-pending" || marker_matches_revision(&marker, &primary_revision);
-    if !marker_guards_primary && let Some(mut reader) = primary_reader.take() {
+    let marker_cleanup_pending = marker.state == "cleanup-pending";
+    let marker_matches_primary = marker_matches_revision(&marker, &primary_revision);
+    if (marker_cleanup_pending || !marker_matches_primary)
+        && let Some(mut reader) = primary_reader.take()
+    {
         // A newer, independently fenced primary is authoritative. A
         // full-rescan reset must not overwrite that progress; it only
-        // removes the stale recovery marker after validating the state.
+        // removes the stale recovery marker after validating and re-fencing
+        // the state.
         let max_size = i64::try_from(MAX_SCANNER_CYCLE_STATE_BYTES).unwrap_or(i64::MAX);
-        if reader.object_info.is_dir || reader.object_info.size < 0 || reader.object_info.size > max_size {
+        if reader.object_info.is_dir || reader.object_info.size < 0 {
             return Err(ScannerError::Other("scanner cycle state changed since recovery was recorded".to_string()));
         }
-        let data = read_cycle_state_body(&mut reader)
-            .await
-            .map_err(|err| ScannerError::Other(format!("scanner cycle state changed since recovery was recorded: {err}")))?;
-        let primary_is_valid = !data.is_empty() && decode_scanner_cycle_state_for_startup(&data).is_ok();
-        if !primary_is_valid {
-            // An invalid compatibility marker cannot fence a corrupt primary
-            // by revision, so rebuild it from the verified usage floor below.
-            // A strict marker keeps the existing fail-closed behavior for an
-            // unexpected stale-primary mutation.
-            if !force_full_rescan {
-                return Err(ScannerError::Other("scanner cycle state changed since recovery was recorded".to_string()));
-            }
+        let primary_is_oversized = reader.object_info.size > max_size;
+        let primary_state = if primary_is_oversized {
+            None
         } else {
+            match read_cycle_state_body(&mut reader).await {
+                Ok(data) if data.is_empty() => None,
+                Ok(data) => decode_scanner_cycle_state_for_startup(&data).ok(),
+                Err(CycleStateBodyReadError::TooLarge) if force_full_rescan || marker_cleanup_pending => None,
+                Err(err) => {
+                    return Err(ScannerError::Other(format!(
+                        "scanner cycle state changed since recovery was recorded: {err}"
+                    )));
+                }
+            }
+        };
+        if let Some((primary_cycle, primary_epoch)) = primary_state {
+            let (cleanup_marker, cleanup_marker_revision) =
+                mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker.clone(), &marker_revision).await?;
+            set_scanner_cycle_recovery_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending"));
+            let usage_floor = persisted_usage_floor(storeapi.clone()).await?;
+            let fence_epoch = primary_epoch
+                .max(usage_floor.leader_epoch)
+                .checked_add(1)
+                .ok_or_else(|| ScannerError::Other("scanner leader epoch is exhausted".to_string()))?;
+            if guard.is_lock_lost() {
+                return Err(ScannerError::Other(
+                    "scanner leader lock was lost before preserving newer cycle state".to_string(),
+                ));
+            }
+            let preserved_data = encode_scanner_cycle_state(&primary_cycle, fence_epoch)
+                .map_err(|err| ScannerError::Other(format!("failed to encode preserved scanner cycle state: {err}")))?;
+            if u64::try_from(preserved_data.len()).unwrap_or(u64::MAX) > MAX_SCANNER_CYCLE_STATE_BYTES {
+                return Err(ScannerError::Other(
+                    "preserved scanner cycle state exceeds the bounded object size".to_string(),
+                ));
+            }
+            let preserved_info = save_config_with_preconditions(
+                storeapi.clone(),
+                DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+                preserved_data,
+                primary_revision.preconditions(),
+            )
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to fence preserved scanner cycle state: {err}")))?;
+            let preserved_revision = preserved_info
+                .etag
+                .filter(|etag| !etag.is_empty())
+                .map(DataUsageCacheRevision::Etag)
+                .ok_or_else(|| ScannerError::Other("preserved scanner cycle state has no revision".to_string()))?;
+            if guard.is_lock_lost() {
+                return Err(ScannerError::Other(
+                    "scanner leader lock was lost after fencing newer cycle state".to_string(),
+                ));
+            }
+            fence_scanner_usage_epoch(&ctx, storeapi.clone(), fence_epoch)
+                .await
+                .map_err(|err| ScannerError::Other(format!("failed to fence preserved scanner usage epoch: {err}")))?;
+            if guard.is_lock_lost() {
+                return Err(ScannerError::Other(
+                    "scanner leader lock was lost after fencing newer cycle state".to_string(),
+                ));
+            }
+            let current_revision = read_config_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+                .await
+                .map_err(|err| ScannerError::Other(format!("failed to verify preserved scanner cycle state: {err}")))?;
+            if current_revision != preserved_revision {
+                return Err(ScannerError::Other(
+                    "scanner cycle state changed before recovery marker cleanup".to_string(),
+                ));
+            }
             storeapi
                 .delete_config_object(
                     RUSTFS_META_BUCKET,
                     DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
                     ScannerObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
-                        no_lock: true,
-                        http_preconditions: Some(marker_revision.preconditions()),
+                        // This is one exact metadata object. Prefix-delete mode
+                        // bypasses HTTP preconditions in the ECStore path.
+                        delete_prefix: false,
+                        http_preconditions: Some(cleanup_marker_revision.preconditions()),
                         ..Default::default()
                     },
                 )
@@ -797,6 +858,12 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
             super::notify_scanner_cycle_recovery_wake();
             return Ok(());
+        } else if !force_full_rescan && !marker_cleanup_pending {
+            // An invalid compatibility marker cannot fence a corrupt primary
+            // by revision, so rebuild it from the verified usage floor below.
+            // A strict marker keeps the existing fail-closed behavior for an
+            // unexpected stale-primary mutation.
+            return Err(ScannerError::Other("scanner cycle state changed since recovery was recorded".to_string()));
         }
     }
 
@@ -868,23 +935,15 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         return Err(err);
     }
 
-    let current_revision = storeapi
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            DATA_USAGE_BLOOM_NAME_PATH.as_str(),
-            None,
-            http::HeaderMap::new(),
-            &ScannerObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
+    let current_revision = match read_config_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
         .await
         .map_err(|err| ScannerError::Other(format!("failed to verify rebuilt scanner cycle state: {err}")))?
-        .object_info
-        .etag
-        .filter(|etag| !etag.is_empty())
-        .ok_or_else(|| ScannerError::Other("rebuilt scanner cycle state lost its revision".to_string()))?;
+    {
+        DataUsageCacheRevision::Etag(etag) => etag,
+        DataUsageCacheRevision::Missing => {
+            return Err(ScannerError::Other("rebuilt scanner cycle state lost its revision".to_string()));
+        }
+    };
     if current_revision != rebuilt_revision {
         set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
@@ -931,9 +990,9 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             RUSTFS_META_BUCKET,
             DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
             ScannerObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                no_lock: true,
+                // This is one exact metadata object. Prefix-delete mode
+                // bypasses HTTP preconditions in the ECStore path.
+                delete_prefix: false,
                 http_preconditions: Some(marker_revision.preconditions()),
                 ..Default::default()
             },
@@ -1099,7 +1158,7 @@ pub(super) fn advance_scanner_cycle(cycle_info: &mut CurrentCycle) -> Result<(),
 
 pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -> Result<PersistedUsageFloor, ScannerError> {
     let mut floor = PersistedUsageFloor::default();
-    let update_floor = |floor: &mut PersistedUsageFloor, usage: DataUsageInfo, path: &str| -> Result<(), ScannerError> {
+    let update_floor = |floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str| -> Result<(), ScannerError> {
         floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
         if let Some(completed_cycle) = usage.scanner_cycle {
             let next_cycle = completed_cycle
@@ -1112,25 +1171,45 @@ pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -
     };
     for primary_path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
         let backup_path = format!("{primary_path}.bkp");
-        let mut pair_found = false;
-        for path in [primary_path, backup_path.as_str()] {
-            let data = match read_config(storeapi.clone(), path).await {
-                Ok(data) => {
-                    pair_found = true;
-                    data
+        let primary_epoch = match read_config(storeapi.clone(), primary_path).await {
+            Ok(data) => {
+                let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
+                    ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
+                })?;
+                let epoch = usage.scanner_epoch.unwrap_or_default();
+                update_floor(&mut floor, &usage, primary_path)?;
+                Some(epoch)
+            }
+            Err(EcstoreError::ConfigNotFound) => None,
+            Err(err) => {
+                return Err(ScannerError::Other(format!(
+                    "failed to read scanner usage epoch floor from {primary_path}: {err}"
+                )));
+            }
+        };
+        let mut any_found = primary_epoch.is_some();
+        match read_config(storeapi.clone(), &backup_path).await {
+            Ok(data) => {
+                any_found = true;
+                let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
+                    ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
+                })?;
+                let backup_epoch = usage.scanner_epoch.unwrap_or_default();
+                // A backup write from an older leader may complete after the
+                // primary epoch has been fenced. It must not advance the startup
+                // floor unless its epoch is at least as new as the primary.
+                if primary_epoch.is_none_or(|epoch| backup_epoch >= epoch) {
+                    update_floor(&mut floor, &usage, &backup_path)?;
                 }
-                Err(EcstoreError::ConfigNotFound) => continue,
-                Err(err) => {
-                    return Err(ScannerError::Other(format!(
-                        "failed to read scanner usage epoch floor from {path}: {err}"
-                    )));
-                }
-            };
-            let usage = serde_json::from_slice::<DataUsageInfo>(&data)
-                .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage floor from {path}: {err}")))?;
-            update_floor(&mut floor, usage, path)?;
+            }
+            Err(EcstoreError::ConfigNotFound) => {}
+            Err(err) => {
+                return Err(ScannerError::Other(format!(
+                    "failed to read scanner usage epoch floor from {backup_path}: {err}"
+                )));
+            }
         }
-        if pair_found {
+        if any_found {
             break;
         }
     }

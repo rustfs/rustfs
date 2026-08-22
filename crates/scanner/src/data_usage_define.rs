@@ -125,6 +125,34 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     }
 }
 
+/// Read only the object revision without materializing its body.
+pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
+    match store
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            path,
+            None,
+            HeaderMap::new(),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(reader) => reader
+            .object_info
+            .etag
+            .filter(|etag| !etag.is_empty())
+            .map(DataUsageCacheRevision::Etag)
+            .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag"))),
+        Err(Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_)) => {
+            Ok(DataUsageCacheRevision::Missing)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
