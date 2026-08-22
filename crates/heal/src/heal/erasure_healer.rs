@@ -1180,7 +1180,7 @@ impl ErasureSetHealer {
 
                 telemetry_unknown |= !increment_counter(processed_objects);
                 completed_in_page += 1;
-                let progress_unknown = {
+                let (progress_unknown, skipped_new_versions, skipped_ilm_expired) = {
                     let mut progress = self.progress.write().await;
                     progress.set_current_object(Some(format!("{bucket}/{object}")));
                     progress.update_object_progress(
@@ -1193,7 +1193,7 @@ impl ErasureSetHealer {
                     if telemetry_unknown {
                         progress.mark_unknown();
                     }
-                    progress.counter_unknown
+                    (progress.counter_unknown, progress.skipped_new_versions, progress.skipped_ilm_expired)
                 };
                 checkpoint_manager
                     .record_object_outcome(
@@ -1203,8 +1203,8 @@ impl ErasureSetHealer {
                         *failed_objects,
                         *skipped_objects,
                         bytes_processed,
-                        0,
-                        0,
+                        skipped_new_versions,
+                        skipped_ilm_expired,
                         telemetry_unknown || progress_unknown,
                     )
                     .await?;

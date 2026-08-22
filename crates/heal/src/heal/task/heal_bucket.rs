@@ -290,14 +290,12 @@ impl HealTask {
                     self.check_control_flags().await?;
                     let mut telemetry_unknown = false;
                     let object = item.name.as_str();
-                    if retry_attempt == 0 {
-                        telemetry_unknown |= !increment_counter(&mut scanned);
-                    }
                     {
                         let mut progress = self.progress.write().await;
                         progress.set_current_object(Some(format!("{bucket}/{object}")));
                     }
 
+                    let mut terminal_outcome = true;
                     let error = match self
                         .await_with_control(
                             self.storage
@@ -345,6 +343,7 @@ impl HealTask {
                                 "Heal bucket object repair skipped due to transient metadata error"
                             );
                         } else if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
+                            terminal_outcome = false;
                             debug!(
                                 target: "rustfs::heal::task",
                                 event = EVENT_HEAL_BUCKET_RESULT,
@@ -384,6 +383,14 @@ impl HealTask {
                                 );
                             }
                         }
+                    }
+
+                    if terminal_outcome {
+                        telemetry_unknown |= !increment_counter(&mut scanned);
+                    }
+
+                    if !terminal_outcome {
+                        continue;
                     }
 
                     let mut progress = self.progress.write().await;
