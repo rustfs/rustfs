@@ -195,6 +195,7 @@ pub struct BucketPolicyArgs<'a> {
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct BucketPolicy {
+    // RUSTFS_COMPAT_TODO(rustfs-6339): accept bucket policies persisted with the legacy "ID" key. Remove after migration tooling rewrites every retained legacy bucket policy.
     #[serde(default, rename = "Id", alias = "ID", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
