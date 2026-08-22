@@ -245,6 +245,18 @@ impl TestECStoreEnvBuilder {
             .await
             .expect("build test ECStore");
 
+        // The production bootstrap only persists pool.bin from the elected
+        // first cluster node.  Test stores intentionally have no cluster
+        // election, but heal-format still requires that durable fence before
+        // it can write any disk format.  Materialize the validated topology
+        // here so the shared fixture models a ready single-node store.
+        let mut pool_meta = ecstore.pool_meta.read().await.clone();
+        pool_meta.dont_save = false;
+        pool_meta
+            .save(ecstore.pools.clone())
+            .await
+            .expect("persist test pool metadata");
+
         if self.init_bucket_metadata {
             let buckets_list = ecstore
                 .list_bucket(&BucketOptions {
