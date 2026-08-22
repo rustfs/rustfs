@@ -1842,6 +1842,27 @@ async fn deleted_checkpoint_is_not_recreated_by_an_old_manager() {
     temp_dir.close().expect("remove deleted checkpoint test directory");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn checkpoint_cleanup_leaves_no_task_specific_lock_artifact() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint manager");
+    let lock_path = Path::new(BUCKET_META_PREFIX)
+        .join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"))
+        .with_extension("rustfs-cas.lock");
+    let lock_path = temp_dir.path().join(RUSTFS_META_BUCKET).join(lock_path);
+
+    manager.cleanup().await.expect("delete checkpoint fixture");
+
+    assert!(
+        !lock_path.exists(),
+        "successful checkpoint cleanup must not leave a task-specific lock artifact"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_blocked_marker_still_blocks_resume_selection() {
     let (temp_dir, disk) = schema_test_disk().await;
