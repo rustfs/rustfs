@@ -25,7 +25,10 @@ use lazy_static::lazy_static;
 use rustfs_lock::client::LockClient;
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 use tokio::sync::{OnceCell, RwLock};
@@ -36,6 +39,16 @@ pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
 pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
+
+static GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_get_metadata_read_version_coalescing_service_ready() {
+    GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY.store(true, Ordering::Release);
+}
+
+pub(crate) fn get_metadata_read_version_coalescing_service_ready() -> bool {
+    GET_METADATA_READ_VERSION_COALESCING_SERVICE_READY.load(Ordering::Acquire)
+}
 
 // Global singletons for backward compatibility with MinIO port.
 // These should be migrated to AppContext over time.

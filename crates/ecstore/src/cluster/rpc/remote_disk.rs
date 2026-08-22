@@ -42,8 +42,9 @@ use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE,
-    INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
+    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
 };
 use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
@@ -98,6 +99,7 @@ const NS_SCANNER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
 const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
 const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
+const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE";
 const BATCH_METADATA_RPC_OFF: &str = "off";
 const BATCH_METADATA_RPC_AUTO: &str = "auto";
 const BATCH_METADATA_RPC_ON: &str = "on";
@@ -202,7 +204,8 @@ fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
 }
 
 fn batch_metadata_rpc_mode_from_env() -> BatchMetadataRpcMode {
-    rustfs_utils::get_env_opt_str(ENV_RUSTFS_METADATA_BATCH_READ)
+    rustfs_utils::get_env_opt_str(ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE)
+        .or_else(|| rustfs_utils::get_env_opt_str(ENV_RUSTFS_METADATA_BATCH_READ))
         .or_else(|| rustfs_utils::get_env_opt_str(LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC))
         .as_deref()
         .map(parse_batch_metadata_rpc_mode)
@@ -1828,6 +1831,12 @@ fn record_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
     }
 }
 
+fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_stage(stage, started_at.elapsed());
+    }
+}
+
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
 /// and falling back to the JSON compatibility strings. Used to size the RPC for the payload
 /// histogram / large-payload alerting (grpc-optimization P0 instrumentation).
@@ -1936,6 +1945,27 @@ fn decode_batch_read_version_response_items(
     }
 
     Ok(batch_read_version_resps)
+}
+
+fn batch_read_version_request_payload_len(req: &BatchReadVersionReq, req_json: &str, req_bin: &[u8]) -> usize {
+    req.items
+        .iter()
+        .fold(req_json.len().saturating_add(req_bin.len()), |total, item| {
+            total
+                .saturating_add(item.org_volume.len())
+                .saturating_add(item.volume.len())
+                .saturating_add(item.path.len())
+                .saturating_add(item.version_id.len())
+        })
+}
+
+fn batch_read_version_response_payload_len(response: &BatchReadVersionResponse) -> usize {
+    response
+        .batch_read_version_resps
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(response.batch_read_version_resps_bin.iter().map(Bytes::len).sum::<usize>())
 }
 
 fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
@@ -2839,14 +2869,19 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
+        let batch_read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let encode_started = read_version_stage_timer(batch_read_version_attribution_enabled);
         let batch_read_version_req = compat_json(&req)?;
         let batch_read_version_req_bin = encode_msgpack(&req)?;
-
+        record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, encode_started);
+        let request_payload_bytes = batch_read_version_attribution_enabled
+            .then(|| batch_read_version_request_payload_len(&req, &batch_read_version_req, &batch_read_version_req_bin));
         let batch_result = self
             .execute_with_timeout_for_op(
                 "batch_read_version",
                 move || async move {
                     let disk = self.disk_ref().await;
+                    let disk_len = disk.len();
                     let mut client = self
                         .get_bulk_client()
                         .await
@@ -2857,9 +2892,20 @@ impl DiskAPI for RemoteDisk {
                         batch_read_version_req_bin: batch_read_version_req_bin.into(),
                     });
 
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request();
+                    if let Some(request_payload_bytes) = request_payload_bytes {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_sent_bytes(
+                            request_payload_bytes.saturating_add(disk_len),
+                        );
+                    }
+                    let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
                     let response = match client.batch_read_version(request).await {
-                        Ok(response) => response.into_inner(),
+                        Ok(response) => {
+                            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
+                            response.into_inner()
+                        }
                         Err(status) if status.code() == Code::Unimplemented => {
+                            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
                             if mode.should_fallback_on_unimplemented() {
                                 record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED);
                                 warn!(
@@ -2876,6 +2922,7 @@ impl DiskAPI for RemoteDisk {
                             }
 
                             record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK);
+                            crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_error();
                             warn!(
                                 event = EVENT_REMOTE_DISK_RPC,
                                 component = LOG_COMPONENT_ECSTORE,
@@ -2888,14 +2935,33 @@ impl DiskAPI for RemoteDisk {
                             );
                             return Err(Error::from(status));
                         }
-                        Err(status) => return Err(Error::from(status)),
+                        Err(status) => {
+                            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
+                            crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_error();
+                            return Err(Error::from(status));
+                        }
                     };
 
                     if !response.success {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_error();
                         return Err(response.error.unwrap_or_default().into());
                     }
 
-                    decode_batch_read_version_response_items(response, &self.endpoint).map(Some)
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_recv_bytes(
+                        batch_read_version_response_payload_len(&response),
+                    );
+                    let decode_started = read_version_stage_timer(batch_read_version_attribution_enabled);
+                    match decode_batch_read_version_response_items(response, &self.endpoint) {
+                        Ok(batch_read_version_resps) => {
+                            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE, decode_started);
+                            Ok(Some(batch_read_version_resps))
+                        }
+                        Err(err) => {
+                            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE, decode_started);
+                            crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_error();
+                            Err(err)
+                        }
+                    }
                 },
                 get_max_timeout_duration(),
             )
@@ -4643,6 +4709,7 @@ mod tests {
             } else {
                 "file version not found".to_string()
             },
+            error_code: if success { 0 } else { DiskError::FileVersionNotFound.to_u32() },
         }
     }
 
@@ -4762,6 +4829,7 @@ mod tests {
     fn batch_metadata_rpc_mode_uses_documented_env_before_legacy_alias() {
         temp_env::with_vars(
             [
+                (ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE, None::<&str>),
                 (ENV_RUSTFS_METADATA_BATCH_READ, Some("auto")),
                 (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
             ],
@@ -4772,9 +4840,24 @@ mod tests {
     }
 
     #[test]
+    fn batch_metadata_rpc_mode_uses_get_coalescer_env_before_batch_env() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE, Some("on")),
+                (ENV_RUSTFS_METADATA_BATCH_READ, Some("off")),
+                (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("off")),
+            ],
+            || {
+                assert_eq!(batch_metadata_rpc_mode_from_env(), BatchMetadataRpcMode::On);
+            },
+        );
+    }
+
+    #[test]
     fn batch_metadata_rpc_mode_falls_back_to_legacy_env_alias() {
         temp_env::with_vars(
             [
+                (ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE, None::<&str>),
                 (ENV_RUSTFS_METADATA_BATCH_READ, None::<&str>),
                 (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
             ],
