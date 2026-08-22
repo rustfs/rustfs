@@ -16,7 +16,8 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
+    get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -107,6 +108,8 @@ pub struct AdminPoolDecommissionInfo {
     pub bytes_failed: usize,
     #[serde(rename = "waitingReason")]
     pub waiting_reason: Option<String>,
+    #[serde(rename = "unresolvedEntries", skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -619,6 +622,7 @@ impl DefaultAdminUsecase {
             bytes_done: info.bytes_done,
             bytes_failed: info.bytes_failed,
             waiting_reason,
+            unresolved_entries: info.unresolved_entries,
         }
     }
 
@@ -676,7 +680,7 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::admin_usecase::capacity::{PoolDecommissionInfo, PoolStatus};
+    use super::super::storage_api::admin_usecase::capacity::{DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
     use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
@@ -987,6 +991,17 @@ mod tests {
                     items_decommission_failed: 1,
                     bytes_done: 1024,
                     bytes_failed: 64,
+                    unresolved_entries: vec![DecommissionUnresolvedEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "prefix/unresolved.txt".to_string(),
+                        pool_index: 3,
+                        set_index: 1,
+                        source_generation: OffsetDateTime::UNIX_EPOCH,
+                        candidate_count: 2,
+                        disk_error_count: 1,
+                        observed_at: OffsetDateTime::UNIX_EPOCH,
+                        reason: "metadata_resolution_failed".to_string(),
+                    }],
                     ..Default::default()
                 }),
             },
@@ -1010,6 +1025,13 @@ mod tests {
         assert_eq!(value["decommissionInfo"]["objectsDecommissionedFailed"], 1);
         assert_eq!(value["decommissionInfo"]["bytesDecommissioned"], 1024);
         assert_eq!(value["decommissionInfo"]["bytesDecommissionedFailed"], 64);
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["bucket"], "bucket-a");
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["object"], "prefix/unresolved.txt");
+        assert_eq!(
+            value["decommissionInfo"]["unresolvedEntries"][0]["sourceGeneration"],
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["reason"], "metadata_resolution_failed");
         assert_eq!(value["decommissionInfo"]["waitingReason"], "queued");
     }
 
