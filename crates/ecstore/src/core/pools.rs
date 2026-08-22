@@ -5143,6 +5143,9 @@ impl ECStore {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
 
+        self.ensure_decommission_multipart_uploads_drained(idx, &pool, &buckets)
+            .await?;
+
         for (set_index, set) in pool.disk_set.iter().enumerate() {
             for bucket_info in &buckets {
                 let mut lifecycle_config = None;
@@ -5254,6 +5257,49 @@ impl ECStore {
         }
 
         Ok(())
+    }
+
+    async fn ensure_decommission_multipart_uploads_drained(
+        &self,
+        idx: usize,
+        pool: &Sets,
+        buckets: &[DecomBucketInfo],
+    ) -> Result<()> {
+        let mut bucket_names = buckets
+            .iter()
+            .filter(|bucket| bucket.name != RUSTFS_META_BUCKET)
+            .map(|bucket| bucket.name.as_str())
+            .collect::<Vec<_>>();
+        bucket_names.sort_unstable();
+        bucket_names.dedup();
+
+        // Take one bucket fence at a time so cross-bucket COPY cannot form an
+        // ABBA cycle. Suspension prevents new source uploads after each fence.
+        for bucket in bucket_names {
+            let lifecycle_guard = self.acquire_bucket_lifecycle_write_lock(bucket).await?;
+            if lifecycle_guard.is_lock_lost() {
+                return Err(Error::other(format!(
+                    "decommission multipart drain lost the bucket lifecycle fence for `{bucket}`"
+                )));
+            }
+            for set in &pool.disk_set {
+                if let Some(upload_path) = set.first_multipart_upload_path_for_decommission(bucket).await? {
+                    return Err(Error::other(format!(
+                        "pool {idx} still contains multipart upload `{upload_path}` for bucket `{bucket}`; resolve it before retrying decommission"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ensure_decommission_multipart_uploads_drained_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
+        let buckets = self.get_buckets_to_decommission().await?;
+        let pool = self.pools[idx].clone();
+        self.ensure_decommission_multipart_uploads_drained(idx, pool.as_ref(), &buckets)
+            .await
     }
 
     #[tracing::instrument(skip(self, rd))]
