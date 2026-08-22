@@ -4819,7 +4819,8 @@ impl ECStore {
         pool: Arc<Sets>,
         bucket: DecomBucketInfo,
     ) -> Result<()> {
-        self.decommission_pool(rx, idx, pool, bucket).await
+        self.decommission_pool(rx, idx, pool, bucket, Arc::new(Semaphore::new(decommission_entry_concurrency_limit())))
+            .await
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -4987,7 +4988,13 @@ impl ECStore {
                     state = "verifying_completion",
                     "Decommission completion verification started"
                 );
-                if let Err(err) = self.check_after_decommission(idx).await {
+                self.ensure_decommission_generation_current(idx, generation).await?;
+                let operation_gate = self.ctx.decommission_operation_gate();
+                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || self.check_after_decommission(idx)).await
+                {
+                    if is_err_operation_canceled(&err) {
+                        return Err(err);
+                    }
                     resolve_decommission_terminal_mark_result(
                         self.decommission_failed_for_operation(idx, canceler).await,
                         "failed",
