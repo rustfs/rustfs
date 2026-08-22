@@ -46,10 +46,9 @@ lists when upstream changes.
   the PR.
 - **Weekly + manual**: `.github/workflows/e2e-s3tests.yml` runs the full
   upstream suite (`TEST_SCOPE=all`) against a Docker deployment (single node
-  or a 4-node distributed cluster behind HAProxy). It fails only on
-  regressions in the implemented whitelist and publishes a classification
-  report (`compat-report.md`, also shown in the job summary) listing promotion
-  candidates and unclassified tests.
+  or a 4-node distributed cluster behind HAProxy). The canonical gate policy
+  and compatibility-report behavior are documented in
+  [`scripts/s3-tests/README.md`](../../scripts/s3-tests/README.md).
 
 ## Running Tests Locally
 

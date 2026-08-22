@@ -20,6 +20,8 @@ DATA_DIR="$TARGET_DIR/rustfs_test_data"
 RUSTFS_PID=""
 TEST_FILTER=""
 TEST_TYPE="all"
+RUSTFS_BUILD_FEATURES="${RUSTFS_BUILD_FEATURES:-ftps,webdav,sftp}"
+export RUSTFS_BUILD_FEATURES
 
 # Function to print colored output
 print_info() {
@@ -92,7 +94,7 @@ build_rustfs() {
     print_info "Building RustFS..."
     cd "$PROJECT_ROOT"
     
-    if ! cargo build --bin rustfs; then
+    if ! cargo build --bin rustfs --features "$RUSTFS_BUILD_FEATURES"; then
         print_error "Failed to build RustFS"
         exit 1
     fi
@@ -219,27 +221,28 @@ start_rustfs() {
 run_tests() {
     print_info "Running e2e tests..."
     cd "$PROJECT_ROOT"
-    
-    local test_cmd="cargo test --package e2e_test --lib"
-    
+
+    local test_cmd=(cargo test --package e2e_test --lib)
+
     case "$TEST_TYPE" in
         "specific")
-            test_cmd="$test_cmd -- $TEST_FILTER --exact --show-output --ignored"
+            test_cmd+=(-- "$TEST_FILTER")
             print_info "Running specific test: $TEST_FILTER"
             ;;
         "file")
-            test_cmd="$test_cmd -- $TEST_FILTER --show-output --ignored"
+            test_cmd+=(-- "$TEST_FILTER")
             print_info "Running tests in file/module: $TEST_FILTER"
             ;;
         "all")
-            test_cmd="$test_cmd -- --show-output --ignored"
+            test_cmd+=(--)
             print_info "Running all e2e tests"
             ;;
     esac
-    
-    print_info "Test command: $test_cmd"
-    
-    if eval "$test_cmd"; then
+    test_cmd+=(--show-output --include-ignored --test-threads=1)
+
+    print_info "Test command: ${test_cmd[*]}"
+
+    if "${test_cmd[@]}"; then
         print_success "All tests passed!"
         return 0
     else

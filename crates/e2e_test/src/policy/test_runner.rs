@@ -14,7 +14,6 @@
 
 use crate::common::init_logging;
 use crate::policy::test_env::PolicyTestEnvironment;
-use serial_test::serial;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
@@ -213,7 +212,6 @@ impl PolicyTestSuite {
 
 /// Test suite
 #[tokio::test]
-#[serial]
 #[ignore = "Connects to existing rustfs server"]
 async fn test_policy_critical_suite() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = TestSuiteConfig {

@@ -21,14 +21,17 @@ Classifies every executed test into:
   - unclassified passes:    passed but not present in any list (new upstream tests)
   - unclassified failures:  failed and not present in any list (new upstream tests)
 
-Writes a markdown report and prints a summary to stdout. Exit code is 0 unless
---fail-on-regression is given and at least one regression was found.
+Writes a markdown report and prints a summary to stdout. Optional gates reject
+regressions, unclassified tests, stale classifications, and incomplete node-ID
+execution.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import pathlib
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -45,15 +48,31 @@ LIST_FILES = {
 }
 
 
-def load_list(path: pathlib.Path) -> set[str]:
-    names: set[str] = set()
+def load_entries(path: pathlib.Path) -> list[str]:
+    names: list[str] = []
     if not path.is_file():
         return names
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            names.add(line)
+            names.append(line)
     return names
+
+
+def classification_errors(entries: dict[str, list[str]]) -> list[str]:
+    errors: list[str] = []
+    lists = {key: set(names) for key, names in entries.items()}
+    for key, names in entries.items():
+        duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
+        if duplicates:
+            errors.append(f"{LIST_FILES[key]} has duplicates: {', '.join(duplicates)}")
+    keys = tuple(lists)
+    for index, left in enumerate(keys):
+        for right in keys[index + 1 :]:
+            overlap = sorted(lists[left] & lists[right])
+            if overlap:
+                errors.append(f"{left}/{right} classifications overlap: {', '.join(overlap)}")
+    return errors
 
 
 def base_name(testcase_name: str) -> str:
@@ -61,17 +80,15 @@ def base_name(testcase_name: str) -> str:
     return testcase_name.split("[", 1)[0]
 
 
-def parse_junit(path: pathlib.Path) -> dict[str, str]:
-    """Return {test name: status} with status in passed/failed/error/skipped.
-
-    Parametrized cases collapse onto their base name; any failing variant marks
-    the whole test failed.
-    """
+def parse_junit(path: pathlib.Path) -> tuple[dict[str, str], list[str], list[tuple[str, str, str, str]]]:
+    """Return exact statuses, pytest-timeout cases, and failure summaries."""
     results: dict[str, str] = {}
+    timed_out: list[str] = []
+    failures: list[tuple[str, str, str, str]] = []
     severity = {"skipped": 0, "passed": 1, "failed": 2, "error": 2}
     root = ET.parse(path).getroot()
     for case in root.iter("testcase"):
-        name = base_name(case.get("name", ""))
+        name = case.get("name", "")
         if not name:
             continue
         if case.find("failure") is not None:
@@ -85,7 +102,35 @@ def parse_junit(path: pathlib.Path) -> dict[str, str]:
         prev = results.get(name)
         if prev is None or severity[status] > severity[prev]:
             results[name] = status
-    return results
+        node = case.find("failure") if status == "failed" else case.find("error")
+        if node is not None:
+            details = " ".join(filter(None, [node.get("message", ""), node.text or ""]))
+            message = node.get("message") or next(iter((node.text or "").strip().splitlines()), "")
+            failures.append((case.get("classname", ""), name, case.get("time", "0"), message))
+            if re.search(r"\bTimeout\s*(?:>|\()", details, re.IGNORECASE):
+                timed_out.append(name)
+    return results, timed_out, failures
+
+
+def collapse_results(results: dict[str, str]) -> dict[str, str]:
+    """Collapse parametrized cases for classification-level reporting."""
+    collapsed: dict[str, str] = {}
+    severity = {"skipped": 0, "passed": 1, "failed": 2, "error": 2}
+    for exact_name, status in results.items():
+        name = base_name(exact_name)
+        previous = collapsed.get(name)
+        if previous is None or severity[status] > severity[previous]:
+            collapsed[name] = status
+    return collapsed
+
+
+def load_collected_nodeids(path: pathlib.Path) -> set[str]:
+    names: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        nodeid = line.strip()
+        if nodeid:
+            names.add(nodeid.rsplit("::", 1)[-1])
+    return names
 
 
 def render_section(title: str, rows: list[str], hint: str = "") -> list[str]:
@@ -102,7 +147,7 @@ def render_section(title: str, rows: list[str], hint: str = "") -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--junit", required=True, type=pathlib.Path, help="junit.xml produced by pytest")
+    parser.add_argument("--junit", type=pathlib.Path, help="junit.xml produced by pytest")
     parser.add_argument(
         "--lists-dir",
         type=pathlib.Path,
@@ -115,14 +160,60 @@ def main() -> int:
         action="store_true",
         help="exit non-zero when a test from implemented_tests.txt failed",
     )
+    parser.add_argument(
+        "--fail-on-unclassified",
+        action="store_true",
+        help="exit non-zero when an executed test is absent from every classification",
+    )
+    parser.add_argument(
+        "--collected-nodeids",
+        type=pathlib.Path,
+        help="exact pytest node IDs from the pinned suite's collect-only pass",
+    )
+    parser.add_argument(
+        "--check-classifications-only",
+        action="store_true",
+        help="validate classification names against collected node IDs without reading JUnit",
+    )
     args = parser.parse_args()
 
-    if not args.junit.is_file():
+    entries = {key: load_entries(args.lists_dir / fname) for key, fname in LIST_FILES.items()}
+    lists = {key: set(names) for key, names in entries.items()}
+    invalid_classifications = classification_errors(entries)
+    collected: set[str] = set()
+    if args.collected_nodeids:
+        collected = load_collected_nodeids(args.collected_nodeids)
+        collected_base = {base_name(name) for name in collected}
+        classified = set().union(*lists.values())
+        missing_classifications = sorted(collected_base - classified)
+        stale_classifications = sorted(classified - collected_base)
+    else:
+        missing_classifications = []
+        stale_classifications = []
+
+    if args.check_classifications_only:
+        if not args.collected_nodeids:
+            parser.error("--check-classifications-only requires --collected-nodeids")
+        for error in invalid_classifications:
+            print(f"[INVALID] {error}")
+        for name in missing_classifications:
+            print(f"[UNCLASSIFIED] {name}")
+        for name in stale_classifications:
+            print(f"[STALE] {name}")
+        return 1 if invalid_classifications or missing_classifications or stale_classifications else 0
+
+    if invalid_classifications:
+        for error in invalid_classifications:
+            print(f"[ERROR] {error}", file=sys.stderr)
+        return 2
+
+    if not args.junit or not args.junit.is_file():
         print(f"[ERROR] junit file not found: {args.junit}", file=sys.stderr)
         return 2
 
-    lists = {key: load_list(args.lists_dir / fname) for key, fname in LIST_FILES.items()}
-    results = parse_junit(args.junit)
+    exact_results, timed_out, failures = parse_junit(args.junit)
+    results = collapse_results(exact_results)
+    missing_results = sorted(collected - exact_results.keys()) if collected else []
 
     regressions: list[str] = []
     promotions: dict[str, list[str]] = {"unimplemented": [], "excluded": []}
@@ -155,7 +246,9 @@ def main() -> int:
     lines = [
         "# S3 compatibility report",
         "",
-        f"Executed: {len(results)} tests — "
+        f"Executed: {len(exact_results)} exact cases across {len(results)} classified tests.",
+        "",
+        "Classification status — "
         f"{counts['passed']} passed, {counts['failed']} failed, "
         f"{counts['error']} errored, {counts['skipped']} skipped.",
         "",
@@ -191,6 +284,16 @@ def main() -> int:
         unclassified_failed,
         "Failing and absent from every list — triage into `unimplemented_tests.txt` or `excluded_tests.txt`.",
     )
+    lines += render_section(
+        "Missing results",
+        missing_results,
+        "Present in the pinned upstream suite but absent from JUnit — the sweep was incomplete.",
+    )
+    lines += render_section(
+        "Timed out",
+        timed_out,
+        "Per-test timeout is an infrastructure failure regardless of compatibility classification.",
+    )
 
     report = "\n".join(lines)
     if args.output:
@@ -201,12 +304,27 @@ def main() -> int:
     print(
         f"[INFO] {len(regressions)} regression(s), "
         f"{len(promotions['unimplemented']) + len(promotions['excluded']) + len(unclassified_passed)} promotion candidate(s), "
-        f"{len(unclassified_failed)} unclassified failure(s)"
+        f"{len(unclassified_failed)} unclassified failure(s), "
+        f"{len(missing_results)} missing result(s), "
+        f"{len(timed_out)} timeout(s)"
     )
     for name in sorted(regressions):
         print(f"[REGRESSION] {name}")
+    if failures:
+        print("[ERROR] s3-tests failed testcase summary:")
+        for classname, name, duration, message in failures[:20]:
+            nodeid = f"{classname}::{name}" if classname else name
+            print(f"[ERROR] - {nodeid} ({duration}s): {message}")
+        if len(failures) > 20:
+            print(f"[ERROR] - ... {len(failures) - 20} additional failed testcases omitted")
 
     if args.fail_on_regression and regressions:
+        return 1
+    if args.fail_on_unclassified and (unclassified_passed or unclassified_failed):
+        return 1
+    if args.collected_nodeids and missing_results:
+        return 1
+    if timed_out:
         return 1
     return 0
 
