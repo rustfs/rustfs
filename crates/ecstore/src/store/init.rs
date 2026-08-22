@@ -1264,7 +1264,7 @@ mod tests {
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
             bucket,
             object,
-            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+            crate::set_disk::PutObjectCommitPause::AfterNamespace,
         );
         let migration_store = Arc::clone(store);
         let migration_bucket = bucket.to_string();
@@ -1365,7 +1365,7 @@ mod tests {
                 &mut reader,
                 &ObjectOptions {
                     version_suspended: true,
-                    mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
                     ..Default::default()
                 },
             )
@@ -2997,7 +2997,7 @@ mod tests {
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
             &bucket,
             &object,
-            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+            crate::set_disk::PutObjectCommitPause::AfterNamespace,
         );
         let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, &object);
         let source_set = store.pools[0].get_disks_by_key(&object);
@@ -3266,7 +3266,7 @@ mod tests {
             object,
             crate::store::object::DecommissionMutationFenceTestPhase::SourceCleanup,
         );
-        let barrier = crate::set_disk::DeleteObjectCommitBarrier::install(&bucket, object);
+        let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
         let source_set = store.pools[0].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
         let worker_bucket = bucket.clone();
@@ -3376,7 +3376,7 @@ mod tests {
         let commit_barrier = crate::set_disk::PutObjectCommitBarrier::install(
             &bucket,
             object,
-            crate::set_disk::PutObjectCommitPause::BeforeNamespace,
+            crate::set_disk::PutObjectCommitPause::AfterNamespace,
         );
         let source_set = store.pools[1].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
