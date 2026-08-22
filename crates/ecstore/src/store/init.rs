@@ -3227,6 +3227,100 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_recovery_keeps_multiple_active_sources() {
+        let temp_dir = tempfile::tempdir().expect("create multi-source recovery store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "durable-ilm-multi-source-recovery",
+            &[4, 4, 4],
+        ))
+        .await;
+        let tier_name = "DECOMMISSION-MULTI-SOURCE";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let entry = Jentry {
+            obj_name: "multi-source-recovery-object".to_string(),
+            version_id: "multi-source-recovery-version".to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+        };
+        let path = tier_delete_journal_object_name(&entry);
+        let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("source and target tier journals should persist");
+        }
+
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            let start_time = OffsetDateTime::now_utc();
+            for pool_idx in [0, 1] {
+                pool_meta.pools[pool_idx].decommission = Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    ..Default::default()
+                });
+            }
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("multiple active decommission runs should persist");
+        let mut restarted_pool_meta = PoolMeta::default();
+        restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("multiple active decommission runs should reload");
+        *store.pool_meta.write().await = restarted_pool_meta;
+
+        let record = validate_durable_ilm_record(&path, &data).expect("tier journal should validate");
+        let source_zero_receipt = store
+            .persist_decommission_durable_ilm_receipt_for_test(0, 2, &path, &record, false)
+            .await
+            .expect("source pool zero receipt should persist on the target");
+        let source_one_receipt = store
+            .persist_decommission_durable_ilm_receipt_for_test(1, 2, &path, &record, false)
+            .await
+            .expect("source pool one receipt should persist on the target");
+        assert_ne!(
+            source_zero_receipt, source_one_receipt,
+            "active source runs must have distinct receipt paths"
+        );
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("multi-source tier journal recovery should complete");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("first active source must remain after target recovery"),
+            data
+        );
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &path)
+                .await
+                .expect("second active source must remain after target recovery"),
+            data
+        );
+        assert!(matches!(
+            com::read_config(store.pools[2].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert!(backend.remove_versions().await.contains(&(entry.obj_name, entry.version_id)));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page() {
         const RECEIPT_COUNT: usize = 1001;
 
