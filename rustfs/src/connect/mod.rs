@@ -31,9 +31,11 @@ pub mod credential_store;
 pub mod heartbeat;
 pub mod identity;
 pub mod identity_store;
+pub mod inventory;
 pub mod offline;
 pub mod registration;
 pub mod runtime;
+mod telemetry;
 
 pub use client::{ClientError, ConnectClient, ConnectConfig};
 pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
@@ -41,6 +43,10 @@ pub use credential_store::{CredentialStore, DeviceCredential};
 pub use heartbeat::{CoarseNodeSummary, HeartbeatError, HeartbeatStatus};
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};
 pub use identity_store::{IdentityStore, StoreError};
+pub use inventory::{
+    InventoryError, InventoryFlag, InventoryOsVersion, InventorySchedule, InventorySnapshot, InventoryStatus,
+    OperatingSystemFamily,
+};
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};
-pub use runtime::{HeartbeatRuntime, spawn_heartbeat_runtime};
+pub use runtime::{HeartbeatRuntime, InventoryRuntime, spawn_heartbeat_runtime, spawn_inventory_runtime};
