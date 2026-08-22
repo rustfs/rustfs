@@ -178,8 +178,13 @@ jobs:
 
       - name: Install Python tools
         run: |
-          python3 -m pip install --user --upgrade pip awscurl tox
+          python3 -m pip install --user --upgrade pip "awscurl==0.44" "tox==4.60.0"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Python tools
+        run: |
+          test "$(python3 -c 'import importlib.metadata as m; print(m.version("awscurl"))')" = "0.44"
+          test "$(python3 -c 'import importlib.metadata as m; print(m.version("tox"))')" = "4.60.0"
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
