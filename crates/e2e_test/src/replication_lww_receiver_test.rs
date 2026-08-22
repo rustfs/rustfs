@@ -31,7 +31,6 @@ use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-use serial_test::serial;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -93,7 +92,6 @@ async fn tag_value(client: &Client, bucket: &str, key: &str, version_id: &str, t
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn receiver_lww_keeps_newer_tags_across_delivery_orders() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
