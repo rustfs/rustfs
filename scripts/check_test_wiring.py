@@ -24,6 +24,7 @@ SCHEDULED_ALERT_WORKFLOWS = (
     ".github/workflows/e2e-s3tests.yml",
     ".github/workflows/fuzz.yml",
     ".github/workflows/mint.yml",
+    ".github/workflows/minio-interop.yml",
     ".github/workflows/nightly-gnu.yml",
     ".github/workflows/performance-ab.yml",
     ".github/workflows/runner-hygiene.yml",

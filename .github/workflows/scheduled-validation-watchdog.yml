@@ -25,6 +25,7 @@ on:
       - "e2e-s3tests"
       - "Fuzz"
       - "mint"
+      - "minio-interop"
       - "Nightly GNU Build"
       - "Performance A/B"
       - "Runner Hygiene"
