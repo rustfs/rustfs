@@ -65,6 +65,7 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, Replicatio
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::future::Future;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
@@ -4267,6 +4268,19 @@ impl ECStore {
         idx: usize,
         owner: Option<&DecommissionCanceler>,
     ) -> Result<()> {
+        self.decommission_failed_with_owner_and_save(idx, owner, self.save_current_pool_meta())
+            .await
+    }
+
+    async fn decommission_failed_with_owner_and_save<SaveFuture>(
+        &self,
+        idx: usize,
+        owner: Option<&DecommissionCanceler>,
+        save_pool_meta: SaveFuture,
+    ) -> Result<()>
+    where
+        SaveFuture: Future<Output = Result<()>>,
+    {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "mark decommission failed")?;
         let _start_guard = self.start_gate.lock().await;
 
@@ -4293,7 +4307,7 @@ impl ECStore {
             (changed, changed.then_some(previous_pool_meta), terminal_canceler)
         };
 
-        if should_reload_pool_meta && let Err(err) = self.save_current_pool_meta().await {
+        if should_reload_pool_meta && let Err(err) = save_pool_meta.await {
             if let Some(previous_pool_meta) = previous_pool_meta {
                 let mut pool_meta = self.pool_meta.write().await;
                 rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
@@ -8931,6 +8945,64 @@ track_decommission_current_object, track_decommission_current_object_stage, vali
         assert!(!queued.is_active());
         assert!(queued.is_cancelled());
         assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+    }
+
+    #[tokio::test]
+    async fn test_decommission_failed_save_failure_preserves_owner_until_retry_succeeds() {
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+
+        store
+            .decommission_failed_with_owner_and_save(0, Some(&canceler), async { Err(Error::SlowDown) })
+            .await
+            .expect_err("injected terminal save failure should be returned");
+
+        {
+            let cancelers = store.decommission_cancelers.read().await;
+            let current = cancelers[0].as_ref().expect("failed save must retain the exact owner slot");
+            assert!(current.owns_same_operation(&canceler));
+            assert!(current.is_active());
+        }
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("rollback must retain active decommission metadata");
+            assert!(info.has_decommission_state());
+            assert!(!info.failed);
+            assert!(!info.complete);
+            assert!(!info.canceled);
+        }
+        assert!(store.decommission_terminal_retryable_for_operation(0, &canceler).await);
+
+        store
+            .decommission_failed_with_owner_and_save(0, Some(&canceler), async { Ok(()) })
+            .await
+            .expect("terminal retry should commit");
+
+        let pool_meta = store.pool_meta.read().await;
+        assert!(
+            pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("terminal metadata should remain")
+                .failed
+        );
+        drop(pool_meta);
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert!(!canceler.is_active());
+        assert!(canceler.is_cancelled());
     }
 
     #[test]
