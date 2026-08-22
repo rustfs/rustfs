@@ -38,9 +38,9 @@ use super::storage_api::bucket_usecase::bucket::{
     metadata_sys,
     policy_sys::PolicySys,
     replication::{
-        ReplicationTargetValidationError, invalid_replication_config_status_field, is_site_replication_rule,
-        merge_incoming_replication_config, replication_target_arns, should_remove_replication_target,
-        unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
+        ReplicationTargetValidationError, invalid_replication_config_status_field, merge_user_replication_config,
+        replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
+        validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -66,6 +66,7 @@ use super::storage_api::bucket_usecase::{
 };
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+    site_replication_remote_peer_deployment_ids,
 };
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
@@ -625,36 +626,38 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
 
 /// Defense in depth for site-replication-managed buckets (issue #1948): an S3
 /// PutBucketReplication replaces the operator-authored rules but must not wipe
-/// the local `site-repl-*` rules the reconciler owns — until its next pass
-/// (600s period) every peer link on this bucket would be silently dead. The
-/// same merge also drops incoming `site-repl-*` impostor rules, matching the
-/// peer bucket-meta ingestion path. Buckets without site-replication rules
-/// keep the verbatim overwrite semantics.
+/// the rules the reconciler derived for the current remote peers
+/// (`site_peer_deployment_ids`) — until its next pass (600s period) every
+/// peer link on this bucket would be silently dead. The same merge also drops
+/// incoming impostors of those rules. An empty peer set (site replication
+/// disabled) keeps the verbatim overwrite semantics: rule ids are not
+/// reserved, so an operator's own `site-repl-*` rule is ordinary state there.
 fn merge_user_replication_config_update(
     incoming: ReplicationConfiguration,
     existing: Option<ReplicationConfiguration>,
+    site_peer_deployment_ids: &HashSet<String>,
 ) -> ReplicationConfiguration {
-    let has_site_rules = existing
-        .as_ref()
-        .is_some_and(|config| config.rules.iter().any(is_site_replication_rule));
-    if !has_site_rules {
+    if site_peer_deployment_ids.is_empty() {
         return incoming;
     }
-    // `existing` holds at least one site-replication rule the merge keeps, so
-    // the merged rule set is non-empty; the fallback only guards the type.
-    merge_incoming_replication_config(Some(incoming.clone()), existing).unwrap_or(incoming)
+    // `incoming` passed structure validation, so it holds at least one rule;
+    // `None` is only reachable when every incoming rule impersonates a
+    // reconciler rule, and then the stored reconciler rules are what remains.
+    merge_user_replication_config(Some(incoming.clone()), existing, site_peer_deployment_ids).unwrap_or(incoming)
 }
 
 /// Split of an S3 DeleteBucketReplication on the stored config (issue #1948):
-/// the operator-authored rules are removed, the local `site-repl-*` rules
-/// survive (`None` means nothing survives and the config is deleted), and the
-/// returned ARNs are the ones whose bucket targets may be garbage-collected —
-/// never an ARN a surviving site-replication rule still points at.
+/// the operator-authored rules are removed, the rules the reconciler derived
+/// for the current remote peers survive (`None` means nothing survives and
+/// the config is deleted), and the returned ARNs are the ones whose bucket
+/// targets may be garbage-collected — never an ARN a surviving reconciler
+/// rule still points at.
 fn split_replication_config_for_user_delete(
     config: ReplicationConfiguration,
+    site_peer_deployment_ids: &HashSet<String>,
 ) -> (Option<ReplicationConfiguration>, HashSet<String>) {
     let mut removable_arns = replication_target_arns(&config);
-    let remaining = merge_incoming_replication_config(None, Some(config));
+    let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids);
     if let Some(remaining) = remaining.as_ref() {
         for rule in &remaining.rules {
             removable_arns.remove(rule.destination.bucket.trim());
@@ -1644,7 +1647,8 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
         let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
-            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone());
+            let site_peers = site_replication_remote_peer_deployment_ids().await?;
+            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers);
             let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
             (remaining, targets)
         } else {
@@ -2543,7 +2547,9 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
-        let replication_configuration = merge_user_replication_config_update(replication_configuration, existing_config);
+        let site_peers = site_replication_remote_peer_deployment_ids().await?;
+        let replication_configuration =
+            merge_user_replication_config_update(replication_configuration, existing_config, &site_peers);
         let data = serialize_config(&replication_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -3180,6 +3186,10 @@ mod tests {
         rule
     }
 
+    fn site_peers(deployment_ids: &[&str]) -> HashSet<String> {
+        deployment_ids.iter().map(|id| id.to_string()).collect()
+    }
+
     #[test]
     fn put_replication_merge_preserves_site_replication_rules() {
         let existing = ReplicationConfiguration {
@@ -3193,21 +3203,75 @@ mod tests {
             role: String::new(),
             rules: vec![
                 replication_rule_with_id("arn:rustfs:replication:us-east-1:new:bucket", "new-user-rule", 1),
-                replication_rule_with_id("arn:rustfs:replication::forged-dep:bucket", "site-repl-forged", 2),
+                replication_rule_with_id("arn:rustfs:replication::forged-dep:bucket", "site-repl-peer-dep", 2),
+                replication_rule_with_id("arn:rustfs:replication::other-dep:bucket", "site-repl-other", 3),
             ],
         };
 
-        let merged = merge_user_replication_config_update(incoming, Some(existing));
+        let merged = merge_user_replication_config_update(incoming, Some(existing), &site_peers(&["peer-dep"]));
 
-        let ids: Vec<_> = merged
+        let rules: Vec<_> = merged
             .rules
             .iter()
-            .map(|rule| rule.id.as_deref().unwrap_or_default())
+            .map(|rule| (rule.id.as_deref().unwrap_or_default(), rule.destination.bucket.as_str()))
             .collect();
         assert_eq!(
-            ids,
-            vec!["new-user-rule", "site-repl-peer-dep"],
-            "user rules replaced, local site-replication rule preserved, forged incoming site-repl rule dropped"
+            rules,
+            vec![
+                ("new-user-rule", "arn:rustfs:replication:us-east-1:new:bucket"),
+                ("site-repl-other", "arn:rustfs:replication::other-dep:bucket"),
+                ("site-repl-peer-dep", "arn:rustfs:replication::peer-dep:bucket"),
+            ],
+            "user rules replaced, the reconciler rule for the current peer kept over the incoming impostor, \
+             a site-repl-* id that names no current peer is ordinary operator state"
+        );
+    }
+
+    // Rule ids do not reserve `site-repl-*`: outside site replication an
+    // owner's `site-repl-user` rule is ordinary state, so PUT stores it
+    // verbatim and DELETE removes it and garbage-collects its target.
+    #[test]
+    fn put_then_delete_replication_without_site_replication_treats_site_repl_id_as_user_rule() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_with_id(user_arn, "site-repl-user", 1)],
+        };
+
+        let stored = merge_user_replication_config_update(incoming.clone(), None, &HashSet::new());
+        assert_eq!(stored, incoming, "PUT on a non-site-replication bucket is verbatim");
+
+        let (remaining, removable) = split_replication_config_for_user_delete(stored, &HashSet::new());
+        assert!(remaining.is_none(), "DELETE must remove the operator's site-repl-* rule");
+        assert_eq!(removable, HashSet::from([user_arn.to_string()]));
+    }
+
+    // Under site replication only a rule the reconciler would derive — id
+    // `site-repl-<peer>` for a current peer, destination ARN naming the same
+    // peer — is reconciler-owned. Everything else is operator state.
+    #[test]
+    fn delete_replication_split_keeps_only_reconciler_derived_rules() {
+        let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                replication_rule_with_id(user_arn, "site-repl-user", 1),
+                replication_rule_with_id(user_arn, "site-repl-peer-dep", 2),
+                replication_rule_with_id("arn:rustfs:replication::gone-dep:bucket", "site-repl-gone-dep", 3),
+                replication_rule_with_id(peer_arn, "site-repl-peer-dep", 4),
+            ],
+        };
+
+        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
+
+        let remaining = remaining.expect("the reconciler-derived rule must survive");
+        assert_eq!(remaining.rules.len(), 1);
+        assert_eq!(remaining.rules[0].destination.bucket, peer_arn);
+        assert_eq!(
+            removable,
+            HashSet::from([user_arn.to_string(), "arn:rustfs:replication::gone-dep:bucket".to_string()]),
+            "targets of operator rules and of a removed peer are garbage-collected"
         );
     }
 
@@ -3230,7 +3294,7 @@ mod tests {
             )],
         };
 
-        let merged = merge_user_replication_config_update(incoming.clone(), Some(existing));
+        let merged = merge_user_replication_config_update(incoming.clone(), Some(existing), &HashSet::new());
 
         assert_eq!(merged.role, incoming.role);
         assert_eq!(merged.rules, incoming.rules, "non-SR buckets keep the verbatim overwrite semantics");
@@ -3248,7 +3312,7 @@ mod tests {
             ],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config);
+        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
 
         let remaining = remaining.expect("site-replication rules must survive a user delete");
         let ids: Vec<_> = remaining
@@ -3271,7 +3335,7 @@ mod tests {
             ],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config);
+        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
 
         assert!(remaining.is_some());
         assert!(
@@ -3288,7 +3352,7 @@ mod tests {
             rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config);
+        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
 
         assert!(remaining.is_none(), "without site-replication rules the whole config is deleted");
         assert_eq!(removable, HashSet::from([user_arn.to_string()]));

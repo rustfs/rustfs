@@ -1128,6 +1128,28 @@ pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
     Ok(load_site_replication_state().await?.enabled())
 }
 
+/// Deployment ids of the remote peers the reconciler derives a
+/// `site-repl-<id>` rule for on every bucket (the same peer filter as
+/// `build_site_replication_config`); empty when site replication is not
+/// enabled. Read by the bucket usecase so an S3 replication-config edit keeps
+/// exactly the reconciler-owned rules (issue #1948); a state-read failure
+/// propagates so the edit fails closed.
+pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<HashSet<String>> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(HashSet::new());
+    }
+    let local_peer = current_local_runtime_peer(&state);
+    Ok(state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect())
+}
+
 async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
     match read_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
         Ok(data) => parse_site_replication_state(&data),

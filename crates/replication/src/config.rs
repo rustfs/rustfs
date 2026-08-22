@@ -282,10 +282,40 @@ pub fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
     None
 }
 
-/// Whether `rule` is a site-replication rule (`site-repl-*` id) owned by the
-/// local site's reconciler rather than authored by an operator.
+/// Rule id prefix the site-replication reconciler stamps on the rules it
+/// derives (`site-repl-<peer deployment id>`).
+pub const SITE_REPLICATION_RULE_ID_PREFIX: &str = "site-repl-";
+
+/// Whether `rule` carries a site-replication rule id (`site-repl-*`). The
+/// reconciler and the peer ingestion path treat the whole namespace as theirs
+/// on a site-replication bucket; the S3 edit path must not — rule ids are not
+/// reserved, so see [`site_replication_rule_deployment_id`].
 pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
-    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
+    rule.id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(SITE_REPLICATION_RULE_ID_PREFIX))
+}
+
+/// Deployment id of the peer a reconciler-derived rule replicates to, or
+/// `None` for any other rule. The reconciler builds each rule from one peer:
+/// the id is `site-repl-<deployment id>` and the destination ARN names that
+/// same deployment id — an operator-authored `site-repl-user` rule, or a
+/// `site-repl-<peer>` id pasted onto a foreign ARN, fails the agreement check.
+/// Callers that know the current peer set must also confirm the id is one of
+/// those peers before treating the rule as reconciler-owned.
+pub fn site_replication_rule_deployment_id(rule: &ReplicationRule) -> Option<&str> {
+    let deployment_id = rule.id.as_deref()?.strip_prefix(SITE_REPLICATION_RULE_ID_PREFIX)?;
+    (!deployment_id.is_empty()
+        && replication_target_arn_deployment_id(&rule.destination.bucket).as_deref() == Some(deployment_id))
+    .then_some(deployment_id)
+}
+
+/// Whether `rule` is one the local reconciler derived for a current remote
+/// site-replication peer in `peer_deployment_ids`. With an empty peer set
+/// (site replication disabled) nothing qualifies, so a bucket outside site
+/// replication keeps the verbatim S3 put/delete semantics.
+pub fn is_reconciler_owned_site_replication_rule(rule: &ReplicationRule, peer_deployment_ids: &HashSet<String>) -> bool {
+    site_replication_rule_deployment_id(rule).is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
 }
 
 /// Merge an incoming replication config into the local one.
@@ -302,6 +332,41 @@ pub fn merge_incoming_replication_config(
     incoming: Option<ReplicationConfiguration>,
     local: Option<ReplicationConfiguration>,
 ) -> Option<ReplicationConfiguration> {
+    merge_replication_config_keeping_site_rules(incoming, local, is_site_replication_rule)
+}
+
+/// [`merge_incoming_replication_config`] for the S3 put/delete-bucket-replication
+/// path (issue #1948): only rules the local reconciler derived for a current
+/// peer in `peer_deployment_ids` survive as site rules; every other stored
+/// rule — including an operator-authored `site-repl-*` id — is operator state
+/// that the request replaces or deletes. An incoming rule whose id is a
+/// current peer's `site-repl-<id>` is dropped whatever its ARN: accepting it
+/// would duplicate the reconciler rule's id.
+pub fn merge_user_replication_config(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+    peer_deployment_ids: &HashSet<String>,
+) -> Option<ReplicationConfiguration> {
+    let incoming = incoming.map(|mut config| {
+        config.rules.retain(|rule| {
+            !rule
+                .id
+                .as_deref()
+                .and_then(|id| id.strip_prefix(SITE_REPLICATION_RULE_ID_PREFIX))
+                .is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
+        });
+        config
+    });
+    merge_replication_config_keeping_site_rules(incoming, local, |rule| {
+        is_reconciler_owned_site_replication_rule(rule, peer_deployment_ids)
+    })
+}
+
+fn merge_replication_config_keeping_site_rules(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+    is_site_rule: impl Fn(&ReplicationRule) -> bool,
+) -> Option<ReplicationConfiguration> {
     let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
     // Operator rules first, then the local site rules — the same order the
     // site-replication reconciler produces, so its no-op check matches and
@@ -309,14 +374,9 @@ pub fn merge_incoming_replication_config(
     let mut rules: Vec<ReplicationRule> = incoming
         .into_iter()
         .flat_map(|config| config.rules)
-        .filter(|rule| !is_site_replication_rule(rule))
+        .filter(|rule| !is_site_rule(rule))
         .collect();
-    rules.extend(
-        local
-            .into_iter()
-            .flat_map(|config| config.rules)
-            .filter(is_site_replication_rule),
-    );
+    rules.extend(local.into_iter().flat_map(|config| config.rules).filter(&is_site_rule));
 
     if rules.is_empty() {
         return None;
@@ -1610,5 +1670,28 @@ mod tests {
             vec![target_b.to_string()],
             "the child rule must win for target A while the overlapping child target B remains eligible"
         );
+    }
+
+    #[test]
+    fn site_replication_rule_deployment_id_requires_id_and_arn_agreement() {
+        let reconciler_rule = replication_rule("site-repl-peer-dep", "arn:rustfs:replication::peer-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&reconciler_rule), Some("peer-dep"));
+
+        // A remote-target ARN carries the remote's deployment id (or a random
+        // uuid), never the operator's rule id.
+        let operator_named_rule = replication_rule("site-repl-user", "arn:minio:replication:us-east-1:2f1c-remote:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&operator_named_rule), None);
+
+        let foreign_arn = replication_rule("site-repl-peer-dep", "arn:rustfs:replication::other-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&foreign_arn), None);
+
+        let empty_id = replication_rule("site-repl-", "arn:rustfs:replication::peer-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&empty_id), None);
+
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        assert!(is_reconciler_owned_site_replication_rule(&reconciler_rule, &peers));
+        assert!(!is_reconciler_owned_site_replication_rule(&reconciler_rule, &HashSet::new()));
+        let removed_peer = replication_rule("site-repl-gone-dep", "arn:rustfs:replication::gone-dep:bucket");
+        assert!(!is_reconciler_owned_site_replication_rule(&removed_peer, &peers));
     }
 }
