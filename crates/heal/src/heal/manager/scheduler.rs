@@ -79,6 +79,27 @@ pub(super) struct PanicCleanupState {
     pub(super) statistics: Arc<RwLock<HealStatistics>>,
 }
 
+async fn cleanup_panicked_task_ownership(state: &PanicCleanupState, task_id: &str) -> bool {
+    // Queue admission transfers ownership while holding queue -> retrying. Use
+    // the same order here so panic cleanup cannot remove a retry after another
+    // request has merged into or admitted that retry.
+    let mut queue = state.heal_queue.lock().await;
+    let mut retrying = state.retrying_heals.lock().await;
+    if retrying.contains_key(task_id) || queue.contains_request_id(task_id) {
+        publish_heal_queue_length(&queue);
+        return true;
+    }
+    let removed_retry = retrying.remove(task_id).map(|retrying| retrying.cancel_token);
+    queue.remove_request_id(task_id);
+    publish_heal_queue_length(&queue);
+    drop(retrying);
+    drop(queue);
+    if let Some(cancel_token) = removed_retry {
+        cancel_token.cancel();
+    }
+    false
+}
+
 pub(super) async fn finish_panicked_heal_task(task: Arc<HealTask>, task_id: String, state: PanicCleanupState) {
     // A panic can interrupt any point between the active/retrying/completed
     // handoff. Each operation is intentionally idempotent so an outer unwind
@@ -125,21 +146,9 @@ pub(super) async fn finish_panicked_heal_task(task: Arc<HealTask>, task_id: Stri
     .await
     .unwrap_or((false, 0));
 
-    let _ = AssertUnwindSafe(async {
-        if let Some(retrying) = state.retrying_heals.lock().await.remove(&task_id) {
-            retrying.cancel_token.cancel();
-        }
-    })
-    .catch_unwind()
-    .await;
-
-    let _ = AssertUnwindSafe(async {
-        let mut queue = state.heal_queue.lock().await;
-        queue.remove_request_id(&task_id);
-        publish_heal_queue_length(&queue);
-    })
-    .catch_unwind()
-    .await;
+    let _ = AssertUnwindSafe(cleanup_panicked_task_ownership(&state, &task_id))
+        .catch_unwind()
+        .await;
     let _ = AssertUnwindSafe(async {
         state
             .replacement_recovery_anchors
