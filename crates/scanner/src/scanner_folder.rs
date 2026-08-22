@@ -55,9 +55,9 @@ use tracing::{debug, error, warn};
 use crate::{
     Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts, ReplicationConfig,
     ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE, ScannerDiskExt as _,
-    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
-    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
+    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, TierRegistrySnapshot, apply_expiry_rule,
+    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    path2_bucket_object_with_base_path, queue_replication_heal, runtime_tier_registry, scanner_is_erasure,
     scanner_replication_config_for_lifecycle_eval,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
@@ -626,6 +626,7 @@ fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) 
     }
 
     into.add_tier_sizes(&summary.tier_stats);
+    into.add_unknown_tier_stats(&summary.unknown_tier_stats);
 }
 
 fn data_usage_root_has_progress(root: &DataUsageEntry) -> bool {
@@ -670,6 +671,9 @@ pub struct FolderScanner {
     budget: Arc<ScannerCycleBudget>,
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
+    /// Tier registry frozen for this folder scan. A refresh applies to the
+    /// next scan and cannot mix generations in one aggregate.
+    tier_registry: TierRegistrySnapshot,
     pending_heals_changed: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
@@ -1329,7 +1333,11 @@ impl FolderScanner {
                     continue;
                 }
 
-                let sz = match self.local_disk.get_size(item.clone()).await {
+                let sz = match self
+                    .local_disk
+                    .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
+                    .await
+                {
                     Ok(sz) => sz,
                     Err(e) => {
                         let failure_action = classify_get_size_failure(&item, &e);
@@ -2161,6 +2169,10 @@ pub async fn scan_data_folder(
 
     let failed_object_ttl = rustfs_utils::get_env_u32(ENV_FAILED_OBJECT_TTL_SECS, DEFAULT_FAILED_OBJECT_TTL_SECS) as u64;
     let failed_objects_max = rustfs_utils::get_env_u32(ENV_FAILED_OBJECTS_MAX, DEFAULT_FAILED_OBJECTS_MAX) as usize;
+    let tier_registry = runtime_tier_registry().await;
+    let mut cache = cache;
+    cache.fold_retired_tiers(&tier_registry.names);
+    cache.info.tier_registry_generation = Some(tier_registry.generation);
 
     // Create folder scanner
     let mut scanner = FolderScanner {
@@ -2189,6 +2201,7 @@ pub async fn scan_data_folder(
         budget: budget.clone(),
         skip_heal,
         local_disk,
+        tier_registry,
         pending_heals_changed: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,

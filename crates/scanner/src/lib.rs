@@ -94,6 +94,45 @@ static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
 
+/// Immutable tier registry captured at the beginning of a folder scan.
+/// Generation makes it possible to prove that a result was classified against
+/// one registry even when the process-wide TTL cache refreshes concurrently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TierRegistrySnapshot {
+    pub(crate) generation: u64,
+    pub(crate) names: Arc<[String]>,
+    /// True when the last refresh attempt failed and `names` is therefore a
+    /// retained last-good snapshot rather than a newly read registry.
+    pub(crate) refresh_failed: bool,
+}
+
+impl TierRegistrySnapshot {
+    /// Apply a refresh only when the registry read succeeds. A failed refresh
+    /// retains the prior generation, preventing a transient config failure
+    /// from classifying the remainder of a scan against an empty registry.
+    pub(crate) fn refreshed(&self, names: Result<Arc<[String]>, ()>) -> Self {
+        match names {
+            Ok(names) => Self {
+                generation: self.generation.saturating_add(1),
+                names,
+                refresh_failed: false,
+            },
+            Err(()) => Self {
+                refresh_failed: true,
+                ..self.clone()
+            },
+        }
+    }
+
+    pub(crate) fn initial(names: Arc<[String]>) -> Self {
+        Self {
+            generation: 1,
+            names,
+            refresh_failed: false,
+        }
+    }
+}
+
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
 }
@@ -383,24 +422,48 @@ const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `TIER_NAME_CACHE_TTL` later; a removed tier can leave an all-zero
 /// `TierStats` seed behind for one cache generation, which merges harmlessly
 /// by key in per-object accounting and disappears on the next refresh.
-static TIER_NAME_CACHE: RwLock<Option<(Instant, Arc<[String]>)>> = RwLock::new(None);
+static TIER_NAME_CACHE: RwLock<Option<(Instant, TierRegistrySnapshot)>> = RwLock::new(None);
+static TIER_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Tier names currently registered in the tier configuration, cached for
-/// `TIER_NAME_CACHE_TTL`.
-pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+/// Return one immutable registry snapshot for a scanner unit of work.
+pub(crate) async fn runtime_tier_registry() -> TierRegistrySnapshot {
     {
         let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
-        if let Some((refreshed_at, names)) = cached
+        if let Some((refreshed_at, snapshot)) = cached
             && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
         {
-            return names;
+            return snapshot;
         }
     }
 
     let tiers = ecstore_get_global_tier_config_mgr().read().await.list_tiers();
     let names: Arc<[String]> = tiers.iter().map(|tier| tier.name.clone()).collect::<Vec<_>>().into();
-    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), Arc::clone(&names)));
-    names
+    let previous = TIER_NAME_CACHE
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(|(_, snapshot)| snapshot.clone());
+    let snapshot = previous
+        .as_ref()
+        .map(|snapshot| {
+            let refreshed = snapshot.refreshed(Ok(Arc::clone(&names)));
+            TierRegistrySnapshot {
+                generation: TIER_REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+                ..refreshed
+            }
+        })
+        .unwrap_or_else(|| TierRegistrySnapshot {
+            generation: TIER_REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            ..TierRegistrySnapshot::initial(names)
+        });
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), snapshot.clone()));
+    snapshot
+}
+
+/// Tier names currently registered in the tier configuration, cached for
+/// `TIER_NAME_CACHE_TTL`.
+pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+    runtime_tier_registry().await.names
 }
 
 /// Test-only cache reset; the production cache has no invalidation hook

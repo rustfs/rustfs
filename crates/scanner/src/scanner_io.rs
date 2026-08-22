@@ -498,6 +498,9 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     ) -> Result<ScannerDiskScanOutcome>;
 
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
+
+    /// Read one object using a registry snapshot captured at scan start.
+    async fn get_size_with_tier_names(&self, item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary>;
 }
 
 #[derive(Debug)]

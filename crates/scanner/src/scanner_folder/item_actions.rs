@@ -289,11 +289,42 @@ impl ScannerItem {
         item.object_path()
     }
 
+    fn effective_tier(oi: &ObjectInfo) -> &str {
+        if oi.transitioned_object.status == crate::TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.as_str()
+        } else {
+            oi.storage_class.as_deref().unwrap_or(crate::storageclass::STANDARD)
+        }
+    }
+
+    fn tier_is_known(oi: &ObjectInfo, tier_names: &[String]) -> bool {
+        let tier = Self::effective_tier(oi);
+        if tier == crate::data_usage_define::UNKNOWN_TIER {
+            return false;
+        }
+        tier == crate::storageclass::STANDARD || tier == crate::storageclass::RRS || tier_names.iter().any(|name| name == tier)
+    }
+
+    fn action_requires_known_tier(action: IlmAction) -> bool {
+        matches!(
+            action,
+            IlmAction::TransitionAction
+                | IlmAction::TransitionVersionAction
+                | IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteRestoredAction
+                | IlmAction::DeleteRestoredVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        )
+    }
+
     pub async fn apply_actions(
         &mut self,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
         versioning_config: VersioningConfiguration,
+        tier_names: &[String],
         size_summary: &mut SizeSummary,
     ) {
         let object_path = self.object_path();
@@ -424,6 +455,18 @@ impl ScannerItem {
 
                 let mut size = actual_size;
                 let mut account_now = true;
+
+                // A retired/unknown source tier may point at a remote object
+                // that cannot be safely deleted or transitioned. Lifecycle
+                // evaluation is still useful for accounting, but all
+                // side-effecting tier actions fail closed until the registry
+                // recognizes the source again.
+                if !Self::tier_is_known(oi, tier_names) && Self::action_requires_known_tier(event.action) {
+                    size = self.heal_actions(oi, actual_size, size_summary).await;
+                    size_summary.actions_accounting(oi, size, actual_size);
+                    cumulative_size += size;
+                    continue;
+                }
 
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
@@ -928,5 +971,16 @@ mod tests {
         assert_eq!(item.prefix, "");
         assert_eq!(item.object_name, "object");
         assert_eq!(item.object_path(), "object");
+    }
+
+    #[test]
+    fn unknown_tier_never_triggers_transition() {
+        let object = ObjectInfo {
+            storage_class: Some("retired-tier".to_string()),
+            ..Default::default()
+        };
+        assert!(!ScannerItem::tier_is_known(&object, &["WARM".to_string()]));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::TransitionAction));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::DeleteVersionAction));
     }
 }

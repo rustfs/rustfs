@@ -216,6 +216,7 @@ pub(super) fn completed_data_usage_info(
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
         objects_total_size: u64::try_from(total.size).ok()?,
         tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+        unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
         buckets_count: u64::try_from(all_buckets.len()).ok()?,
         bucket_sizes,
         buckets_usage,

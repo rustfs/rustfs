@@ -29,7 +29,8 @@ use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
-    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, hash_path, prefix_usage_in_cache,
+    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, UNKNOWN_TIER, UnknownTierStats,
+    hash_path, prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -205,7 +206,8 @@ impl ScannerSizeSummaryExt for SizeSummary {
             self.versions = self.versions.saturating_add(1);
         }
 
-        let size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        let logical_size = size.max(0);
+        let size = usize::try_from(logical_size).unwrap_or(usize::MAX);
         self.total_size = self.total_size.saturating_add(size);
 
         if oi.transitioned_object.free_version {
@@ -217,12 +219,34 @@ impl ScannerSizeSummaryExt for SizeSummary {
             tier = oi.transitioned_object.tier.clone();
         }
 
-        if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
-            *tier_stats = tier_stats.add(&TierStats {
-                total_size: u64::try_from(oi.size).unwrap_or(0),
-                num_versions: 1,
-                num_objects: u64::from(oi.is_latest),
-            });
+        let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
+        let tier_registry_is_empty = self.tier_stats.is_empty()
+            || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
+        let known_tier = tier != UNKNOWN_TIER && (builtin_tier || self.tier_stats.contains_key(&tier));
+
+        // With no configured tier, retain the historical empty-map shape for
+        // ordinary STANDARD/RRS objects. A non-built-in key is still an
+        // observable unknown and must create only the fixed bucket.
+        if tier_registry_is_empty && known_tier {
+            return;
+        }
+
+        let accounting_key = if known_tier { tier.clone() } else { UNKNOWN_TIER.to_string() };
+        let tier_stats = self.tier_stats.entry(accounting_key).or_default();
+        let physical_size = u64::try_from(oi.size.max(0)).unwrap_or(0);
+        *tier_stats = tier_stats.add(&TierStats {
+            total_size: physical_size,
+            num_versions: 1,
+            num_objects: u64::from(oi.is_latest),
+        });
+        if !known_tier {
+            self.unknown_tier_stats.record_dimensions(
+                &tier,
+                u64::try_from(logical_size).unwrap_or(u64::MAX),
+                physical_size,
+                1,
+                u64::from(oi.is_latest),
+            );
         }
     }
 }
@@ -344,6 +368,10 @@ pub struct DataUsageCacheInfo {
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
     pub cache_key_format: u16,
+    /// Registry generation used for the completed/partial scan. This is
+    /// process-local audit data; older cache writers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_generation: Option<u64>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -353,7 +381,7 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let mut state = serializer.serialize_map(Some(16))?;
+        let mut state = serializer.serialize_map(Some(17))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
@@ -370,6 +398,7 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
         state.serialize_entry("cache_key_format", &self.cache_key_format)?;
+        state.serialize_entry("tier_registry_generation", &self.tier_registry_generation)?;
         state.end()
     }
 }
@@ -390,6 +419,17 @@ pub(crate) enum DataUsageCachePrepareOutcome {
 }
 
 impl DataUsageCache {
+    /// Reconcile tier keys loaded from an older cache against the registry
+    /// frozen for this scan. New metadata is already routed through
+    /// `UNKNOWN_TIER`; this pass handles retired keys that predate that rule.
+    pub(crate) fn fold_retired_tiers(&mut self, tier_names: &[String]) {
+        for entry in self.cache.values_mut() {
+            if let Some(tiers) = entry.all_tier_stats.as_mut() {
+                tiers.fold_unknown_tiers(tier_names.iter().map(String::as_str));
+            }
+        }
+    }
+
     /// Prefix-level usage query over this (writer-side) cache; see
     /// [`prefix_usage_in_cache`] for the semantics
     /// (rustfs/backlog#1872).
@@ -875,6 +915,7 @@ impl DataUsageCache {
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
             tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: flat.unknown_tier_stats.filter(|stats| !stats.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()
