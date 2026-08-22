@@ -46,7 +46,7 @@ use std::sync::{
     Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::{net::TcpStream, sync::RwLock, time};
@@ -1229,8 +1229,55 @@ pub(crate) async fn heal_bucket_local_on_disks(
     opts: &HealOpts,
     disks: Vec<Option<DiskStore>>,
 ) -> Result<HealResultItem> {
+    let fenced_pools = decommission_suspended_pools_for_heal().await;
+    heal_bucket_local_on_disks_with_fence(bucket, opts, disks, &fenced_pools).await
+}
+
+/// Pool indices this node currently considers suspended by decommission
+/// (draining, or terminal but not yet cleared). Resolved live at execution
+/// time so a dispatcher acting on a stale pool assignment still cannot
+/// authorize bucket-volume mutations on a source pool being decommissioned.
+async fn decommission_suspended_pools_for_heal() -> BTreeSet<usize> {
+    let Some(store) = runtime_sources::object_store_handle() else {
+        return BTreeSet::new();
+    };
+    let pool_meta = store.pool_meta.read().await;
+    (0..pool_meta.pools.len())
+        .filter(|&idx| pool_meta.is_suspended(idx))
+        .collect()
+}
+
+fn disk_pool_index(disk: &DiskStore) -> Option<usize> {
+    usize::try_from(disk.endpoint().pool_idx).ok()
+}
+
+/// Drive-state marker reported for bucket-heal drives on decommission-suspended
+/// pools; those drives are never stat'ed, created, or deleted by heal.
+fn fenced_decommission_drive_state() -> DriveState {
+    DriveState::Unknown("skipped-decommission-suspended".to_string())
+}
+
+pub(crate) async fn heal_bucket_local_on_disks_with_fence(
+    bucket: &str,
+    opts: &HealOpts,
+    disks: Vec<Option<DiskStore>>,
+    fenced_pools: &BTreeSet<usize>,
+) -> Result<HealResultItem> {
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
     let after_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
+
+    // Fence first from a plain snapshot so every per-disk future sees the same
+    // decision regardless of when it runs.
+    let mut fenced_disks = vec![false; disks.len()];
+    let mut fenced_pool_idxs: BTreeSet<usize> = BTreeSet::new();
+    for (index, disk) in disks.iter().enumerate() {
+        if let Some(pool_idx) = disk.as_ref().and_then(disk_pool_index)
+            && fenced_pools.contains(&pool_idx)
+        {
+            fenced_disks[index] = true;
+            fenced_pool_idxs.insert(pool_idx);
+        }
+    }
 
     let mut futures = Vec::new();
     for (index, disk) in disks.iter().enumerate() {
@@ -1238,7 +1285,14 @@ pub(crate) async fn heal_bucket_local_on_disks(
         let bucket = bucket.to_string();
         let bs_clone = before_state.clone();
         let as_clone = after_state.clone();
+        let fenced_disks = fenced_disks.clone();
         futures.push(async move {
+            if fenced_disks[index] {
+                let skipped = fenced_decommission_drive_state().to_string();
+                bs_clone.write().await[index] = skipped.clone();
+                as_clone.write().await[index] = skipped;
+                return None;
+            }
             let disk = match disk {
                 Some(disk) => disk,
                 None => {
@@ -1315,7 +1369,7 @@ pub(crate) async fn heal_bucket_local_on_disks(
     if opts.remove && !bucket.starts_with(disk::RUSTFS_META_BUCKET) && !is_all_buckets_not_found(&errs) {
         let mut futures = Vec::new();
         for (index, disk) in disks.iter().enumerate() {
-            if matches!(errs[index].as_ref(), Some(Error::DiskNotFound | Error::VolumeNotFound)) {
+            if fenced_disks[index] || matches!(errs[index].as_ref(), Some(Error::DiskNotFound | Error::VolumeNotFound)) {
                 continue;
             }
             let Some(disk) = disk.clone() else {
@@ -1363,7 +1417,11 @@ pub(crate) async fn heal_bucket_local_on_disks(
             let disk = disk.clone();
             let bucket = bucket.to_string();
             let bs_clone = before_state.clone();
+            let fenced_disks = fenced_disks.clone();
             futures.push(async move {
+                if fenced_disks[idx] {
+                    return (idx, None);
+                }
                 if bs_clone.read().await[idx] == DriveState::Missing.to_string() {
                     let Some(disk) = disk.as_ref() else {
                         return (idx, Some(Error::DiskNotFound));
@@ -1407,6 +1465,15 @@ pub(crate) async fn heal_bucket_local_on_disks(
             endpoint: disk.clone().map(|s| s.to_string()).unwrap_or_default(),
             state: state.to_string(),
         });
+    }
+
+    if !fenced_pool_idxs.is_empty() {
+        let pools = fenced_pool_idxs
+            .iter()
+            .map(|idx| idx.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        res.detail = format!("skipped: bucket-volume heal fenced on decommission-suspended pool(s): {pools}");
     }
 
     match operation_error {
@@ -1905,6 +1972,169 @@ mod tests {
 
         for disk in disks {
             disk.stat_volume(bucket).await.expect("bucket should exist after heal");
+        }
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_fenced_skips_decommission_suspended_pool_volumes() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for bucket heal decommission fence regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 2), (1, 2)], "heal-bucket-decom-fence").await;
+        let bucket = "fenced-bucket";
+
+        // Pool 0 still holds the bucket; pool 1 (suspended source pool) has
+        // already had its volumes removed by decommissioning.
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should be created on pool 0");
+        disks[1]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should be created on pool 0");
+        for disk in disks.iter().skip(2) {
+            disk.stat_volume(bucket)
+                .await
+                .expect_err("pool 1 should start without the bucket volume");
+        }
+
+        let fenced_pools: BTreeSet<usize> = [1].into();
+        let result = heal_bucket_local_on_disks_with_fence(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+            &fenced_pools,
+        )
+        .await
+        .expect("fenced bucket heal should report a skipped classification instead of failing");
+
+        assert!(
+            result.detail.contains("skipped") && result.detail.contains('1'),
+            "result must classify the fenced pools explicitly, got detail: {:?}",
+            result.detail
+        );
+        assert_eq!(result.before.drives.len(), 4);
+        assert_eq!(result.after.drives.len(), 4);
+        for drive in result.before.drives.iter().take(2) {
+            assert_eq!(drive.state, DriveState::Ok.to_string(), "pool 0 drives must be inspected");
+        }
+        for drive in result.after.drives.iter().skip(2) {
+            assert_eq!(
+                drive.state,
+                fenced_decommission_drive_state().to_string(),
+                "pool 1 drives must be reported as skipped"
+            );
+        }
+
+        // The suspended source pool's volumes must not have been recreated.
+        for (idx, disk) in disks.iter().enumerate() {
+            if idx < 2 {
+                disk.stat_volume(bucket).await.expect("pool 0 bucket volume must survive");
+            } else {
+                assert!(
+                    matches!(disk.stat_volume(bucket).await, Err(Error::VolumeNotFound)),
+                    "pool 1 volume {idx} must stay absent after a fenced heal"
+                );
+            }
+        }
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_fenced_still_heals_active_pools() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for active-pool heal regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 2), (1, 2)], "heal-bucket-active-heal").await;
+        let bucket = "active-bucket";
+        disks[0]
+            .make_volume(bucket)
+            .await
+            .expect("bucket should exist on the first disk");
+
+        let fenced_pools: BTreeSet<usize> = [1].into();
+        let result = heal_bucket_local_on_disks_with_fence(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+            &fenced_pools,
+        )
+        .await
+        .expect("fenced bucket heal should still repair active pool volumes");
+
+        assert!(!result.detail.is_empty(), "fencing pool 1 must still produce a skipped classification");
+        assert_eq!(
+            result.after.drives[0].state,
+            DriveState::Ok.to_string(),
+            "existing pool 0 volume must stay healthy"
+        );
+        assert_eq!(
+            result.after.drives[1].state,
+            DriveState::Ok.to_string(),
+            "missing pool 0 volume must be recreated"
+        );
+        disks[1]
+            .stat_volume(bucket)
+            .await
+            .expect("missing volume on the active pool must be recreated");
+
+        reset_local_disk_test_state().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_bucket_local_fenced_keeps_suspended_pool_volumes_on_remove() {
+        reset_local_disk_test_state().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for fenced remove regression");
+        let disks = init_test_local_disks_for_pools(&temp_dir, &[(0, 2), (1, 2)], "heal-bucket-fenced-remove").await;
+        let bucket = "remove-fenced-bucket";
+        for disk in disks.iter() {
+            disk.make_volume(bucket).await.expect("bucket should exist on every disk");
+        }
+
+        let fenced_pools: BTreeSet<usize> = [1].into();
+        let result = heal_bucket_local_on_disks_with_fence(
+            bucket,
+            &HealOpts {
+                remove: true,
+                recreate: false,
+                ..Default::default()
+            },
+            disks.iter().cloned().map(Some).collect(),
+            &fenced_pools,
+        )
+        .await
+        .expect("fenced bucket removal should succeed on the active pool");
+
+        assert!(
+            result.detail.contains("skipped"),
+            "removal must classify fenced pools explicitly, got detail: {:?}",
+            result.detail
+        );
+        for (idx, disk) in disks.iter().enumerate() {
+            if idx < 2 {
+                assert!(
+                    matches!(disk.stat_volume(bucket).await, Err(Error::VolumeNotFound)),
+                    "pool 0 volume {idx} should be removed by heal"
+                );
+            } else {
+                disk.stat_volume(bucket)
+                    .await
+                    .expect("suspended pool volume must be preserved from heal deletion");
+            }
         }
 
         reset_local_disk_test_state().await;
