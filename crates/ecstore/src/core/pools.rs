@@ -1247,6 +1247,7 @@ fn is_decommission_cancel_requested(cancel_signal: bool, pool: Option<&PoolStatu
             .is_some_and(|info| info.canceled)
 }
 
+#[cfg(test)]
 fn should_skip_canceled_decommission_routine(cancel_signal: bool, pool: Option<&PoolStatus>) -> bool {
     cancel_signal
         && pool
@@ -2854,13 +2855,28 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
+        self.decommission_cancel_with_generation(idx, None).await
+    }
+
+    async fn decommission_cancel_with_generation(&self, idx: usize, generation: Option<OffsetDateTime>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
 
         let _start_guard = self.start_gate.lock().await;
-        let canceled_worker = self.cancel_decommission_routine_and_wait(idx).await;
+        let canceled_worker = if generation.is_some() {
+            false
+        } else {
+            self.cancel_decommission_routine_and_wait(idx).await
+        };
 
         let (should_save_pool_meta, should_reload_pool_meta, already_canceled, previous_pool_meta) = {
             let mut lock = self.pool_meta.write().await;
+            if let Some(generation) = generation {
+                match ensure_decommission_generation(&lock, idx, generation) {
+                    Ok(()) => {}
+                    Err(Error::OperationCanceled) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
+            }
             let mut already_canceled = false;
             let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
                 if let Some(info) = pool.decommission.as_ref() {
@@ -2887,6 +2903,12 @@ impl ECStore {
                 changed.then_some(previous_pool_meta),
             )
         };
+
+        if generation.is_some() && should_save_pool_meta {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
+        }
+        let canceled_worker = canceled_worker || (generation.is_some() && should_save_pool_meta);
 
         if !canceled_worker && !already_canceled {
             warn!(
@@ -2960,21 +2982,48 @@ impl ECStore {
         Ok(())
     }
 
-    async fn promote_queued_decommission(&self, idx: usize) -> Result<()> {
-        let promoted = {
+    async fn promote_queued_decommission(&self, idx: usize) -> Result<OffsetDateTime> {
+        // Serialize promotion and generation capture with clear/restart transitions.
+        let (promoted, generation, save_error) = {
+            let _start_guard = self.start_gate.lock().await;
             let mut pool_meta = self.pool_meta.write().await;
-            pool_meta.promote_queued_decommission(idx)
+            let promoted = pool_meta.promote_queued_decommission(idx);
+            drop(pool_meta);
+
+            let save_error = if promoted {
+                self.save_current_pool_meta().await.err()
+            } else {
+                None
+            };
+
+            let generation = self.active_decommission_generation(idx).await?;
+            (promoted, generation, save_error)
         };
 
-        if promoted {
-            self.save_current_pool_meta().await?;
-            if let Some(notification_sys) = runtime_sources::notification_sys() {
-                let stage = format!("promote_queued_decommission for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+        if let Some(err) = save_error {
+            resolve_decommission_terminal_mark_after_error_result(
+                self.decommission_failed_with_generation(idx, Some(generation)).await,
+                idx,
+                &err,
+            )?;
+            return Err(err);
+        }
+
+        if promoted && let Some(notification_sys) = runtime_sources::notification_sys() {
+            let stage = format!("promote_queued_decommission for pool {idx}");
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            {
+                resolve_decommission_terminal_mark_after_error_result(
+                    self.decommission_failed_with_generation(idx, Some(generation)).await,
+                    idx,
+                    &err,
+                )?;
+                return Err(err);
             }
         }
 
-        Ok(())
+        Ok(generation)
     }
 
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
@@ -4158,36 +4207,26 @@ impl ECStore {
         idx: usize,
         entry_budget: Arc<Semaphore>,
     ) -> Result<()> {
-        if let Err(err) = self.promote_queued_decommission(idx).await {
-            resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
-            return Err(err);
-        }
+        let generation = match self.promote_queued_decommission(idx).await {
+            Ok(generation) => generation,
+            Err(Error::OperationCanceled) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        defer!(|| async {
+            self.clear_decommission_canceler_for_generation(idx, generation).await;
+        });
+
         if rx.is_cancelled() {
-            let already_canceled = {
-                let pool_meta = self.pool_meta.read().await;
-                should_skip_canceled_decommission_routine(true, pool_meta.pools.get(idx))
-            };
-            if already_canceled {
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    state = "canceled_preserved",
-                    "Decommission routine skipped because pool is already canceled"
-                );
-                return Ok(());
-            }
-            if let Err(err) = self.decommission_cancel(idx).await {
-                resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
+            if let Err(err) = self.decommission_cancel_with_generation(idx, Some(generation)).await {
+                resolve_decommission_terminal_mark_after_error_result(
+                    self.decommission_failed_with_generation(idx, Some(generation)).await,
+                    idx,
+                    &err,
+                )?;
                 return Err(err);
             }
             return Ok(());
         }
-        let generation = self.active_decommission_generation(idx).await?;
-        defer!(|| async {
-            self.clear_decommission_canceler_for_generation(idx, generation).await;
-        });
         let result = self.decommission_in_background(rx.clone(), idx, entry_budget).await;
 
         let (final_state, canceled, cmd_line) = {
@@ -7878,6 +7917,16 @@ mod pools_tests {
             .expect("decommission metadata should exist")
             .queued = true;
         assert!(ensure_decommission_generation(&meta, 0, generation).is_err());
+
+        let replacement_generation = generation + Duration::seconds(2);
+        let info = meta.pools[0]
+            .decommission
+            .as_mut()
+            .expect("decommission metadata should exist");
+        info.queued = false;
+        info.start_time = Some(replacement_generation);
+        assert!(ensure_decommission_generation(&meta, 0, generation).is_err());
+        assert!(ensure_decommission_generation(&meta, 0, replacement_generation).is_ok());
     }
 
     #[test]
