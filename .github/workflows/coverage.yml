@@ -48,6 +48,10 @@ on:
     # e2e-replication-nightly (04:00) and performance-ab (06:00) lanes.
     - cron: "43 7 * * 0"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.
 permissions:
