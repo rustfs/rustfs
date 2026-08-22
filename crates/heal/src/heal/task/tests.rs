@@ -2124,6 +2124,7 @@ async fn erasure_set_heal_applies_usage_baseline_to_progress() {
         usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
             objects_count: 10,
             bytes: 8,
+            generation: Some(1),
         })),
         ..Default::default()
     });
@@ -2147,6 +2148,8 @@ async fn erasure_set_heal_applies_usage_baseline_to_progress() {
     let progress = task.get_progress().await;
     assert_eq!(progress.objects_total_count, 10);
     assert_eq!(progress.objects_total_size, 8);
+    assert!(progress.baseline_generation.is_some());
+    assert!(progress.baseline_known);
     assert_eq!(progress.bytes_processed, 2);
     assert!((progress.progress_percentage - 25.0).abs() < 0.001);
 }

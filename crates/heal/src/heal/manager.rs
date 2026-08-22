@@ -2012,16 +2012,44 @@ impl HealManager {
         }
 
         let mut snapshot = HealProgress::default();
+        let mut has_object_sweep = false;
+        let mut all_object_baselines_known = true;
+        let mut counter_overflow = false;
+        let mut stage_current = 0_u64;
+        let mut stage_total = 0_u64;
         for task in active_tasks {
             let progress = task.get_progress().await;
-            snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
-            snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
-            snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
-            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
-            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
-            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
-            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
-            snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
+            let object_sweep = matches!(progress.kind, crate::heal::progress::HealProgressKind::ObjectSweep);
+            has_object_sweep |= object_sweep;
+            if object_sweep {
+                all_object_baselines_known &= progress.baseline_known;
+            }
+            counter_overflow |=
+                progress.counter_unknown || matches!(progress.progress_state, crate::heal::progress::HealProgressState::Unknown);
+            match stage_current.checked_add(progress.stage_current) {
+                Some(sum) => stage_current = sum,
+                None => counter_overflow = true,
+            }
+            match stage_total.checked_add(progress.stage_total) {
+                Some(sum) => stage_total = sum,
+                None => counter_overflow = true,
+            }
+            for (target, value) in [
+                (&mut snapshot.objects_scanned, progress.objects_scanned),
+                (&mut snapshot.objects_healed, progress.objects_healed),
+                (&mut snapshot.objects_failed, progress.objects_failed),
+                (&mut snapshot.skipped_objects, progress.skipped_objects),
+                (&mut snapshot.skipped_new_versions, progress.skipped_new_versions),
+                (&mut snapshot.skipped_ilm_expired, progress.skipped_ilm_expired),
+                (&mut snapshot.objects_total_count, progress.objects_total_count),
+                (&mut snapshot.objects_total_size, progress.objects_total_size),
+                (&mut snapshot.bytes_processed, progress.bytes_processed),
+            ] {
+                match target.checked_add(value) {
+                    Some(sum) => *target = sum,
+                    None => counter_overflow = true,
+                }
+            }
             snapshot.start_time = match (snapshot.start_time, progress.start_time) {
                 (Some(current), Some(next)) => Some(current.min(next)),
                 (None, next) => next,
@@ -2036,7 +2064,36 @@ impl HealManager {
                 snapshot.current_object = progress.current_object;
             }
         }
-        snapshot.refresh_progress_percentage();
+        snapshot.kind = if has_object_sweep {
+            crate::heal::progress::HealProgressKind::ObjectSweep
+        } else {
+            crate::heal::progress::HealProgressKind::Stage
+        };
+        snapshot.stage_current = stage_current;
+        snapshot.stage_total = stage_total;
+        snapshot.baseline_known = has_object_sweep && all_object_baselines_known;
+        snapshot.progress_state = if counter_overflow {
+            crate::heal::progress::HealProgressState::Unknown
+        } else if has_object_sweep && !all_object_baselines_known {
+            crate::heal::progress::HealProgressState::Indeterminate
+        } else if has_object_sweep {
+            crate::heal::progress::HealProgressState::Running
+        } else if stage_total == 0 {
+            crate::heal::progress::HealProgressState::Indeterminate
+        } else {
+            crate::heal::progress::HealProgressState::Running
+        };
+        if counter_overflow {
+            snapshot.progress_percentage = 0.0;
+        } else if !has_object_sweep {
+            snapshot.progress_percentage = if stage_total == 0 {
+                0.0
+            } else {
+                ((stage_current as f64 / stage_total as f64) * 100.0).min(99.999)
+            };
+        } else {
+            snapshot.refresh_progress_percentage();
+        }
         snapshot.refresh_estimated_completion_time();
         Some(snapshot)
     }

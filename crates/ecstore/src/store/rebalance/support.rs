@@ -271,7 +271,7 @@ pub(super) fn resolve_latest_object_info_candidates(
             .filter(|candidate| latest_candidate_mod_time(candidate) == Some(latest_mod_time))
             .collect::<Vec<_>>();
 
-        latest_candidates.sort_by(|left, right| right.idx.cmp(&left.idx));
+        latest_candidates.sort_by_key(|left| std::cmp::Reverse(left.idx));
 
         let Some(winner) = latest_candidates.first() else {
             return Err(Error::ErasureReadQuorum);
