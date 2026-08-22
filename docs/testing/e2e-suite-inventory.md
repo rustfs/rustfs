@@ -41,6 +41,7 @@
 | copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
 | create_bucket_region_test | 2 | ✅ |
+| data_usage_test | 2 |  |
 | degraded_read_eof_regression_test | 3 |  |
 | delete_marker_migration_semantics_test | 2 | ✅ |
 | delete_object_no_content_length_test | 1 |  |
@@ -99,4 +100,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 575 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 453 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 577 tests across 83 modules · PR smoke: 163 tests / 36 modules · merge/main full: 455 tests / 74 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
