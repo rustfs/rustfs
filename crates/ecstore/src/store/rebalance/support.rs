@@ -16,7 +16,10 @@ use std::collections::HashMap;
 
 use crate::error::{Error, Result, StorageError, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{ObjectInfo, ObjectOptions};
-use rustfs_utils::http::metadata_compat::strip_internal_prefix;
+use rustfs_utils::http::metadata_compat::{
+    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+    strip_internal_prefix_preserving_case,
+};
 use rustfs_utils::path::decode_dir_object;
 use time::OffsetDateTime;
 
@@ -160,6 +163,24 @@ struct LatestUserDefinedIdentity {
     other: HashMap<String, String>,
 }
 
+fn normalize_internal_identity_suffix(key: &str) -> Option<String> {
+    let suffix = strip_internal_prefix_preserving_case(key)?;
+
+    for dynamic_prefix in [
+        SUFFIX_REPLICATION_RESET_ARN_PREFIX,
+        SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+    ] {
+        let prefix_len = dynamic_prefix.len();
+        if let (Some(prefix), Some(remainder)) = (suffix.get(..prefix_len), suffix.get(prefix_len..))
+            && prefix.eq_ignore_ascii_case(dynamic_prefix)
+        {
+            return Some(format!("{dynamic_prefix}{remainder}"));
+        }
+    }
+
+    Some(suffix.to_lowercase())
+}
+
 fn normalize_user_defined_identity(user_defined: &HashMap<String, String>) -> Option<LatestUserDefinedIdentity> {
     let mut identity = LatestUserDefinedIdentity {
         internal: HashMap::with_capacity(user_defined.len()),
@@ -167,7 +188,7 @@ fn normalize_user_defined_identity(user_defined: &HashMap<String, String>) -> Op
     };
 
     for (key, value) in user_defined {
-        if let Some(suffix) = strip_internal_prefix(key) {
+        if let Some(suffix) = normalize_internal_identity_suffix(key) {
             if identity
                 .internal
                 .insert(suffix, value.clone())

@@ -1704,6 +1704,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_latest_object_info_candidates_preserves_dynamic_internal_metadata_identity_case() {
+        for suffix_prefix in ["replication-reset-", "replication-delete-marker-version-"] {
+            let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+            let mut rustfs_alias = base.clone();
+            rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!(
+                    "X-RUSTFS-INTERNAL-{}{suffix}",
+                    suffix_prefix.to_uppercase(),
+                    suffix = "arn:aws:s3:::Bucket"
+                ),
+                "value".to_string(),
+            )]));
+            let mut minio_alias = base.clone();
+            minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::Bucket"),
+                "value".to_string(),
+            )]));
+
+            let (_, idx) = resolve_latest_object_info_candidates(
+                vec![
+                    LatestObjectInfoCandidate {
+                        info: Some(rustfs_alias.clone()),
+                        idx: 0,
+                        err: None,
+                    },
+                    LatestObjectInfoCandidate {
+                        info: Some(minio_alias),
+                        idx: 1,
+                        err: None,
+                    },
+                ],
+                "bucket",
+                "object",
+                &ObjectOptions::default(),
+            )
+            .expect("dynamic internal aliases with the same target should resolve");
+            assert_eq!(idx, 1);
+
+            let mut different_target_case = base;
+            different_target_case.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::bucket"),
+                "value".to_string(),
+            )]));
+
+            assert_equal_time_identity_conflict(rustfs_alias, different_target_case);
+        }
+    }
+
+    #[test]
     fn resolve_latest_object_info_candidates_rejects_conflicting_internal_metadata_aliases_in_one_candidate() {
         let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
         let mut first = base.clone();
