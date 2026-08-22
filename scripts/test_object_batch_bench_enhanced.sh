@@ -74,13 +74,19 @@ FAKE_WARP="${TMP_DIR}/fake-warp"
 cat >"$FAKE_WARP" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ " $* " == *" --analyze.v "* ]]
+[[ " $* " == *" --no-color "* ]]
 cat <<'LOG'
  -       PUT Average: 161 Obj/s, 5.0MiB/s; Current 161 Obj/s, 5.0MiB/s.
-Report: GET. Concurrency: 64. Ran: 7s
+Operation: GET. Concurrency: 64. Ran: 7s
+Requests considered: 1000:
  * Average: 653.90 MiB/s, 20925.58 obj/s
- * Reqs: Avg: 3.5ms, 50%: 2.0ms, 90%: 3.6ms, 99%: 24.1ms, Fastest: 0.2ms, Slowest: 607.7ms, StdDev: 20.6ms
+ * Avg: 3.5ms, 50%: 2.0ms, 90%: 3.6ms, 99%: 24.1ms, Fastest: 0.2ms, Slowest: 607.7ms, StdDev: 20.6ms
 Throughput, split into 7 x 1s:
 LOG
+if [[ "${FAKE_WARP_ERRORS:-0}" == "1" ]]; then
+  echo 'Total Errors: 1.'
+fi
 EOF
 chmod +x "$FAKE_WARP"
 
@@ -102,6 +108,32 @@ chmod +x "$FAKE_WARP"
   --require-server-provenance >/dev/null 2>&1
 
 rg -q '^32767B,warp,1,1,128,ok,0,[^,]+,[^,]+,653.90 MiB/s,685663846.400000,20925.58,3.5 ms,3.500000,[^,]+,3.6 ms,3.600000,24.1 ms,24.100000$' "${TMP_DIR}/fake-warp-run/round_results.csv"
+
+cat >"${TMP_DIR}/warp-no-details.log" <<'EOF'
+warp: Starting benchmark in 3s...
+Operation: PUT. Concurrency: 8
+ * Average: 2.76 MiB/s, 707.03 obj/s
+EOF
+"$RUNNER" --extract-metrics-from-log "${TMP_DIR}/warp-no-details.log" >"${TMP_DIR}/warp-no-details.csv"
+rg -qx '2.76 MiB/s,2894069.760000,707.03,N/A,N/A,N/A,N/A,N/A,N/A' "${TMP_DIR}/warp-no-details.csv"
+
+if FAKE_WARP_ERRORS=1 "$RUNNER" \
+  --tool warp \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key test-access \
+  --secret-key test-secret \
+  --sizes 32767B \
+  --rounds 1 \
+  --retry-per-round 1 \
+  --retry-sleep-secs 1 \
+  --cooldown-secs 0 \
+  --duration 1s \
+  --out-dir "${TMP_DIR}/fake-warp-errors" \
+  --warp-bin "$FAKE_WARP" >/dev/null 2>&1; then
+  echo "expected Warp request errors to fail the benchmark" >&2
+  exit 1
+fi
+rg -q ',failed,1,' "${TMP_DIR}/fake-warp-errors/round_results.csv"
 
 "$RUNNER" \
   --tool warp \
