@@ -87,7 +87,7 @@ async fn test_head_reports_managed_metadata_for_sse_s3() -> Result<(), Box<dyn s
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -147,7 +147,7 @@ async fn test_head_reports_managed_metadata_for_sse_kms_and_copy() -> Result<(),
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -250,7 +250,7 @@ async fn test_multipart_upload_writes_encrypted_data() -> Result<(), Box<dyn std
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

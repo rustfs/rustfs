@@ -4154,6 +4154,9 @@ impl ECStore {
             )
             .await?;
 
+            let source_cleanup_mutation_fence = self
+                .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
+                .await?;
             let cleanup_result = run_decommission_side_effect(&rx, &operation_gate, || async {
                 data_movement::cleanup_source_entry_if_unchanged(
                     set.clone(),
@@ -4166,6 +4169,7 @@ impl ECStore {
                         lifecycle_guard: bucket_incarnation_fence
                             .as_ref()
                             .and_then(|guard| guard.namespace_lock_guard()),
+                        object_mutation_fence: Some(&source_cleanup_mutation_fence),
                     },
                     "decommission",
                 )
@@ -4269,6 +4273,29 @@ impl ECStore {
             "Decommission entry completed"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_entry_for_test(
+        self: &Arc<Self>,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+    ) -> Result<()> {
+        self.decommission_entry(
+            CancellationToken::new(),
+            idx,
+            OffsetDateTime::now_utc(),
+            entry,
+            bucket,
+            set,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -5239,15 +5266,20 @@ impl ECStore {
     ) -> Result<()> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
-        let result = data_movement::migrate_object(
+        let mut migration = tokio::task::JoinSet::new();
+        migration.spawn(data_movement::migrate_decommission_object(
             self,
             pool_idx,
             bucket.clone(),
             rd,
             expected_bucket_incarnation_id,
             "decommission_object",
-        )
-        .await;
+        ));
+        let result = migration
+            .join_next()
+            .await
+            .ok_or_else(|| Error::other("decommission migration task was not started"))?
+            .map_err(|err| Error::other(format!("decommission migration task join error: {err}")))?;
         if result.is_ok() {
             warn!("decommission_object: migrated {} {}", &bucket, &object_name);
         }
