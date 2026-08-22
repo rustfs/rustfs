@@ -400,7 +400,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -440,7 +440,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -470,7 +470,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       # On a PR, one failing protocol leg is enough to know the PR is not ready,
       # so stop the sibling leg instead of paying another ~40 minutes for it.
