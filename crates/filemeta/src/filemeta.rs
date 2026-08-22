@@ -90,6 +90,22 @@ fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
 
+/// xl.meta key marking a tier free-version record.
+///
+/// A free version is a delete-marker-shaped cleanup hint appended by
+/// [`MetaObject::delete_version`] when a version whose remote transition
+/// completed is removed from xl.meta; it carries the remote tier identity for
+/// an idempotent remote delete and is never a user-visible version
+/// (`num_versions` excludes it). While the record exists it is consumed by the
+/// lifecycle free-version recovery scan and the usage scanner, which re-enqueue
+/// the pending remote delete, and by heal metadata walks. On S3 and lifecycle
+/// delete paths the same obligation is also carried by a committed tier-journal
+/// entry; deletes without such an entry (for example a removed version whose
+/// transition state decodes as unknown) rely on this record alone until the
+/// worker removes it after a successful remote delete. Decommission does not
+/// preserve these semantics: its exact inventory keeps the records inline in
+/// `versions` and the migration loop treats them as ordinary delete markers —
+/// see docs/architecture/decommission-compatibility.md.
 pub const FREE_VERSION: &str = "free-version";
 
 pub const TRANSITION_STATUS: &str = "transition-status";

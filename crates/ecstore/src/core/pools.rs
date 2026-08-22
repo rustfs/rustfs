@@ -1130,6 +1130,23 @@ fn should_cleanup_decommission_source_entry(decommissioned: usize, total_version
     decommissioned.saturating_add(expired) == total_versions
 }
 
+/// Disposition reason logged for tier free-version records that decommission
+/// skips instead of migrating.
+const DECOMMISSION_FREE_VERSION_SKIP_REASON: &str = "tier_free_version_not_migrated";
+
+/// Counts the tier free-version records present in a decommission entry
+/// inventory. The exact loader (`load_file_info_versions_exact`) keeps these
+/// records inline in `versions` instead of separating them into
+/// `free_versions`, and the migration loop then routes them through the
+/// generic delete-marker path: the free-version flag and its remote-tier
+/// identity are never carried to the target pool, and a lone record is skipped
+/// by the empty-delete-marker rule. Accounting for them here keeps the final
+/// sweep from silently omitting records whose free-version disposition was
+/// dropped (see docs/architecture/decommission-compatibility.md).
+fn decommission_free_versions_skipped(fivs: &FileInfoVersions) -> usize {
+    fivs.versions.iter().filter(|version| version.tier_free_version()).count()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     dead_code,
@@ -3096,6 +3113,22 @@ impl ECStore {
 
         fivs.versions
             .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
+
+        let skipped_free_versions = decommission_free_versions_skipped(&fivs);
+        if skipped_free_versions > 0 {
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                skipped_free_versions,
+                reason = DECOMMISSION_FREE_VERSION_SKIP_REASON,
+                state = "free_versions_skipped",
+                "Decommission skipped free-version migration"
+            );
+        }
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -5458,11 +5491,12 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 #[cfg(test)]
 mod pools_tests {
     use super::{
-        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF,
-        DecomBucketInfo, DecommissionStartPoolState, DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta,
-        PoolSpaceInfo, PoolStatus, apply_decommission_status_space_info, bind_decommission_cancelers,
-        bind_missing_decommission_cancelers, cancel_decommission_canceler, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        DECOMMISSION_FREE_VERSION_SKIP_REASON, DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
+        DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF, DecomBucketInfo, DecommissionStartPoolState, DecommissionTerminalState,
+        ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, apply_decommission_status_space_info,
+        bind_decommission_cancelers, bind_missing_decommission_cancelers, cancel_decommission_canceler,
+        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
+        decommission_free_versions_skipped, decommission_item_size, decommission_meta_bucket_options,
         decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
         ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
@@ -6760,6 +6794,27 @@ mod pools_tests {
     #[test]
     fn test_should_cleanup_decommission_source_entry_rejects_counter_overrun() {
         assert!(!should_cleanup_decommission_source_entry(2, 2, 1));
+    }
+
+    #[test]
+    fn decommission_free_version_accounting_reports_skipped_records() {
+        let mut fivs = FileInfoVersions::default();
+        assert_eq!(decommission_free_versions_skipped(&fivs), 0);
+
+        fivs.versions.push(FileInfo {
+            name: "object.txt".to_string(),
+            ..Default::default()
+        });
+        let mut free_one = FileInfo::default();
+        free_one.set_tier_free_version();
+        fivs.versions.push(free_one);
+        let mut free_two = FileInfo::default();
+        free_two.set_tier_free_version();
+        free_two.transition_tier = "WARM".to_string();
+        fivs.versions.push(free_two);
+
+        assert_eq!(decommission_free_versions_skipped(&fivs), 2);
+        assert_eq!(DECOMMISSION_FREE_VERSION_SKIP_REASON, "tier_free_version_not_migrated");
     }
 
     #[test]
