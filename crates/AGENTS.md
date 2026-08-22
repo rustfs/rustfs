@@ -19,7 +19,9 @@ Applies to all paths under `crates/`.
 
 - Document lock acquisition order when a module uses multiple locks. Never acquire the same set of locks in different orders across code paths.
 - Never hold a `tokio::sync::RwLock`/`Mutex` write guard across `.await` points unless the critical section is unavoidably async and the hold time is bounded.
-- Prefer `compare_exchange` loops over load-then-store for concurrent counters (peak values, adaptive heuristics).
+- Prefer direct atomic `fetch_*` operations for unconditional updates and
+  `compare_exchange` loops only for conditional updates such as peaks or
+  adaptive state.
 - When resetting multi-field atomic statistics, use a version/sequence counter or accept that concurrent readers may see partial snapshots; document the tradeoff.
 - `std::sync::Mutex` is acceptable in async context only when held for a brief, non-`await`-containing critical section. If in doubt, use `tokio::sync::Mutex`.
 
@@ -40,7 +42,9 @@ Applies to all paths under `crates/`.
 - Keep unit tests close to the module they test.
 - Keep integration tests under each crate's `tests/` directory.
 - Add regression tests for bug fixes and behavior changes.
-- Every test function must contain at least one `assert!`/`assert_eq!`/`assert_matches!`. A test that only calls code without asserting is not a test.
+- Every test needs an observable failure criterion. Direct assertions,
+  delegated assertions, snapshots/properties, `#[should_panic]`, and meaningful
+  `Result` failures are all valid; a call that can silently succeed is not.
 - In tests, prefer `.expect("context: what was being tested")` over bare `.unwrap()`. A test failure should tell you which operation failed and with what input.
 
 ## Async and Performance
