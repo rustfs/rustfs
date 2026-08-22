@@ -37,7 +37,7 @@ async fn test_bucket_default_sse_s3_put_object() -> Result<(), Box<dyn std::erro
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -159,7 +159,7 @@ async fn test_bucket_default_sse_kms_put_object() -> Result<(), Box<dyn std::err
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -278,7 +278,7 @@ async fn test_bucket_default_sse_kms_multipart_crc32() -> Result<(), Box<dyn std
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -475,7 +475,7 @@ async fn test_explicit_encryption_overrides_bucket_default() -> Result<(), Box<d
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -570,7 +570,7 @@ async fn test_sse_kms_without_key_id_populates_default() -> Result<(), Box<dyn s
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
