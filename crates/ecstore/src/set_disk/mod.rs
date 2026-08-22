@@ -97,7 +97,7 @@ use crate::storage_api_contracts::{
         CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations as _, MultipartUploadResult, PartInfo,
     },
     namespace::NamespaceLocking as _,
-    object::{DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::store::utils::is_reserved_or_invalid_bucket;

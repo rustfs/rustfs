@@ -41,7 +41,7 @@ use crate::set_disk::{
 };
 use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
-    object::{ObjectIO as _, ObjectOperations as _},
+    object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
 use parking_lot::Mutex as ParkingMutex;
 use rustfs_io_metrics::{
@@ -1216,6 +1216,14 @@ fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Ve
     (del_objects, del_errs)
 }
 
+fn return_batch_delete_lock_error_with_accounting(
+    objects: &[ObjectToDelete],
+    err: Error,
+) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+    let (deleted, errors) = return_batch_delete_lock_error(objects, err);
+    (deleted, errors, vec![None; objects.len()])
+}
+
 fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
     let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
     object_names.sort_unstable();
@@ -2312,6 +2320,22 @@ impl ECStore {
         result
     }
 
+    pub async fn delete_objects_with_tier_delete_journal_and_accounting(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let result = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, Some(Arc::clone(self)))
+            .await;
+        let success_count = result.1.iter().filter(|err| err.is_none()).count();
+        if success_count > 0 {
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+        }
+        result
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         self.handle_delete_object_with_journal(bucket, object, opts, None).await
@@ -2689,6 +2713,19 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let (deleted, errors, _) = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, tier_journal_api)
+            .await;
+        (deleted, errors)
+    }
+
+    pub(super) async fn handle_delete_objects_with_journal_and_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
             .iter()
@@ -2701,6 +2738,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
@@ -2714,7 +2752,7 @@ impl ECStore {
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
                 Ok(guard) => Some(guard),
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             }
         };
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
@@ -2726,21 +2764,21 @@ impl ECStore {
                 Err(err) => {
                     let message = err.to_string();
                     let errors = (0..objects.len()).map(|_| Some(Error::other(message.clone()))).collect();
-                    return (del_objects, errors);
+                    return (del_objects, errors, accounting);
                 }
             }
         }
         if !is_meta_bucketname(bucket)
             && let Err(err) = get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
         {
-            return return_batch_delete_lock_error(objects.as_slice(), err);
+            return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err);
         }
         let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
             None
         } else {
             Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
                 Ok(guard) => guard,
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             })
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
@@ -2750,7 +2788,7 @@ impl ECStore {
             let (state, incarnation_id, config_revision) =
                 match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
                     Ok(snapshot) => snapshot,
-                    Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                    Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
                 self.id,
@@ -2766,7 +2804,10 @@ impl ECStore {
         if let (Some(expected), Some(current)) = (opts.expected_bucket_incarnation_id, current_bucket_incarnation_id)
             && expected != current
         {
-            return return_batch_delete_lock_error(objects.as_slice(), StorageError::BucketNotFound(bucket.to_string()));
+            return return_batch_delete_lock_error_with_accounting(
+                objects.as_slice(),
+                StorageError::BucketNotFound(bucket.to_string()),
+            );
         }
         #[cfg(test)]
         if current_bucket_incarnation_id.is_some() {
@@ -2774,7 +2815,7 @@ impl ECStore {
         }
         let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
-            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+            Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
 
         let mut futures = Vec::with_capacity(self.pools.len());
@@ -2783,22 +2824,24 @@ impl ECStore {
             if self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
-            futures.push(pool.delete_objects(bucket, objects.clone(), opts.clone()));
+            futures.push(pool.delete_objects_with_accounting(bucket, objects.clone(), opts.clone()));
         }
 
         let results = join_all(futures).await;
 
         for idx in 0..del_objects.len() {
-            for (dels, errs) in results.iter() {
+            for (dels, errs, pool_accounting) in results.iter() {
                 if errs[idx].is_none() && dels[idx].found {
                     del_errs[idx] = None;
                     del_objects[idx] = dels[idx].clone();
+                    accounting[idx] = pool_accounting[idx].clone();
                     break;
                 }
 
                 if del_errs[idx].is_none() {
                     del_errs[idx] = errs[idx].clone();
                     del_objects[idx] = dels[idx].clone();
+                    accounting[idx] = pool_accounting[idx].clone();
                 }
             }
         }
@@ -2807,7 +2850,7 @@ impl ECStore {
             v.object_name = decode_dir_object(&v.object_name);
         });
 
-        (del_objects, del_errs)
+        (del_objects, del_errs, accounting)
 
         // let mut futures = Vec::with_capacity(objects.len());
 
