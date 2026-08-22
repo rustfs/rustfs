@@ -50,10 +50,10 @@ use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
-    DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest,
-    MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest,
-    ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-    RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+    DeleteVersionRequest, DeleteVersionsRequest, DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest,
+    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
+    RenameDataRequest, RenameFileRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
     SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
     WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
@@ -111,6 +111,28 @@ const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
 pub const REMOTE_SNAPSHOT_LEASE_TTL: Duration = Duration::from_secs(60);
+
+fn decode_delete_versions_errors(response: DeleteVersionsResponse, expected_len: usize) -> Vec<Option<Error>> {
+    if !response.item_errors.is_empty() {
+        if response.item_errors.len() != expected_len {
+            return vec![Some(Error::other("malformed delete_versions item errors")); expected_len];
+        }
+        return response
+            .item_errors
+            .into_iter()
+            .map(|error| (error.code != 0).then(|| error.into()))
+            .collect();
+    }
+
+    if response.errors.len() != expected_len {
+        return vec![Some(Error::other("malformed delete_versions errors")); expected_len];
+    }
+    response
+        .errors
+        .into_iter()
+        .map(|error| (!error.is_empty()).then(|| Error::other(error)))
+        .collect()
+}
 
 fn snapshot_lease_token_from_response(response: SnapshotLeaseResponse) -> Result<SnapshotLeaseToken> {
     if !response.success {
@@ -2406,8 +2428,6 @@ impl DiskAPI for RemoteDisk {
             return errors;
         }
 
-        // TODO(backlog): replace string errors with typed `StorageError` variants
-
         let result = self
             .execute_with_timeout(
                 || async {
@@ -2439,17 +2459,7 @@ impl DiskAPI for RemoteDisk {
             }
             return errors;
         }
-        response
-            .errors
-            .iter()
-            .map(|error| {
-                if error.is_empty() {
-                    None
-                } else {
-                    Some(Error::other(error.to_string()))
-                }
-            })
-            .collect()
+        decode_delete_versions_errors(response, versions.len())
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -3759,6 +3769,63 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[test]
+    fn delete_versions_response_preserves_typed_item_errors() {
+        let errors = decode_delete_versions_errors(
+            DeleteVersionsResponse {
+                success: true,
+                errors: vec!["file not found".to_string(), String::new()],
+                error: None,
+                item_errors: vec![
+                    rustfs_protos::proto_gen::node_service::Error {
+                        code: DiskError::FileNotFound.to_u32(),
+                        error_info: "file not found".to_string(),
+                    },
+                    rustfs_protos::proto_gen::node_service::Error::default(),
+                ],
+            },
+            2,
+        );
+
+        assert!(matches!(errors.as_slice(), [Some(DiskError::FileNotFound), None]));
+    }
+
+    #[test]
+    fn delete_versions_response_accepts_legacy_string_errors() {
+        let errors = decode_delete_versions_errors(
+            DeleteVersionsResponse {
+                success: true,
+                errors: vec!["legacy error".to_string(), String::new()],
+                error: None,
+                item_errors: Vec::new(),
+            },
+            2,
+        );
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].as_ref().map(ToString::to_string).as_deref(), Some("io error legacy error"));
+        assert!(errors[1].is_none());
+    }
+
+    #[test]
+    fn delete_versions_response_rejects_misaligned_item_errors() {
+        let errors = decode_delete_versions_errors(
+            DeleteVersionsResponse {
+                success: true,
+                errors: vec!["file not found".to_string()],
+                error: None,
+                item_errors: vec![rustfs_protos::proto_gen::node_service::Error {
+                    code: DiskError::FileNotFound.to_u32(),
+                    error_info: "file not found".to_string(),
+                }],
+            },
+            2,
+        );
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(Option::is_some));
+    }
 
     #[test]
     fn disk_mutation_digest_marks_rolling_compatibility() {

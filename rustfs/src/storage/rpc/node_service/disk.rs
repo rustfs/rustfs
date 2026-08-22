@@ -146,6 +146,29 @@ fn encode_file_info_msgpack(value: &FileInfo) -> std::result::Result<Vec<u8>, Di
     encode_msgpack_with_capacity(value, "FileInfo", FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
 }
 
+fn encode_delete_versions_errors(disk_errors: Vec<Option<DiskError>>) -> (Vec<String>, Vec<Error>) {
+    let mut errors = Vec::with_capacity(disk_errors.len());
+    let mut item_errors = Vec::with_capacity(disk_errors.len());
+    for error in disk_errors {
+        match error {
+            Some(error) => {
+                let code = match &error {
+                    DiskError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => DiskError::FileNotFound.to_u32(),
+                    _ => error.to_u32(),
+                };
+                let error_info = error.to_string();
+                errors.push(error_info.clone());
+                item_errors.push(Error { code, error_info });
+            }
+            None => {
+                errors.push(String::new());
+                item_errors.push(Error::default());
+            }
+        }
+    }
+    (errors, item_errors)
+}
+
 fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
     let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value
@@ -552,6 +575,7 @@ impl NodeService {
                             success: false,
                             errors: Vec::new(),
                             error: Some(DiskError::other(format!("decode FileInfoVersions failed: {err}")).into()),
+                            item_errors: Vec::new(),
                         }));
                     }
                 };
@@ -563,30 +587,26 @@ impl NodeService {
                         success: false,
                         errors: Vec::new(),
                         error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                        item_errors: Vec::new(),
                     }));
                 }
             };
 
-            let errors = disk
-                .delete_versions(&request.volume, versions, opts)
-                .await
-                .into_iter()
-                .map(|error| match error {
-                    Some(e) => e.to_string(),
-                    None => "".to_string(),
-                })
-                .collect();
+            let (errors, item_errors) =
+                encode_delete_versions_errors(disk.delete_versions(&request.volume, versions, opts).await);
 
             Ok(Response::new(DeleteVersionsResponse {
                 success: true,
                 errors,
                 error: None,
+                item_errors,
             }))
         } else {
             Ok(Response::new(DeleteVersionsResponse {
                 success: false,
                 errors: Vec::new(),
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
+                item_errors: Vec::new(),
             }))
         }
     }
@@ -1612,8 +1632,8 @@ impl NodeService {
 mod tests {
     use super::{
         compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
-        encode_batch_read_version_response_payloads, encode_file_info_msgpack, encode_msgpack, encode_msgpack_named,
-        encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
     };
     use crate::storage::rpc::node_service::make_server;
     use crate::storage::storage_api::ReadMultipleResp;
@@ -1630,6 +1650,18 @@ mod tests {
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn delete_versions_response_dual_writes_typed_item_errors() {
+        let raw_not_found = super::DiskError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let (errors, item_errors) = encode_delete_versions_errors(vec![Some(raw_not_found), None]);
+
+        assert!(errors[0].starts_with("io error "));
+        assert!(errors[1].is_empty());
+        assert_eq!(item_errors[0].code, super::DiskError::FileNotFound.to_u32());
+        assert_eq!(item_errors[0].error_info, errors[0]);
+        assert_eq!(item_errors[1].code, 0);
     }
 
     #[tokio::test]
