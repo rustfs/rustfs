@@ -287,6 +287,7 @@ jobs:
 
           frontend fe_s3
             bind *:9000
+            option http-buffer-request
             default_backend be_s3
 
           backend be_s3
