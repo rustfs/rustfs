@@ -274,11 +274,55 @@ def yaml_block(lines: list[str], key: str, indent: int) -> list[str] | None:
     return lines[start:end]
 
 
-def workflow_job_block(lines: list[str], job_name: str) -> str | None:
-    block = yaml_block(lines, job_name, 2)
-    if block is None:
+def workflow_step_block(job_lines: list[str], action: str) -> tuple[int, list[str]] | None:
+    uses_index = next(
+        (
+            index
+            for index, line in enumerate(job_lines)
+            if line.split("#", 1)[0].strip() in {f"uses: {action}", f"- uses: {action}"}
+        ),
+        None,
+    )
+    if uses_index is None:
         return None
-    return "\n".join(line.split("#", 1)[0] for line in block)
+    start = next(
+        (
+            index
+            for index in range(uses_index, -1, -1)
+            if job_lines[index].lstrip().startswith("- ")
+        ),
+        uses_index,
+    )
+    indent = len(job_lines[start]) - len(job_lines[start].lstrip())
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(job_lines))
+            if len(job_lines[index]) - len(job_lines[index].lstrip()) == indent
+            and job_lines[index].lstrip().startswith("- ")
+        ),
+        len(job_lines),
+    )
+    return start, job_lines[start:end]
+
+
+def alert_step_errors(job_lines: list[str], expected_action_if: str | None) -> list[str]:
+    checkout = workflow_step_block(job_lines, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0")
+    action = workflow_step_block(job_lines, "./.github/actions/schedule-failure-issue")
+    if checkout is None or action is None:
+        return []
+
+    errors: list[str] = []
+    if checkout[0] >= action[0]:
+        errors.append("checkout must run before the local alert action")
+    checkout_ifs = [line.strip() for line in checkout[1] if line.strip().startswith("if:")]
+    if checkout_ifs:
+        errors.append("checkout step must not be conditional")
+    action_ifs = [line.strip() for line in action[1] if line.strip().startswith("if:")]
+    expected_ifs = [] if expected_action_if is None else [expected_action_if]
+    if action_ifs != expected_ifs:
+        errors.append("alert action has an invalid step condition")
+    return errors
 
 
 def check_scheduled_alerts(root: Path) -> list[str]:
@@ -294,23 +338,25 @@ def check_scheduled_alerts(root: Path) -> list[str]:
 
         on_block = yaml_block(lines, "on", 0)
         schedule_block = yaml_block(on_block or [], "schedule", 2)
-        schedule = re.search(
-            r"^\s*-\s+cron:\s*[\"']?(\d+)\s+(\d+)\s+",
-            "\n".join(schedule_block or []),
-            re.MULTILINE,
-        )
-        if not schedule:
+        cron_lines = [line for line in schedule_block or [] if re.match(r"^\s*-\s+cron:", line)]
+        if not cron_lines:
             errors.append(f"{relative}: missing simple numeric schedule")
         else:
-            minute, hour = map(int, schedule.groups())
-            if minute == 0:
-                errors.append(f"{relative}: scheduled validation must avoid minute zero")
-            schedule_slots.setdefault((hour, minute), []).append(relative)
+            for cron_line in cron_lines:
+                schedule = re.match(r"^\s*-\s+cron:\s*[\"']?(\d+)\s+(\d+)\s+", cron_line)
+                if not schedule:
+                    errors.append(f"{relative}: missing simple numeric schedule")
+                    continue
+                minute, hour = map(int, schedule.groups())
+                if minute == 0:
+                    errors.append(f"{relative}: scheduled validation must avoid minute zero")
+                schedule_slots.setdefault((hour, minute), []).append(relative)
 
-        job = workflow_job_block(lines, "alert-on-failure")
-        if job is None:
+        job_lines = yaml_block(lines, "alert-on-failure", 2)
+        if job_lines is None:
             errors.append(f"{relative}: missing alert-on-failure job")
             continue
+        job = "\n".join(line.split("#", 1)[0] for line in job_lines)
         required = (
             "always()",
             "github.event_name == 'schedule'",
@@ -323,6 +369,8 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         missing = [token for token in required if token not in job]
         if missing:
             errors.append(f"{relative}: alert-on-failure missing {', '.join(missing)}")
+        else:
+            errors.extend(f"{relative}: {error}" for error in alert_step_errors(job_lines, None))
 
     for (hour, minute), workflows in schedule_slots.items():
         if len(workflows) > 1:
@@ -353,10 +401,11 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             errors.append(f"{relative}: missing workflow name")
         elif f'- "{match.group(1).strip()}"' not in watchdog_sources:
             errors.append(f"{relative}: missing from scheduled completion watchdog")
-    watchdog_job = workflow_job_block(watchdog_lines, "alert-on-incomplete-run")
-    if watchdog_job is None:
+    watchdog_job_lines = yaml_block(watchdog_lines, "alert-on-incomplete-run", 2)
+    if watchdog_job_lines is None:
         errors.append(".github/workflows/scheduled-validation-watchdog.yml: missing alert-on-incomplete-run job")
         return errors
+    watchdog_job = "\n".join(line.split("#", 1)[0] for line in watchdog_job_lines)
     required = (
         "github.event.workflow_run.event == 'schedule'",
         "github.event.workflow_run.conclusion != 'success'",
@@ -378,6 +427,11 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         errors.append(
             ".github/workflows/scheduled-validation-watchdog.yml: missing " + ", ".join(missing)
         )
+    else:
+        errors.extend(
+            ".github/workflows/scheduled-validation-watchdog.yml: " + error
+            for error in alert_step_errors(watchdog_job_lines, None)
+        )
 
     freshness_path = root / ".github/workflows/scheduled-validation-freshness.yml"
     try:
@@ -385,10 +439,11 @@ def check_scheduled_alerts(root: Path) -> list[str]:
     except FileNotFoundError:
         errors.append(".github/workflows/scheduled-validation-freshness.yml: missing freshness check")
         return errors
-    freshness_job = workflow_job_block(freshness_lines, "check-freshness")
-    if freshness_job is None:
+    freshness_job_lines = yaml_block(freshness_lines, "check-freshness", 2)
+    if freshness_job_lines is None:
         errors.append(".github/workflows/scheduled-validation-freshness.yml: missing check-freshness job")
         return errors
+    freshness_job = "\n".join(line.split("#", 1)[0] for line in freshness_job_lines)
     required = (
         "python3 scripts/check_scheduled_validation_freshness.py",
         "actions: read",
@@ -403,6 +458,11 @@ def check_scheduled_alerts(root: Path) -> list[str]:
     if missing:
         errors.append(
             ".github/workflows/scheduled-validation-freshness.yml: missing " + ", ".join(missing)
+        )
+    else:
+        errors.extend(
+            ".github/workflows/scheduled-validation-freshness.yml: " + error
+            for error in alert_step_errors(freshness_job_lines, "if: failure()")
         )
     if not (root / "scripts/check_scheduled_validation_freshness.py").is_file():
         errors.append("scripts/check_scheduled_validation_freshness.py: missing freshness checker")
@@ -608,15 +668,17 @@ class SelfTests(unittest.TestCase):
                 + "    github.event.workflow_run.conclusion != 'failure'\n"
                 + "    actions: read\n"
                 + "    issues: write\n"
-                + "    uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
-                + "    uses: ./.github/actions/schedule-failure-issue\n"
-                + "    github-token: ${{ secrets.GITHUB_TOKEN }}\n"
-                + "    workflow-name: ${{ github.event.workflow_run.name }}\n"
-                + "    source-run-id: ${{ github.event.workflow_run.id }}\n"
-                + "    source-run-attempt: ${{ github.event.workflow_run.run_attempt }}\n"
-                + "    source-event: ${{ github.event.workflow_run.event }}\n"
-                + "    source-ref-name: ${{ github.event.workflow_run.head_branch }}\n"
-                + "    source-sha: ${{ github.event.workflow_run.head_sha }}\n"
+                + "    steps:\n"
+                + "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                + "      - uses: ./.github/actions/schedule-failure-issue\n"
+                + "        with:\n"
+                + "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                + "          workflow-name: ${{ github.event.workflow_run.name }}\n"
+                + "          source-run-id: ${{ github.event.workflow_run.id }}\n"
+                + "          source-run-attempt: ${{ github.event.workflow_run.run_attempt }}\n"
+                + "          source-event: ${{ github.event.workflow_run.event }}\n"
+                + "          source-ref-name: ${{ github.event.workflow_run.head_branch }}\n"
+                + "          source-sha: ${{ github.event.workflow_run.head_sha }}\n"
             )
             freshness = root / ".github/workflows/scheduled-validation-freshness.yml"
             freshness.write_text(
@@ -624,12 +686,14 @@ class SelfTests(unittest.TestCase):
                 "  check-freshness:\n"
                 "    actions: read\n"
                 "    issues: write\n"
-                "    uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
-                "    python3 scripts/check_scheduled_validation_freshness.py\n"
-                "    if: failure()\n"
-                "    uses: ./.github/actions/schedule-failure-issue\n"
-                "    github-token: ${{ secrets.GITHUB_TOKEN }}\n"
-                "    details-file: ${{ runner.temp }}/scheduled-validation-freshness.md\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                "      - run: python3 scripts/check_scheduled_validation_freshness.py\n"
+                "      - uses: ./.github/actions/schedule-failure-issue\n"
+                "        if: failure()\n"
+                "        with:\n"
+                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                "          details-file: ${{ runner.temp }}/scheduled-validation-freshness.md\n"
             )
             checker = root / "scripts/check_scheduled_validation_freshness.py"
             checker.parent.mkdir()
@@ -643,6 +707,16 @@ class SelfTests(unittest.TestCase):
                 (
                     "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
                     "uses: actions/checkout@missing",
+                ),
+                (
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n",
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                    "        if: github.event_name == 'workflow_dispatch'\n",
+                ),
+                (
+                    "      - uses: ./.github/actions/schedule-failure-issue\n",
+                    "      - uses: ./.github/actions/schedule-failure-issue\n"
+                    "        if: github.event_name == 'workflow_dispatch'\n",
                 ),
                 ("uses: ./.github/actions/schedule-failure-issue", "uses: actions/checkout@v7"),
                 ("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing"),
@@ -659,6 +733,16 @@ class SelfTests(unittest.TestCase):
                 (
                     "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
                     "uses: actions/checkout@missing",
+                ),
+                (
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n",
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                    "        if: github.event_name == 'workflow_dispatch'\n",
+                ),
+                (
+                    "      - uses: ./.github/actions/schedule-failure-issue\n",
+                    "      - uses: ./.github/actions/schedule-failure-issue\n"
+                    "        if: github.event_name == 'workflow_dispatch'\n",
                 ),
                 ("uses: ./.github/actions/schedule-failure-issue", "uses: actions/checkout@v7"),
                 ("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing"),
@@ -688,6 +772,22 @@ class SelfTests(unittest.TestCase):
                 first_original.replace('  schedule:\n    - cron: "1 1 * * *"\n', "")
                 + '  decoy:\n    strategy:\n      matrix:\n        cron:\n          - "1 1 * * *"\n'
                 + '    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(first_original)
+
+            first.write_text(
+                first_original.replace(
+                    '    - cron: "1 1 * * *"\n',
+                    '    - cron: "1 1 * * *"\n    - cron: "0 5 * * *"\n',
+                )
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(
+                first_original.replace(
+                    '    - cron: "1 1 * * *"\n',
+                    '    - cron: "1 1 * * *"\n    - cron: "2 2 * * *"\n',
+                )
             )
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             first.write_text(first_original)
@@ -726,6 +826,18 @@ class SelfTests(unittest.TestCase):
                     "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
                     "uses: actions/checkout@missing",
                 )
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            freshness.write_text(
+                freshness_original.replace(
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n",
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                    "        if: github.event_name == 'workflow_dispatch'\n",
+                )
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            freshness.write_text(
+                freshness_original.replace("if: failure()", "if: github.event_name == 'workflow_dispatch'")
             )
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             freshness.write_text(
