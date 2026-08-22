@@ -712,14 +712,14 @@ impl ECStore {
 
     pub(crate) async fn complete_multipart_upload_for_data_movement(
         self: Arc<Self>,
-        target_pool_idx: usize,
+        target: (usize, Option<&ObjectLockDiagGuard>),
         bucket: &str,
         object: &str,
         upload_id: &str,
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
-        mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<ObjectInfo> {
+        let (target_pool_idx, mutation_fence) = target;
         check_complete_multipart_args(bucket, object, upload_id)?;
         if !opts.data_movement {
             return Err(Error::other("targeted multipart completion requires data_movement options"));

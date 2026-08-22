@@ -3538,7 +3538,7 @@ mod tests {
                 "the injected error pool must be the decommission source"
             );
 
-            let expected_errors = vec![
+            let expected_errors = [
                 StorageError::ErasureWriteQuorum,
                 StorageError::NamespaceLockQuorumUnavailable {
                     mode: "delete_objects_commit",
