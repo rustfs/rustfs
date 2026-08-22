@@ -2206,20 +2206,30 @@ fn site_replication_bootstrap_token(uri: &Uri) -> Option<String> {
     query_pairs(uri).get("bootstrapToken").cloned()
 }
 
-fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
+/// Query for a peer `make-with-versioning` bucket op. `versioningEnabled`
+/// always travels so the outbound query matches MinIO's site-replication
+/// make-bucket wire contract: MinIO's own create-bucket hook sends
+/// `versioningEnabled=true` on this op. RustFS's inbound handler
+/// force-enables versioning either way.
+fn make_with_versioning_bucket_op_path(bucket: &str, created_at: Option<&str>, lock_enabled: bool) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("bucket", &bucket.bucket);
-    query.append_pair("operation", "make-with-versioning");
-    if let Some(created_at) = bucket
-        .created_at
-        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok())
-    {
-        query.append_pair("createdAt", &created_at);
+    query.append_pair("bucket", bucket);
+    query.append_pair("operation", SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING);
+    query.append_pair("versioningEnabled", "true");
+    if let Some(created_at) = created_at {
+        query.append_pair("createdAt", created_at);
     }
-    if bucket.object_lock_config.is_some() {
+    if lock_enabled {
         query.append_pair("lockEnabled", "true");
     }
-    format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
+    format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?{}", query.finish())
+}
+
+fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
+    let created_at = bucket
+        .created_at
+        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok());
+    make_with_versioning_bucket_op_path(&bucket.bucket, created_at.as_deref(), bucket.object_lock_config.is_some())
 }
 
 fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at: Option<OffsetDateTime>) -> SRBucketMeta {
@@ -4246,16 +4256,7 @@ async fn broadcast_site_replication_make_bucket(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
 
-    let path = {
-        let mut query = form_urlencoded::Serializer::new(String::new());
-        query.append_pair("bucket", bucket);
-        query.append_pair("operation", "make-with-versioning");
-        query.append_pair("createdAt", &created_at);
-        if lock_enabled {
-            query.append_pair("lockEnabled", "true");
-        }
-        format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
-    };
+    let path = make_with_versioning_bucket_op_path(bucket, Some(&created_at), lock_enabled);
     let path = if let Some(token) = bootstrap_token {
         with_site_replication_bootstrap_token(&path, token)
     } else {
@@ -13923,6 +13924,30 @@ mod tests {
 
         assert!(query_flag(&uri, "lockEnabled"));
         assert!(!query_flag(&uri, "missing"));
+    }
+
+    /// A3 red-light: `versioningEnabled` must travel on every outbound
+    /// make-with-versioning bucket op so the query matches MinIO's
+    /// site-replication make-bucket wire contract (MinIO's own hook sends
+    /// `versioningEnabled=true` on this op).
+    #[test]
+    fn test_make_with_versioning_op_paths_send_versioning_enabled() {
+        let bucket = SRBucketInfo {
+            bucket: "photos".to_string(),
+            created_at: Some(OffsetDateTime::UNIX_EPOCH),
+            object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
+            ..Default::default()
+        };
+        let bootstrap = bootstrap_bucket_make_op_path(&bucket);
+        assert!(bootstrap.contains("operation=make-with-versioning"), "{bootstrap}");
+        assert!(bootstrap.contains("versioningEnabled=true"), "{bootstrap}");
+        assert!(bootstrap.contains("createdAt="), "{bootstrap}");
+        assert!(bootstrap.contains("lockEnabled=true"), "{bootstrap}");
+
+        // The broadcast path (create-bucket hook) shares the same builder.
+        let broadcast = make_with_versioning_bucket_op_path("photos", Some("1970-01-01T00:00:00Z"), false);
+        assert!(broadcast.contains("versioningEnabled=true"), "{broadcast}");
+        assert!(!broadcast.contains("lockEnabled"), "{broadcast}");
     }
 
     #[tokio::test]
