@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::durable_namespace::TIER_DELETE_JOURNAL_NAMESPACE;
 use crate::bucket::lifecycle::runtime_boundary;
 use crate::bucket::lifecycle::tier_sweeper::{
     Jentry, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -49,7 +50,7 @@ const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
 const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
 const TIER_DELETE_JOURNAL_TRANSACTION_VERSION: u8 = 5;
-pub(crate) const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
+pub(crate) const TIER_DELETE_JOURNAL_PREFIX: &str = TIER_DELETE_JOURNAL_NAMESPACE.prefix;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -431,6 +432,21 @@ async fn process_committed_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jen
             false,
         )
         .await?;
+    }
+    let path = tier_delete_journal_object_name(je);
+    let data = encode_tier_delete_journal_entry(je).map_err(std::io::Error::other)?;
+    let target_pool_indices = api
+        .record_durable_ilm_decommission_terminal_target_pools(&path, &data)
+        .await
+        .map_err(std::io::Error::other)?;
+    if let Some(target_pool_indices) = target_pool_indices {
+        for target_pool_idx in target_pool_indices {
+            match config_boundary::delete_config(api.pools[target_pool_idx].clone(), &path).await {
+                Ok(()) | Err(Error::ConfigNotFound) => {}
+                Err(err) => return Err(std::io::Error::other(err)),
+            }
+        }
+        return Ok(());
     }
     remove_tier_delete_journal_entry(api, je).await
 }
