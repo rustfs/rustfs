@@ -4325,6 +4325,16 @@ pub async fn expire_transitioned_object(
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> Result<ObjectInfo, std::io::Error> {
+    expire_transitioned_object_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, None).await
+}
+
+async fn expire_transitioned_object_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> Result<ObjectInfo, std::io::Error> {
     let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
         .await
         .ok_or_else(|| std::io::Error::other("lifecycle expiry is not allowed for this bucket"))?;
@@ -4335,6 +4345,9 @@ pub async fn expire_transitioned_object(
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
     opts.add_namespace_lock_guard(&publication_guard);
+    if let Some(signal) = lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
+    }
     opts.delete_replication_config_snapshot = Some(Arc::new(snapshot));
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action.delete_restored() {
@@ -4994,11 +5007,31 @@ pub async fn apply_expiry_on_transitioned_object(
     src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
 ) -> bool {
+    apply_expiry_on_transitioned_object_with_lock_lost_signal(api, oi, lc_event, src, bucket_incarnation_id, None).await
+}
+
+async fn apply_expiry_on_transitioned_object_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    _src: &LcEventSrc,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> bool {
     if lc_event.action.delete_all() {
-        return apply_expiry_on_non_transitioned_objects(api, oi, lc_event, src, bucket_incarnation_id).await;
+        return apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
+            api,
+            oi,
+            lc_event,
+            bucket_incarnation_id,
+            lock_lost_signal,
+        )
+        .await;
     }
     let time_ilm = Metrics::time_ilm(lc_event.action);
-    if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src, bucket_incarnation_id).await {
+    if let Err(_err) =
+        expire_transitioned_object_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, lock_lost_signal).await
+    {
         return false;
     }
     time_ilm(1)();
@@ -5012,6 +5045,16 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
     bucket_incarnation_id: Uuid,
+) -> bool {
+    apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(api, oi, lc_event, bucket_incarnation_id, None).await
+}
+
+async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    lc_event: &lifecycle::Event,
+    bucket_incarnation_id: Uuid,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {
     let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
         return false;
@@ -5042,6 +5085,9 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         ..Default::default()
     };
     opts.add_namespace_lock_guard(&publication_guard);
+    if let Some(signal) = lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
+    }
 
     if lc_event.action.delete_versioned() {
         opts.version_id = oi.version_id.map(|v| v.to_string());
@@ -5123,6 +5169,61 @@ async fn enqueue_expiry_rule_with_incarnation(
     expiry_state.enqueue_by_days(oi, event, src, bucket_incarnation_id)
 }
 
+fn lifecycle_expiry_object_matches(current: &ObjectInfo, expected: &ObjectInfo) -> bool {
+    current.version_id == expected.version_id
+        && current.data_dir == expected.data_dir
+        && current.mod_time == expected.mod_time
+        && current.etag == expected.etag
+        && current.delete_marker == expected.delete_marker
+        && current.transitioned_object.name == expected.transitioned_object.name
+        && current.transitioned_object.version_id == expected.transitioned_object.version_id
+        && current.transitioned_object.tier == expected.transitioned_object.tier
+        && current.transitioned_object.status == expected.transitioned_object.status
+        && current.restore_expires == expected.restore_expires
+}
+
+pub(crate) async fn apply_expiry_rule_for_data_movement(
+    api: Arc<ECStore>,
+    event: &lifecycle::Event,
+    src: &LcEventSrc,
+    oi: &ObjectInfo,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> bool {
+    let Ok(_lifecycle_guard) = api.acquire_bucket_lifecycle_read_lock(&oi.bucket).await else {
+        return false;
+    };
+    let Ok(bucket_incarnation_id) = api.bucket_incarnation_id_from_disk(&oi.bucket).await else {
+        return false;
+    };
+    let current = match api
+        .get_object_info(
+            &oi.bucket,
+            &oi.name,
+            &ObjectOptions {
+                version_id: oi.version_id.map(|version_id| version_id.to_string()),
+                versioned: oi.version_id.is_some(),
+                expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(current) => current,
+        Err(_) => return false,
+    };
+    if !lifecycle_expiry_object_matches(&current, oi) {
+        return false;
+    }
+
+    if oi.transitioned_object.status.is_empty() {
+        apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(api, oi, event, bucket_incarnation_id, lock_lost_signal)
+            .await
+    } else {
+        apply_expiry_on_transitioned_object_with_lock_lost_signal(api, oi, event, src, bucket_incarnation_id, lock_lost_signal)
+            .await
+    }
+}
+
 pub(crate) async fn apply_expiry_rule_in(api: Arc<ECStore>, event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let Ok(_lifecycle_guard) = api.acquire_bucket_lifecycle_read_lock(&oi.bucket).await else {
         return false;
@@ -5146,17 +5247,7 @@ pub(crate) async fn apply_expiry_rule_in(api: Arc<ECStore>, event: &lifecycle::E
         Ok(current) => current,
         Err(_) => return false,
     };
-    if current.version_id != oi.version_id
-        || current.data_dir != oi.data_dir
-        || current.mod_time != oi.mod_time
-        || current.etag != oi.etag
-        || current.delete_marker != oi.delete_marker
-        || current.transitioned_object.name != oi.transitioned_object.name
-        || current.transitioned_object.version_id != oi.transitioned_object.version_id
-        || current.transitioned_object.tier != oi.transitioned_object.tier
-        || current.transitioned_object.status != oi.transitioned_object.status
-        || current.restore_expires != oi.restore_expires
-    {
+    if !lifecycle_expiry_object_matches(&current, oi) {
         return false;
     }
     enqueue_expiry_rule_with_incarnation(event, src, oi, bucket_incarnation_id).await

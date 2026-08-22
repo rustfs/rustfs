@@ -501,6 +501,8 @@ pub(crate) mod ecstore_notification {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_rebalance {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rebalance::test_util;
     pub(crate) use rustfs_ecstore::api::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,

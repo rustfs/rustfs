@@ -1,3 +1,4 @@
+use super::control::RebalanceWorkerActivationFence;
 use super::meta::{
     apply_rebalance_save_option, apply_rebalance_terminal_event, classify_rebalance_terminal_event, clone_first_arc,
     complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, ensure_valid_rebalance_pool_index,
@@ -39,9 +40,97 @@ pub(super) fn source_cleanup_defer_attempt(deferred_attempts: &mut HashMap<Strin
     *attempts
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RebalanceLocalActivationOutcome {
+    Started,
+    NotStartedTerminal,
+}
+
+pub(super) fn commit_local_rebalance_worker_activation(
+    meta: &mut super::RebalanceMeta,
+    expected_id: &str,
+    cancel: CancellationToken,
+) -> Result<RebalanceLocalActivationOutcome> {
+    if meta.id != expected_id {
+        return Err(Error::other(format!(
+            "rebalance metadata changed before local worker activation: expected {expected_id}, found {}",
+            meta.id
+        )));
+    }
+    if meta.stopped_at.is_some() || !is_rebalance_in_progress(meta) {
+        return Ok(RebalanceLocalActivationOutcome::NotStartedTerminal);
+    }
+    meta.cancel = Some(cancel);
+    Ok(RebalanceLocalActivationOutcome::Started)
+}
+
+pub(super) fn stage_local_rebalance_worker_activation(
+    meta: &super::RebalanceMeta,
+    expected_id: &str,
+    cancel: CancellationToken,
+    now: OffsetDateTime,
+) -> Result<(super::RebalanceMeta, RebalanceLocalActivationOutcome, bool)> {
+    let mut candidate = meta.clone();
+    let completed_at_goal = complete_rebalance_pools_at_goal(&mut candidate, now);
+    let completed_empty_queue = complete_rebalance_pools_with_empty_queue(&mut candidate, now);
+    let outcome = commit_local_rebalance_worker_activation(&mut candidate, expected_id, cancel)?;
+    let must_persist =
+        completed_at_goal || completed_empty_queue || outcome == RebalanceLocalActivationOutcome::NotStartedTerminal;
+    Ok((candidate, outcome, must_persist))
+}
+
+pub(super) fn commit_local_rebalance_worker_activation_candidate(
+    current: &mut super::RebalanceMeta,
+    expected_id: &str,
+    expected_cancel: Option<&CancellationToken>,
+    candidate: super::RebalanceMeta,
+) -> Result<()> {
+    if current.id != expected_id || candidate.id != expected_id {
+        return Err(Error::other(format!(
+            "rebalance metadata changed before local worker activation commit: expected {expected_id}, found {}",
+            current.id
+        )));
+    }
+    if !Arc::ptr_eq(&current.activation_gate, &candidate.activation_gate) {
+        return Err(Error::other(format!(
+            "rebalance activation gate changed before local worker activation commit: {expected_id}"
+        )));
+    }
+    if current.cancel.as_ref() != expected_cancel {
+        return Err(Error::other(format!(
+            "rebalance worker token changed before local worker activation commit: {expected_id}"
+        )));
+    }
+    *current = candidate;
+    Ok(())
+}
+
+pub(super) fn rollback_local_rebalance_worker_activation(
+    meta: Option<&mut super::RebalanceMeta>,
+    expected_id: &str,
+    activation_token: &CancellationToken,
+) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    if meta.id != expected_id || meta.cancel.as_ref() != Some(activation_token) {
+        return false;
+    }
+    if let Some(cancel) = meta.cancel.take() {
+        cancel.cancel();
+        return true;
+    }
+    false
+}
+
 impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        self.start_rebalance_under_gate().await
+    }
+
+    pub(super) async fn start_rebalance_under_gate(self: &Arc<Self>) -> Result<()> {
         info!(
             event = EVENT_REBALANCE_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -49,12 +138,27 @@ impl ECStore {
             state = "starting",
             "Starting rebalance"
         );
+        let expected_id: Arc<str> = {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            Arc::from(rebalance_meta.as_ref().ok_or(Error::ConfigNotFound)?.id.as_str())
+        };
+        let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
+        let activation_fence = match self
+            .fence_rebalance_worker_activation(pool.clone(), expected_id.as_ref())
+            .await?
+        {
+            RebalanceWorkerActivationFence::Ready(fence) => fence,
+            RebalanceWorkerActivationFence::NotStartedTerminal => return Ok(()),
+        };
+
         let decommission_running = self.is_decommission_running().await;
-        // let rebalance_meta = self.rebalance_meta.read().await;
 
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();
-        let mut meta_to_save = None;
+        let activation_outcome;
+        let candidate;
+        let expected_cancel;
+        let must_persist;
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -74,25 +178,70 @@ impl ECStore {
                 );
                 return Ok(());
             }
-            let now = OffsetDateTime::now_utc();
-            if complete_rebalance_pools_at_goal(meta, now) {
-                meta_to_save = Some(meta.clone());
+            expected_cancel = meta.cancel.clone();
+            (candidate, activation_outcome, must_persist) = stage_local_rebalance_worker_activation(
+                meta,
+                expected_id.as_ref(),
+                cancel_tx.clone(),
+                OffsetDateTime::now_utc(),
+            )?;
+            if let Err(err) = activation_fence.ensure_held() {
+                cancel_tx.cancel();
+                return Err(err);
             }
-            if complete_rebalance_pools_with_empty_queue(meta, now) {
-                meta_to_save = Some(meta.clone());
+            if !must_persist
+                && let Err(err) = commit_local_rebalance_worker_activation_candidate(
+                    meta,
+                    expected_id.as_ref(),
+                    expected_cancel.as_ref(),
+                    candidate.clone(),
+                )
+            {
+                cancel_tx.cancel();
+                return Err(err);
             }
-            meta.cancel = Some(cancel_tx);
-
-            drop(rebalance_meta);
         }
 
-        if let Some(meta) = meta_to_save {
-            let pool = clone_first_arc(self.pools.as_slice(), "start_rebalance: no pools available")?;
-            resolve_rebalance_meta_save_result(
-                self.save_rebalance_meta_with_merge(pool, &meta, "start_rebalance complete pools at goal")
-                    .await,
-                "start_rebalance complete pools at goal",
-            )?;
+        if must_persist {
+            let save_result = resolve_rebalance_meta_save_result(
+                self.save_rebalance_meta_under_activation_fence(
+                    pool,
+                    &candidate,
+                    "start_rebalance persist activation candidate",
+                    activation_fence.as_ref(),
+                    expected_id.as_ref(),
+                )
+                .await,
+                "start_rebalance persist activation candidate",
+            );
+            if let Err(err) = save_result {
+                cancel_tx.cancel();
+                return Err(err);
+            }
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            let Some(meta) = rebalance_meta.as_mut() else {
+                cancel_tx.cancel();
+                return Err(Error::ConfigNotFound);
+            };
+            if let Err(err) = commit_local_rebalance_worker_activation_candidate(
+                meta,
+                expected_id.as_ref(),
+                expected_cancel.as_ref(),
+                candidate,
+            ) {
+                cancel_tx.cancel();
+                return Err(err);
+            }
+        }
+        if !must_persist && let Err(err) = activation_fence.ensure_held() {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
+            return Err(err);
+        }
+        drop(activation_fence);
+
+        if activation_outcome != RebalanceLocalActivationOutcome::Started {
+            return Ok(());
         }
 
         let participants = if let Some(ref meta) = *self.rebalance_meta.read().await {
@@ -110,6 +259,8 @@ impl ECStore {
         };
 
         if !participants.iter().any(|participating| *participating) {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -120,6 +271,11 @@ impl ECStore {
             );
             return Ok(());
         }
+
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
+        let endpoints = self.endpoints();
 
         let mut workers_started = 0usize;
         for (idx, participating) in participants.iter().enumerate() {
@@ -136,7 +292,7 @@ impl ECStore {
                 continue;
             }
 
-            if !runtime_sources::endpoint_pool_is_local(idx) {
+            if !runtime_sources::endpoint_pool_is_local(&endpoints, idx) {
                 debug!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -152,9 +308,10 @@ impl ECStore {
             let pool_idx = idx;
             let store = self.clone();
             let rx_clone = rx.clone();
+            let worker_id = Arc::clone(&expected_id);
             workers_started += 1;
             tokio::spawn(async move {
-                if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx).await {
+                if let Err(err) = store.rebalance_buckets(rx_clone, pool_idx, worker_id).await {
                     error!(
                         event = EVENT_REBALANCE_STATE,
                         component = LOG_COMPONENT_ECSTORE,
@@ -178,6 +335,8 @@ impl ECStore {
         }
 
         if workers_started == 0 {
+            let mut rebalance_meta = self.rebalance_meta.write().await;
+            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -201,13 +360,14 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    async fn rebalance_buckets(self: &Arc<Self>, rx: CancellationToken, pool_index: usize) -> Result<()> {
+    async fn rebalance_buckets(self: &Arc<Self>, rx: CancellationToken, pool_index: usize, rebalance_id: Arc<str>) -> Result<()> {
         ensure_valid_rebalance_pool_index(self.pools.len(), pool_index)?;
 
         let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<Result<()>>(1);
 
         // Save rebalance metadata periodically
         let store = self.clone();
+        let save_rebalance_id = Arc::clone(&rebalance_id);
         let save_task = tokio::spawn(async move {
             let mut timer = tokio::time::interval_at(Instant::now() + Duration::from_secs(30), Duration::from_secs(10));
             let mut msg: String;
@@ -221,6 +381,11 @@ impl ECStore {
                         let terminal_event = classify_rebalance_terminal_event(result, now);
                         msg = terminal_event.message().to_string();
                         let mut rebalance_meta = store.rebalance_meta.write().await;
+                        super::control::ensure_rebalance_run_id(
+                            rebalance_meta.as_ref(),
+                            save_rebalance_id.as_ref(),
+                            "apply rebalance terminal event",
+                        )?;
                         if let Some(meta) = rebalance_meta.as_mut() {
                             let meta_stopped = meta.stopped_at.is_some();
                             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
@@ -269,7 +434,10 @@ impl ECStore {
                     }
                 }
 
-                if let Err(err) = store.save_rebalance_stats(pool_index, RebalSaveOpt::Stats).await {
+                if let Err(err) = store
+                    .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
+                    .await
+                {
                     let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
                     error!("{} err: {:?}", msg, wrapped);
                     if quit {
@@ -335,7 +503,7 @@ impl ECStore {
                 break;
             }
 
-            let next_bucket = match self.next_rebal_bucket(pool_index).await {
+            let next_bucket = match self.next_rebal_bucket(pool_index, rebalance_id.as_ref()).await {
                 Ok(bucket) => bucket,
                 Err(err) => {
                     error!(
@@ -367,7 +535,8 @@ impl ECStore {
                 );
 
                 let outcome = match resolve_rebalance_bucket_result(
-                    self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index).await,
+                    self.rebalance_bucket(rx.clone(), bucket.clone(), pool_index, Arc::clone(&rebalance_id))
+                        .await,
                     pool_index,
                     &bucket,
                 ) {
@@ -430,7 +599,7 @@ impl ECStore {
                         "Deferred rebalance bucket after transient object failures"
                     );
                     if let Err(err) = self
-                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone())
+                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref())
                         .await
                     {
                         error!(
@@ -494,7 +663,7 @@ impl ECStore {
                     "Completed rebalance bucket"
                 );
                 source_cleanup_deferred_attempts.remove(&bucket);
-                if let Err(err) = self.bucket_rebalance_done(pool_index, bucket).await {
+                if let Err(err) = self.bucket_rebalance_done(pool_index, bucket, rebalance_id.as_ref()).await {
                     error!(
                         event = EVENT_REBALANCE_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -555,8 +724,9 @@ impl ECStore {
         final_result
     }
 
-    pub(super) async fn check_if_rebalance_done(&self, pool_index: usize) -> bool {
+    pub(super) async fn check_if_rebalance_done(&self, pool_index: usize, expected_id: &str) -> Result<bool> {
         let mut rebalance_meta = self.rebalance_meta.write().await;
+        super::control::ensure_rebalance_worker_active(rebalance_meta.as_ref(), expected_id, "check rebalance completion")?;
 
         if let Some(meta) = rebalance_meta.as_mut()
             && let Some(pool_stat) = meta.pool_stats.get_mut(pool_index)
@@ -571,7 +741,7 @@ impl ECStore {
                     state = "already_completed",
                     "Rebalance pool is already completed"
                 );
-                return true;
+                return Ok(true);
             }
 
             // Mark pool rebalance as done only after it reaches the PercentFreeGoal.
@@ -601,19 +771,30 @@ impl ECStore {
                     percent_free = pfi,
                     "Marked rebalance pool completed"
                 );
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 }
 
 impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
+        self.save_rebalance_stats_inner(pool_idx, opt, None).await
+    }
+
+    pub async fn save_rebalance_stats_for_id(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: &str) -> Result<()> {
+        self.save_rebalance_stats_inner(pool_idx, opt, Some(expected_id)).await
+    }
+
+    async fn save_rebalance_stats_inner(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: Option<&str>) -> Result<()> {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
+            if let Some(expected_id) = expected_id {
+                super::control::ensure_rebalance_run_id(rebalance_meta.as_ref(), expected_id, "save rebalance stats")?;
+            }
             let Some(meta) = rebalance_meta.as_mut() else {
                 return Ok(());
             };
@@ -635,10 +816,14 @@ impl ECStore {
             "Rebalance metadata save requested"
         );
         let stage = format!("save_rebalance_stats for pool {pool_idx} opt {opt:?}");
-        resolve_rebalance_meta_save_result(
-            self.save_rebalance_meta_with_merge(pool, &meta_to_save, stage.as_str()).await,
-            stage.as_str(),
-        )?;
+        let save_result = match expected_id {
+            Some(expected_id) => {
+                self.save_rebalance_meta_for_id_with_merge(pool, &meta_to_save, stage.as_str(), expected_id)
+                    .await
+            }
+            None => self.save_rebalance_meta_with_merge(pool, &meta_to_save, stage.as_str()).await,
+        };
+        resolve_rebalance_meta_save_result(save_result, stage.as_str())?;
 
         Ok(())
     }
