@@ -189,16 +189,16 @@ impl ECStore {
                 cancel_tx.cancel();
                 return Err(err);
             }
-            if !must_persist {
-                if let Err(err) = commit_local_rebalance_worker_activation_candidate(
+            if !must_persist
+                && let Err(err) = commit_local_rebalance_worker_activation_candidate(
                     meta,
                     expected_id.as_ref(),
                     expected_cancel.as_ref(),
                     candidate.clone(),
-                ) {
-                    cancel_tx.cancel();
-                    return Err(err);
-                }
+                )
+            {
+                cancel_tx.cancel();
+                return Err(err);
             }
         }
 

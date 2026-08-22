@@ -1420,6 +1420,7 @@ pub(crate) async fn migrate_decommission_object(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,

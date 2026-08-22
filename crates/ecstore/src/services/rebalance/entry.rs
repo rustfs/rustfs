@@ -50,6 +50,22 @@ fn ensure_rebalance_entry_active(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct RebalanceEntryTarget {
+    bucket: String,
+    pool_index: usize,
+}
+
+struct RebalanceEntryCleanupContext<'a> {
+    run_guard: &'a super::control::RebalanceRunGuard,
+    pool_index: usize,
+    bucket: &'a str,
+    object: &'a str,
+    stats_updates: &'a [&'a FileInfo],
+    expected_id: &'a str,
+    cancel: &'a CancellationToken,
+}
+
 #[cfg(test)]
 static REBALANCE_RUN_SIGNAL_TEST_FENCES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
@@ -113,39 +129,39 @@ fn attach_rebalance_run_signal_test_fence(
 impl ECStore {
     async fn finish_rebalance_entry_after_cleanup(
         &self,
-        run_guard: &super::control::RebalanceRunGuard,
-        pool_index: usize,
-        bucket: &str,
-        object: &str,
-        stats_updates: &[&FileInfo],
-        expected_id: &str,
-        cancel: &CancellationToken,
+        context: &RebalanceEntryCleanupContext<'_>,
         cleanup: impl std::future::Future<Output = std::result::Result<ObjectInfo, data_movement::SourceCleanupError>>,
     ) -> Result<RebalanceEntryCleanupResult> {
         // Persisted stats can complete a pool on restart, so source cleanup must resolve first.
-        ensure_rebalance_entry_active(cancel)?;
-        run_guard.ensure_held("rebalance source cleanup")?;
+        ensure_rebalance_entry_active(context.cancel)?;
+        context.run_guard.ensure_held("rebalance source cleanup")?;
         let cleanup_result = cleanup.await;
-        ensure_rebalance_entry_active(cancel)?;
-        run_guard.ensure_held("rebalance source cleanup")?;
-        let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup_result, bucket, object);
+        ensure_rebalance_entry_active(context.cancel)?;
+        context.run_guard.ensure_held("rebalance source cleanup")?;
+        let cleanup_result = resolve_rebalance_entry_cleanup_delete_result(cleanup_result, context.bucket, context.object);
         let RebalanceEntryCleanupResult::Completed { warning } = cleanup_result else {
             return Ok(cleanup_result);
         };
         if let Some(message) = warning.as_ref() {
-            run_guard.ensure_held("record rebalance cleanup warning")?;
+            context.run_guard.ensure_held("record rebalance cleanup warning")?;
             let warning_result = self
-                .record_rebalance_cleanup_warning(pool_index, bucket, object, message.clone(), expected_id)
+                .record_rebalance_cleanup_warning(
+                    context.pool_index,
+                    context.bucket,
+                    context.object,
+                    message.clone(),
+                    context.expected_id,
+                )
                 .await;
-            run_guard.ensure_held("record rebalance cleanup warning")?;
+            context.run_guard.ensure_held("record rebalance cleanup warning")?;
             if let Err(err) = warning_result {
                 error!(
                     event = EVENT_REBALANCE_ENTRY,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REBALANCE,
-                    pool_index,
-                    bucket,
-                    object,
+                    pool_index = context.pool_index,
+                    bucket = context.bucket,
+                    object = context.object,
                     stage = "cleanup_source",
                     error = ?err,
                     "Failed to record rebalance source cleanup warning"
@@ -153,22 +169,26 @@ impl ECStore {
             }
         }
 
-        run_guard.ensure_held("record rebalance entry stats")?;
+        context.run_guard.ensure_held("record rebalance entry stats")?;
         let stats_result = self
-            .update_pool_stats_batch_for_rebalance(pool_index, bucket.to_string(), stats_updates, expected_id)
+            .update_pool_stats_batch_for_rebalance(
+                context.pool_index,
+                context.bucket.to_string(),
+                context.stats_updates,
+                context.expected_id,
+            )
             .await;
-        run_guard.ensure_held("record rebalance entry stats")?;
-        resolve_rebalance_stats_update_result(stats_result, pool_index, bucket, object)?;
+        context.run_guard.ensure_held("record rebalance entry stats")?;
+        resolve_rebalance_stats_update_result(stats_result, context.pool_index, context.bucket, context.object)?;
 
         Ok(RebalanceEntryCleanupResult::Completed { warning })
     }
 
     #[allow(unused_assignments)]
-    #[tracing::instrument(skip(self, set))]
+    #[tracing::instrument(skip(self, set, target), fields(bucket = %target.bucket, pool_index = target.pool_index))]
     async fn rebalance_entry(
         self: Arc<Self>,
-        bucket: String,
-        pool_index: usize,
+        target: RebalanceEntryTarget,
         entry: MetaCacheEntry,
         set: Arc<SetDisks>,
         bucket_configs: Arc<RebalanceBucketConfigs>,
@@ -176,6 +196,7 @@ impl ECStore {
         cancel: CancellationToken,
         // wk: Arc<Workers>,
     ) -> Result<RebalanceEntryOutcome> {
+        let RebalanceEntryTarget { bucket, pool_index } = target;
         debug!(
             event = EVENT_REBALANCE_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
@@ -445,13 +466,15 @@ impl ECStore {
             }
             let cleanup_result = self
                 .finish_rebalance_entry_after_cleanup(
-                    &run_guard,
-                    pool_index,
-                    bucket.as_str(),
-                    entry.name.as_str(),
-                    stats_updates.as_slice(),
-                    rebalance_id.as_ref(),
-                    &cancel,
+                    &RebalanceEntryCleanupContext {
+                        run_guard: &run_guard,
+                        pool_index,
+                        bucket: bucket.as_str(),
+                        object: entry.name.as_str(),
+                        stats_updates: stats_updates.as_slice(),
+                        expected_id: rebalance_id.as_ref(),
+                        cancel: &cancel,
+                    },
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
@@ -687,8 +710,7 @@ impl ECStore {
                             );
                             let result = this
                                 .rebalance_entry(
-                                    bucket,
-                                    pool_index,
+                                    RebalanceEntryTarget { bucket, pool_index },
                                     entry,
                                     set,
                                     bucket_configs,
@@ -875,8 +897,10 @@ pub mod test_util {
             let entry_task = tokio::spawn(async move {
                 entry_store
                     .rebalance_entry(
-                        bucket.to_string(),
-                        0,
+                        RebalanceEntryTarget {
+                            bucket: bucket.to_string(),
+                            pool_index: 0,
+                        },
                         entry,
                         entry_set,
                         Arc::new(RebalanceBucketConfigs::default()),
@@ -1050,8 +1074,10 @@ mod tests {
         tokio::spawn(async move {
             store
                 .rebalance_entry(
-                    crate::disk::RUSTFS_META_BUCKET.to_string(),
-                    0,
+                    RebalanceEntryTarget {
+                        bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                        pool_index: 0,
+                    },
                     entry,
                     set,
                     bucket_configs,
@@ -1102,20 +1128,21 @@ mod tests {
                 .rebalance_run_guard(rebalance_id, "rebalance source cleanup test")
                 .await
                 .expect("rebalance source cleanup test guard should be acquired");
+            let stats_updates = [&version];
+            let cleanup_context = RebalanceEntryCleanupContext {
+                run_guard: &run_guard,
+                pool_index: 0,
+                bucket: "bucket",
+                object: "object.bin",
+                stats_updates: &stats_updates,
+                expected_id: rebalance_id,
+                cancel: &cancel,
+            };
             finish_store
-                .finish_rebalance_entry_after_cleanup(
-                    &run_guard,
-                    0,
-                    "bucket",
-                    "object.bin",
-                    &[&version],
-                    rebalance_id,
-                    &cancel,
-                    async move {
-                        cleanup_released.await.expect("cleanup release sender should remain alive");
-                        Ok(ObjectInfo::default())
-                    },
-                )
+                .finish_rebalance_entry_after_cleanup(&cleanup_context, async move {
+                    cleanup_released.await.expect("cleanup release sender should remain alive");
+                    Ok(ObjectInfo::default())
+                })
                 .await
         });
 
@@ -1162,17 +1189,19 @@ mod tests {
             .rebalance_run_guard(rebalance_id, "rebalance cleanup warning test")
             .await
             .expect("rebalance cleanup warning test guard should be acquired");
+        let warning_cancel = CancellationToken::new();
+        let warning_stats_updates = [&warning_version];
+        let warning_cleanup_context = RebalanceEntryCleanupContext {
+            run_guard: &warning_guard,
+            pool_index: 0,
+            bucket: "bucket",
+            object: "object.bin",
+            stats_updates: &warning_stats_updates,
+            expected_id: rebalance_id,
+            cancel: &warning_cancel,
+        };
         let warning_result = store
-            .finish_rebalance_entry_after_cleanup(
-                &warning_guard,
-                0,
-                "bucket",
-                "object.bin",
-                &[&warning_version],
-                rebalance_id,
-                &CancellationToken::new(),
-                async { Err(Error::SlowDown.into()) },
-            )
+            .finish_rebalance_entry_after_cleanup(&warning_cleanup_context, async { Err(Error::SlowDown.into()) })
             .await
             .expect("cleanup warnings should not fail the completed migration");
         assert!(matches!(warning_result, RebalanceEntryCleanupResult::Completed { warning: Some(_) }));
@@ -1191,17 +1220,21 @@ mod tests {
             .rebalance_run_guard(rebalance_id, "rebalance cleanup deferral test")
             .await
             .expect("rebalance cleanup deferral test guard should be acquired");
+        let deferred_cancel = CancellationToken::new();
+        let deferred_stats_updates = [&warning_version];
+        let deferred_cleanup_context = RebalanceEntryCleanupContext {
+            run_guard: &deferred_guard,
+            pool_index: 0,
+            bucket: "bucket",
+            object: "object.bin",
+            stats_updates: &deferred_stats_updates,
+            expected_id: rebalance_id,
+            cancel: &deferred_cancel,
+        };
         let deferred = store
-            .finish_rebalance_entry_after_cleanup(
-                &deferred_guard,
-                0,
-                "bucket",
-                "object.bin",
-                &[&warning_version],
-                rebalance_id,
-                &CancellationToken::new(),
-                async { Err(data_movement::SourceCleanupError::SourceChanged) },
-            )
+            .finish_rebalance_entry_after_cleanup(&deferred_cleanup_context, async {
+                Err(data_movement::SourceCleanupError::SourceChanged)
+            })
             .await
             .expect("source changes should defer cleanup without failing the worker");
         assert!(matches!(deferred, RebalanceEntryCleanupResult::Deferred { .. }));
@@ -1280,8 +1313,10 @@ mod tests {
         let mut entry_task = tokio::spawn(async move {
             entry_store
                 .rebalance_entry(
-                    bucket.to_string(),
-                    0,
+                    RebalanceEntryTarget {
+                        bucket: bucket.to_string(),
+                        pool_index: 0,
+                    },
                     entry,
                     entry_set,
                     Arc::new(RebalanceBucketConfigs::default()),
