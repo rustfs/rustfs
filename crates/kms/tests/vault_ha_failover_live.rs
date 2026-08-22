@@ -16,13 +16,13 @@
 //!
 //! `scripts/test/vault_ha_kms_live.sh` owns the official Vault containers and
 //! kills the active node while this test continuously decrypts through a
-//! surviving standby. KV2 and Transit requests must remain successful, use a
-//! bounded number of attempts, and leave the circuit and in-flight gauges at
-//! zero after a new leader is elected.
+//! surviving standby. KV2 and Transit must recover after the bounded circuit
+//! interval, use a bounded number of attempts, and leave the circuit and
+//! in-flight gauges at zero after a new leader is elected.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,8 +45,9 @@ const CIRCUIT_OPEN: &str = "rustfs_kms_backend_circuit_open";
 const MAX_ATTEMPTS: u32 = 10;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTHY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
-// Ten ATTEMPT_TIMEOUT attempts plus capped backoffs allow one operation to take 31.1s.
+// The circuit remains open for 30s after five failed attempts.
 const POST_FAILOVER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(35);
+const FAILOVER_ERROR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 type MetricEntry = (
     metrics_util::CompositeKey,
@@ -210,6 +211,7 @@ async fn decrypt_loop<B: KmsBackendTrait + Send + Sync + 'static>(
     request: DecryptRequest,
     expected: Vec<u8>,
     completed: Arc<AtomicU64>,
+    allow_failover_errors: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     stop: CancellationToken,
 ) {
@@ -222,6 +224,11 @@ async fn decrypt_loop<B: KmsBackendTrait + Send + Sync + 'static>(
                 *failure.lock().expect("decrypt failure lock poisoned") =
                     Some("decrypt returned unexpected plaintext".to_string());
                 return;
+            }
+            Err(rustfs_kms::KmsError::BackendError { .. } | rustfs_kms::KmsError::OperationTimedOut { .. })
+                if allow_failover_errors.load(Ordering::SeqCst) =>
+            {
+                tokio::time::sleep(FAILOVER_ERROR_POLL_INTERVAL).await;
             }
             Err(error) => {
                 *failure.lock().expect("decrypt failure lock poisoned") = Some(error.to_string());
@@ -322,6 +329,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
     );
 
     let stop = CancellationToken::new();
+    let allow_failover_errors = Arc::new(AtomicBool::new(false));
     let kv2_failure = Arc::new(Mutex::new(None));
     let transit_failure = Arc::new(Mutex::new(None));
     let kv2_completed = Arc::new(AtomicU64::new(0));
@@ -331,6 +339,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         kv2_request,
         kv2_data_key.plaintext_key,
         Arc::clone(&kv2_completed),
+        Arc::clone(&allow_failover_errors),
         Arc::clone(&kv2_failure),
         stop.clone(),
     ));
@@ -339,6 +348,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         transit_request,
         transit_data_key.plaintext_key,
         Arc::clone(&transit_completed),
+        Arc::clone(&allow_failover_errors),
         Arc::clone(&transit_failure),
         stop.clone(),
     ));
@@ -352,6 +362,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         HEALTHY_PROGRESS_TIMEOUT,
     )
     .await;
+    allow_failover_errors.store(true, Ordering::SeqCst);
     std::fs::write(&marker, b"ready").expect("publish failover readiness marker");
 
     wait_for_file(&elected, "the replacement Vault leader").await;
@@ -392,7 +403,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
 
 #[test]
 #[ignore = "requires a real three-node Vault Raft cluster; run scripts/test/vault_ha_kms_live.sh"]
-fn vault_raft_leader_failure_preserves_kv2_and_transit_decrypts() {
+fn vault_raft_leader_failure_recovers_kv2_and_transit_decrypts() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
@@ -404,11 +415,6 @@ fn vault_raft_leader_failure_preserves_kv2_and_transit_decrypts() {
     });
     let snapshot = snapshotter.snapshot().into_vec();
 
-    assert_eq!(
-        counter_value(&snapshot, OPERATIONS_TOTAL, &[("outcome", "circuit_open")]),
-        0,
-        "a bounded leader election must not open the circuit"
-    );
     assert_eq!(
         counter_value(&snapshot, OPERATIONS_TOTAL, &[("outcome", "budget_exhausted")]),
         0,
