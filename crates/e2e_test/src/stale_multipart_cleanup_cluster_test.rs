@@ -15,7 +15,6 @@
 use crate::common::{RustFSTestClusterEnvironment, init_logging};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::CompletedMultipartUpload;
 use tokio::time::{Duration, sleep};
 use tracing::info;
 use uuid::Uuid;
@@ -43,32 +42,18 @@ async fn list_parts_reports_missing_upload(
     }
 }
 
-async fn complete_reports_missing_upload(
+async fn multipart_listing_reports_missing_upload(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let result = client
-        .complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
-        .multipart_upload(CompletedMultipartUpload::builder().build())
-        .send()
-        .await;
-    match result {
-        Ok(_) => Ok(false),
-        Err(SdkError::ServiceError(err)) => {
-            let code = err.err().meta().code().unwrap_or("");
-            if code == "NoSuchUpload" {
-                Ok(true)
-            } else {
-                Err(format!("unexpected complete_multipart_upload service error: code={code}, err={err:?}").into())
-            }
-        }
-        Err(err) => Err(format!("unexpected complete_multipart_upload error: {err:?}").into()),
-    }
+    let result = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
+
+    Ok(!result
+        .uploads()
+        .iter()
+        .any(|upload| upload.key() == Some(key) && upload.upload_id() == Some(upload_id)))
 }
 
 async fn wait_for_cleanup_on_all_nodes(
@@ -81,8 +66,8 @@ async fn wait_for_cleanup_on_all_nodes(
         let mut all_cleaned = true;
         for (idx, client) in clients.iter().enumerate() {
             let list_parts_missing = list_parts_reports_missing_upload(client, bucket, key, upload_id).await?;
-            let complete_missing = complete_reports_missing_upload(client, bucket, key, upload_id).await?;
-            if !(list_parts_missing && complete_missing) {
+            let listing_missing = multipart_listing_reports_missing_upload(client, bucket, key, upload_id).await?;
+            if !(list_parts_missing && listing_missing) {
                 info!("stale multipart still visible on node {} at attempt {}", idx, attempt + 1);
                 all_cleaned = false;
                 break;
@@ -145,6 +130,10 @@ async fn test_stale_multipart_cleanup_removes_incomplete_upload_across_cluster()
         parts_before_cleanup.parts().len(),
         1,
         "multipart upload should be visible before background cleanup"
+    );
+    assert!(
+        !multipart_listing_reports_missing_upload(&clients[2], CLEANUP_BUCKET, &key, &upload_id).await?,
+        "multipart upload listing should contain the upload before background cleanup"
     );
 
     wait_for_cleanup_on_all_nodes(&clients, CLEANUP_BUCKET, &key, &upload_id).await?;

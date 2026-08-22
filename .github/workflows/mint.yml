@@ -45,13 +45,6 @@
 # docker-capable self-hosted `dind-sm-standard-2` label was the alternative but
 # has fewer cores and reintroduces fleet-state risk for no reliability gain.
 
-# DISABLED. This workflow is switched off in the repository's Actions settings
-# (state: disabled_manually) and does not run on any trigger, including its cron
-# and workflow_dispatch. That state lives in GitHub's UI and is invisible when
-# reading this file, which has already misled at least one audit — hence this
-# banner. Re-enabling is a UI action; anyone doing so should first check that the
-# workflow still matches the current CI layout. See rustfs/backlog#1603.
-#
 name: mint
 
 on:
@@ -70,13 +63,13 @@ on:
           - core
           - full
       mint-image:
-        description: "Mint image reference"
+        description: "Mint image reference (empty = pinned default)"
         required: false
-        default: "minio/mint:edge"
+        default: ""
   schedule:
     # Weekly, after the Sunday s3-tests full sweep (starts 02:00 UTC, up to
     # 3h) has finished, so the two never contend for the same runner pool.
-    - cron: "0 6 * * 0"
+    - cron: "41 6 * * 0"
 
 env:
   S3_ACCESS_KEY: rustfsadmin-ci

@@ -1,0 +1,63 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Scheduled Validation Watchdog
+
+on:
+  workflow_run:
+    workflows:
+      - "Security Audit"
+      - "Build and Release"
+      - "Continuous Integration"
+      - "coverage"
+      - "e2e-nightly"
+      - "e2e-s3tests"
+      - "Fuzz"
+      - "mint"
+      - "minio-interop"
+      - "Nightly GNU Build"
+      - "Performance A/B"
+      - "Runner Hygiene"
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  alert-on-incomplete-run:
+    name: Alert on incomplete scheduled run
+    if: >-
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.conclusion != 'success' &&
+      github.event.workflow_run.conclusion != 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update incomplete-run issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          workflow-name: ${{ github.event.workflow_run.name }}
+          source-run-id: ${{ github.event.workflow_run.id }}
+          source-run-attempt: ${{ github.event.workflow_run.run_attempt }}
+          source-event: ${{ github.event.workflow_run.event }}
+          source-ref-name: ${{ github.event.workflow_run.head_branch }}
+          source-sha: ${{ github.event.workflow_run.head_sha }}

@@ -1,0 +1,14 @@
+[
+  { "workflow": ".github/workflows/audit.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/build.yml", "max_age_hours": 192 },
+  { "workflow": ".github/workflows/ci.yml", "max_age_hours": 192 },
+  { "workflow": ".github/workflows/coverage.yml", "max_age_hours": 192 },
+  { "workflow": ".github/workflows/e2e-replication-nightly.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/e2e-s3tests.yml", "max_age_hours": 192 },
+  { "workflow": ".github/workflows/fuzz.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/mint.yml", "max_age_hours": 192 },
+  { "workflow": ".github/workflows/minio-interop.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/nightly-gnu.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/performance-ab.yml", "max_age_hours": 36 },
+  { "workflow": ".github/workflows/runner-hygiene.yml", "max_age_hours": 792 }
+]
