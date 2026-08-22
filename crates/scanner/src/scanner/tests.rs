@@ -1411,6 +1411,22 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
 }
 
 #[tokio::test]
+async fn test_leadership_claim_rejects_terminal_epoch() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    let mut persisted_epoch = u64::MAX - 1;
+
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+    assert_eq!(persisted_epoch, u64::MAX - 1);
+    assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+}
+
+#[tokio::test]
 async fn test_leadership_claim_confirms_commit_after_returned_error() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
