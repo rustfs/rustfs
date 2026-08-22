@@ -1455,6 +1455,36 @@ where
     Ok(())
 }
 
+async fn run_decommission_phases<F>(
+    rx: CancellationToken,
+    regular_buckets: Vec<DecomBucketInfo>,
+    meta_buckets: Vec<DecomBucketInfo>,
+    bucket_concurrency: usize,
+    mut start_bucket: F,
+) -> Result<()>
+where
+    F: FnMut(DecomBucketInfo, CancellationToken) -> BoxFuture<'static, Result<()>>,
+{
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    for bucket in meta_buckets {
+        decommission_cancel_signal_result(rx.is_cancelled())?;
+        start_bucket(bucket, rx.clone()).await?;
+    }
+
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    if bucket_concurrency <= 1 {
+        for bucket in regular_buckets {
+            decommission_cancel_signal_result(rx.is_cancelled())?;
+            start_bucket(bucket, rx.clone()).await?;
+        }
+        return Ok(());
+    }
+
+    run_decommission_buckets_bounded(rx, regular_buckets, bucket_concurrency, start_bucket).await
+}
+
 #[cfg(test)]
 async fn wait_decommission_worker_drain(workers: &Semaphore, limit: usize) -> Result<()> {
     let permits = u32::try_from(limit)
@@ -4902,25 +4932,6 @@ impl ECStore {
         Ok(())
     }
 
-    async fn decommission_buckets_concurrently(
-        self: &Arc<Self>,
-        rx: CancellationToken,
-        idx: usize,
-        pool: Arc<Sets>,
-        buckets: Vec<DecomBucketInfo>,
-        limit: usize,
-        entry_budget: Arc<Semaphore>,
-    ) -> Result<()> {
-        let store = Arc::clone(self);
-        run_decommission_buckets_bounded(rx, buckets, limit, move |bucket, rx| {
-            let store = Arc::clone(&store);
-            let pool = pool.clone();
-            let entry_budget = entry_budget.clone();
-            Box::pin(async move { store.decommission_pending_bucket(rx, idx, pool, bucket, entry_budget).await })
-        })
-        .await
-    }
-
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_in_background(
         self: &Arc<Self>,
@@ -4935,31 +4946,15 @@ impl ECStore {
             pool_meta.pending_buckets(idx)
         };
         let bucket_concurrency = decommission_bucket_concurrency_limit();
-        if bucket_concurrency <= 1 {
-            for bucket in pending {
-                self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                    .await?;
-            }
-            return Ok(());
-        }
-
         let (regular_buckets, meta_buckets) = split_decommission_buckets(pending);
-        self.decommission_buckets_concurrently(
-            rx.clone(),
-            idx,
-            pool.clone(),
-            regular_buckets,
-            bucket_concurrency,
-            entry_budget.clone(),
-        )
-        .await?;
-
-        for bucket in meta_buckets {
-            self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                .await?;
-        }
-
-        Ok(())
+        let store = Arc::clone(self);
+        run_decommission_phases(rx, regular_buckets, meta_buckets, bucket_concurrency, move |bucket, rx| {
+            let store = Arc::clone(&store);
+            let pool = pool.clone();
+            let entry_budget = entry_budget.clone();
+            Box::pin(async move { store.decommission_pending_bucket(rx, idx, pool, bucket, entry_budget).await })
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -6377,8 +6372,8 @@ mod pools_tests {
         resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
         resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
         rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
-        run_decommission_listing_with_retry_and_drain, run_decommission_side_effect, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
+        run_decommission_listing_with_retry_and_drain, run_decommission_phases, run_decommission_side_effect,
+        should_cleanup_decommission_source_entry, should_continue_decommission_queue, should_count_decommission_version_complete,
         should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
         should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
         spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
@@ -6397,7 +6392,7 @@ mod pools_tests {
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_rio::Index;
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration as StdDuration;
@@ -6687,6 +6682,66 @@ mod pools_tests {
         assert_eq!(
             meta.iter().map(|bucket| bucket.prefix.as_str()).collect::<Vec<_>>(),
             vec![crate::config::com::CONFIG_PREFIX, crate::disk::BUCKET_META_PREFIX,]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_phase_precedes_regular_failure() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let err = run_decommission_phases(
+            CancellationToken::new(),
+            vec![
+                DecomBucketInfo {
+                    name: "regular-fails".to_string(),
+                    ..Default::default()
+                },
+                DecomBucketInfo {
+                    name: "regular-not-started".to_string(),
+                    ..Default::default()
+                },
+            ],
+            vec![
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+                },
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
+                },
+            ],
+            1,
+            {
+                let events = Arc::clone(&events);
+                move |bucket, _rx| {
+                    let events = Arc::clone(&events);
+                    Box::pin(async move {
+                        let event = if bucket.name == crate::disk::RUSTFS_META_BUCKET {
+                            format!("meta:{}", bucket.prefix)
+                        } else {
+                            format!("regular:{}", bucket.name)
+                        };
+                        events.lock().expect("phase event lock should not be poisoned").push(event);
+                        if bucket.name == "regular-fails" {
+                            Err(Error::SlowDown)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("regular failure should remain fatal after metadata completes");
+
+        assert!(matches!(err, Error::SlowDown));
+        assert_eq!(
+            *events.lock().expect("phase event lock should not be poisoned"),
+            vec![
+                format!("meta:{}", crate::config::com::CONFIG_PREFIX),
+                format!("meta:{}", crate::disk::BUCKET_META_PREFIX),
+                "regular:regular-fails".to_string(),
+            ]
         );
     }
 
