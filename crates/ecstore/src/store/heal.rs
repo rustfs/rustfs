@@ -150,6 +150,34 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        // Bucket heal rebuilds bucket volumes across the cluster, so a pool
+        // whose decommission is suspended or finished must not be dispatched
+        // to. Mirror the scoped object-heal deferral: an explicit blocked
+        // error instead of silently touching drained storage.
+        if let Some(pool_idx) = opts.pool {
+            let suspended_complete = {
+                let pool_meta = self.pool_meta.read().await;
+                pool_meta.is_suspended(pool_idx).then(|| {
+                    pool_meta
+                        .pools
+                        .get(pool_idx)
+                        .and_then(|status| status.decommission.as_ref())
+                        .is_some_and(|decommission| decommission.complete)
+                })
+            };
+            if let Some(complete) = suspended_complete {
+                return Err(if complete {
+                    StorageError::InvalidArgument(
+                        "heal".to_string(),
+                        "pool".to_string(),
+                        format!("heal pool {pool_idx} has completed decommission"),
+                    )
+                } else {
+                    Error::SlowDown
+                });
+            }
+        }
+
         let res = self.peer_sys.heal_bucket(bucket, opts).await?;
 
         Ok(res)
@@ -555,6 +583,93 @@ mod tests {
 
             assert!(matches!(err, Some(StorageError::SlowDown)));
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_heal_bucket_blocks_when_requested_pool_is_suspended() {
+        let mut store = minimal_heal_store().await;
+        store.pool_meta = RwLock::new(PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        });
+
+        // In-progress decommission: scoped bucket heal is deferred, not executed.
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("suspended pool must block scoped bucket heal before fan-out");
+
+        assert!(matches!(err, StorageError::SlowDown), "unexpected error: {err:?}");
+
+        // Completed decommission: scoped bucket heal fails with a terminal error.
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let decommission = pool_meta.pools[1]
+                .decommission
+                .as_mut()
+                .expect("test pool should have decommission state");
+            decommission.complete = true;
+        }
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("completed pool must fail scoped bucket heal");
+
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "pool" && reason.contains("completed decommission")),
+            "unexpected error: {err:?}"
+        );
+
+        // Active pool scope and unscoped heals still dispatch (the empty peer
+        // system fails the fan-out with a quorum error, not a fence error).
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("active pool scope should reach the peer fan-out");
+
+        assert!(matches!(err, StorageError::ErasureWriteQuorum), "unexpected error: {err:?}");
+
+        let err = store
+            .handle_heal_bucket("bucket", &HealOpts::default())
+            .await
+            .expect_err("unscoped heal should reach the peer fan-out");
+
+        assert!(matches!(err, StorageError::ErasureWriteQuorum), "unexpected error: {err:?}");
     }
 
     #[tokio::test]
