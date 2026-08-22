@@ -125,6 +125,34 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     }
 }
 
+/// Read only the object revision without materializing its body.
+pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
+    match store
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            path,
+            None,
+            HeaderMap::new(),
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(reader) => reader
+            .object_info
+            .etag
+            .filter(|etag| !etag.is_empty())
+            .map(DataUsageCacheRevision::Etag)
+            .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag"))),
+        Err(Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_)) => {
+            Ok(DataUsageCacheRevision::Missing)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
@@ -145,6 +173,11 @@ pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
 
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));
+
+/// Durable companion object for a cycle-state object which cannot be decoded.
+/// The primary object is deliberately never replaced or deleted by recovery.
+pub static DATA_USAGE_BLOOM_RECOVERY_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{}.recovery-required.json", DATA_USAGE_BLOOM_NAME_PATH.as_str()));
 
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
