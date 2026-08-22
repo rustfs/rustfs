@@ -47,21 +47,29 @@ def fmt_pct(covered: int, count: int) -> str:
     return f"{100.0 * covered / count:.2f}%" if count else "—"
 
 
+def _line_counts(lines: dict[str, int], source: str) -> tuple[int, int]:
+    covered = lines["covered"]
+    count = lines["count"]
+    if type(covered) is not int or type(count) is not int or covered < 0 or count < 0 or covered > count:
+        raise ValueError(f"invalid line coverage for {source}: {covered}/{count}")
+    return covered, count
+
+
 def load_coverage(path: str, root: str) -> tuple[dict[str, list[int]], dict[str, int]]:
     with open(path, encoding="utf-8") as fh:
         export = json.load(fh)
 
     data = export["data"][0]
     files = data["files"]
-    totals = data["totals"]["lines"]
+    total_covered, total_count = _line_counts(data["totals"]["lines"], "totals")
 
     crates: dict[str, list[int]] = {}
     for f in files:
-        lines = f["summary"]["lines"]
+        covered, count = _line_counts(f["summary"]["lines"], f["filename"])
         acc = crates.setdefault(crate_label(f["filename"], root), [0, 0])
-        acc[0] += lines["covered"]
-        acc[1] += lines["count"]
-    return crates, totals
+        acc[0] += covered
+        acc[1] += count
+    return crates, {"covered": total_covered, "count": total_count}
 
 
 def main() -> int:
@@ -73,7 +81,7 @@ def main() -> int:
 
     try:
         crates, totals = load_coverage(path, root)
-    except (KeyError, IndexError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:
         print(f"error: unexpected llvm-cov JSON shape ({exc})", file=sys.stderr)
         return 1
 

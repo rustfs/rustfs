@@ -37,14 +37,19 @@ def load_baselines(path: str) -> tuple[float, dict[str, tuple[int, int]]]:
     if config.get("phase") != "report-only":
         raise ValueError("coverage baseline phase must be report-only")
 
-    allowed_drop = float(config["allowed_drop_percentage_points"])
+    raw_allowed_drop = config["allowed_drop_percentage_points"]
+    if isinstance(raw_allowed_drop, bool) or not isinstance(raw_allowed_drop, (int, float)):
+        raise ValueError("allowed_drop_percentage_points must be a number")
+    allowed_drop = float(raw_allowed_drop)
     if not math.isfinite(allowed_drop) or allowed_drop < 0:
         raise ValueError("allowed_drop_percentage_points must be finite and non-negative")
 
     baselines: dict[str, tuple[int, int]] = {}
     for crate, values in config["crates"].items():
-        covered = int(values["covered"])
-        count = int(values["count"])
+        covered = values["covered"]
+        count = values["count"]
+        if type(covered) is not int or type(count) is not int:
+            raise ValueError(f"invalid baseline for {crate}: covered and count must be integers")
         if covered < 0 or count <= 0 or covered > count:
             raise ValueError(f"invalid baseline for {crate}: {covered}/{count}")
         baselines[crate] = (covered, count)
@@ -65,6 +70,8 @@ def compare(
         if crate not in current:
             raise ValueError(f"coverage report is missing {crate}")
         covered, count = current[crate]
+        if type(covered) is not int or type(count) is not int:
+            raise ValueError(f"invalid coverage for {crate}: covered and count must be integers")
         if covered < 0 or count <= 0 or covered > count:
             raise ValueError(f"invalid coverage for {crate}: {covered}/{count}")
         current_pct = 100.0 * covered / count
@@ -97,36 +104,32 @@ def self_test() -> None:
         root = Path(tmp)
         coverage = root / "coverage.json"
         baseline = root / "baseline.toml"
-        coverage.write_text(
-            json.dumps(
+        coverage_data = {
+            "data": [
                 {
-                    "data": [
+                    "files": [
                         {
-                            "files": [
-                                {
-                                    "filename": str(root / "crates/iam/src/lib.rs"),
-                                    "summary": {"lines": {"covered": 80, "count": 100}},
-                                },
-                                {
-                                    "filename": str(root / "crates/kms/src/lib.rs"),
-                                    "summary": {"lines": {"covered": 90, "count": 100}},
-                                },
-                                {
-                                    "filename": str(root / "crates/policy/src/lib.rs"),
-                                    "summary": {"lines": {"covered": 90, "count": 100}},
-                                },
-                                {
-                                    "filename": str(root / "crates/crypto/src/lib.rs"),
-                                    "summary": {"lines": {"covered": 90, "count": 100}},
-                                },
-                            ],
-                            "totals": {"lines": {"covered": 350, "count": 400}},
-                        }
-                    ]
+                            "filename": str(root / "crates/iam/src/lib.rs"),
+                            "summary": {"lines": {"covered": 80, "count": 100}},
+                        },
+                        {
+                            "filename": str(root / "crates/kms/src/lib.rs"),
+                            "summary": {"lines": {"covered": 90, "count": 100}},
+                        },
+                        {
+                            "filename": str(root / "crates/policy/src/lib.rs"),
+                            "summary": {"lines": {"covered": 90, "count": 100}},
+                        },
+                        {
+                            "filename": str(root / "crates/crypto/src/lib.rs"),
+                            "summary": {"lines": {"covered": 90, "count": 100}},
+                        },
+                    ],
+                    "totals": {"lines": {"covered": 350, "count": 400}},
                 }
-            ),
-            encoding="utf-8",
-        )
+            ]
+        }
+        coverage.write_text(json.dumps(coverage_data), encoding="utf-8")
         baseline_text = """phase = "report-only"
 allowed_drop_percentage_points = 1.0
 [crates."crates/iam"]
@@ -159,7 +162,7 @@ count = 100
             assert str(error) == "invalid coverage for crates/iam: 101/100"
         else:
             raise AssertionError("invalid coverage must fail closed")
-        for invalid_threshold in ("nan", "inf", "-inf"):
+        for invalid_threshold in ("true", '"1.0"', "nan", "inf", "-inf"):
             baseline.write_text(
                 baseline_text.replace("allowed_drop_percentage_points = 1.0", f"allowed_drop_percentage_points = {invalid_threshold}"),
                 encoding="utf-8",
@@ -170,6 +173,51 @@ count = 100
                 pass
             else:
                 raise AssertionError(f"non-finite threshold {invalid_threshold} must fail closed")
+        for field, invalid_values in (
+            ("covered", ("true", '"90"', "90.0", "90.5")),
+            ("count", ("true", '"100"', "100.0", "100.5")),
+        ):
+            for invalid_value in invalid_values:
+                baseline.write_text(
+                    baseline_text.replace(f"{field} = {90 if field == 'covered' else 100}", f"{field} = {invalid_value}", 1),
+                    encoding="utf-8",
+                )
+                try:
+                    load_baselines(str(baseline))
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"non-integer baseline {field} {invalid_value} must fail closed")
+        for covered, count in (
+            (True, 100),
+            (80, True),
+            (80.0, 100),
+            (80, 100.0),
+            (float("nan"), 100),
+            (80, float("inf")),
+        ):
+            try:
+                compare({**current, "crates/iam": [covered, count]}, baselines, allowed_drop)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid aggregate coverage {covered}/{count} must fail closed")
+        lines = coverage_data["data"][0]["files"][0]["summary"]["lines"]
+        for field, invalid_values in (
+            ("covered", (True, "80", 80.0, 80.5, float("nan"), float("inf"), float("-inf"))),
+            ("count", (True, "100", 100.0, 100.5, float("nan"), float("inf"), float("-inf"))),
+        ):
+            original = lines[field]
+            for invalid_value in invalid_values:
+                lines[field] = invalid_value
+                coverage.write_text(json.dumps(coverage_data), encoding="utf-8")
+                try:
+                    load_coverage(str(coverage), str(root))
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"invalid raw coverage {field} {invalid_value} must fail closed")
+            lines[field] = original
         baseline.write_text(
             baseline_text.replace(
                 '[crates."crates/crypto"]\ncovered = 90\ncount = 100\n',
