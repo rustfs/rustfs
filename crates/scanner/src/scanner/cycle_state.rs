@@ -438,6 +438,45 @@ async fn read_cycle_recovery_marker_bytes(
     Ok((Some(data), revision))
 }
 
+async fn read_cycle_recovery_marker_revision(
+    storeapi: Arc<impl ScannerObjectIO>,
+) -> Result<DataUsageCacheRevision, CycleRecoveryMarkerReadError> {
+    let reader = match storeapi
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+            None,
+            http::HeaderMap::new(),
+            &ScannerObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(reader) => reader,
+        Err(
+            EcstoreError::FileNotFound
+            | EcstoreError::VolumeNotFound
+            | EcstoreError::ObjectNotFound(_, _)
+            | EcstoreError::BucketNotFound(_)
+            | EcstoreError::ConfigNotFound,
+        ) => return Ok(DataUsageCacheRevision::Missing),
+        Err(err) => return Err(CycleRecoveryMarkerReadError::Backend(err)),
+    };
+    if reader.object_info.is_dir || reader.object_info.size < 0 {
+        return Err(CycleRecoveryMarkerReadError::Invalid("marker is not a regular object"));
+    }
+    reader
+        .object_info
+        .etag
+        .as_ref()
+        .filter(|etag| !etag.is_empty())
+        .cloned()
+        .map(DataUsageCacheRevision::Etag)
+        .ok_or(CycleRecoveryMarkerReadError::Invalid("marker has no revision"))
+}
+
 async fn quarantine_invalid_cycle_state(
     storeapi: Arc<impl ScannerObjectIO>,
     revision: &DataUsageCacheRevision,
@@ -711,14 +750,22 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         return Err(ScannerError::Other("scanner leader lock was lost before recovery reset".to_string()));
     }
 
-    let (marker_data, marker_revision) = read_cycle_recovery_marker_bytes(storeapi.clone())
-        .await
-        .map_err(|err| ScannerError::Other(format!("failed to read cycle recovery marker: {err}")))?;
+    let (marker_data, marker_revision, marker_body_invalid) = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
+        Ok((marker_data, marker_revision)) => (marker_data, marker_revision, false),
+        Err(CycleRecoveryMarkerReadError::Invalid(_)) => {
+            let marker_revision = read_cycle_recovery_marker_revision(storeapi.clone())
+                .await
+                .map_err(|err| ScannerError::Other(format!("failed to read cycle recovery marker: {err}")))?;
+            (Some(Vec::new()), marker_revision, true)
+        }
+        Err(err) => return Err(ScannerError::Other(format!("failed to read cycle recovery marker: {err}"))),
+    };
     let marker_data = marker_data.ok_or_else(|| ScannerError::Other("scanner cycle recovery marker is absent".to_string()))?;
     let (marker, force_full_rescan) = match serde_json::from_slice::<ScannerCycleRecoveryMarker>(&marker_data) {
         Ok(marker) if validate_recovery_marker(&marker).is_ok() => (marker, false),
         _ => (decode_recovery_marker_for_reset(&marker_data, &marker_revision)?, true),
     };
+    let force_full_rescan = force_full_rescan || marker_body_invalid;
 
     if guard.is_lock_lost() {
         return Err(ScannerError::Other(

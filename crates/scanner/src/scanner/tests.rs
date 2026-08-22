@@ -1394,6 +1394,56 @@ async fn full_rescan_reset_rebuilds_oversized_primary_after_cleanup_marker() {
 }
 
 #[tokio::test]
+async fn full_rescan_reset_rebuilds_with_oversized_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
+        .await
+        .expect("corrupt cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), vec![b'x'; 64 * 1024 + 1])
+        .await
+        .expect("oversized recovery marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("full-rescan reset should recover an oversized marker");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (_, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn full_rescan_reset_rebuilds_with_empty_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
+        .await
+        .expect("corrupt cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), Vec::new())
+        .await
+        .expect("empty recovery marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("full-rescan reset should recover an empty marker");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("rebuilt cycle state should remain durable");
+    let (_, leader_epoch) = decode_scanner_cycle_state(&state).expect("rebuilt cycle state should decode");
+    assert_eq!(leader_epoch, 1);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
 async fn full_rescan_reset_keeps_cleanup_marker_when_preserved_epoch_is_exhausted() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let primary = CurrentCycle {
