@@ -800,6 +800,20 @@ jobs:
       - name: Verify awscurl
         run: test -x "$AWSCURL_PATH"
 
+      - name: Install mc
+        env:
+          MC_VERSION: RELEASE.2025-08-13T08-35-41Z
+          MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+        run: |
+          MC_BINARY="mc.linux-amd64.${MC_VERSION}"
+          curl -fsSLo "$RUNNER_TEMP/mc" "https://github.com/minio/mc/releases/download/${MC_VERSION}/${MC_BINARY}"
+          echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
+          chmod +x "$RUNNER_TEMP/mc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Verify mc
+        run: mc --version
+
       - name: Install Vault
         run: |
           VAULT_VERSION="1.17.6"
