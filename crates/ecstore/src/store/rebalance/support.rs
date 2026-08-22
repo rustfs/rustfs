@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::error::{Error, Result, StorageError, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{ObjectInfo, ObjectOptions};
+use rustfs_utils::http::metadata_compat::strip_internal_prefix;
 use rustfs_utils::path::decode_dir_object;
 use time::OffsetDateTime;
 
@@ -137,37 +138,140 @@ pub(super) fn rebalance_disk_set_lookup_error(pool_idx: usize, set_idx: usize, p
     ))
 }
 
+fn latest_candidate_mod_time(candidate: &LatestObjectInfoCandidate) -> Option<OffsetDateTime> {
+    candidate
+        .info
+        .as_ref()
+        .map(|info| info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))
+}
+
+fn same_transition_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
+    left.transition_version_state == right.transition_version_state
+        && left.transitioned_object.name == right.transitioned_object.name
+        && left.transitioned_object.version_id == right.transitioned_object.version_id
+        && left.transitioned_object.tier == right.transitioned_object.tier
+        && left.transitioned_object.free_version == right.transitioned_object.free_version
+        && left.transitioned_object.status == right.transitioned_object.status
+}
+
+#[derive(PartialEq, Eq)]
+struct LatestUserDefinedIdentity {
+    internal: HashMap<String, String>,
+    other: HashMap<String, String>,
+}
+
+fn normalize_user_defined_identity(user_defined: &HashMap<String, String>) -> Option<LatestUserDefinedIdentity> {
+    let mut identity = LatestUserDefinedIdentity {
+        internal: HashMap::with_capacity(user_defined.len()),
+        other: HashMap::with_capacity(user_defined.len()),
+    };
+
+    for (key, value) in user_defined {
+        if let Some(suffix) = strip_internal_prefix(key) {
+            if identity
+                .internal
+                .insert(suffix, value.clone())
+                .is_some_and(|previous| previous != *value)
+            {
+                return None;
+            }
+        } else {
+            identity.other.insert(key.clone(), value.clone());
+        }
+    }
+
+    Some(identity)
+}
+
+fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
+    match (
+        normalize_user_defined_identity(&left.user_defined),
+        normalize_user_defined_identity(&right.user_defined),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Pool-specific erasure geometry is intentionally excluded: `get_object_info`
+/// returns each pool's own `data_blocks`/`parity_blocks`, so those values can
+/// differ for the same object version while the selected winner still carries
+/// the chosen pool's layout. `put_object_reader` is also intentionally
+/// excluded because it is a transient request handle that `ObjectInfo::clone`
+/// drops. Every other ObjectInfo field is part of the production-visible
+/// identity and must agree before the pool index can provide a deterministic
+/// tie-break.
+fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
+    left.bucket == right.bucket
+        && left.name == right.name
+        && left.storage_class == right.storage_class
+        && left.mod_time == right.mod_time
+        && left.size == right.size
+        && left.actual_size == right.actual_size
+        && left.is_dir == right.is_dir
+        && same_user_defined_identity(left, right)
+        && left.user_tags == right.user_tags
+        && left.version_id == right.version_id
+        && left.data_dir == right.data_dir
+        && left.delete_marker == right.delete_marker
+        && same_transition_identity(left, right)
+        && left.restore_ongoing == right.restore_ongoing
+        && left.restore_expires == right.restore_expires
+        && left.parts == right.parts
+        && left.is_latest == right.is_latest
+        && left.content_type == right.content_type
+        && left.content_encoding == right.content_encoding
+        && left.expires == right.expires
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time
+        && left.etag == right.etag
+        && left.inlined == right.inlined
+        && left.metadata_only == right.metadata_only
+        && left.version_only == right.version_only
+        && left.replication_status_internal == right.replication_status_internal
+        && left.replication_status == right.replication_status
+        && left.version_purge_status_internal == right.version_purge_status_internal
+        && left.version_purge_status == right.version_purge_status
+        && left.replication_decision == right.replication_decision
+        && left.checksum == right.checksum
+}
+
 pub(super) fn resolve_latest_object_info_candidates(
-    mut candidates: Vec<LatestObjectInfoCandidate>,
+    candidates: Vec<LatestObjectInfoCandidate>,
     bucket: &str,
     object: &str,
     opts: &ObjectOptions,
 ) -> Result<(ObjectInfo, usize)> {
-    candidates.sort_by(|a, b| {
-        let a_mod = if let Some(info) = &a.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
+    let latest_mod_time = candidates.iter().filter_map(latest_candidate_mod_time).max();
+
+    if let Some(latest_mod_time) = latest_mod_time {
+        let mut latest_candidates = candidates
+            .into_iter()
+            .filter(|candidate| latest_candidate_mod_time(candidate) == Some(latest_mod_time))
+            .collect::<Vec<_>>();
+
+        latest_candidates.sort_by(|left, right| right.idx.cmp(&left.idx));
+
+        let Some(winner) = latest_candidates.first() else {
+            return Err(Error::ErasureReadQuorum);
+        };
+        let Some(winner_info) = winner.info.as_ref() else {
+            return Err(Error::ErasureReadQuorum);
         };
 
-        let b_mod = if let Some(info) = &b.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
-
-        if a_mod == b_mod {
-            return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
+        if latest_candidates.iter().skip(1).any(|candidate| {
+            candidate
+                .info
+                .as_ref()
+                .is_none_or(|info| !same_latest_object_info_identity(winner_info, info))
+        }) {
+            return Err(Error::ErasureReadQuorum);
         }
 
-        b_mod.cmp(&a_mod)
-    });
+        return Ok((winner_info.clone(), winner.idx));
+    }
 
     for candidate in candidates {
-        if let Some(info) = candidate.info {
-            return Ok((info, candidate.idx));
-        }
-
         if let Some(err) = candidate.err
             && !is_err_object_not_found(&err)
             && !is_err_version_not_found(&err)
