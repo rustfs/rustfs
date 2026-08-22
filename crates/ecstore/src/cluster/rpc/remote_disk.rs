@@ -778,14 +778,16 @@ impl RemoteDisk {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
-        let probe = self.data_transport.probe_ns_scanner(NsScannerCapabilityRequest {
+        let probe = self.data_transport.probe_ns_scanner_capability(NsScannerCapabilityRequest {
             endpoint: self.endpoint.grid_host(),
+            supports_tier_registry_generation: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
             .map_err(|_| DiskError::other("remote namespace scanner capability probe timed out"))?;
         match result {
-            Ok(server_epoch) => Ok(Some(server_epoch)),
+            Ok(response) if response.supports_tier_registry_generation == Some(true) => Ok(Some(response.server_epoch)),
+            Ok(_) => Ok(None),
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
             Err(DiskError::MethodNotAllowed) => Ok(None),
             Err(err)
@@ -3974,10 +3976,21 @@ mod tests {
         NsScannerProbe(NsScannerCapabilityRequest),
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
+        ns_scanner_generation_support: Arc<StdMutex<Option<bool>>>,
+    }
+
+    impl Default for RecordingInternodeDataTransport {
+        fn default() -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::default(),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -4197,6 +4210,15 @@ mod tests {
             Self {
                 calls: Arc::default(),
                 ns_scanner_probe_status: Arc::new(StdMutex::new(Some(status))),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+            }
+        }
+
+        fn with_ns_scanner_generation_support(support: Option<bool>) -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::default(),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(support)),
             }
         }
 
@@ -4860,6 +4882,23 @@ mod tests {
                 );
             }
             Ok(Uuid::from_u128(1))
+        }
+
+        async fn probe_ns_scanner_capability(
+            &self,
+            request: NsScannerCapabilityRequest,
+        ) -> Result<crate::storage_api_contracts::internode::NsScannerCapabilityResponse> {
+            let server_epoch = self.probe_ns_scanner(request).await?;
+            let supports_tier_registry_generation = *self
+                .ns_scanner_generation_support
+                .lock()
+                .expect("namespace scanner generation support lock poisoned");
+            Ok(crate::storage_api_contracts::internode::NsScannerCapabilityResponse {
+                version: crate::storage_api_contracts::internode::NS_SCANNER_PROTOCOL_VERSION,
+                server_epoch,
+                proof: Vec::new(),
+                supports_tier_registry_generation,
+            })
         }
 
         fn name(&self) -> &'static str {
@@ -6669,6 +6708,22 @@ mod tests {
                     .ns_scanner_server_epoch()
                     .await
                     .expect("unsupported namespace scanner response should be classified"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_falls_back_without_generation_support() {
+        for support in [None, Some(false)] {
+            let transport = RecordingInternodeDataTransport::with_ns_scanner_generation_support(support);
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+            assert_eq!(
+                remote_disk
+                    .ns_scanner_server_epoch()
+                    .await
+                    .expect("missing generation support should be classified as unsupported"),
                 None
             );
         }

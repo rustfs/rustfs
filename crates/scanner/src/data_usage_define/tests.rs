@@ -710,6 +710,12 @@ fn unknown_tier_is_bounded_and_accounted() {
     assert_eq!(summary.unknown_tier_stats.unknown_bytes, 11);
     assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 11);
     assert_eq!(summary.unknown_tier_stats.unknown_objects, 1);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 0);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 0);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
     assert!(
         summary
             .unknown_tier_stats
@@ -743,6 +749,10 @@ fn unknown_tier_is_accounted_when_no_remote_tier_is_configured() {
         ..Default::default()
     };
     summary.actions_accounting(&standard, 4, 4);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 13);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 4);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 3 + 4);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 4);
     assert_eq!(summary.tier_stats.len(), 1, "built-ins preserve the no-tier map shape");
 }
 
@@ -762,6 +772,8 @@ fn million_unique_tier_keys_do_not_grow_stats_map() {
     assert_eq!(summary.tier_stats.len(), 2);
     assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 1_000_000);
     assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1_000_000);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
 }
 
 #[test]
@@ -786,20 +798,85 @@ fn unknown_tier_never_triggers_transition() {
 fn removed_tier_survives_restart_as_unknown() {
     let mut summary = SizeSummary::new();
     summary.tier_stats.insert("COLD".to_string(), TierStats::default());
+    summary.tier_stats.insert(
+        "RETIRED".to_string(),
+        TierStats {
+            total_size: 5,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
     let object = ObjectInfo {
-        storage_class: Some("retired-tier".to_string()),
+        storage_class: Some("COLD".to_string()),
         size: 5,
         ..Default::default()
     };
     summary.actions_accounting(&object, 5, 5);
     let mut entry = DataUsageEntry::default();
     entry.add_tier_sizes(&summary.tier_stats);
-    entry.add_unknown_tier_stats(&summary.unknown_tier_stats);
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 2,
+        unknown_physical_bytes: 2,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
     let encoded = rmp_serde::to_vec(&entry).expect("entry should encode");
     let restored: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("entry should decode");
+    assert_eq!(restored.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+    assert_eq!(
+        restored.all_tier_stats.as_ref().expect("tier stats persisted").tiers["RETIRED"].total_size,
+        5
+    );
 
-    assert_eq!(restored.all_tier_stats.expect("tier stats persisted").tiers[UNKNOWN_TIER].total_size, 5);
-    assert_eq!(restored.unknown_tier_stats.expect("unknown stats persisted").unknown_bytes, 5);
+    let mut cache = DataUsageCache::default();
+    cache.replace("bucket", "", restored);
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let folded = cache.cache.get(&hash_path("bucket").key()).expect("folded cache entry");
+    assert_eq!(
+        folded.all_tier_stats.as_ref().expect("tier stats persisted").tiers[UNKNOWN_TIER].total_size,
+        5
+    );
+    assert_eq!(folded.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+}
+
+#[test]
+fn retired_tier_fold_is_idempotent_and_rejects_mixed_companion_provenance() {
+    let mut cache = DataUsageCache::default();
+    let mut entry = DataUsageEntry {
+        all_tier_stats: Some(AllTierStats {
+            tiers: HashMap::from([(
+                "RETIRED".to_string(),
+                TierStats {
+                    total_size: 5,
+                    num_versions: 1,
+                    num_objects: 1,
+                },
+            )]),
+        }),
+        ..Default::default()
+    };
+    entry.unknown_tier_stats = Some(UnknownTierStats {
+        unknown_physical_bytes: 5,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 5,
+        physical_known: 5,
+        ..Default::default()
+    });
+    cache.replace("bucket", "", entry);
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let first = cache.cache.get(&hash_path("bucket").key()).expect("entry").clone();
+    assert_eq!(first.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(first.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+    assert!(first.tier_accounting_proof.is_none(), "mixed provenance must not publish");
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let second = cache.cache.get(&hash_path("bucket").key()).expect("entry");
+    assert_eq!(second.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(second.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
 }
 
 #[test]
@@ -846,6 +923,16 @@ fn unknown_tier_counter_uses_checked_arithmetic() {
     unknown.record("overflow", 1, 1, 1);
     assert_eq!(unknown.unknown_bytes, u64::MAX);
     assert_eq!(unknown.unknown_objects, 1);
+    assert!(unknown.counter_overflowed);
+    assert!(unknown.checked_add(&UnknownTierStats::default()).is_none());
+    assert!(
+        unknown
+            .checked_add(&UnknownTierStats {
+                unknown_bytes: 1,
+                ..Default::default()
+            })
+            .is_none()
+    );
 }
 
 #[test]
@@ -1101,7 +1188,7 @@ const USAGE_CACHE_WIRE_FIXTURE: &[u8] = &[
     0xdc, 0x00, 0x20, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
     0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f,
     0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x01, 0x81, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63,
-    0x6b, 0x65, 0x74, 0x8c, 0xa8, 0x63, 0x68, 0x69, 0x6c, 0x64, 0x72, 0x65, 0x6e, 0x90, 0xa4, 0x73, 0x69, 0x7a, 0x65, 0xcd, 0x10,
+    0x6b, 0x65, 0x74, 0x8b, 0xa8, 0x63, 0x68, 0x69, 0x6c, 0x64, 0x72, 0x65, 0x6e, 0x90, 0xa4, 0x73, 0x69, 0x7a, 0x65, 0xcd, 0x10,
     0x00, 0xa7, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x03, 0xa8, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x05, 0xae,
     0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72, 0x73, 0x01, 0xa9, 0x6f, 0x62, 0x6a, 0x5f, 0x73,
     0x69, 0x7a, 0x65, 0x73, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x6f, 0x62, 0x6a, 0x5f,
@@ -1109,8 +1196,7 @@ const USAGE_CACHE_WIRE_FIXTURE: &[u8] = &[
     0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0xc0, 0xa9, 0x63, 0x6f, 0x6d, 0x70, 0x61, 0x63,
     0x74, 0x65, 0x64, 0xc3, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x02, 0xae,
     0x61, 0x6c, 0x6c, 0x5f, 0x74, 0x69, 0x65, 0x72, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0x91, 0x81, 0xa4, 0x57, 0x41, 0x52, 0x4d,
-    0x93, 0xcd, 0x08, 0x00, 0x02, 0x01, 0xb2, 0x75, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x5f, 0x74, 0x69, 0x65, 0x72, 0x5f, 0x73,
-    0x74, 0x61, 0x74, 0x73, 0xc0,
+    0x93, 0xcd, 0x08, 0x00, 0x02, 0x01,
 ];
 
 #[test]

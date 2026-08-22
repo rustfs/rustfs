@@ -100,13 +100,14 @@ where
     let _ = tokio::time::timeout(SCANNER_CACHE_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan).await;
 }
 
-pub(crate) fn current_cache_root_entry(
+pub(crate) fn current_cache_root_entry_with_generation(
     cache: &DataUsageCache,
     name: &str,
     source: DataUsageCacheSource,
     next_cycle: u64,
     leader_epoch: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    tier_registry_generation: Option<u64>,
 ) -> std::result::Result<Option<DataUsageEntryInfo>, ScannerError> {
     let metadata_is_current = cache.info.name == name
         && cache.info.source == Some(source)
@@ -115,7 +116,8 @@ pub(crate) fn current_cache_root_entry(
         && cache.info.last_update.is_some()
         && cache.info.next_cycle == next_cycle
         && cache.info.leader_epoch == leader_epoch
-        && cache.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT;
+        && cache.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
+        && tier_registry_generation.is_none_or(|generation| cache.info.tier_registry_generation == Some(generation));
     if !metadata_is_current {
         return Ok(None);
     }
@@ -131,6 +133,13 @@ pub(crate) enum DataUsageCacheScanState {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DataUsageCacheReuseOptions {
+    pub(crate) require_source: bool,
+    pub(crate) tier_registry_generation: Option<u64>,
+}
+
+#[cfg(test)]
 pub(crate) fn current_cache_root_or_prepare(
     cache: &mut DataUsageCache,
     name: &str,
@@ -140,11 +149,51 @@ pub(crate) fn current_cache_root_or_prepare(
     scan_plan_digest: DataUsageScanPlanDigest,
     require_source: bool,
 ) -> DataUsageCacheScanState {
-    match current_cache_root_entry(cache, name, source, next_cycle, leader_epoch, scan_plan_digest) {
+    current_cache_root_or_prepare_with_generation(
+        cache,
+        name,
+        source,
+        next_cycle,
+        leader_epoch,
+        scan_plan_digest,
+        DataUsageCacheReuseOptions {
+            require_source,
+            tier_registry_generation: None,
+        },
+    )
+}
+
+pub(crate) fn current_cache_root_or_prepare_with_generation(
+    cache: &mut DataUsageCache,
+    name: &str,
+    source: DataUsageCacheSource,
+    next_cycle: u64,
+    leader_epoch: u64,
+    scan_plan_digest: DataUsageScanPlanDigest,
+    options: DataUsageCacheReuseOptions,
+) -> DataUsageCacheScanState {
+    if options.tier_registry_generation.is_some_and(|generation| {
+        cache.info.next_cycle <= next_cycle
+            && cache.info.leader_epoch <= leader_epoch
+            && cache.info.tier_registry_generation != Some(generation)
+    }) {
+        // Make prepare_for_scan take its reset path so an entry classified by
+        // an older registry cannot be reused under the new cycle generation.
+        cache.info.scan_plan_digest = None;
+    }
+    match current_cache_root_entry_with_generation(
+        cache,
+        name,
+        source,
+        next_cycle,
+        leader_epoch,
+        scan_plan_digest,
+        options.tier_registry_generation,
+    ) {
         Ok(Some(root)) => DataUsageCacheScanState::Current(Box::new(root)),
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
-            outcome: cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, require_source),
+            outcome: cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
         },
     }
 }
@@ -159,7 +208,7 @@ pub(super) fn cache_snapshot_is_current(
     scan_plan_digest: DataUsageScanPlanDigest,
 ) -> bool {
     matches!(
-        current_cache_root_entry(cache, name, source, next_cycle, leader_epoch, scan_plan_digest),
+        current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
 }
@@ -168,6 +217,7 @@ pub(super) fn completed_data_usage_info(
     results: &[DataUsageCache],
     expected_sources: &HashSet<DataUsageCacheSource>,
     all_buckets: &[String],
+    tier_registry_names: &[String],
     bucket_plan_complete: bool,
     budget_elapsed: bool,
     cancelled: bool,
@@ -180,6 +230,19 @@ pub(super) fn completed_data_usage_info(
         return None;
     }
     if !scanner_results_form_complete_snapshot(results, expected_sources) {
+        return None;
+    }
+
+    // A generation is comparable across nodes because it is derived from the
+    // frozen registry names. Cycle and leader fencing remain separate cache
+    // metadata. Legacy peers omit the generation; an all-legacy result remains
+    // readable, but mixing legacy and new (or two new generations) would make
+    // the per-tier accounting ambiguous.
+    let registry_generation = results.first()?.info.tier_registry_generation;
+    if results.iter().any(|result| match registry_generation {
+        Some(generation) => result.info.tier_registry_generation != Some(generation),
+        None => result.info.tier_registry_generation.is_some(),
+    }) {
         return None;
     }
 
@@ -200,7 +263,14 @@ pub(super) fn completed_data_usage_info(
         if !total.checked_merge(&merged) {
             return None;
         }
+        if !tier_accounting_proof_is_publishable(&merged, registry_generation, tier_registry_names) {
+            return None;
+        }
         buckets_usage.insert(bucket.clone(), checked_bucket_usage_info(&merged)?);
+    }
+
+    if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
+        return None;
     }
 
     let merged_last_update = results.iter().filter_map(|result| result.info.last_update).max()?;
@@ -224,6 +294,109 @@ pub(super) fn completed_data_usage_info(
         ..Default::default()
     };
     Some((data_usage_info, merged_last_update))
+}
+
+fn tier_accounting_proof_is_publishable(
+    entry: &DataUsageEntry,
+    registry_generation: Option<u64>,
+    tier_registry_names: &[String],
+) -> bool {
+    let has_scalar_usage = entry.size > 0
+        || entry.objects > 0
+        || entry.versions > 0
+        || entry.delete_markers > 0
+        || entry.failed_objects > 0
+        || !entry.obj_sizes.is_empty()
+        || !entry.obj_versions.is_empty()
+        || entry.replication_stats.as_ref().is_some_and(|stats| !stats.is_empty());
+    let has_tier_accounted_data = entry
+        .all_tier_stats
+        .as_ref()
+        .is_some_and(|stats| stats.tiers.values().any(|tier| !tier.is_empty()))
+        || entry.unknown_tier_stats.as_ref().is_some_and(|stats| {
+            stats.counter_overflowed
+                || stats.unknown_bytes > 0
+                || stats.unknown_physical_bytes > 0
+                || stats.unknown_objects > 0
+                || stats.unknown_versions > 0
+        });
+
+    let Some(proof) = entry.tier_accounting_proof else {
+        return !has_scalar_usage && !has_tier_accounted_data;
+    };
+    if proof.overflowed
+        || entry
+            .unknown_tier_stats
+            .as_ref()
+            .is_some_and(|stats| stats.counter_overflowed)
+        || u64::try_from(entry.size).ok() != Some(proof.logical_total)
+    {
+        return false;
+    }
+    let unknown_logical = entry.unknown_tier_stats.as_ref().map_or(0, |stats| stats.unknown_bytes);
+    let unknown_physical = entry
+        .unknown_tier_stats
+        .as_ref()
+        .map_or(0, |stats| stats.unknown_physical_bytes);
+    if proof
+        .logical_known
+        .checked_add(unknown_logical)
+        .is_none_or(|total| total != proof.logical_total)
+        || proof
+            .physical_known
+            .checked_add(unknown_physical)
+            .is_none_or(|total| total != proof.physical_total)
+    {
+        return false;
+    }
+    if registry_generation.is_some()
+        && entry.all_tier_stats.as_ref().is_some_and(|stats| {
+            stats.tiers.keys().any(|tier| {
+                tier != crate::UNKNOWN_TIER
+                    && tier != crate::storageclass::STANDARD
+                    && tier != crate::storageclass::RRS
+                    && !tier_registry_names.iter().any(|allowed| allowed == tier)
+            })
+        })
+    {
+        return false;
+    }
+
+    if !has_tier_accounted_data {
+        return true;
+    }
+
+    let Some(tiers) = entry.all_tier_stats.as_ref() else {
+        return false;
+    };
+    let map_unknown_physical = tiers.tiers.get(crate::UNKNOWN_TIER).map_or(0, |stats| stats.total_size);
+    let companion_unknown_physical = entry
+        .unknown_tier_stats
+        .as_ref()
+        .map_or(0, |stats| stats.unknown_physical_bytes);
+    if map_unknown_physical != companion_unknown_physical {
+        return false;
+    }
+
+    // A no-configuration scan intentionally stores only UNKNOWN_TIER after
+    // the first unknown object; STANDARD/RRS remain absent to preserve the
+    // historical empty-map shape. In that shape the scalar proof is the sole
+    // source of known physical bytes. Configured registries seed at least one
+    // non-UNKNOWN key, whose map total must match the proof.
+    let has_known_tier_map = tiers.tiers.keys().any(|tier| tier.as_str() != crate::UNKNOWN_TIER);
+    if !has_known_tier_map {
+        return true;
+    }
+    let Some(known_tier_physical_total) = tiers
+        .tiers
+        .iter()
+        .filter(|(tier, _)| tier.as_str() != crate::UNKNOWN_TIER)
+        .map(|(_, stats)| stats)
+        .try_fold(0_u64, |total, stats| total.checked_add(stats.total_size))
+    else {
+        return false;
+    };
+    proof.physical_known == known_tier_physical_total
 }
 
 pub(super) async fn send_cache_root_entry_info(
@@ -320,13 +493,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
         return None;
     }
     if matches!(
-        current_cache_root_entry(
+        current_cache_root_entry_with_generation(
             &persisted,
             DATA_USAGE_ROOT,
             source,
             cache_snapshot.info.next_cycle,
             cache_snapshot.info.leader_epoch,
             scan_plan_digest,
+            cache_snapshot.info.tier_registry_generation,
         ),
         Ok(Some(_))
     ) {

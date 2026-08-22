@@ -297,12 +297,16 @@ impl ScannerItem {
         }
     }
 
-    fn tier_is_known(oi: &ObjectInfo, tier_names: &[String]) -> bool {
-        let tier = Self::effective_tier(oi);
-        if tier == crate::data_usage_define::UNKNOWN_TIER {
-            return false;
-        }
-        tier == crate::storageclass::STANDARD || tier == crate::storageclass::RRS || tier_names.iter().any(|name| name == tier)
+    fn tier_name_is_known(tier: &str, tier_names: &[String]) -> bool {
+        !tier.is_empty()
+            && tier != crate::data_usage_define::UNKNOWN_TIER
+            && (tier == crate::storageclass::STANDARD
+                || tier == crate::storageclass::RRS
+                || tier_names.iter().any(|name| name == tier))
+    }
+
+    pub(crate) fn tier_is_known(oi: &ObjectInfo, tier_names: &[String]) -> bool {
+        Self::tier_name_is_known(Self::effective_tier(oi), tier_names)
     }
 
     fn action_requires_known_tier(action: IlmAction) -> bool {
@@ -317,6 +321,22 @@ impl ScannerItem {
                 | IlmAction::DeleteAllVersionsAction
                 | IlmAction::DelMarkerDeleteAllVersionsAction
         )
+    }
+
+    fn action_blocked_by_unknown_tier(
+        action: IlmAction,
+        oi: &ObjectInfo,
+        all_versions_known: bool,
+        tier_names: &[String],
+        target: &str,
+    ) -> bool {
+        if !Self::action_requires_known_tier(action) {
+            return false;
+        }
+        !Self::tier_is_known(oi, tier_names)
+            || (action.delete_all() && !all_versions_known)
+            || (matches!(action, IlmAction::TransitionAction | IlmAction::TransitionVersionAction)
+                && !Self::tier_name_is_known(target, tier_names))
     }
 
     pub async fn apply_actions(
@@ -433,6 +453,9 @@ impl ScannerItem {
         let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
+        let all_versions_known = object_infos
+            .iter()
+            .all(|candidate| Self::tier_is_known(candidate, tier_names));
         'eventLoop: {
             for (i, event) in events.iter().enumerate() {
                 let oi = &object_infos[i];
@@ -461,7 +484,7 @@ impl ScannerItem {
                 // evaluation is still useful for accounting, but all
                 // side-effecting tier actions fail closed until the registry
                 // recognizes the source again.
-                if !Self::tier_is_known(oi, tier_names) && Self::action_requires_known_tier(event.action) {
+                if Self::action_blocked_by_unknown_tier(event.action, oi, all_versions_known, tier_names, &event.storage_class) {
                     size = self.heal_actions(oi, actual_size, size_summary).await;
                     size_summary.actions_accounting(oi, size, actual_size);
                     cumulative_size += size;
@@ -979,8 +1002,42 @@ mod tests {
             storage_class: Some("retired-tier".to_string()),
             ..Default::default()
         };
-        assert!(!ScannerItem::tier_is_known(&object, &["WARM".to_string()]));
+        let tier_names = ["WARM".to_string()];
+        assert!(!ScannerItem::tier_is_known(&object, &tier_names));
         assert!(ScannerItem::action_requires_known_tier(IlmAction::TransitionAction));
         assert!(ScannerItem::action_requires_known_tier(IlmAction::DeleteVersionAction));
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::NoneAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+
+        let known = ObjectInfo {
+            storage_class: Some(crate::storageclass::STANDARD.to_string()),
+            ..Default::default()
+        };
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::DeleteAllVersionsAction,
+            &known,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &known,
+            true,
+            &tier_names,
+            crate::storageclass::STANDARD
+        ));
     }
 }

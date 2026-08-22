@@ -114,12 +114,13 @@ impl ScannerIODisk for Disk {
             .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), object_path.as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
 
-        let mut size_summary = SizeSummary::default();
-
         // The caller supplies one registry snapshot for the whole folder scan;
         // seeding from it prevents a TTL refresh from mixing generations in a
         // single result.
-        size_summary.tier_stats = tier_stats_template(tier_names);
+        let mut size_summary = SizeSummary {
+            tier_stats: tier_stats_template(tier_names),
+            ..Default::default()
+        };
 
         let lock_config = object_lock_config_for_scanner_item(&item).await;
 
@@ -134,7 +135,9 @@ impl ScannerIODisk for Disk {
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
-                enqueue_runtime_free_version(oi).await;
+                if ScannerItem::tier_is_known(&oi, tier_names) {
+                    enqueue_runtime_free_version(oi).await;
+                }
             }
         }
 

@@ -48,6 +48,7 @@ impl ScannerIOCycle for ECStore {
         scan_mode: HealScanMode,
     ) -> Result<ScannerCycleResult> {
         let child_token = ctx.child_token();
+        let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
 
         // Check the local pool metadata before listing buckets. A failed or
         // canceled decommission remains suspended after its worker exits, so
@@ -127,6 +128,8 @@ impl ScannerIOCycle for ECStore {
             scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_snapshot_digest(&activity_before));
         let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
         let cache_cycle_floor = Arc::new(AtomicU64::new(want_cycle));
+        let tier_registry = runtime_tier_registry_for_cycle(want_cycle, leader_epoch).await;
+        let tier_registry_generation = tier_registry.generation;
 
         if all_buckets.is_empty() {
             reset_set_scan_gauges();
@@ -156,6 +159,9 @@ impl ScannerIOCycle for ECStore {
             .await?
             {
                 return Ok(ScannerCycleResult::new(status, None));
+            }
+            if status == ScannerCycleStatus::Complete {
+                complete_tier_registry_cycle(want_cycle, leader_epoch);
             }
             let dirty_usage_clear =
                 (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
@@ -249,6 +255,7 @@ impl ScannerIOCycle for ECStore {
                     all_buckets: Arc::clone(&all_buckets),
                     digest: scan_plan_digest,
                     leader_epoch,
+                    tier_registry_generation,
                     dirty_usage_buckets: dirty_usage_snapshot.buckets.clone(),
                     bucket_failures: bucket_failures.clone(),
                     pending_maintenance_work: pending_maintenance_work.clone(),
@@ -366,6 +373,7 @@ impl ScannerIOCycle for ECStore {
             &results,
             &expected_sources,
             &all_bucket_names,
+            &tier_registry.names,
             bucket_plan_complete,
             budget_elapsed,
             ctx.is_cancelled(),
@@ -391,6 +399,9 @@ impl ScannerIOCycle for ECStore {
             &failed_buckets,
         );
         result?;
+        if cycle_status == ScannerCycleStatus::Complete {
+            complete_tier_registry_cycle(want_cycle, leader_epoch);
+        }
         let remote_dirty_usage_acknowledgements = if cycle_status == ScannerCycleStatus::Complete {
             crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
         } else {
