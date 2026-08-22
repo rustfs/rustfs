@@ -13,6 +13,8 @@
 // limitations under the License.
 /// Per-object scan actions: ScannerItem, the get-size failure policy, and the heal/ILM admission helpers.
 use super::*;
+#[cfg(test)]
+use rustfs_filemeta::MetadataResolutionParams;
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -88,6 +90,7 @@ pub(super) fn build_object_heal_request(
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_object_heal_entry(
     entries: &MetaCacheEntries,
     resolver: MetadataResolutionParams,

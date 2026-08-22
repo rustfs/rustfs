@@ -305,13 +305,17 @@ pub(super) fn build_pending_scanner_heal_request(entry: &PendingScannerHeal) -> 
     match entry.kind {
         PendingScannerHealKind::Bucket => Some(build_bucket_heal_request(entry.bucket.clone(), HealChannelPriority::High)),
         PendingScannerHealKind::Object => entry.object.as_ref().map(|object| {
-            build_object_heal_request(
+            let mut request = build_object_heal_request(
                 entry.bucket.clone(),
                 object.clone(),
                 entry.version_id.clone(),
                 entry.scan_mode,
                 HealChannelPriority::High,
-            )
+            );
+            if entry.version_id.is_none() {
+                request.remove_corrupted = Some(false);
+            }
+            request
         }),
     }
 }
