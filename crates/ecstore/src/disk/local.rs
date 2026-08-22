@@ -858,6 +858,7 @@ const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
+const EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED: &str = "disk_local_delete_rollback_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
@@ -6106,6 +6107,43 @@ impl LocalDisk {
         Ok((bytes, modtime))
     }
 
+    async fn write_missing_delete_marker(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        object_dir: &Path,
+        xl_path: &Path,
+        rollback_dir: Option<Uuid>,
+    ) -> Result<()> {
+        if let Some(rollback_dir) = rollback_dir {
+            let rollback_path = object_dir.join(rollback_dir.to_string());
+            fs::create_dir_all(&rollback_path).await.map_err(to_file_error)?;
+            fs::write(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), [])
+                .await
+                .map_err(to_file_error)?;
+        }
+        if let Err(err) = self.write_metadata("", volume, path, fi).await {
+            if let Some(rollback_dir) = rollback_dir
+                && let Err(restore_err) = restore_delete_rollback(object_dir, xl_path, rollback_dir, &self.publication_root).await
+            {
+                warn!(
+                    event = EVENT_DISK_LOCAL_DELETE_ROLLBACK_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    result = "failed",
+                    volume,
+                    path,
+                    rollback_dir = %rollback_dir,
+                    error = ?restore_err,
+                    "Disk local delete rollback failed"
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
     async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo], opts: &DeleteOptions) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let xlpath = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -6123,7 +6161,20 @@ impl LocalDisk {
             return restore_metadata_backup(object_dir, &xlpath, rollback_dir, &self.publication_root).await;
         }
 
-        let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await?;
+        let (data, _) = match self.read_all_data_with_dmtime(volume, volume_dir.as_path(), &xlpath).await {
+            Ok(data) => data,
+            Err(DiskError::FileNotFound) => {
+                // `deleted` alone can be an explicit marker purge; only
+                // `mark_deleted` may create metadata that was not present.
+                let Some(delete_marker) = fis.iter().find(|fi| fi.deleted && fi.mark_deleted).cloned() else {
+                    return Err(DiskError::FileNotFound);
+                };
+                return self
+                    .write_missing_delete_marker(volume, path, delete_marker, object_dir, &xlpath, opts.old_data_dir)
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
 
         if data.is_empty() {
             return Err(DiskError::FileNotFound);
@@ -10427,29 +10478,9 @@ impl DiskAPI for LocalDisk {
                 }
 
                 if fi.deleted && force_del_marker {
-                    if let Some(rollback_dir) = rollback_dir {
-                        let rollback_path = file_path.join(rollback_dir.to_string());
-                        fs::create_dir_all(&rollback_path).await.map_err(to_file_error)?;
-                        fs::write(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), [])
-                            .await
-                            .map_err(to_file_error)?;
-                    }
-                    if let Err(err) = self.write_metadata("", volume, path, fi).await {
-                        if let Some(rollback_dir) = rollback_dir
-                            && let Err(restore_err) =
-                                restore_delete_rollback(file_path.as_path(), &xl_path, rollback_dir, &self.publication_root).await
-                        {
-                            warn!(
-                                volume,
-                                path,
-                                rollback_dir = %rollback_dir,
-                                error = ?restore_err,
-                                "failed to restore metadata after delete marker commit error"
-                            );
-                        }
-                        return Err(err);
-                    }
-                    return Ok(());
+                    return self
+                        .write_missing_delete_marker(volume, path, fi, file_path.as_path(), &xl_path, rollback_dir)
+                        .await;
                 }
 
                 return if fi.version_id.is_some() {

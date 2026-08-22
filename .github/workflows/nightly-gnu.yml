@@ -16,7 +16,7 @@ name: Nightly GNU Build
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "7 0 * * *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
 
@@ -194,3 +194,23 @@ jobs:
 
       - name: Run HA leader failover live checks (three-node Raft cluster in Docker)
         run: bash scripts/test/vault_ha_kms_live.sh
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [build, kms-vault-lane, kms-vault-ha-failover]
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

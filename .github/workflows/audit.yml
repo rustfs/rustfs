@@ -46,7 +46,7 @@ on:
     # advisory could sit unnoticed for seven days. The check list is unchanged —
     # splitting it into a light daily advisories-only run and a weekly full run
     # would create runs where sources/bans/licenses go unverified.
-    - cron: '0 3 * * *' # Daily 03:00 UTC (staggered after the midnight ci/build crons)
+    - cron: '23 3 * * *' # Daily 03:23 UTC
   workflow_dispatch:
 
 permissions:
