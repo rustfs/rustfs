@@ -21,6 +21,7 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let completed_heals = self.completed_heals.clone();
+        let displaced_terminals = self.displaced_terminals.clone();
         let task_aliases = self.task_aliases.clone();
         let retrying_heals = self.retrying_heals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
@@ -53,6 +54,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            displaced_terminals: &displaced_terminals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
@@ -71,6 +73,7 @@ impl HealManager {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
+                            displaced_terminals: &displaced_terminals,
                             task_aliases: &task_aliases,
                             retrying_heals: &retrying_heals,
                             mrf_repair_notice_targets: &mrf_repair_notice_targets,
@@ -98,6 +101,7 @@ impl HealManager {
             heal_queue,
             active_heals,
             completed_heals,
+            displaced_terminals,
             task_aliases,
             retrying_heals,
             mrf_repair_notice_targets,
@@ -183,6 +187,7 @@ impl HealManager {
                 let active_heals_clone = active_heals.clone();
                 let heal_queue_clone = heal_queue.clone();
                 let completed_heals_clone = completed_heals.clone();
+                let displaced_terminals_clone = displaced_terminals.clone();
                 let task_aliases_clone = task_aliases.clone();
                 let retrying_heals_clone = retrying_heals.clone();
                 let mrf_repair_notice_targets_clone = mrf_repair_notice_targets.clone();
@@ -363,6 +368,7 @@ impl HealManager {
                         let retry_heal_queue = heal_queue_clone.clone();
                         let retrying_heals_for_spawn = retrying_heals_clone.clone();
                         let retry_task_aliases = task_aliases_clone.clone();
+                        let retry_displaced_terminals = displaced_terminals_clone.clone();
                         let retry_mrf_repair_notice_targets = mrf_repair_notice_targets_clone.clone();
                         let retry_completed_heals = completed_heals_clone.clone();
                         let retry_notify = notify_clone.clone();
@@ -430,6 +436,14 @@ impl HealManager {
                                 let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;
+                                // Publish the terminal synchronously while the
+                                // queue transition is protected. The subsequent
+                                // queue -> retrying handoff retains the lock order
+                                // used by operations_snapshot.
+                                let displaced_terminal = admission_decision
+                                    .displaced_request
+                                    .as_ref()
+                                    .map(|request| record_displaced_terminal(&retry_displaced_terminals, request));
                                 match admission {
                                     HealAdmissionResult::Accepted => {
                                         // Transfer ownership while holding queue -> retrying,
@@ -437,10 +451,18 @@ impl HealManager {
                                         #[cfg(test)]
                                         pause_retry_ownership_transition(&retry_request_id, true).await;
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
-                                        let displaced_task_id = admission_decision.displaced_task_id;
+                                        let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
                                         drop(queue);
-                                        if let Some(displaced_task_id) = displaced_task_id {
-                                            remove_task_aliases_for_task(&retry_task_aliases, &displaced_task_id).await;
+                                        if let (Some(displaced_task_id), Some(displaced_terminal)) =
+                                            (displaced_task_id, displaced_terminal)
+                                        {
+                                            remove_displaced_task_aliases(
+                                                &retry_task_aliases,
+                                                &retry_displaced_terminals,
+                                                &displaced_task_id,
+                                                &displaced_terminal,
+                                            )
+                                            .await;
                                             remove_mrf_repair_notice_targets(
                                                 &retry_mrf_repair_notice_targets,
                                                 &displaced_task_id,

@@ -438,11 +438,17 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::metadata_sys;
     use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
-    use crate::disk::{DiskOption, format::FormatV3, new_disk};
-    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::disk::{DeleteOptions, DiskOption, format::FormatV3, new_disk};
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalanceInfo, RebalanceStats};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations};
     use crate::store::init_format::{load_format_erasure, save_format_file};
+    use crate::store::init_local_disks_with_instance_ctx;
+    use tokio_util::sync::CancellationToken;
 
     async fn minimal_heal_pool(pool_idx: usize) -> Arc<Sets> {
         let format = FormatV3::new(1, 1);
@@ -647,6 +653,51 @@ mod tests {
         ));
     }
 
+    async fn multi_pool_heal_store() -> (tempfile::TempDir, Arc<ECStore>, CancellationToken) {
+        let temp_dir = tempfile::tempdir().expect("multi-pool heal test directory should be created");
+        let mut pool_endpoints = Vec::new();
+        for pool_index in 0..2 {
+            let mut endpoints = Vec::new();
+            for disk_index in 0..4 {
+                let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("multi-pool heal test disk should be created");
+                let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8"))
+                    .expect("test endpoint should parse");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
+            pool_endpoints.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 4,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("heal-owner-pool-{pool_index}"),
+                platform: "test".to_string(),
+            });
+        }
+
+        let endpoint_pools = EndpointServerPools::from(pool_endpoints);
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("multi-pool local disks should initialize");
+        let shutdown = CancellationToken::new();
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            shutdown.clone(),
+            instance_ctx,
+        )
+        .await
+        .expect("multi-pool test store should initialize");
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        (temp_dir, store, shutdown)
+    }
+
     #[tokio::test]
     async fn heal_object_pool_scope_selects_only_requested_pool() {
         let store = minimal_heal_store().await;
@@ -804,6 +855,229 @@ mod tests {
 
             assert!(matches!(err, Some(StorageError::SlowDown)));
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unscoped_heal_object_suspended_owner_semantics() {
+        let (_temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = format!("heal-owner-{}", Uuid::new_v4().simple());
+        let active_object = "active-owner";
+        let suspended_only_object = "suspended-only";
+        let duplicate_object = "duplicate-owner";
+        let marker_object = "marker-owner";
+        let quorum_object = "quorum-owner";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in all pools");
+
+        let mut active_reader = PutObjReader::from_vec(b"active owner".to_vec());
+        store.pools[0]
+            .put_object(&bucket, active_object, &mut active_reader, &ObjectOptions::default())
+            .await
+            .expect("active owner object should be written");
+        let active_disks = store.pools[0].disk_set[0].disks.read().await.clone();
+        let missing_active_disk = active_disks[0].clone().expect("active disk should be online");
+        missing_active_disk
+            .delete(
+                &bucket,
+                active_object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("active owner shard should be removed for repair");
+        assert!(
+            missing_active_disk.read_xl(&bucket, active_object, false).await.is_err(),
+            "the active owner fixture must start with one missing metadata copy"
+        );
+
+        let mut suspended_reader = PutObjReader::from_vec(b"suspended owner".to_vec());
+        store.pools[1]
+            .put_object(&bucket, suspended_only_object, &mut suspended_reader, &ObjectOptions::default())
+            .await
+            .expect("suspended owner object should be written");
+        for (pool_index, mod_time) in [1_i64, 2_i64].into_iter().enumerate() {
+            let mut duplicate_reader = PutObjReader::from_vec(format!("duplicate-pool-{pool_index}").into_bytes());
+            store.pools[pool_index]
+                .put_object(
+                    &bucket,
+                    duplicate_object,
+                    &mut duplicate_reader,
+                    &ObjectOptions {
+                        mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(mod_time)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("duplicate owner object should be written");
+        }
+        let duplicate_missing_disk = store.pools[0].disk_set[0].disks.read().await[0]
+            .clone()
+            .expect("duplicate active owner disk should be online");
+        duplicate_missing_disk
+            .delete(
+                &bucket,
+                duplicate_object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("duplicate active owner shard should be removed for repair");
+        let history_version = Uuid::new_v4();
+        let mut history_reader = PutObjReader::from_vec(b"marker history".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                marker_object,
+                &mut history_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(history_version.to_string()),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned marker history should be written");
+        store.pools[0]
+            .delete_object(
+                &bucket,
+                marker_object,
+                ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker should be written");
+        let mut quorum_reader = PutObjReader::from_vec(b"quorum boundary".to_vec());
+        store.pools[0]
+            .put_object(&bucket, quorum_object, &mut quorum_reader, &ObjectOptions::default())
+            .await
+            .expect("quorum boundary object should be written");
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let mut next = PoolMeta::new(&store.pools, &pool_meta);
+            next.pools[1].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            });
+            *pool_meta = next;
+        }
+
+        let (_, duplicate_owner) = store
+            .get_latest_object_info_with_idx(&bucket, duplicate_object, &ObjectOptions::default())
+            .await
+            .expect("duplicate owner should resolve");
+        assert_eq!(duplicate_owner, 1, "latest duplicate must win when all pools are eligible");
+        let (_, active_duplicate_owner) = store
+            .get_latest_object_info_with_idx(
+                &bucket,
+                duplicate_object,
+                &ObjectOptions {
+                    skip_decommissioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("active duplicate owner should resolve");
+        assert_eq!(
+            active_duplicate_owner, 0,
+            "suspended duplicate must be excluded from active owner selection"
+        );
+        let (duplicate_result, duplicate_err) = store
+            .handle_heal_object(&bucket, duplicate_object, "", &HealOpts::default())
+            .await
+            .expect("duplicate owner heal should complete through the production path");
+        assert_eq!(duplicate_result.object, duplicate_object);
+        assert!(duplicate_err.is_none(), "active duplicate should be repaired: {duplicate_err:?}");
+        assert!(
+            duplicate_missing_disk.read_xl(&bucket, duplicate_object, false).await.is_ok(),
+            "production heal must repair the active duplicate owner rather than the suspended owner"
+        );
+        let (marker_info, marker_owner) = store
+            .get_latest_object_info_with_idx(
+                &bucket,
+                marker_object,
+                &ObjectOptions {
+                    skip_decommissioned: true,
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("latest delete marker should resolve");
+        assert_eq!(marker_owner, 0);
+        assert!(marker_info.delete_marker, "latest version must preserve delete-marker semantics");
+
+        let (active_result, active_err) = store
+            .handle_heal_object(&bucket, active_object, "", &HealOpts::default())
+            .await
+            .expect("unscoped active-owner heal should complete");
+        assert_eq!(active_result.object, active_object);
+        assert!(active_err.is_none(), "active owner must be selected even with a suspended pool");
+        assert!(
+            missing_active_disk.read_xl(&bucket, active_object, false).await.is_ok(),
+            "active owner heal must write the missing disk metadata: result={active_result:?}, err={active_err:?}"
+        );
+        assert!(
+            store.pools[1]
+                .get_object_info(&bucket, active_object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the suspended pool must not be written for an active-owner object"
+        );
+
+        let (suspended_result, suspended_err) = store
+            .handle_heal_object(&bucket, suspended_only_object, "", &HealOpts::default())
+            .await
+            .expect("unscoped suspended-only heal should return a terminal result");
+        assert!(suspended_result.object.is_empty());
+        assert!(matches!(suspended_err, Some(Error::FileNotFound)));
+        assert!(
+            store.pools[1]
+                .get_object_info(&bucket, suspended_only_object, &ObjectOptions::default())
+                .await
+                .is_ok(),
+            "suspended-only data must remain untouched when unscoped heal reports absent"
+        );
+
+        let (_, explicit_err) = store
+            .handle_heal_object(
+                &bucket,
+                suspended_only_object,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit suspended-owner heal should return a mapped error");
+        assert!(matches!(explicit_err, Some(Error::SlowDown)));
+
+        let original_quorum_disks = store.pools[0].disk_set[0].disks.read().await.clone();
+        let surviving_quorum_disk = original_quorum_disks[3].clone();
+        *store.pools[0].disk_set[0].disks.write().await = vec![None, None, None, surviving_quorum_disk];
+        let (_, quorum_err) = store
+            .handle_heal_object(&bucket, quorum_object, "", &HealOpts::default())
+            .await
+            .expect("quorum boundary heal should return a mapped result");
+        *store.pools[0].disk_set[0].disks.write().await = original_quorum_disks;
+        assert!(
+            matches!(quorum_err, Some(Error::ErasureReadQuorum)),
+            "quorum-boundary heal must preserve quorum error, got {quorum_err:?}"
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
