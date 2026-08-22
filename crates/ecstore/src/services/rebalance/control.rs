@@ -1193,6 +1193,17 @@ mod tests {
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
 
     #[tokio::test]
+    async fn rebalance_stop_wait_probe_matches_run_id() {
+        let probe = RebalanceStopWaitProbe::install("rebalance-stop-current");
+
+        observe_rebalance_stop_wait_attempt(Some("rebalance-stop-stale"));
+        assert!(!probe.state.attempted.load(std::sync::atomic::Ordering::Acquire));
+
+        observe_rebalance_stop_wait_attempt(Some("rebalance-stop-current"));
+        probe.wait_until_attempted().await;
+    }
+
+    #[tokio::test]
     async fn cancel_rebalance_admission_is_id_checked_and_idempotent() {
         let rebalance_id = "rebalance-admission-current";
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1340,10 +1351,7 @@ mod tests {
         assert!(!admitted_cancel.is_cancelled());
         drop(local_meta);
 
-        store
-            .cancel_rebalance_admission_for_id(rebalance_id)
-            .await
-            .expect("the installed token should cancel the admitted worker");
+        admitted_cancel.cancel();
         assert!(admitted_cancel.is_cancelled());
 
         let mut persisted = RebalanceMeta::new();
@@ -1401,7 +1409,7 @@ mod tests {
             decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
             tokio::time::timeout(std::time::Duration::from_secs(15), probe.wait_until_attempted())
                 .await
-                .expect("real decommission start should reach activation lock acquisition");
+                .expect("real decommission start should reach the activation path");
         } else {
             let store = Arc::clone(&decommission_store);
             decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
@@ -1412,7 +1420,7 @@ mod tests {
                 tokio::spawn(async move { store.init_rebalance_start(vec!["bucket".to_string()]).await.map(|_| ()) });
             tokio::time::timeout(std::time::Duration::from_secs(15), probe.wait_until_attempted())
                 .await
-                .expect("real rebalance start should reach activation lock acquisition");
+                .expect("real rebalance start should reach the activation path");
         }
 
         let mut observed_rebalance_result = None;

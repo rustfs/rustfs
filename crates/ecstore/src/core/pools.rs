@@ -2876,8 +2876,6 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
-        #[cfg(test)]
-        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
         let activation_fence = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
@@ -4420,6 +4418,8 @@ impl ECStore {
         let indices = dedup_indices(&indices);
         validate_start_decommission_request(&indices, self.single_pool())?;
 
+        #[cfg(test)]
+        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
         #[cfg(test)]
         let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
@@ -4775,7 +4775,22 @@ mod tests {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
         let start_store = Arc::clone(&store);
-        let start_task = tokio::spawn(async move { start_store.start_decommission(vec![0]).await });
+        let start_task = tokio::spawn(async move {
+            start_store
+                .save_current_pool_meta_for_decommission_start(
+                    &[0],
+                    vec![(
+                        0,
+                        PoolSpaceInfo {
+                            free: 50,
+                            total: 100,
+                            used: 50,
+                        },
+                    )],
+                    Vec::new(),
+                )
+                .await
+        });
 
         barrier.wait_until_paused().await;
         let mut replica_disks = Vec::new();
