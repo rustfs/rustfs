@@ -6260,7 +6260,7 @@ impl ECStore {
             let Some(changed) =
                 update_decommission_for_operation(cancelers.as_slice(), &mut pool_meta, idx, owner, |pool_meta| {
                     reconcile_decommission_unresolved_entries_for_completion(pool_meta, idx, verified_generation)?;
-                    Ok(pool_meta.decommission_complete(idx))
+                    Ok::<bool, Error>(pool_meta.decommission_complete(idx))
                 })
             else {
                 return Ok(());
