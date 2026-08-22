@@ -53,8 +53,8 @@ jobs:
     runs-on: sm-standard-2
     # A normal nightly restores the last successful binary and builds only the
     # candidate; daily access keeps that cache warm. A cache miss may build both
-    # but remains capped and reports a timeout through the scheduled alert.
-    timeout-minutes: 120
+    # and needs room for the A/B run plus artifact and cache publication.
+    timeout-minutes: 180
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

@@ -33,5 +33,9 @@ require_present_pattern 'SCHEDULED_BASELINE_SHA' "the resolved scheduled baselin
 require_present_pattern "SCHEDULED_BASELINE_SHA:-\\\$candidate_sha" "the first scheduled run must seed from its verified candidate"
 require_present_pattern 'git merge-base --is-ancestor' "the scheduled baseline must stay on candidate history"
 require_present_pattern 'Cache successful candidate baseline' "a successful candidate must become the next cached baseline"
+if ! sed -n '/^  warp-ab:/,/^  alert-on-failure:/p' "$workflow" | grep -Eq '^    timeout-minutes:[[:space:]]*180([[:space:]]|$)'; then
+  echo "invalid performance A/B workflow contract: the cold-cache path must fit both builds, the A/B run, and evidence publication" >&2
+  exit 1
+fi
 
 echo "Performance A/B workflow contract ok."
