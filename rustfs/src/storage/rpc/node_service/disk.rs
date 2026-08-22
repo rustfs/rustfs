@@ -23,10 +23,12 @@ use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_STAGE_READ_VERSION_DISK_READ, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE,
-    INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_STAGE_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -242,24 +244,42 @@ fn record_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
     }
 }
 
+fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        global_internode_metrics().record_stage_duration_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            stage,
+            started_at.elapsed(),
+        );
+    }
+}
+
 fn encode_batch_read_version_response_payloads(
     batch_read_version_resps: &[BatchReadVersionResp],
     request_decoded_from_msgpack: bool,
 ) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
+    let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
     let mut batch_read_version_resps_json = Vec::with_capacity(batch_read_version_resps.len());
-    let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
-
+    let json_encode_started = internode_stage_timer(attribution_enabled);
     for batch_read_version_resp in batch_read_version_resps {
         batch_read_version_resps_json.push(
             compat_response_json(batch_read_version_resp, request_decoded_from_msgpack)
                 .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
         );
+    }
+    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE, json_encode_started);
+
+    let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
+    let msgpack_encode_started = internode_stage_timer(attribution_enabled);
+    for batch_read_version_resp in batch_read_version_resps {
         batch_read_version_resps_bin.push(Bytes::from(encode_msgpack_with_capacity(
             batch_read_version_resp,
             "BatchReadVersionResp",
             FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT,
         )?));
     }
+    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, msgpack_encode_started);
 
     Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
 }
@@ -485,15 +505,37 @@ impl NodeService {
         &self,
         request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request = request.into_inner();
+        if attribution_enabled {
+            let metrics = global_internode_metrics();
+            metrics.record_incoming_request_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                request
+                    .disk
+                    .len()
+                    .saturating_add(request.batch_read_version_req.len())
+                    .saturating_add(request.batch_read_version_req_bin.len()),
+            );
+        }
         if let Some(disk) = self.find_disk(&request.disk).await {
+            let decode_started = internode_stage_timer(attribution_enabled);
             let decoded_batch_read_version_req: DecodedRpcPayload<BatchReadVersionReq> = match decode_msgpack_or_json_with_source(
                 &request.batch_read_version_req_bin,
                 &request.batch_read_version_req,
                 "BatchReadVersionReq",
             ) {
-                Ok(batch_read_version_req) => batch_read_version_req,
+                Ok(batch_read_version_req) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, decode_started);
+                    batch_read_version_req
+                }
                 Err(err) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, decode_started);
                     return Ok(Response::new(BatchReadVersionResponse {
                         success: false,
                         batch_read_version_resps: Vec::new(),
@@ -514,8 +556,10 @@ impl NodeService {
                 }));
             }
 
+            let disk_read_started = internode_stage_timer(attribution_enabled);
             match disk.batch_read_version(batch_read_version_req).await {
                 Ok(batch_read_version_resps) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, disk_read_started);
                     let (batch_read_version_resps, batch_read_version_resps_bin) =
                         match encode_batch_read_version_response_payloads(&batch_read_version_resps, request_decoded_from_msgpack)
                         {
@@ -537,12 +581,15 @@ impl NodeService {
                         error: None,
                     }))
                 }
-                Err(err) => Ok(Response::new(BatchReadVersionResponse {
-                    success: false,
-                    batch_read_version_resps: Vec::new(),
-                    batch_read_version_resps_bin: Vec::new(),
-                    error: Some(err.into()),
-                })),
+                Err(err) => {
+                    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, disk_read_started);
+                    Ok(Response::new(BatchReadVersionResponse {
+                        success: false,
+                        batch_read_version_resps: Vec::new(),
+                        batch_read_version_resps_bin: Vec::new(),
+                        error: Some(err.into()),
+                    }))
+                }
             }
         } else {
             Ok(Response::new(BatchReadVersionResponse {
@@ -722,9 +769,9 @@ impl NodeService {
         &self,
         request: Request<ReadVersionRequest>,
     ) -> Result<Response<ReadVersionResponse>, Status> {
-        let request = request.into_inner();
         let metrics = global_internode_metrics();
         let read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let request = request.into_inner();
         if read_version_attribution_enabled {
             metrics.record_incoming_request_for_operation_and_backend(
                 INTERNODE_OPERATION_GRPC_READ_VERSION,

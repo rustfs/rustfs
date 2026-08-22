@@ -53,11 +53,12 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::disk_store::DiskStoreRenameDataExt;
+use crate::disk::disk_store::{DiskStoreRenameDataExt, get_drive_metadata_timeout};
 use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::disk::{
-    DataDirDeleteStatus, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK,
-    PartTransactionAction, STORAGE_FORMAT_FILE_BACKUP, part_transaction_path,
+    BATCH_READ_VERSION_MAX_ITEMS, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp, DataDirDeleteStatus, Disk,
+    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
+    STORAGE_FORMAT_FILE_BACKUP, part_transaction_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
@@ -75,7 +76,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -92,6 +93,235 @@ fn metadata_metrics_path(bucket: &str) -> &'static str {
 
 fn metadata_distribution_key(bucket: &str, object: &str) -> String {
     [bucket, object].join("/")
+}
+
+fn read_version_coalescing_enabled() -> bool {
+    let enabled = || {
+        rustfs_utils::get_env_opt_str(ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE)
+            .is_some_and(|value| value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("on"))
+    };
+
+    #[cfg(test)]
+    {
+        enabled()
+    }
+
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(enabled)
+    }
+}
+
+fn read_version_coalescing_delay() -> Duration {
+    #[cfg(test)]
+    {
+        let micros = rustfs_utils::get_env_u64(
+            ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS,
+            DEFAULT_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS,
+        );
+        Duration::from_micros(micros)
+    }
+
+    #[cfg(not(test))]
+    {
+        static DELAY: OnceLock<Duration> = OnceLock::new();
+        *DELAY.get_or_init(|| {
+            Duration::from_micros(rustfs_utils::get_env_u64(
+                ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS,
+                DEFAULT_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS,
+            ))
+        })
+    }
+}
+
+struct CoalescedReadVersionRequest {
+    item: BatchReadVersionItem,
+    tx: oneshot::Sender<disk::error::Result<FileInfo>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ReadVersionCoalescerKey {
+    disk: usize,
+    incl_free_versions: bool,
+    read_data: bool,
+    healing: bool,
+}
+
+impl ReadVersionCoalescerKey {
+    fn new(disk: &DiskStore, opts: &ReadOptions) -> Self {
+        Self {
+            disk: Arc::as_ptr(disk) as usize,
+            incl_free_versions: opts.incl_free_versions,
+            read_data: opts.read_data,
+            healing: opts.healing,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReadVersionCoalescer {
+    lanes: HashMap<ReadVersionCoalescerKey, Vec<CoalescedReadVersionRequest>>,
+}
+
+fn read_version_coalescer() -> &'static Mutex<ReadVersionCoalescer> {
+    static COALESCER: OnceLock<Mutex<ReadVersionCoalescer>> = OnceLock::new();
+    COALESCER.get_or_init(|| Mutex::new(ReadVersionCoalescer::default()))
+}
+
+fn record_read_version_coalescer_event(event: &'static str, item_count: usize) {
+    counter!(
+        METRIC_GET_METADATA_READ_VERSION_COALESCER_TOTAL,
+        "event" => event,
+        "item_count" => item_count.to_string()
+    )
+    .increment(1);
+}
+
+async fn read_version_via_coalescer(
+    disk: DiskStore,
+    org_bucket: &str,
+    bucket: &str,
+    object: &str,
+    version_id: &str,
+    opts: &ReadOptions,
+    allow_coalescing: bool,
+) -> disk::error::Result<FileInfo> {
+    if !allow_coalescing || !read_version_coalescing_enabled() {
+        return disk.read_version(org_bucket, bucket, object, version_id, opts).await;
+    }
+    if !matches!(disk.as_ref(), Disk::Remote(_)) {
+        record_read_version_coalescer_event("bypass_non_remote", 1);
+        return disk.read_version(org_bucket, bucket, object, version_id, opts).await;
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let item = BatchReadVersionItem {
+        org_volume: org_bucket.to_string(),
+        volume: bucket.to_string(),
+        path: object.to_string(),
+        version_id: version_id.to_string(),
+    };
+    let lane_key = ReadVersionCoalescerKey::new(&disk, opts);
+    let pending = {
+        let mut coalescer = read_version_coalescer().lock().await;
+        let lane = coalescer.lanes.entry(lane_key).or_default();
+        let schedule_delayed_flush = lane.is_empty();
+        lane.push(CoalescedReadVersionRequest { item, tx });
+        if lane.len() >= BATCH_READ_VERSION_MAX_ITEMS {
+            coalescer.lanes.remove(&lane_key)
+        } else if schedule_delayed_flush {
+            let disk = disk.clone();
+            let task_opts = *opts;
+            tokio::spawn(async move {
+                tokio::time::sleep(read_version_coalescing_delay()).await;
+                flush_read_version_coalescer_lane(lane_key, disk, task_opts).await;
+            });
+            None
+        } else {
+            None
+        }
+    };
+
+    if let Some(pending) = pending {
+        flush_read_version_coalescer_pending(lane_key, disk, *opts, pending).await;
+    }
+
+    rx.await
+        .unwrap_or_else(|_| Err(DiskError::other("coalesced read_version response channel closed")))
+}
+
+async fn flush_read_version_coalescer_lane(lane_key: ReadVersionCoalescerKey, disk: DiskStore, opts: ReadOptions) {
+    let pending = {
+        let mut coalescer = read_version_coalescer().lock().await;
+        coalescer.lanes.remove(&lane_key).unwrap_or_default()
+    };
+    flush_read_version_coalescer_pending(lane_key, disk, opts, pending).await;
+}
+
+async fn flush_read_version_coalescer_pending(
+    lane_key: ReadVersionCoalescerKey,
+    disk: DiskStore,
+    opts: ReadOptions,
+    pending: Vec<CoalescedReadVersionRequest>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+
+    #[cfg(test)]
+    {
+        let mut observed_paths = HashSet::new();
+        for request in &pending {
+            if observed_paths.insert(request.item.path.as_str()) {
+                disk_call_counters::record(&request.item.path, disk_call_counters::KIND_BATCH_READ_VERSION, lane_key.disk);
+            }
+        }
+    }
+
+    let mut senders = Vec::with_capacity(pending.len());
+    let mut items = Vec::with_capacity(pending.len());
+    for request in pending {
+        senders.push(request.tx);
+        items.push(request.item);
+    }
+
+    let expected_items = items.clone();
+    record_read_version_coalescer_event("attempted_batch", items.len());
+    let result =
+        match tokio::time::timeout(get_drive_metadata_timeout(), disk.batch_read_version(BatchReadVersionReq { items, opts }))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(DiskError::Timeout),
+        };
+    match result {
+        Ok(responses) => {
+            let results = map_batch_read_version_responses(&expected_items, responses);
+            for (tx, result) in senders.into_iter().zip(results) {
+                let _ = tx.send(result);
+            }
+        }
+        Err(err) => {
+            let message = err.to_string();
+            for tx in senders {
+                let _ = tx.send(Err(DiskError::other(message.clone())));
+            }
+        }
+    }
+}
+
+fn map_batch_read_version_responses(
+    expected_items: &[BatchReadVersionItem],
+    responses: Vec<BatchReadVersionResp>,
+) -> Vec<crate::disk::error::Result<FileInfo>> {
+    let mut results = (0..expected_items.len())
+        .map(|_| Err(DiskError::other("coalesced read_version response missing")))
+        .collect::<Vec<_>>();
+    let mut seen = vec![false; expected_items.len()];
+    for response in responses {
+        let Some(expected) = expected_items.get(response.index) else {
+            continue;
+        };
+        let Some(slot) = results.get_mut(response.index) else {
+            continue;
+        };
+        if seen[response.index] {
+            *slot = Err(DiskError::other("coalesced read_version response duplicate index"));
+            continue;
+        }
+        seen[response.index] = true;
+        if response.path != expected.path || response.version_id != expected.version_id {
+            *slot = Err(DiskError::other("coalesced read_version response identity mismatch"));
+        } else {
+            *slot = if response.success {
+                Ok(response.file_info)
+            } else {
+                Err(DiskError::other(response.error))
+            };
+        }
+    }
+    results
 }
 
 pub(in crate::set_disk) fn bounded_metadata_fanout_order(
@@ -133,11 +363,15 @@ pub(in crate::set_disk) fn bounded_metadata_fanout_order(
     order
 }
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE";
+const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS";
+const DEFAULT_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS: u64 = 200;
+const METRIC_GET_METADATA_READ_VERSION_COALESCER_TOTAL: &str = "rustfs_get_metadata_read_version_coalescer_total";
 pub(in crate::set_disk) const ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE: &str = "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE";
 /// Default reader-setup strategy for the GET read path (rustfs/backlog#1215,
 /// #1159, #923).
@@ -2356,6 +2590,7 @@ impl SetDisks {
             false,
             true,
             0,
+            false,
         )
         .await?;
         Ok((ress, errors))
@@ -2386,6 +2621,36 @@ impl SetDisks {
             true,
             caller_allows_early_stop,
             default_parity_count,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::set_disk) async fn read_all_fileinfo_observed_for_get_object(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        incl_free_versions: bool,
+        caller_allows_early_stop: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            false,
+            incl_free_versions,
+            true,
+            caller_allows_early_stop,
+            default_parity_count,
+            true,
         )
         .await
     }
@@ -2408,6 +2673,7 @@ impl SetDisks {
         // subset would fail write quorum (backlog#872 regression).
         caller_allows_early_stop: bool,
         default_parity_count: usize,
+        allow_coalescing: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         let early_stop_enabled =
             caller_allows_early_stop && observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
@@ -2424,6 +2690,7 @@ impl SetDisks {
                 healing,
                 incl_free_versions,
                 default_parity_count,
+                allow_coalescing,
             )
             .await;
         }
@@ -2446,6 +2713,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             observe,
+            allow_coalescing,
         )
         .await
     }
@@ -2461,6 +2729,7 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
         observe: bool,
+        allow_coalescing: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         let fanout_start = observe.then(Instant::now);
         let mut ress = Vec::with_capacity(disks.len());
@@ -2492,7 +2761,7 @@ impl SetDisks {
                     if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
                         tokio::time::sleep(delay).await;
                     }
-                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
+                    read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
                         .await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2559,6 +2828,7 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
         default_parity_count: usize,
+        allow_coalescing: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         let fanout_start = Instant::now();
         let mut ress = vec![FileInfo::default(); disks.len()];
@@ -2607,7 +2877,7 @@ impl SetDisks {
                         if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
                             tokio::time::sleep(delay).await;
                         }
-                        disk.read_version(&org_bucket, &bucket, &object, &version_id, &task_opts)
+                        read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
                             .await
                     } else {
                         Err(DiskError::DiskNotFound)
@@ -5737,6 +6007,7 @@ pub(crate) mod disk_call_counters {
 
     /// Kind label for the per-disk `read_version` metadata RPC.
     pub const KIND_READ_VERSION: &str = "read_version";
+    pub const KIND_BATCH_READ_VERSION: &str = "batch_read_version";
 
     /// Registry key: (object, kind, disk_index).
     type CountKey = (String, String, usize);
@@ -6458,6 +6729,234 @@ mod tests {
         assert_eq!(scope.total(disk_call_counters::KIND_READ_VERSION), (DISKS * 2) as u64);
 
         drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn metadata_read_version_coalescer_bypasses_local_disks() {
+        const DISKS: usize = 4;
+        let bucket = "coalesced-read-version-local-bypass-bucket";
+        let object_a = "coalesced-local-object-a";
+        let object_b = "coalesced-local-object-b";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object_a, None).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object_b, None).await;
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE, Some("auto")),
+                (ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS, Some("5000")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(object_a);
+                let disks_a = disks.clone();
+                let disks_b = disks.clone();
+                let read_a = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed_for_get_object(
+                        &disks_a, "", bucket, object_a, "", false, false, false, 2,
+                    )
+                    .await
+                    .map(|(file_infos, errors, _)| (file_infos, errors))
+                });
+                tokio::task::yield_now().await;
+                let read_b = tokio::spawn(async move {
+                    SetDisks::read_all_fileinfo_observed_for_get_object(
+                        &disks_b, "", bucket, object_b, "", false, false, false, 2,
+                    )
+                    .await
+                    .map(|(file_infos, errors, _)| (file_infos, errors))
+                });
+
+                let (metadata_a, errs_a) = read_a
+                    .await
+                    .expect("first read task should not panic")
+                    .expect("first coalesced read should resolve");
+                let (metadata_b, errs_b) = read_b
+                    .await
+                    .expect("second read task should not panic")
+                    .expect("second coalesced read should resolve");
+
+                assert_eq!(metadata_a.iter().filter(|fi| fi.name == object_a).count(), DISKS);
+                assert_eq!(metadata_b.iter().filter(|fi| fi.name == object_b).count(), DISKS);
+                assert!(errs_a.iter().all(Option::is_none));
+                assert!(errs_b.iter().all(Option::is_none));
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    DISKS as u64,
+                    "local disks still execute the ordinary per-disk read_version path"
+                );
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_BATCH_READ_VERSION),
+                    0,
+                    "GET coalescing targets internode RPC count only and must not batch local disk reads"
+                );
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test]
+    async fn metadata_read_version_coalescer_requires_get_object_intent() {
+        const DISKS: usize = 4;
+        let bucket = "coalesced-read-version-default-bypass-bucket";
+        let object = "default-bypass-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_metadata_fanout_fileinfo(&disks, bucket, object, None).await;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE, Some("auto"))], async {
+            let calls = disk_call_counters::observe(object);
+            let (metadata, errs) = SetDisks::read_all_fileinfo(&disks, "", bucket, object, "", false, false, false)
+                .await
+                .expect("default metadata read should resolve");
+
+            assert_eq!(metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
+            assert!(errs.iter().all(Option::is_none));
+            assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), DISKS as u64);
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_BATCH_READ_VERSION),
+                0,
+                "non-GET metadata paths must bypass coalescer even when the env gate is enabled"
+            );
+        })
+        .await;
+
+        drop(dirs);
+    }
+
+    #[test]
+    fn batch_read_version_response_mapping_preserves_index_and_errors() {
+        let expected_items = vec![
+            BatchReadVersionItem {
+                org_volume: String::new(),
+                volume: "bucket".to_string(),
+                path: "object-a".to_string(),
+                version_id: "v-a".to_string(),
+            },
+            BatchReadVersionItem {
+                org_volume: String::new(),
+                volume: "bucket".to_string(),
+                path: "object-b".to_string(),
+                version_id: "v-b".to_string(),
+            },
+            BatchReadVersionItem {
+                org_volume: String::new(),
+                volume: "bucket".to_string(),
+                path: "object-c".to_string(),
+                version_id: "v-c".to_string(),
+            },
+        ];
+        let ok_file_info = FileInfo {
+            name: "object-a".to_string(),
+            ..Default::default()
+        };
+        let responses = vec![
+            BatchReadVersionResp {
+                index: 2,
+                path: "object-c".to_string(),
+                version_id: "v-c".to_string(),
+                success: false,
+                file_info: FileInfo::default(),
+                error: "disk read failed".to_string(),
+            },
+            BatchReadVersionResp {
+                index: 0,
+                path: "object-a".to_string(),
+                version_id: "v-a".to_string(),
+                success: true,
+                file_info: ok_file_info,
+                error: String::new(),
+            },
+        ];
+
+        let mut results = map_batch_read_version_responses(&expected_items, responses).into_iter();
+        let first = results
+            .next()
+            .expect("slot 0 should exist")
+            .expect("slot 0 should map the success response by index");
+        assert_eq!(first.name, "object-a");
+
+        let missing = results
+            .next()
+            .expect("slot 1 should exist")
+            .expect_err("slot 1 should stay missing");
+        assert!(
+            missing.to_string().contains("response missing"),
+            "unexpected missing response error: {missing}"
+        );
+
+        let failed = results
+            .next()
+            .expect("slot 2 should exist")
+            .expect_err("slot 2 should map the response error");
+        assert!(failed.to_string().contains("disk read failed"), "unexpected per-item error: {failed}");
+        assert!(results.next().is_none());
+    }
+
+    #[test]
+    fn batch_read_version_response_mapping_rejects_identity_mismatch_and_duplicate_index() {
+        let expected_items = vec![BatchReadVersionItem {
+            org_volume: String::new(),
+            volume: "bucket".to_string(),
+            path: "object-a".to_string(),
+            version_id: "v-a".to_string(),
+        }];
+        let mismatched = map_batch_read_version_responses(
+            &expected_items,
+            vec![BatchReadVersionResp {
+                index: 0,
+                path: "object-b".to_string(),
+                version_id: "v-a".to_string(),
+                success: true,
+                file_info: FileInfo {
+                    name: "object-b".to_string(),
+                    ..Default::default()
+                },
+                error: String::new(),
+            }],
+        )
+        .pop()
+        .expect("slot 0 should exist")
+        .expect_err("identity mismatch should fail closed");
+        assert!(
+            mismatched.to_string().contains("identity mismatch"),
+            "unexpected mismatch error: {mismatched}"
+        );
+
+        let duplicate = map_batch_read_version_responses(
+            &expected_items,
+            vec![
+                BatchReadVersionResp {
+                    index: 0,
+                    path: "object-a".to_string(),
+                    version_id: "v-a".to_string(),
+                    success: true,
+                    file_info: FileInfo {
+                        name: "object-a".to_string(),
+                        ..Default::default()
+                    },
+                    error: String::new(),
+                },
+                BatchReadVersionResp {
+                    index: 0,
+                    path: "object-a".to_string(),
+                    version_id: "v-a".to_string(),
+                    success: true,
+                    file_info: FileInfo {
+                        name: "object-a".to_string(),
+                        ..Default::default()
+                    },
+                    error: String::new(),
+                },
+            ],
+        )
+        .pop()
+        .expect("slot 0 should exist")
+        .expect_err("duplicate response index should fail closed");
+        assert!(
+            duplicate.to_string().contains("duplicate index"),
+            "unexpected duplicate error: {duplicate}"
+        );
     }
 
     /// Isolation guard: unobserved objects record nothing (so parallel tests do

@@ -44,6 +44,8 @@ pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK: &str = "disk";
 const EVENT_DISK_PART_ERR_UNCLASSIFIED: &str = "disk_part_err_unclassified";
+const ENV_BATCH_READ_VERSION_SERVER_PARALLELISM: &str = "RUSTFS_BATCH_READ_VERSION_SERVER_PARALLELISM";
+const BATCH_READ_VERSION_SERVER_PARALLELISM: usize = 4;
 
 pub fn part_transaction_path(part_path: &str) -> String {
     match part_path.rsplit_once('/') {
@@ -62,6 +64,7 @@ use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
+use futures::stream::{self, StreamExt};
 use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
@@ -414,6 +417,14 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_version(_org_volume, volume, path, version_id, opts).await,
             Disk::Remote(remote_disk) => remote_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.batch_read_version(req).await,
+            Disk::Remote(remote_disk) => remote_disk.batch_read_version(req).await,
         }
     }
 
@@ -1028,34 +1039,43 @@ where
     D: DiskAPI + ?Sized,
 {
     validate_batch_read_version_item_count(req.items.len())?;
+    let parallelism = batch_read_version_server_parallelism();
 
-    let mut responses = Vec::with_capacity(req.items.len());
-    for (index, item) in req.items.iter().enumerate() {
-        let response = match disk
-            .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
-            .await
-        {
-            Ok(file_info) => BatchReadVersionResp {
-                index,
-                path: item.path.clone(),
-                version_id: item.version_id.clone(),
-                success: true,
-                file_info,
-                error: String::new(),
-            },
-            Err(err) => BatchReadVersionResp {
-                index,
-                path: item.path.clone(),
-                version_id: item.version_id.clone(),
-                success: false,
-                file_info: FileInfo::default(),
-                error: err.to_string(),
-            },
-        };
-        responses.push(response);
-    }
+    let mut responses = stream::iter(req.items.into_iter().enumerate())
+        .map(|(index, item)| async move {
+            match disk
+                .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
+                .await
+            {
+                Ok(file_info) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: true,
+                    file_info,
+                    error: String::new(),
+                },
+                Err(err) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: false,
+                    file_info: FileInfo::default(),
+                    error: err.to_string(),
+                },
+            }
+        })
+        .buffer_unordered(parallelism)
+        .collect::<Vec<_>>()
+        .await;
+    responses.sort_unstable_by_key(|response| response.index);
 
     Ok(responses)
+}
+
+fn batch_read_version_server_parallelism() -> usize {
+    rustfs_utils::get_env_usize(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, BATCH_READ_VERSION_SERVER_PARALLELISM)
+        .clamp(1, BATCH_READ_VERSION_MAX_ITEMS)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1415,6 +1435,26 @@ mod tests {
             disk_idx: Some(2),
         };
         assert!(!partial_valid_location.valid());
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_defaults_to_conservative_four() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, None::<&str>, || {
+            assert_eq!(batch_read_version_server_parallelism(), 4);
+        });
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_honors_env_with_bounds() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("8"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 8);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("0"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 1);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("9999"), || {
+            assert_eq!(batch_read_version_server_parallelism(), BATCH_READ_VERSION_MAX_ITEMS);
+        });
     }
 
     /// Test FileInfoVersions find_version_index
