@@ -1,0 +1,9 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "heartbeat",
+  "fixture": "duplicate",
+  "description": "An exact requestId replay returns the first result and creates no second heartbeat.",
+  "first": {"requestId": "550e8400-e29b-41d4-a716-446655440000", "sequence": 42},
+  "replay": {"requestId": "550e8400-e29b-41d4-a716-446655440000", "sequence": 42},
+  "expected": {"decision": "DUPLICATE", "heartbeatWrites": 1, "events": 1, "sameResponse": true}
+}
