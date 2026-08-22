@@ -671,7 +671,9 @@ impl ErasureSetHealer {
                         error = %e,
                         "Erasure set bucket heal failed"
                     );
-                    // continue to next bucket, do not interrupt the whole process
+                    // A single durable cursor and ledger cannot safely preserve
+                    // this bucket while processing a later one.
+                    break;
                 }
             }
 
@@ -1233,7 +1235,13 @@ impl ErasureSetHealer {
             if !is_truncated {
                 break;
             }
-            resume_manager.set_resume_cursor(next_token.clone()).await?;
+            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
+            if continuation_token.is_none() {
+                // A truncated page without a continuation token is terminal.
+                // Retain its ledger until bucket completion is durable.
+                break;
+            }
+            resume_manager.set_resume_cursor(continuation_token.clone()).await?;
             checkpoint_manager.prune_completed_page().await?;
 
             // Anti-loop guard: an empty page reported as truncated cannot advance
@@ -1253,12 +1261,6 @@ impl ErasureSetHealer {
                 )));
             }
             previous_page_last = page_last;
-
-            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
-            if continuation_token.is_none() {
-                // Truncated but no continuation token: treat as end of listing.
-                break;
-            }
         }
 
         Ok(())
@@ -1645,6 +1647,7 @@ mod resume_loop_tests {
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         fail_listing: AtomicBool,
+        fail_listing_buckets: Mutex<HashSet<String>>,
     }
 
     impl FakeStorage {
@@ -1680,6 +1683,9 @@ mod resume_loop_tests {
         }
         fn fail_listing(&self) {
             self.fail_listing.store(true, Ordering::SeqCst);
+        }
+        fn fail_bucket_listing(&self, bucket: &str) {
+            self.fail_listing_buckets.lock().unwrap().insert(bucket.to_string());
         }
     }
 
@@ -1771,7 +1777,7 @@ mod resume_loop_tests {
         }
         async fn list_objects_for_heal_page(
             &self,
-            _bucket: &str,
+            bucket: &str,
             _prefix: &str,
             continuation_token: Option<&str>,
             include_lifecycle_object_info: bool,
@@ -1780,7 +1786,7 @@ mod resume_loop_tests {
                 .lock()
                 .unwrap()
                 .push(include_lifecycle_object_info);
-            if self.fail_listing.load(Ordering::SeqCst) {
+            if self.fail_listing.load(Ordering::SeqCst) || self.fail_listing_buckets.lock().unwrap().contains(bucket) {
                 return Err(Error::other("injected listing failure"));
             }
             let key = continuation_token.map(str::to_string);
@@ -2159,6 +2165,49 @@ mod resume_loop_tests {
     }
 
     #[tokio::test]
+    async fn bucket_failure_stops_before_a_later_bucket_checkpoint() {
+        let env = make_env().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let buckets = vec!["a".to_string(), "b".to_string()];
+        let resume = ResumeManager::new(
+            env.healer.disk.clone(),
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            buckets.clone(),
+        )
+        .await
+        .unwrap();
+        let checkpoint = CheckpointManager::new(env.healer.disk.clone(), task_id.clone())
+            .await
+            .unwrap();
+        env.storage.fail_bucket_listing("a");
+        for _ in 0..3 {
+            assert!(resume.schedule_retry().await.unwrap());
+        }
+
+        env.healer
+            .execute_heal_with_resume(&buckets, "pool_0_set_0", &resume, &checkpoint)
+            .await
+            .expect_err("the first bucket failure must keep the pass incomplete");
+        let persisted = checkpoint.get_checkpoint().await;
+        assert_eq!(persisted.current_bucket_index, 0);
+        assert!(resume.get_state().await.completed_buckets.is_empty());
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&buckets, "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect_err("recovery must retry the earlier failed bucket");
+        assert!(!resumed.get_state().await.completed);
+    }
+
+    #[tokio::test]
     async fn completed_resume_state_is_not_selected_for_a_new_heal() {
         let env = make_env().await;
         env.resume
@@ -2450,6 +2499,39 @@ mod resume_loop_tests {
         let state = resumed.get_state().await;
         assert_eq!(state.successful_objects, 2);
         assert_eq!(state.processed_objects, 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_page_without_token_retains_its_replay_ledger() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: true,
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("the tokenless truncated page is a terminal page");
+        assert_eq!((processed, successful, failed, skipped), (1, 1, 0, 0));
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("terminal-page recovery must not replay a durable identity");
+
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 1);
+        assert_eq!(state.processed_objects, 1);
     }
 
     #[tokio::test]
