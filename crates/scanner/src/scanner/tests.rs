@@ -803,6 +803,10 @@ fn scanner_cycle_state_decodes_legacy_and_fenced_formats() {
     let (fenced_cycle, fenced_epoch) = decode_scanner_cycle_state(&fenced).expect("fenced cycle state should decode");
     assert_eq!(fenced_cycle.next, 13);
     assert_eq!(fenced_epoch, 7);
+
+    let mut trailing = fenced;
+    trailing.push(0);
+    assert!(decode_scanner_cycle_state(&trailing).is_err());
 }
 
 #[test]

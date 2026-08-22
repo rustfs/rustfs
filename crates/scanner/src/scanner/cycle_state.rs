@@ -1100,7 +1100,11 @@ pub(super) fn decode_scanner_cycle_state(buf: &[u8]) -> Result<(CurrentCycle, u6
         (0, &buf[8..])
     };
 
-    let cycle_info = rmp_serde::from_slice::<CurrentCycle>(payload)?;
+    let mut deserializer = rmp_serde::Deserializer::new(std::io::Cursor::new(payload));
+    let cycle_info = CurrentCycle::deserialize(&mut deserializer)?;
+    if deserializer.position() != u64::try_from(payload.len()).unwrap_or(u64::MAX) {
+        return Err(ScannerCycleStateError::InvalidData("scanner cycle state has trailing bytes"));
+    }
     if cycle_info.next != persisted_next {
         return Err(ScannerCycleStateError::InvalidData("scanner cycle counter disagrees with encoded state"));
     }
