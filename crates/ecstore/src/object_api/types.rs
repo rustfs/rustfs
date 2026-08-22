@@ -1091,7 +1091,7 @@ impl ObjectInfo {
                     }
                 };
 
-                // TODO:VersionPurgeStatus
+                // TODO(backlog): handle VersionPurgeStatus in object listing
                 let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
                 objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
 

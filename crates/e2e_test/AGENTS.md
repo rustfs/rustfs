@@ -28,4 +28,3 @@ follow.
 ## Suggested Validation
 
 - `cargo test --package e2e_test`
-- Full gate before commit: `make pre-commit`

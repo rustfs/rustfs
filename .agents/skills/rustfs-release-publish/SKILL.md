@@ -1,6 +1,6 @@
 ---
 name: rustfs-release-publish
-description: "End-to-end RustFS release pipeline: first publish any merged-but-unreleased rustfs/console changes and wait for its latest Release asset, then bump RustFS version files on main directly to the final target, publish a visible GitHub prerelease from a preview tag without updating latest channels, validate it, and publish the final tag on the SAME commit. Use whenever the user wants to release/publish a RustFS version (发版/发布)."
+description: "Run the end-to-end RustFS console gate, version bump, preview validation, and final-tag publication pipeline. Use only when the user explicitly asks to release or publish a RustFS version (发版/发布)."
 ---
 # RustFS Release Publish (preview-validated pipeline)
 

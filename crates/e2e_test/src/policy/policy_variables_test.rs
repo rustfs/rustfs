@@ -17,7 +17,6 @@
 use crate::common::{awscurl_delete, awscurl_put, init_logging};
 use crate::policy::test_env::PolicyTestEnvironment;
 use aws_sdk_s3::primitives::ByteStream;
-use serial_test::serial;
 use tracing::info;
 
 /// Helper function to create a regular user with given credentials
@@ -122,7 +121,6 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
 
 /// Test AWS policy variables with single-value scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_single_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_single_value_impl().await
@@ -275,7 +273,6 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
 
 /// Test AWS policy variables with multi-value scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_multi_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_multi_value_impl().await
@@ -401,7 +398,6 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
 
 /// Test AWS policy variables with variable concatenation
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_concatenation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_concatenation_impl().await
@@ -491,7 +487,6 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
 
 /// Test AWS policy variables with nested scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_nested() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_nested_impl().await
@@ -509,7 +504,6 @@ pub async fn test_aws_policy_variables_nested_impl() -> Result<(), Box<dyn std::
 
 /// Test AWS policy variables with STS temporary credentials
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_sts() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_sts_impl().await
@@ -705,7 +699,6 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
 
 /// Test AWS policy variables with deny scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 #[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_deny() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     test_aws_policy_variables_deny_impl().await

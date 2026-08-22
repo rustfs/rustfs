@@ -1,97 +1,46 @@
 ---
 name: pr-creation-checker
-description: Prepare PR-ready diffs by validating scope, checking required verification steps, drafting a compliant English PR title/body, and surfacing blockers before opening or updating a pull request in RustFS.
+description: Perform the final RustFS PR preflight and draft compliant English title/body metadata immediately before creating or updating a PR. Do not use during implementation or as a second general code review.
 ---
 
 # PR Creation Checker
 
-Use this skill before `gh pr create`, before `gh pr edit`, or when reviewing whether a branch is ready for PR.
+Use this skill only at the PR boundary. Reuse completed diff review and
+verification evidence; do not reread the repository or rerun equivalent checks.
 
-## Read sources of truth first
+## Preflight
 
-- Read `AGENTS.md`.
-- Read `.github/pull_request_template.md`.
-- Use `Makefile` and `.config/make/` for local quality commands.
-- Use `.github/workflows/ci.yml` for CI expectations.
-- Do not restate long command matrices or template sections from memory when the files exist.
+1. Confirm the branch is based on current `origin/main` and contains only the
+   intended task diff.
+2. Inspect `git diff --stat`, `git diff --check`, and changed file names for
+   secrets, logs, generated artifacts, or unrelated edits.
+3. Confirm the checks selected by root `AGENTS.md` passed on the final diff.
+   Do not replace focused behavioral tests with a generic gate or rerun checks
+   already covered by an unchanged umbrella run.
+4. Read `.github/pull_request_template.md`. Consult `Makefile`, `.config/make/`,
+   or CI only when the required command/current gate is uncertain.
+5. Return `BLOCKED` for an unclean scope, missing required evidence, failed
+   required checks, or non-compliant metadata.
 
-## Workflow
+## Metadata
 
-1. Collect PR context
-- Confirm base branch, current branch, change goal, and scope.
-- Confirm whether the task is: draft a new PR, update an existing PR, or preflight-check readiness.
-- Confirm whether the branch includes only intended changes.
+- Title: English Conventional Commit, at most 72 characters, with no tool
+  prefix.
+- Body: English, exact template headings, `N/A` where needed, concise rationale,
+  actual verification commands, and material risks/rollback notes.
+- Use repository-relative paths; never include local absolute paths.
+- Keep prose paragraphs on one logical line and never include the literal
+  sequence `\n`.
+- Use a temporary body file with `gh pr create --body-file` or
+  `gh pr edit --body-file`; never pass multiline Markdown inline.
 
-2. Inspect change scope
-- Review the diff and summarize what changed.
-- Inspect `git diff --stat` and `git diff --numstat`; assess production-code growth separately. Tests, fixtures, generated code, and documentation have no growth budget. Treat line counts as signals, not quotas.
-- Call out unrelated edits, generated artifacts, logs, or secrets as blockers.
-- Mark risky areas explicitly: auth, storage, config, network, migrations, breaking changes.
-- Use the simplicity-adversary verdict instead of producing a per-symbol inventory. Block growth only when the review identifies duplication or gives a concrete smaller design that preserves correctness, compatibility, readability, and real boundaries.
-- Confirm replacement implementations remove the superseded in-scope path or adapt compatibility at the boundary to one canonical core.
-- Scan the diff for newly added string literals and confirm whether they duplicate values already defined as constants/enums/typed wrappers in the same module or shared modules.
-- Treat introducing a new hardcoded literal where a project constant already exists as a likely regression risk; require either a refactor to reuse the constant or an explicit exception explanation in the PR body.
+## Output
 
-3. Verify readiness requirements
-- Select checks from `AGENTS.md` "Verification Before PR" based on the final diff's risk tier. Do not replace a focused behavioral test with `make pre-commit`, or a required high-risk `make pre-pr` with a narrower gate.
-- For focused verification, state why the selected tier is sufficient and list the scope-specific commands in the PR body.
-- If `make` is unavailable, use the equivalent commands from `.config/make/`.
-- Add scope-specific verification commands when the changed area needs more than the baseline.
-- If required checks fail, stop and return `BLOCKED`.
+- Status: `READY` or `BLOCKED`.
+- Title.
+- Complete PR body.
+- Verification commands and results.
+- Risks or `N/A`.
 
-4. Draft PR metadata
-- Write the PR title in English using Conventional Commits and keep it within 72 characters.
-- If a generic PR workflow suggests a different title format, ignore it and follow the repository rule instead.
-- In RustFS, do not use tool-specific prefixes such as `[codex]` when the repository requires Conventional Commits.
-- Keep the PR body in English.
-- Use the exact section headings from `.github/pull_request_template.md`.
-- Fill non-applicable sections with `N/A`.
-- Include verification commands in the PR description.
-- Do not include local filesystem paths in the PR body unless the user explicitly asks for them.
-- Prefer repo-relative paths, command names, and concise summaries over machine-specific paths such as `/Users/...`.
-
-5. Prepare reviewer context
-- Summarize why the change exists.
-- Summarize what was verified.
-- Call out risks, rollout notes, config impact, and rollback notes when applicable.
-- Mention assumptions or missing context instead of guessing.
-
-6. Prepare CLI-safe output
-- When proposing `gh pr create` or `gh pr edit`, use `--body-file`, never inline `--body` for multiline markdown.
-- Return a ready-to-save PR body plus a short title.
-- If not ready, return blockers first and list the minimum steps needed to unblock.
-
-## Output format
-
-### Status
-- `READY` or `BLOCKED`
-
-### Title
-- `<type>(<scope>): <summary>`
-
-### PR Body
-- Reproduce the repository template headings exactly.
-- Fill every section.
-- Omit local absolute paths unless explicitly required.
-
-### Verification
-- List each command run.
-- State pass/fail.
-
-### Risks
-- List breaking changes, config changes, migration impact, or `N/A`.
-
-## Blocker rules
-
-- Return `BLOCKED` if the checks required by the `AGENTS.md` validation tier have not passed.
-- Return `BLOCKED` if a documentation-only, agent-instruction-only, or local developer-tooling-only change lacks focused verification for the changed surface.
-- Return `BLOCKED` if the diff contains unrelated changes that are not acknowledged.
-- Return `BLOCKED` if required template sections are missing.
-- Return `BLOCKED` if the title/body is not in English.
-- Return `BLOCKED` if the title does not follow the repository's Conventional Commit rule.
-- Return `BLOCKED` if the diff introduces string literals that should use existing constants but did not.
-- Return `BLOCKED` for production-code growth only when the review identifies a duplicated or superseded implementation, or supplies a concrete smaller design with equivalent semantics. Fewer lines alone are not evidence.
-
-## Reference
-
-- Use [pr-readiness-checklist.md](references/pr-readiness-checklist.md) for a short final pass before opening or editing the PR.
+Immediately before the GitHub write, repeat only the five preflight checks above
+against the final head.
