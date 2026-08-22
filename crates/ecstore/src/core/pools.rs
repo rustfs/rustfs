@@ -865,16 +865,22 @@ fn should_replace_pool_status_for_status_refresh(
     !has_active_worker && persisted.last_update > current.last_update
 }
 
-fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) {
+/// Merges a persisted pool metadata snapshot into `current` monotonically:
+/// a pool entry is replaced only when no active worker covers it and the
+/// snapshot is strictly newer, so delayed snapshots never roll back local
+/// queued/terminal progressions. Returns whether any entry was replaced or
+/// appended.
+pub(crate) fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) -> bool {
     if persisted.pools.is_empty() {
-        return;
+        return false;
     }
 
     if current.pools.is_empty() {
         *current = persisted;
-        return;
+        return true;
     }
 
+    let mut merged_newer = false;
     for (idx, persisted_pool) in persisted.pools.into_iter().enumerate() {
         if persisted_pool.id != idx {
             continue;
@@ -884,11 +890,14 @@ fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active
         if idx < current.pools.len() {
             if should_replace_pool_status_for_status_refresh(current.pools.get(idx), &persisted_pool, has_active_worker) {
                 current.pools[idx] = persisted_pool;
+                merged_newer = true;
             }
         } else if idx == current.pools.len() && !has_active_worker {
             current.pools.push(persisted_pool);
+            merged_newer = true;
         }
     }
+    merged_newer
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -5705,6 +5714,55 @@ mod pools_tests {
         assert!(!info.failed);
         assert_eq!(info.items_decommissioned, 10);
         assert_eq!(info.bytes_done, 1_024);
+    }
+
+    #[test]
+    fn test_merge_pool_status_refresh_fails_closed_on_missing_persisted_pools() {
+        let newer = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let mut current = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        current.pools[0].last_update = newer;
+
+        assert!(
+            !merge_pool_status_refresh(&mut current, PoolMeta::default(), &[false]),
+            "an empty persisted snapshot must fail closed instead of replacing local state"
+        );
+
+        let info = current.pools[0]
+            .decommission
+            .as_ref()
+            .expect("local decommission info should survive a missing snapshot");
+        assert!(info.complete);
+        assert_eq!(current.pools[0].last_update, newer);
+    }
+
+    #[test]
+    fn test_merge_pool_status_refresh_ignores_mislabeled_pool_entries() {
+        let older = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let mut current = PoolMeta {
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        };
+        let mut persisted = PoolMeta {
+            pools: vec![decommission_test_pool_status(0, Some(PoolDecommissionInfo::default()))],
+            ..Default::default()
+        };
+        persisted.pools[0].id = 7;
+        persisted.pools[0].last_update = older;
+
+        assert!(
+            !merge_pool_status_refresh(&mut current, persisted, &[false]),
+            "a pool entry whose id does not match its index must be ignored"
+        );
+        assert!(current.pools[0].decommission.is_none());
     }
 
     #[test]
