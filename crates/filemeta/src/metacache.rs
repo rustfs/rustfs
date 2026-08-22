@@ -111,6 +111,9 @@ pub struct MetaCacheHealDiscovery {
     /// healing disabled; this is an explicit bounded continuation, not a
     /// version claim.
     pub truncated_objects: Vec<String>,
+    /// Validated candidates beyond the main cap, retained with exact version
+    /// identities so callers never fall back to a latest-version request.
+    pub truncated_candidates: Vec<MetaCacheHealCandidate>,
 }
 
 impl MetaCacheEntry {
@@ -442,6 +445,7 @@ impl MetaCacheEntries {
             unverified_count: 0,
             truncated: false,
             truncated_objects: Vec::with_capacity(MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS.min(limit)),
+            truncated_candidates: Vec::new(),
         };
         let mut seen: HashMap<(String, Option<Uuid>, MetaCacheHealCandidateKind), usize> =
             HashMap::with_capacity(limit.min(self.0.len()));
@@ -580,10 +584,10 @@ impl MetaCacheEntries {
                     {
                         discovery.truncated_objects.push(candidate.object.clone());
                     }
-                    // The remaining versions in this raw entry cannot add a
-                    // bounded candidate; avoid parsing a very long history
-                    // after the safe continuation has been recorded.
-                    break;
+                    if discovery.truncated_objects.iter().any(|object| object == &candidate.object) {
+                        discovery.truncated_candidates.push(candidate);
+                    }
+                    continue;
                 } else {
                     entry_seen.insert(key.clone());
                     seen.insert(key, discovery.candidates.len());
@@ -775,7 +779,7 @@ fn valid_heal_candidate_name(bucket: &str, entry: &MetaCacheEntry) -> bool {
     if bucket.is_empty()
         || entry.name.is_empty()
         || entry.is_dir()
-        || entry.name.contains('\\')
+        || (cfg!(windows) && entry.name.contains('\\'))
         || entry.name.chars().any(char::is_control)
     {
         return false;
@@ -2131,6 +2135,13 @@ mod tests {
         assert!(discovery.candidates.len() <= 5);
         assert!(discovery.truncated, "bounded discovery must expose dropped candidates");
         assert!(
+            discovery
+                .truncated_candidates
+                .iter()
+                .all(|candidate| candidate.version_id.is_some()),
+            "overflow candidates must retain exact version identities"
+        );
+        assert!(
             discovery.truncated_objects.iter().any(|object| object == "object"),
             "bounded discovery must expose an object-level safe continuation"
         );
@@ -2165,7 +2176,6 @@ mod tests {
             "./object",
             "object/../other",
             "object//name",
-            "object\\name",
             "object\u{0001}name",
             "object\0name",
         ] {
@@ -2175,6 +2185,33 @@ mod tests {
             assert!(
                 discovery.candidates.is_empty(),
                 "invalid key should not become a heal candidate: {invalid_name:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let mut entry = metacache_entry_single_version(400, now, "object\\name");
+            entry.name = "object\\name".to_string();
+            assert!(
+                MetaCacheEntries(vec![Some(entry)])
+                    .discover_heal_candidates("bucket", 5)
+                    .candidates
+                    .is_empty(),
+                "backslash is a path separator on Windows"
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut entry = metacache_entry_single_version(400, now, "object\\name");
+            entry.name = "object\\name".to_string();
+            assert_eq!(
+                MetaCacheEntries(vec![Some(entry)])
+                    .discover_heal_candidates("bucket", 5)
+                    .candidates
+                    .len(),
+                1,
+                "backslash is object-key data on Unix"
             );
         }
 

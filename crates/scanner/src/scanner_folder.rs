@@ -1977,40 +1977,35 @@ impl FolderScanner {
                                 found_objects = true;
                             }
 
-                            // A bounded candidate union may overflow for an
-                            // object with a very long version history. Keep
-                            // that overflow explicit and issue one safe,
-                            // versionless inspection request per object so
-                            // the dropped versions are not silently treated
-                            // as absent. This continuation is deliberately
-                            // outside the versioned candidate cap and always
-                            // disables destructive cleanup.
-                            for object in discovery.truncated_objects {
+                            // Candidates beyond the main cap remain exact
+                            // version requests; never downgrade them to a
+                            // latest-version (version_id=None) heal.
+                            for candidate in discovery.truncated_candidates {
+                                let version_id = candidate.validated_version().map(|id| id.to_string());
+                                let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
                                 if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
-                                    && !seen_truncated_objects.contains(&object)
+                                    && !seen_truncated_objects.contains(&candidate.object)
                                 {
                                     continue;
                                 }
-                                if !seen_truncated_objects.insert(object.clone()) {
-                                    continue;
-                                }
-                                let identity = (object.clone(), None, MetaCacheHealCandidateKind::UnversionedObject);
+                                seen_truncated_objects.insert(candidate.object.clone());
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
-                                let request = build_non_destructive_object_heal_request(
+                                let request = build_object_heal_request(
                                     bucket.clone(),
-                                    object.clone(),
+                                    candidate.object.clone(),
+                                    version_id.clone(),
                                     self.scan_mode,
                                     HealChannelPriority::High,
                                 );
-                                (self.update_current_path)(&object).await;
+                                (self.update_current_path)(&candidate.object).await;
                                 let admission = self
                                     .send_required_scanner_heal_request(
                                         PendingScannerHealKind::Object,
                                         bucket.clone(),
-                                        Some(object.clone()),
-                                        None,
+                                        Some(candidate.object.clone()),
+                                        version_id,
                                         request,
                                     )
                                     .await?;
