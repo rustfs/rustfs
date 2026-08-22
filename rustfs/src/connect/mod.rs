@@ -25,10 +25,16 @@
 //! not been enrolled into a Connect control plane never calls into it, so an
 //! unconfigured server generates no key and holds no identity.
 
+pub mod client;
+pub mod credential_store;
 pub mod identity;
 pub mod identity_store;
 pub mod offline;
+pub mod registration;
 
+pub use client::{ClientError, ConnectClient, ConnectConfig};
+pub use credential_store::{CredentialStore, DeviceCredential};
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};
 pub use identity_store::{IdentityStore, StoreError};
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
+pub use registration::{RegistrationToken, TokenError};

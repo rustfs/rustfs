@@ -51,7 +51,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-    use serial_test::serial;
     use std::error::Error;
     use tokio::time::{Duration, timeout};
     use tracing::info;
@@ -129,7 +128,6 @@ mod tests {
     /// the body — and assert the server log names the object, at the log level a
     /// default deployment actually runs with.
     #[tokio::test]
-    #[serial]
     async fn midstream_get_failure_is_logged_with_the_object_at_default_log_level() -> TestResult {
         init_logging();
         info!("rustfs#4784: a mid-stream GET failure must name its object in the source log");

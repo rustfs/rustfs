@@ -206,6 +206,13 @@ def check_runner_selection(root: Path) -> list[str]:
     return errors
 
 
+def check_s3_tests_runner(root: Path) -> list[str]:
+    runner = (root / "scripts/s3-tests/run.sh").read_text()
+    if "--showlocals" in runner:
+        return ["scripts/s3-tests/run.sh: pytest failure diagnostics must not dump local values"]
+    return []
+
+
 def profile_selection(root: Path, profile: str) -> str:
     if not re.fullmatch(r"e2e-[a-z0-9-]+", profile):
         raise ValueError(f"invalid e2e profile name: {profile}")
@@ -272,6 +279,7 @@ def validate(root: Path) -> list[str]:
     errors.extend(check_e2e_modules(root))
     errors.extend(check_fuzz_targets(root))
     errors.extend(check_runner_selection(root))
+    errors.extend(check_s3_tests_runner(root))
     errors.extend(check_profile_definitions(root))
     return errors
 
@@ -340,6 +348,23 @@ class SelfTests(unittest.TestCase):
                 "  fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/one\n"
             )
             self.assertEqual(len(check_fuzz_targets(root)), 1)
+
+    def test_s3_runner_rejects_unbounded_failure_locals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = root / "scripts/s3-tests/run.sh"
+            runner.parent.mkdir(parents=True)
+            runner.write_text("tox -- -vv -ra --tb=long\n")
+            self.assertEqual(check_s3_tests_runner(root), [])
+            runner.write_text("tox -- -vv -ra --showlocals --tb=long\n")
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            with (
+                mock.patch(__name__ + ".check_e2e_modules", return_value=[]),
+                mock.patch(__name__ + ".check_fuzz_targets", return_value=[]),
+                mock.patch(__name__ + ".check_runner_selection", return_value=[]),
+                mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
+            ):
+                self.assertEqual(len(validate(root)), 1)
 
     def test_profile_listing_enforces_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,7 +436,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("OK: e2e modules, runner selection, fuzz matrices, and profile guards are wired")
+    print("OK: e2e modules, runner selection, fuzz matrices, profiles, and bounded diagnostics are wired")
     return 0
 
 

@@ -249,7 +249,7 @@ impl Sets {
 
         self.connect_disks().await;
 
-        // TODO: config interval
+        // TODO(backlog): make monitor_and_connect interval configurable instead of hardcoded 15s
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {

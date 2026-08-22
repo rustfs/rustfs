@@ -454,7 +454,7 @@ impl S3PeerSys {
                 }
             }
             topology_complete &= bucket_map.values().all(|count| *count >= quorum);
-            // TODO: MRF
+            // TODO(backlog): integrate MRF backlog stats into scanner bucket listing
         }
 
         let mut buckets: Vec<BucketInfo> = result_map.into_values().collect();

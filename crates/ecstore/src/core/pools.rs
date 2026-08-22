@@ -36,7 +36,8 @@ use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_operation_canceled,
+    is_err_version_not_found,
 };
 use crate::layout::endpoints::EndpointServerPools;
 use crate::object_api::{GetObjectReader, ObjectOptions};
@@ -817,7 +818,60 @@ async fn load_decommission_entry_exact_versions(
 }
 
 fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_error: Option<Error>) -> Result<()> {
-    if let Some(err) = entry_error { Err(err) } else { list_result }
+    match list_result {
+        Ok(()) => entry_error.map_or(Ok(()), Err),
+        Err(list_err) => resolve_decommission_listing_error(Some(list_err), entry_error).map_or(Ok(()), Err),
+    }
+}
+
+fn resolve_decommission_listing_error(listing_error: Option<Error>, entry_error: Option<Error>) -> Option<Error> {
+    match (listing_error, entry_error) {
+        (Some(listing_error), Some(entry_error)) if is_err_operation_canceled(&listing_error) => Some(entry_error),
+        (Some(listing_error), Some(entry_error)) if is_err_operation_canceled(&entry_error) => Some(listing_error),
+        (Some(listing_error), _) => Some(listing_error),
+        (None, entry_error) => entry_error,
+    }
+}
+
+fn decommission_unresolved_listing_error(
+    bucket: &str,
+    prefix: &str,
+    candidate: Option<&str>,
+    candidate_count: usize,
+    disk_error_count: usize,
+    pool_index: usize,
+    set_index: usize,
+) -> Error {
+    let location = candidate.unwrap_or(prefix);
+    Error::other(format!(
+        "decommission listing could not resolve metadata for {bucket}/{location} on pool {pool_index} set {set_index} ({candidate_count} candidate(s), {disk_error_count} disk error(s))"
+    ))
+}
+
+fn resolve_decommission_partial_listing_entry(
+    entries: MetaCacheEntries,
+    resolver: MetadataResolutionParams,
+    bucket: &str,
+    prefix: &str,
+    disk_error_count: usize,
+    pool_index: usize,
+    set_index: usize,
+) -> Result<MetaCacheEntry> {
+    let candidate_count = entries.as_ref().iter().flatten().count();
+    if let Some(entry) = entries.resolve(resolver) {
+        return Ok(entry);
+    }
+
+    let candidate = entries.as_ref().iter().flatten().map(|entry| entry.name.as_str()).next();
+    Err(decommission_unresolved_listing_error(
+        bucket,
+        prefix,
+        candidate,
+        candidate_count,
+        disk_error_count,
+        pool_index,
+        set_index,
+    ))
 }
 
 fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
@@ -2976,6 +3030,34 @@ impl ECStore {
         canceled_worker
     }
 
+    async fn clear_decommission_canceler_for_generation(&self, idx: usize, generation: OffsetDateTime) {
+        let _start_guard = self.start_gate.lock().await;
+        let generation_is_current = self
+            .pool_meta
+            .read()
+            .await
+            .pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .and_then(|info| info.start_time)
+            == Some(generation);
+        if !generation_is_current {
+            return;
+        }
+
+        let mut cancelers = self.decommission_cancelers.write().await;
+        if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "canceler_already_cleared",
+                "Decommission canceler already cleared"
+            );
+        }
+    }
+
     async fn cancel_decommission_routines_and_wait(&self, indices: &[usize]) {
         let canceled_worker = {
             let mut cancelers = self.decommission_cancelers.write().await;
@@ -3340,6 +3422,7 @@ impl ECStore {
         let list_rx_for_drain = list_rx.clone();
         let list_bi = bi.clone();
         let list_outstanding = outstanding.clone();
+        let list_entry_error = entry_error.clone();
         let mut listing = tokio::spawn(async move {
             run_decommission_listing_with_retry_and_drain(
                 list_rx.clone(),
@@ -3352,7 +3435,11 @@ impl ECStore {
                     let set = list_set.clone();
                     let rx = list_rx_for_list.clone();
                     let bucket = list_bi.clone();
-                    async move { set.list_objects_to_decommission(rx, bucket, callback).await }
+                    let entry_error = list_entry_error.clone();
+                    async move {
+                        set.list_objects_to_decommission(rx, bucket, callback, entry_error, idx, set_idx)
+                            .await
+                    }
                 },
                 move || {
                     let rx = list_rx_for_drain.clone();
@@ -4071,20 +4158,6 @@ impl ECStore {
         idx: usize,
         entry_budget: Arc<Semaphore>,
     ) -> Result<()> {
-        defer!(|| async {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    state = "canceler_already_cleared",
-                    "Decommission canceler already cleared"
-                );
-            }
-        });
-
         if let Err(err) = self.promote_queued_decommission(idx).await {
             resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
             return Err(err);
@@ -4112,6 +4185,9 @@ impl ECStore {
             return Ok(());
         }
         let generation = self.active_decommission_generation(idx).await?;
+        defer!(|| async {
+            self.clear_decommission_canceler_for_generation(idx, generation).await;
+        });
         let result = self.decommission_in_background(rx.clone(), idx, entry_budget).await;
 
         let (final_state, canceled, cmd_line) = {
@@ -4166,7 +4242,11 @@ impl ECStore {
                 return Ok(());
             }
 
-            resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
+            resolve_decommission_terminal_mark_after_error_result(
+                self.decommission_failed_with_generation(idx, Some(generation)).await,
+                idx,
+                &err,
+            )?;
             warn!(
                 event = EVENT_DECOMMISSION_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -4217,7 +4297,11 @@ impl ECStore {
                         rx.cancel();
                         return Ok(());
                     }
-                    resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
+                    resolve_decommission_terminal_mark_result(
+                        self.decommission_failed_with_generation(idx, Some(generation)).await,
+                        "failed",
+                        &cmd_line,
+                    )?;
                     return Err(Error::other(format!(
                         "failed to finalize decommission for pool {cmd_line}: post-check failed: {err}"
                     )));
@@ -4238,7 +4322,11 @@ impl ECStore {
                     state = "marking_completed",
                     "Decommission marking completed state"
                 );
-                resolve_decommission_terminal_mark_result(self.complete_decommission(idx).await, "completed", &cmd_line)?;
+                resolve_decommission_terminal_mark_result(
+                    self.complete_decommission_with_generation(idx, Some(generation)).await,
+                    "completed",
+                    &cmd_line,
+                )?;
             }
             DecommissionFinalState::Failed => {
                 warn!(
@@ -4250,7 +4338,11 @@ impl ECStore {
                     state = "marking_failed",
                     "Decommission marking failed state"
                 );
-                resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
+                resolve_decommission_terminal_mark_result(
+                    self.decommission_failed_with_generation(idx, Some(generation)).await,
+                    "failed",
+                    &cmd_line,
+                )?;
             }
         }
 
@@ -4268,16 +4360,28 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn decommission_failed(&self, idx: usize) -> Result<()> {
+        self.decommission_failed_with_generation(idx, None).await
+    }
+
+    async fn decommission_failed_with_generation(&self, idx: usize, generation: Option<OffsetDateTime>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "mark decommission failed")?;
+        let _start_guard = self.start_gate.lock().await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
+            if let Some(generation) = generation {
+                match ensure_decommission_generation(&pool_meta, idx, generation) {
+                    Ok(()) => {}
+                    Err(Error::OperationCanceled) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
+            }
             let previous_pool_meta = pool_meta.clone();
             let changed = pool_meta.decommission_failed(idx);
             (changed, changed.then_some(previous_pool_meta))
         };
 
-        {
+        if should_reload_pool_meta {
             let mut cancelers = self.decommission_cancelers.write().await;
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
@@ -4333,18 +4437,29 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
+        self.complete_decommission_with_generation(idx, None).await
+    }
+
+    async fn complete_decommission_with_generation(&self, idx: usize, generation: Option<OffsetDateTime>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
 
         let _start_guard = self.start_gate.lock().await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
+            if let Some(generation) = generation {
+                match ensure_decommission_generation(&pool_meta, idx, generation) {
+                    Ok(()) => {}
+                    Err(Error::OperationCanceled) => return Ok(()),
+                    Err(err) => return Err(err),
+                }
+            }
             let previous_pool_meta = pool_meta.clone();
             let changed = pool_meta.decommission_complete(idx);
             (changed, changed.then_some(previous_pool_meta))
         };
 
-        {
+        if should_reload_pool_meta {
             let mut cancelers = self.decommission_cancelers.write().await;
             take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), idx);
         }
@@ -4676,7 +4791,7 @@ impl ECStore {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
 
-        for set in &pool.disk_set {
+        for (set_index, set) in pool.disk_set.iter().enumerate() {
             for bucket_info in &buckets {
                 let mut lifecycle_config = None;
                 let mut object_lock_config = None;
@@ -4771,7 +4886,7 @@ impl ECStore {
                 });
 
                 let list_result = set
-                    .list_objects_to_decommission(callback_rx, bucket_info.clone(), callback)
+                    .list_objects_to_decommission(callback_rx, bucket_info.clone(), callback, entry_error.clone(), idx, set_index)
                     .await;
                 let entry_error = entry_error.lock().await.clone();
                 resolve_decommission_check_after_list_result(list_result, entry_error)?;
@@ -5575,20 +5690,27 @@ async fn record_decommission_entry_error(
     rx: &CancellationToken,
     err: Error,
 ) {
+    if rx.is_cancelled() {
+        return;
+    }
+
     let mut first_err = entry_error.lock().await;
-    if first_err.is_none() {
+    if first_err.is_none() && !rx.is_cancelled() {
         *first_err = Some(err);
         rx.cancel();
     }
 }
 
 impl SetDisks {
-    #[tracing::instrument(skip(self, rx, cb_func))]
+    #[tracing::instrument(skip(self, rx, cb_func, entry_error))]
     async fn list_objects_to_decommission(
         self: &Arc<Self>,
         rx: CancellationToken,
         bucket_info: DecomBucketInfo,
         cb_func: ListCallback,
+        entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
+        pool_index: usize,
+        set_index: usize,
     ) -> Result<()> {
         let (disks, _) = self.get_online_disks_with_healing(false).await;
         ensure_decommission_listing_disks_available(!disks.is_empty(), &bucket_info.name)?;
@@ -5603,6 +5725,12 @@ impl SetDisks {
         };
 
         let cb1 = cb_func.clone();
+        let unresolved_error = entry_error.clone();
+        let unresolved_rx = rx.clone();
+        let unresolved_bucket = bucket_info.name.clone();
+        let unresolved_prefix = bucket_info.prefix.clone();
+        let unresolved_pool_index = pool_index;
+        let unresolved_set_index = set_index;
 
         list_path_raw(
             rx,
@@ -5615,26 +5743,61 @@ impl SetDisks {
                 skip_walkdir_total_timeout: true,
                 walkdir_stall_timeout: Some(DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT),
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| Box::pin(cb1(entry)))),
-                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                partial: Some(Box::new(move |entries: MetaCacheEntries, errs: &[Option<DiskError>]| {
                     let resolver = resolver.clone();
                     let cb_func = cb_func.clone();
-                    match entries.resolve(resolver) {
-                        Some(entry) => {
+                    let bucket = unresolved_bucket.clone();
+                    let prefix = unresolved_prefix.clone();
+                    let unresolved_error = unresolved_error.clone();
+                    let unresolved_rx = unresolved_rx.clone();
+                    let pool_index = unresolved_pool_index;
+                    let set_index = unresolved_set_index;
+                    let disk_error_count = errs.iter().flatten().count();
+                    if unresolved_rx.is_cancelled() {
+                        return Box::pin(async {});
+                    }
+
+                    match resolve_decommission_partial_listing_entry(
+                        entries,
+                        resolver,
+                        &bucket,
+                        &prefix,
+                        disk_error_count,
+                        pool_index,
+                        set_index,
+                    ) {
+                        Ok(entry) => {
                             warn!("decommission_pool: list_objects_to_decommission get {}", &entry.name);
                             Box::pin(async move {
                                 cb_func(entry).await;
                             })
                         }
-                        None => {
-                            warn!("decommission_pool: list_objects_to_decommission get none");
-                            Box::pin(async {})
-                        }
+                        Err(err) => Box::pin(async move {
+                            if unresolved_rx.is_cancelled() {
+                                return;
+                            }
+                            warn!(
+                                event = EVENT_DECOMMISSION_BUCKET,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                bucket = %bucket,
+                                prefix = %prefix,
+                                state = "unresolved_entry",
+                                error = %err,
+                                "Decommission listing failed closed on unresolved metadata"
+                            );
+                            record_decommission_entry_error(&unresolved_error, &unresolved_rx, err).await;
+                        }),
                     }
                 })),
                 ..Default::default()
             },
         )
         .await?;
+
+        if let Some(err) = entry_error.lock().await.clone() {
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -5844,11 +6007,12 @@ mod pools_tests {
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
         merge_pool_status_refresh, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
-        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        pool_meta_has_active_decommission, record_decommission_entry_error, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result, resolve_decommission_listing_error,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_partial_listing_entry, resolve_decommission_pool_meta_reload_result,
         resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
         resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
@@ -5867,7 +6031,9 @@ mod pools_tests {
     use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
-    use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
+    use rustfs_filemeta::{
+        FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
+    };
     use rustfs_rio::Index;
     use std::sync::{
         Arc,
@@ -7063,6 +7229,65 @@ mod pools_tests {
     fn test_resolve_decommission_check_after_list_result_prefers_entry_error() {
         let err = resolve_decommission_check_after_list_result(Err(Error::OperationCanceled), Some(Error::SlowDown))
             .expect_err("entry error should win over cancellation");
+        assert!(matches!(err, Error::SlowDown));
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_unresolved_metadata() {
+        let err = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![None]),
+            MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 2,
+                bucket: "bucket-a".to_string(),
+                ..Default::default()
+            },
+            "bucket-a",
+            "prefix/",
+            1,
+            2,
+            3,
+        )
+        .expect_err("unresolved partial listing must fail closed");
+
+        let message = err.to_string();
+        assert!(message.contains("decommission listing could not resolve metadata"));
+        assert!(message.contains("bucket-a/prefix/"));
+        assert!(message.contains("pool 2 set 3"));
+        assert!(message.contains("1 disk error(s)"));
+    }
+
+    #[tokio::test]
+    async fn test_record_decommission_entry_error_cancels_listing_and_preserves_first_error() {
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None));
+        let rx = CancellationToken::new();
+
+        record_decommission_entry_error(&entry_error, &rx, Error::SlowDown).await;
+        record_decommission_entry_error(&entry_error, &rx, Error::OperationCanceled).await;
+
+        assert!(rx.is_cancelled());
+        assert!(matches!(*entry_error.lock().await, Some(Error::SlowDown)));
+    }
+
+    #[tokio::test]
+    async fn test_record_decommission_entry_error_ignores_already_canceled_listing() {
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None));
+        let rx = CancellationToken::new();
+        rx.cancel();
+
+        record_decommission_entry_error(&entry_error, &rx, Error::SlowDown).await;
+
+        assert!(entry_error.lock().await.is_none());
+    }
+
+    #[test]
+    fn test_resolve_decommission_listing_error_preserves_real_listing_failure() {
+        let err = resolve_decommission_listing_error(Some(Error::SlowDown), Some(Error::OperationCanceled))
+            .expect("listing failure should be returned");
+        assert!(matches!(err, Error::SlowDown));
+
+        let err = resolve_decommission_listing_error(Some(Error::OperationCanceled), Some(Error::SlowDown))
+            .expect("entry failure should be returned");
         assert!(matches!(err, Error::SlowDown));
     }
 
