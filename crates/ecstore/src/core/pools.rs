@@ -5478,7 +5478,7 @@ impl ECStore {
         }
     }
 
-    async fn advance_durable_ilm_decommission_receipts(&self, path: &str, data: &[u8], terminal: bool) -> Result<()> {
+    async fn advance_durable_ilm_decommission_receipts(&self, path: &str, data: &[u8], terminal: bool) -> Result<Vec<usize>> {
         let active_runs = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta
@@ -5495,20 +5495,25 @@ impl ECStore {
                 .collect::<Vec<_>>()
         };
         if active_runs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let stage = if terminal { "terminal" } else { "progress" };
         let record = validate_durable_ilm_record(path, data)
             .map_err(|err| Error::other(format!("{stage} durable ILM record is invalid at path `{path}`: {err}")))?;
+        let mut terminal_target_pool_indices = Vec::new();
         for (source_pool_idx, run_token) in active_runs {
             let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, record.id_kind, &record.id);
             let mut receipt_found = false;
             for pool_idx in 0..self.pools.len() {
                 if pool_idx != source_pool_idx {
-                    receipt_found |= self
+                    let found = self
                         .advance_durable_ilm_decommission_receipt(pool_idx, &receipt_path, &record, terminal)
                         .await?;
+                    receipt_found |= found;
+                    if terminal && found && !terminal_target_pool_indices.contains(&pool_idx) {
+                        terminal_target_pool_indices.push(pool_idx);
+                    }
                 }
             }
             if terminal && !receipt_found {
@@ -5518,14 +5523,27 @@ impl ECStore {
                 )));
             }
         }
-        Ok(())
+        Ok(terminal_target_pool_indices)
     }
 
     pub(crate) async fn record_durable_ilm_decommission_progress(&self, path: &str, data: &[u8]) -> Result<()> {
-        self.advance_durable_ilm_decommission_receipts(path, data, false).await
+        self.advance_durable_ilm_decommission_receipts(path, data, false)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn record_durable_ilm_decommission_terminal(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.record_durable_ilm_decommission_terminal_target_pools(path, data)
+            .await
+            .map(|_| ())
+    }
+
+    /// Record terminal proof and return its non-source receipt pools for targeted cleanup.
+    pub(crate) async fn record_durable_ilm_decommission_terminal_target_pools(
+        &self,
+        path: &str,
+        data: &[u8],
+    ) -> Result<Vec<usize>> {
         self.advance_durable_ilm_decommission_receipts(path, data, true).await
     }
 
@@ -7021,6 +7039,7 @@ mod pools_tests {
         let job_bytes = job.encode().expect("large manual job should remain within its record limit");
         assert!(job_bytes.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
         let record = validate_durable_ilm_record(&path, &job_bytes).expect("large manual job should validate");
+        let expected_checkpoint = record.checkpoint.clone();
         let mut receipt = DecommissionDurableIlmReceipt::new(&path, &record);
         receipt.terminal_checkpoint = Some(record.checkpoint);
 
@@ -7029,7 +7048,8 @@ mod pools_tests {
 
         assert!(encoded.len() <= DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
         assert_eq!(decoded.source_path, path);
-        assert!(decoded.terminal_checkpoint.is_some());
+        assert_eq!(decoded.checkpoint, expected_checkpoint);
+        assert_eq!(decoded.terminal_checkpoint, Some(expected_checkpoint));
     }
 
     #[test]

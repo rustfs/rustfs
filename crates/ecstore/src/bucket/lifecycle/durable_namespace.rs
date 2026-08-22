@@ -169,7 +169,7 @@ pub(crate) enum DurableIlmRecordCheckpoint {
     ManualTransitionJob {
         content_sha256: String,
         identity_sha256: String,
-        updated_at_unix_nanos: i128,
+        updated_at_unix_nanos: i64,
         state: manual_transition_job::ManualTransitionJobState,
         scan_completed: bool,
         cancel_requested: bool,
@@ -181,7 +181,7 @@ pub(crate) enum DurableIlmRecordCheckpoint {
     ManualTransitionScope {
         content_sha256: String,
         identity_sha256: String,
-        updated_at_unix_nanos: i128,
+        updated_at_unix_nanos: i64,
     },
     ManualTransitionTask {
         content_sha256: String,
@@ -817,13 +817,15 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 job.created_at_unix_nanos,
             ))?;
             let progress_proof = ManualTransitionJobProgressProof::new(&job.report, &job.queue_snapshot, job.cursor_revision)?;
+            let updated_at_unix_nanos = i64::try_from(job.updated_at_unix_nanos)
+                .map_err(|_| Error::other("manual transition job updated_at exceeds durable ILM checkpoint range"))?;
             (
                 "job_id",
                 job_id.to_string(),
                 DurableIlmRecordCheckpoint::ManualTransitionJob {
                     content_sha256,
                     identity_sha256,
-                    updated_at_unix_nanos: job.updated_at_unix_nanos,
+                    updated_at_unix_nanos,
                     state: job.state,
                     scan_completed: job.scan_completed,
                     cancel_requested: job.cancel_requested,
@@ -850,13 +852,15 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 &admission.tier,
                 admission.dry_run,
             ))?;
+            let updated_at_unix_nanos = i64::try_from(admission.updated_at_unix_nanos)
+                .map_err(|_| Error::other("manual transition scope updated_at exceeds durable ILM checkpoint range"))?;
             (
                 "job_id",
                 admission.job_id.to_string(),
                 DurableIlmRecordCheckpoint::ManualTransitionScope {
                     content_sha256,
                     identity_sha256,
-                    updated_at_unix_nanos: admission.updated_at_unix_nanos,
+                    updated_at_unix_nanos,
                 },
             )
         }
@@ -978,6 +982,22 @@ mod tests {
             .validate_successor(&compact)
             .expect("legacy checkpoints should accept the same bounded generation");
         assert_eq!(legacy.compacted().expect("legacy checkpoint should compact"), compact);
+    }
+
+    #[test]
+    fn manual_transition_job_checkpoint_rejects_timestamp_outside_wire_range() {
+        let options = super::super::bucket_lifecycle_ops::ManualTransitionRunOptions::default();
+        let mut job = manual_transition_job::ManualTransitionJobRecord::new(
+            Uuid::new_v4(),
+            "checkpoint-timestamp-bucket",
+            &options,
+            "owner",
+        );
+        job.updated_at_unix_nanos = i128::from(i64::MAX) + 1;
+
+        let err = try_manual_job_checkpoint(&job).expect_err("out-of-range checkpoint timestamp must fail closed");
+
+        assert!(err.to_string().contains("updated_at exceeds durable ILM checkpoint range"));
     }
 
     #[test]
