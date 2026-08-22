@@ -3969,6 +3969,55 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
+fn delete_removes_current_object(opts: &ObjectOptions) -> bool {
+    delete_request_targets_current(
+        opts.version_id
+            .as_deref()
+            .and_then(|version_id| Uuid::parse_str(version_id).ok()),
+    )
+}
+
+fn delete_request_targets_current(version_id: Option<Uuid>) -> bool {
+    version_id.is_none() || version_id.is_some_and(|version_id| version_id.is_nil())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteMemoryUpdate {
+    DeleteMarker,
+    Object { size: u64, removed_current_object: bool },
+}
+
+fn delete_memory_update(
+    creates_delete_marker: bool,
+    committed_delete_marker: bool,
+    requested_current: bool,
+    accounting_size: Option<u64>,
+    removed_current_object: bool,
+) -> Option<DeleteMemoryUpdate> {
+    if creates_delete_marker || (committed_delete_marker && requested_current) {
+        return Some(DeleteMemoryUpdate::DeleteMarker);
+    }
+
+    (!committed_delete_marker)
+        .then_some(accounting_size)
+        .flatten()
+        .map(|size| DeleteMemoryUpdate::Object {
+            size,
+            removed_current_object,
+        })
+}
+
+async fn apply_delete_memory_update(bucket: &str, update: Option<DeleteMemoryUpdate>) {
+    match update {
+        Some(DeleteMemoryUpdate::DeleteMarker) => record_bucket_delete_marker_memory(bucket).await,
+        Some(DeleteMemoryUpdate::Object {
+            size,
+            removed_current_object,
+        }) => record_bucket_object_delete_memory(bucket, size, removed_current_object).await,
+        None => {}
+    }
+}
+
 /// `DeleteObjects` is idempotent. A raw filesystem `NotFound` can cross the
 /// distributed delete path instead of its usual typed missing-object error.
 fn is_delete_objects_not_found(error: &EcstoreError) -> bool {
@@ -8409,8 +8458,6 @@ impl DefaultObjectUsecase {
             object: ObjectToDelete,
             versioned: bool,
             version_suspended: bool,
-            size: i64,
-            existing: Option<ObjectInfo>,
         }
 
         // Phase 2 (bounded concurrency, backlog#929 / HP-8): collect the
@@ -8428,32 +8475,23 @@ impl DefaultObjectUsecase {
                     skip_stat,
                 } = prepared;
                 let synthetic_version_id = object.version_id.is_none() && is_dir_object(&object.object_name);
-                let (goi, source_missing) = if skip_stat {
-                    (ObjectInfo::default(), false)
-                } else {
+                if !skip_stat {
                     match store_ref.get_object_info(bucket_ref, &object.object_name, &opts).await {
-                        Ok(res) => (res, false),
-                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
-                            (ObjectInfo::default(), true)
-                        }
+                        Ok(_) => {}
+                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                         Err(err) => return Err(ApiError::from(err)),
                     }
-                };
-
-                let size = goi.size;
+                }
 
                 if synthetic_version_id {
                     object.version_id = Some(Uuid::nil());
                 }
 
-                let existing = (!skip_stat && !source_missing).then_some(goi);
                 Ok::<_, ApiError>(AdmittedDelete {
                     idx,
                     object,
                     versioned: opts.versioned,
                     version_suspended: opts.version_suspended,
-                    size,
-                    existing,
                 })
             }))
             .buffered(DELETE_OBJECTS_PRE_STAT_CONCURRENCY)
@@ -8464,15 +8502,11 @@ impl DefaultObjectUsecase {
         // per-key success/failure reporting is unchanged.
         let mut object_to_delete = Vec::new();
         let mut object_to_delete_idx = Vec::new();
-        let mut object_sizes = Vec::new();
-        let mut existing_object_infos = Vec::new();
         let mut object_versioning = Vec::new();
         for admitted in admitted_deletes {
-            object_sizes.push(admitted.size);
             object_to_delete_idx.push(admitted.idx);
             object_versioning.push((admitted.versioned, admitted.version_suspended));
             object_to_delete.push(admitted.object);
-            existing_object_infos.push(admitted.existing);
         }
         let cache_adapter = self.object_data_cache();
         let cache_keys_before_delete = object_to_delete
@@ -8489,8 +8523,8 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
         apply_bucket_generation_guard(&req, &bucket, &mut storage_delete_opts)?;
-        let (dobjs, errs) = store
-            .delete_objects_with_tier_delete_journal(&bucket, object_to_delete.clone(), storage_delete_opts)
+        let (dobjs, errs, accounting) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
             .await;
 
         let _manager = get_concurrency_manager();
@@ -8515,17 +8549,16 @@ impl DefaultObjectUsecase {
                     delete_results[didx].delete_object = Some(deleted_object.clone());
                     let (versioned, version_suspended) = object_versioning[i];
                     let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
-                    if creates_delete_marker {
-                        record_bucket_delete_marker_memory(&bucket).await;
-                    } else {
-                        let size = object_sizes[i].max(0) as u64;
-                        record_bucket_object_delete_memory(
-                            &bucket,
-                            size,
-                            existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
-                        )
-                        .await;
-                    }
+                    let committed_delete_marker = dobjs[i].delete_marker;
+                    let delete_accounting = accounting.get(i).and_then(Option::as_ref);
+                    let update = delete_memory_update(
+                        creates_delete_marker,
+                        committed_delete_marker,
+                        delete_request_targets_current(object_to_delete[i].version_id),
+                        delete_accounting.and_then(|value| value.size),
+                        delete_accounting.is_some_and(|value| value.removed_current_object),
+                    );
+                    apply_delete_memory_update(&bucket, update).await;
                 }
                 Err(error) => {
                     delete_results[didx].error = Some(error);
@@ -8803,12 +8836,24 @@ impl DefaultObjectUsecase {
             let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
         }
 
-        // Fast in-memory update for immediate quota and admin usage consistency
-        if delete_creates_delete_marker(&opts) {
-            record_bucket_delete_marker_memory(&bucket).await;
+        // Fast in-memory update for immediate quota and admin usage consistency.
+        // Prefix/force deletes and synthetic directory entries do not carry one
+        // committed object identity; leave their cache delta to reconciliation.
+        let update = if force_delete || obj_info.name.is_empty() || synthetic_version_id {
+            None
         } else {
-            record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
-        }
+            // The storage commit returns this object's metadata while its
+            // generation lock is held. Never fall back to a pre-delete stat:
+            // an overwrite can commit between that stat and this delete.
+            delete_memory_update(
+                delete_creates_delete_marker(&opts),
+                obj_info.delete_marker,
+                opts.version_id.is_none(),
+                quota_object_size(&obj_info).ok(),
+                delete_removes_current_object(&opts),
+            )
+        };
+        apply_delete_memory_update(&bucket, update).await;
 
         if obj_info.name.is_empty() {
             if let Some((operation_id, target_arns, generation)) = force_delete_intent {
@@ -17859,6 +17904,158 @@ mod tests {
         // delete as a delete-marker creation, the stat must stay so usage
         // accounting keeps its size input.
         assert!(!can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), false));
+    }
+
+    #[test]
+    fn delete_accounting_recognizes_explicit_null_as_current_object() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::nil().to_string()),
+            version_suspended: true,
+            ..Default::default()
+        };
+        assert!(delete_removes_current_object(&opts));
+        assert!(delete_request_targets_current(Some(Uuid::nil())));
+        assert!(!delete_request_targets_current(Some(Uuid::new_v4())));
+        assert!(!delete_removes_current_object(&ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn compressed_object_delete_restores_usage_baseline() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        let object = ObjectInfo {
+            size: 400,
+            actual_size: 1000,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let accounting_size = quota_object_size(&object).expect("logical compressed size should be canonical");
+
+        assert_eq!(
+            delete_memory_update(false, false, true, Some(accounting_size), true),
+            Some(DeleteMemoryUpdate::Object {
+                size: 1000,
+                removed_current_object: true,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_accounting_metadata_is_reconciled_without_overflow() {
+        assert_eq!(delete_memory_update(false, false, true, None, true), None);
+        assert_eq!(
+            delete_memory_update(false, true, true, None, true),
+            Some(DeleteMemoryUpdate::DeleteMarker)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn compressed_delete_requests_restore_usage_baseline() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let bucket = format!("compressed-delete-request-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create compressed delete request bucket");
+
+        // Seed the process-local usage with the canonical logical bytes. The
+        // direct storage PUT below intentionally does not apply an app-layer
+        // usage delta; the two real DELETE requests must remove exactly this
+        // amount through their request-layer wiring.
+        crate::app::storage_api::test::data_usage::seed_bucket_usage_memory_for_test(&bucket, 2_000).await;
+
+        for object in ["single", "batch"] {
+            let mut metadata = HashMap::new();
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+            insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, "1000".to_string());
+            let reader = HashReader::from_stream(std::io::Cursor::new(vec![0x5a; 400]), 400, 1000, None, None, false)
+                .expect("compressed fixture reader should be valid");
+            let mut reader = PutObjReader::new(reader);
+            store
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        user_defined: metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("compressed fixture object should be written");
+        }
+
+        let mut single_req = build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("single".to_string())
+                .build()
+                .expect("single delete input should build"),
+            Method::DELETE,
+        );
+        single_req.extensions.insert(crate::storage::access::ReqInfo {
+            cred: Some(rustfs_credentials::Credentials::default()),
+            is_owner: true,
+            ..Default::default()
+        });
+        DefaultObjectUsecase::from_global()
+            .execute_delete_object(single_req)
+            .await
+            .expect("single compressed delete should succeed");
+        assert_eq!(
+            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            Some(1_000),
+            "single delete must subtract the logical accounting size"
+        );
+
+        let mut batch_req = build_request(
+            DeleteObjectsInput::builder()
+                .bucket(bucket.clone())
+                .delete(Delete {
+                    objects: vec![ObjectIdentifier {
+                        key: "batch".to_string(),
+                        ..Default::default()
+                    }],
+                    quiet: None,
+                })
+                .build()
+                .expect("batch delete input should build"),
+            Method::POST,
+        );
+        batch_req.extensions.insert(crate::storage::access::ReqInfo {
+            cred: Some(rustfs_credentials::Credentials::default()),
+            is_owner: true,
+            ..Default::default()
+        });
+        DefaultObjectUsecase::from_global()
+            .execute_delete_objects(batch_req)
+            .await
+            .expect("batch compressed delete should succeed");
+        assert_eq!(
+            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            Some(0),
+            "batch delete must subtract the committed logical accounting size"
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up compressed delete request bucket");
     }
 
     #[tokio::test]

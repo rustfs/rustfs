@@ -296,7 +296,10 @@ pub(crate) fn build_list_objects_v2_output(
             let mut obj = Object {
                 key: Some(key),
                 last_modified: v.mod_time.map(Timestamp::from),
-                size: Some(v.get_actual_size().unwrap_or_default()),
+                // Compressed legacy objects may retain an unknown (-1)
+                // logical-size sentinel; never expose that internal value in
+                // an S3 response.
+                size: Some(v.get_actual_size_or_physical()),
                 e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
                 storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                 ..Default::default()
@@ -654,6 +657,45 @@ mod tests {
         assert_eq!(output.key_count, Some(3));
         assert_eq!(output.contents.as_ref().map(std::vec::Vec::len), Some(1));
         assert_eq!(output.common_prefixes.as_ref().map(std::vec::Vec::len), Some(2));
+    }
+
+    #[test]
+    fn list_objects_never_exposes_compressed_unknown_size_sentinel() {
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        let output = build_list_objects_v2_output(
+            ListObjectsV2Info {
+                objects: vec![ObjectInfo {
+                    name: "legacy-compressed".to_string(),
+                    size: 128,
+                    actual_size: -1,
+                    user_defined: std::sync::Arc::new(metadata),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            false,
+            1000,
+            "bucket".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            output
+                .contents
+                .as_ref()
+                .and_then(|objects| objects.first())
+                .and_then(|object| object.size),
+            Some(128)
+        );
     }
 
     #[test]

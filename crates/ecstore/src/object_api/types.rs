@@ -762,6 +762,9 @@ impl ObjectInfo {
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
+        if self.actual_size < -1 || (self.actual_size == -1 && !self.is_compressed()) {
+            return Err(std::io::Error::other("invalid negative actual size"));
+        }
         if self.actual_size > 0 {
             return Ok(self.actual_size);
         }
@@ -773,10 +776,25 @@ impl ObjectInfo {
                 let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                 return Ok(size);
             }
-            let mut actual_size = 0;
-            self.parts.iter().for_each(|part| {
-                actual_size += part.actual_size;
-            });
+            if self.actual_size == -1 && self.parts.is_empty() {
+                return Ok(-1);
+            }
+            let mut actual_size = 0_i64;
+            let mut unknown = false;
+            for part in self.parts.iter() {
+                match part.actual_size {
+                    -1 => unknown = true,
+                    size if size >= 0 => {
+                        actual_size = actual_size
+                            .checked_add(size)
+                            .ok_or_else(|| std::io::Error::other("compressed actual size overflow"))?;
+                    }
+                    _ => return Err(std::io::Error::other("invalid negative compressed part size")),
+                }
+            }
+            if unknown {
+                return Ok(-1);
+            }
             if actual_size == 0 && actual_size != self.size {
                 return Err(std::io::Error::other(format!("invalid decompressed size {} {}", actual_size, self.size)));
             }
@@ -789,6 +807,18 @@ impl ObjectInfo {
         }
 
         Ok(self.size)
+    }
+
+    /// Returns a non-negative size for client and replication boundaries.
+    ///
+    /// Compressed legacy metadata can retain the internal `-1` unknown-size
+    /// sentinel. Those boundaries cannot emit a negative length, so they use
+    /// the persisted physical size while quota accounting keeps the sentinel
+    /// distinction in [`crate::data_usage::quota_object_size`].
+    pub fn get_actual_size_or_physical(&self) -> i64 {
+        self.get_actual_size()
+            .map(|size| if size >= 0 { size } else { self.size.max(0) })
+            .unwrap_or_else(|_| self.size.max(0))
     }
 
     pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
