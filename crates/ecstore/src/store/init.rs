@@ -626,7 +626,7 @@ mod tests {
         io::Cursor,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1305,6 +1305,85 @@ mod tests {
             start_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         });
+    }
+
+    const DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER: &str = "delete_marker_copy";
+    const DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
+    #[cfg(feature = "test-util")]
+    const DECOMMISSION_TEST_FAULT_STAGE_TIERED: &str = "decommission_tiered_object";
+
+    async fn seed_decommission_source(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        body: Vec<u8>,
+        opts: &ObjectOptions,
+    ) {
+        let mut reader = PutObjReader::from_vec(body);
+        store.pools[0]
+            .put_object(bucket, object, &mut reader, opts)
+            .await
+            .expect("seed decommission source object");
+    }
+
+    async fn run_decommission_entry_retry_test(
+        store: &Arc<crate::store::ECStore>,
+        rx: CancellationToken,
+        bucket: &str,
+        object: &str,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
+    ) -> crate::error::Result<()> {
+        let source_set = store.pools[0].get_disks_by_key(object);
+        store
+            .decommission_entry_with_retry_state_for_test(
+                rx,
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.to_string(),
+                source_set,
+                expected_bucket_incarnation_id,
+                source_changed_exhaustions,
+            )
+            .await
+    }
+
+    async fn read_decommission_target_body(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Vec<u8> {
+        let mut reader = store.pools[1]
+            .get_object_reader(bucket, object, None, HeaderMap::new(), opts)
+            .await
+            .expect("read decommission target object");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("drain decommission target body");
+        body
+    }
+
+    async fn assert_decommission_source_absent(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) {
+        let err = store.pools[0]
+            .get_object_info(bucket, object, opts)
+            .await
+            .expect_err("decommission source must be retained until target commit, then removed");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)),
+            "unexpected decommission source result: {err:?}"
+        );
     }
 
     async fn write_decommission_test_multipart_source(
@@ -3100,6 +3179,537 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_retries_source_changed_without_canceling_other_bucket() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_retries_source_changed_without_canceling_other_bucket".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create decommission retry store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-entry-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let changed_bucket = format!("decom-retry-a-{}", uuid::Uuid::new_v4());
+                    let other_bucket = format!("decom-retry-b-{}", uuid::Uuid::new_v4());
+                    for bucket in [&changed_bucket, &other_bucket] {
+                        store
+                            .make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create decommission retry bucket");
+                    }
+
+                    let changed_object = "changed.bin";
+                    let first_version = uuid::Uuid::new_v4();
+                    let second_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &changed_bucket,
+                        changed_object,
+                        b"first generation".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(first_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    let other_object = "other.bin";
+                    seed_decommission_source(
+                        &store,
+                        &other_bucket,
+                        other_object,
+                        b"other bucket generation".to_vec(),
+                        &ObjectOptions::default(),
+                    )
+                    .await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let mutation_calls = Arc::new(AtomicUsize::new(0));
+                    let mutation_calls_for_hook = Arc::clone(&mutation_calls);
+                    let mutation_store = Arc::clone(&store);
+                    let mutation_bucket = changed_bucket.clone();
+                    let _mutation_guard = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(
+                        move |bucket, object, attempt| {
+                            let is_target = bucket == mutation_bucket.as_str() && object == changed_object;
+                            let calls = Arc::clone(&mutation_calls_for_hook);
+                            let store = Arc::clone(&mutation_store);
+                            let bucket = mutation_bucket.clone();
+                            Box::pin(async move {
+                                if !is_target {
+                                    return;
+                                }
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                if attempt == 1 {
+                                    seed_decommission_source(
+                                        &store,
+                                        &bucket,
+                                        changed_object,
+                                        b"second generation".to_vec(),
+                                        &ObjectOptions {
+                                            versioned: true,
+                                            version_id: Some(second_version.to_string()),
+                                            mod_time: Some(base_time + time::Duration::seconds(1)),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                }
+                            })
+                        },
+                    ));
+
+                    let ordinary_faults = Arc::new(AtomicUsize::new(0));
+                    let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
+                    let fault_bucket = other_bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, bucket, object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                                && bucket == fault_bucket.as_str()
+                                && object == other_object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                ordinary_faults_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let rx = CancellationToken::new();
+                    let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
+                    let changed_incarnation = Some(
+                        store
+                            .bucket_incarnation_id(&changed_bucket)
+                            .await
+                            .expect("changed bucket incarnation"),
+                    );
+                    let other_incarnation = Some(
+                        store
+                            .bucket_incarnation_id(&other_bucket)
+                            .await
+                            .expect("other bucket incarnation"),
+                    );
+                    let (changed_result, other_result) = tokio::join!(
+                        run_decommission_entry_retry_test(
+                            &store,
+                            rx.clone(),
+                            &changed_bucket,
+                            changed_object,
+                            changed_incarnation,
+                            Arc::clone(&source_changed_exhaustions),
+                        ),
+                        run_decommission_entry_retry_test(
+                            &store,
+                            rx.clone(),
+                            &other_bucket,
+                            other_object,
+                            other_incarnation,
+                            Arc::clone(&source_changed_exhaustions),
+                        )
+                    );
+                    changed_result.expect("SourceChanged entry retry must converge");
+                    other_result.expect("other bucket entry must continue through ordinary copy retries");
+
+                    assert!(!rx.is_cancelled(), "entry-level SourceChanged must not cancel the shared worker token");
+                    assert_eq!(mutation_calls.load(Ordering::SeqCst), 2, "entry must be re-listed after SourceChanged");
+                    assert_eq!(ordinary_faults.load(Ordering::SeqCst), 2, "ordinary copy must consume the retry budget");
+                    assert_eq!(source_changed_exhaustions.load(Ordering::SeqCst), 0);
+
+                    for (version_id, expected_body) in [
+                        (first_version, b"first generation".as_slice()),
+                        (second_version, b"second generation".as_slice()),
+                    ] {
+                        let opts = ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version_id.to_string()),
+                            ..Default::default()
+                        };
+                        assert_decommission_source_absent(&store, &changed_bucket, changed_object, &opts).await;
+                        assert_eq!(
+                            read_decommission_target_body(&store, &changed_bucket, changed_object, &opts).await,
+                            expected_body
+                        );
+                    }
+                    assert_decommission_source_absent(&store, &other_bucket, other_object, &ObjectOptions::default()).await;
+                    assert_eq!(
+                        read_decommission_target_body(&store, &other_bucket, other_object, &ObjectOptions::default()).await,
+                        b"other bucket generation"
+                    );
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_exhausted_source_changed_retains_source_and_records_failure() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_exhausted_source_changed_retains_source_and_records_failure".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create decommission exhaustion store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-entry-exhaustion",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-exhausted-{}", uuid::Uuid::new_v4());
+                    let object = "exhausted.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create decommission exhaustion bucket");
+                    let original_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &bucket,
+                        object,
+                        b"original generation".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(original_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let mutation_calls = Arc::new(AtomicUsize::new(0));
+                    let mutation_calls_for_hook = Arc::clone(&mutation_calls);
+                    let mutation_store = Arc::clone(&store);
+                    let mutation_bucket = bucket.clone();
+                    let _mutation_guard = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(
+                        move |called_bucket, called_object, _attempt| {
+                            let is_target = called_bucket == mutation_bucket.as_str() && called_object == object;
+                            let calls = Arc::clone(&mutation_calls_for_hook);
+                            let store = Arc::clone(&mutation_store);
+                            let bucket = mutation_bucket.clone();
+                            Box::pin(async move {
+                                if !is_target {
+                                    return;
+                                }
+                                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                                let offset = i64::try_from(call).expect("entry retry count should fit i64");
+                                seed_decommission_source(
+                                    &store,
+                                    &bucket,
+                                    object,
+                                    format!("concurrent generation {call}").into_bytes(),
+                                    &ObjectOptions {
+                                        versioned: true,
+                                        version_id: Some(uuid::Uuid::new_v4().to_string()),
+                                        mod_time: Some(base_time + time::Duration::seconds(offset)),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                            })
+                        },
+                    ));
+
+                    let rx = CancellationToken::new();
+                    let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        rx.clone(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::clone(&source_changed_exhaustions),
+                    )
+                    .await
+                    .expect("entry-level exhaustion must stay local below the pool threshold");
+
+                    assert!(!rx.is_cancelled(), "one exhausted entry must not cancel other bucket workers");
+                    assert_eq!(mutation_calls.load(Ordering::SeqCst), crate::core::pools::DECOMMISSION_ENTRY_MAX_ATTEMPTS);
+                    assert_eq!(source_changed_exhaustions.load(Ordering::SeqCst), 1);
+                    store.pools[0]
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(original_version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("retry exhaustion must retain the original source version");
+                    let pool_meta = store.pool_meta.read().await;
+                    let info = pool_meta.pools[0]
+                        .decommission
+                        .as_ref()
+                        .expect("decommission progress must be initialized");
+                    assert_eq!(info.items_decommission_failed, 1, "exhausted entry must be visible as failed");
+                    drop(pool_meta);
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_delete_marker_copy_retries_real_path() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_delete_marker_copy_retries_real_path".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create delete marker retry store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-delete-marker-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-marker-{}", uuid::Uuid::new_v4());
+                    let object = "marker.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create delete marker retry bucket");
+                    let data_version = uuid::Uuid::new_v4();
+                    let marker_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &bucket,
+                        object,
+                        b"delete marker data".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(data_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    store.pools[0]
+                        .delete_object(
+                            &bucket,
+                            object,
+                            ObjectOptions {
+                                versioned: true,
+                                version_id: Some(marker_version.to_string()),
+                                delete_marker: true,
+                                mod_time: Some(base_time + time::Duration::seconds(1)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("seed source delete marker");
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let fault_calls = Arc::new(AtomicUsize::new(0));
+                    let fault_calls_for_hook = Arc::clone(&fault_calls);
+                    let fault_bucket = bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, called_bucket, called_object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
+                                && called_bucket == fault_bucket.as_str()
+                                && called_object == object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                fault_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        CancellationToken::new(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+                    .expect("delete marker copy retries must converge");
+
+                    assert_eq!(
+                        fault_calls.load(Ordering::SeqCst),
+                        crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS - 1
+                    );
+                    let marker_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(marker_version.to_string()),
+                        ..Default::default()
+                    };
+                    let target_marker = store.pools[1]
+                        .get_object_info(&bucket, object, &marker_opts)
+                        .await
+                        .expect("target delete marker must exist");
+                    assert!(target_marker.delete_marker);
+                    assert_decommission_source_absent(&store, &bucket, object, &marker_opts).await;
+
+                    let data_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(data_version.to_string()),
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        read_decommission_target_body(&store, &bucket, object, &data_opts).await,
+                        b"delete marker data"
+                    );
+                    assert_decommission_source_absent(&store, &bucket, object, &data_opts).await;
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_tiered_copy_retries_real_path() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_tiered_copy_retries_real_path".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create tiered retry store dir");
+                    let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-tiered-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-tiered-{}", uuid::Uuid::new_v4());
+                    let object = "tiered.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create tiered retry bucket");
+                    let mut reader = PutObjReader::from_vec(b"tiered generation".to_vec());
+                    let original = store.pools[0]
+                        .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                        .expect("seed tiered source object");
+                    let tier_name = format!("DECOM{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+                    register_mock_tier(&ctx.tier_config_mgr(), &tier_name).await;
+                    store.pools[0]
+                        .transition_object(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                transition: TransitionOptions {
+                                    status: TRANSITION_PENDING.to_string(),
+                                    tier: tier_name,
+                                    etag: original.etag.clone().expect("tiered source ETag"),
+                                    ..Default::default()
+                                },
+                                version_id: original.version_id.map(|version_id| version_id.to_string()),
+                                mod_time: original.mod_time,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("transition source object to mock tier");
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let fault_calls = Arc::new(AtomicUsize::new(0));
+                    let fault_calls_for_hook = Arc::clone(&fault_calls);
+                    let fault_bucket = bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, called_bucket, called_object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
+                                && called_bucket == fault_bucket.as_str()
+                                && called_object == object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                fault_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        CancellationToken::new(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+                    .expect("tiered copy retries must converge");
+
+                    assert_eq!(
+                        fault_calls.load(Ordering::SeqCst),
+                        crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS - 1
+                    );
+                    let target = store.pools[1]
+                        .get_object_info(&bucket, object, &ObjectOptions::default())
+                        .await
+                        .expect("tiered target metadata must exist");
+                    assert_eq!(target.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+                    assert_decommission_source_absent(&store, &bucket, object, &ObjectOptions::default()).await;
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
