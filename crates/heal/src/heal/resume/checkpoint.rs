@@ -57,6 +57,30 @@ pub struct ResumeCheckpoint {
     pub failed_objects: HashSet<String>,
     /// skipped objects
     pub skipped_objects: HashSet<String>,
+    /// Aggregate object ledger counters restored alongside the dedup sets.
+    #[serde(default)]
+    pub successful_objects: u64,
+    #[serde(default)]
+    pub failed_object_count: u64,
+    #[serde(default)]
+    pub skipped_object_count: u64,
+    #[serde(default)]
+    pub skipped_new_versions: u64,
+    #[serde(default)]
+    pub skipped_ilm_expired: u64,
+    #[serde(default)]
+    pub processed_bytes: u64,
+    #[serde(default)]
+    pub total_objects: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub baseline_generation: Option<u64>,
+    #[serde(default)]
+    pub baseline_known: bool,
+    /// Persistent telemetry fence for counter/byte overflow or corruption.
+    #[serde(default)]
+    pub counter_unknown: bool,
 }
 
 impl ResumeCheckpoint {
@@ -70,6 +94,17 @@ impl ResumeCheckpoint {
             processed_objects: HashSet::new(),
             failed_objects: HashSet::new(),
             skipped_objects: HashSet::new(),
+            successful_objects: 0,
+            failed_object_count: 0,
+            skipped_object_count: 0,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
+            processed_bytes: 0,
+            total_objects: 0,
+            total_bytes: 0,
+            baseline_generation: None,
+            baseline_known: false,
+            counter_unknown: false,
         }
     }
 
@@ -91,6 +126,34 @@ impl ResumeCheckpoint {
         self.skipped_objects.insert(object);
     }
 
+    pub fn update_progress(&mut self, successful: u64, failed: u64, skipped: u64, bytes: u64) {
+        self.successful_objects = successful;
+        self.failed_object_count = failed;
+        self.skipped_object_count = skipped;
+        self.processed_bytes = bytes;
+    }
+
+    pub fn set_progress_baseline(&mut self, total_objects: u64, total_bytes: u64, generation: Option<u64>) {
+        self.total_objects = total_objects;
+        self.total_bytes = total_bytes;
+        self.baseline_generation = generation;
+        // The caller has already validated that this is a complete snapshot;
+        // preserve the distinction between a known empty scope and an old
+        // checkpoint that omitted all baseline fields.
+        self.baseline_known = true;
+    }
+
+    pub fn mark_counter_unknown(&mut self) {
+        self.counter_unknown = true;
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn set_skipped_version_counts(&mut self, new_versions: u64, ilm_expired: u64) {
+        self.skipped_new_versions = new_versions;
+        self.skipped_ilm_expired = ilm_expired;
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
     /// Advance past a fully-processed page: objects below `object_index` are
     /// skipped by position on resume, so the per-object sets no longer need
     /// their entries and would otherwise grow with the whole bucket.
@@ -107,6 +170,17 @@ impl ResumeCheckpoint {
         self.update_position(0, 0);
         self.processed_objects.clear();
         self.skipped_objects.clear();
+        self.successful_objects = 0;
+        self.failed_object_count = 0;
+        self.skipped_object_count = 0;
+        self.skipped_new_versions = 0;
+        self.skipped_ilm_expired = 0;
+        self.processed_bytes = 0;
+        self.total_objects = 0;
+        self.total_bytes = 0;
+        self.baseline_generation = None;
+        self.baseline_known = false;
+        self.counter_unknown = false;
         self.failed_objects.clear();
     }
 }
@@ -185,6 +259,17 @@ impl CheckpointManager {
             checkpoint.processed_objects.clear();
             checkpoint.failed_objects.clear();
             checkpoint.skipped_objects.clear();
+            checkpoint.successful_objects = 0;
+            checkpoint.failed_object_count = 0;
+            checkpoint.skipped_object_count = 0;
+            checkpoint.skipped_new_versions = 0;
+            checkpoint.skipped_ilm_expired = 0;
+            checkpoint.processed_bytes = 0;
+            checkpoint.total_objects = 0;
+            checkpoint.total_bytes = 0;
+            checkpoint.baseline_generation = None;
+            checkpoint.baseline_known = false;
+            checkpoint.counter_unknown = false;
             checkpoint.current_bucket_index = 0;
             checkpoint.current_object_index = 0;
             checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
@@ -265,6 +350,34 @@ impl CheckpointManager {
         checkpoint.add_skipped_object(object);
         drop(checkpoint);
         self.save_checkpoint_if_due().await
+    }
+
+    pub async fn update_progress(&self, successful: u64, failed: u64, skipped: u64, bytes: u64) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.update_progress(successful, failed, skipped, bytes);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    pub async fn set_progress_baseline(&self, total_objects: u64, total_bytes: u64, generation: Option<u64>) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.set_progress_baseline(total_objects, total_bytes, generation);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    pub async fn mark_counter_unknown(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.mark_counter_unknown();
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    pub async fn set_skipped_version_counts(&self, new_versions: u64, ilm_expired: u64) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.set_skipped_version_counts(new_versions, ilm_expired);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
     }
 
     async fn save_checkpoint_if_due(&self) -> Result<()> {

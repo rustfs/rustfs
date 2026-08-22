@@ -32,7 +32,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("erasure_set: {} ({} buckets)", set_disk_id, buckets.len())));
-            progress.update_progress(0, 4, 0, 0);
+            progress.update_stage(0, 4);
         }
 
         let is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
@@ -158,7 +158,7 @@ impl HealTask {
             None
         };
 
-        self.apply_erasure_set_usage_baseline(&buckets).await?;
+        self.apply_erasure_set_usage_baseline(&buckets, &set_disk_id).await?;
 
         let healing_marker = format!("{set_disk_id}:{}", self.id);
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
@@ -244,7 +244,7 @@ impl HealTask {
                         );
                         {
                             let mut progress = self.progress.write().await;
-                            progress.update_progress(4, 4, 0, 0);
+                            progress.update_stage(4, 4);
                         }
                         return Err(Error::TaskExecutionFailed {
                             message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
@@ -297,7 +297,7 @@ impl HealTask {
                 );
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(4, 4, 0, 0);
+                    progress.update_stage(4, 4);
                 }
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
@@ -307,7 +307,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 4, 0, 0);
+            progress.update_stage(1, 4);
         }
 
         // The rebuilt disks are formatted now: mark them as healing so
@@ -336,7 +336,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(2, 4, 0, 0);
+            progress.update_stage(2, 4);
         }
 
         // Step 3: Heal bucket structure
@@ -420,7 +420,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(3, 4, 0, 0);
+            progress.update_stage(3, 4);
         }
 
         // Step 4: Execute erasure set heal with resume
@@ -463,9 +463,7 @@ impl HealTask {
         };
 
         {
-            let mut progress = self.progress.write().await;
-            let bytes_processed = progress.bytes_processed;
-            progress.update_progress(4, 4, 0, bytes_processed);
+            self.progress.write().await.update_stage(4, 4);
         }
 
         match result {

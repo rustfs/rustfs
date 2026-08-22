@@ -649,7 +649,7 @@ impl HealTask {
 
         let mut progress = self.progress.write().await;
         progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
-        progress.update_progress(0, 1, 0, 0);
+        progress.update_stage(1, 1);
         Ok(())
     }
 
@@ -733,7 +733,7 @@ impl HealTask {
             "Heal object skipped for data usage cache after transient error"
         );
         let mut progress = self.progress.write().await;
-        progress.update_progress(3, 3, 0, 0);
+        progress.update_stage(3, 3);
         true
     }
 
@@ -757,7 +757,7 @@ impl HealTask {
         );
         let mut progress = self.progress.write().await;
         progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
-        progress.update_progress(4, 4, 0, 0);
+        progress.update_stage(4, 4);
         true
     }
 
@@ -831,6 +831,10 @@ impl HealTask {
 
         match &result {
             Ok(_) => {
+                // A stage can reach its final step before the durable resume
+                // ledger and cleanup fences commit. Publish terminal 100 only
+                // after the enclosing operation has returned success.
+                self.progress.write().await.mark_completed();
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Completed;
                 demote_to_debug_when!(self.heal_type.is_per_object(), info, target: "rustfs::heal::task", {

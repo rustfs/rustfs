@@ -15,15 +15,70 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
+pub(crate) fn increment_counter(counter: &mut u64) -> bool {
+    match counter.checked_add(1) {
+        Some(next) => {
+            *counter = next;
+            true
+        }
+        None => {
+            *counter = u64::MAX;
+            false
+        }
+    }
+}
+
+pub(crate) fn add_bytes(total: &mut u64, amount: u64) -> bool {
+    match total.checked_add(amount) {
+        Some(next) => {
+            *total = next;
+            true
+        }
+        None => {
+            *total = u64::MAX;
+            false
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HealProgressKind {
+    #[default]
+    Unknown,
+    Stage,
+    ObjectSweep,
+}
+
+/// Whether the object ledger can produce a meaningful percentage.
+///
+/// A zero-valued baseline is not a completed scan: it means that no complete
+/// usage snapshot was available.  Keep this state explicit so callers do not
+/// mistake the legacy `0.0` wire value for a measured zero-percent result.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HealProgressState {
+    #[default]
+    Unknown,
+    Indeterminate,
+    Running,
+    Completed,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealProgress {
+    #[serde(default)]
+    pub kind: HealProgressKind,
     /// Objects scanned
     pub objects_scanned: u64,
     /// Objects healed
     pub objects_healed: u64,
     /// Objects failed
     pub objects_failed: u64,
+    /// Versions deferred for a later retry pass.
+    #[serde(default)]
+    pub skipped_objects: u64,
     /// Versions skipped because they were written after this heal started
     pub skipped_new_versions: u64,
     /// Versions skipped because lifecycle already selected them for expiry
@@ -44,11 +99,38 @@ pub struct HealProgress {
     pub last_update_time: Option<SystemTime>,
     /// Estimated completion time
     pub estimated_completion_time: Option<SystemTime>,
+    /// Current stage number. Stage updates are intentionally independent from
+    /// the object ledger below.
+    #[serde(default)]
+    pub stage_current: u64,
+    /// Number of stages in the current task.
+    #[serde(default)]
+    pub stage_total: u64,
+    /// Explicitly distinguishes a missing usage baseline from measured 0%.
+    #[serde(default)]
+    pub progress_state: HealProgressState,
+    /// True only after the task's durable completion ledger was committed.
+    #[serde(default)]
+    pub ledger_complete: bool,
+    /// Generation of the usage snapshot used for the baseline, if available.
+    #[serde(default)]
+    pub baseline_generation: Option<u64>,
+    /// Whether the baseline was explicitly observed.  This is separate from
+    /// the counters so a known empty scope (0 objects, 0 bytes) is not
+    /// confused with a legacy snapshot that omitted the baseline fields.
+    #[serde(default)]
+    pub baseline_known: bool,
+    /// Internal telemetry fence set when an aggregate counter overflows or
+    /// becomes inconsistent.  It prevents a later refresh from fabricating a
+    /// percentage from the poisoned values.
+    #[serde(default)]
+    pub counter_unknown: bool,
 }
 
 impl HealProgress {
     pub fn new() -> Self {
         Self {
+            kind: HealProgressKind::Unknown,
             start_time: Some(SystemTime::now()),
             last_update_time: Some(SystemTime::now()),
             ..Default::default()
@@ -56,12 +138,87 @@ impl HealProgress {
     }
 
     pub fn update_progress(&mut self, scanned: u64, healed: u64, failed: u64, bytes: u64) {
+        self.update_object_sweep_progress(scanned, healed, failed, bytes);
+    }
+
+    pub fn update_object_sweep_progress(&mut self, scanned: u64, healed: u64, failed: u64, bytes: u64) {
+        self.kind = HealProgressKind::ObjectSweep;
         self.objects_scanned = scanned;
         self.objects_healed = healed;
         self.objects_failed = failed;
         self.bytes_processed = bytes;
         self.last_update_time = Some(SystemTime::now());
 
+        let explicit_skipped = match self.skipped_new_versions.checked_add(self.skipped_ilm_expired) {
+            Some(value) => value,
+            None => {
+                self.mark_unknown();
+                0
+            }
+        };
+        let skipped = healed
+            .checked_add(failed)
+            .and_then(|value| value.checked_add(explicit_skipped))
+            .and_then(|value| scanned.checked_sub(value))
+            .unwrap_or(0);
+        self.update_object_progress(scanned, healed, failed, skipped, bytes);
+    }
+
+    /// Update task stage progress without modifying object counters.
+    pub fn update_stage(&mut self, current: u64, total: u64) {
+        let object_sweep_active = matches!(self.kind, HealProgressKind::ObjectSweep);
+        if !object_sweep_active {
+            self.kind = HealProgressKind::Stage;
+        }
+        self.ledger_complete = false;
+        self.stage_current = current.min(total);
+        self.stage_total = total;
+        if object_sweep_active {
+            self.last_update_time = Some(SystemTime::now());
+            self.refresh_progress_percentage();
+            return;
+        }
+        self.progress_state = if total == 0 {
+            HealProgressState::Indeterminate
+        } else {
+            HealProgressState::Running
+        };
+        self.progress_percentage = if total == 0 {
+            0.0
+        } else {
+            (current as f64 / total as f64 * 100.0).min(100.0)
+        };
+        self.last_update_time = Some(SystemTime::now());
+    }
+
+    /// Update the disjoint object ledger. `scanned` is the number of terminal
+    /// object outcomes and must equal healed + failed + deferred skipped plus
+    /// the two terminal skip classes. Overflow is a corrupt/unknown counter
+    /// state, not a reason to abort a completed heal.
+    pub fn update_object_progress(&mut self, scanned: u64, healed: u64, failed: u64, skipped: u64, bytes: u64) {
+        self.kind = HealProgressKind::ObjectSweep;
+        // `skipped` is the transient/deferred class.  The two explicit skip
+        // counters are terminal classifications too, so include them in the
+        // same ledger without making callers maintain a second aggregate.
+        let outcomes = healed
+            .checked_add(failed)
+            .and_then(|value| value.checked_add(skipped))
+            .and_then(|value| value.checked_add(self.skipped_new_versions))
+            .and_then(|value| value.checked_add(self.skipped_ilm_expired));
+        self.objects_scanned = scanned;
+        self.objects_healed = healed;
+        self.objects_failed = failed;
+        self.skipped_objects = skipped;
+        self.bytes_processed = bytes;
+        self.last_update_time = Some(SystemTime::now());
+        self.ledger_complete = false;
+        if outcomes != Some(scanned) {
+            // Telemetry corruption must not abort a heal.  Preserve the
+            // counters for diagnostics, but do not derive a percentage from a
+            // double-counted or overflowing ledger.
+            self.mark_unknown();
+            return;
+        }
         self.refresh_progress_percentage();
         self.refresh_estimated_completion_time();
     }
@@ -69,50 +226,88 @@ impl HealProgress {
     pub fn set_total_baseline(&mut self, objects_total_count: u64, objects_total_size: u64) {
         self.objects_total_count = objects_total_count;
         self.objects_total_size = objects_total_size;
+        self.baseline_known = true;
         self.last_update_time = Some(SystemTime::now());
         self.refresh_progress_percentage();
         self.refresh_estimated_completion_time();
     }
 
+    pub fn set_total_baseline_with_generation(&mut self, objects_total_count: u64, objects_total_size: u64, generation: u64) {
+        self.baseline_generation = Some(generation);
+        self.set_total_baseline(objects_total_count, objects_total_size);
+    }
+
     pub fn record_skipped_new_version(&mut self) {
-        self.skipped_new_versions = self.skipped_new_versions.saturating_add(1);
+        let Some(next) = self.skipped_new_versions.checked_add(1) else {
+            self.mark_unknown();
+            return;
+        };
+        self.skipped_new_versions = next;
         self.last_update_time = Some(SystemTime::now());
         self.refresh_progress_percentage();
         self.refresh_estimated_completion_time();
     }
 
     pub fn record_skipped_ilm_expired(&mut self) {
-        self.skipped_ilm_expired = self.skipped_ilm_expired.saturating_add(1);
+        let Some(next) = self.skipped_ilm_expired.checked_add(1) else {
+            self.mark_unknown();
+            return;
+        };
+        self.skipped_ilm_expired = next;
         self.last_update_time = Some(SystemTime::now());
         self.refresh_progress_percentage();
         self.refresh_estimated_completion_time();
     }
 
-    fn completed_for_baseline(&self) -> u64 {
+    fn completed_for_baseline(&self) -> Option<u64> {
         self.objects_healed
-            .saturating_add(self.objects_failed)
-            .saturating_add(self.skipped_new_versions)
-            .saturating_add(self.skipped_ilm_expired)
+            .checked_add(self.objects_failed)?
+            .checked_add(self.skipped_objects)?
+            .checked_add(self.skipped_new_versions)?
+            .checked_add(self.skipped_ilm_expired)
     }
 
     pub(crate) fn refresh_progress_percentage(&mut self) {
+        if self.ledger_complete {
+            self.progress_state = HealProgressState::Completed;
+            self.progress_percentage = 100.0;
+            return;
+        }
+        if self.counter_unknown {
+            self.progress_state = HealProgressState::Unknown;
+            self.progress_percentage = 0.0;
+            return;
+        }
+        if !self.baseline_known {
+            self.progress_state = HealProgressState::Indeterminate;
+            self.progress_percentage = 0.0;
+            self.estimated_completion_time = None;
+            return;
+        }
         if self.objects_total_size > 0 {
             self.progress_percentage = ((self.bytes_processed as f64 / self.objects_total_size as f64) * 100.0).min(100.0);
+            self.progress_percentage = self.progress_percentage.min(99.999);
+            self.progress_state = HealProgressState::Running;
             return;
         }
         if self.objects_total_count > 0 {
-            let completed = self.completed_for_baseline();
+            let Some(completed) = self.completed_for_baseline() else {
+                self.progress_state = HealProgressState::Unknown;
+                self.progress_percentage = 0.0;
+                return;
+            };
             self.progress_percentage = ((completed as f64 / self.objects_total_count as f64) * 100.0).min(100.0);
+            self.progress_percentage = self.progress_percentage.min(99.999);
+            self.progress_state = HealProgressState::Running;
             return;
         }
-
-        let total = self
-            .objects_scanned
-            .saturating_add(self.objects_healed)
-            .saturating_add(self.objects_failed);
-        if total > 0 {
-            self.progress_percentage = (self.objects_healed as f64 / total as f64) * 100.0;
+        if self.baseline_known {
+            self.progress_state = HealProgressState::Running;
+            self.progress_percentage = 0.0;
+            return;
         }
+        self.progress_state = HealProgressState::Indeterminate;
+        self.progress_percentage = 0.0;
     }
 
     pub fn set_current_object(&mut self, object: Option<String>) {
@@ -125,7 +320,11 @@ impl HealProgress {
             self.estimated_completion_time = None;
             return;
         };
-        if self.is_completed() || !(0.0..100.0).contains(&self.progress_percentage) || self.bytes_processed == 0 {
+        if self.is_completed()
+            || self.progress_percentage <= 0.0
+            || self.progress_percentage >= 100.0
+            || self.bytes_processed == 0
+        {
             self.estimated_completion_time = None;
             return;
         }
@@ -142,18 +341,39 @@ impl HealProgress {
     }
 
     pub fn is_completed(&self) -> bool {
-        if self.progress_percentage >= 100.0 {
-            return true;
-        }
-        if self.objects_total_count > 0 || self.objects_total_size > 0 {
-            return false;
-        }
+        self.ledger_complete
+    }
 
-        self.objects_scanned > 0 && self.objects_healed.saturating_add(self.objects_failed) >= self.objects_scanned
+    /// Mark telemetry unknown while allowing the underlying heal operation to
+    /// continue.  This is used for corrupt/overflowing counters at the
+    /// observability boundary; it must never turn a successful heal into an
+    /// execution error.
+    pub fn mark_unknown(&mut self) {
+        self.counter_unknown = true;
+        self.progress_state = HealProgressState::Unknown;
+        self.ledger_complete = false;
+        self.progress_percentage = 0.0;
+        self.estimated_completion_time = None;
+        self.last_update_time = Some(SystemTime::now());
+    }
+
+    /// Mark the object ledger terminal only after the enclosing task has
+    /// committed all durable resume state and cleanup fences.
+    pub fn mark_completed(&mut self) {
+        let telemetry_unknown = self.counter_unknown || self.progress_state == HealProgressState::Unknown;
+        self.ledger_complete = true;
+        if !telemetry_unknown {
+            self.progress_state = HealProgressState::Completed;
+        }
+        self.progress_percentage = 100.0;
+        self.last_update_time = Some(SystemTime::now());
+        self.estimated_completion_time = None;
     }
 
     pub fn get_success_rate(&self) -> f64 {
-        let total = self.objects_healed + self.objects_failed;
+        let Some(total) = self.objects_healed.checked_add(self.objects_failed) else {
+            return 0.0;
+        };
         if total > 0 {
             (self.objects_healed as f64 / total as f64) * 100.0
         } else {
@@ -230,6 +450,7 @@ mod tests {
         assert_eq!(progress.objects_scanned, 0);
         assert_eq!(progress.objects_healed, 0);
         assert_eq!(progress.objects_failed, 0);
+        assert_eq!(progress.skipped_objects, 0);
         assert_eq!(progress.skipped_new_versions, 0);
         assert_eq!(progress.skipped_ilm_expired, 0);
         assert_eq!(progress.objects_total_count, 0);
@@ -250,10 +471,8 @@ mod tests {
         assert_eq!(progress.objects_healed, 8);
         assert_eq!(progress.objects_failed, 2);
         assert_eq!(progress.bytes_processed, 1024);
-        // Progress percentage should be calculated based on healed/total
-        // total = scanned + healed + failed = 10 + 8 + 2 = 20
-        // healed/total = 8/20 = 0.4 = 40%
-        assert!((progress.progress_percentage - 40.0).abs() < 0.001);
+        assert_eq!(progress.progress_state, HealProgressState::Indeterminate);
+        assert_eq!(progress.progress_percentage, 0.0);
         assert!(progress.last_update_time.is_some());
     }
 
@@ -262,7 +481,8 @@ mod tests {
         let mut progress = HealProgress::new();
         progress.start_time = Some(SystemTime::now() - Duration::from_secs(10));
 
-        progress.update_progress(100, 25, 0, 4096);
+        progress.set_total_baseline(100, 16384);
+        progress.update_progress(25, 25, 0, 4096);
 
         let eta = progress
             .estimated_completion_time
@@ -275,7 +495,7 @@ mod tests {
         let mut progress = HealProgress::new();
         progress.set_total_baseline(10, 8192);
 
-        progress.update_progress(100, 25, 0, 4096);
+        progress.update_progress(25, 25, 0, 4096);
 
         assert!((progress.progress_percentage - 50.0).abs() < 0.001);
     }
@@ -285,7 +505,7 @@ mod tests {
         let mut progress = HealProgress::new();
         progress.set_total_baseline(10, 0);
 
-        progress.update_progress(100, 3, 2, 0);
+        progress.update_progress(5, 3, 2, 0);
 
         assert!((progress.progress_percentage - 50.0).abs() < 0.001);
     }
@@ -295,7 +515,7 @@ mod tests {
         let mut progress = HealProgress::new();
         progress.set_total_baseline(10, 0);
 
-        progress.update_progress(100, 3, 2, 0);
+        progress.update_progress(5, 3, 2, 0);
         progress.record_skipped_new_version();
 
         assert_eq!(progress.skipped_new_versions, 1);
@@ -336,7 +556,8 @@ mod tests {
     fn test_heal_progress_update_progress_all_healed() {
         let mut progress = HealProgress::new();
         // When scanned=0, healed=10, failed=0: total=10, progress = 10/10 = 100%
-        progress.update_progress(0, 10, 0, 2048);
+        progress.update_progress(10, 10, 0, 2048);
+        progress.mark_completed();
 
         // All healed, should be 100%
         assert!((progress.progress_percentage - 100.0).abs() < 0.001);
@@ -394,6 +615,7 @@ mod tests {
         assert_eq!(json["objectsScanned"], 10);
         assert_eq!(json["objectsHealed"], 8);
         assert_eq!(json["objectsFailed"], 2);
+        assert_eq!(json["skippedObjects"], 0);
         assert_eq!(json["skippedNewVersions"], 0);
         assert_eq!(json["skippedIlmExpired"], 0);
         assert_eq!(json["bytesProcessed"], 1024);
@@ -405,6 +627,7 @@ mod tests {
     fn test_heal_progress_is_completed_by_percentage() {
         let mut progress = HealProgress::new();
         progress.update_progress(10, 10, 0, 1024);
+        progress.mark_completed();
 
         assert!(progress.is_completed());
     }
@@ -415,7 +638,7 @@ mod tests {
         progress.objects_scanned = 10;
         progress.objects_healed = 8;
         progress.objects_failed = 2;
-        // healed + failed = 8 + 2 = 10 >= scanned = 10
+        progress.mark_completed();
         assert!(progress.is_completed());
     }
 
@@ -453,6 +676,66 @@ mod tests {
         progress.objects_failed = 0;
 
         assert!((progress.get_success_rate() - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn single_object_progress_reaches_terminal_100() {
+        let mut progress = HealProgress::new();
+        progress.update_object_progress(1, 1, 0, 0, 128);
+        assert!(!progress.is_completed());
+        progress.mark_completed();
+        assert!(progress.is_completed());
+        assert_eq!(progress.progress_percentage, 100.0);
+    }
+
+    #[test]
+    fn progress_without_baseline_is_indeterminate() {
+        let mut progress = HealProgress::new();
+        progress.update_object_progress(1, 1, 0, 0, 128);
+        assert_eq!(progress.progress_state, HealProgressState::Indeterminate);
+        assert_eq!(progress.progress_percentage, 0.0);
+        assert!(progress.estimated_completion_time.is_none());
+    }
+
+    #[test]
+    fn progress_retry_is_exactly_once() {
+        let mut progress = HealProgress::new();
+        progress.set_total_baseline(1, 128);
+        progress.update_object_progress(1, 1, 0, 0, 128);
+        progress.update_object_progress(1, 1, 0, 0, 128);
+        assert_eq!(progress.objects_scanned, 1);
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.bytes_processed, 128);
+    }
+
+    #[test]
+    fn progress_never_triggers_cleanup_before_terminal_ledger_empty() {
+        let mut progress = HealProgress::new();
+        progress.progress_percentage = 100.0;
+        assert!(!progress.is_completed());
+        progress.mark_completed();
+        assert!(progress.is_completed());
+    }
+
+    #[test]
+    fn progress_counter_overflow_is_marked_unknown_without_aborting_completed_heal() {
+        let mut progress = HealProgress::new();
+        progress.update_object_progress(u64::MAX, u64::MAX, 1, 0, 0);
+        assert_eq!(progress.progress_state, HealProgressState::Unknown);
+        progress.mark_completed();
+        assert!(progress.is_completed());
+        assert_eq!(progress.progress_state, HealProgressState::Unknown);
+    }
+
+    #[test]
+    fn stage_updates_do_not_double_count_object_outcomes() {
+        let mut progress = HealProgress::new();
+        progress.update_object_progress(2, 1, 0, 1, 256);
+        progress.update_stage(3, 4);
+        assert_eq!(progress.kind, HealProgressKind::ObjectSweep);
+        assert_eq!(progress.objects_scanned, 2);
+        assert_eq!(progress.objects_healed, 1);
+        assert_eq!(progress.skipped_objects, 1);
     }
 
     #[test]

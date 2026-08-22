@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
-    progress::HealProgress,
+    progress::{HealProgress, add_bytes, increment_counter},
     resume::{
         CheckpointManager, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
         replacement_target_identities_match,
@@ -410,6 +410,9 @@ impl ErasureSetHealer {
                 && state.successful_objects == 0
                 && state.failed_objects == 0
                 && state.skipped_objects == 0
+                && state.skipped_new_versions == 0
+                && state.skipped_ilm_expired == 0
+                && state.processed_bytes == 0
             {
                 // schedule_retry persists the authoritative resume reset before
                 // resetting the checkpoint. Reapply the checkpoint reset after
@@ -474,6 +477,23 @@ impl ErasureSetHealer {
 
         // 2. initialize progress
         self.initialize_progress(buckets, &state).await;
+        let (baseline_known, baseline_count, baseline_size, baseline_generation) = {
+            let baseline = self.progress.read().await;
+            (
+                baseline.baseline_known,
+                baseline.objects_total_count,
+                baseline.objects_total_size,
+                baseline.baseline_generation,
+            )
+        };
+        if baseline_known {
+            resume_manager
+                .set_progress_baseline(baseline_count, baseline_size, baseline_generation)
+                .await?;
+            checkpoint_manager
+                .set_progress_baseline(baseline_count, baseline_size, baseline_generation)
+                .await?;
+        }
 
         // 3. continue from checkpoint
         let current_bucket_index = checkpoint.current_bucket_index;
@@ -483,6 +503,58 @@ impl ErasureSetHealer {
         let mut successful_objects = state.successful_objects;
         let mut failed_objects = state.failed_objects;
         let mut skipped_objects = state.skipped_objects;
+        let checkpoint_has_progress = checkpoint.baseline_known
+            || checkpoint.successful_objects > 0
+            || checkpoint.failed_object_count > 0
+            || checkpoint.skipped_object_count > 0
+            || checkpoint.skipped_new_versions > 0
+            || checkpoint.skipped_ilm_expired > 0
+            || checkpoint.processed_bytes > 0
+            || checkpoint.total_objects > 0
+            || checkpoint.total_bytes > 0
+            || checkpoint.baseline_generation.is_some()
+            || checkpoint.counter_unknown;
+        let checkpoint_generation_mismatch = checkpoint.baseline_known && checkpoint.baseline_generation != baseline_generation;
+        let mut restored_counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
+        if checkpoint_has_progress {
+            successful_objects = checkpoint.successful_objects;
+            failed_objects = checkpoint.failed_object_count;
+            skipped_objects = checkpoint.skipped_object_count;
+            let restored_processed_objects = successful_objects
+                .checked_add(failed_objects)
+                .and_then(|value| value.checked_add(skipped_objects))
+                .and_then(|value| value.checked_add(checkpoint.skipped_new_versions))
+                .and_then(|value| value.checked_add(checkpoint.skipped_ilm_expired));
+            let checkpoint_counter_overflow = restored_processed_objects.is_none();
+            restored_counter_unknown |= checkpoint_counter_overflow;
+            processed_objects = restored_processed_objects.unwrap_or(u64::MAX);
+            let mut progress = self.progress.write().await;
+            progress.objects_scanned = processed_objects;
+            progress.objects_healed = successful_objects;
+            progress.objects_failed = failed_objects;
+            progress.skipped_objects = skipped_objects;
+            progress.skipped_new_versions = checkpoint.skipped_new_versions;
+            progress.skipped_ilm_expired = checkpoint.skipped_ilm_expired;
+            if checkpoint.baseline_known && !checkpoint_generation_mismatch {
+                progress.objects_total_count = checkpoint.total_objects;
+                progress.objects_total_size = checkpoint.total_bytes;
+                progress.baseline_generation = checkpoint.baseline_generation;
+                progress.baseline_known = true;
+            }
+            progress.bytes_processed = checkpoint.processed_bytes;
+            progress.counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
+            progress.refresh_progress_percentage();
+            if checkpoint_generation_mismatch || checkpoint_counter_overflow || progress.counter_unknown {
+                progress.mark_unknown();
+            }
+        }
+        if checkpoint_generation_mismatch {
+            restored_counter_unknown = true;
+        }
+        if restored_counter_unknown {
+            checkpoint_manager.mark_counter_unknown().await?;
+            resume_manager.mark_counter_unknown().await?;
+        }
         let mut failed_buckets = 0u64;
 
         // 4. process remaining buckets
@@ -516,13 +588,42 @@ impl ErasureSetHealer {
                 return bucket_result;
             }
 
-            // update checkpoint position
-            checkpoint_manager.update_position(bucket_idx, current_object_index).await?;
-
             // update progress
-            resume_manager
-                .update_progress(processed_objects, successful_objects, failed_objects, skipped_objects)
+            let progress_snapshot = self.progress.read().await;
+            let bytes_processed = progress_snapshot.bytes_processed;
+            let skipped_new_versions = progress_snapshot.skipped_new_versions;
+            let skipped_ilm_expired = progress_snapshot.skipped_ilm_expired;
+            let counter_unknown = progress_snapshot.counter_unknown;
+            drop(progress_snapshot);
+            // The checkpoint is the recovery authority for object progress.
+            // Publish its counters and fence before the resume summary so a
+            // crash between the two stores cannot make recovery select newer
+            // summary bytes with an older checkpoint ledger.
+            if counter_unknown {
+                checkpoint_manager.mark_counter_unknown().await?;
+            }
+            checkpoint_manager
+                .update_progress(successful_objects, failed_objects, skipped_objects, bytes_processed)
                 .await?;
+            checkpoint_manager
+                .set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired)
+                .await?;
+            checkpoint_manager.update_position(bucket_idx, current_object_index).await?;
+            resume_manager
+                .update_progress_with_bytes(
+                    processed_objects,
+                    successful_objects,
+                    failed_objects,
+                    skipped_objects,
+                    bytes_processed,
+                )
+                .await?;
+            resume_manager
+                .set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired)
+                .await?;
+            if counter_unknown {
+                resume_manager.mark_counter_unknown().await?;
+            }
 
             // check cancel status
             if self.cancel_token.is_cancelled() {
@@ -781,14 +882,36 @@ impl ErasureSetHealer {
 
                 if should_skip_new_version(item.mod_time_unix_nanos, started_at_secs) {
                     checkpoint_manager.add_processed_object(key).await?;
-                    *processed_objects = processed_objects.saturating_add(1);
+                    let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_new_versions_total").increment(1);
-                    {
+                    let (skipped_new, skipped_ilm, counter_unknown) = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_new_version();
                         progress.set_current_object(Some(format!("skipped_new: {bucket}/{}", item.name)));
-                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                        progress.update_object_progress(
+                            *processed_objects,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                        );
+                        if !counter_ok {
+                            progress.mark_unknown();
+                        }
+                        (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
+                    };
+                    if !counter_ok || counter_unknown {
+                        checkpoint_manager.mark_counter_unknown().await?;
+                    }
+                    checkpoint_manager
+                        .set_skipped_version_counts(skipped_new, skipped_ilm)
+                        .await?;
+                    checkpoint_manager
+                        .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                        .await?;
+                    if !counter_ok || counter_unknown {
+                        resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
                         target: "rustfs::heal::erasure_healer",
@@ -821,14 +944,36 @@ impl ErasureSetHealer {
                         .await?
                 {
                     checkpoint_manager.add_processed_object(key).await?;
-                    *processed_objects = processed_objects.saturating_add(1);
+                    let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_ilm_expired_total").increment(1);
-                    {
+                    let (skipped_new, skipped_ilm, counter_unknown) = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_ilm_expired();
                         progress.set_current_object(Some(format!("skipped_ilm: {bucket}/{}", item.name)));
-                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                        progress.update_object_progress(
+                            *processed_objects,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                        );
+                        if !counter_ok {
+                            progress.mark_unknown();
+                        }
+                        (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
+                    };
+                    if !counter_ok || counter_unknown {
+                        checkpoint_manager.mark_counter_unknown().await?;
+                    }
+                    checkpoint_manager
+                        .set_skipped_version_counts(skipped_new, skipped_ilm)
+                        .await?;
+                    checkpoint_manager
+                        .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                        .await?;
+                    if !counter_ok || counter_unknown {
+                        resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
                         target: "rustfs::heal::erasure_healer",
@@ -954,10 +1099,11 @@ impl ErasureSetHealer {
 
             while let Some((key, object, version_id, result)) = page_tasks.next().await {
                 let (object_size, result) = result;
+                let mut telemetry_unknown = false;
                 match result {
                     Ok(true) => {
-                        *successful_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
+                        telemetry_unknown |= !increment_counter(successful_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         checkpoint_manager.add_processed_object(key).await?;
                         debug!(
                             target: "rustfs::heal::erasure_healer",
@@ -974,8 +1120,8 @@ impl ErasureSetHealer {
                     }
                     Ok(false) => {
                         checkpoint_manager.add_processed_object(key).await?;
-                        *successful_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
+                        telemetry_unknown |= !increment_counter(successful_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -991,8 +1137,8 @@ impl ErasureSetHealer {
                     }
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(Error::TransientSkip { message }) => {
-                        *skipped_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
+                        telemetry_unknown |= !increment_counter(skipped_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         checkpoint_manager.add_skipped_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -1008,8 +1154,8 @@ impl ErasureSetHealer {
                         });
                     }
                     Err(err) => {
-                        *failed_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
+                        telemetry_unknown |= !increment_counter(failed_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         checkpoint_manager.add_failed_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -1026,12 +1172,31 @@ impl ErasureSetHealer {
                     }
                 }
 
-                *processed_objects += 1;
+                telemetry_unknown |= !increment_counter(processed_objects);
                 completed_in_page += 1;
-                {
+                let progress_unknown = {
                     let mut progress = self.progress.write().await;
                     progress.set_current_object(Some(format!("{bucket}/{object}")));
-                    progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                    progress.update_object_progress(
+                        *processed_objects,
+                        *successful_objects,
+                        *failed_objects,
+                        *skipped_objects,
+                        bytes_processed,
+                    );
+                    if telemetry_unknown {
+                        progress.mark_unknown();
+                    }
+                    progress.counter_unknown
+                };
+                if telemetry_unknown || progress_unknown {
+                    checkpoint_manager.mark_counter_unknown().await?;
+                }
+                checkpoint_manager
+                    .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                    .await?;
+                if telemetry_unknown || progress_unknown {
+                    resume_manager.mark_counter_unknown().await?;
                 }
 
                 if completed_in_page.is_multiple_of(100) {
@@ -1083,10 +1248,66 @@ impl ErasureSetHealer {
     /// initialize progress tracking
     async fn initialize_progress(&self, _buckets: &[String], state: &crate::heal::resume::ResumeState) {
         let mut progress = self.progress.write().await;
-        progress.objects_scanned = state.total_objects;
+        let existing_baseline = (
+            progress.objects_total_count,
+            progress.objects_total_size,
+            progress.baseline_generation,
+            progress.progress_state,
+            progress.baseline_known,
+        );
+        let baseline_generation_mismatch =
+            state.baseline_known && existing_baseline.4 && state.baseline_generation != existing_baseline.2;
+        let use_persisted_baseline = state.baseline_known && !baseline_generation_mismatch;
+        progress.objects_scanned = state.processed_objects;
         progress.objects_healed = state.successful_objects;
         progress.objects_failed = state.failed_objects;
-        progress.bytes_processed = 0; // Resume state tracks object counts, not byte counters.
+        progress.skipped_objects = state.skipped_objects;
+        progress.skipped_new_versions = state.skipped_new_versions;
+        progress.skipped_ilm_expired = state.skipped_ilm_expired;
+        progress.bytes_processed = state.processed_bytes;
+        progress.counter_unknown = state.counter_unknown;
+        if use_persisted_baseline
+            || existing_baseline.0 > 0
+            || existing_baseline.1 > 0
+            || existing_baseline.2.is_some()
+            || existing_baseline.4
+        {
+            progress.objects_total_count = if use_persisted_baseline {
+                state.total_objects
+            } else {
+                existing_baseline.0
+            };
+            progress.objects_total_size = if use_persisted_baseline {
+                state.total_bytes
+            } else {
+                existing_baseline.1
+            };
+            progress.baseline_generation = if use_persisted_baseline {
+                state.baseline_generation
+            } else {
+                existing_baseline.2
+            };
+            progress.baseline_known = use_persisted_baseline
+                || existing_baseline.0 > 0
+                || existing_baseline.1 > 0
+                || existing_baseline.2.is_some()
+                || existing_baseline.4;
+        }
+        progress.progress_state = if use_persisted_baseline
+            || existing_baseline.0 > 0
+            || existing_baseline.1 > 0
+            || existing_baseline.2.is_some()
+            || existing_baseline.4
+        {
+            crate::heal::progress::HealProgressState::Running
+        } else {
+            crate::heal::progress::HealProgressState::Indeterminate
+        };
+        if baseline_generation_mismatch || state.counter_unknown {
+            progress.mark_unknown();
+        }
+        progress.ledger_complete = false;
+        progress.refresh_progress_percentage();
         progress.start_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.start_time));
         progress.last_update_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.last_update));
         progress.set_current_object(state.current_object.clone());

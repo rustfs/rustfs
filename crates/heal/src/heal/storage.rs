@@ -19,6 +19,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -34,6 +36,9 @@ pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 pub struct HealBucketUsageBaseline {
     pub objects_count: u64,
     pub bytes: u64,
+    /// Stable identity of the validated usage snapshot and selected scope.
+    /// `None` is retained for test/legacy providers that cannot expose one.
+    pub generation: Option<u64>,
 }
 
 pub struct HealLifecycleExpiryContext {
@@ -785,10 +790,29 @@ impl HealStorageAPI for ECStoreHealStorage {
         let mut baseline = HealBucketUsageBaseline::default();
         for bucket in buckets {
             if let Some(usage) = info.buckets_usage.get(bucket) {
-                baseline.objects_count = baseline.objects_count.saturating_add(usage.objects_count);
-                baseline.bytes = baseline.bytes.saturating_add(usage.size);
+                baseline.objects_count = match baseline.objects_count.checked_add(usage.objects_count) {
+                    Some(total) => total,
+                    // A corrupt/overflowing usage snapshot is not a usable
+                    // denominator.  Leave progress indeterminate instead of
+                    // turning saturation into a plausible percentage.
+                    None => return Ok(None),
+                };
+                baseline.bytes = match baseline.bytes.checked_add(usage.size) {
+                    Some(total) => total,
+                    None => return Ok(None),
+                };
             }
         }
+
+        let identity = info.snapshot_identity();
+        let mut hasher = DefaultHasher::new();
+        identity.last_update.hash(&mut hasher);
+        identity.scanner_cycle.hash(&mut hasher);
+        identity.scanner_epoch.hash(&mut hasher);
+        let mut scope = buckets.to_vec();
+        scope.sort_unstable();
+        scope.hash(&mut hasher);
+        baseline.generation = Some(hasher.finish());
 
         Ok(Some(baseline))
     }
