@@ -1787,6 +1787,24 @@ async fn checkpoint_integrity_survives_missing_legacy_sidecar() {
 }
 
 #[tokio::test]
+async fn checkpoint_integrity_survives_multi_object_reload() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+    for index in 0..32 {
+        manager.add_processed_object(format!("processed-{index}")).await.unwrap();
+        manager.add_failed_object(format!("failed-{index}")).await.unwrap();
+        manager.add_skipped_object(format!("skipped-{index}")).await.unwrap();
+    }
+    manager.update_position(2, 9).await.unwrap();
+
+    CheckpointManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("a healthy multi-object checkpoint must survive reload");
+    temp_dir.close().unwrap();
+}
+
+#[tokio::test]
 async fn new_checkpoint_manager_rebuilds_an_empty_snapshot() {
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();

@@ -615,7 +615,18 @@ impl CheckpointManager {
     fn serialize_without_digest(checkpoint: &ResumeCheckpoint) -> Result<Vec<u8>> {
         let mut unsigned = checkpoint.clone();
         unsigned.integrity_digest = None;
-        serde_json::to_vec(&unsigned).map_err(|e| Error::TaskExecutionFailed {
+        let mut value = serde_json::to_value(&unsigned).map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to serialize checkpoint: {e}"),
+        })?;
+        for field in ["processed_objects", "failed_objects", "skipped_objects"] {
+            let Some(values) = value.get_mut(field).and_then(serde_json::Value::as_array_mut) else {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to canonicalize checkpoint field: {field}"),
+                });
+            };
+            values.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+        }
+        serde_json::to_vec(&value).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to serialize checkpoint: {e}"),
         })
     }
