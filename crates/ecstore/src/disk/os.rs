@@ -1093,7 +1093,7 @@ static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
-        .worker_threads(2)
+        .worker_threads(num_cpus::get().min(8))
         .max_blocking_threads(threads)
         .thread_name("rustfs-fsync")
         .thread_stack_size(512 * 1024)
