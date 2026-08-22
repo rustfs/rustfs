@@ -14,7 +14,7 @@
 
 //! E2E tests for group management (fixes #2028).
 
-use crate::common::{RustFSTestEnvironment, admin_request, awscurl_delete, awscurl_get, awscurl_put, init_logging};
+use crate::common::{RustFSTestEnvironment, admin_ok, admin_request, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::{Client, Config};
 use tracing::info;
@@ -83,7 +83,6 @@ async fn update_group_members_rejects_invalid_new_group_names() -> Result<(), Bo
 
 /// Test that deleting a group with members fails, and deleting an empty group succeeds.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -91,29 +90,58 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
     env.start_rustfs_server(vec![]).await?;
 
     // 1. Create a user
-    let add_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey=testuser1", env.url);
     let user_body = serde_json::json!({
         "secretKey": "testuser1secret",
         "status": "enabled"
     });
-    awscurl_put(&add_user_url, &user_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/add-user?accessKey=testuser1",
+        Some(user_body.to_string()),
+    )
+    .await?;
     info!("Created testuser1");
 
     // 2. Create a group with testuser1 as a member
-    let update_members_url = format!("{}/rustfs/admin/v3/update-group-members", env.url);
     let add_member_body = serde_json::json!({
         "group": "testgroup",
         "members": ["testuser1"],
         "isRemove": false,
         "groupStatus": "enabled"
     });
-    awscurl_put(&update_members_url, &add_member_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/update-group-members",
+        Some(add_member_body.to_string()),
+    )
+    .await?;
     info!("Added testuser1 to testgroup");
 
     // 3. Attempt to delete the group while it still has members — should fail
-    let delete_group_url = format!("{}/rustfs/admin/v3/group/testgroup", env.url);
-    let delete_result = awscurl_delete(&delete_group_url, &env.access_key, &env.secret_key).await;
-    assert!(delete_result.is_err(), "deleting a non-empty group should fail");
+    let (delete_status, delete_body) = admin_request(
+        &env.url,
+        http::Method::DELETE,
+        "/rustfs/admin/v3/group/testgroup",
+        None,
+        &env.access_key,
+        &env.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "deleting a non-empty group must return HTTP 400, body: {delete_body}"
+    );
+    assert!(
+        delete_body.contains("<Code>InvalidRequest</Code>"),
+        "deleting a non-empty group must return InvalidRequest, body: {delete_body}"
+    );
+    assert!(
+        delete_body.contains("<Message>group is not empty</Message>"),
+        "deleting a non-empty group returned an unexpected message: {delete_body}"
+    );
     info!("Delete of non-empty group correctly rejected");
 
     // 4. Remove the member from the group
@@ -123,17 +151,42 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
         "isRemove": true,
         "groupStatus": "enabled"
     });
-    awscurl_put(&update_members_url, &remove_member_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/update-group-members",
+        Some(remove_member_body.to_string()),
+    )
+    .await?;
     info!("Removed testuser1 from testgroup");
 
     // 5. Delete the now-empty group — should succeed
-    awscurl_delete(&delete_group_url, &env.access_key, &env.secret_key).await?;
+    admin_ok(&env, http::Method::DELETE, "/rustfs/admin/v3/group/testgroup", None).await?;
     info!("Deleted empty testgroup successfully");
 
     // 6. Verify the group no longer exists
-    let get_group_url = format!("{}/rustfs/admin/v3/group?group=testgroup", env.url);
-    let get_result = awscurl_get(&get_group_url, &env.access_key, &env.secret_key).await;
-    assert!(get_result.is_err(), "group should no longer exist after deletion");
+    let (get_status, get_body) = admin_request(
+        &env.url,
+        http::Method::GET,
+        "/rustfs/admin/v3/group?group=testgroup",
+        None,
+        &env.access_key,
+        &env.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        get_status,
+        reqwest::StatusCode::NOT_FOUND,
+        "a deleted group must return HTTP 404, body: {get_body}"
+    );
+    assert!(
+        get_body.contains("<Code>NoSuchResource</Code>"),
+        "a deleted group must return NoSuchResource, body: {get_body}"
+    );
+    assert!(
+        get_body.contains("<Message>group 'testgroup' does not exist</Message>"),
+        "a deleted group returned an unexpected message: {get_body}"
+    );
     info!("Confirmed testgroup no longer exists");
 
     Ok(())
@@ -142,7 +195,6 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
 /// Test that a user with only group membership (no explicit user policy) gets group policies
 /// and can perform actions allowed by the group (regression test for #2028.1).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -163,36 +215,53 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
             "Resource": ["*"]
         }]
     });
-    let add_policy_url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
-    awscurl_put(&add_policy_url, &policy_doc.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-canned-policy?name={policy_name}"),
+        Some(policy_doc.to_string()),
+    )
+    .await?;
     info!("Created canned policy {}", policy_name);
 
     // 2. Create user with no explicit policy
-    let add_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, user_name);
     let user_body = serde_json::json!({
         "secretKey": user_secret,
         "status": "enabled"
     });
-    awscurl_put(&add_user_url, &user_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={user_name}"),
+        Some(user_body.to_string()),
+    )
+    .await?;
     info!("Created user {} with no explicit policy", user_name);
 
     // 3. Add user to group (creates group with this member; user_group_memberships must be updated)
-    let update_members_url = format!("{}/rustfs/admin/v3/update-group-members", env.url);
     let add_member_body = serde_json::json!({
         "group": group_name,
         "members": [user_name],
         "isRemove": false,
         "groupStatus": "enabled"
     });
-    awscurl_put(&update_members_url, &add_member_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/update-group-members",
+        Some(add_member_body.to_string()),
+    )
+    .await?;
     info!("Added {} to group {}", user_name, group_name);
 
     // 4. Attach policy to group
-    let set_policy_url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=true",
-        env.url, policy_name, group_name
-    );
-    awscurl_put(&set_policy_url, "", &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/set-user-or-group-policy?policyName={policy_name}&userOrGroup={group_name}&isGroup=true"),
+        Some(String::new()),
+    )
+    .await?;
     info!("Attached policy {} to group {}", policy_name, group_name);
 
     // 5. User with only group (no user policy) should be able to list buckets
@@ -209,7 +278,6 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
 /// Test that after deleting a user who was the only member of a group, the group can be deleted
 /// (regression test for #2028.2: delete group uses backend membership, not stale cache).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires awscurl and spawns a real RustFS server"]
 async fn test_delete_group_after_deleting_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -221,33 +289,47 @@ async fn test_delete_group_after_deleting_user() -> Result<(), Box<dyn std::erro
     let group_name = "soledeletegroup";
 
     // 1. Create user
-    let add_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, user_name);
     let user_body = serde_json::json!({
         "secretKey": user_secret,
         "status": "enabled"
     });
-    awscurl_put(&add_user_url, &user_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={user_name}"),
+        Some(user_body.to_string()),
+    )
+    .await?;
     info!("Created user {}", user_name);
 
     // 2. Add user to group
-    let update_members_url = format!("{}/rustfs/admin/v3/update-group-members", env.url);
     let add_member_body = serde_json::json!({
         "group": group_name,
         "members": [user_name],
         "isRemove": false,
         "groupStatus": "enabled"
     });
-    awscurl_put(&update_members_url, &add_member_body.to_string(), &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::PUT,
+        "/rustfs/admin/v3/update-group-members",
+        Some(add_member_body.to_string()),
+    )
+    .await?;
     info!("Added {} to group {}", user_name, group_name);
 
     // 3. Delete the user (backend and cache update so group membership becomes empty)
-    let remove_user_url = format!("{}/rustfs/admin/v3/remove-user?accessKey={}", env.url, user_name);
-    awscurl_delete(&remove_user_url, &env.access_key, &env.secret_key).await?;
+    admin_ok(
+        &env,
+        http::Method::DELETE,
+        &format!("/rustfs/admin/v3/remove-user?accessKey={user_name}"),
+        None,
+    )
+    .await?;
     info!("Deleted user {}", user_name);
 
     // 4. Deleting the group should succeed (backend has empty members; no stale cache)
-    let delete_group_url = format!("{}/rustfs/admin/v3/group/{}", env.url, group_name);
-    awscurl_delete(&delete_group_url, &env.access_key, &env.secret_key).await?;
+    admin_ok(&env, http::Method::DELETE, &format!("/rustfs/admin/v3/group/{group_name}"), None).await?;
     info!("Deleted group {} after user was removed", group_name);
 
     Ok(())

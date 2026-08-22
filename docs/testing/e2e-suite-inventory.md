@@ -52,7 +52,7 @@
 | fault_proxy | 7 |  |
 | get_codec_streaming_compat_test | 1 |  |
 | get_stream_failure_observability_test | 1 |  |
-| group_delete_test | 1 |  |
+| group_delete_test | 4 |  |
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
 | heal_erasure_disk_rebuild_test | 4 | 🌙 |
@@ -99,4 +99,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 575 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 453 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 578 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 456 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
