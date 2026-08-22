@@ -58,8 +58,13 @@ rg -qx 'evidence_mode=dry-run' "$OUT_DIR/manifest.env"
 rg -qx 'formal_evidence=false' "$OUT_DIR/manifest.env"
 rg -qx 'performance_conclusion=not_measured_dry_run' "$OUT_DIR/manifest.env"
 rg -qx 'bucket_isolation=per-leg' "$OUT_DIR/manifest.env"
-rg -qx 'dataset_setup=get-and-mixed-via-warp-put' "$OUT_DIR/manifest.env"
-[[ "$(rg -c -- '--extra-args --noclear' "$TRACE_FILE")" == "64" ]]
+rg -qx 'dataset_setup=get-and-mixed-via-bounded-warp-native' "$OUT_DIR/manifest.env"
+rg -qx 'dataset_objects=64' "$OUT_DIR/manifest.env"
+[[ "$(rg -c -- '--extra-args --objects\\ 64\\ --noclear' "$TRACE_FILE")" == "32" ]]
+if rg -q -- 'dataset-setup' "$TRACE_FILE"; then
+  echo "unexpected redundant dataset setup command" >&2
+  exit 1
+fi
 ! rg -q -- 'rustfs-bench' "$TRACE_FILE"
 
 if "$RUNNER" \
