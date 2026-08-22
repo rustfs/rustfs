@@ -17,6 +17,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -24,6 +25,9 @@ import tomllib
 from pathlib import Path
 
 from coverage_per_crate import fmt_pct, load_coverage
+
+
+SECURITY_CRATES = ("crates/iam", "crates/kms", "crates/policy", "crates/crypto")
 
 
 def load_baselines(path: str) -> tuple[float, dict[str, tuple[int, int]]]:
@@ -34,8 +38,8 @@ def load_baselines(path: str) -> tuple[float, dict[str, tuple[int, int]]]:
         raise ValueError("coverage baseline phase must be report-only")
 
     allowed_drop = float(config["allowed_drop_percentage_points"])
-    if allowed_drop < 0:
-        raise ValueError("allowed_drop_percentage_points must be non-negative")
+    if not math.isfinite(allowed_drop) or allowed_drop < 0:
+        raise ValueError("allowed_drop_percentage_points must be finite and non-negative")
 
     baselines: dict[str, tuple[int, int]] = {}
     for crate, values in config["crates"].items():
@@ -44,8 +48,10 @@ def load_baselines(path: str) -> tuple[float, dict[str, tuple[int, int]]]:
         if covered < 0 or count <= 0 or covered > count:
             raise ValueError(f"invalid baseline for {crate}: {covered}/{count}")
         baselines[crate] = (covered, count)
-    if not baselines:
-        raise ValueError("coverage baseline has no crates")
+    missing = [crate for crate in SECURITY_CRATES if crate not in baselines]
+    unexpected = sorted(set(baselines).difference(SECURITY_CRATES))
+    if missing or unexpected:
+        raise ValueError(f"coverage baseline crate set mismatch: missing={missing}, unexpected={unexpected}")
     return allowed_drop, baselines
 
 
@@ -105,16 +111,23 @@ def self_test() -> None:
                                     "filename": str(root / "crates/kms/src/lib.rs"),
                                     "summary": {"lines": {"covered": 90, "count": 100}},
                                 },
+                                {
+                                    "filename": str(root / "crates/policy/src/lib.rs"),
+                                    "summary": {"lines": {"covered": 90, "count": 100}},
+                                },
+                                {
+                                    "filename": str(root / "crates/crypto/src/lib.rs"),
+                                    "summary": {"lines": {"covered": 90, "count": 100}},
+                                },
                             ],
-                            "totals": {"lines": {"covered": 170, "count": 200}},
+                            "totals": {"lines": {"covered": 350, "count": 400}},
                         }
                     ]
                 }
             ),
             encoding="utf-8",
         )
-        baseline.write_text(
-            """phase = "report-only"
+        baseline_text = """phase = "report-only"
 allowed_drop_percentage_points = 1.0
 [crates."crates/iam"]
 covered = 90
@@ -122,13 +135,18 @@ count = 100
 [crates."crates/kms"]
 covered = 85
 count = 100
-""",
-            encoding="utf-8",
-        )
+[crates."crates/policy"]
+covered = 90
+count = 100
+[crates."crates/crypto"]
+covered = 90
+count = 100
+"""
+        baseline.write_text(baseline_text, encoding="utf-8")
         current, _ = load_coverage(str(coverage), str(root))
         allowed_drop, baselines = load_baselines(str(baseline))
         rows = compare(current, baselines, allowed_drop)
-        assert [row[-1] for row in rows] == [True, False]
+        assert [row[-1] for row in rows] == [True, False, False, False]
         try:
             compare({"crates/iam": current["crates/iam"]}, baselines, allowed_drop)
         except ValueError as error:
@@ -141,6 +159,30 @@ count = 100
             assert str(error) == "invalid coverage for crates/iam: 101/100"
         else:
             raise AssertionError("invalid coverage must fail closed")
+        for invalid_threshold in ("nan", "inf", "-inf"):
+            baseline.write_text(
+                baseline_text.replace("allowed_drop_percentage_points = 1.0", f"allowed_drop_percentage_points = {invalid_threshold}"),
+                encoding="utf-8",
+            )
+            try:
+                load_baselines(str(baseline))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"non-finite threshold {invalid_threshold} must fail closed")
+        baseline.write_text(
+            baseline_text.replace(
+                '[crates."crates/crypto"]\ncovered = 90\ncount = 100\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_baselines(str(baseline))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("missing security-crate baseline must fail closed")
 
 
 def main() -> int:
