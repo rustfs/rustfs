@@ -67,7 +67,7 @@ impl ResumeUtils {
                 // Extract task ID from filename: {task_id}_ahm_resume_state.json
                 if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}"))
                     && validate_resume_task_id(task_id).is_ok()
-                    && CheckpointManager::is_resumable(disk, task_id).await
+                    && CheckpointManager::is_resumable(disk, task_id).await?
                 {
                     task_ids.push(task_id.to_string());
                 }

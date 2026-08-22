@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::{Error, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,7 @@ use super::{
 };
 
 const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
+const RESUME_CHECKPOINT_DIGEST_FILE: &str = "ahm_checkpoint.sha256";
 
 /// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
 /// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
@@ -145,19 +148,22 @@ impl CheckpointManager {
 
     /// Validate the checkpoint while enumerating resumable state. This reads
     /// the checkpoint once and also isolates malformed or unsupported data.
-    pub(crate) async fn is_resumable(disk: &DiskStore, task_id: &str) -> bool {
-        if validate_resume_task_id(task_id).is_err() || Self::is_blocked(disk, task_id).await {
-            return false;
+    pub(crate) async fn is_resumable(disk: &DiskStore, task_id: &str) -> Result<bool> {
+        validate_resume_task_id(task_id)?;
+        if Self::is_blocked(disk, task_id).await {
+            return Err(Error::InvalidCheckpoint(format!("Resume task {task_id} has a blocked checkpoint")));
         }
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
         let Ok(path) = path_to_str(&file_path) else {
-            return false;
+            return Err(Error::InvalidCheckpoint("Resume checkpoint path is not valid UTF-8".to_string()));
         };
         match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
-            Ok(bytes) if bytes.is_empty() => true,
-            Ok(bytes) => Self::load_from_data(disk.clone(), task_id, bytes.to_vec()).await.is_ok(),
-            Err(crate::heal::DiskError::FileNotFound) => true,
-            Err(_) => false,
+            Ok(bytes) if bytes.is_empty() => Ok(true),
+            Ok(bytes) => Self::load_from_data(disk.clone(), task_id, bytes.to_vec())
+                .await
+                .map(|_| true),
+            Err(crate::heal::DiskError::FileNotFound) => Ok(true),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -399,6 +405,7 @@ impl CheckpointManager {
 
         let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
         delete_resume_file(&self.disk, &checkpoint_file).await?;
+        delete_resume_file(&self.disk, &Self::digest_path(&task_id)).await?;
         delete_resume_file(&self.disk, &Self::blocked_path(&task_id)).await?;
 
         debug!(
@@ -531,6 +538,19 @@ impl CheckpointManager {
             }
         }
 
+        let digest_path = Self::digest_path(&checkpoint.task_id);
+        let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(checkpoint_data.as_ref()));
+        HealDiskExt::write_all(
+            self.disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            path_to_str(&digest_path)?,
+            EcstoreDiskBytes::from(digest.into_bytes()),
+        )
+        .await
+        .map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to save checkpoint digest: {e}"),
+        })?;
+
         let mut last_saved = self.last_saved.lock().map_err(|_| Error::TaskExecutionFailed {
             message: "Checkpoint save state lock is poisoned after save".to_string(),
         })?;
@@ -554,11 +574,35 @@ impl CheckpointManager {
         let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
 
         let path_str = path_to_str(&file_path)?;
-        HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path_str)
+        let checkpoint = HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path_str)
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to read checkpoint file: {e}"),
-            })
+            })?;
+        let digest_path = Self::digest_path(task_id);
+        let digest_path = path_to_str(&digest_path)?;
+        match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, digest_path).await {
+            Ok(expected) => {
+                let actual = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&checkpoint));
+                if expected.as_ref() != actual.as_bytes() {
+                    Self::block_invalid_snapshot(disk, task_id).await;
+                    return Err(Error::InvalidCheckpoint(format!(
+                        "Resume checkpoint digest does not match task {task_id}"
+                    )));
+                }
+            }
+            Err(crate::heal::DiskError::FileNotFound) => {}
+            Err(error) => {
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to read checkpoint digest: {error}"),
+                });
+            }
+        }
+        Ok(checkpoint)
+    }
+
+    fn digest_path(task_id: &str) -> std::path::PathBuf {
+        Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_DIGEST_FILE}"))
     }
 }
