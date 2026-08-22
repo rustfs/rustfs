@@ -6886,6 +6886,10 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 
 #[cfg(test)]
 mod pools_tests {
+    use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
+    use super::record_decommission_entry_error;
+    use super::resolve_decommission_listing_error;
+    use super::resolve_decommission_partial_listing_entry;
     use super::{
         DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_META_PREFIXES, DECOMMISSION_PROGRESS_SAVE_INTERVAL,
         DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionDurableIlmReceipt, DecommissionStartPoolState,
