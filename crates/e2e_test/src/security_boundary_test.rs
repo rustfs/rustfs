@@ -17,14 +17,14 @@
 //! These tests verify that RustFS properly enforces security-sensitive
 //! controls by issuing real requests against a running server and asserting
 //! the concrete outcome of each control:
-//! - DoS protection (oversized tagging payloads, excessive multipart parts)
+//! - DoS protection (oversized tagging payloads, out-of-range multipart part numbers)
 //! - SSRF prevention (internal/private endpoints rejected for tiering)
 //! - Race condition handling (concurrent writes converge without corruption)
 
 use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_put, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Tag, Tagging};
+use aws_sdk_s3::types::{Tag, Tagging};
 use std::error::Error;
 use tracing::info;
 
@@ -88,9 +88,9 @@ async fn test_large_xml_body_rejection() -> Result<(), Box<dyn Error + Send + Sy
     Ok(())
 }
 
-/// Excessive multipart parts must be rejected.
+/// Multipart part numbers above the S3 limit must be rejected.
 #[tokio::test]
-async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_multipart_part_number_above_limit() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
@@ -108,18 +108,23 @@ async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + S
 
     let upload_id = create_result.upload_id().expect("upload_id should be present").to_string();
 
-    // Try to complete with too many parts (should be rejected).
-    let mut parts = Vec::new();
-    for i in 1..=10001 {
-        parts.push(CompletedPart::builder().part_number(i).e_tag(format!("etag-{i}")).build());
-    }
-
-    let result = client
-        .complete_multipart_upload()
+    client
+        .upload_part()
         .bucket(&bucket_name)
         .key("test-large")
         .upload_id(&upload_id)
-        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(parts)).build())
+        .part_number(10000)
+        .body(ByteStream::from_static(b"upper-bound part"))
+        .send()
+        .await?;
+
+    let result = client
+        .upload_part()
+        .bucket(&bucket_name)
+        .key("test-large")
+        .upload_id(&upload_id)
+        .part_number(10001)
+        .body(ByteStream::from_static(b"out-of-range part"))
         .send()
         .await;
 
@@ -133,7 +138,13 @@ async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + S
         .await;
     let _ = client.delete_bucket().bucket(&bucket_name).send().await;
 
-    assert!(result.is_err(), "Server should reject excessive multipart parts");
+    let err = result.expect_err("server must reject excessive multipart parts");
+    let code = err.as_service_error().and_then(ProvideErrorMetadata::code);
+    assert_eq!(
+        code,
+        Some("InvalidArgument"),
+        "Part number 10001 should be rejected with InvalidArgument, got code {code:?}, err: {err:?}"
+    );
 
     env.stop_server();
     Ok(())
