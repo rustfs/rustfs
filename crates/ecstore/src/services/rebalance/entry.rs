@@ -322,7 +322,16 @@ impl ECStore {
                 if let Some(signal) = delete_marker_lock_lost_signal.as_ref() {
                     opts.add_namespace_lock_lost_signal(Arc::clone(signal));
                 }
-                async move { store.delete_object(&bucket, &object, opts).await }
+                async move {
+                    // Keep the full delete path on a fresh poll stack while retaining abort-on-drop cancellation.
+                    let mut deletion = tokio::task::JoinSet::new();
+                    deletion.spawn(async move { store.delete_object(&bucket, &object, opts).await });
+                    deletion
+                        .join_next()
+                        .await
+                        .ok_or_else(|| Error::other("rebalance delete-marker task was not started"))?
+                        .map_err(|err| Error::other(format!("rebalance delete-marker task join error: {err}")))?
+                }
             };
             run_guard.ensure_held("rebalance version migration")?;
             let result = migrate_entry_version(
@@ -786,7 +795,7 @@ impl ECStore {
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(feature = "test-util")]
 pub mod test_util {
     use super::super::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use super::*;
@@ -941,6 +950,7 @@ mod tests {
         DeleteObjectCommitBarrier, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
         TieredMetadataCommitBarrier,
     };
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
@@ -971,6 +981,21 @@ mod tests {
                 RebalanceStats::default(),
             ],
             ..Default::default()
+        }
+    }
+
+    async fn prepare_rebalance_test_volumes(store: &ECStore) {
+        let opts = MakeBucketOptions {
+            force_create: true,
+            ..Default::default()
+        };
+        for pool in &store.pools {
+            pool.make_bucket(crate::disk::RUSTFS_META_BUCKET, &opts)
+                .await
+                .expect("rebalance test metadata volume should exist on every set");
+            pool.make_bucket(crate::disk::RUSTFS_META_MULTIPART_BUCKET, &opts)
+                .await
+                .expect("rebalance test multipart volume should exist on every set");
         }
     }
 
@@ -1327,6 +1352,7 @@ mod tests {
         let bucket = crate::disk::RUSTFS_META_BUCKET;
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        prepare_rebalance_test_volumes(store.as_ref()).await;
         for (object, pause, staged_commit) in [
             (
                 "rebalance-multipart-new-upload-fence",
@@ -1416,6 +1442,7 @@ mod tests {
         let object = "rebalance-tiered-commit-fence-object";
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        prepare_rebalance_test_volumes(store.as_ref()).await;
         let source_set = store.pools[0].get_disks_by_key(object);
         let target_set = store.pools[1].get_disks_by_key(object);
         let version_id = uuid::Uuid::new_v4();
@@ -1497,6 +1524,7 @@ mod tests {
         let object = "rebalance-delete-marker-commit-fence-object";
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        prepare_rebalance_test_volumes(store.as_ref()).await;
         let source_set = store.pools[0].get_disks_by_key(object);
         let target_set = store.pools[1].get_disks_by_key(object);
         let mut reader = PutObjReader::from_vec(b"source version beneath delete marker".to_vec());
@@ -1569,6 +1597,7 @@ mod tests {
         let object = "rebalance-lifecycle-mutation-fence-object";
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        prepare_rebalance_test_volumes(store.as_ref()).await;
         let source_set = store.pools[0].get_disks_by_key(object);
         source_set
             .delete_object(
@@ -1619,6 +1648,7 @@ mod tests {
         let object = "rebalance-source-cleanup-fence-object";
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+        prepare_rebalance_test_volumes(store.as_ref()).await;
         let source_set = store.pools[0].get_disks_by_key(object);
         source_set
             .delete_object(
