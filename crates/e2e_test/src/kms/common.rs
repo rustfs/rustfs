@@ -206,8 +206,18 @@ async fn wait_for_kms_ready_with_timeout(
     loop {
         match tokio::time::timeout_at(deadline, get_kms_status(base_url, access_key, secret_key)).await {
             Ok(Ok(status)) => {
-                info!("KMS is ready (status: {})", status);
-                return Ok(());
+                let backend_status = serde_json::from_str::<serde_json::Value>(&status)
+                    .ok()
+                    .and_then(|value| value.get("backend_status")?.as_str().map(str::to_owned));
+                if backend_status.as_deref() == Some("healthy") {
+                    info!("KMS is ready (status: {})", status);
+                    return Ok(());
+                }
+                warn!(
+                    backend_status = backend_status.as_deref().unwrap_or("missing"),
+                    elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "KMS not ready yet, retrying…"
+                );
             }
             Ok(Err(e)) => {
                 let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -227,10 +237,52 @@ async fn wait_for_kms_ready_with_timeout(
 
 #[cfg(test)]
 mod readiness_tests {
-    use super::wait_for_kms_ready_with_timeout;
+    use super::{wait_for_kms_ready, wait_for_kms_ready_with_timeout};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn kms_readiness_retries_http_success_until_backend_is_healthy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for backend_status in ["error", "healthy"] {
+                let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("read readiness request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                server_requests.fetch_add(1, Ordering::SeqCst);
+
+                let body = format!(r#"{{"backend_status":"{backend_status}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.expect("write readiness response");
+            }
+        });
+
+        wait_for_kms_ready(&format!("http://{address}"), "access-key", "secret-key")
+            .await
+            .expect("KMS should become ready after the healthy response");
+
+        let observed_requests = requests.load(Ordering::SeqCst);
+        server.abort();
+        assert_eq!(observed_requests, 2, "an HTTP 200 unhealthy status must be retried");
+    }
 
     #[tokio::test]
     async fn kms_readiness_deadline_covers_a_stalled_status_request() {
