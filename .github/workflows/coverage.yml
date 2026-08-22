@@ -59,8 +59,9 @@ jobs:
     runs-on: sm-standard-4
     # The instrumented build cannot reuse the regular CI cache (different
     # RUSTFLAGS), so a cold run rebuilds the workspace before running the
-    # full suite; give it double the test job's 60-minute budget.
-    timeout-minutes: 120
+    # full suite. Exact-head run 32573798257 needed 119m42s including reports
+    # and artifact upload, so keep a bounded 30-minute publication margin.
+    timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Match the PR gate's nextest semantics (ci.yml runs `--profile ci`):
