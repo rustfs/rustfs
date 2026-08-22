@@ -3036,6 +3036,8 @@ impl ECStore {
             Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
                 let target_pool_idx = self.get_pool_idx_no_lock(bucket, object, 0).await?;
                 let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+                #[cfg(test)]
+                pause_versioned_delete_marker_after_commit(bucket, object).await;
                 obj.name = decode_dir_object(object);
                 return Ok(obj);
             }
