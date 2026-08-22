@@ -868,7 +868,6 @@ mod tests {
         SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE,
         SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
     };
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::time::Duration;
     use temp_env::{with_var, with_var_unset};
@@ -916,7 +915,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_uses_persisted_values_when_env_is_unset() {
         let config = server_config_with_scanner(&[
             (SCANNER_SPEED, "slow"),
@@ -944,7 +942,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_normalizes_persisted_default_speed() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "default")]);
 
@@ -960,7 +957,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_prefers_env_over_persisted_config() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "slowest"), (SCANNER_CYCLE, "600")]);
 
@@ -977,7 +973,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_prefers_heal_bitrot_cycle_over_scanner_compat_config() {
         let config = server_config_with_scanner_and_heal(&[(SCANNER_BITROT_CYCLE, "3600")], &[(HEAL_BITROT_CYCLE, "off")]);
 
@@ -990,7 +985,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_marks_scanner_bitrot_cycle_as_compat_source() {
         let config = server_config_with_scanner(&[(SCANNER_BITROT_CYCLE, "3600")]);
 
@@ -1007,7 +1001,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_normalizes_persisted_default_bitrot_cycles() {
         let default_cycle = DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string();
         for config in [
@@ -1032,7 +1025,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_validation_rejects_invalid_persisted_speed_with_env_override() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "warp")]);
 
@@ -1066,7 +1058,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_uses_derived_delay_for_excessive_env_override() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "slow")]);
 
@@ -1087,7 +1078,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_reports_value_sources() {
         let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_OBJECTS, "100"), (SCANNER_CACHE_SAVE_TIMEOUT, "5")]);
 
@@ -1108,7 +1098,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn applied_runtime_config_is_the_authoritative_scheduler_state() {
         let config = server_config_with_scanner(&[(SCANNER_CYCLE, "321")]);
 
@@ -1125,7 +1114,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_reports_persisted_pacing_overrides() {
         let config = server_config_with_scanner(&[("delay", "3.5"), ("max_wait", "7")]);
 
@@ -1147,7 +1135,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_prefers_env_pacing_overrides() {
         let config = server_config_with_scanner(&[("delay", "3.5"), ("max_wait", "7")]);
 
@@ -1169,7 +1156,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_preserves_subsecond_max_wait() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "fast")]);
 

@@ -1,11 +1,12 @@
 ---
 name: code-change-verification
-description: Verify code changes by identifying correctness, regression, security, and performance risks from diffs or patches, then produce prioritized findings with file/line evidence and concrete fixes. Use when reviewing commits, PRs, and merged patches before/after release.
+description: Review a commit, PR, or merged patch when the user requests ordinary code-change verification. Do not combine with adversarial-validation; use that skill instead for explicitly adversarial, substantial, or high-risk RustFS reviews.
 ---
 
 # Code Change Verification
 
-Use this skill to review code changes consistently before merge, before release, and during incident follow-up.
+Use this skill for an ordinary requested review. If the root policy or user calls
+for adversarial validation, use `adversarial-validation` instead of running both.
 
 ## Quick Start
 
@@ -79,4 +80,3 @@ Run the full checklist in [rust-code-quality](../rust-code-quality/SKILL.md) —
   - Impact: ...
   - Fix suggestion: ...
   - Validation: ...
-

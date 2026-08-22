@@ -19,7 +19,6 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
@@ -62,7 +61,6 @@ impl VaultKmsTestContext {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_end_to_end") {
@@ -118,7 +116,6 @@ async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_isolation") {
@@ -205,7 +202,6 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_large_file") {
@@ -270,7 +266,6 @@ async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_multipart_upload") {
@@ -301,7 +296,6 @@ async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_operations") {
