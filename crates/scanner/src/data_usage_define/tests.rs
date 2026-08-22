@@ -674,6 +674,34 @@ fn size_summary_actions_accounting_accumulates_tier_stats() {
 }
 
 #[test]
+fn size_summary_unknown_accounting_keeps_physical_tier_and_version_only() {
+    let mut summary = SizeSummary::default();
+    summary
+        .tier_stats
+        .insert(storageclass::STANDARD.to_string(), TierStats::default());
+    let object = ObjectInfo {
+        size: 12,
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        version_id: Some(uuid::Uuid::new_v4()),
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting_unknown(&object);
+
+    assert_eq!(summary.total_size, 0, "unknown logical size must not become zero or physical bytes");
+    assert_eq!(summary.versions, 1);
+    assert_eq!(
+        summary.tier_stats.get(storageclass::STANDARD),
+        Some(&TierStats {
+            total_size: 12,
+            num_versions: 1,
+            num_objects: 1,
+        })
+    );
+}
+
+#[test]
 fn test_data_usage_entry_merge_sums_failed_objects() {
     let mut left = DataUsageEntry {
         failed_objects: 2,
@@ -1079,6 +1107,16 @@ fn data_usage_cache_prepare_for_scan_preserves_pending_heal_only_progress() {
             scan_plan_digest: Some(TEST_PLAN_DIGEST),
             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
             pending_heals: vec![pending_heal.clone()],
+            size_reconciliation: HashMap::from([(
+                "size-key".to_string(),
+                SizeReconciliationEntry {
+                    key: "size-key".to_string(),
+                    bucket: "bucket".to_string(),
+                    object: "prefix/object".to_string(),
+                    reason: "invalid_declared_size".to_string(),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         },
         ..Default::default()
@@ -1088,6 +1126,7 @@ fn data_usage_cache_prepare_for_scan_preserves_pending_heal_only_progress() {
 
     assert_eq!(outcome, DataUsageCachePrepareOutcome::Reused);
     assert_eq!(cache.info.pending_heals, vec![pending_heal]);
+    assert!(cache.info.size_reconciliation.contains_key("size-key"));
     assert!(cache.cache.is_empty());
     assert!(!cache.info.snapshot_complete);
 }
