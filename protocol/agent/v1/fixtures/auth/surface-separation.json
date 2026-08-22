@@ -49,7 +49,7 @@
       "schemeType": "mutualTLS",
       "forbiddenSecuritySchemes": ["sessionCookie"],
       "defaultSecurity": ["agentMutualTls"],
-      "publicOperations": ["getProtocolStatus"]
+      "publicOperations": ["getProtocolStatus", "exchangeRegistrationToken"]
     },
     {
       "document": "openapi/control.json",

@@ -24,7 +24,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _, LineEnding};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -210,6 +210,12 @@ impl DeviceIdentity {
         self.signing_key
             .to_pkcs8_der()
             .map(|der| Zeroizing::new(der.as_bytes().to_vec()))
+            .map_err(|error| IdentityError::MalformedKey(error.to_string()))
+    }
+
+    pub(crate) fn to_pkcs8_pem(&self) -> Result<Zeroizing<String>, IdentityError> {
+        self.signing_key
+            .to_pkcs8_pem(LineEnding::LF)
             .map_err(|error| IdentityError::MalformedKey(error.to_string()))
     }
 

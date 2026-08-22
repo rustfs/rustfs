@@ -2406,7 +2406,7 @@ impl DiskAPI for RemoteDisk {
             return errors;
         }
 
-        // TODO: use Error not string
+        // TODO(backlog): replace string errors with typed `StorageError` variants
 
         let result = self
             .execute_with_timeout(

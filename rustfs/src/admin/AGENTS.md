@@ -25,4 +25,3 @@ Applies to `rustfs/src/admin/`.
 ## Suggested Validation
 
 - Admin handler and routing tests under `rustfs/src/admin/`
-- Full gate before commit: `make pre-commit`

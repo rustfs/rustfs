@@ -55,4 +55,3 @@ shared plugin/runtime primitives from `rustfs-targets`.
   - Focused: `cargo test -p rustfs-notify runtime_facade`
   - Focused: `cargo test -p rustfs-notify runtime_view`
   - Focused: `cargo test -p rustfs-notify config_manager`
-- Full gate before commit: `make pre-commit`
