@@ -289,6 +289,9 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             "always()",
             "github.event_name == 'schedule'",
             "contains(needs.*.result, 'failure')",
+            "issues: write",
+            "uses: ./.github/actions/schedule-failure-issue",
+            "github-token: ${{ secrets.GITHUB_TOKEN }}",
         )
         missing = [token for token in required if token not in job]
         if missing:
@@ -497,6 +500,12 @@ class SelfTests(unittest.TestCase):
                 "  alert-on-failure:\n"
                 "    if: always() && github.event_name == 'schedule' && "
                 "contains(needs.*.result, 'failure')\n"
+                "    permissions:\n"
+                "      issues: write\n"
+                "    steps:\n"
+                "      - uses: ./.github/actions/schedule-failure-issue\n"
+                "        with:\n"
+                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
             )
             names: list[str] = []
             for relative in SCHEDULED_ALERT_WORKFLOWS:
@@ -517,9 +526,17 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(check_scheduled_alerts(root), [])
 
             first = root / SCHEDULED_ALERT_WORKFLOWS[0]
-            first.write_text(first.read_text().replace("contains(needs.*.result, 'failure')", "false"))
-            self.assertEqual(len(check_scheduled_alerts(root)), 1)
-            first.write_text(first.read_text().replace("false", "contains(needs.*.result, 'failure')"))
+            mutations = (
+                ("contains(needs.*.result, 'failure')", "false"),
+                ("issues: write", "issues: read"),
+                ("uses: ./.github/actions/schedule-failure-issue", "uses: actions/checkout@v7"),
+                ("github-token: ${{ secrets.GITHUB_TOKEN }}", "github-token: missing"),
+            )
+            for required, replacement in mutations:
+                original = first.read_text()
+                first.write_text(original.replace(required, replacement))
+                self.assertEqual(len(check_scheduled_alerts(root)), 1)
+                first.write_text(original)
 
             watchdog.write_text(watchdog.read_text().replace(f'- "{names[0]}"\n', ""))
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
