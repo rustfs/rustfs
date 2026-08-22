@@ -4673,7 +4673,7 @@ async fn gather_results(
             entry.name = entry.name.replace("\\", "/");
         }
 
-        // TODO: rx.recv()
+        // TODO(backlog): integrate rx.recv() for incremental listing results
 
         if let Some(marker) = &opts.marker
             && ((!opts.include_marker && &entry.name <= marker) || (opts.include_marker && &entry.name < marker))
@@ -4703,7 +4703,7 @@ async fn gather_results(
             continue;
         }
 
-        // TODO: Lifecycle
+        // TODO(backlog): integrate lifecycle evaluation during object listing
 
         entries.push(Some(entry));
         candidate_entries += 1;

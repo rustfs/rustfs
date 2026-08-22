@@ -2,7 +2,7 @@
   "protocolVersion": "v1",
   "fixtureSet": "auth",
   "fixture": "error-codes",
-  "description": "Frozen ErrorInfo reasons for agent authentication and negotiation. Clients branch on status and reason, never on message.",
+  "description": "Frozen ErrorInfo reasons for agent authentication, negotiation, and credential-rotation authorization. Clients branch on status and reason, never on message.",
   "domain": "rustfs.connect",
   "detailType": "type.googleapis.com/google.rpc.ErrorInfo",
   "disclosureRules": [
@@ -81,6 +81,24 @@
       "httpStatus": 401,
       "status": "UNAUTHENTICATED",
       "meaning": "A browser session cookie was presented to an authenticated agent operation. The agent surface never accepts it."
+    },
+    {
+      "reason": "ROTATION_CREDENTIAL_NOT_CURRENT",
+      "httpStatus": 409,
+      "status": "ABORTED",
+      "meaning": "The authenticated certificate is valid for ordinary agent operations but is not the device's current ACTIVE credential and therefore cannot authorize another rotation."
+    },
+    {
+      "reason": "ROTATION_REQUEST_CONFLICT",
+      "httpStatus": 409,
+      "status": "ABORTED",
+      "meaning": "The requestId already belongs to a rotation with different transcript inputs and cannot be reused."
+    },
+    {
+      "reason": "ROTATION_PROOF_INVALID",
+      "httpStatus": 401,
+      "status": "UNAUTHENTICATED",
+      "meaning": "The credential proof does not verify over the canonical rotation transcript under the presented certificate key."
     }
   ]
 }

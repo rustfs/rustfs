@@ -866,7 +866,7 @@ impl BucketTargetSys {
             return Some(cli);
         }
 
-        // TODO: spawn a task to reload the target
+        // TODO(backlog): spawn an async task to proactively reload the replication target
         if self.is_reloading_target(bucket, arn).await {
             return None;
         }
