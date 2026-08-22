@@ -133,7 +133,7 @@ static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<ScannerCy
 static SCANNER_CYCLE_RECOVERY_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 pub(super) fn notify_scanner_cycle_recovery_wake() {
-    SCANNER_CYCLE_RECOVERY_WAKE.notify_waiters();
+    SCANNER_CYCLE_RECOVERY_WAKE.notify_one();
 }
 
 #[cfg(test)]

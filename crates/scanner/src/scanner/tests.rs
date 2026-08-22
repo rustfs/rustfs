@@ -118,6 +118,15 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
     assert!(cycle_ctx.is_cancelled());
 }
 
+#[tokio::test]
+async fn scanner_cycle_recovery_wake_survives_wait_registration_race() {
+    notify_scanner_cycle_recovery_wake();
+
+    tokio::time::timeout(Duration::from_secs(1), SCANNER_CYCLE_RECOVERY_WAKE.notified())
+        .await
+        .expect("recovery wake should retain a permit until the waiter registers");
+}
+
 struct ScannerDefaultSpeedGuard;
 
 impl ScannerDefaultSpeedGuard {
