@@ -24,8 +24,11 @@
 use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
+use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use storage_api::owner::{
@@ -93,6 +96,45 @@ static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Immutable tier registry captured at the beginning of a folder scan.
+/// Generation makes it possible to prove that a result was classified against
+/// one registry even when the process-wide TTL cache refreshes concurrently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TierRegistrySnapshot {
+    pub(crate) generation: u64,
+    pub(crate) names: Arc<[String]>,
+    /// True when the last refresh attempt failed and `names` is therefore a
+    /// retained last-good snapshot rather than a newly read registry.
+    pub(crate) refresh_failed: bool,
+}
+
+impl TierRegistrySnapshot {
+    /// Apply a refresh only when the registry read succeeds. A failed refresh
+    /// retains the prior generation, preventing a transient config failure
+    /// from classifying the remainder of a scan against an empty registry.
+    pub(crate) fn refreshed(&self, names: Result<Arc<[String]>, ()>) -> Self {
+        match names {
+            Ok(names) => Self {
+                generation: self.generation.saturating_add(1),
+                names,
+                refresh_failed: false,
+            },
+            Err(()) => Self {
+                refresh_failed: true,
+                ..self.clone()
+            },
+        }
+    }
+
+    pub(crate) fn initial(names: Arc<[String]>) -> Self {
+        Self {
+            generation: 1,
+            names,
+            refresh_failed: false,
+        }
+    }
+}
 
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
@@ -371,6 +413,7 @@ pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
 /// How long the scanner caches the runtime tier-name list before re-reading
 /// the tier configuration manager.
 const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_TIER_REGISTRY_NAME_BYTES: usize = 256;
 
 /// Process-wide TTL cache of runtime tier names.
 ///
@@ -383,24 +426,192 @@ const TIER_NAME_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `TIER_NAME_CACHE_TTL` later; a removed tier can leave an all-zero
 /// `TierStats` seed behind for one cache generation, which merges harmlessly
 /// by key in per-object accounting and disappears on the next refresh.
-static TIER_NAME_CACHE: RwLock<Option<(Instant, Arc<[String]>)>> = RwLock::new(None);
+static TIER_NAME_CACHE: RwLock<Option<(Instant, TierRegistrySnapshot)>> = RwLock::new(None);
+static TIER_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static TIER_CYCLE_SNAPSHOTS: LazyLock<RwLock<HashMap<(u64, u64), TierRegistrySnapshot>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static TIER_ACTIVE_CYCLES: LazyLock<RwLock<HashMap<(u64, u64), usize>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+static TIER_NAME_REFRESH_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Return one immutable registry snapshot for a scanner unit of work.
+pub(crate) async fn runtime_tier_registry() -> TierRegistrySnapshot {
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, snapshot)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return snapshot;
+        }
+    }
+
+    // Serialize refreshes so a slower read of the old config cannot overwrite
+    // a newer snapshot published by a concurrent caller.
+    let _refresh_guard = TIER_NAME_REFRESH_LOCK.lock().await;
+    {
+        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
+        if let Some((refreshed_at, snapshot)) = cached
+            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
+        {
+            return snapshot;
+        }
+    }
+
+    let previous = TIER_NAME_CACHE
+        .read()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .map(|(_, snapshot)| snapshot.clone());
+    let names = ecstore_get_global_tier_config_mgr()
+        .read()
+        .await
+        .list_tiers()
+        .into_iter()
+        .map(|tier| tier.name)
+        .collect::<Vec<_>>();
+    let snapshot = match validate_tier_registry_names(names) {
+        Ok(names) => {
+            let generation = next_tier_registry_generation();
+            match previous {
+                Some(previous) => TierRegistrySnapshot {
+                    generation,
+                    ..previous.refreshed(Ok(names))
+                },
+                None => TierRegistrySnapshot {
+                    generation,
+                    ..TierRegistrySnapshot::initial(names)
+                },
+            }
+        }
+        Err(()) => match previous {
+            Some(previous) => previous.refreshed(Err(())),
+            None => TierRegistrySnapshot {
+                generation: next_tier_registry_generation(),
+                names: Arc::new([]),
+                refresh_failed: true,
+            },
+        },
+    };
+    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), snapshot.clone()));
+    snapshot
+}
+
+fn next_tier_registry_generation() -> u64 {
+    TIER_REGISTRY_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_tier_registry_names(mut names: Vec<String>) -> Result<Arc<[String]>, ()> {
+    if names.iter().any(|name| {
+        name.is_empty()
+            || name.len() > MAX_TIER_REGISTRY_NAME_BYTES
+            || name.bytes().any(|byte| byte.is_ascii_control())
+            || name == UNKNOWN_TIER
+            || name == storageclass::STANDARD
+            || name == storageclass::RRS
+    }) {
+        return Err(());
+    }
+    names.sort_unstable();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(());
+    }
+    Ok(names.into())
+}
 
 /// Tier names currently registered in the tier configuration, cached for
 /// `TIER_NAME_CACHE_TTL`.
 pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
+    runtime_tier_registry().await.names
+}
+
+/// Return the immutable tier registry for one scanner cycle/leader pair.
+/// Different buckets and disks belonging to the same cycle share this entry,
+/// so a TTL refresh cannot split one published cycle across generations.
+pub(crate) async fn runtime_tier_registry_for_cycle(cycle: u64, leader_epoch: u64) -> TierRegistrySnapshot {
+    let key = (cycle, leader_epoch);
+    prune_inactive_tier_cycle_snapshots(cycle, leader_epoch);
     {
-        let cached = TIER_NAME_CACHE.read().unwrap_or_else(|err| err.into_inner()).clone();
-        if let Some((refreshed_at, names)) = cached
-            && refreshed_at.elapsed() < TIER_NAME_CACHE_TTL
-        {
-            return names;
+        let cached = TIER_CYCLE_SNAPSHOTS.read().unwrap_or_else(|err| err.into_inner());
+        if let Some(snapshot) = cached.get(&key) {
+            return snapshot.clone();
         }
     }
 
-    let tiers = ecstore_get_global_tier_config_mgr().read().await.list_tiers();
-    let names: Arc<[String]> = tiers.iter().map(|tier| tier.name.clone()).collect::<Vec<_>>().into();
-    *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((Instant::now(), Arc::clone(&names)));
-    names
+    let mut snapshot = runtime_tier_registry().await;
+    // The registry generation describes the configuration snapshot, not the
+    // scan that consumed it. Keep it stable across cycles so a healthy cache
+    // can be reused; cycle and leader fencing are carried separately by the
+    // cache metadata and scan plan.
+    snapshot.generation = tier_registry_generation(&snapshot.names);
+    let mut cached = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    if let Some(existing) = cached.get(&key) {
+        return existing.clone();
+    }
+    cached.insert(key, snapshot.clone());
+    snapshot
+}
+
+fn prune_inactive_tier_cycle_snapshots(cycle: u64, leader_epoch: u64) {
+    let active = TIER_ACTIVE_CYCLES.read().unwrap_or_else(|err| err.into_inner());
+    let mut snapshots = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    snapshots.retain(|(entry_cycle, entry_epoch), _| {
+        active.contains_key(&(*entry_cycle, *entry_epoch))
+            || *entry_epoch > leader_epoch
+            || (*entry_epoch == leader_epoch && *entry_cycle >= cycle)
+    });
+}
+
+pub(crate) struct TierRegistryCycleGuard {
+    key: (u64, u64),
+}
+
+impl Drop for TierRegistryCycleGuard {
+    fn drop(&mut self) {
+        let mut active = TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner());
+        if let Some(count) = active.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.key);
+            }
+        }
+    }
+}
+
+pub(crate) fn begin_tier_registry_cycle(cycle: u64, leader_epoch: u64) -> TierRegistryCycleGuard {
+    let mut active = TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner());
+    let count = active.entry((cycle, leader_epoch)).or_default();
+    *count = count.saturating_add(1);
+    TierRegistryCycleGuard {
+        key: (cycle, leader_epoch),
+    }
+}
+
+fn tier_registry_generation(names: &[String]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-tier-registry-v1");
+    for name in names {
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(prefix)
+}
+
+/// Drop cycle snapshots only after the scanner has finished publishing a
+/// cycle. In-flight or retryable cycles must retain their original registry;
+/// TTL/capacity eviction could make a later bucket in the same cycle refresh
+/// to a different generation.
+pub(crate) fn complete_tier_registry_cycle(cycle: u64, leader_epoch: u64) {
+    let active = TIER_ACTIVE_CYCLES.read().unwrap_or_else(|err| err.into_inner());
+    let mut cached = TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner());
+    cached.retain(|(entry_cycle, entry_epoch), _| {
+        active.contains_key(&(*entry_cycle, *entry_epoch))
+            || *entry_epoch > leader_epoch
+            || (*entry_epoch == leader_epoch && *entry_cycle > cycle)
+    });
 }
 
 /// Test-only cache reset; the production cache has no invalidation hook
@@ -408,6 +619,9 @@ pub(crate) async fn runtime_tier_names() -> Arc<[String]> {
 #[cfg(test)]
 fn reset_tier_name_cache_for_test() {
     *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = None;
+    TIER_ACTIVE_CYCLES.write().unwrap_or_else(|err| err.into_inner()).clear();
+    TIER_CYCLE_SNAPSHOTS.write().unwrap_or_else(|err| err.into_inner()).clear();
+    TIER_REGISTRY_GENERATION.store(0, Ordering::Relaxed);
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
@@ -614,6 +828,68 @@ mod tests {
         // (pointer-equal) without re-reading the manager.
         let second = runtime_tier_names().await;
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn tier_registry_cycle_snapshot_stays_fixed_while_active() {
+        reset_tier_name_cache_for_test();
+        let cycle = 9_000_001;
+        let leader_epoch = 9_000_002;
+        let guard = begin_tier_registry_cycle(cycle, leader_epoch);
+        let first = runtime_tier_registry_for_cycle(cycle, leader_epoch).await;
+
+        // Simulate a TTL refresh observing a different configuration while the
+        // original cycle is still scanning. The active cycle entry must win.
+        *TIER_NAME_CACHE.write().unwrap_or_else(|err| err.into_inner()) = Some((
+            Instant::now() - TIER_NAME_CACHE_TTL - Duration::from_secs(1),
+            TierRegistrySnapshot {
+                generation: u64::MAX,
+                names: Arc::from(["COLD".to_string()]),
+                refresh_failed: false,
+            },
+        ));
+        let second = runtime_tier_registry_for_cycle(cycle, leader_epoch).await;
+        assert_eq!(second.generation, first.generation);
+        assert_eq!(second.names, first.names);
+
+        drop(guard);
+        complete_tier_registry_cycle(cycle, leader_epoch);
+        reset_tier_name_cache_for_test();
+    }
+
+    #[tokio::test]
+    async fn tier_registry_generation_survives_new_cycle_with_same_names() {
+        reset_tier_name_cache_for_test();
+        let first_cycle = 9_000_011;
+        let second_cycle = first_cycle + 1;
+        let leader_epoch = 9_000_012;
+
+        let first_guard = begin_tier_registry_cycle(first_cycle, leader_epoch);
+        let first = runtime_tier_registry_for_cycle(first_cycle, leader_epoch).await;
+        drop(first_guard);
+        complete_tier_registry_cycle(first_cycle, leader_epoch);
+
+        let second_guard = begin_tier_registry_cycle(second_cycle, leader_epoch);
+        let second = runtime_tier_registry_for_cycle(second_cycle, leader_epoch).await;
+        assert_eq!(first.names, second.names);
+        assert_eq!(first.generation, second.generation);
+
+        drop(second_guard);
+        complete_tier_registry_cycle(second_cycle, leader_epoch);
+        reset_tier_name_cache_for_test();
+    }
+
+    #[test]
+    fn invalid_tier_registry_names_fail_closed_for_refresh() {
+        assert!(validate_tier_registry_names(vec!["COLD\n".to_string()]).is_err());
+        assert!(validate_tier_registry_names(vec![UNKNOWN_TIER.to_string()]).is_err());
+        assert!(validate_tier_registry_names(vec!["COLD".to_string(), "COLD".to_string()]).is_err());
+        assert_eq!(
+            validate_tier_registry_names(vec!["WARM".to_string(), "COLD".to_string()])
+                .expect("valid registry names")
+                .as_ref(),
+            ["COLD".to_string(), "WARM".to_string()]
+        );
     }
 
     #[test]

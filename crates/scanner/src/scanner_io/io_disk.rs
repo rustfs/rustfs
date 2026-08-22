@@ -13,29 +13,38 @@
 // limitations under the License.
 /// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use super::*;
+use crate::UNKNOWN_TIER;
 
 ///
 /// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
 ///
-/// Preserves the original seeding semantics: with no tiers configured the map
-/// stays completely empty (STANDARD/RRS are not seeded either); otherwise the
-/// standard storage classes are seeded alongside every configured tier so
-/// per-object accounting always finds its tier key.
+/// Preserves the original no-tier shape: with no tiers configured the map
+/// stays completely empty (STANDARD/RRS/UNKNOWN are not seeded either).
+/// Otherwise the standard storage classes and one fixed unknown bucket are
+/// seeded alongside every configured tier so per-object accounting never
+/// inserts an untrusted metadata key.
 pub(super) fn tier_stats_template(tier_names: &[String]) -> HashMap<String, TierStats> {
-    let mut tier_stats = HashMap::with_capacity(tier_names.len() + 2);
+    let mut tier_stats = HashMap::with_capacity(tier_names.len() + 3);
     for tier_name in tier_names {
-        tier_stats.insert(tier_name.clone(), TierStats::default());
+        if tier_name != UNKNOWN_TIER {
+            tier_stats.insert(tier_name.clone(), TierStats::default());
+        }
     }
     if !tier_stats.is_empty() {
         tier_stats.insert(storageclass::STANDARD.to_string(), TierStats::default());
         tier_stats.insert(storageclass::RRS.to_string(), TierStats::default());
+        tier_stats.insert(UNKNOWN_TIER.to_string(), TierStats::default());
     }
     tier_stats
 }
 
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
-    async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
+    async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary> {
+        self.get_size_with_tier_names(item, &runtime_tier_names().await).await
+    }
+
+    async fn get_size_with_tier_names(&self, mut item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary> {
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
@@ -105,12 +114,13 @@ impl ScannerIODisk for Disk {
             .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), object_path.as_str(), versioned))
             .collect::<Vec<ObjectInfo>>();
 
-        let mut size_summary = SizeSummary::default();
-
-        // Tier names come from the process-wide TTL cache; seeding from them
-        // replaces the per-object clone of every full TierConfig.
-        let tier_names = runtime_tier_names().await;
-        size_summary.tier_stats = tier_stats_template(&tier_names);
+        // The caller supplies one registry snapshot for the whole folder scan;
+        // seeding from it prevents a TTL refresh from mixing generations in a
+        // single result.
+        let mut size_summary = SizeSummary {
+            tier_stats: tier_stats_template(tier_names),
+            ..Default::default()
+        };
 
         let lock_config = object_lock_config_for_scanner_item(&item).await;
 
@@ -120,12 +130,14 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
-        item.apply_actions(object_infos, lock_config, versioning_config, &mut size_summary)
+        item.apply_actions(object_infos, lock_config, versioning_config, tier_names, &mut size_summary)
             .await;
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
-                enqueue_runtime_free_version(oi).await;
+                if ScannerItem::tier_is_known(&oi, tier_names) {
+                    enqueue_runtime_free_version(oi).await;
+                }
             }
         }
 

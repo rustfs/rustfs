@@ -29,7 +29,8 @@ use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
-    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, hash_path, prefix_usage_in_cache,
+    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -205,25 +206,79 @@ impl ScannerSizeSummaryExt for SizeSummary {
             self.versions = self.versions.saturating_add(1);
         }
 
-        let size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        let logical_size = size.max(0);
+        let size = usize::try_from(logical_size).unwrap_or(usize::MAX);
         self.total_size = self.total_size.saturating_add(size);
+        let logical_bytes = u64::try_from(logical_size).unwrap_or(u64::MAX);
+        let physical_bytes = u64::try_from(oi.size.max(0)).unwrap_or(0);
+        let mut proof = TierAccountingProof {
+            logical_total: logical_bytes,
+            logical_known: 0,
+            physical_total: physical_bytes,
+            physical_known: 0,
+            overflowed: false,
+        };
 
         if oi.transitioned_object.free_version {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
+            self.tier_accounting_proof.saturating_add(proof);
             return;
         }
 
-        let mut tier = oi.storage_class.clone().unwrap_or_else(|| storageclass::STANDARD.to_string());
-        if oi.transitioned_object.status == TRANSITION_COMPLETE {
-            tier = oi.transitioned_object.tier.clone();
+        let tier = if oi.transitioned_object.status == TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.as_str()
+        } else {
+            oi.storage_class.as_deref().unwrap_or(storageclass::STANDARD)
+        };
+
+        let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
+        let tier_registry_is_empty =
+            self.tier_stats.is_empty() || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
+        let known_tier = tier != UNKNOWN_TIER && (builtin_tier || self.tier_stats.contains_key(tier));
+
+        // With no configured tier, retain the historical empty-map shape for
+        // ordinary STANDARD/RRS objects. A non-built-in key is still an
+        // observable unknown and must create only the fixed bucket.
+        if tier_registry_is_empty && known_tier {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
+            self.tier_accounting_proof.saturating_add(proof);
+            return;
         }
 
-        if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
-            *tier_stats = tier_stats.add(&TierStats {
-                total_size: u64::try_from(oi.size).unwrap_or(0),
-                num_versions: 1,
-                num_objects: u64::from(oi.is_latest),
-            });
+        // Configured tiers and the fixed bucket are normally seeded, so the
+        // hot path can mutate them without allocating a key for every object.
+        // The fallback inserts only when a legacy/no-config summary sees its
+        // first unknown key.
+        let tier_stats = if known_tier {
+            if let Some(stats) = self.tier_stats.get_mut(tier) {
+                stats
+            } else {
+                self.tier_stats.entry(tier.to_owned()).or_default()
+            }
+        } else if let Some(stats) = self.tier_stats.get_mut(UNKNOWN_TIER) {
+            stats
+        } else {
+            self.tier_stats.entry(UNKNOWN_TIER.to_string()).or_default()
+        };
+        *tier_stats = tier_stats.add(&TierStats {
+            total_size: physical_bytes,
+            num_versions: 1,
+            num_objects: u64::from(oi.is_latest),
+        });
+        if known_tier {
+            proof.logical_known = logical_bytes;
+            proof.physical_known = physical_bytes;
         }
+        if !known_tier {
+            self.unknown_tier_stats
+                .record_dimensions(tier, logical_bytes, physical_bytes, 1, u64::from(oi.is_latest));
+            if self.unknown_tier_stats.counter_overflowed {
+                proof.overflowed = true;
+            }
+        }
+        self.tier_accounting_proof.saturating_add(proof);
     }
 }
 
@@ -271,6 +326,11 @@ pub struct DataUsageEntryInfo {
     pub name: String,
     pub parent: String,
     pub entry: DataUsageEntry,
+    /// Registry generation used to classify this root entry. Older remote
+    /// workers omit it; callers must reject that result when a frozen cycle
+    /// requires generation fencing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -344,6 +404,10 @@ pub struct DataUsageCacheInfo {
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
     pub cache_key_format: u16,
+    /// Registry generation used for the completed/partial scan. This is
+    /// process-local audit data; older cache writers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_generation: Option<u64>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -353,7 +417,8 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let mut state = serializer.serialize_map(Some(16))?;
+        let field_count = 16 + usize::from(self.tier_registry_generation.is_some());
+        let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
@@ -370,6 +435,9 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
         state.serialize_entry("cache_key_format", &self.cache_key_format)?;
+        if let Some(generation) = self.tier_registry_generation {
+            state.serialize_entry("tier_registry_generation", &generation)?;
+        }
         state.end()
     }
 }
@@ -390,6 +458,58 @@ pub(crate) enum DataUsageCachePrepareOutcome {
 }
 
 impl DataUsageCache {
+    /// Reconcile tier keys loaded from an older cache against the registry
+    /// frozen for this scan. New metadata is already routed through
+    /// `UNKNOWN_TIER`; this pass handles retired keys that predate that rule.
+    /// Legacy `TierStats` carries physical bytes only, so this migration does
+    /// not manufacture a logical unknown-byte value from that physical total.
+    pub(crate) fn fold_retired_tiers(&mut self, tier_names: &[String]) {
+        let known_tiers = tier_names.iter().map(String::as_str).collect::<HashSet<_>>();
+        for entry in self.cache.values_mut() {
+            let Some(tiers) = entry.all_tier_stats.as_mut() else { continue };
+            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).cloned().unwrap_or_default();
+            let companion_present = entry.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty());
+            let migrate_existing_unknown = !companion_present;
+            let mut retired = TierStats::default();
+            let mut retired_key_found = false;
+            if migrate_existing_unknown {
+                retired = retired.add(&existing_unknown);
+            }
+            for (tier, stats) in &tiers.tiers {
+                if tier != UNKNOWN_TIER
+                    && tier != storageclass::STANDARD
+                    && tier != storageclass::RRS
+                    && !known_tiers.contains(tier.as_str())
+                {
+                    retired_key_found = true;
+                    retired = retired.add(stats);
+                }
+            }
+            tiers.fold_unknown_tiers(tier_names.iter().map(String::as_str));
+            if !retired.is_empty() && !companion_present {
+                entry.add_unknown_tier_stats(&UnknownTierStats {
+                    // The legacy map stores physical bytes only. Logical
+                    // bytes remain zero until a fresh object scan observes
+                    // them under the current metadata format.
+                    unknown_physical_bytes: retired.total_size,
+                    unknown_objects: retired.num_objects,
+                    unknown_versions: retired.num_versions,
+                    ..Default::default()
+                });
+                // The legacy tier map has no logical-byte dimension, so a
+                // proof that classified this retired key as known cannot be
+                // repaired safely. Mark it unvalidated and require a fresh
+                // scan rather than guessing a logical subtraction.
+                entry.tier_accounting_proof = None;
+            } else if retired_key_found {
+                // A nonempty companion has no provenance tying it to the
+                // retired map keys. Reject the mixed cache until a fresh scan
+                // reconciles the dimensions instead of double-counting them.
+                entry.tier_accounting_proof = None;
+            }
+        }
+    }
+
     /// Prefix-level usage query over this (writer-side) cache; see
     /// [`prefix_usage_in_cache`] for the semantics
     /// (rustfs/backlog#1872).
@@ -875,6 +995,7 @@ impl DataUsageCache {
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
             tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: flat.unknown_tier_stats.filter(|stats| !stats.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()

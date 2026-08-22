@@ -573,7 +573,6 @@ fn size_summary_add_saturates_all_usage_counters() {
             failed_count: usize::MAX,
         },
     );
-
     let mut increment = SizeSummary {
         total_size: 1,
         versions: 1,
@@ -588,6 +587,24 @@ fn size_summary_add_saturates_all_usage_counters() {
         failed_count: 1,
         ..Default::default()
     };
+    summary.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: u64::MAX,
+            num_versions: u64::MAX,
+            num_objects: u64::MAX,
+        },
+    );
+    increment.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 1,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    increment.unknown_tier_stats.unknown_bytes = 1;
+    increment.unknown_tier_stats.unknown_physical_bytes = 1;
     increment.repl_target_stats.insert(
         target.clone(),
         ReplTargetSizeSummary {
@@ -624,6 +641,8 @@ fn size_summary_add_saturates_all_usage_counters() {
     assert_eq!(target_summary.failed_size, i64::MAX);
     assert_eq!(target_summary.pending_count, usize::MAX);
     assert_eq!(target_summary.failed_count, usize::MAX);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, u64::MAX);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1);
 }
 
 #[test]
@@ -670,6 +689,249 @@ fn size_summary_actions_accounting_accumulates_tier_stats() {
             num_versions: 2,
             num_objects: 2,
         }
+    );
+}
+
+#[test]
+fn unknown_tier_is_bounded_and_accounted() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 11,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 11, 11);
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats.get(UNKNOWN_TIER).map(|stats| stats.total_size), Some(11));
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_objects, 1);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 0);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 0);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+    assert!(
+        summary
+            .unknown_tier_stats
+            .diagnostics
+            .iter()
+            .all(|entry| !entry.contains("retired"))
+    );
+}
+
+#[test]
+fn unknown_tier_is_accounted_when_no_remote_tier_is_configured() {
+    let mut summary = SizeSummary::new();
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 3,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 9, 9);
+
+    assert_eq!(summary.tier_stats.len(), 1);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 3);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 9);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 3);
+
+    let standard = ObjectInfo {
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        size: 4,
+        is_latest: true,
+        ..Default::default()
+    };
+    summary.actions_accounting(&standard, 4, 4);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 13);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 4);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 3 + 4);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 4);
+    assert_eq!(summary.tier_stats.len(), 1, "built-ins preserve the no-tier map shape");
+}
+
+#[test]
+fn million_unique_tier_keys_do_not_grow_stats_map() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    for index in 0..1_000_000_u64 {
+        let object = ObjectInfo {
+            storage_class: Some(format!("untrusted-tier-{index}")),
+            size: 1,
+            ..Default::default()
+        };
+        summary.actions_accounting(&object, 1, 1);
+    }
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 1_000_000);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1_000_000);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+}
+
+#[test]
+fn unknown_tier_never_triggers_transition() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let mut object = ObjectInfo {
+        storage_class: Some("removed-tier".to_string()),
+        size: 7,
+        ..Default::default()
+    };
+    object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+    object.transitioned_object.tier = "removed-tier".to_string();
+
+    summary.actions_accounting(&object, 7, 7);
+
+    assert_eq!(summary.tier_stats.get("removed-tier"), None);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 7);
+}
+
+#[test]
+fn removed_tier_survives_restart_as_unknown() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("COLD".to_string(), TierStats::default());
+    summary.tier_stats.insert(
+        "RETIRED".to_string(),
+        TierStats {
+            total_size: 5,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    let object = ObjectInfo {
+        storage_class: Some("COLD".to_string()),
+        size: 5,
+        ..Default::default()
+    };
+    summary.actions_accounting(&object, 5, 5);
+    let mut entry = DataUsageEntry::default();
+    entry.add_tier_sizes(&summary.tier_stats);
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 2,
+        unknown_physical_bytes: 2,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
+    let encoded = rmp_serde::to_vec(&entry).expect("entry should encode");
+    let restored: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("entry should decode");
+    assert_eq!(restored.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+    assert_eq!(
+        restored.all_tier_stats.as_ref().expect("tier stats persisted").tiers["RETIRED"].total_size,
+        5
+    );
+
+    let mut cache = DataUsageCache::default();
+    cache.replace("bucket", "", restored);
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let folded = cache.cache.get(&hash_path("bucket").key()).expect("folded cache entry");
+    assert_eq!(
+        folded.all_tier_stats.as_ref().expect("tier stats persisted").tiers[UNKNOWN_TIER].total_size,
+        5
+    );
+    assert_eq!(folded.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+}
+
+#[test]
+fn retired_tier_fold_is_idempotent_and_rejects_mixed_companion_provenance() {
+    let mut cache = DataUsageCache::default();
+    let mut entry = DataUsageEntry {
+        all_tier_stats: Some(AllTierStats {
+            tiers: HashMap::from([(
+                "RETIRED".to_string(),
+                TierStats {
+                    total_size: 5,
+                    num_versions: 1,
+                    num_objects: 1,
+                },
+            )]),
+        }),
+        ..Default::default()
+    };
+    entry.unknown_tier_stats = Some(UnknownTierStats {
+        unknown_physical_bytes: 5,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 5,
+        physical_known: 5,
+        ..Default::default()
+    });
+    cache.replace("bucket", "", entry);
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let first = cache.cache.get(&hash_path("bucket").key()).expect("entry").clone();
+    assert_eq!(first.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(first.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+    assert!(first.tier_accounting_proof.is_none(), "mixed provenance must not publish");
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let second = cache.cache.get(&hash_path("bucket").key()).expect("entry");
+    assert_eq!(second.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(second.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+}
+
+#[test]
+fn tier_registry_refresh_does_not_mix_cycle_generations() {
+    let first = crate::TierRegistrySnapshot {
+        generation: 1,
+        names: Arc::from(["WARM".to_string()]),
+        refresh_failed: false,
+    };
+    let second = crate::TierRegistrySnapshot {
+        generation: 2,
+        names: Arc::from(["COLD".to_string()]),
+        refresh_failed: false,
+    };
+    assert_ne!(first.generation, second.generation);
+    assert_eq!(first.names.as_ref(), ["WARM".to_string()]);
+    assert_eq!(second.names.as_ref(), ["COLD".to_string()]);
+    assert!(first.refreshed(Err(())).refresh_failed);
+    assert!(!second.refreshed(Ok(Arc::from(["HOT".to_string()]))).refresh_failed);
+    assert_eq!(first.refreshed(Err(())).generation, first.generation);
+    assert_eq!(first.refreshed(Err(())).names, first.names);
+}
+
+#[test]
+fn unknown_tier_counter_uses_checked_arithmetic() {
+    let max = TierStats {
+        total_size: u64::MAX,
+        num_versions: u64::MAX,
+        num_objects: u64::MAX,
+    };
+    assert!(max.checked_add(&TierStats::default()).is_some());
+    assert!(
+        max.checked_add(&TierStats {
+            total_size: 1,
+            ..Default::default()
+        })
+        .is_none()
+    );
+
+    let mut unknown = UnknownTierStats {
+        unknown_bytes: u64::MAX,
+        ..Default::default()
+    };
+    unknown.record("overflow", 1, 1, 1);
+    assert_eq!(unknown.unknown_bytes, u64::MAX);
+    assert_eq!(unknown.unknown_objects, 1);
+    assert!(unknown.counter_overflowed);
+    assert!(unknown.checked_add(&UnknownTierStats::default()).is_none());
+    assert!(
+        unknown
+            .checked_add(&UnknownTierStats {
+                unknown_bytes: 1,
+                ..Default::default()
+            })
+            .is_none()
     );
 }
 

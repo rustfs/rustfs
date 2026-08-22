@@ -23,7 +23,7 @@ use crate::storage_api::owner::{
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
     DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
-    ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
+    ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
 use rustfs_filemeta::FileInfo;
@@ -986,8 +986,8 @@ fn is_xl_meta_path_accepts_forward_separator() {
 fn tier_stats_template_seeds_tiers_and_standard_classes() {
     let template = tier_stats_template(&["WARM".to_string(), "COLD".to_string()]);
 
-    assert_eq!(template.len(), 4);
-    for tier in ["WARM", "COLD", storageclass::STANDARD, storageclass::RRS] {
+    assert_eq!(template.len(), 5);
+    for tier in ["WARM", "COLD", storageclass::STANDARD, storageclass::RRS, UNKNOWN_TIER] {
         assert_eq!(template.get(tier), Some(&TierStats::default()), "missing seed for tier {tier}");
     }
 }
@@ -1328,7 +1328,7 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
     );
 
     let update_time = SystemTime::now();
-    apply_bucket_result_to_cache(
+    assert!(apply_bucket_result_to_cache(
         &mut cache,
         DataUsageEntryInfo {
             name: "bucket".to_string(),
@@ -1338,12 +1338,51 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
                 objects: 2,
                 ..Default::default()
             },
+            tier_registry_generation: None,
         },
         update_time,
-    );
+    ));
 
     assert_eq!(cache.info.last_update, Some(update_time));
     let entry = cache.find("bucket").expect("bucket entry should remain present");
     assert_eq!(entry.size, 10);
     assert_eq!(entry.objects, 2);
+}
+
+#[test]
+fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            tier_registry_generation: Some(7),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            size: 3,
+            ..Default::default()
+        },
+    );
+
+    let applied = apply_bucket_result_to_cache(
+        &mut cache,
+        DataUsageEntryInfo {
+            name: "bucket".to_string(),
+            parent: DATA_USAGE_ROOT.to_string(),
+            entry: DataUsageEntry {
+                size: 11,
+                ..Default::default()
+            },
+            tier_registry_generation: Some(8),
+        },
+        SystemTime::now(),
+    );
+
+    assert!(!applied);
+    assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
+    assert!(cache.info.last_update.is_none());
 }
