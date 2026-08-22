@@ -31,6 +31,7 @@ pub(crate) mod admin {
 }
 
 pub(crate) mod capacity {
+    pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
     pub(crate) type RebalStatus = crate::storage::storage_api::ecstore_rebalance::RebalStatus;
