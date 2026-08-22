@@ -53,8 +53,7 @@ fn create_user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key:
 async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if !crate::common::awscurl_available() {
-        info!("Skipping test_bucket_policy_authenticated_user because awscurl is not available");
-        return Ok(());
+        return Err("awscurl is required for test_bucket_policy_authenticated_user".into());
     }
     info!("Starting test_bucket_policy_authenticated_user...");
 
