@@ -1045,6 +1045,40 @@ async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_curs
 }
 
 #[tokio::test]
+async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let primary = CurrentCycle {
+        next: 42,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        encode_scanner_cycle_state(&primary, 7).expect("valid cycle state should encode"),
+    )
+    .await
+    .expect("valid cycle state should be persisted");
+    save_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed marker should be persisted");
+
+    reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+        .await
+        .expect("reset should clear a stale malformed marker");
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("valid primary should remain durable");
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("primary cycle state should decode");
+    assert_eq!(cycle.next, 42, "reset must not regress an independently fenced primary");
+    assert_eq!(leader_epoch, 7);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
 async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let marker = ScannerCycleRecoveryMarker {

@@ -758,8 +758,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ) => (None, DataUsageCacheRevision::Missing),
         Err(err) => return Err(ScannerError::Other(format!("failed to inspect scanner cycle state: {err}"))),
     };
-    let marker_guards_primary =
-        force_full_rescan || marker.state == "cleanup-pending" || marker_matches_revision(&marker, &primary_revision);
+    let marker_guards_primary = marker.state == "cleanup-pending" || marker_matches_revision(&marker, &primary_revision);
     if !marker_guards_primary && let Some(mut reader) = primary_reader.take() {
         // A newer, independently fenced primary is authoritative. A
         // full-rescan reset must not overwrite that progress; it only
@@ -771,26 +770,34 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         let data = read_cycle_state_body(&mut reader)
             .await
             .map_err(|err| ScannerError::Other(format!("scanner cycle state changed since recovery was recorded: {err}")))?;
-        if data.is_empty() || decode_scanner_cycle_state_for_startup(&data).is_err() {
-            return Err(ScannerError::Other("scanner cycle state changed since recovery was recorded".to_string()));
+        let primary_is_valid = !data.is_empty() && decode_scanner_cycle_state_for_startup(&data).is_ok();
+        if !primary_is_valid {
+            // An invalid compatibility marker cannot fence a corrupt primary
+            // by revision, so rebuild it from the verified usage floor below.
+            // A strict marker keeps the existing fail-closed behavior for an
+            // unexpected stale-primary mutation.
+            if !force_full_rescan {
+                return Err(ScannerError::Other("scanner cycle state changed since recovery was recorded".to_string()));
+            }
+        } else {
+            storeapi
+                .delete_config_object(
+                    RUSTFS_META_BUCKET,
+                    DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+                    ScannerObjectOptions {
+                        delete_prefix: true,
+                        delete_prefix_object: true,
+                        no_lock: true,
+                        http_preconditions: Some(marker_revision.preconditions()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}")))?;
+            set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+            super::notify_scanner_cycle_recovery_wake();
+            return Ok(());
         }
-        storeapi
-            .delete_config_object(
-                RUSTFS_META_BUCKET,
-                DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
-                ScannerObjectOptions {
-                    delete_prefix: true,
-                    delete_prefix_object: true,
-                    no_lock: true,
-                    http_preconditions: Some(marker_revision.preconditions()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|err| ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}")))?;
-        set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
-        super::notify_scanner_cycle_recovery_wake();
-        return Ok(());
     }
 
     if guard.is_lock_lost() {
