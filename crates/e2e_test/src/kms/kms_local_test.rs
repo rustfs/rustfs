@@ -127,7 +127,7 @@ async fn test_local_kms_key_isolation() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait a moment for RustFS to fully start up and initialize KMS
-    kms_env.wait_for_kms_ready().await?;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -227,7 +227,7 @@ async fn test_local_kms_large_file() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait a moment for RustFS to fully start up and initialize KMS
-    kms_env.wait_for_kms_ready().await?;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
@@ -309,7 +309,7 @@ async fn test_local_kms_multipart_upload() {
         .expect("Failed to start RustFS with Local KMS");
 
     // Wait for KMS initialization
-    kms_env.wait_for_kms_ready().await?;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     info!("RustFS started with KMS auto-configuration, default_key_id: {}", default_key_id);
 
