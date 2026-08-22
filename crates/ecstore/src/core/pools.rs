@@ -71,8 +71,6 @@ use std::future::Future;
 use std::io::Cursor;
 use std::io::Write;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
