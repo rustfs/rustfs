@@ -220,8 +220,8 @@ impl ScannerSizeSummaryExt for SizeSummary {
         }
 
         let builtin_tier = tier == storageclass::STANDARD || tier == storageclass::RRS;
-        let tier_registry_is_empty = self.tier_stats.is_empty()
-            || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
+        let tier_registry_is_empty =
+            self.tier_stats.is_empty() || (self.tier_stats.len() == 1 && self.tier_stats.contains_key(UNKNOWN_TIER));
         let known_tier = tier != UNKNOWN_TIER && (builtin_tier || self.tier_stats.contains_key(&tier));
 
         // With no configured tier, retain the historical empty-map shape for

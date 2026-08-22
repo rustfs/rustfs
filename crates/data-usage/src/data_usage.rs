@@ -375,7 +375,8 @@ pub struct DataUsageInfo {
     /// tier exists, so an absent value means "not accounted", never "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_stats: Option<AllTierStats>,
-    /// Bounded diagnostics for objects classified into [`UNKNOWN_TIER`].
+    /// Bounded diagnostics and separate logical/physical counters for objects
+    /// classified into [`UNKNOWN_TIER`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unknown_tier_stats: Option<UnknownTierStats>,
 
