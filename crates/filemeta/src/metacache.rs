@@ -781,9 +781,16 @@ fn valid_heal_candidate_name(bucket: &str, entry: &MetaCacheEntry) -> bool {
         return false;
     }
 
-    // Keep the S3 key opaque. In particular, do not normalize or reject dot
-    // components or repeated separators; identity is checked against the
-    // decoded FileInfo below and the raw key must be preserved exactly.
+    // Validate raw key components without normalizing them. The scanner maps
+    // accepted keys to filesystem paths later, so dot components and empty
+    // internal components must be rejected before that boundary. A final
+    // empty component is retained for valid keys ending in '/'.
+    let mut components = entry.name.split('/').peekable();
+    while let Some(component) = components.next() {
+        if component == "." || component == ".." || (component.is_empty() && components.peek().is_some()) {
+            return false;
+        }
+    }
     true
 }
 
@@ -2153,7 +2160,15 @@ mod tests {
             "malformed and rejected metadata must remain observable during discovery"
         );
 
-        for invalid_name in ["object\\name", "object\u{0001}name", "object\0name"] {
+        for invalid_name in [
+            "../object",
+            "./object",
+            "object/../other",
+            "object//name",
+            "object\\name",
+            "object\u{0001}name",
+            "object\0name",
+        ] {
             let mut entry = metacache_entry_single_version(400, now, invalid_name);
             entry.name = invalid_name.to_string();
             let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
@@ -2163,7 +2178,7 @@ mod tests {
             );
         }
 
-        for valid_name in ["../object", "object//", "trailing/"] {
+        for valid_name in ["trailing/", "prefix/object"] {
             let mut entry = metacache_entry_single_version(401, now, valid_name);
             entry.name = valid_name.to_string();
             let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
