@@ -280,7 +280,7 @@ jobs:
           defaults
             mode http
             log global
-            option httplog
+            log-format '%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %tsc %HM %HP'
             timeout connect 5s
             timeout client  30s
             timeout server  30s
