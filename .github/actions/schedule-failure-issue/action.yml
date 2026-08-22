@@ -14,9 +14,10 @@
 
 name: "Schedule Failure Issue"
 description: >-
-  Open (or update) a tracking issue when a scheduled workflow run fails.
+  Open (or update) a tracking issue when a scheduled workflow run fails or
+  does not complete normally.
   Dedupes by workflow name: if an open issue titled
-  "[scheduled-failure] <workflow name>" already exists, the failure is
+  "[scheduled-failure] <workflow name>" already exists, the result is
   appended as a comment; otherwise a new issue is created. This is the
   single alerting mechanism for all scheduled pipelines (backlog#1149 ci-8).
 
@@ -38,6 +39,30 @@ inputs:
       Set to an empty string to skip labeling.
     required: false
     default: "infrastructure"
+  source-run-id:
+    description: "Run ID to report. Defaults to the current workflow run."
+    required: false
+    default: ${{ github.run_id }}
+  source-run-attempt:
+    description: "Run attempt to report. Defaults to the current attempt."
+    required: false
+    default: ${{ github.run_attempt }}
+  source-event:
+    description: "Trigger event of the run being reported."
+    required: false
+    default: ${{ github.event_name }}
+  source-ref-name:
+    description: "Ref name of the run being reported."
+    required: false
+    default: ${{ github.ref_name }}
+  source-sha:
+    description: "Commit SHA of the run being reported."
+    required: false
+    default: ${{ github.sha }}
+  details-file:
+    description: "Optional Markdown file appended to the issue body."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -48,17 +73,22 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         WORKFLOW_NAME: ${{ inputs.workflow-name }}
         ISSUE_LABEL: ${{ inputs.label }}
+        SOURCE_RUN_ID: ${{ inputs.source-run-id }}
+        SOURCE_RUN_ATTEMPT: ${{ inputs.source-run-attempt }}
+        SOURCE_EVENT: ${{ inputs.source-event }}
+        SOURCE_REF_NAME: ${{ inputs.source-ref-name }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        DETAILS_FILE: ${{ inputs.details-file }}
       run: |
         set -euo pipefail
 
         title="[scheduled-failure] ${WORKFLOW_NAME}"
-        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
 
-        # Failed job names for this run attempt. The alert job runs while the
-        # run as a whole is still in progress, so inspect the jobs that have
-        # already completed with a non-success conclusion.
+        # Inspect the reported run attempt. It can be the current in-workflow
+        # failure or a completed run observed by the external watchdog.
         failed_jobs="$(gh api \
-          "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+          "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${SOURCE_RUN_ATTEMPT}/jobs" \
           --paginate \
           --jq '.jobs[]
                 | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")
@@ -67,15 +97,26 @@ runs:
           failed_jobs="- (failed job not recorded yet — see the run page)"
         fi
 
+        details=""
+        if [ -n "${DETAILS_FILE}" ]; then
+          if [ -f "${DETAILS_FILE}" ]; then
+            details="$(cat "${DETAILS_FILE}")"
+          else
+            details="Details file was not available: \`${DETAILS_FILE}\`"
+          fi
+        fi
+
         body="$(cat <<EOF
-        Scheduled run of **${WORKFLOW_NAME}** failed.
+        Run of **${WORKFLOW_NAME}** did not complete successfully.
 
-        - Run: ${run_url} (attempt ${GITHUB_RUN_ATTEMPT})
-        - Event: \`${GITHUB_EVENT_NAME}\`
-        - Ref: \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA}\`
+        - Run: ${run_url} (attempt ${SOURCE_RUN_ATTEMPT})
+        - Event: \`${SOURCE_EVENT}\`
+        - Ref: \`${SOURCE_REF_NAME}\` @ \`${SOURCE_SHA}\`
 
-        Failed jobs:
+        Non-success jobs:
         ${failed_jobs}
+
+        ${details}
         EOF
         )"
 
