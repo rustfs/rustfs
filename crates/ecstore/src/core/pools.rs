@@ -5814,6 +5814,9 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 
 #[cfg(test)]
 mod pools_tests {
+    use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
+    use super::record_decommission_entry_error;
+    use super::resolve_decommission_listing_error;
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionCanceler,
         DecommissionStartPoolState, DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo,
@@ -5844,9 +5847,9 @@ mod pools_tests {
         should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
         should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
         spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, touch_decommission_progress, track_decommission_current_object,
-        track_decommission_current_object_stage, update_decommission_for_operation, validate_start_decommission_request,
-        wait_decommission_listing_retry, wait_decommission_worker_drain, with_decommission_entry_context,
+        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
+        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_listing_retry,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -5856,6 +5859,7 @@ mod pools_tests {
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use crate::store::ECStore;
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
+    use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_rio::Index;
     use std::sync::{
         Arc,
