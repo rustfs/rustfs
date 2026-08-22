@@ -189,34 +189,69 @@ pub async fn wait_for_kms_ready(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let total_deadline = Duration::from_secs(5);
+    wait_for_kms_ready_with_timeout(base_url, access_key, secret_key, Duration::from_secs(5)).await
+}
+
+async fn wait_for_kms_ready_with_timeout(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    total_deadline: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = tokio::time::Instant::now();
+    let deadline = start + total_deadline;
     let mut backoff = Duration::from_millis(200);
     let max_backoff = Duration::from_secs(1);
-    let mut first_attempt = true;
 
     loop {
-        if !first_attempt {
-            if start.elapsed() >= total_deadline {
-                return Err("KMS failed to become ready within 5 seconds".into());
-            }
-            sleep(backoff).await;
-            backoff = (backoff * 2).min(max_backoff);
-        }
-        first_attempt = false;
-
-        match get_kms_status(base_url, access_key, secret_key).await {
-            Ok(status) => {
+        match tokio::time::timeout_at(deadline, get_kms_status(base_url, access_key, secret_key)).await {
+            Ok(Ok(status)) => {
                 info!("KMS is ready (status: {})", status);
                 return Ok(());
             }
-            Err(e) => {
-                if start.elapsed() >= total_deadline {
-                    return Err(format!("KMS did not become ready within 5 s: last error: {e}").into());
-                }
-                warn!(error = %e, elapsed_ms = start.elapsed().as_millis() as u64, "KMS not ready yet, retrying…");
+            Ok(Err(e)) => {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                warn!(error = %e, elapsed_ms, "KMS not ready yet, retrying…");
             }
+            Err(_) => return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into()),
         }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into());
+        }
+        sleep((now + backoff).min(deadline) - now).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::wait_for_kms_ready_with_timeout;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn kms_readiness_deadline_covers_a_stalled_status_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read readiness request");
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_kms_ready_with_timeout(&format!("http://{address}"), "access-key", "secret-key", Duration::from_millis(50)),
+        )
+        .await
+        .expect("readiness helper must enforce its own deadline");
+
+        server.abort();
+        assert!(result.is_err(), "a stalled status request must not outlive the readiness deadline");
     }
 }
 

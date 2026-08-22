@@ -19,7 +19,6 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
 use tracing::{error, info};
 
 use super::common::{
