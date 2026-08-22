@@ -1044,22 +1044,6 @@ fn resolve_decommission_partial_listing_entry(
     ))
 }
 
-async fn record_decommission_entry_error(
-    entry_error: &Arc<tokio::sync::Mutex<Option<Error>>>,
-    rx: &CancellationToken,
-    err: Error,
-) {
-    if rx.is_cancelled() {
-        return;
-    }
-
-    let mut first_err = entry_error.lock().await;
-    if first_err.is_none() && !rx.is_cancelled() {
-        *first_err = Some(err);
-        rx.cancel();
-    }
-}
-
 fn validate_decommission_durable_ilm_copy(
     path: &str,
     source_record: &ValidatedDurableIlmRecord,
