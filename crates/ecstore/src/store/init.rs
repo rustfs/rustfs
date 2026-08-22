@@ -4578,6 +4578,70 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn decommission_final_sweep_blocks_cancel_until_source_cleanup_finishes() {
+        let temp_dir = tempfile::tempdir().expect("create final sweep gate store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-final-sweep-gate", &[4, 4])).await;
+        let job_id = uuid::Uuid::new_v4();
+        let job = ManualTransitionJobRecord::new(job_id, "final-sweep-gate", &ManualTransitionRunOptions::default(), "owner");
+        let path = manual_transition_job_record_object_name(job_id).expect("manual job path should build");
+        let data = job.encode().expect("manual job should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("manual job fixture should persist in both pools");
+        }
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active decommission run identity should persist");
+
+        let barrier = SourceCleanupDeleteBarrier::install(RUSTFS_META_BUCKET, &path);
+        let final_sweep = tokio::spawn({
+            let store = store.clone();
+            async move { store.check_after_decommission_for_test(0).await }
+        });
+        barrier.wait_until_paused().await;
+
+        let mut cancel = tokio::spawn({
+            let store = store.clone();
+            async move { store.decommission_cancel(0).await }
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut cancel)
+                .await
+                .is_err(),
+            "cancel must wait for the final sweep source cleanup"
+        );
+
+        barrier.release();
+        final_sweep
+            .await
+            .expect("final sweep task should not panic")
+            .expect("final sweep should finish after the barrier releases");
+        cancel
+            .await
+            .expect("cancel task should not panic")
+            .expect("cancel should complete after the final sweep releases the operation gate");
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.canceled)
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn decommission_durable_ilm_recovery_keeps_multiple_active_sources() {
         let temp_dir = tempfile::tempdir().expect("create multi-source recovery store dir");
         let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
