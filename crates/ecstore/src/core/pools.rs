@@ -3233,7 +3233,7 @@ impl ECStore {
     ) -> Result<()> {
         let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
         if !index_cancelers.is_empty() {
-            let _ = spawn_decommission_index_cancelers(store, rx, index_cancelers);
+            std::mem::drop(spawn_decommission_index_cancelers(store, rx, index_cancelers));
         }
 
         Ok(())
@@ -3255,7 +3255,7 @@ impl ECStore {
             return Ok(());
         }
 
-        let _ = spawn_decommission_index_cancelers(self.clone(), rx, index_cancelers);
+        std::mem::drop(spawn_decommission_index_cancelers(self.clone(), rx, index_cancelers));
         Ok(())
     }
 
@@ -3280,7 +3280,7 @@ impl ECStore {
         let index_cancelers = self
             .start_decommission_with_routines(indices, &rx, local_indices.as_slice())
             .await?;
-        let _ = spawn_decommission_index_cancelers(store, rx, index_cancelers);
+        std::mem::drop(spawn_decommission_index_cancelers(store, rx, index_cancelers));
 
         Ok(())
     }
@@ -4292,38 +4292,36 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
-        if should_reload_pool_meta {
-            if let Some(notification_sys) = runtime_sources::notification_sys() {
-                let stage = format!("decommission_failed for pool {idx}");
-                if let Some(err) = observe_decommission_terminal_reload_result(
-                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
-                    stage.as_str(),
-                ) {
-                    if let Err(record_err) = self
-                        .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
-                        .await
-                    {
-                        warn!(
-                            event = EVENT_DECOMMISSION_STATE,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            state = "terminal_reload_record_failed",
-                            error = %record_err,
-                            original_error = %err,
-                            "Decommission terminal reload failure record failed"
-                        );
-                    }
+        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
+            let stage = format!("decommission_failed for pool {idx}");
+            if let Some(err) = observe_decommission_terminal_reload_result(
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
+                stage.as_str(),
+            ) {
+                if let Err(record_err) = self
+                    .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
+                    .await
+                {
                     warn!(
                         event = EVENT_DECOMMISSION_STATE,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_POOLS,
                         pool_index = idx,
-                        state = "terminal_reload_failed",
-                        error = %err,
-                        "Decommission terminal state saved but pool meta reload failed"
+                        state = "terminal_reload_record_failed",
+                        error = %record_err,
+                        original_error = %err,
+                        "Decommission terminal reload failure record failed"
                     );
                 }
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "terminal_reload_failed",
+                    error = %err,
+                    "Decommission terminal state saved but pool meta reload failed"
+                );
             }
         }
 
@@ -4380,38 +4378,36 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
-        if should_reload_pool_meta {
-            if let Some(notification_sys) = runtime_sources::notification_sys() {
-                let stage = format!("complete_decommission for pool {idx}");
-                if let Some(err) = observe_decommission_terminal_reload_result(
-                    resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
-                    stage.as_str(),
-                ) {
-                    if let Err(record_err) = self
-                        .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
-                        .await
-                    {
-                        warn!(
-                            event = EVENT_DECOMMISSION_STATE,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            state = "terminal_reload_record_failed",
-                            error = %record_err,
-                            original_error = %err,
-                            "Decommission terminal reload failure record failed"
-                        );
-                    }
+        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
+            let stage = format!("complete_decommission for pool {idx}");
+            if let Some(err) = observe_decommission_terminal_reload_result(
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
+                stage.as_str(),
+            ) {
+                if let Err(record_err) = self
+                    .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
+                    .await
+                {
                     warn!(
                         event = EVENT_DECOMMISSION_STATE,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_POOLS,
                         pool_index = idx,
-                        state = "terminal_reload_failed",
-                        error = %err,
-                        "Decommission terminal state saved but pool meta reload failed"
+                        state = "terminal_reload_record_failed",
+                        error = %record_err,
+                        original_error = %err,
+                        "Decommission terminal reload failure record failed"
                     );
                 }
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "terminal_reload_failed",
+                    error = %err,
+                    "Decommission terminal state saved but pool meta reload failed"
+                );
             }
         }
 
