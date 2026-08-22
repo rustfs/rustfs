@@ -3868,6 +3868,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 actual_size,
                 object_info.etag.clone().unwrap_or_default(),
                 object_info.mod_time,
+                &put_opts.internal,
             ),
         )
         .await
