@@ -3422,9 +3422,27 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
-    #[tokio::test]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn decommission_migrates_and_verifies_registered_durable_ilm_records() {
+    fn decommission_migrates_and_verifies_registered_durable_ilm_records() {
+        std::thread::Builder::new()
+            .name("durable-ilm-decommission-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("durable ILM decommission runtime should build");
+                runtime.block_on(decommission_migrates_and_verifies_registered_durable_ilm_records_scenario());
+            })
+            .expect("durable ILM decommission scenario thread should spawn")
+            .join()
+            .expect("durable ILM decommission scenario should not panic");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn decommission_migrates_and_verifies_registered_durable_ilm_records_scenario() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-decommission", &[4, 4])).await;
