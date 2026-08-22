@@ -10,8 +10,10 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -279,7 +281,14 @@ def workflow_step_block(job_lines: list[str], action: str) -> tuple[int, list[st
         (
             index
             for index, line in enumerate(job_lines)
-            if line.split("#", 1)[0].strip() in {f"uses: {action}", f"- uses: {action}"}
+            if (
+                line.split("#", 1)[0].strip() == f"- uses: {action}"
+                and len(line) - len(line.lstrip()) == 6
+            )
+            or (
+                line.split("#", 1)[0].strip() == f"uses: {action}"
+                and len(line) - len(line.lstrip()) == 8
+            )
         ),
         None,
     )
@@ -306,13 +315,27 @@ def workflow_step_block(job_lines: list[str], action: str) -> tuple[int, list[st
     return start, job_lines[start:end]
 
 
-def alert_step_errors(job_lines: list[str], expected_action_if: str | None) -> list[str]:
+def alert_step_errors(
+    job_lines: list[str],
+    expected_action_if: str | None,
+    required_permissions: tuple[str, ...],
+    required_action_tokens: tuple[str, ...],
+) -> list[str]:
     checkout = workflow_step_block(job_lines, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0")
     action = workflow_step_block(job_lines, "./.github/actions/schedule-failure-issue")
-    if checkout is None or action is None:
-        return []
-
     errors: list[str] = []
+    permissions = yaml_block(job_lines, "permissions", 4)
+    permission_text = "\n".join(line.split("#", 1)[0] for line in permissions or [])
+    missing_permissions = [token for token in required_permissions if token not in permission_text]
+    if missing_permissions:
+        errors.append("alert job permissions missing " + ", ".join(missing_permissions))
+    if checkout is None:
+        errors.append("checkout step is missing")
+    if action is None:
+        errors.append("local alert action step is missing")
+    if checkout is None or action is None:
+        return errors
+
     if checkout[0] >= action[0]:
         errors.append("checkout must run before the local alert action")
     checkout_ifs = [line.strip() for line in checkout[1] if line.strip().startswith("if:")]
@@ -322,7 +345,23 @@ def alert_step_errors(job_lines: list[str], expected_action_if: str | None) -> l
     expected_ifs = [] if expected_action_if is None else [expected_action_if]
     if action_ifs != expected_ifs:
         errors.append("alert action has an invalid step condition")
+    action_text = "\n".join(line.split("#", 1)[0] for line in action[1])
+    missing_action_tokens = [token for token in required_action_tokens if token not in action_text]
+    if missing_action_tokens:
+        errors.append("alert action inputs missing " + ", ".join(missing_action_tokens))
     return errors
+
+
+def schedule_utc_slots(hour: int, minute: int, timezone_name: str | None) -> set[tuple[int, int]]:
+    if timezone_name is None:
+        return {(hour, minute)}
+    zone = ZoneInfo(timezone_name)
+    return {
+        (utc.hour, utc.minute)
+        for year in (2025, 2026)
+        for month in range(1, 13)
+        for utc in [datetime(year, month, 1, hour, minute, tzinfo=zone).astimezone(timezone.utc)]
+    }
 
 
 def check_scheduled_alerts(root: Path) -> list[str]:
@@ -338,11 +377,13 @@ def check_scheduled_alerts(root: Path) -> list[str]:
 
         on_block = yaml_block(lines, "on", 0)
         schedule_block = yaml_block(on_block or [], "schedule", 2)
-        cron_lines = [line for line in schedule_block or [] if re.match(r"^\s*-\s+cron:", line)]
-        if not cron_lines:
+        schedule_lines = schedule_block or []
+        cron_indices = [index for index, line in enumerate(schedule_lines) if re.match(r"^\s*-\s+cron:", line)]
+        if not cron_indices:
             errors.append(f"{relative}: missing simple numeric schedule")
         else:
-            for cron_line in cron_lines:
+            for position, cron_index in enumerate(cron_indices):
+                cron_line = schedule_lines[cron_index]
                 schedule = re.match(r"^\s*-\s+cron:\s*[\"']?(\d+)\s+(\d+)\s+", cron_line)
                 if not schedule:
                     errors.append(f"{relative}: missing simple numeric schedule")
@@ -350,7 +391,17 @@ def check_scheduled_alerts(root: Path) -> list[str]:
                 minute, hour = map(int, schedule.groups())
                 if minute == 0:
                     errors.append(f"{relative}: scheduled validation must avoid minute zero")
-                schedule_slots.setdefault((hour, minute), []).append(relative)
+                entry_end = cron_indices[position + 1] if position + 1 < len(cron_indices) else len(schedule_lines)
+                entry = "\n".join(schedule_lines[cron_index + 1 : entry_end])
+                timezone_match = re.search(r"^\s*timezone:\s*[\"']?([^\"'\s]+)", entry, re.MULTILINE)
+                timezone_name = timezone_match.group(1) if timezone_match else None
+                try:
+                    utc_slots = schedule_utc_slots(hour, minute, timezone_name)
+                except ZoneInfoNotFoundError:
+                    errors.append(f"{relative}: unknown schedule timezone {timezone_name}")
+                    continue
+                for slot in utc_slots:
+                    schedule_slots.setdefault(slot, []).append(relative)
 
         job_lines = yaml_block(lines, "alert-on-failure", 2)
         if job_lines is None:
@@ -370,7 +421,10 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         if missing:
             errors.append(f"{relative}: alert-on-failure missing {', '.join(missing)}")
         else:
-            errors.extend(f"{relative}: {error}" for error in alert_step_errors(job_lines, None))
+            errors.extend(
+                f"{relative}: {error}"
+                for error in alert_step_errors(job_lines, None, ("issues: write",), ("github-token: ${{ secrets.GITHUB_TOKEN }}",))
+            )
 
     for (hour, minute), workflows in schedule_slots.items():
         if len(workflows) > 1:
@@ -430,7 +484,20 @@ def check_scheduled_alerts(root: Path) -> list[str]:
     else:
         errors.extend(
             ".github/workflows/scheduled-validation-watchdog.yml: " + error
-            for error in alert_step_errors(watchdog_job_lines, None)
+            for error in alert_step_errors(
+                watchdog_job_lines,
+                None,
+                ("actions: read", "issues: write"),
+                (
+                    "github-token: ${{ secrets.GITHUB_TOKEN }}",
+                    "workflow-name: ${{ github.event.workflow_run.name }}",
+                    "source-run-id: ${{ github.event.workflow_run.id }}",
+                    "source-run-attempt: ${{ github.event.workflow_run.run_attempt }}",
+                    "source-event: ${{ github.event.workflow_run.event }}",
+                    "source-ref-name: ${{ github.event.workflow_run.head_branch }}",
+                    "source-sha: ${{ github.event.workflow_run.head_sha }}",
+                ),
+            )
         )
 
     freshness_path = root / ".github/workflows/scheduled-validation-freshness.yml"
@@ -462,7 +529,15 @@ def check_scheduled_alerts(root: Path) -> list[str]:
     else:
         errors.extend(
             ".github/workflows/scheduled-validation-freshness.yml: " + error
-            for error in alert_step_errors(freshness_job_lines, "if: failure()")
+            for error in alert_step_errors(
+                freshness_job_lines,
+                "if: failure()",
+                ("actions: read", "issues: write"),
+                (
+                    "github-token: ${{ secrets.GITHUB_TOKEN }}",
+                    "details-file: ${{ runner.temp }}/scheduled-validation-freshness.md",
+                ),
+            )
         )
     if not (root / "scripts/check_scheduled_validation_freshness.py").is_file():
         errors.append("scripts/check_scheduled_validation_freshness.py: missing freshness checker")
@@ -666,8 +741,9 @@ class SelfTests(unittest.TestCase):
                 + "    github.event.workflow_run.event == 'schedule'\n"
                 + "    github.event.workflow_run.conclusion != 'success'\n"
                 + "    github.event.workflow_run.conclusion != 'failure'\n"
-                + "    actions: read\n"
-                + "    issues: write\n"
+                + "    permissions:\n"
+                + "      actions: read\n"
+                + "      issues: write\n"
                 + "    steps:\n"
                 + "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                 + "      - uses: ./.github/actions/schedule-failure-issue\n"
@@ -684,8 +760,9 @@ class SelfTests(unittest.TestCase):
             freshness.write_text(
                 "jobs:\n"
                 "  check-freshness:\n"
-                "    actions: read\n"
-                "    issues: write\n"
+                "    permissions:\n"
+                "      actions: read\n"
+                "      issues: write\n"
                 "    steps:\n"
                 "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                 "      - run: python3 scripts/check_scheduled_validation_freshness.py\n"
@@ -726,6 +803,40 @@ class SelfTests(unittest.TestCase):
                 first.write_text(original.replace(required, replacement))
                 self.assertEqual(len(check_scheduled_alerts(root)), 1)
                 first.write_text(original)
+
+            first_original = first.read_text()
+            real_steps = (
+                "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                "      - uses: ./.github/actions/schedule-failure-issue\n"
+                "        with:\n"
+                "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+            )
+            first.write_text(
+                first_original.replace(
+                    real_steps,
+                    "      - run: |\n"
+                    "          : <<'MARKER'\n"
+                    "          uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
+                    "          MARKER\n"
+                    "      - run: |\n"
+                    "          : <<'MARKER'\n"
+                    "          uses: ./.github/actions/schedule-failure-issue\n"
+                    "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "          MARKER\n",
+                )
+            )
+            self.assertTrue(check_scheduled_alerts(root))
+            first.write_text(
+                first_original.replace(
+                    real_steps,
+                    "      - uses: ./.github/actions/schedule-failure-issue\n"
+                    "        with:\n"
+                    "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+                    "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n",
+                )
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(first_original)
 
             watchdog_mutations = (
                 ("actions: read", "actions: none"),
@@ -812,6 +923,22 @@ class SelfTests(unittest.TestCase):
             second_original = second.read_text()
             second.write_text(re.sub(r'- cron: "\d+ \d+', '- cron: "1 1', second_original, count=1))
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            second.write_text(second_original)
+
+            first.write_text(
+                first_original.replace(
+                    '    - cron: "1 1 * * *"\n',
+                    '    - cron: "7 0 * * *"\n      timezone: "Asia/Shanghai"\n',
+                )
+            )
+            second.write_text(
+                second_original.replace(
+                    '    - cron: "2 2 * * *"\n',
+                    '    - cron: "2 2 * * *"\n    - cron: "7 16 * * *"\n',
+                )
+            )
+            self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            first.write_text(first_original)
             second.write_text(second_original)
 
             freshness_original = freshness.read_text()
