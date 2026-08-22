@@ -1476,6 +1476,40 @@ fn test_checkpoint_object_sets_dedupe_and_prune() {
     assert!(checkpoint.failed_objects.is_empty());
 }
 
+#[tokio::test]
+async fn checkpoint_page_commit_keeps_ledger_until_cursor_is_durable() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+
+    checkpoint
+        .record_object_outcome(
+            "bucket/object:v1".to_string(),
+            CheckpointObjectOutcome::Processed,
+            1,
+            0,
+            0,
+            128,
+            0,
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+    checkpoint.advance_page(0, 1).await.unwrap();
+
+    let reloaded = CheckpointManager::load_from_disk(disk.clone(), &task_id).await.unwrap();
+    let snapshot = reloaded.get_checkpoint().await;
+    assert_eq!(snapshot.current_object_index, 1);
+    assert_eq!(snapshot.successful_objects, 1);
+    assert_eq!(snapshot.processed_bytes, 128);
+    assert!(snapshot.processed_objects.contains("bucket/object:v1"));
+
+    checkpoint.prune_completed_page().await.unwrap();
+    let reloaded = CheckpointManager::load_from_disk(disk, &task_id).await.unwrap();
+    assert!(reloaded.get_checkpoint().await.processed_objects.is_empty());
+}
+
 #[test]
 fn test_checkpoint_loads_legacy_vec_format() {
     // Checkpoints written before the HashSet migration stored the object

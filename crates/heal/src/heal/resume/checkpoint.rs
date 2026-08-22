@@ -34,6 +34,13 @@ const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 /// to the new `compose_key` identities, so a stale checkpoint is discarded.
 pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 5;
 
+#[derive(Debug, Clone, Copy)]
+pub enum CheckpointObjectOutcome {
+    Processed,
+    Failed,
+    Skipped,
+}
+
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
@@ -310,12 +317,32 @@ impl CheckpointManager {
         self.save_checkpoint_throttled().await
     }
 
-    /// Advance past a completed page and prune the per-object sets, then persist.
+    /// Persist a completed page position while retaining its identities.
     pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.complete_page(bucket_index, object_index);
         drop(checkpoint);
         self.save_checkpoint_throttled().await
+    }
+
+    /// Persist the page position while retaining identities until the resume
+    /// cursor is durable.
+    pub async fn advance_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.update_position(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// Remove the previous page's dedup identities only after its resume cursor
+    /// has been durably exposed.
+    pub async fn prune_completed_page(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.processed_objects.clear();
+        checkpoint.skipped_objects.clear();
+        checkpoint.failed_objects.clear();
+        drop(checkpoint);
+        self.save_checkpoint().await
     }
 
     /// Reset the checkpoint to the start of the scan for a retry, then persist.
@@ -348,6 +375,34 @@ impl CheckpointManager {
     pub async fn add_skipped_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_skipped_object(object);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    /// Atomically persist an object's dedup identity with its aggregate result.
+    pub async fn record_object_outcome(
+        &self,
+        object: String,
+        outcome: CheckpointObjectOutcome,
+        successful: u64,
+        failed: u64,
+        skipped: u64,
+        bytes: u64,
+        skipped_new_versions: u64,
+        skipped_ilm_expired: u64,
+        counter_unknown: bool,
+    ) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        match outcome {
+            CheckpointObjectOutcome::Processed => checkpoint.add_processed_object(object),
+            CheckpointObjectOutcome::Failed => checkpoint.add_failed_object(object),
+            CheckpointObjectOutcome::Skipped => checkpoint.add_skipped_object(object),
+        }
+        checkpoint.update_progress(successful, failed, skipped, bytes);
+        checkpoint.set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired);
+        if counter_unknown {
+            checkpoint.mark_counter_unknown();
+        }
         drop(checkpoint);
         self.save_checkpoint_if_due().await
     }

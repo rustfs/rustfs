@@ -15,7 +15,7 @@
 use crate::heal::{
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
-        CheckpointManager, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
+        CheckpointManager, CheckpointObjectOutcome, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
         replacement_target_identities_match,
     },
     storage::{HealStorageAPI, next_heal_listing_token},
@@ -881,7 +881,6 @@ impl ErasureSetHealer {
                 }
 
                 if should_skip_new_version(item.mod_time_unix_nanos, started_at_secs) {
-                    checkpoint_manager.add_processed_object(key).await?;
                     let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_new_versions_total").increment(1);
@@ -901,14 +900,18 @@ impl ErasureSetHealer {
                         }
                         (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
                     };
-                    if !counter_ok || counter_unknown {
-                        checkpoint_manager.mark_counter_unknown().await?;
-                    }
                     checkpoint_manager
-                        .set_skipped_version_counts(skipped_new, skipped_ilm)
-                        .await?;
-                    checkpoint_manager
-                        .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                        .record_object_outcome(
+                            key,
+                            CheckpointObjectOutcome::Processed,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                            skipped_new,
+                            skipped_ilm,
+                            !counter_ok || counter_unknown,
+                        )
                         .await?;
                     if !counter_ok || counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
@@ -943,7 +946,6 @@ impl ErasureSetHealer {
                         )
                         .await?
                 {
-                    checkpoint_manager.add_processed_object(key).await?;
                     let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_ilm_expired_total").increment(1);
@@ -963,14 +965,18 @@ impl ErasureSetHealer {
                         }
                         (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
                     };
-                    if !counter_ok || counter_unknown {
-                        checkpoint_manager.mark_counter_unknown().await?;
-                    }
                     checkpoint_manager
-                        .set_skipped_version_counts(skipped_new, skipped_ilm)
-                        .await?;
-                    checkpoint_manager
-                        .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                        .record_object_outcome(
+                            key,
+                            CheckpointObjectOutcome::Processed,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                            skipped_new,
+                            skipped_ilm,
+                            !counter_ok || counter_unknown,
+                        )
                         .await?;
                     if !counter_ok || counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
@@ -1100,11 +1106,10 @@ impl ErasureSetHealer {
             while let Some((key, object, version_id, result)) = page_tasks.next().await {
                 let (object_size, result) = result;
                 let mut telemetry_unknown = false;
-                match result {
+                let checkpoint_outcome = match result {
                     Ok(true) => {
                         telemetry_unknown |= !increment_counter(successful_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
-                        checkpoint_manager.add_processed_object(key).await?;
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -1117,9 +1122,9 @@ impl ErasureSetHealer {
                             state = "healed",
                             "Erasure set object healed"
                         );
+                        CheckpointObjectOutcome::Processed
                     }
                     Ok(false) => {
-                        checkpoint_manager.add_processed_object(key).await?;
                         telemetry_unknown |= !increment_counter(successful_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
@@ -1134,12 +1139,12 @@ impl ErasureSetHealer {
                             state = "missing_treated_as_ok",
                             "Erasure set missing object treated as ok"
                         );
+                        CheckpointObjectOutcome::Processed
                     }
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(Error::TransientSkip { message }) => {
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
-                        checkpoint_manager.add_skipped_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -1152,11 +1157,11 @@ impl ErasureSetHealer {
                             error = %message,
                             "Erasure set object heal skipped due to transient error"
                         });
+                        CheckpointObjectOutcome::Skipped
                     }
                     Err(err) => {
                         telemetry_unknown |= !increment_counter(failed_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
-                        checkpoint_manager.add_failed_object(key).await?;
                         demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -1169,8 +1174,9 @@ impl ErasureSetHealer {
                             error = %err,
                             "Erasure set object heal failed"
                         });
+                        CheckpointObjectOutcome::Failed
                     }
-                }
+                };
 
                 telemetry_unknown |= !increment_counter(processed_objects);
                 completed_in_page += 1;
@@ -1189,11 +1195,18 @@ impl ErasureSetHealer {
                     }
                     progress.counter_unknown
                 };
-                if telemetry_unknown || progress_unknown {
-                    checkpoint_manager.mark_counter_unknown().await?;
-                }
                 checkpoint_manager
-                    .update_progress(*successful_objects, *failed_objects, *skipped_objects, bytes_processed)
+                    .record_object_outcome(
+                        key,
+                        checkpoint_outcome,
+                        *successful_objects,
+                        *failed_objects,
+                        *skipped_objects,
+                        bytes_processed,
+                        0,
+                        0,
+                        telemetry_unknown || progress_unknown,
+                    )
                     .await?;
                 if telemetry_unknown || progress_unknown {
                     resume_manager.mark_counter_unknown().await?;
@@ -1206,12 +1219,13 @@ impl ErasureSetHealer {
 
             *current_object_index = global_obj_idx;
 
-            // Persist the authoritative cursor FIRST (points at the next page
-            // boundary), then prune the per-version dedup sets. Both are
-            // idempotent under crash: heal_object re-heals safely.
+            // Persist the checkpoint ledger and page position before exposing
+            // the next resume cursor. A crash before cursor publication keeps
+            // the page identities available for exact-once replay.
             let next_cursor = if is_truncated { next_token.clone() } else { None };
+            checkpoint_manager.advance_page(bucket_index, *current_object_index).await?;
             resume_manager.set_resume_cursor(next_cursor.clone()).await?;
-            checkpoint_manager.complete_page(bucket_index, *current_object_index).await?;
+            checkpoint_manager.prune_completed_page().await?;
             // Check if there are more pages
             if !is_truncated {
                 break;

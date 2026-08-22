@@ -31,7 +31,7 @@ mod checkpoint;
 mod replacement;
 mod utils;
 
-pub use checkpoint::{CheckpointManager, ResumeCheckpoint};
+pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, ResumeCheckpoint};
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
