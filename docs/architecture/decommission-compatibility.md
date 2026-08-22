@@ -153,6 +153,91 @@ No migration step is required for these decisions because this note documents th
 current RustFS behavior. Changing either decision later requires an operator
 compatibility note and updated characterization tests.
 
+## Tier Free Versions During Decommission
+
+A tier free version is an internal xl.meta record (`rustfs_filemeta::FREE_VERSION`,
+flagged `XL_FLAG_FREE_VERSION`) shaped like a delete marker. It is created by
+`MetaObject::init_free_version` when a version whose remote transition completed is
+deleted locally: the visible version is removed and the record keeps the remote-tier
+identity (tier, object name, version id, state, destination id) needed for an
+idempotent remote delete. Free versions are not user-visible versions; `num_versions`
+and all listing/GET paths exclude them.
+
+### Lifecycle And Consumers
+
+Creation: any local delete that removes a version whose transition status is
+`complete` appends the record via `MetaObject::delete_version` →
+`init_free_version` (skipped only when `skip_tier_free_version` is set, as on
+data-movement copies). The same deletes also persist a durable tier-journal
+entry on every user-facing path: S3 single deletes (`execute_delete_object` →
+`delete_object_with_tier_delete_journal`), S3 batch deletes, lifecycle expiry,
+and lifecycle delete-all all prepare and commit a journal entry around the
+delete. A journal entry is omitted when the removed version's transition state
+decodes as `TransitionVersionState::Unknown`, or on internal journal-less
+delete paths that never touch transitioned user objects.
+
+Consumption while the record exists: the background recovery loop started by
+`init_background_expiry` (spawned by `spawn_tier_free_version_recovery_once`,
+enabled by default) scans disks for pending records and re-enqueues them; the
+usage scanner does the same; the lifecycle worker then deletes the remote tier
+object idempotently and only afterwards removes the local record. Heal walks
+include free-version records in metadata healing. Transition planning,
+replication, restore, GET, listings, and usage aggregation never depend on
+them.
+
+### Decommission Handling
+
+The exact decommission inventory loader (`load_file_info_versions_exact` via
+`get_all_file_info_versions`) keeps free-version records inline in `versions`; it
+never populates `free_versions`, so the source-cleanup preflight comparison of
+`free_versions` is vacuous for decommission. The migration loop then routes every
+record through the generic delete-marker handling:
+
+- a record that is the only remaining version without replication is skipped by the
+  empty-delete-marker rule and counted as done;
+- any other record is copied to the target pool as an ordinary delete marker with the
+  same version id and mod time.
+
+In both cases the free-version flag and its remote-tier identity are dropped:
+decommission neither preserves free-version semantics nor performs or reschedules the
+pending remote-tier delete. Source cleanup then removes the original records together
+with the source xl.meta.
+
+Allowed physical-delete timing: the source record may be removed once the migration
+loop has dispositioned it (copied as a plain marker or skipped as lone), which
+happens regardless of whether its remote-tier delete was ever performed.
+
+### Reference-Audit Result
+
+No cluster-local consumer resolves a free version after decommission finishes: GET,
+listing, transition planning, replication, restore, and heal operate either on
+user-visible versions or while the record still exists. The remote exposure is
+bounded:
+
+- On every user-facing delete path the remote-delete obligation is durably carried
+  by the committed tier-journal entry, which the tier sweeper processes
+  independently of xl.meta; the free-version record is an idempotent second
+  pointer, not the only one. Dropping it during decommission therefore does not
+  orphan the remote object.
+- Residual exposure: for records whose version state decoded as `Unknown` no
+  journal entry exists, so dropping the unconsumed record loses that cleanup hint
+  and the remote-tier object is orphaned. The same applies to any future internal
+  delete path that removes transitioned versions without a journal entry.
+
+Copying a pending record as an ordinary delete marker also adds a user-visible
+tombstone to the target pool's version history that the source never exposed.
+
+Because of the residual journal-less case, decommission must account for every
+free-version record instead of omitting it silently:
+
+- `decommission_free_versions_skipped` counts the records per decommission entry;
+- entries with a non-zero count log `state = "free_versions_skipped"` with reason
+  `tier_free_version_not_migrated`.
+
+Regression guard:
+
+- `decommission_free_version_accounting_reports_skipped_records`
+
 ## Regression Guard
 
 The queued multi-pool contract is guarded by:
