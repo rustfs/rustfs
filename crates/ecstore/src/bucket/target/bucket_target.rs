@@ -206,7 +206,9 @@ pub struct BucketTarget {
     #[serde(default)]
     pub region: String,
 
-    #[serde(alias = "bandwidth", default)]
+    // madmin-go v3.0.109 tags this `bandwidthlimit`; `bandwidth` is a legacy
+    // alias kept for inputs written before the madmin tag was verified.
+    #[serde(alias = "bandwidthlimit", alias = "bandwidth", default)]
     pub bandwidth_limit: i64,
 
     #[serde(rename = "replicationSync", default)]
@@ -576,9 +578,10 @@ mod tests {
     #[test]
     fn minio_written_bucket_targets_json_populates_madmin_named_fields() {
         // A MinIO-written bucket-targets.json carries madmin's JSON tags
-        // (`bandwidth`, `storageclass`, `resetID`, `deploymentID`,
-        // `credentials.sessionToken`). On migration these must land in the
-        // matching fields instead of silently defaulting (backlog#1946).
+        // (`bandwidthlimit`, `storageclass`, `resetID`, `deploymentID`,
+        // `credentials.sessionToken` — madmin-go v3.0.109 bucket-targets.go).
+        // On migration these must land in the matching fields instead of
+        // silently defaulting (backlog#1951).
         let targets: BucketTargets = serde_json::from_value(serde_json::json!({
             "targets": [{
                 "sourcebucket": "src",
@@ -591,7 +594,7 @@ mod tests {
                 "targetbucket": "dst",
                 "type": "replication",
                 "replicationSync": true,
-                "bandwidth": 107374182400i64,
+                "bandwidthlimit": 107374182400i64,
                 "storageclass": "STANDARD",
                 "resetID": "reset-789",
                 "deploymentID": "deploy-123"
