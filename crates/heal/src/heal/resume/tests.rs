@@ -1601,25 +1601,28 @@ async fn test_checkpoint_schema_v4_discarded_on_load() {
 }
 
 #[tokio::test]
-async fn unsigned_previous_checkpoint_schema_preserves_progress() {
+async fn downgraded_unsigned_checkpoint_resets_untrusted_progress() {
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();
-    let mut legacy = ResumeCheckpoint::new(task_id.clone());
-    legacy.schema_version = CURRENT_CHECKPOINT_SCHEMA - 1;
-    legacy.update_position(2, 500);
-    legacy.add_processed_object("object".to_string());
-    legacy.integrity_digest = None;
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+    manager.add_processed_object("victim-a".to_string()).await.unwrap();
+    manager.update_position(2, 500).await.unwrap();
     let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
-    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, serde_json::to_vec(&legacy).unwrap().into())
+    let bytes = disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path).await.unwrap();
+    let mut downgraded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    downgraded["schema_version"] = serde_json::json!(CURRENT_CHECKPOINT_SCHEMA - 1);
+    downgraded.as_object_mut().unwrap().remove("integrity_digest");
+    downgraded["processed_objects"] = serde_json::json!(["victim-b"]);
+    disk.write_all(RUSTFS_META_BUCKET, &checkpoint_path, serde_json::to_vec(&downgraded).unwrap().into())
         .await
-        .expect("write previous-schema checkpoint");
+        .expect("write downgraded checkpoint");
 
     let manager = CheckpointManager::load_from_disk(disk, &task_id).await.unwrap();
     let checkpoint = manager.get_checkpoint().await;
     assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA);
-    assert_eq!(checkpoint.current_bucket_index, 2);
-    assert_eq!(checkpoint.current_object_index, 500);
-    assert!(checkpoint.processed_objects.contains("object"));
+    assert_eq!(checkpoint.current_bucket_index, 0);
+    assert_eq!(checkpoint.current_object_index, 0);
+    assert!(checkpoint.processed_objects.is_empty());
     temp_dir.close().unwrap();
 }
 

@@ -289,7 +289,7 @@ impl CheckpointManager {
             });
         }
 
-        if let Some(expected) = checkpoint.integrity_digest.as_deref() {
+        let integrity_verified = if let Some(expected) = checkpoint.integrity_digest.as_deref() {
             let actual = Self::checkpoint_digest(&Self::serialize_without_digest(&checkpoint)?);
             if expected != actual {
                 Self::block_invalid_snapshot(&disk, task_id).await;
@@ -297,6 +297,7 @@ impl CheckpointManager {
                     "Resume checkpoint digest does not match task {task_id}"
                 )));
             }
+            true
         } else if checkpoint.schema_version >= CURRENT_CHECKPOINT_SCHEMA {
             Self::block_invalid_snapshot(&disk, task_id).await;
             return Err(Error::InvalidCheckpoint(format!(
@@ -314,17 +315,18 @@ impl CheckpointManager {
                             "Resume checkpoint digest does not match task {task_id}"
                         )));
                     }
+                    true
                 }
-                Err(crate::heal::DiskError::FileNotFound) => {}
+                Err(crate::heal::DiskError::FileNotFound) => false,
                 Err(error) => {
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to read checkpoint digest: {error}"),
                     });
                 }
             }
-        }
+        };
 
-        if checkpoint.schema_version < CHECKPOINT_PER_VERSION_SCHEMA {
+        if checkpoint.schema_version < CHECKPOINT_PER_VERSION_SCHEMA || !integrity_verified {
             warn!(
                 target: "rustfs::heal::resume",
                 event = EVENT_HEAL_CHECKPOINT_STATE,
