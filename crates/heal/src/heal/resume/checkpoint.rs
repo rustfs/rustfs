@@ -61,6 +61,11 @@ pub struct ResumeCheckpoint {
     pub failed_objects: HashSet<String>,
     /// skipped objects
     pub skipped_objects: HashSet<String>,
+    /// Integrity digest over the checkpoint with this field set to `None`.
+    /// Keeping it in the checkpoint makes the payload and its authentication
+    /// record one CAS generation instead of two independently-written files.
+    #[serde(default)]
+    pub integrity_digest: Option<String>,
 }
 
 impl ResumeCheckpoint {
@@ -74,6 +79,7 @@ impl ResumeCheckpoint {
             processed_objects: HashSet::new(),
             failed_objects: HashSet::new(),
             skipped_objects: HashSet::new(),
+            integrity_digest: None,
         }
     }
 
@@ -427,8 +433,12 @@ impl CheckpointManager {
         let _save_guard = self.save_lock.lock().await;
         let checkpoint = self.checkpoint.read().await.clone();
         validate_resume_task_id(&checkpoint.task_id)?;
+        let unsigned_checkpoint_data = Self::serialize_without_digest(&checkpoint)?;
+        let digest = Self::checkpoint_digest(&unsigned_checkpoint_data);
+        let mut persisted_checkpoint = checkpoint.clone();
+        persisted_checkpoint.integrity_digest = Some(digest);
         let checkpoint_data =
-            EcstoreDiskBytes::from(serde_json::to_vec(&checkpoint).map_err(|e| Error::TaskExecutionFailed {
+            EcstoreDiskBytes::from(serde_json::to_vec(&persisted_checkpoint).map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to serialize checkpoint: {e}"),
             })?);
 
@@ -538,19 +548,6 @@ impl CheckpointManager {
             }
         }
 
-        let digest_path = Self::digest_path(&checkpoint.task_id);
-        let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(checkpoint_data.as_ref()));
-        HealDiskExt::write_all(
-            self.disk.as_ref(),
-            RUSTFS_META_BUCKET,
-            path_to_str(&digest_path)?,
-            EcstoreDiskBytes::from(digest.into_bytes()),
-        )
-        .await
-        .map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to save checkpoint digest: {e}"),
-        })?;
-
         let mut last_saved = self.last_saved.lock().map_err(|_| Error::TaskExecutionFailed {
             message: "Checkpoint save state lock is poisoned after save".to_string(),
         })?;
@@ -580,26 +577,51 @@ impl CheckpointManager {
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to read checkpoint file: {e}"),
             })?;
-        let digest_path = Self::digest_path(task_id);
-        let digest_path = path_to_str(&digest_path)?;
-        match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, digest_path).await {
-            Ok(expected) => {
-                let actual = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&checkpoint));
-                if expected.as_ref() != actual.as_bytes() {
-                    Self::block_invalid_snapshot(disk, task_id).await;
-                    return Err(Error::InvalidCheckpoint(format!(
-                        "Resume checkpoint digest does not match task {task_id}"
-                    )));
-                }
+        let parsed: ResumeCheckpoint = serde_json::from_slice(&checkpoint).map_err(|error| Error::TaskExecutionFailed {
+            message: format!("Failed to deserialize checkpoint for integrity validation: {error}"),
+        })?;
+        if let Some(expected) = parsed.integrity_digest.as_deref() {
+            let actual = Self::checkpoint_digest(&Self::serialize_without_digest(&parsed)?);
+            if expected != actual {
+                Self::block_invalid_snapshot(disk, task_id).await;
+                return Err(Error::InvalidCheckpoint(format!(
+                    "Resume checkpoint digest does not match task {task_id}"
+                )));
             }
-            Err(crate::heal::DiskError::FileNotFound) => {}
-            Err(error) => {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to read checkpoint digest: {error}"),
-                });
+        } else {
+            let digest_path = Self::digest_path(task_id);
+            let digest_path = path_to_str(&digest_path)?;
+            match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, digest_path).await {
+                Ok(expected) => {
+                    let actual = Self::checkpoint_digest(&checkpoint);
+                    if expected.as_ref() != actual.as_bytes() {
+                        Self::block_invalid_snapshot(disk, task_id).await;
+                        return Err(Error::InvalidCheckpoint(format!(
+                            "Resume checkpoint digest does not match task {task_id}"
+                        )));
+                    }
+                }
+                Err(crate::heal::DiskError::FileNotFound) => {}
+                Err(error) => {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to read checkpoint digest: {error}"),
+                    });
+                }
             }
         }
         Ok(checkpoint)
+    }
+
+    fn serialize_without_digest(checkpoint: &ResumeCheckpoint) -> Result<Vec<u8>> {
+        let mut unsigned = checkpoint.clone();
+        unsigned.integrity_digest = None;
+        serde_json::to_vec(&unsigned).map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to serialize checkpoint: {e}"),
+        })
+    }
+
+    fn checkpoint_digest(checkpoint_data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(checkpoint_data))
     }
 
     fn digest_path(task_id: &str) -> std::path::PathBuf {

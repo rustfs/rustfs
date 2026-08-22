@@ -1769,6 +1769,24 @@ async fn checkpoint_digest_rejects_same_length_progress_tampering() {
 }
 
 #[tokio::test]
+async fn checkpoint_integrity_survives_missing_legacy_sidecar() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+    manager.update_position(2, 9).await.unwrap();
+
+    let digest_path = format!("{BUCKET_META_PREFIX}/{task_id}_ahm_checkpoint.sha256");
+    delete_resume_file(&disk, Path::new(&digest_path)).await.unwrap();
+
+    let restored = CheckpointManager::load_from_disk(disk, &task_id).await.unwrap();
+    let checkpoint = restored.get_checkpoint().await;
+    assert_eq!(checkpoint.current_bucket_index, 2);
+    assert_eq!(checkpoint.current_object_index, 9);
+    assert!(checkpoint.integrity_digest.is_some());
+    temp_dir.close().unwrap();
+}
+
+#[tokio::test]
 async fn new_checkpoint_manager_rebuilds_an_empty_snapshot() {
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();
