@@ -31,6 +31,10 @@ use crate::admin::storage_api::bucket::metadata::{
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
+use crate::admin::storage_api::bucket::replication::{
+    assign_site_replication_rule_priorities, is_site_replication_rule, merge_incoming_replication_config,
+    replication_target_arn_deployment_id,
+};
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
@@ -1115,6 +1119,36 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
             format!("failed to load site replication state: {err}"),
         )),
     }
+}
+
+/// Whether this deployment participates in site replication (two or more
+/// peers in the persisted state). Read by the S3 interface layer to gate
+/// replication-config edits (MinIO `ErrReplicationDenyEditError` semantics,
+/// issue #1948); a state-read failure propagates so the gate fails closed.
+pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
+    Ok(load_site_replication_state().await?.enabled())
+}
+
+/// Deployment ids of the remote peers the reconciler derives a
+/// `site-repl-<id>` rule for on every bucket (the same peer filter as
+/// `build_site_replication_config`); empty when site replication is not
+/// enabled. Read by the bucket usecase so an S3 replication-config edit keeps
+/// exactly the reconciler-owned rules (issue #1948); a state-read failure
+/// propagates so the edit fails closed.
+pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<HashSet<String>> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(HashSet::new());
+    }
+    let local_peer = current_local_runtime_peer(&state);
+    Ok(state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect())
 }
 
 async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
@@ -7748,20 +7782,6 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     replication_target_arn_deployment_id(&target.arn)
 }
 
-fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
-    let parts: Vec<_> = arn.split(':').collect();
-    if parts.len() == 6
-        && parts[0] == "arn"
-        && matches!(parts[1], "rustfs" | "minio")
-        && parts[2] == "replication"
-        && !parts[4].is_empty()
-    {
-        return Some(parts[4].to_string());
-    }
-
-    None
-}
-
 fn prune_removed_site_replication_bucket_targets(
     existing: BucketTargets,
     removed_deployment_ids: &HashSet<String>,
@@ -7784,10 +7804,6 @@ fn prune_removed_site_replication_bucket_targets(
     let removed = original_len.saturating_sub(targets.len());
 
     (BucketTargets { targets }, removed)
-}
-
-fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
-    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
 }
 
 /// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
@@ -7813,52 +7829,6 @@ async fn site_replication_targets_online(bucket: &str, replication_config_xml: &
     }
 
     true
-}
-
-/// Merge a peer's replication config into the local one.
-///
-/// `site-repl-*` rules encode the *sender's* outbound direction — their destination ARN
-/// names the receiver — so applying a peer's rule set verbatim replaces the receiver's
-/// reverse rule with one pointing at itself. No bucket target can satisfy that ARN
-/// (`reconcile_site_replication_bucket_targets` skips the local peer), so the receiver
-/// silently stops replicating back: the one-directional symptom. Only operator-authored
-/// rules travel between sites; each site owns its own `site-repl-*` rules.
-fn merge_incoming_replication_config(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
-) -> Option<ReplicationConfiguration> {
-    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
-    // Operator rules first, then the local site rules — the same order
-    // `ensure_site_replication_bucket_replication_config_with_runtime` produces, so its
-    // no-op check matches and the bucket metadata is written once per broadcast, not twice.
-    let mut rules: Vec<ReplicationRule> = incoming
-        .into_iter()
-        .flat_map(|config| config.rules)
-        .filter(|rule| !is_site_replication_rule(rule))
-        .collect();
-    rules.extend(
-        local
-            .into_iter()
-            .flat_map(|config| config.rules)
-            .filter(is_site_replication_rule),
-    );
-
-    if rules.is_empty() {
-        return None;
-    }
-
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
-
-    // A site-replication ARN in `role` is the sender's, and `site_replication_target_arns_by_peer`
-    // reads it — carrying it over would pin the receiver's targets to the sender's identity.
-    let role = match replication_target_arn_deployment_id(&incoming_role) {
-        Some(_) => String::new(),
-        None => incoming_role,
-    };
-
-    Some(ReplicationConfiguration { role, rules })
 }
 
 /// Merge a peer's ILM expiry document into the local lifecycle config.
@@ -8199,9 +8169,7 @@ fn prune_removed_site_replication_rules(
         return (None, removed);
     }
 
-    for (index, rule) in config.rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    assign_site_replication_rule_priorities(&mut config.rules, is_site_replication_rule);
 
     (Some(config), removed)
 }
@@ -8375,9 +8343,10 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
         .cloned()
         .collect();
     rules.extend(desired.rules);
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    // Operator priorities are the operator's policy; only the derived rules
+    // take free slots, by the same function as the config merges so a merged
+    // write and this pass agree byte for byte.
+    assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
 
     // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
     // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
@@ -17000,7 +16969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_removed_site_replication_rules_removes_site_rule_and_reorders_priorities() {
+    fn test_prune_removed_site_replication_rules_removes_site_rule_and_keeps_operator_priority() {
         let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
         let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
         let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
@@ -17017,9 +16986,9 @@ mod tests {
         assert!(updated.role.is_empty());
         assert_eq!(updated.rules.len(), 2);
         assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));
-        assert_eq!(updated.rules[0].priority, Some(1));
+        assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
-        assert_eq!(updated.rules[1].priority, Some(2));
+        assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
     }
 
     #[test]
