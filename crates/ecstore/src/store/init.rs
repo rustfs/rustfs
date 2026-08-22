@@ -3284,21 +3284,39 @@ mod tests {
 
         let record = validate_durable_ilm_record(&path, &data).expect("tier journal should validate");
         let source_zero_receipt = store
-            .persist_decommission_durable_ilm_receipt_for_test(0, 2, &path, &record, false)
-            .await
-            .expect("source pool zero receipt should persist on the target");
-        store
             .persist_decommission_durable_ilm_receipt_for_test(0, 1, &path, &record, false)
             .await
-            .expect("source pool zero receipt may reach another active source first");
+            .expect("source pool zero receipt should persist on the other active source");
         let source_one_receipt = store
-            .persist_decommission_durable_ilm_receipt_for_test(1, 2, &path, &record, false)
+            .persist_decommission_durable_ilm_receipt_for_test(1, 0, &path, &record, false)
             .await
-            .expect("source pool one receipt should persist on the target");
+            .expect("source pool one receipt should persist on the other active source");
         assert_ne!(
             source_zero_receipt, source_one_receipt,
             "active source runs must have distinct receipt paths"
         );
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("cross-source receipts should not remove active source journals");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        for pool in &store.pools {
+            assert_eq!(
+                com::read_config(pool.clone(), &path)
+                    .await
+                    .expect("cross-source receipts alone must retain every journal copy"),
+                data
+            );
+        }
+
+        store
+            .persist_decommission_durable_ilm_receipt_for_test(0, 2, &path, &record, false)
+            .await
+            .expect("source pool zero receipt should persist on the target");
+        store
+            .persist_decommission_durable_ilm_receipt_for_test(1, 2, &path, &record, false)
+            .await
+            .expect("source pool one receipt should persist on the target");
 
         let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await

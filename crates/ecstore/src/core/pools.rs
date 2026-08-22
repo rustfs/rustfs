@@ -5478,7 +5478,12 @@ impl ECStore {
         }
     }
 
-    async fn advance_durable_ilm_decommission_receipts(&self, path: &str, data: &[u8], terminal: bool) -> Result<Vec<usize>> {
+    async fn advance_durable_ilm_decommission_receipts(
+        &self,
+        path: &str,
+        data: &[u8],
+        terminal: bool,
+    ) -> Result<Option<Vec<usize>>> {
         let active_runs = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta
@@ -5495,7 +5500,7 @@ impl ECStore {
                 .collect::<Vec<_>>()
         };
         if active_runs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let stage = if terminal { "terminal" } else { "progress" };
@@ -5528,7 +5533,7 @@ impl ECStore {
                 )));
             }
         }
-        Ok(terminal_target_pool_indices)
+        Ok(Some(terminal_target_pool_indices))
     }
 
     pub(crate) async fn record_durable_ilm_decommission_progress(&self, path: &str, data: &[u8]) -> Result<()> {
@@ -5548,7 +5553,7 @@ impl ECStore {
         &self,
         path: &str,
         data: &[u8],
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Option<Vec<usize>>> {
         self.advance_durable_ilm_decommission_receipts(path, data, true).await
     }
 

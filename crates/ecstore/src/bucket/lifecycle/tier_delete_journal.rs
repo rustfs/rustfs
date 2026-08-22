@@ -439,7 +439,7 @@ async fn process_committed_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jen
         .record_durable_ilm_decommission_terminal_target_pools(&path, &data)
         .await
         .map_err(std::io::Error::other)?;
-    if !target_pool_indices.is_empty() {
+    if let Some(target_pool_indices) = target_pool_indices {
         for target_pool_idx in target_pool_indices {
             match config_boundary::delete_config(api.pools[target_pool_idx].clone(), &path).await {
                 Ok(()) | Err(Error::ConfigNotFound) => {}
