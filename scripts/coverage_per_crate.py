@@ -47,23 +47,13 @@ def fmt_pct(covered: int, count: int) -> str:
     return f"{100.0 * covered / count:.2f}%" if count else "—"
 
 
-def main() -> int:
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
-        print(__doc__.strip(), file=sys.stderr)
-        return 2
-    path = sys.argv[1]
-    root = os.path.abspath(sys.argv[2] if len(sys.argv) == 3 else os.getcwd())
-
+def load_coverage(path: str, root: str) -> tuple[dict[str, list[int]], dict[str, int]]:
     with open(path, encoding="utf-8") as fh:
         export = json.load(fh)
 
-    try:
-        data = export["data"][0]
-        files = data["files"]
-        totals = data["totals"]["lines"]
-    except (KeyError, IndexError) as exc:
-        print(f"error: unexpected llvm-cov JSON shape ({exc})", file=sys.stderr)
-        return 1
+    data = export["data"][0]
+    files = data["files"]
+    totals = data["totals"]["lines"]
 
     crates: dict[str, list[int]] = {}
     for f in files:
@@ -71,6 +61,21 @@ def main() -> int:
         acc = crates.setdefault(crate_label(f["filename"], root), [0, 0])
         acc[0] += lines["covered"]
         acc[1] += lines["count"]
+    return crates, totals
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    path = sys.argv[1]
+    root = os.path.abspath(sys.argv[2] if len(sys.argv) == 3 else os.getcwd())
+
+    try:
+        crates, totals = load_coverage(path, root)
+    except (KeyError, IndexError) as exc:
+        print(f"error: unexpected llvm-cov JSON shape ({exc})", file=sys.stderr)
+        return 1
 
     rows = sorted(
         crates.items(),

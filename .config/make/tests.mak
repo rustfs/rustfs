@@ -36,6 +36,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_manual_transition_runbooks.sh
 	./scripts/check_embedded_secrets.sh --self-test
 	python3 ./scripts/check_test_wiring.py --self-test
+	python3 ./scripts/check_security_coverage.py --self-test
 	python3 ./scripts/s3-tests/test_report_compat.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
