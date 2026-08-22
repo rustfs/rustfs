@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Per-object scan actions: ScannerItem, the get-size failure policy, and the heal/ILM admission helpers.
 use super::*;
+use sha2::{Digest as _, Sha256};
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -30,6 +31,259 @@ pub(super) enum GetSizeFailureAction {
     Skip,
     RecordFailed,
     HealMetadata { object: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SizeResolutionReason {
+    CompressedSizeUnknown,
+    InvalidPhysicalSize,
+    UnsupportedCompression,
+    InvalidObjectSize,
+    InvalidPartSize,
+    InvalidDeclaredSize,
+    SizeOverflowOrMismatch,
+}
+
+impl SizeResolutionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CompressedSizeUnknown => "compressed_size_unknown",
+            Self::InvalidPhysicalSize => "invalid_physical_size",
+            Self::UnsupportedCompression => "unsupported_compression",
+            Self::InvalidObjectSize => "invalid_object_size",
+            Self::InvalidPartSize => "invalid_part_size",
+            Self::InvalidDeclaredSize => "invalid_declared_size",
+            Self::SizeOverflowOrMismatch => "size_overflow_or_mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SizeResolution {
+    Known { logical: i64, physical: i64 },
+    Unknown { physical: i64, reason: SizeResolutionReason },
+    Corrupt { physical: i64, reason: SizeResolutionReason },
+}
+
+impl SizeResolution {
+    fn known_size(&self) -> Option<i64> {
+        match self {
+            Self::Known { logical, .. } => Some(*logical),
+            Self::Unknown { .. } | Self::Corrupt { .. } => None,
+        }
+    }
+}
+
+fn size_reconciliation_key(oi: &ObjectInfo, reason: SizeResolutionReason) -> String {
+    let version = oi
+        .version_id
+        .filter(|version| !version.is_nil())
+        .map(|version| version.to_string())
+        .unwrap_or_default();
+    let generation = oi
+        .data_dir
+        .filter(|generation| !generation.is_nil())
+        .map(|generation| generation.to_string())
+        .unwrap_or_default();
+    // Length-prefix each component so an object key containing the separator
+    // cannot alias another identity. S3 keys are bounded in normal operation;
+    // oversized persisted values use a digest so a corrupt metadata record
+    // cannot grow the ledger without bound.
+    fn component(value: &str) -> String {
+        const MAX_COMPONENT_LEN: usize = 512;
+        if value.len() <= MAX_COMPONENT_LEN {
+            return format!("{}:{}", value.len(), value);
+        }
+        let digest = Sha256::digest(value.as_bytes());
+        let digest = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+        format!("hash:{}:{}", value.len(), digest)
+    }
+    format!(
+        "{}|{}|{}|{}|{}",
+        component(&oi.bucket),
+        component(&oi.name),
+        component(&version),
+        component(&generation),
+        component(reason.as_str())
+    )
+}
+
+pub(super) fn bounded_reconciliation_field(value: &str) -> String {
+    const MAX_FIELD_LEN: usize = 512;
+    if value.len() <= MAX_FIELD_LEN {
+        return value.to_string();
+    }
+    let digest = hex_simd::encode_to_string(Sha256::digest(value.as_bytes()), hex_simd::AsciiCase::Lower);
+    let prefix_len = MAX_FIELD_LEN - 65;
+    let prefix = value
+        .char_indices()
+        .take_while(|(offset, ch)| offset.saturating_add(ch.len_utf8()) <= prefix_len)
+        .map(|(_, ch)| ch)
+        .collect::<String>();
+    format!("{}~{}", prefix, digest)
+}
+
+fn record_size_resolution(summary: &mut SizeSummary, oi: &ObjectInfo, resolution: &SizeResolution) {
+    match resolution {
+        SizeResolution::Known { .. } => {}
+        SizeResolution::Unknown { physical, reason } | SizeResolution::Corrupt { physical, reason } => {
+            summary.record_size_reconciliation(SizeReconciliationEntry {
+                key: size_reconciliation_key(oi, *reason),
+                bucket: bounded_reconciliation_field(&oi.bucket),
+                object: bounded_reconciliation_field(&oi.name),
+                version_id: oi
+                    .version_id
+                    .filter(|version| !version.is_nil())
+                    .map(|version| version.to_string()),
+                generation: oi
+                    .data_dir
+                    .filter(|generation| !generation.is_nil())
+                    .map(|generation| generation.to_string()),
+                reason: reason.as_str().to_string(),
+                physical_size: u64::try_from(*physical).ok(),
+                first_seen: 0,
+                attempts: 0,
+            });
+        }
+    }
+}
+
+/// Resolve the size metadata once at the scanner trust boundary. A compressed
+/// -1 sentinel is valid legacy metadata, but it cannot participate in normal
+/// logical-size accounting or size-filtered lifecycle rules.
+pub(super) fn resolve_size(oi: &ObjectInfo) -> SizeResolution {
+    let physical = oi.size;
+    if physical < 0 {
+        return SizeResolution::Corrupt {
+            physical,
+            reason: SizeResolutionReason::InvalidPhysicalSize,
+        };
+    }
+
+    let compressed = match oi.compression_read_plan() {
+        Ok((_, _, compressed)) => compressed,
+        Err(_) => {
+            return SizeResolution::Corrupt {
+                physical,
+                reason: SizeResolutionReason::UnsupportedCompression,
+            };
+        }
+    };
+
+    if oi.actual_size < -1 || (oi.actual_size == -1 && !compressed) {
+        return SizeResolution::Corrupt {
+            physical,
+            reason: SizeResolutionReason::InvalidObjectSize,
+        };
+    }
+
+    // Match ObjectInfo::get_actual_size: a positive in-memory value is the
+    // authoritative decoded size. Stale declared/part metadata must not turn
+    // an otherwise valid object into a false corruption report.
+    if oi.actual_size > 0 {
+        return SizeResolution::Known {
+            logical: oi.actual_size,
+            physical,
+        };
+    }
+
+    if oi
+        .parts
+        .iter()
+        .any(|part| part.actual_size < -1 || (part.actual_size < 0 && !compressed))
+    {
+        return SizeResolution::Corrupt {
+            physical,
+            reason: SizeResolutionReason::InvalidPartSize,
+        };
+    }
+
+    let declared = rustfs_utils::http::get_str(&oi.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
+    let declared = match declared {
+        Some(value) if value.is_empty() => {
+            return SizeResolution::Corrupt {
+                physical,
+                reason: SizeResolutionReason::InvalidDeclaredSize,
+            };
+        }
+        Some(value) => match value.parse::<i64>() {
+            Ok(value) if value >= 0 => Some(value),
+            _ => {
+                return SizeResolution::Corrupt {
+                    physical,
+                    reason: SizeResolutionReason::InvalidDeclaredSize,
+                };
+            }
+        },
+        None => None,
+    };
+
+    let logical = match oi.get_actual_size() {
+        Ok(size) if size == -1 && compressed && declared.is_none() => {
+            return SizeResolution::Unknown {
+                physical,
+                reason: SizeResolutionReason::CompressedSizeUnknown,
+            };
+        }
+        Ok(size) if size >= 0 => size,
+        Ok(_) | Err(_) => {
+            return SizeResolution::Corrupt {
+                physical,
+                reason: SizeResolutionReason::SizeOverflowOrMismatch,
+            };
+        }
+    };
+
+    if compressed && logical == 0 && physical != 0 && oi.parts.is_empty() && declared.is_none() {
+        return SizeResolution::Corrupt {
+            physical,
+            reason: SizeResolutionReason::SizeOverflowOrMismatch,
+        };
+    }
+
+    SizeResolution::Known { logical, physical }
+}
+
+fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
+    object_infos.iter().map(resolve_size).collect()
+}
+
+fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
+    let filter_has_size = |filter: &s3s::dto::LifecycleRuleFilter| {
+        filter.object_size_greater_than.is_some()
+            || filter.object_size_less_than.is_some()
+            || filter
+                .and
+                .as_ref()
+                .is_some_and(|and| and.object_size_greater_than.is_some() || and.object_size_less_than.is_some())
+    };
+    lifecycle
+        .rules
+        .iter()
+        .find(|rule| rule.id.as_deref().unwrap_or_default() == rule_id)
+        .and_then(|rule| rule.filter.as_ref())
+        .is_some_and(filter_has_size)
+}
+
+fn lifecycle_event_allowed(resolution: &SizeResolution, event: &Event, lifecycle: &BucketLifecycleConfiguration) -> bool {
+    match resolution {
+        // Corrupt metadata cannot safely authorize a destructive action, even
+        // when the evaluator happened to produce a time-only event.
+        SizeResolution::Corrupt { .. } => false,
+        // A valid-but-unknown logical size may still execute lifecycle
+        // actions whose rule is independent of object-size predicates. The
+        // evaluator has already selected the rule; only that rule's filter
+        // can make the missing logical value action-critical.
+        SizeResolution::Unknown { .. } => !lifecycle_rule_has_size_filter(lifecycle, &event.rule_id),
+        SizeResolution::Known { .. } => true,
+    }
+}
+
+/// A successful newer-noncurrent batch consumes both known and unresolved
+/// versions from the retained-version alert count. The two accounting paths
+/// are separate because only known sizes can contribute byte totals.
+fn remaining_versions_after_queued_noncurrent(remaining_versions: usize, known_count: usize, unknown_count: usize) -> usize {
+    remaining_versions.saturating_sub(known_count.saturating_add(unknown_count))
 }
 
 /// How the corrupt-metadata branch records the repair after attempting an
@@ -319,34 +573,45 @@ impl ScannerItem {
             "Scanner lifecycle evaluation started"
         );
 
+        let resolved_sizes = resolve_sizes(&object_infos);
+        if let Some(first) = object_infos.first() {
+            size_summary.record_reconciliation_scope(
+                &bounded_reconciliation_field(&first.bucket),
+                &bounded_reconciliation_field(&first.name),
+            );
+        }
+        for (oi, resolution) in object_infos.iter().zip(resolved_sizes.iter()) {
+            record_size_resolution(size_summary, oi, resolution);
+        }
+        let has_corrupt_size = resolved_sizes
+            .iter()
+            .any(|resolution| matches!(resolution, SizeResolution::Corrupt { .. }));
+
         // `versioning_config` is resolved once per object by the caller
         // (`get_size`) and handed in; only `prefix_enabled` is consulted here.
 
-        let Some(lifecycle) = self.lifecycle.as_ref() else {
-            let mut cumulative_size = 0;
-            for oi in object_infos.iter() {
-                let actual_size = match oi.get_actual_size() {
-                    Ok(size) => size,
-                    Err(_) => {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            state = "size_lookup_failed",
-                            "Scanner lifecycle action used fallback size"
-                        );
+        let Some(lifecycle) = self.lifecycle.clone() else {
+            let mut cumulative_size: i64 = 0;
+            for (oi, resolved_size) in object_infos.iter().zip(resolved_sizes.iter()) {
+                let accounting_size = match resolved_size {
+                    SizeResolution::Known { logical, .. } => *logical,
+                    // A valid compressed legacy sentinel has no logical size,
+                    // but heal and replication still need to run. The
+                    // physical size is only an input to those operations; it
+                    // is not folded into the logical total below.
+                    SizeResolution::Unknown { physical, .. } => {
+                        self.heal_actions(oi, *physical, size_summary).await;
+                        size_summary.actions_accounting_unknown(oi);
                         continue;
                     }
+                    SizeResolution::Corrupt { .. } => continue,
                 };
 
-                let size = self.heal_actions(oi, actual_size, size_summary).await;
+                let size = self.heal_actions(oi, accounting_size, size_summary).await;
 
-                size_summary.actions_accounting(oi, size, actual_size);
+                size_summary.actions_accounting(oi, size, accounting_size);
 
-                cumulative_size += size;
+                cumulative_size = cumulative_size.saturating_add(size);
             }
 
             self.alert_excessive_versions(object_infos.len(), cumulative_size);
@@ -400,25 +665,108 @@ impl ScannerItem {
         let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
         let mut noncurrent_events: Vec<Event> = Vec::new();
         let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();
+        let mut noncurrent_unknown: Vec<&ObjectInfo> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
         'eventLoop: {
             for (i, event) in events.iter().enumerate() {
                 let oi = &object_infos[i];
-                let actual_size = match oi.get_actual_size() {
-                    Ok(size) => size,
-                    Err(_) => {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                            bucket = %self.bucket,
-                            object = %oi.name,
-                            state = "size_lookup_failed",
-                            "Scanner lifecycle action used fallback size"
-                        );
-                        0
+                let known_size = resolved_sizes[i].known_size();
+                if has_corrupt_size
+                    && matches!(
+                        event.action,
+                        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction
+                    )
+                {
+                    // An all-version delete would also remove a corrupt
+                    // sibling that could not be reconciled safely.
+                    continue;
+                }
+                if !lifecycle_event_allowed(&resolved_sizes[i], event, &lifecycle) {
+                    // An unknown logical size must not make an otherwise
+                    // non-destructive scan disappear from heal/physical-tier
+                    // accounting. Size-filtered or deferred events remain
+                    // pending, so retain the version-only physical counters.
+                    if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
+                        self.heal_actions(oi, *physical, size_summary).await;
+                        size_summary.actions_accounting_unknown(oi);
+                    }
+                    continue;
+                }
+                let actual_size = match known_size {
+                    Some(size) => size,
+                    None => {
+                        match event.action {
+                            IlmAction::DeleteAction
+                            | IlmAction::DeleteRestoredAction
+                            | IlmAction::DeleteRestoredVersionAction
+                            | IlmAction::DeleteAllVersionsAction
+                            | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                                let done_ilm = Metrics::time_ilm(event.action);
+                                let trace_started_at = trace_start_instant();
+                                let queued = apply_expiry_rule(event, &LcEventSrc::Scanner, oi).await;
+                                emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
+                                if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
+                                    done_ilm(1)();
+                                    if event.action == IlmAction::DeleteAllVersionsAction
+                                        || event.action == IlmAction::DelMarkerDeleteAllVersionsAction
+                                    {
+                                        remaining_versions = 0;
+                                    }
+                                } else if matches!(
+                                    event.action,
+                                    IlmAction::DeleteAction
+                                        | IlmAction::DeleteRestoredAction
+                                        | IlmAction::DeleteRestoredVersionAction
+                                ) {
+                                    size_summary.actions_accounting_unknown(oi);
+                                } else {
+                                    size_summary.actions_accounting_unknown(oi);
+                                    for (j, retained) in object_infos.iter().enumerate().skip(i + 1) {
+                                        match &resolved_sizes[j] {
+                                            SizeResolution::Known { logical, .. } => PendingScannerAccounting {
+                                                object: retained,
+                                                retained_size: *logical,
+                                                expired_size: 0,
+                                            }
+                                            .apply(size_summary, &mut cumulative_size, false),
+                                            SizeResolution::Unknown { .. } => {
+                                                size_summary.actions_accounting_unknown(retained);
+                                            }
+                                            SizeResolution::Corrupt { .. } => {}
+                                        }
+                                    }
+                                }
+                            }
+                            IlmAction::DeleteVersionAction => {
+                                if let Some(opt) = object_opts.get(i) {
+                                    to_delete_objs.push(ObjectToDelete {
+                                        object_name: opt.name.clone(),
+                                        version_id: opt.version_id,
+                                        ..Default::default()
+                                    });
+                                    noncurrent_events.push(event.clone());
+                                    noncurrent_unknown.push(oi);
+                                }
+                            }
+                            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
+                                let trace_started_at = trace_start_instant();
+                                let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                                emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
+                                if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
+                                    let done_ilm = Metrics::time_ilm(event.action);
+                                    done_ilm(1)();
+                                }
+                                size_summary.actions_accounting_unknown(oi);
+                            }
+                            IlmAction::NoneAction | IlmAction::ActionCount => {
+                                if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
+                                    self.heal_actions(oi, *physical, size_summary).await;
+                                }
+                                size_summary.actions_accounting_unknown(oi);
+                            }
+                        }
+                        continue;
                     }
                 };
 
@@ -446,35 +794,23 @@ impl ScannerItem {
                             done_ilm(1)();
                             remaining_versions = 0;
                         } else {
-                            PendingScannerAccounting {
-                                object: oi,
-                                retained_size: actual_size,
-                                expired_size: 0,
-                            }
-                            .apply(size_summary, &mut cumulative_size, false);
-                            for retained in object_infos.iter().skip(i + 1) {
-                                let retained_size = match retained.get_actual_size() {
-                                    Ok(size) => size,
-                                    Err(_) => {
-                                        warn!(
-                                            target: "rustfs::scanner::folder",
-                                            event = EVENT_SCANNER_LIFECYCLE_ACTION,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                            bucket = %self.bucket,
-                                            object = %retained.name,
-                                            state = "size_lookup_failed",
-                                            "Scanner lifecycle action used fallback size"
-                                        );
-                                        0
-                                    }
-                                };
+                            if let Some(actual_size) = known_size {
                                 PendingScannerAccounting {
-                                    object: retained,
-                                    retained_size,
+                                    object: oi,
+                                    retained_size: actual_size,
                                     expired_size: 0,
                                 }
                                 .apply(size_summary, &mut cumulative_size, false);
+                            }
+                            for (j, retained) in object_infos.iter().enumerate().skip(i + 1) {
+                                if let Some(retained_size) = resolved_sizes[j].known_size() {
+                                    PendingScannerAccounting {
+                                        object: retained,
+                                        retained_size,
+                                        expired_size: 0,
+                                    }
+                                    .apply(size_summary, &mut cumulative_size, false);
+                                }
                             }
                         }
                         break 'eventLoop;
@@ -511,11 +847,13 @@ impl ScannerItem {
                                 version_id: opt.version_id,
                                 ..Default::default()
                             });
-                            noncurrent_accounting.push(PendingScannerAccounting {
-                                object: oi,
-                                retained_size: actual_size,
-                                expired_size: 0,
-                            });
+                            if let Some(actual_size) = known_size {
+                                noncurrent_accounting.push(PendingScannerAccounting {
+                                    object: oi,
+                                    retained_size: actual_size,
+                                    expired_size: 0,
+                                });
+                            }
                             account_now = false;
                         }
                         noncurrent_events.push(event.clone());
@@ -548,7 +886,7 @@ impl ScannerItem {
 
                 if account_now {
                     size_summary.actions_accounting(oi, size, actual_size);
-                    cumulative_size += size;
+                    cumulative_size = cumulative_size.saturating_add(size);
                 }
             }
         }
@@ -576,10 +914,19 @@ impl ScannerItem {
             }
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
-                remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
+                remaining_versions = remaining_versions_after_queued_noncurrent(
+                    remaining_versions,
+                    noncurrent_accounting.len(),
+                    noncurrent_unknown.len(),
+                );
             }
             for pending in noncurrent_accounting {
                 pending.apply(size_summary, &mut cumulative_size, queued);
+            }
+            if !queued {
+                for object in noncurrent_unknown {
+                    size_summary.actions_accounting_unknown(object);
+                }
             }
         }
         self.alert_excessive_versions(remaining_versions, cumulative_size);
@@ -928,5 +1275,362 @@ mod tests {
         assert_eq!(item.prefix, "");
         assert_eq!(item.object_name, "object");
         assert_eq!(item.object_path(), "object");
+    }
+
+    #[test]
+    fn size_resolution_rejects_negative_overflow_and_unknown_compression() {
+        let compressed = |actual_size: i64, declared: Option<&str>| {
+            let mut user_defined = HashMap::new();
+            rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+            if let Some(declared) = declared {
+                rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, declared.to_string());
+            }
+            ObjectInfo {
+                size: 12,
+                actual_size,
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            }
+        };
+
+        let normal = ObjectInfo {
+            size: 12,
+            actual_size: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_size(&normal),
+            SizeResolution::Known {
+                logical: 10,
+                physical: 12
+            }
+        );
+
+        let stale_declared_metadata = ObjectInfo {
+            size: 12,
+            actual_size: 10,
+            user_defined: Arc::new(HashMap::from([("x-rustfs-internal-actual-size".to_string(), "not-a-size".to_string())])),
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                actual_size: -2,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_size(&stale_declared_metadata),
+            SizeResolution::Known {
+                logical: 10,
+                physical: 12
+            }
+        );
+
+        assert_eq!(
+            resolve_size(&compressed(0, Some("9"))),
+            SizeResolution::Known {
+                logical: 9,
+                physical: 12
+            }
+        );
+        assert_eq!(
+            resolve_size(&compressed(-1, None)),
+            SizeResolution::Unknown {
+                physical: 12,
+                reason: SizeResolutionReason::CompressedSizeUnknown,
+            }
+        );
+        assert!(matches!(
+            resolve_size(&compressed(0, Some("not-a-size"))),
+            SizeResolution::Corrupt {
+                reason: SizeResolutionReason::InvalidDeclaredSize,
+                ..
+            }
+        ));
+        assert!(matches!(
+            resolve_size(&ObjectInfo {
+                size: 12,
+                actual_size: -2,
+                ..Default::default()
+            }),
+            SizeResolution::Corrupt { .. }
+        ));
+        assert!(matches!(resolve_size(&compressed(0, Some("-1"))), SizeResolution::Corrupt { .. }));
+        assert!(matches!(resolve_size(&compressed(0, Some(""))), SizeResolution::Corrupt { .. }));
+
+        let unsupported = {
+            let mut object = compressed(0, None);
+            let mut metadata = (*object.user_defined).clone();
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "unsupported".to_string());
+            object.user_defined = Arc::new(metadata);
+            object
+        };
+        assert!(matches!(resolve_size(&unsupported), SizeResolution::Corrupt { .. }));
+
+        let invalid_part = {
+            let mut object = compressed(0, None);
+            object.parts = Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                size: 12,
+                actual_size: -2,
+                ..Default::default()
+            }]);
+            object
+        };
+        assert!(matches!(resolve_size(&invalid_part), SizeResolution::Corrupt { .. }));
+
+        let overflow = {
+            let mut object = compressed(0, None);
+            object.parts = Arc::new(vec![
+                rustfs_filemeta::ObjectPartInfo {
+                    size: 1,
+                    actual_size: i64::MAX,
+                    ..Default::default()
+                },
+                rustfs_filemeta::ObjectPartInfo {
+                    size: 1,
+                    actual_size: 1,
+                    ..Default::default()
+                },
+            ]);
+            object
+        };
+        assert!(matches!(resolve_size(&overflow), SizeResolution::Corrupt { .. }));
+
+        let mismatch = compressed(0, None);
+        assert!(matches!(resolve_size(&mismatch), SizeResolution::Corrupt { .. }));
+        assert_eq!(
+            resolve_size(&ObjectInfo {
+                size: 0,
+                actual_size: 0,
+                ..Default::default()
+            }),
+            SizeResolution::Known { logical: 0, physical: 0 }
+        );
+    }
+
+    #[test]
+    fn size_resolution_records_and_replays_one_identity() {
+        let version_id = uuid::Uuid::new_v4();
+        let generation = uuid::Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "not-a-number".to_string());
+        let corrupt = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 12,
+            version_id: Some(version_id),
+            data_dir: Some(generation),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        let mut summary = SizeSummary::default();
+        let resolution = resolve_size(&corrupt);
+        record_size_resolution(&mut summary, &corrupt, &resolution);
+        record_size_resolution(&mut summary, &corrupt, &resolution);
+        assert_eq!(summary.size_reconciliation.len(), 1);
+        assert_eq!(summary.size_reconciliation[0].reason, "invalid_declared_size");
+        assert_eq!(summary.size_reconciliation[0].physical_size, Some(12));
+
+        let known = ObjectInfo {
+            actual_size: 12,
+            user_defined: Arc::new(HashMap::new()),
+            ..corrupt.clone()
+        };
+        record_size_resolution(&mut summary, &known, &resolve_size(&known));
+        summary.record_reconciliation_scope(&known.bucket, &known.name);
+        assert_eq!(summary.reconciliation_scopes.len(), 1);
+        assert_eq!(summary.reconciliation_scopes[0].bucket, "bucket");
+    }
+
+    #[test]
+    fn malformed_size_has_same_ilm_accounting() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "invalid".to_string());
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 12,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let resolution = resolve_size(&object);
+        let mut without_ilm = SizeSummary::default();
+        let mut with_ilm = SizeSummary::default();
+        record_size_resolution(&mut without_ilm, &object, &resolution);
+        record_size_resolution(&mut with_ilm, &object, &resolution);
+        assert_eq!(without_ilm.size_reconciliation, with_ilm.size_reconciliation);
+        assert_eq!(without_ilm.total_size, 0);
+        assert_eq!(with_ilm.total_size, 0);
+        assert!(without_ilm.tier_stats.is_empty());
+        assert!(with_ilm.tier_stats.is_empty());
+    }
+
+    #[test]
+    fn size_resolution_parses_once_per_version() {
+        let objects = vec![
+            ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "one".to_string(),
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            },
+            ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "two".to_string(),
+                size: 2,
+                actual_size: -2,
+                ..Default::default()
+            },
+        ];
+        let resolutions = resolve_sizes(&objects);
+        assert_eq!(resolutions.len(), objects.len());
+        assert!(matches!(resolutions[0], SizeResolution::Known { logical: 1, .. }));
+        assert!(matches!(resolutions[1], SizeResolution::Corrupt { .. }));
+    }
+
+    #[test]
+    fn queued_unknown_noncurrent_versions_are_removed_from_alert_count() {
+        assert_eq!(remaining_versions_after_queued_noncurrent(3, 1, 2), 0);
+        assert_eq!(remaining_versions_after_queued_noncurrent(7, 2, 1), 4);
+        assert_eq!(remaining_versions_after_queued_noncurrent(usize::MAX, usize::MAX, usize::MAX), 0);
+    }
+
+    #[test]
+    fn malformed_size_blocks_size_dependent_transition_but_allows_time_only_expiry() {
+        let size_filtered = BucketLifecycleConfiguration {
+            rules: vec![s3s::dto::LifecycleRule {
+                status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                id: Some("size".to_string()),
+                filter: Some(s3s::dto::LifecycleRuleFilter {
+                    object_size_greater_than: Some(1),
+                    ..Default::default()
+                }),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+            ..Default::default()
+        };
+        let unknown = SizeResolution::Unknown {
+            physical: 12,
+            reason: SizeResolutionReason::CompressedSizeUnknown,
+        };
+        let size_event = Event {
+            action: IlmAction::DeleteAction,
+            rule_id: "size".to_string(),
+            ..Default::default()
+        };
+        assert!(!lifecycle_event_allowed(&unknown, &size_event, &size_filtered));
+        assert!(!lifecycle_event_allowed(
+            &unknown,
+            &Event {
+                action: IlmAction::TransitionAction,
+                rule_id: "size".to_string(),
+                ..Default::default()
+            },
+            &size_filtered
+        ));
+        let mixed_filters = BucketLifecycleConfiguration {
+            rules: vec![
+                size_filtered.rules[0].clone(),
+                s3s::dto::LifecycleRule {
+                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                    expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    id: Some("time".to_string()),
+                    filter: None,
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(lifecycle_event_allowed(
+            &unknown,
+            &Event {
+                action: IlmAction::DeleteAction,
+                rule_id: "time".to_string(),
+                ..Default::default()
+            },
+            &mixed_filters
+        ));
+        assert!(lifecycle_event_allowed(
+            &unknown,
+            &Event {
+                action: IlmAction::TransitionAction,
+                ..Default::default()
+            },
+            &BucketLifecycleConfiguration::default()
+        ));
+        assert!(!lifecycle_event_allowed(
+            &SizeResolution::Corrupt {
+                physical: 12,
+                reason: SizeResolutionReason::InvalidDeclaredSize,
+            },
+            &Event {
+                action: IlmAction::DeleteAction,
+                ..Default::default()
+            },
+            &BucketLifecycleConfiguration::default()
+        ));
+        assert!(lifecycle_event_allowed(
+            &SizeResolution::Known {
+                logical: 10,
+                physical: 12,
+            },
+            &Event {
+                action: IlmAction::DeleteAllVersionsAction,
+                ..Default::default()
+            },
+            &BucketLifecycleConfiguration::default()
+        ));
+        assert!(lifecycle_event_allowed(
+            &unknown,
+            &Event {
+                action: IlmAction::DeleteAction,
+                rule_id: "time-only".to_string(),
+                ..Default::default()
+            },
+            &BucketLifecycleConfiguration::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn long_object_size_reconciliation_scope_uses_bounded_identity() {
+        let object_name = "o".repeat(600);
+        let mut item = scanner_item_with_prefix("");
+        item.object_name = object_name.clone();
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        let object = ObjectInfo {
+            bucket: item.bucket.clone(),
+            name: object_name.clone(),
+            size: 12,
+            actual_size: -1,
+            version_id: Some(uuid::Uuid::new_v4()),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let mut summary = SizeSummary::default();
+        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &mut summary)
+            .await;
+
+        let bounded_bucket = bounded_reconciliation_field(&item.bucket);
+        let bounded_object = bounded_reconciliation_field(&object_name);
+        assert_eq!(summary.reconciliation_scopes[0].bucket, bounded_bucket);
+        assert_eq!(summary.reconciliation_scopes[0].object, bounded_object);
+        assert_eq!(summary.size_reconciliation[0].object, bounded_object);
+        assert_eq!(summary.versions, 1);
+        assert_eq!(summary.total_size, 0);
     }
 }

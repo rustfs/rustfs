@@ -388,6 +388,66 @@ async fn test_record_failed_ttl_zero_noop() {
     assert!(!scanner.should_skip_failed("path2"));
 }
 
+#[tokio::test]
+async fn malformed_size_reconciliation_replays_after_restart() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+
+    let entry = SizeReconciliationEntry {
+        key: "1:b|6:object|0:|0:".to_string(),
+        bucket: "b".to_string(),
+        object: "object".to_string(),
+        reason: "invalid_declared_size".to_string(),
+        physical_size: Some(12),
+        ..Default::default()
+    };
+    let mut summary = SizeSummary::default();
+    summary.record_size_reconciliation(entry.clone());
+    summary.record_reconciliation_scope("b", "object");
+    scanner.apply_size_reconciliation(&summary);
+    scanner.apply_size_reconciliation(&summary);
+
+    assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
+    assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
+    assert_eq!(scanner.new_cache.info.size_reconciliation[&entry.key].attempts, 2);
+
+    let encoded = rmp_serde::to_vec_named(&scanner.new_cache.info).expect("size ledger should encode");
+    let decoded: crate::data_usage_define::DataUsageCacheInfo =
+        rmp_serde::from_slice(&encoded).expect("size ledger should decode");
+    assert_eq!(decoded.size_reconciliation.len(), 1);
+    assert_eq!(decoded.size_reconciliation[&entry.key].reason, "invalid_declared_size");
+
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("b", "object");
+    scanner.apply_size_reconciliation(&resolved);
+    assert!(scanner.new_cache.info.size_reconciliation.is_empty());
+    assert!(scanner.update_cache.info.size_reconciliation.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+    let long_object = "o".repeat(600);
+    let bounded_object = item_actions::bounded_reconciliation_field(&long_object);
+    let entry = SizeReconciliationEntry {
+        key: "long-object-key".to_string(),
+        bucket: "b".to_string(),
+        object: bounded_object,
+        reason: "invalid_declared_size".to_string(),
+        ..Default::default()
+    };
+    let mut summary = SizeSummary::default();
+    summary.record_size_reconciliation(entry);
+    scanner.apply_size_reconciliation(&summary);
+    assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
+
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("b", &long_object);
+    scanner.apply_size_reconciliation(&resolved);
+    assert!(scanner.new_cache.info.size_reconciliation.is_empty());
+}
+
 #[test]
 fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
     let temp_dir = std::env::temp_dir();
