@@ -580,6 +580,7 @@ mod tests {
                 recover_transition_transaction_records, save_transition_transaction_record,
                 transition_transaction_record_object_name,
             },
+            validate_durable_ilm_record,
         },
         bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG},
         client::transition_api::ReaderImpl,
