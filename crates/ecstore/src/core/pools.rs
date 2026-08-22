@@ -2876,6 +2876,8 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
+        #[cfg(test)]
+        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
         let activation_fence = acquire_pool_rebalance_activation_locks(rebalance_pool.clone()).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
@@ -4418,8 +4420,6 @@ impl ECStore {
         let indices = dedup_indices(&indices);
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        #[cfg(test)]
-        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
         #[cfg(test)]
         let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
