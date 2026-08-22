@@ -5501,6 +5501,7 @@ impl ECStore {
         let stage = if terminal { "terminal" } else { "progress" };
         let record = validate_durable_ilm_record(path, data)
             .map_err(|err| Error::other(format!("{stage} durable ILM record is invalid at path `{path}`: {err}")))?;
+        let active_source_pool_indices = active_runs.iter().map(|(pool_idx, _)| *pool_idx).collect::<Vec<_>>();
         let mut terminal_target_pool_indices = Vec::new();
         for (source_pool_idx, run_token) in active_runs {
             let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, record.id_kind, &record.id);
@@ -5511,7 +5512,11 @@ impl ECStore {
                         .advance_durable_ilm_decommission_receipt(pool_idx, &receipt_path, &record, terminal)
                         .await?;
                     receipt_found |= found;
-                    if terminal && found && !terminal_target_pool_indices.contains(&pool_idx) {
+                    if terminal
+                        && found
+                        && !active_source_pool_indices.contains(&pool_idx)
+                        && !terminal_target_pool_indices.contains(&pool_idx)
+                    {
                         terminal_target_pool_indices.push(pool_idx);
                     }
                 }
