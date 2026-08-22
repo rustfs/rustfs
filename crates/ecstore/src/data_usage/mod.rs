@@ -1391,7 +1391,37 @@ impl BucketUsageAccumulator {
 }
 
 pub fn quota_object_size(object: &ObjectInfo) -> Result<u64, Error> {
-    let logical_size = u64::try_from(object.get_actual_size().map_err(Error::other)?).map_err(|_| Error::PartMissingOrCorrupt)?;
+    // A compressed object may carry -1 while the transformed size is unknown
+    // (legacy streaming sentinel). In that case the persisted physical size
+    // is still a valid accounting floor; every other negative value is corrupt.
+    // An explicit negative `actual-size` metadata value is corrupt, however:
+    // the sentinel is only valid in the in-memory/object-part field written by
+    // the legacy streaming path, not as a persisted declared size.
+    let compressed = object.is_compressed();
+    if object.actual_size < -1 || (object.actual_size == -1 && !compressed) {
+        return Err(Error::PartMissingOrCorrupt);
+    }
+    if object
+        .parts
+        .iter()
+        .any(|part| part.actual_size < -1 || (part.actual_size < 0 && !compressed))
+    {
+        return Err(Error::PartMissingOrCorrupt);
+    }
+    let declared_actual_size = rustfs_utils::http::get_str(&object.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE)
+        .filter(|value| !value.is_empty());
+    if declared_actual_size
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|size| size < 0)
+    {
+        return Err(Error::PartMissingOrCorrupt);
+    }
+    let logical_size = match object.get_actual_size().map_err(Error::other)? {
+        size if size == -1 && compressed && declared_actual_size.is_none() => None,
+        size if size >= 0 => Some(u64::try_from(size).map_err(|_| Error::PartMissingOrCorrupt)?),
+        _ => return Err(Error::PartMissingOrCorrupt),
+    };
     let persisted_part_size = if object.parts.is_empty() {
         u64::try_from(object.size).map_err(|_| Error::PartMissingOrCorrupt)?
     } else {
@@ -1399,12 +1429,8 @@ pub fn quota_object_size(object: &ObjectInfo) -> Result<u64, Error> {
             // Compressed streaming objects persist -1 when the transformed
             // part size is unknown. The physical part size remains a valid
             // quota floor; reject only non-negative values that overflow.
-            let actual_size = if part.actual_size < 0 {
-                if object.is_compressed() {
-                    0
-                } else {
-                    return Err(Error::PartMissingOrCorrupt);
-                }
+            let actual_size = if part.actual_size == -1 {
+                0
             } else {
                 u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?
             };
@@ -1412,7 +1438,7 @@ pub fn quota_object_size(object: &ObjectInfo) -> Result<u64, Error> {
             total.checked_add(part_size).ok_or(Error::PartMissingOrCorrupt)
         })?
     };
-    Ok(logical_size.max(persisted_part_size))
+    Ok(logical_size.unwrap_or(0).max(persisted_part_size))
 }
 
 type UsageVersionPage = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -3318,6 +3344,80 @@ mod tests {
             quota_object_size(&poisoned).expect("persisted part accounting must bound legacy user metadata"),
             4096
         );
+    }
+
+    #[test]
+    fn quota_object_size_accepts_compressed_unknown_actual_size_sentinel() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        let object = ObjectInfo {
+            size: 400,
+            actual_size: -1,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        assert_eq!(quota_object_size(&object).expect("compressed sentinel is valid"), 400);
+    }
+
+    #[test]
+    fn quota_object_size_rejects_compressed_part_sum_overflow() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        let object = ObjectInfo {
+            size: 1,
+            user_defined: Arc::new(metadata),
+            parts: Arc::new(vec![
+                rustfs_filemeta::ObjectPartInfo {
+                    actual_size: i64::MAX,
+                    ..Default::default()
+                },
+                rustfs_filemeta::ObjectPartInfo {
+                    actual_size: 1,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        assert!(matches!(quota_object_size(&object), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn quota_object_size_rejects_negative_values_other_than_the_compressed_sentinel() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        let corrupt_object = ObjectInfo {
+            size: 400,
+            actual_size: -2,
+            user_defined: Arc::new(metadata.clone()),
+            ..Default::default()
+        };
+        assert!(matches!(quota_object_size(&corrupt_object), Err(Error::PartMissingOrCorrupt)));
+
+        let corrupt_part = ObjectInfo {
+            size: 400,
+            user_defined: Arc::new(metadata),
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                size: 400,
+                actual_size: -2,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(matches!(quota_object_size(&corrupt_part), Err(Error::PartMissingOrCorrupt)));
     }
 
     #[tokio::test]

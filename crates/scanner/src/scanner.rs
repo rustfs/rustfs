@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
-    DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_with_revision,
+    DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
 };
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
@@ -54,9 +54,7 @@ use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELA
 use rustfs_data_usage::observed_data_usage_is_newer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-#[cfg(test)]
-use tokio::sync::Notify;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -104,6 +102,13 @@ const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// unavailable peer cannot drive a tight retry loop.
 const SCANNER_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
 const SCANNER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// A transient backend outage remains self-healing after the short retry
+/// budget is exhausted, but the probe is intentionally sparse until storage
+/// recovers or an operator reset wakes the scanner.
+const SCANNER_CYCLE_RECOVERY_PAUSED_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Permanent recovery states still get a sparse status probe so a reset that
+/// races the wait registration cannot leave the scanner asleep forever.
+const SCANNER_CYCLE_RECOVERY_BLOCKED_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,6 +129,12 @@ type ScannerCycleStatePersistTestHook = (u64, Arc<Notify>);
 #[cfg(test)]
 static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<ScannerCycleStatePersistTestHook>>> =
     LazyLock::new(|| StdMutex::new(None));
+
+static SCANNER_CYCLE_RECOVERY_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+pub(super) fn notify_scanner_cycle_recovery_wake() {
+    SCANNER_CYCLE_RECOVERY_WAKE.notify_one();
+}
 
 #[cfg(test)]
 struct ScannerCycleStatePersistTestHookGuard;
@@ -576,19 +587,21 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
             tokio::time::sleep(sleep_time).await;
         }
 
+        let mut transient_backoff = ScannerRetryBackoff::default();
+        let mut recovery_retry_count = 0_u32;
         loop {
             if ctx_clone.is_cancelled() {
                 break;
             }
 
-            if let Err(e) = run_data_scanner_with_maintenance_state(
+            let run_result = run_data_scanner_with_maintenance_state(
                 ctx_clone.clone(),
                 storeapi_clone.clone(),
                 startup_features,
                 startup_maintenance_generation,
             )
-            .await
-            {
+            .await;
+            if let Err(e) = &run_result {
                 error!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_CYCLE_STATE,
@@ -599,11 +612,52 @@ pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
                     "Scanner runtime iteration failed"
                 );
             }
+            let recovery_status = scanner_cycle_recovery_status();
+            if recovery_status.retryable {
+                recovery_retry_count = recovery_retry_count.saturating_add(1);
+                let _ = record_scanner_cycle_recovery_retry(recovery_retry_count);
+            } else {
+                recovery_retry_count = 0;
+            }
+
+            let recovery_status = scanner_cycle_recovery_status();
+            if recovery_status.state == "paused" {
+                transient_backoff.record_retryable_cycle(false);
+                tokio::select! {
+                    _ = ctx_clone.cancelled() => break,
+                    _ = SCANNER_CYCLE_RECOVERY_WAKE.notified() => {},
+                    _ = tokio::time::sleep(SCANNER_CYCLE_RECOVERY_PAUSED_INTERVAL) => {},
+                }
+                recovery_retry_count = 0;
+                continue;
+            }
+            if !recovery_status.retryable
+                && matches!(recovery_status.state.as_str(), "blocked" | "recovery-required" | "cleanup-pending")
+            {
+                transient_backoff.record_retryable_cycle(false);
+                tokio::select! {
+                    _ = ctx_clone.cancelled() => break,
+                    _ = SCANNER_CYCLE_RECOVERY_WAKE.notified() => {},
+                    _ = tokio::time::sleep(SCANNER_CYCLE_RECOVERY_BLOCKED_PROBE_INTERVAL) => {},
+                }
+                continue;
+            }
+
+            let retry_delay = if recovery_status.retryable || run_result.is_err() {
+                transient_backoff.record_retryable_cycle(true);
+                transient_backoff
+                    .retry_interval(scanner_cycle_interval())
+                    .unwrap_or(SCANNER_RETRY_BASE_INTERVAL)
+            } else {
+                transient_backoff.record_retryable_cycle(false);
+                randomized_cycle_delay()
+            };
             // Backoff before retrying after lock contention or scanner-level failures.
             // Keep this cancellation-aware so shutdown is not delayed by backoff sleep.
             tokio::select! {
                 _ = ctx_clone.cancelled() => break,
-                _ = tokio::time::sleep(randomized_cycle_delay()) => {}
+                _ = SCANNER_CYCLE_RECOVERY_WAKE.notified() => {},
+                _ = tokio::time::sleep(retry_delay) => {}
             }
         }
     });
@@ -1606,40 +1660,22 @@ async fn run_data_scanner_with_maintenance_state(
         observe_scanner_activity(&storeapi, distributed, &mut scanner_activity_seen).await;
     }
 
-    let (buf, mut cycle_revision) = match read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await {
-        Ok((buf, revision)) => (buf.unwrap_or_default(), revision),
-        Err(err) => {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                state = "revision_load_failed",
-                error = %err,
-                "Scanner cycle state revision load failed"
-            );
-            global_metrics().set_cycle(None).await;
-            return Ok(());
-        }
-    };
-    let (mut cycle_info, mut leader_epoch) = match decode_scanner_cycle_state_for_startup(&buf) {
-        Ok(state) => state,
-        Err(err) => {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                state = "cycle_decode_failed",
-                error = %err,
-                "Scanner stopped because persisted cycle state is invalid"
-            );
-            global_metrics().set_cycle(None).await;
-            return Ok(());
-        }
-    };
+    let (mut cycle_info, mut leader_epoch, mut cycle_revision) =
+        match load_scanner_cycle_state_for_startup(storeapi.clone()).await {
+            ScannerCycleStateStartup::Ready {
+                cycle,
+                leader_epoch,
+                revision,
+            } => (cycle, leader_epoch, revision),
+            ScannerCycleStateStartup::Blocked => {
+                global_metrics().set_cycle(None).await;
+                return Ok(());
+            }
+            ScannerCycleStateStartup::Transient(err) => {
+                global_metrics().set_cycle(None).await;
+                return Err(err);
+            }
+        };
     let usage_floor = match persisted_usage_floor(storeapi.clone()).await {
         Ok(floor) => floor,
         Err(err) => {
@@ -2219,7 +2255,12 @@ pub(crate) use activity::{
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
-pub(crate) use cycle_state::{current_scanner_leader_epoch, decode_persisted_scanner_cycle_fence};
+pub use cycle_state::{
+    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, reset_scanner_cycle_recovery, scanner_cycle_recovery_status,
+};
+pub(crate) use cycle_state::{
+    current_scanner_leader_epoch, decode_persisted_scanner_cycle_fence, load_scanner_cycle_state_for_startup,
+};
 pub use heal_info::{BackgroundHealInfo, read_background_heal_info, save_background_heal_info};
 pub use usage_store::store_data_usage_in_backend;
 
