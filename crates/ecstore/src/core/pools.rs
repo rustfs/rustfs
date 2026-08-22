@@ -5282,13 +5282,12 @@ impl ECStore {
                     "decommission multipart drain lost the bucket lifecycle fence for `{bucket}`"
                 )));
             }
-        }
-
-        for set in &pool.disk_set {
-            if let Some(upload_path) = set.first_multipart_upload_path_for_decommission().await? {
-                return Err(Error::other(format!(
-                    "pool {idx} still contains multipart upload `{upload_path}`; resolve it before retrying decommission"
-                )));
+            for set in &pool.disk_set {
+                if let Some(upload_path) = set.first_multipart_upload_path_for_decommission(bucket).await? {
+                    return Err(Error::other(format!(
+                        "pool {idx} still contains multipart upload `{upload_path}` for bucket `{bucket}`; resolve it before retrying decommission"
+                    )));
+                }
             }
         }
 

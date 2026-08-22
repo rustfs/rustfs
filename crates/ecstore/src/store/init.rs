@@ -1631,9 +1631,10 @@ mod tests {
             .ensure_decommission_multipart_uploads_drained_for_test(0)
             .await
             .expect_err("an unresolved source multipart upload must block final decommission");
+        let drain_error = err.to_string();
         assert!(
-            err.to_string().contains("still contains multipart upload"),
-            "unexpected drain error: {err}"
+            drain_error.contains("still contains multipart upload") && drain_error.contains(&bucket),
+            "the drain error must identify both the upload path and user bucket: {drain_error}"
         );
 
         let listed = store
@@ -1696,6 +1697,65 @@ mod tests {
             .await
             .expect("final decommission gate should open after all source uploads are resolved");
         assert_pool_object_present(&store.pools[0], &bucket, complete_object).await;
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn active_multipart_upload_routes_before_faulted_suspended_source() {
+        let temp_dir = tempfile::tempdir().expect("create active-first multipart routing store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "active-first-multipart-routing", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("active-first-multipart-routing-{}", uuid::Uuid::new_v4());
+        let object = "target-upload.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create active-first multipart routing bucket");
+
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_read_lock(&bucket)
+            .await
+            .expect("acquire multipart creation lifecycle fence");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[1]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create upload in active target pool");
+        drop(lifecycle_guard);
+
+        mark_test_pool_decommissioning(&store, 0).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let original_source_disks = {
+            let mut disks = source_set.disks.write().await;
+            let original = disks.clone();
+            disks.fill(None);
+            original
+        };
+
+        let source_result = store.pools[0]
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await;
+        let routed_result = store
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await;
+        *source_set.disks.write().await = original_source_disks;
+
+        assert!(
+            matches!(&source_result, Err(StorageError::ErasureReadQuorum)),
+            "the suspended source must expose the injected hard read failure: {source_result:?}"
+        );
+        let routed = routed_result.expect("the active target UploadID must be resolved before the faulted suspended source");
+        assert_eq!(routed.upload_id, upload.upload_id);
 
         shutdown.cancel();
     }

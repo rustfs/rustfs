@@ -612,9 +612,9 @@ impl SetDisks {
         Ok((disks, candidate_paths, discovery_quorum))
     }
 
-    pub(crate) async fn first_multipart_upload_path_for_decommission(&self) -> Result<Option<String>> {
+    pub(crate) async fn first_multipart_upload_path_for_decommission(&self, bucket: &str) -> Result<Option<String>> {
         let (_, paths, _) = self
-            .discover_multipart_upload_paths(RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET)
+            .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET)
             .await?;
         Ok(paths.into_iter().next())
     }
