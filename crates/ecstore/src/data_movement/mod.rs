@@ -1545,13 +1545,12 @@ async fn migrate_object_inner(
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement(
-                    target_pool_idx,
+                    (target_pool_idx, mutation_fence),
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
                     parts,
                     &complete_multipart_opts,
-                    mutation_fence,
                 )
                 .await
             {
