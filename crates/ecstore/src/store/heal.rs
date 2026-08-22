@@ -616,6 +616,21 @@ mod tests {
                 .await
                 .expect("duplicate owner object should be written");
         }
+        let duplicate_missing_disk = store.pools[0].disk_set[0].disks.read().await[0]
+            .clone()
+            .expect("duplicate active owner disk should be online");
+        duplicate_missing_disk
+            .delete(
+                &bucket,
+                duplicate_object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("duplicate active owner shard should be removed for repair");
         let history_version = Uuid::new_v4();
         let mut history_reader = PutObjReader::from_vec(b"marker history".to_vec());
         store.pools[0]
@@ -678,6 +693,16 @@ mod tests {
         assert_eq!(
             active_duplicate_owner, 0,
             "suspended duplicate must be excluded from active owner selection"
+        );
+        let (duplicate_result, duplicate_err) = store
+            .handle_heal_object(&bucket, duplicate_object, "", &HealOpts::default())
+            .await
+            .expect("duplicate owner heal should complete through the production path");
+        assert_eq!(duplicate_result.object, duplicate_object);
+        assert!(duplicate_err.is_none(), "active duplicate should be repaired: {duplicate_err:?}");
+        assert!(
+            duplicate_missing_disk.read_xl(&bucket, duplicate_object, false).await.is_ok(),
+            "production heal must repair the active duplicate owner rather than the suspended owner"
         );
         let (marker_info, marker_owner) = store
             .get_latest_object_info_with_idx(
