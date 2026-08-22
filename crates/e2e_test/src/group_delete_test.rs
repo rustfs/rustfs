@@ -129,9 +129,18 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
         &env.secret_key,
     )
     .await?;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "deleting a non-empty group must return HTTP 400, body: {delete_body}"
+    );
     assert!(
-        !delete_status.is_success(),
-        "deleting a non-empty group should fail, got {delete_status}: {delete_body}"
+        delete_body.contains("<Code>InvalidRequest</Code>"),
+        "deleting a non-empty group must return InvalidRequest, body: {delete_body}"
+    );
+    assert!(
+        delete_body.contains("<Message>group is not empty</Message>"),
+        "deleting a non-empty group returned an unexpected message: {delete_body}"
     );
     info!("Delete of non-empty group correctly rejected");
 
@@ -165,9 +174,18 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
         &env.secret_key,
     )
     .await?;
+    assert_eq!(
+        get_status,
+        reqwest::StatusCode::NOT_FOUND,
+        "a deleted group must return HTTP 404, body: {get_body}"
+    );
     assert!(
-        !get_status.is_success(),
-        "group should no longer exist after deletion, got {get_status}: {get_body}"
+        get_body.contains("<Code>NoSuchResource</Code>"),
+        "a deleted group must return NoSuchResource, body: {get_body}"
+    );
+    assert!(
+        get_body.contains("<Message>group 'testgroup' does not exist</Message>"),
+        "a deleted group returned an unexpected message: {get_body}"
     );
     info!("Confirmed testgroup no longer exists");
 
