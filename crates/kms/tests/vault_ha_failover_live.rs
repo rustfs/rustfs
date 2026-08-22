@@ -22,8 +22,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metrics_util::MetricKind;
@@ -168,14 +168,21 @@ fn retryable_failures(snapshot: &[MetricEntry], operation: &str) -> u64 {
         .sum()
 }
 
-async fn wait_for_count(counter: &AtomicU64, failed: &AtomicBool, minimum: u64, description: &str, timeout: Duration) {
+async fn wait_for_count(
+    counter: &AtomicU64,
+    failure: &Mutex<Option<String>>,
+    minimum: u64,
+    description: &str,
+    timeout: Duration,
+) {
     tokio::time::timeout(timeout, async {
         while counter.load(Ordering::SeqCst) < minimum {
-            assert!(
-                !failed.load(Ordering::SeqCst),
-                "{description} worker failed after {} successful decrypts",
-                counter.load(Ordering::SeqCst)
-            );
+            if let Some(error) = failure.lock().expect("decrypt failure lock poisoned").as_ref() {
+                panic!(
+                    "{description} worker failed after {} successful decrypts: {error}",
+                    counter.load(Ordering::SeqCst)
+                );
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -203,7 +210,7 @@ async fn decrypt_loop<B: KmsBackendTrait + Send + Sync + 'static>(
     request: DecryptRequest,
     expected: Vec<u8>,
     completed: Arc<AtomicU64>,
-    failed: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
     stop: CancellationToken,
 ) {
     while !stop.is_cancelled() {
@@ -211,8 +218,13 @@ async fn decrypt_loop<B: KmsBackendTrait + Send + Sync + 'static>(
             Ok(response) if response.plaintext == expected => {
                 completed.fetch_add(1, Ordering::SeqCst);
             }
-            Ok(_) | Err(_) => {
-                failed.store(true, Ordering::SeqCst);
+            Ok(_) => {
+                *failure.lock().expect("decrypt failure lock poisoned") =
+                    Some("decrypt returned unexpected plaintext".to_string());
+                return;
+            }
+            Err(error) => {
+                *failure.lock().expect("decrypt failure lock poisoned") = Some(error.to_string());
                 return;
             }
         }
@@ -310,7 +322,8 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
     );
 
     let stop = CancellationToken::new();
-    let failed = Arc::new(AtomicBool::new(false));
+    let kv2_failure = Arc::new(Mutex::new(None));
+    let transit_failure = Arc::new(Mutex::new(None));
     let kv2_completed = Arc::new(AtomicU64::new(0));
     let transit_completed = Arc::new(AtomicU64::new(0));
     let kv2_worker = tokio::spawn(decrypt_loop(
@@ -318,7 +331,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         kv2_request,
         kv2_data_key.plaintext_key,
         Arc::clone(&kv2_completed),
-        Arc::clone(&failed),
+        Arc::clone(&kv2_failure),
         stop.clone(),
     ));
     let transit_worker = tokio::spawn(decrypt_loop(
@@ -326,12 +339,19 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
         transit_request,
         transit_data_key.plaintext_key,
         Arc::clone(&transit_completed),
-        Arc::clone(&failed),
+        Arc::clone(&transit_failure),
         stop.clone(),
     ));
 
-    wait_for_count(&kv2_completed, &failed, 2, "two healthy KV2 decrypts", HEALTHY_PROGRESS_TIMEOUT).await;
-    wait_for_count(&transit_completed, &failed, 2, "two healthy Transit decrypts", HEALTHY_PROGRESS_TIMEOUT).await;
+    wait_for_count(&kv2_completed, &kv2_failure, 2, "two healthy KV2 decrypts", HEALTHY_PROGRESS_TIMEOUT).await;
+    wait_for_count(
+        &transit_completed,
+        &transit_failure,
+        2,
+        "two healthy Transit decrypts",
+        HEALTHY_PROGRESS_TIMEOUT,
+    )
+    .await;
     std::fs::write(&marker, b"ready").expect("publish failover readiness marker");
 
     wait_for_file(&elected, "the replacement Vault leader").await;
@@ -342,7 +362,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
     let transit_after_election = transit_completed.load(Ordering::SeqCst) + 2;
     wait_for_count(
         &kv2_completed,
-        &failed,
+        &kv2_failure,
         kv2_after_election,
         "post-failover KV2 decrypts",
         POST_FAILOVER_PROGRESS_TIMEOUT,
@@ -350,7 +370,7 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
     .await;
     wait_for_count(
         &transit_completed,
-        &failed,
+        &transit_failure,
         transit_after_election,
         "post-failover Transit decrypts",
         POST_FAILOVER_PROGRESS_TIMEOUT,
@@ -360,7 +380,14 @@ async fn exercise_failover(snapshotter: &Snapshotter) {
     stop.cancel();
     kv2_worker.await.expect("KV2 decrypt worker must join");
     transit_worker.await.expect("Transit decrypt worker must join");
-    assert!(!failed.load(Ordering::SeqCst), "no decrypt may fail or return different plaintext");
+    assert!(
+        kv2_failure.lock().expect("KV2 failure lock poisoned").is_none(),
+        "no KV2 decrypt may fail or return different plaintext"
+    );
+    assert!(
+        transit_failure.lock().expect("Transit failure lock poisoned").is_none(),
+        "no Transit decrypt may fail or return different plaintext"
+    );
 }
 
 #[test]
