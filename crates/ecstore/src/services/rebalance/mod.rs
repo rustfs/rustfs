@@ -47,6 +47,8 @@ mod runtime;
 mod types;
 mod worker;
 
+#[cfg(feature = "test-util")]
+pub use entry::test_util::PausedRebalanceEntryTestFixture;
 pub(crate) use meta::is_rebalance_conflicting_with_decommission;
 pub use meta::{decode_rebalance_stop_propagation_record, encode_rebalance_stop_propagation_record};
 pub use types::{

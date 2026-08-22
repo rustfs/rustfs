@@ -1124,7 +1124,8 @@ mod rebalance_handler_tests {
     #[serial_test::serial]
     async fn real_admin_stop_cancels_paused_entry_before_waiting_for_activation_gate() {
         const REBALANCE_ID: &str = "admin-stop-paused-entry";
-        let mut fixture = rustfs_ecstore::api::rebalance::test_util::PausedRebalanceEntryTestFixture::new(REBALANCE_ID).await;
+        let mut fixture =
+            crate::admin::storage_api::ecstore_rebalance::test_util::PausedRebalanceEntryTestFixture::new(REBALANCE_ID).await;
         fixture.wait_until_entry_paused().await;
 
         let stop_store = fixture.store();
@@ -1155,10 +1156,11 @@ mod rebalance_handler_tests {
     async fn real_admin_stop_accepts_same_run_terminalization_after_prepare() {
         const REBALANCE_ID: &str = "admin-stop-terminal-after-prepare";
         const REPLACEMENT_ID: &str = "admin-stop-replacement";
-        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
-            started_rebalance_meta(REBALANCE_ID),
-        )
-        .await;
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(REBALANCE_ID),
+            )
+            .await;
         let terminal_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let worker_barrier = std::sync::Arc::clone(&terminal_barrier);
         let worker_store = std::sync::Arc::clone(&store);
@@ -1238,10 +1240,11 @@ mod rebalance_handler_tests {
     #[serial_test::serial]
     async fn real_admin_stop_loads_persisted_active_rebalance_from_cold_memory() {
         const REBALANCE_ID: &str = "admin-stop-cold-memory";
-        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
-            started_rebalance_meta(REBALANCE_ID),
-        )
-        .await;
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(REBALANCE_ID),
+            )
+            .await;
         *store.rebalance_meta.write().await = None;
         assert!(store.current_rebalance_id().await.is_none());
 
@@ -1271,10 +1274,11 @@ mod rebalance_handler_tests {
     async fn real_admin_stop_refreshes_persisted_active_over_stale_inactive_memory() {
         const PERSISTED_REBALANCE_ID: &str = "admin-stop-persisted-active";
         const STALE_REBALANCE_ID: &str = "admin-stop-stale-terminal";
-        let (_temp_dirs, store) = rustfs_ecstore::api::rebalance::test_util::test_store_with_persisted_rebalance_meta(
-            started_rebalance_meta(PERSISTED_REBALANCE_ID),
-        )
-        .await;
+        let (_temp_dirs, store) =
+            crate::admin::storage_api::ecstore_rebalance::test_util::test_store_with_persisted_rebalance_meta(
+                started_rebalance_meta(PERSISTED_REBALANCE_ID),
+            )
+            .await;
         *store.rebalance_meta.write().await = Some(RebalanceMeta {
             id: STALE_REBALANCE_ID.to_string(),
             stopped_at: Some(OffsetDateTime::now_utc()),

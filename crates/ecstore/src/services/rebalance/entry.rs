@@ -951,11 +951,10 @@ mod tests {
         TieredMetadataCommitBarrier,
     };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
-    use crate::storage_api_contracts::multipart::MultipartOperations as _;
+    use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
-    use rustfs_storage_api::CompletePart;
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
