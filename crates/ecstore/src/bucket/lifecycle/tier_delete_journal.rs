@@ -433,16 +433,22 @@ async fn process_committed_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jen
         )
         .await?;
     }
-    record_tier_delete_journal_decommission_terminal(&api, je).await?;
-    remove_tier_delete_journal_entry(api, je).await
-}
-
-async fn record_tier_delete_journal_decommission_terminal(api: &Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
     let path = tier_delete_journal_object_name(je);
     let data = encode_tier_delete_journal_entry(je).map_err(std::io::Error::other)?;
-    api.record_durable_ilm_decommission_terminal(&path, &data)
+    let target_pool_indices = api
+        .record_durable_ilm_decommission_terminal_target_pools(&path, &data)
         .await
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    if !target_pool_indices.is_empty() {
+        for target_pool_idx in target_pool_indices {
+            match config_boundary::delete_config(api.pools[target_pool_idx].clone(), &path).await {
+                Ok(()) | Err(Error::ConfigNotFound) => {}
+                Err(err) => return Err(std::io::Error::other(err)),
+            }
+        }
+        return Ok(());
+    }
+    remove_tier_delete_journal_entry(api, je).await
 }
 
 fn object_info_references_tier_delete(info: &ObjectInfo, je: &Jentry) -> std::io::Result<bool> {
