@@ -382,9 +382,7 @@ fn merge_replication_config_keeping_site_rules(
         return None;
     }
 
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    assign_site_replication_rule_priorities(&mut rules, &is_site_rule);
 
     // A site-replication ARN in `role` is the sender's, and the reconciler's
     // per-peer target lookup reads it — carrying it over would pin the
@@ -395,6 +393,30 @@ fn merge_replication_config_keeping_site_rules(
     };
 
     Some(ReplicationConfiguration { role, rules })
+}
+
+/// Give the site rules in `rules` the lowest priorities no operator rule uses,
+/// in rule order, leaving every operator rule's priority untouched. Operator
+/// priorities decide which rule wins per target, so they are part of the
+/// submitted policy; site rules are derived state and only need to be unique
+/// (`validate_replication_config_structure` rejects duplicates). The result
+/// is a pure function of the rule list, so the site-replication reconciler,
+/// the peer ingestion merge and the S3 edit merge all converge on the same
+/// bytes and the reconciler's no-op check holds.
+pub fn assign_site_replication_rule_priorities(rules: &mut [ReplicationRule], is_site_rule: impl Fn(&ReplicationRule) -> bool) {
+    let taken: HashSet<i32> = rules
+        .iter()
+        .filter(|rule| !is_site_rule(rule))
+        .map(|rule| rule.priority.unwrap_or(0))
+        .collect();
+    let mut next = 1;
+    for rule in rules.iter_mut().filter(|rule| is_site_rule(rule)) {
+        while taken.contains(&next) {
+            next += 1;
+        }
+        rule.priority = Some(next);
+        next = next.saturating_add(1);
+    }
 }
 
 pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
@@ -1693,5 +1715,81 @@ mod tests {
         assert!(!is_reconciler_owned_site_replication_rule(&reconciler_rule, &HashSet::new()));
         let removed_peer = replication_rule("site-repl-gone-dep", "arn:rustfs:replication::gone-dep:bucket");
         assert!(!is_reconciler_owned_site_replication_rule(&removed_peer, &peers));
+    }
+
+    // The merge must not rewrite the operator's priorities: with the
+    // priority-5 rule listed first and renumbered 1 then 2, the priority-1
+    // delete-marker-disabled rule would win the replication decision.
+    #[test]
+    fn merge_keeps_operator_priorities_and_replication_decision() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                delete_marker_rule("dm-enabled", user_arn, "logs/", 5, true),
+                delete_marker_rule("dm-disabled", user_arn, "logs/2026/", 1, false),
+            ],
+        };
+        let mut site_rule = delete_marker_rule("site-repl-peer-dep", peer_arn, "", 7, true);
+        site_rule.prefix = None;
+        let local = structure_config(vec![site_rule]);
+        let opts = ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            version_id: None,
+            ..Default::default()
+        };
+        let submitted: Vec<_> = incoming.filter_target_replication_decisions(&opts);
+
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        let merged = merge_user_replication_config(Some(incoming.clone()), Some(local.clone()), &peers).expect("rules");
+
+        let priorities: Vec<_> = merged
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(
+            priorities,
+            vec![
+                ("dm-enabled", Some(5)),
+                ("dm-disabled", Some(1)),
+                ("site-repl-peer-dep", Some(2))
+            ],
+            "operator priorities are kept verbatim; the site rule takes the lowest free slot"
+        );
+        assert!(validate_replication_config_structure(&merged).is_ok());
+        let mut decisions = merged.filter_target_replication_decisions(&opts);
+        decisions.retain(|(arn, _)| arn == user_arn);
+        assert_eq!(decisions, submitted, "the merged config must replicate exactly as the operator submitted");
+        assert_eq!(decisions, vec![(user_arn.to_string(), true)]);
+
+        // The peer ingestion merge follows the same rule.
+        let merged = merge_incoming_replication_config(Some(incoming), Some(local)).expect("rules");
+        let priorities: Vec<_> = merged.rules.iter().map(|rule| rule.priority).collect();
+        assert_eq!(priorities, vec![Some(5), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn site_rule_priorities_skip_every_operator_priority() {
+        let mut rules = vec![
+            delete_marker_rule("a", "arn:a", "", 2, true),
+            delete_marker_rule("site-repl-x", "arn:rustfs:replication::x:b", "", 9, true),
+            delete_marker_rule("b", "arn:a", "", 1, true),
+            delete_marker_rule("site-repl-y", "arn:rustfs:replication::y:b", "", 9, true),
+            delete_marker_rule("c", "arn:a", "", 4, true),
+        ];
+        assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
+        let priorities: Vec<_> = rules.iter().map(|rule| rule.priority).collect();
+        assert_eq!(priorities, vec![Some(2), Some(3), Some(1), Some(5), Some(4)]);
+        assert!(validate_replication_config_structure(&structure_config(rules.clone())).is_ok());
+
+        // Idempotent, so the reconciler's pass over an already-merged config
+        // is a byte-stable no-op rather than a rewrite every period.
+        let settled = rules.clone();
+        assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
+        assert_eq!(rules, settled);
     }
 }

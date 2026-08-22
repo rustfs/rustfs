@@ -32,7 +32,8 @@ use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
-    is_site_replication_rule, merge_incoming_replication_config, replication_target_arn_deployment_id,
+    assign_site_replication_rule_priorities, is_site_replication_rule, merge_incoming_replication_config,
+    replication_target_arn_deployment_id,
 };
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
@@ -8168,9 +8169,7 @@ fn prune_removed_site_replication_rules(
         return (None, removed);
     }
 
-    for (index, rule) in config.rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    assign_site_replication_rule_priorities(&mut config.rules, is_site_replication_rule);
 
     (Some(config), removed)
 }
@@ -8344,9 +8343,10 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
         .cloned()
         .collect();
     rules.extend(desired.rules);
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    // Operator priorities are the operator's policy; only the derived rules
+    // take free slots, by the same function as the config merges so a merged
+    // write and this pass agree byte for byte.
+    assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
 
     // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
     // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
@@ -16969,7 +16969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_removed_site_replication_rules_removes_site_rule_and_reorders_priorities() {
+    fn test_prune_removed_site_replication_rules_removes_site_rule_and_keeps_operator_priority() {
         let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
         let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
         let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
@@ -16986,9 +16986,9 @@ mod tests {
         assert!(updated.role.is_empty());
         assert_eq!(updated.rules.len(), 2);
         assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));
-        assert_eq!(updated.rules[0].priority, Some(1));
+        assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
-        assert_eq!(updated.rules[1].priority, Some(2));
+        assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
     }
 
     #[test]
