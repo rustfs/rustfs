@@ -15,7 +15,7 @@
 use crate::bucket::metadata_sys::{ObjectLockConfigState, get_object_lock_config, get_object_lock_config_state};
 use crate::bucket::object_lock::objectlock;
 use crate::error::{Error, Result, StorageError};
-use crate::object_api::ObjectInfo;
+use crate::object_api::{ObjectInfo, ObjectOptions};
 use s3s::dto::{Date, DefaultRetention, ObjectLockConfiguration, ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use std::sync::Arc;
@@ -136,10 +136,39 @@ pub fn add_years(dt: OffsetDateTime, years: i32) -> OffsetDateTime {
 
 /// Check if an object has legal hold enabled.
 /// Returns true if legal hold is ON.
-#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> bool {
     let lhold = objectlock::get_object_legalhold_meta(user_defined);
     matches!(lhold.status, Some(ref st) if st.as_str() == ObjectLockLegalHoldStatus::ON)
+}
+
+/// Whether an authorized replication write (`ObjectOptions::replication_request`)
+/// may overwrite a locked destination version.
+///
+/// The source's lock state governs a replica (MinIO `checkPutObjectLockAllowed`
+/// skips the existing-version check for replicas), and a source-side hold
+/// release or retention change reaches this site only through this write. The
+/// overwrite is allowed only when the write carries the source timestamp of
+/// every category that currently locks the version, so receiver-side LWW
+/// (`merge_replication_metadata_lww`) judges each of them: a category locked
+/// more recently here is kept, otherwise the source's newer state wins. A write
+/// without that timestamp carries no source decision for the category — the
+/// metadata replace would lift the lock unjudged — so it stays WORM-rejected.
+pub fn replication_write_may_pass_worm_gate(
+    user_defined: &std::collections::HashMap<String, String>,
+    opts: &ObjectOptions,
+) -> bool {
+    if !opts.replication_request {
+        return false;
+    }
+    if has_legal_hold(user_defined) && opts.replication_legalhold_timestamp.is_none() {
+        return false;
+    }
+    let ret = objectlock::get_object_retention_meta(user_defined);
+    let retention_locked = ret
+        .mode
+        .as_ref()
+        .is_some_and(|mode| is_retention_active(mode.as_str(), ret.retain_until_date.as_ref()));
+    !(retention_locked && opts.replication_retention_timestamp.is_none())
 }
 
 /// Check if an object is locked based on its metadata.
@@ -239,7 +268,12 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
         return Ok(None);
     }
 
-    if let Some(status) = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
+    // A cleared retention / legal hold is persisted as empty strings (the
+    // MinIO on-disk shape, `parse_object_lock_retention`); read it as "no lock"
+    // rather than as corrupt metadata.
+    let persisted = |key: &str| obj_info.user_defined.get(key).filter(|value| !value.is_empty());
+
+    if let Some(status) = persisted(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
         if status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::ON) {
             return Ok(Some(ObjectLockBlockReason::LegalHold));
         }
@@ -248,8 +282,8 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
         }
     }
 
-    let mode = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
-    let retain_until = obj_info.user_defined.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
+    let mode = persisted(X_AMZ_OBJECT_LOCK_MODE.as_str());
+    let retain_until = persisted(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
     let explicit_ret = match (mode, retain_until) {
         (None, None) => None,
         (Some(mode), Some(retain_until)) => {
@@ -483,6 +517,98 @@ mod tests {
 
             let err = check_object_lock_for_deletion_with_config(None, &obj_info, false).expect_err(case);
             assert!(err.to_string().contains(expected), "unexpected {case} error: {err}");
+        }
+    }
+
+    /// A replication write passes the WORM gate only when it carries the
+    /// source timestamp of every category that currently locks the version.
+    #[test]
+    fn replication_write_passes_worm_gate_only_with_every_locking_category_timestamp() {
+        use rustfs_utils::http::headers::{
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        };
+
+        let hold = [(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON")];
+        let retention = [
+            (AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2099-01-01T00:00:00Z"),
+        ];
+        let expired = [
+            (AMZ_OBJECT_LOCK_MODE_LOWER, "COMPLIANCE"),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2000-01-01T00:00:00Z"),
+        ];
+        let metadata = |entries: &[&[(&str, &str)]]| -> std::collections::HashMap<String, String> {
+            entries
+                .iter()
+                .flat_map(|entries| entries.iter())
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let opts = |hold_ts: bool, retention_ts: bool| ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: hold_ts.then_some(OffsetDateTime::UNIX_EPOCH),
+            replication_retention_timestamp: retention_ts.then_some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+
+        let locked_by_both = metadata(&[&hold, &retention]);
+        assert!(replication_write_may_pass_worm_gate(&locked_by_both, &opts(true, true)));
+        assert!(!replication_write_may_pass_worm_gate(&locked_by_both, &opts(true, false)));
+        assert!(!replication_write_may_pass_worm_gate(&locked_by_both, &opts(false, true)));
+
+        assert!(replication_write_may_pass_worm_gate(&metadata(&[&hold]), &opts(true, false)));
+        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&hold]), &opts(false, true)));
+        assert!(replication_write_may_pass_worm_gate(&metadata(&[&retention]), &opts(false, true)));
+        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&retention]), &opts(true, false)));
+
+        // Expired retention and a released hold no longer lock anything.
+        let unlocked = metadata(&[&expired, &[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "OFF")]]);
+        assert!(replication_write_may_pass_worm_gate(&unlocked, &opts(false, false)));
+
+        // Never for a non-replication write, whatever it carries.
+        let local = ObjectOptions {
+            replication_request: false,
+            ..opts(true, true)
+        };
+        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&hold]), &local));
+    }
+
+    /// A local PutObjectRetention / PutObjectLegalHold "clear" persists the
+    /// lock keys as empty strings (the MinIO on-disk shape, see
+    /// `parse_object_lock_retention`); that is "no lock", not corruption, and
+    /// must not wedge later explicit-version PUTs or deletes
+    /// (rustfs/backlog#1953).
+    #[test]
+    fn deletion_treats_cleared_empty_lock_metadata_as_unlocked() {
+        use rustfs_utils::http::headers::{
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        };
+
+        let cases: [(&str, &[&str]); 3] = [
+            (
+                "cleared retention",
+                &[AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER],
+            ),
+            ("cleared legal hold", &[AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER]),
+            (
+                "all cleared",
+                &[
+                    AMZ_OBJECT_LOCK_MODE_LOWER,
+                    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+                    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+                ],
+            ),
+        ];
+
+        for (case, keys) in cases {
+            let user_defined = keys.iter().map(|key| (key.to_string(), String::new())).collect();
+            let obj_info = ObjectInfo {
+                user_defined: Arc::new(user_defined),
+                ..Default::default()
+            };
+
+            let result = check_object_lock_for_deletion_with_config(None, &obj_info, false);
+            assert!(matches!(result, Ok(None)), "{case}: empty lock keys must read as unlocked: {result:?}");
         }
     }
 
