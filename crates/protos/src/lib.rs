@@ -1849,7 +1849,7 @@ mod scanner_activity_tests {
             },
             ScannerActivityResponse {
                 publication_blocked: Some(true),
-                ..response.clone()
+                ..response
             },
         ] {
             assert_ne!(
@@ -1933,7 +1933,7 @@ mod scanner_activity_tests {
             },
             ScannerPublicationLeaseRequest {
                 token: vec![3; 16].into(),
-                ..request.clone()
+                ..request
             },
         ] {
             assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());

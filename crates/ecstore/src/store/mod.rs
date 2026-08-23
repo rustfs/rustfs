@@ -1224,7 +1224,7 @@ mod tests {
 
         let gate = store.ctx.data_movement_operation_gate();
         let (writer_started, writer_started_rx) = tokio::sync::oneshot::channel();
-        let mut movement_writer = tokio::spawn(async move {
+        let movement_writer = tokio::spawn(async move {
             let _ = writer_started.send(());
             gate.write_owned().await
         });
