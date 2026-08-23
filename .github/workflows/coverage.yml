@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Weekly workspace line-coverage baseline (backlog#1153 infra-5).
+# Workspace line-coverage baseline and security-crate calibration
+# (backlog#1153 infra-5/infra-6).
 #
-# NON-BLOCKING by design: this workflow only runs on schedule and manual
-# dispatch, so it never attaches a status to a PR and must never be made a
-# required check. It exists to give coverage a visible baseline and trend
-# (per-crate table in the job summary, lcov artifact kept 90 days) — the
-# per-crate ratchet for the security-critical crates builds on it later
-# (backlog#1153 infra-6, report-only first per the ci-11 ladder).
+# NON-BLOCKING by design: the weekly job gives coverage a visible baseline and
+# trend, while relevant pull requests run a report-only security-crate
+# comparison. Neither job is a required check during calibration.
 #
 # Measurement scope matches the PR test gate (ci.yml "Run tests"):
 # `--workspace --exclude e2e_test` with the `ci` nextest profile. Doctests are
@@ -31,6 +29,17 @@
 name: coverage
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/iam/**"
+      - "crates/kms/**"
+      - "crates/policy/**"
+      - "crates/crypto/**"
+      - ".config/coverage-baselines.toml"
+      - "scripts/coverage_per_crate.py"
+      - "scripts/check_security_coverage.py"
+      - ".github/workflows/coverage.yml"
   workflow_dispatch:
   schedule:
     # 07:00 UTC Sunday — staggered clear of the other Sunday crons: ci (00:00),
@@ -39,6 +48,10 @@ on:
     # e2e-replication-nightly (04:00) and performance-ab (06:00) lanes.
     - cron: "43 7 * * 0"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.
 permissions:
@@ -46,12 +59,14 @@ permissions:
 
 jobs:
   coverage:
-    name: Workspace coverage (weekly)
+    name: Workspace line coverage
     runs-on: sm-standard-4
     # The instrumented build cannot reuse the regular CI cache (different
-    # RUSTFLAGS), so a cold week rebuilds the workspace before running the
-    # full suite; give it double the test job's 60-minute budget.
-    timeout-minutes: 120
+    # RUSTFLAGS), so a cold run rebuilds the workspace before running the
+    # full suite. Two later exact-head runs exhausted 150 minutes before the
+    # report steps, so allow one additional 90-minute cold-run margin while
+    # keeping the calibration job bounded.
+    timeout-minutes: 240
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Match the PR gate's nextest semantics (ci.yml runs `--profile ci`):
@@ -91,7 +106,9 @@ jobs:
           cargo llvm-cov report --json --output-path target/llvm-cov/coverage.json
 
       - name: Write per-crate summary
-        run: python3 scripts/coverage_per_crate.py target/llvm-cov/coverage.json >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          python3 scripts/coverage_per_crate.py target/llvm-cov/coverage.json >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/check_security_coverage.py target/llvm-cov/coverage.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage artifact
         if: always()

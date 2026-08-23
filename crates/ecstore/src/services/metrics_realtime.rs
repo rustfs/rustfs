@@ -220,6 +220,14 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             last_usage_save_unix_secs: metrics.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: metrics.usage_freshness.last_usage_save_result,
             last_usage_save_result_code: metrics.usage_freshness.last_usage_save_result_code,
+            last_durable_success_unix_secs: metrics.usage_freshness.last_durable_success_unix_secs,
+            last_publication_unix_secs: metrics.usage_freshness.last_publication_unix_secs,
+            last_publication_state: metrics.usage_freshness.last_publication_state,
+            last_publication_reason: metrics.usage_freshness.last_publication_reason,
+            deferred_pending: metrics.usage_freshness.deferred_pending,
+            deferred_total: metrics.usage_freshness.deferred_total,
+            last_deferred_unix_secs: metrics.usage_freshness.last_deferred_unix_secs,
+            last_deferred_reason: metrics.usage_freshness.last_deferred_reason,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -816,6 +824,14 @@ mod test {
                 last_usage_save_unix_secs: 12,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
+                last_durable_success_unix_secs: 13,
+                last_publication_unix_secs: 14,
+                last_publication_state: "published".to_string(),
+                last_publication_reason: "complete".to_string(),
+                deferred_pending: true,
+                deferred_total: 15,
+                last_deferred_unix_secs: 16,
+                last_deferred_reason: "data_movement".to_string(),
             },
             ..Default::default()
         });
@@ -828,6 +844,14 @@ mod test {
         assert_eq!(scanner.usage_freshness.last_usage_save_unix_secs, 12);
         assert_eq!(scanner.usage_freshness.last_usage_save_result, "success");
         assert_eq!(scanner.usage_freshness.last_usage_save_result_code, 1);
+        assert_eq!(scanner.usage_freshness.last_durable_success_unix_secs, 13);
+        assert_eq!(scanner.usage_freshness.last_publication_unix_secs, 14);
+        assert_eq!(scanner.usage_freshness.last_publication_state, "published");
+        assert_eq!(scanner.usage_freshness.last_publication_reason, "complete");
+        assert!(scanner.usage_freshness.deferred_pending);
+        assert_eq!(scanner.usage_freshness.deferred_total, 15);
+        assert_eq!(scanner.usage_freshness.last_deferred_unix_secs, 16);
+        assert_eq!(scanner.usage_freshness.last_deferred_reason, "data_movement");
     }
 
     #[test]

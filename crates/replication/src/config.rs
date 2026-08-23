@@ -270,6 +270,218 @@ pub fn active_replication_rule_destination_arns(config: &ReplicationConfiguratio
     arns
 }
 
+/// Deployment id extracted from a site-replication target ARN
+/// (`arn:{rustfs|minio}:replication::<deployment-id>:<bucket>`), or `None`
+/// for an operator-authored ARN.
+pub fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
+    let parts: Vec<_> = arn.split(':').collect();
+    if parts.len() == 6
+        && parts[0] == "arn"
+        && matches!(parts[1], "rustfs" | "minio")
+        && parts[2] == "replication"
+        && !parts[4].is_empty()
+    {
+        return Some(parts[4].to_string());
+    }
+
+    None
+}
+
+/// Rule id prefix the site-replication reconciler stamps on the rules it
+/// derives (`site-repl-<peer deployment id>`).
+pub const SITE_REPLICATION_RULE_ID_PREFIX: &str = "site-repl-";
+
+/// Whether `rule` carries a site-replication rule id (`site-repl-*`). Rule
+/// ids are not reserved, so this is only the classification of
+/// [`OperatorRuleContract::Legacy`]; every other path classifies by
+/// [`site_replication_rule_deployment_id`].
+pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
+    rule.id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(SITE_REPLICATION_RULE_ID_PREFIX))
+}
+
+/// Deployment id of the peer a reconciler-derived rule replicates to, or
+/// `None` for any other rule. The reconciler builds each rule from one peer:
+/// the id is `site-repl-<deployment id>` and the destination ARN names that
+/// same deployment id — an operator-authored `site-repl-user` rule, or a
+/// `site-repl-<peer>` id pasted onto a foreign ARN, fails the agreement check.
+/// Callers that know the current peer set must also confirm the id is one of
+/// those peers before treating the rule as reconciler-owned.
+pub fn site_replication_rule_deployment_id(rule: &ReplicationRule) -> Option<&str> {
+    let deployment_id = rule.id.as_deref()?.strip_prefix(SITE_REPLICATION_RULE_ID_PREFIX)?;
+    (!deployment_id.is_empty()
+        && replication_target_arn_deployment_id(&rule.destination.bucket).as_deref() == Some(deployment_id))
+    .then_some(deployment_id)
+}
+
+/// Whether `rule` is one the local reconciler derived for a current remote
+/// site-replication peer in `peer_deployment_ids`. With an empty peer set
+/// (site replication disabled) nothing qualifies, so a bucket outside site
+/// replication keeps the verbatim S3 put/delete semantics.
+pub fn is_reconciler_owned_site_replication_rule(rule: &ReplicationRule, peer_deployment_ids: &HashSet<String>) -> bool {
+    site_replication_rule_deployment_id(rule).is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
+}
+
+/// Whether a config's `Role` is a site-replication ARN naming a site in
+/// `deployment_ids`. Such a role is the holder's identity, not policy: the
+/// reconciler's per-peer target lookup reads it, so carrying it across sites
+/// would pin the receiver's targets to the sender's. Any other role — an IAM
+/// role, or an operator remote target whose ARN happens to carry an empty
+/// region — passed target validation and drives target selection.
+pub fn is_site_replication_role(role: &str, deployment_ids: &HashSet<String>) -> bool {
+    replication_target_arn_deployment_id(role).is_some_and(|deployment_id| deployment_ids.contains(&deployment_id))
+}
+
+/// How the sites of a cluster treat the operator rules of a replication
+/// config merge. Every site must apply the same contract to the same
+/// payload or the sites persist different configs, so the S3 edit path
+/// probes the peers before merging and a peer payload carries the contract
+/// its sender applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorRuleContract {
+    /// Site rules are the derived id/ARN shape; operator rule priorities are
+    /// kept verbatim.
+    Derived,
+    /// Some site still runs the pre-contract code: every `site-repl-*` id is
+    /// a site rule, a site-replication-shaped `Role` is dropped, and every
+    /// rule is renumbered 1..n in list order on ingest and on each reconciler
+    /// pass. Merging the same way keeps a mixed cluster on one config; the
+    /// operator's priority values are lost for that edit but their order —
+    /// what decides the winning rule per target — is not, because the S3
+    /// merge lists the operator rules in priority order first.
+    Legacy,
+}
+
+/// Merge a peer's replication config into the local one.
+///
+/// Reconciler-derived rules encode the *holder's* outbound direction — their
+/// destination ARN names another site — so applying an external rule set
+/// verbatim replaces the local reverse rule with one this site can never
+/// satisfy (no bucket target backs it) and replication silently stops. Only
+/// operator-authored rules travel: the sender's derived rules are dropped
+/// and the local site's survive. `site_deployment_ids` is every site of the
+/// cluster, the receiver included — the sender's rule towards the receiver
+/// names the receiver's own id. Rules are classified by the derived id/ARN
+/// contract ([`is_reconciler_owned_site_replication_rule`]), the same one
+/// the S3 edit merge applies, so an operator-authored `site-repl-*` id
+/// persists on every site. `incoming == None` models a delete of the
+/// operator-authored rules.
+pub fn merge_incoming_replication_config(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+    site_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
+) -> Option<ReplicationConfiguration> {
+    merge_replication_config_keeping_site_rules(incoming, local, site_deployment_ids, contract)
+}
+
+/// [`merge_incoming_replication_config`] for the S3 put/delete-bucket-replication
+/// path (issue #1948): only rules the local reconciler derived for a current
+/// peer in `peer_deployment_ids` survive as site rules; every other stored
+/// rule — including an operator-authored `site-repl-*` id — is operator state
+/// that the request replaces or deletes. An incoming rule whose id is a
+/// current peer's `site-repl-<id>` is dropped whatever its ARN: accepting it
+/// would duplicate the reconciler rule's id. Under
+/// [`OperatorRuleContract::Legacy`] the merge instead reproduces what the
+/// pre-contract peers will do with the broadcast, listing the operator rules
+/// in priority order so their relative order survives the renumbering.
+pub fn merge_user_replication_config(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+    peer_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
+) -> Option<ReplicationConfiguration> {
+    let incoming = incoming.map(|mut config| {
+        match contract {
+            OperatorRuleContract::Derived => config.rules.retain(|rule| {
+                !rule
+                    .id
+                    .as_deref()
+                    .and_then(|id| id.strip_prefix(SITE_REPLICATION_RULE_ID_PREFIX))
+                    .is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
+            }),
+            // Pre-contract peers renumber in list order, so listing the
+            // operator rules in priority order keeps their relative order —
+            // and the replication decision — through that renumbering.
+            OperatorRuleContract::Legacy => config.rules.sort_by_key(|rule| rule.priority.unwrap_or(0)),
+        }
+        config
+    });
+    merge_replication_config_keeping_site_rules(incoming, local, peer_deployment_ids, contract)
+}
+
+fn merge_replication_config_keeping_site_rules(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+    deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
+) -> Option<ReplicationConfiguration> {
+    let is_site_rule = |rule: &ReplicationRule| match contract {
+        OperatorRuleContract::Derived => is_reconciler_owned_site_replication_rule(rule, deployment_ids),
+        OperatorRuleContract::Legacy => is_site_replication_rule(rule),
+    };
+    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
+    // Operator rules first, then the local site rules — the same order the
+    // site-replication reconciler produces, so its no-op check matches and
+    // the bucket metadata is written once per broadcast, not twice.
+    let mut rules: Vec<ReplicationRule> = incoming
+        .into_iter()
+        .flat_map(|config| config.rules)
+        .filter(|rule| !is_site_rule(rule))
+        .collect();
+    rules.extend(
+        local
+            .into_iter()
+            .flat_map(|config| config.rules)
+            .filter(|rule| is_site_rule(rule)),
+    );
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    let drop_role = match contract {
+        OperatorRuleContract::Derived => {
+            assign_site_replication_rule_priorities(&mut rules, is_site_rule);
+            is_site_replication_role(&incoming_role, deployment_ids)
+        }
+        OperatorRuleContract::Legacy => {
+            for (index, rule) in rules.iter_mut().enumerate() {
+                rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
+            }
+            replication_target_arn_deployment_id(&incoming_role).is_some()
+        }
+    };
+    let role = if drop_role { String::new() } else { incoming_role };
+
+    Some(ReplicationConfiguration { role, rules })
+}
+
+/// Give the site rules in `rules` the lowest priorities no operator rule uses,
+/// in rule order, leaving every operator rule's priority untouched. Operator
+/// priorities decide which rule wins per target, so they are part of the
+/// submitted policy; site rules are derived state and only need to be unique
+/// (`validate_replication_config_structure` rejects duplicates). The result
+/// is a pure function of the rule list, so the site-replication reconciler,
+/// the peer ingestion merge and the S3 edit merge all converge on the same
+/// bytes and the reconciler's no-op check holds.
+pub fn assign_site_replication_rule_priorities(rules: &mut [ReplicationRule], is_site_rule: impl Fn(&ReplicationRule) -> bool) {
+    let taken: HashSet<i32> = rules
+        .iter()
+        .filter(|rule| !is_site_rule(rule))
+        .map(|rule| rule.priority.unwrap_or(0))
+        .collect();
+    let mut next = 1;
+    for rule in rules.iter_mut().filter(|rule| is_site_rule(rule)) {
+        while taken.contains(&next) {
+            next += 1;
+        }
+        rule.priority = Some(next);
+        next = next.saturating_add(1);
+    }
+}
+
 pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
     let role = config.role.trim();
     if !role.is_empty() {
@@ -1543,5 +1755,277 @@ mod tests {
             vec![target_b.to_string()],
             "the child rule must win for target A while the overlapping child target B remains eligible"
         );
+    }
+
+    #[test]
+    fn site_replication_rule_deployment_id_requires_id_and_arn_agreement() {
+        let reconciler_rule = replication_rule("site-repl-peer-dep", "arn:rustfs:replication::peer-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&reconciler_rule), Some("peer-dep"));
+
+        // A remote-target ARN carries the remote's deployment id (or a random
+        // uuid), never the operator's rule id.
+        let operator_named_rule = replication_rule("site-repl-user", "arn:minio:replication:us-east-1:2f1c-remote:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&operator_named_rule), None);
+
+        let foreign_arn = replication_rule("site-repl-peer-dep", "arn:rustfs:replication::other-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&foreign_arn), None);
+
+        let empty_id = replication_rule("site-repl-", "arn:rustfs:replication::peer-dep:bucket");
+        assert_eq!(site_replication_rule_deployment_id(&empty_id), None);
+
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        assert!(is_reconciler_owned_site_replication_rule(&reconciler_rule, &peers));
+        assert!(!is_reconciler_owned_site_replication_rule(&reconciler_rule, &HashSet::new()));
+        let removed_peer = replication_rule("site-repl-gone-dep", "arn:rustfs:replication::gone-dep:bucket");
+        assert!(!is_reconciler_owned_site_replication_rule(&removed_peer, &peers));
+    }
+
+    // The merge must not rewrite the operator's priorities: with the
+    // priority-5 rule listed first and renumbered 1 then 2, the priority-1
+    // delete-marker-disabled rule would win the replication decision.
+    #[test]
+    fn merge_keeps_operator_priorities_and_replication_decision() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let incoming = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                delete_marker_rule("dm-enabled", user_arn, "logs/", 5, true),
+                delete_marker_rule("dm-disabled", user_arn, "logs/2026/", 1, false),
+            ],
+        };
+        let mut site_rule = delete_marker_rule("site-repl-peer-dep", peer_arn, "", 7, true);
+        site_rule.prefix = None;
+        let local = structure_config(vec![site_rule]);
+        let opts = ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            version_id: None,
+            ..Default::default()
+        };
+        let submitted: Vec<_> = incoming.filter_target_replication_decisions(&opts);
+
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        let merged =
+            merge_user_replication_config(Some(incoming.clone()), Some(local.clone()), &peers, OperatorRuleContract::Derived)
+                .expect("rules");
+
+        let priorities: Vec<_> = merged
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(
+            priorities,
+            vec![
+                ("dm-enabled", Some(5)),
+                ("dm-disabled", Some(1)),
+                ("site-repl-peer-dep", Some(2))
+            ],
+            "operator priorities are kept verbatim; the site rule takes the lowest free slot"
+        );
+        assert!(validate_replication_config_structure(&merged).is_ok());
+        let mut decisions = merged.filter_target_replication_decisions(&opts);
+        decisions.retain(|(arn, _)| arn == user_arn);
+        assert_eq!(decisions, submitted, "the merged config must replicate exactly as the operator submitted");
+        assert_eq!(decisions, vec![(user_arn.to_string(), true)]);
+
+        // The peer ingestion merge follows the same rule.
+        let merged =
+            merge_incoming_replication_config(Some(incoming), Some(local), &peers, OperatorRuleContract::Derived).expect("rules");
+        let priorities: Vec<_> = merged.rules.iter().map(|rule| rule.priority).collect();
+        assert_eq!(priorities, vec![Some(5), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn site_rule_priorities_skip_every_operator_priority() {
+        let mut rules = vec![
+            delete_marker_rule("a", "arn:a", "", 2, true),
+            delete_marker_rule("site-repl-x", "arn:rustfs:replication::x:b", "", 9, true),
+            delete_marker_rule("b", "arn:a", "", 1, true),
+            delete_marker_rule("site-repl-y", "arn:rustfs:replication::y:b", "", 9, true),
+            delete_marker_rule("c", "arn:a", "", 4, true),
+        ];
+        assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
+        let priorities: Vec<_> = rules.iter().map(|rule| rule.priority).collect();
+        assert_eq!(priorities, vec![Some(2), Some(3), Some(1), Some(5), Some(4)]);
+        assert!(validate_replication_config_structure(&structure_config(rules.clone())).is_ok());
+
+        // Idempotent, so the reconciler's pass over an already-merged config
+        // is a byte-stable no-op rather than a rewrite every period.
+        let settled = rules.clone();
+        assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
+        assert_eq!(rules, settled);
+    }
+
+    fn operator_rule_ids(config: &ReplicationConfiguration) -> Vec<(&str, Option<i32>)> {
+        config
+            .rules
+            .iter()
+            .filter(|rule| site_replication_rule_deployment_id(rule).is_none())
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect()
+    }
+
+    // Issue #1948 review: an owner-authored `site-repl-user` rule is operator
+    // state. Site A's S3 merge keeps it; the broadcast payload must survive
+    // site B's peer ingestion too, or the sites persist different configs.
+    #[test]
+    fn peer_ingestion_keeps_owner_site_repl_user_rule_and_sites_agree() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let put = structure_config(vec![
+            delete_marker_rule("site-repl-user", user_arn, "logs/", 3, true),
+            delete_marker_rule("nightly", user_arn, "", 1, true),
+        ]);
+        let a_local = structure_config(vec![replication_rule("site-repl-b-dep", "arn:rustfs:replication::b-dep:bucket")]);
+        let a_peers = HashSet::from(["b-dep".to_string()]);
+        let a_merged =
+            merge_user_replication_config(Some(put), Some(a_local), &a_peers, OperatorRuleContract::Derived).expect("rules");
+        assert_eq!(operator_rule_ids(&a_merged), vec![("site-repl-user", Some(3)), ("nightly", Some(1))]);
+
+        // Site B ingests A's broadcast; its own reverse rule names A.
+        let b_local = structure_config(vec![replication_rule("site-repl-a-dep", "arn:rustfs:replication::a-dep:bucket")]);
+        let b_sites = HashSet::from(["a-dep".to_string(), "b-dep".to_string()]);
+        let b_merged =
+            merge_incoming_replication_config(Some(a_merged.clone()), Some(b_local), &b_sites, OperatorRuleContract::Derived)
+                .expect("rules");
+
+        let ids: Vec<_> = b_merged.rules.iter().map(|rule| rule.id.as_deref().unwrap()).collect();
+        assert_eq!(ids, vec!["site-repl-user", "nightly", "site-repl-a-dep"]);
+        assert_eq!(
+            operator_rule_ids(&b_merged),
+            operator_rule_ids(&a_merged),
+            "both sites must persist the same operator rules"
+        );
+    }
+
+    // Issue #1948 review: `Role` is only the sender's when it names a
+    // current site-replication peer; an owner-submitted role target has
+    // already passed target validation and drives target selection.
+    #[test]
+    fn merge_keeps_operator_role_target_for_target_selection() {
+        let role = "arn:minio:replication::operator-dep:bucket";
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        let incoming = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![delete_marker_rule("nightly", role, "", 1, true)],
+        };
+        let local = structure_config(vec![replication_rule(
+            "site-repl-peer-dep",
+            "arn:rustfs:replication::peer-dep:bucket",
+        )]);
+        let opts = ObjectOpts {
+            name: "logs/app.log".to_string(),
+            ..Default::default()
+        };
+
+        let merged =
+            merge_user_replication_config(Some(incoming.clone()), Some(local.clone()), &peers, OperatorRuleContract::Derived)
+                .expect("rules");
+        assert_eq!(merged.role, role);
+        assert_eq!(replication_target_arns(&merged), HashSet::from([role.to_string()]));
+        assert_eq!(merged.filter_target_arns(&opts), vec![role.to_string()]);
+
+        let ingested =
+            merge_incoming_replication_config(Some(incoming.clone()), Some(local.clone()), &peers, OperatorRuleContract::Derived)
+                .expect("rules");
+        assert_eq!(ingested.role, role);
+        assert_eq!(ingested.filter_target_arns(&opts), vec![role.to_string()]);
+
+        // A role naming a current peer is the sender's identity and still goes.
+        let mut derived_role = incoming;
+        derived_role.role = "arn:rustfs:replication::peer-dep:bucket".to_string();
+        let merged =
+            merge_user_replication_config(Some(derived_role), Some(local), &peers, OperatorRuleContract::Derived).expect("rules");
+        assert!(merged.role.is_empty());
+    }
+
+    // Issue #1948 review: while a site still runs the pre-contract code the
+    // cluster must stay on one config. A new site broadcasting `5,1` would
+    // be renumbered `1,2` by that peer — selecting the other overlapping
+    // rule — so the new sites merge the legacy way and list the operator
+    // rules in priority order first, which keeps the decision.
+    #[test]
+    fn legacy_contract_matches_pre_contract_peers_and_keeps_the_decision() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let put = ReplicationConfiguration {
+            role: "arn:minio:replication::operator-dep:bucket".to_string(),
+            rules: vec![
+                delete_marker_rule("dm-enabled", user_arn, "logs/", 5, true),
+                delete_marker_rule("dm-disabled", user_arn, "logs/2026/", 1, false),
+                delete_marker_rule("site-repl-user", user_arn, "tmp/", 2, true),
+            ],
+        };
+        let a_local = structure_config(vec![replication_rule("site-repl-b-dep", "arn:rustfs:replication::b-dep:bucket")]);
+        let opts = ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            ..Default::default()
+        };
+        // Decisions per rule destination: the role is dropped by the legacy
+        // merge, so compare against the rules alone.
+        let submitted: Vec<_> = structure_config(put.rules.clone()).filter_target_replication_decisions(&opts);
+
+        let a_peers = HashSet::from(["b-dep".to_string()]);
+        let a_merged =
+            merge_user_replication_config(Some(put.clone()), Some(a_local.clone()), &a_peers, OperatorRuleContract::Legacy)
+                .expect("rules");
+        let layout: Vec<_> = a_merged
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                ("dm-disabled", Some(1)),
+                ("dm-enabled", Some(2)),
+                ("site-repl-b-dep", Some(3))
+            ],
+            "legacy: operator rules in priority order, every rule renumbered 1..n, `site-repl-*` ids dropped"
+        );
+        assert!(a_merged.role.is_empty(), "legacy peers drop any site-replication-shaped role");
+        let mut decisions = a_merged.filter_target_replication_decisions(&opts);
+        decisions.retain(|(arn, _)| arn == user_arn);
+        assert_eq!(decisions, submitted, "the renumbering must not flip the winning rule");
+
+        // A pre-contract peer renumbers A's payload in list order: same bytes.
+        let mut pre_contract = a_merged
+            .rules
+            .iter()
+            .filter(|rule| !is_site_replication_rule(rule))
+            .cloned()
+            .collect::<Vec<_>>();
+        pre_contract.push(replication_rule("site-repl-a-dep", "arn:rustfs:replication::a-dep:bucket"));
+        for (index, rule) in pre_contract.iter_mut().enumerate() {
+            rule.priority = Some(index as i32 + 1);
+        }
+        // A new peer told the payload is legacy produces the same bytes too.
+        let b_local = structure_config(vec![replication_rule("site-repl-a-dep", "arn:rustfs:replication::a-dep:bucket")]);
+        let b_sites = HashSet::from(["a-dep".to_string(), "b-dep".to_string()]);
+        let b_merged = merge_incoming_replication_config(Some(a_merged), Some(b_local), &b_sites, OperatorRuleContract::Legacy)
+            .expect("rules");
+        assert_eq!(b_merged.rules, pre_contract);
+
+        // Every site on the derived contract: the submitted policy is kept.
+        let a_merged =
+            merge_user_replication_config(Some(put), Some(a_local), &a_peers, OperatorRuleContract::Derived).expect("rules");
+        let layout: Vec<_> = a_merged
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(
+            layout,
+            vec![
+                ("dm-enabled", Some(5)),
+                ("dm-disabled", Some(1)),
+                ("site-repl-user", Some(2)),
+                ("site-repl-b-dep", Some(3))
+            ]
+        );
+        assert_eq!(a_merged.role, "arn:minio:replication::operator-dep:bucket");
     }
 }

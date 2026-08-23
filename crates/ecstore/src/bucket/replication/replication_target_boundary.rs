@@ -472,6 +472,7 @@ pub(crate) fn replication_complete_multipart_options(
     actual_size: String,
     source_etag: String,
     source_mtime: Option<OffsetDateTime>,
+    source_internal: &AdvancedPutOptions,
 ) -> PutObjectOptions {
     let mut user_metadata = HashMap::new();
     insert_header_map(&mut user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, actual_size);
@@ -484,6 +485,14 @@ pub(crate) fn replication_complete_multipart_options(
             // mtime must degrade to epoch so header() suppresses the header
             // instead of asserting the replication time as the object's mtime.
             source_mtime: source_mtime.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            // Carry the per-category LWW timestamps on the complete request as
+            // well: the receiver's CompleteMultipartUpload options builder
+            // parses the same headers, so the multipart transport gets the
+            // same receiver-side LWW as the single-PUT transport
+            // (rustfs/backlog#1953). Epoch values keep the headers suppressed.
+            tagging_timestamp: source_internal.tagging_timestamp,
+            retention_timestamp: source_internal.retention_timestamp,
+            legalhold_timestamp: source_internal.legalhold_timestamp,
             replication_status: ReplicationStatusType::Replica,
             replication_request: true,
             ..Default::default()
@@ -663,20 +672,39 @@ mod tests {
     #[test]
     fn replication_complete_multipart_options_sets_actual_size() {
         let source_mtime = OffsetDateTime::from_unix_timestamp(1_716_170_000).expect("valid test timestamp");
+        let source_internal = AdvancedPutOptions {
+            tagging_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_100).expect("valid test timestamp"),
+            retention_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_200).expect("valid test timestamp"),
+            legalhold_timestamp: OffsetDateTime::from_unix_timestamp(1_716_170_300).expect("valid test timestamp"),
+            ..Default::default()
+        };
         let options = replication_complete_multipart_options(
             "1024".to_string(),
             "0123456789abcdef0123456789abcdef-3".to_string(),
             Some(source_mtime),
+            &source_internal,
         );
         assert_eq!(options.internal.source_etag, "0123456789abcdef0123456789abcdef-3");
         assert_eq!(options.internal.source_mtime, source_mtime);
 
+        // The complete request must carry the same per-category LWW timestamps
+        // as the initiate request; the receiver reads them from the complete
+        // headers (rustfs/backlog#1953).
+        assert_eq!(options.internal.tagging_timestamp, source_internal.tagging_timestamp);
+        assert_eq!(options.internal.retention_timestamp, source_internal.retention_timestamp);
+        assert_eq!(options.internal.legalhold_timestamp, source_internal.legalhold_timestamp);
+
         // Absent source mtime must degrade to epoch (header suppressed), not
         // the AdvancedPutOptions default of now_utc() — that default would
         // stamp the replication time as the replica's mtime and break the
-        // multipart HEAD convergence.
-        let options_no_mtime = replication_complete_multipart_options("1024".to_string(), String::new(), None);
+        // multipart HEAD convergence. Unset category timestamps stay epoch so
+        // header() keeps suppressing them.
+        let options_no_mtime =
+            replication_complete_multipart_options("1024".to_string(), String::new(), None, &AdvancedPutOptions::default());
         assert_eq!(options_no_mtime.internal.source_mtime.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.tagging_timestamp.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.retention_timestamp.unix_timestamp(), 0);
+        assert_eq!(options_no_mtime.internal.legalhold_timestamp.unix_timestamp(), 0);
 
         assert_eq!(
             get_header_map(&options.user_metadata, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).as_deref(),

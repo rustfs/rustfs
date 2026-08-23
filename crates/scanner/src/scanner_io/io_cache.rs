@@ -31,6 +31,8 @@ impl ScannerIOCache for SetDisks {
             all_buckets,
             digest: scan_plan_digest,
             leader_epoch,
+            tier_registry_generation,
+            publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
             pending_maintenance_work,
@@ -40,6 +42,27 @@ impl ScannerIOCache for SetDisks {
         let set_label = self.set_index.to_string();
 
         let source = DataUsageCacheSource::new(self.pool_index, self.set_index);
+        let expected_publication_epoch = match publication_epoch {
+            Some(epoch) => epoch,
+            None => scanner_publication_epoch(self.clone())
+                .await
+                .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
+        };
+        let mut old_cache = DataUsageCache::default();
+        if let Err(e) = old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                pool = self.pool_index,
+                set = self.set_index,
+                cache_name = DATA_USAGE_CACHE_NAME,
+                state = "old_cache_load_failed",
+                error = %e,
+                "Scanner old data usage cache load failed; rebuilding from bucket caches"
+            );
+        }
         if buckets.is_empty() {
             let now = SystemTime::now();
             let mut cache = DataUsageCache {
@@ -48,6 +71,7 @@ impl ScannerIOCache for SetDisks {
                     next_cycle: want_cycle,
                     last_update: Some(now),
                     leader_epoch,
+                    tier_registry_generation: Some(tier_registry_generation),
                     source: Some(source),
                     snapshot_complete: true,
                     scan_plan_digest: Some(scan_plan_digest),
@@ -61,10 +85,16 @@ impl ScannerIOCache for SetDisks {
                 cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
             }
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            return persist_and_publish_cache_snapshot(self, &updates, cache, cache_cycle_floor.as_ref())
-                .await
-                .map(|_| ())
-                .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
+            return persist_and_publish_cache_snapshot(
+                self,
+                &updates,
+                cache,
+                cache_cycle_floor.as_ref(),
+                expected_publication_epoch,
+            )
+            .await
+            .map(|_| ())
+            .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
         }
 
         let (disks, healing) = self.get_online_disks_with_healing(false).await;
@@ -80,6 +110,24 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no online disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
+            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
+            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
+            incomplete_scope.info.next_cycle = want_cycle;
+            incomplete_scope.info.last_update = None;
+            incomplete_scope.info.leader_epoch = leader_epoch;
+            incomplete_scope.info.source = Some(source);
+            incomplete_scope.info.snapshot_complete = false;
+            incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
+            incomplete_scope.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+            if let Some(lkg) = lkg {
+                incomplete_scope.info.lkg_snapshot_complete = true;
+                incomplete_scope.info.lkg_next_cycle = Some(lkg.info.next_cycle);
+                incomplete_scope.info.lkg_last_update = lkg.info.last_update;
+                incomplete_scope.info.lkg_leader_epoch = Some(lkg.info.leader_epoch);
+                incomplete_scope.info.lkg_scan_plan_digest = lkg.info.scan_plan_digest;
+            }
+            let _ = updates.send(incomplete_scope).await;
             return Ok(());
         }
         // Preserve the original set topology across capability filtering. During
@@ -162,6 +210,24 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no usable namespace scanner disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
+            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
+            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
+            incomplete_scope.info.next_cycle = want_cycle;
+            incomplete_scope.info.last_update = None;
+            incomplete_scope.info.leader_epoch = leader_epoch;
+            incomplete_scope.info.source = Some(source);
+            incomplete_scope.info.snapshot_complete = false;
+            incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
+            incomplete_scope.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+            if let Some(lkg) = lkg {
+                incomplete_scope.info.lkg_snapshot_complete = true;
+                incomplete_scope.info.lkg_next_cycle = Some(lkg.info.next_cycle);
+                incomplete_scope.info.lkg_last_update = lkg.info.last_update;
+                incomplete_scope.info.lkg_leader_epoch = Some(lkg.info.leader_epoch);
+                incomplete_scope.info.lkg_scan_plan_digest = lkg.info.scan_plan_digest;
+            }
+            let _ = updates.send(incomplete_scope).await;
             return Ok(());
         }
         let set_disk_inventory = Arc::new(scanner_set_disk_inventory(self.as_ref()).await);
@@ -203,22 +269,22 @@ impl ScannerIOCache for SetDisks {
         record_disk_bucket_scans_active(0, &pool_label, &set_label);
         let _reset_disk_bucket_scan_gauges = DiskBucketScanGaugeReset::new(pool_label.clone(), set_label.clone());
 
-        let mut old_cache = DataUsageCache::default();
-        if let Err(e) = old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await {
-            warn!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                pool = self.pool_index,
-                set = self.set_index,
-                cache_name = DATA_USAGE_CACHE_NAME,
-                state = "old_cache_load_failed",
-                error = %e,
-                "Scanner old data usage cache load failed; rebuilding from bucket caches"
-            );
+        // Fence a stale set aggregate before copying entries into per-bucket work caches.
+        if old_cache.info.next_cycle <= want_cycle
+            && old_cache.info.leader_epoch <= leader_epoch
+            && old_cache.info.tier_registry_generation != Some(tier_registry_generation)
+        {
+            old_cache.info.scan_plan_digest = None;
         }
-        match old_cache.prepare_for_scan(
+        let old_lkg = old_cache.info.snapshot_complete.then_some({
+            (
+                old_cache.info.next_cycle,
+                old_cache.info.last_update,
+                old_cache.info.leader_epoch,
+                old_cache.info.scan_plan_digest,
+            )
+        });
+        let prepare_outcome = match old_cache.prepare_for_scan(
             DATA_USAGE_ROOT,
             want_cycle,
             leader_epoch,
@@ -259,7 +325,16 @@ impl ScannerIOCache for SetDisks {
                 );
                 return Ok(());
             }
-            DataUsageCachePrepareOutcome::Reused | DataUsageCachePrepareOutcome::Reset => {}
+            outcome => outcome,
+        };
+        if matches!(prepare_outcome, DataUsageCachePrepareOutcome::Reused)
+            && let Some((cycle, last_update, epoch, digest)) = old_lkg
+        {
+            old_cache.info.lkg_snapshot_complete = true;
+            old_cache.info.lkg_next_cycle = Some(cycle);
+            old_cache.info.lkg_last_update = last_update;
+            old_cache.info.lkg_leader_epoch = Some(epoch);
+            old_cache.info.lkg_scan_plan_digest = digest;
         }
 
         let mut cache = DataUsageCache {
@@ -267,6 +342,7 @@ impl ScannerIOCache for SetDisks {
                 name: DATA_USAGE_ROOT.to_string(),
                 next_cycle: want_cycle,
                 leader_epoch,
+                tier_registry_generation: Some(tier_registry_generation),
                 source: Some(source),
                 snapshot_complete: false,
                 scan_plan_digest: Some(scan_plan_digest),
@@ -328,8 +404,9 @@ impl ScannerIOCache for SetDisks {
                         };
 
                         let mut cache = cache_mutex_clone.lock().await;
-                        apply_bucket_result_to_cache(&mut cache, result, SystemTime::now());
-                        completed_bucket_count_clone.fetch_add(1, Ordering::Relaxed);
+                        if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
+                            completed_bucket_count_clone.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -361,6 +438,7 @@ impl ScannerIOCache for SetDisks {
             let pending_maintenance_work_clone = pending_maintenance_work.clone();
             let dirty_usage_buckets_clone = dirty_usage_buckets.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
+            let expected_publication_epoch_clone = expected_publication_epoch;
             let remote_server_epoch = match worker_mode {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
@@ -460,6 +538,7 @@ impl ScannerIOCache for SetDisks {
                                 session_id: remote_session_id,
                                 session_sequence: request_sequence,
                                 scan_plan_digest: bucket_scan_plan_digest,
+                                tier_registry_generation,
                                 skip_healing: healing,
                                 scan_mode,
                             },
@@ -675,14 +754,17 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
-                    let scan_state = current_cache_root_or_prepare(
+                    let scan_state = current_cache_root_or_prepare_with_generation(
                         &mut cache,
                         &bucket.name,
                         source,
                         want_cycle,
                         leader_epoch,
                         bucket_scan_plan_digest,
-                        require_cache_source,
+                        DataUsageCacheReuseOptions {
+                            require_source: require_cache_source,
+                            tier_registry_generation: Some(tier_registry_generation),
+                        },
                     );
                     let outcome = match scan_state {
                         DataUsageCacheScanState::Current(root) => {
@@ -697,6 +779,23 @@ impl ScannerIOCache for SetDisks {
                                     cache_name = %cache_name,
                                     state = "lock_lost_before_reuse",
                                     "Current scanner bucket cache root publish skipped after lock loss"
+                                );
+                                continue;
+                            }
+                            if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch)
+                                .await
+                                .is_none()
+                            {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                error!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "publication_epoch_changed_before_reuse",
+                                    "Current scanner bucket cache root publish skipped after movement epoch change"
                                 );
                                 continue;
                             }
@@ -848,7 +947,12 @@ impl ScannerIOCache for SetDisks {
                             {
                                 let done_save = Metrics::time(Metric::SaveUsage);
                                 if let Err(e) = cache
-                                    .save_with_revisions(store_clone_clone.clone(), cache_name.as_str(), &revisions)
+                                    .save_with_revisions_for_epoch(
+                                        store_clone_clone.clone(),
+                                        cache_name.as_str(),
+                                        &revisions,
+                                        expected_publication_epoch_clone,
+                                    )
                                     .await
                                 {
                                     error!(
@@ -905,7 +1009,12 @@ impl ScannerIOCache for SetDisks {
                             false
                         } else {
                             match partial_cache
-                                .save_with_revisions(store_clone_clone.clone(), cache_name.as_str(), &revisions)
+                                .save_with_revisions_for_epoch(
+                                    store_clone_clone.clone(),
+                                    cache_name.as_str(),
+                                    &revisions,
+                                    expected_publication_epoch_clone,
+                                )
                                 .await
                             {
                                 Ok(()) => true,
@@ -976,7 +1085,12 @@ impl ScannerIOCache for SetDisks {
 
                     let done_save = Metrics::time(Metric::SaveUsage);
                     if let Err(e) = cache
-                        .save_with_revisions(store_clone_clone.clone(), &cache_name, &revisions)
+                        .save_with_revisions_for_epoch(
+                            store_clone_clone.clone(),
+                            &cache_name,
+                            &revisions,
+                            expected_publication_epoch_clone,
+                        )
                         .await
                     {
                         done_save();
@@ -1007,6 +1121,24 @@ impl ScannerIOCache for SetDisks {
                             cache_name = %cache_name,
                             state = "lock_lost_after_save",
                             "Scanner bucket cache root publish skipped after lock loss"
+                        );
+                        continue;
+                    }
+
+                    if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch_clone)
+                        .await
+                        .is_none()
+                    {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        error!(
+                            target: "rustfs::scanner::io",
+                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_IO,
+                            bucket = %bucket.name,
+                            cache_name = %cache_name,
+                            state = "publication_epoch_changed_after_save",
+                            "Scanner bucket cache root publish skipped after movement epoch change"
                         );
                         continue;
                     }
@@ -1099,23 +1231,37 @@ impl ScannerIOCache for SetDisks {
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
+                cache.info.lkg_snapshot_complete = false;
+                cache.info.lkg_next_cycle = None;
+                cache.info.lkg_last_update = None;
+                cache.info.lkg_leader_epoch = None;
+                cache.info.lkg_scan_plan_digest = None;
                 cache.clone()
             };
-            let _ = persist_and_publish_cache_snapshot(self.clone(), &updates, cache_snapshot, cache_cycle_floor.as_ref()).await;
+            let _ = persist_and_publish_cache_snapshot(
+                self.clone(),
+                &updates,
+                cache_snapshot,
+                cache_cycle_floor.as_ref(),
+                expected_publication_epoch,
+            )
+            .await;
         } else {
-            let incomplete_scope = DataUsageCache {
-                info: DataUsageCacheInfo {
-                    name: DATA_USAGE_ROOT.to_string(),
-                    next_cycle: want_cycle,
-                    leader_epoch,
-                    source: Some(source),
-                    snapshot_complete: false,
-                    scan_plan_digest: Some(scan_plan_digest),
-                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                    ..Default::default()
-                },
-                cache: HashMap::new(),
-            };
+            let mut incomplete_scope = cache_mutex.lock().await.clone();
+            incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
+            incomplete_scope.info.next_cycle = want_cycle;
+            incomplete_scope.info.last_update = None;
+            incomplete_scope.info.leader_epoch = leader_epoch;
+            incomplete_scope.info.tier_registry_generation = Some(tier_registry_generation);
+            incomplete_scope.info.source = Some(source);
+            incomplete_scope.info.snapshot_complete = false;
+            incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
+            incomplete_scope.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+            incomplete_scope.info.lkg_snapshot_complete = old_cache.info.lkg_snapshot_complete;
+            incomplete_scope.info.lkg_next_cycle = old_cache.info.lkg_next_cycle;
+            incomplete_scope.info.lkg_last_update = old_cache.info.lkg_last_update;
+            incomplete_scope.info.lkg_leader_epoch = old_cache.info.lkg_leader_epoch;
+            incomplete_scope.info.lkg_scan_plan_digest = old_cache.info.lkg_scan_plan_digest;
             if let Err(e) = updates.send(incomplete_scope).await {
                 error!(
                     target: "rustfs::scanner::io",

@@ -1653,13 +1653,8 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
                     if !is_sts_success_response_tag(element.local_name().as_ref()) {
                         return None;
                     }
-                    root_prefix = element
-                        .name()
-                        .prefix()
-                        .map(|prefix| std::str::from_utf8(prefix.as_ref()).map(str::to_owned))
-                        .transpose()
-                        .ok()?;
-                } else if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                    root_prefix = element.name().prefix().map(|prefix| prefix.as_ref().to_owned());
+                } else if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG {
                     return None;
                 }
                 depth += 1;
@@ -1668,7 +1663,7 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
                 if depth == 0 {
                     return None;
                 }
-                if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG {
                     return None;
                 }
             }
@@ -1702,8 +1697,8 @@ fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
     }
 }
 
-fn is_sts_success_response_tag(tag: &[u8]) -> bool {
-    STS_SUCCESS_RESPONSE_TAGS.iter().any(|candidate| candidate.as_bytes() == tag)
+fn is_sts_success_response_tag(tag: &str) -> bool {
+    STS_SUCCESS_RESPONSE_TAGS.contains(&tag)
 }
 
 fn wrap_sts_error_response(xml: &str, status: StatusCode, request_id: &str) -> String {

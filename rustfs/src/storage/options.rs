@@ -554,10 +554,11 @@ fn apply_replication_timestamps_from_headers(headers: &HeaderMap<HeaderValue>, o
 
     // Persist into the internal metadata keys so a later outbound replication
     // pass (replication_target_boundary) reads the source's modification
-    // times instead of falling back to mod_time.
-    // TODO(P1-6): receiver-side LWW is still missing — when the stored
-    // per-category timestamp is newer than the inbound one, the existing
-    // tags/retention/legal-hold should win instead of being overwritten.
+    // times instead of falling back to mod_time. Receiver-side LWW happens at
+    // the set layer under the object write lock
+    // (ecstore set_disk::ops::object::merge_replication_metadata_lww,
+    // rustfs/backlog#1953): a category whose stored timestamp is newer than
+    // the inbound one keeps the local values.
     for (timestamp, suffix) in [
         (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP),
         (opts.replication_retention_timestamp, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP),

@@ -16,9 +16,7 @@
 //! session policy** (`Policy` parameter) via `awscurl --service sts` with explicit
 //! `Content-Type: application/x-www-form-urlencoded` on `POST /`.
 
-use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_delete, awscurl_post_sts_form_urlencoded, awscurl_put, init_logging,
-};
+use crate::common::{RustFSTestEnvironment, awscurl_delete, awscurl_post_sts_form_urlencoded, awscurl_put, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, Tag, Tagging};
@@ -175,11 +173,6 @@ async fn cleanup_bucket_and_object(admin: &Client, bucket: &str, key: &str) {
 #[tokio::test]
 async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_iam_policy_existing_object_tag_get_object: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let user = format!("e2eiamtag-{suffix}");
     let user_secret = "longSecretKeyForTest123!";
@@ -233,11 +226,6 @@ async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<
 #[tokio::test]
 async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_bucket_policy_existing_object_tag_get_object: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let user = format!("e2ebptag-{suffix}");
     let user_secret = "longSecretKeyForTest456!";
@@ -294,11 +282,6 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
 #[tokio::test]
 async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_sts_assume_role_session_policy_existing_object_tag: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let parent = format!("e2e-sts-par-{suffix}");
     let parent_secret = "longSecretKeyForParentSts99!";
@@ -370,11 +353,6 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
 #[tokio::test]
 async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping test_e2e_sts_session_policy_delete_objects_object_prefix_only: awscurl not available");
-        return Ok(());
-    }
-
     let suffix = Uuid::new_v4();
     let parent = format!("e2e-sts-del-par-{suffix}");
     let parent_secret = "longSecretKeyForParentDelete99!";

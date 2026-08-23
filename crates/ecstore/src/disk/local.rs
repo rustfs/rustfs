@@ -8000,10 +8000,15 @@ impl DiskAPI for LocalDisk {
             use std::io::Write as _;
 
             let file_path = self.io_get_object_path(volume, path)?;
-            let lock_path = file_path.with_extension("rustfs-cas.lock");
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             return Ok(tokio::task::spawn_blocking(move || {
+                // A persistent directory lock bounds metadata growth. Removing
+                // per-target lock files can split flock ownership across inodes.
+                let lock_path = file_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?
+                    .join(".rustfs-cas.lock");
                 let lock = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -8068,7 +8073,25 @@ impl DiskAPI for LocalDisk {
             .map_err(DiskError::from)??);
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let file_path = self.io_get_object_path(volume, path)?;
+            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            let publication_root = self.publication_root.clone();
+            return Ok(tokio::task::spawn_blocking(move || {
+                os::compare_and_update_control_file(
+                    &file_path,
+                    expected.as_deref(),
+                    replacement.as_deref(),
+                    sync_metadata,
+                    &publication_root,
+                )
+            })
+            .await
+            .map_err(DiskError::from)??);
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (volume, path, expected, replacement);
             Err(DiskError::MethodNotAllowed)
@@ -8940,6 +8963,7 @@ impl DiskAPI for LocalDisk {
         )
         .await?;
 
+        out.close().await?;
         Ok(())
     }
 
@@ -21823,9 +21847,9 @@ mod test {
         assert!(matches!(results[1].as_ref().unwrap_err(), DiskError::Io(_)));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn conditional_file_update_never_deletes_a_new_owner() {
+    async fn windows_and_unix_conditional_file_update_never_deletes_a_new_owner() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -21856,8 +21880,18 @@ mod test {
             disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
                 .await
                 .expect("new owner marker should remain"),
-            owner_b
+            owner_b.clone()
         );
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(owner_b), None)
+                .await
+                .expect("current owner should remove marker"),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[cfg(unix)]
@@ -21872,7 +21906,10 @@ mod test {
         let marker_path = disk
             .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
             .expect("marker path should resolve");
-        let lock_path = marker_path.with_extension("rustfs-cas.lock");
+        let lock_path = marker_path
+            .parent()
+            .expect("marker path should have a parent")
+            .join(".rustfs-cas.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -21881,6 +21918,40 @@ mod test {
             .open(lock_path)
             .expect("marker lock should open");
         flock(&lock, FlockOperation::LockExclusive).expect("marker lock should be held");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(Bytes::from_static(b"owner"))),
+        )
+        .await
+        .expect("contended conditional update must not block")
+        .expect_err("contended conditional update must retry");
+
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::WouldBlock));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_conditional_file_update_returns_would_block_when_marker_lock_is_contended() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let lock_path = marker_path
+            .parent()
+            .expect("marker path should have a parent")
+            .join(".rustfs-cas.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .expect("marker lock should open");
+        lock.try_lock().expect("marker lock should be held");
 
         let err = tokio::time::timeout(
             Duration::from_secs(1),
