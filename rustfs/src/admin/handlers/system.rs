@@ -1343,7 +1343,9 @@ mod tests {
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
         assert_eq!(response.replication.contract_version, 1);
         assert_eq!(response.replication.bucket_replication.contract_version, 1);
-        assert_eq!(response.replication.remote_targets.contract_version, 1);
+        // v2: disableProxy moved from unsupported to writable (per-target
+        // read-proxy opt-out reached the admin API).
+        assert_eq!(response.replication.remote_targets.contract_version, 2);
         assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
         assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
         assert_eq!(
@@ -1374,7 +1376,15 @@ mod tests {
                 .remote_targets
                 .fields
                 .iter()
-                .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Unsupported)
+                .any(|field| field.name == "disableProxy" && field.state == super::ReplicationFieldState::Supported)
+        );
+        assert!(
+            response
+                .replication
+                .remote_targets
+                .fields
+                .iter()
+                .any(|field| field.name == "edge" && field.state == super::ReplicationFieldState::Unsupported)
         );
         assert!(
             response
@@ -1445,7 +1455,7 @@ mod tests {
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
         assert_eq!(value["replication"]["contract_version"], 1);
         assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
-        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 1);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 2);
         assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
         assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
         assert_eq!(
@@ -1464,7 +1474,14 @@ mod tests {
                 .as_array()
                 .expect("remote target fields should be an array")
                 .iter()
-                .any(|field| field["name"] == "disableProxy" && field["state"] == "unsupported")
+                .any(|field| field["name"] == "disableProxy" && field["state"] == "supported")
+        );
+        assert!(
+            value["replication"]["remote_targets"]["fields"]
+                .as_array()
+                .expect("remote target fields should be an array")
+                .iter()
+                .any(|field| field["name"] == "edge" && field["state"] == "unsupported")
         );
         assert!(
             value["replication"]["remote_targets"]["fields"]

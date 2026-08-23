@@ -32,16 +32,17 @@ use crate::bucket::metadata_sys::{
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
 };
-use crate::bucket::replication::ReplicationObjectBridge;
+use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
+use crate::bucket::versioning::VersioningApi;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
-    get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_lock_optimization_enabled, is_object_lock_diag_enabled,
+    SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled, same_distributed_lock_domain,
 };
 use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
-    object::{ObjectIO as _, ObjectOperations as _},
+    object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
 use parking_lot::Mutex as ParkingMutex;
 use rustfs_io_metrics::{
@@ -352,6 +353,8 @@ impl fmt::Display for ObjectLockDiagMode {
 
 pub(crate) struct ObjectLockDiagGuard {
     guard: rustfs_lock::NamespaceLockGuard,
+    #[cfg(test)]
+    test_namespace_lock_fence: Option<NamespaceLockFence>,
     enabled: bool,
     op: &'static str,
     bucket: Option<String>,
@@ -373,6 +376,8 @@ impl ObjectLockDiagGuard {
     ) -> Self {
         Self {
             guard,
+            #[cfg(test)]
+            test_namespace_lock_fence: None,
             enabled,
             op,
             bucket,
@@ -393,6 +398,115 @@ impl ObjectLockDiagGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.guard.is_lock_lost()
     }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.ensure_namespace_lock_fence();
+        if let Some(signal) = self.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        #[cfg(test)]
+        if let Some(fence) = self.test_namespace_lock_fence.as_ref() {
+            opts.add_namespace_lock_fence_for_test(fence);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecommissionMutationFenceTestPhase {
+    Migration,
+    SourceCleanup,
+}
+
+#[cfg(test)]
+struct DecommissionMutationFenceLossState {
+    bucket: String,
+    object: String,
+    phase: DecommissionMutationFenceTestPhase,
+    fence: NamespaceLockFence,
+    loss_handle: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionMutationFenceLossHook {
+    state: Arc<DecommissionMutationFenceLossState>,
+}
+
+#[cfg(test)]
+static DECOMMISSION_MUTATION_FENCE_LOSS_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DecommissionMutationFenceLossState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DecommissionMutationFenceLossHook {
+    pub(crate) fn install(bucket: &str, object: &str, phase: DecommissionMutationFenceTestPhase) -> Self {
+        let (fence, loss_handle) = NamespaceLockFence::loss_handle_for_test();
+        let state = Arc::new(DecommissionMutationFenceLossState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            phase,
+            fence,
+            loss_handle,
+        });
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        assert!(slot.is_none(), "decommission mutation fence loss hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn mark_lost(&self) {
+        self.state.loss_handle.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionMutationFenceLossHook {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission mutation fence loss hooks should not poison");
+        if slot.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn decommission_mutation_fence_for_test(
+    bucket: &str,
+    object: &str,
+    phase: DecommissionMutationFenceTestPhase,
+) -> Option<NamespaceLockFence> {
+    DECOMMISSION_MUTATION_FENCE_LOSS_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission mutation fence loss hooks should not poison")
+        .as_ref()
+        .filter(|hook| hook.bucket == bucket && hook.object == object && hook.phase == phase)
+        .map(|hook| hook.fence.clone())
+}
+
+pub(crate) struct SourceCleanupMutationFence {
+    guard: ObjectLockDiagGuard,
+    source_lock_covered: bool,
+}
+
+impl SourceCleanupMutationFence {
+    pub(crate) fn source_lock_covered(&self) -> bool {
+        self.source_lock_covered
+    }
+
+    pub(crate) fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        self.guard.add_namespace_lock_fence(opts);
+    }
 }
 
 /// Opaque write-lock guard for the RestoreObject accept path; see
@@ -410,10 +524,7 @@ impl RestoreAcceptGuard {
     }
 
     pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
-        opts.ensure_namespace_lock_fence();
-        if let Some(signal) = self.0.lock_lost_signal() {
-            opts.add_namespace_lock_lost_signal(signal);
-        }
+        self.0.add_namespace_lock_fence(opts);
     }
 }
 
@@ -690,16 +801,6 @@ impl SelectObjectSnapshotLockLossWake {
     }
 }
 
-// LockRegistry clones its canonical client Arc for each endpoint host, so an
-// exact Arc set identifies one distributed namespace-lock quorum domain.
-fn same_distributed_lock_domain(left: &[Arc<dyn rustfs_lock::LockClient>], right: &[Arc<dyn rustfs_lock::LockClient>]) -> bool {
-    left.iter()
-        .all(|left_client| right.iter().any(|right_client| Arc::ptr_eq(left_client, right_client)))
-        && right
-            .iter()
-            .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
-}
-
 impl AsyncRead for SelectObjectSnapshotReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         if self.lock_loss_wake.poll_lost(cx) || self.lease.is_lost() {
@@ -805,7 +906,7 @@ fn resolve_latest_object_access(
 }
 
 fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
-    opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+    (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
 #[cfg(test)]
@@ -813,6 +914,8 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
+    namespace_acquired: AtomicBool,
 }
 
 #[cfg(test)]
@@ -832,6 +935,8 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             bucket: bucket.to_string(),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: AtomicBool::new(false),
         });
         let mut slot = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -848,6 +953,18 @@ impl DeleteAfterObjectLockSnapshotBarrier {
 
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
+    }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        let namespace_pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), namespace_pending)
+            .await
+            .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(Ordering::Acquire)
     }
 }
 
@@ -872,6 +989,97 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
         .expect("delete snapshot barrier mutex should not poison")
         .as_ref()
         .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+        state.namespace_pending.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_namespace_acquired(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
+        state.namespace_acquired.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+struct VersionedDeleteMarkerCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct VersionedDeleteMarkerCommitBarrier {
+    state: Arc<VersionedDeleteMarkerCommitBarrierState>,
+}
+
+#[cfg(test)]
+static VERSIONED_DELETE_MARKER_COMMIT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<VersionedDeleteMarkerCommitBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl VersionedDeleteMarkerCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(VersionedDeleteMarkerCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        assert!(slot.is_none(), "versioned delete-marker commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("versioned DELETE should reach the post-marker-commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for VersionedDeleteMarkerCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("versioned delete-marker commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_versioned_delete_marker_after_commit(bucket: &str, object: &str) {
+    let state = VERSIONED_DELETE_MARKER_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("versioned delete-marker commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
         .cloned();
     if let Some(state) = state {
         state.arrived.notify_one();
@@ -911,6 +1119,160 @@ fn writer_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions
     lookup_opts.skip_rebalancing = true;
 
     lookup_opts
+}
+
+fn delete_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
+    let mut lookup_opts = writer_pool_lookup_opts(opts, no_lock);
+    lookup_opts.skip_decommissioned = opts.data_movement;
+    lookup_opts
+}
+
+fn should_delete_from_all_pools(opts: &ObjectOptions, pool_count: usize) -> bool {
+    pool_count > 0 && (!opts.versioned && !opts.version_suspended || opts.version_id.is_some())
+}
+
+fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_snapshot: &DeleteReplicationConfigSnapshot) -> bool {
+    if object.version_id.is_some() {
+        return false;
+    }
+
+    let object_name = decode_dir_object(&object.object_name);
+    let (versioned, version_suspended) = delete_config_snapshot.versioning_config().delete_state(&object_name);
+    versioned || version_suspended
+}
+
+fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
+    !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
+}
+
+#[cfg(test)]
+struct BatchDeletePoolErrorInjectionState {
+    bucket: String,
+    pool_idx: usize,
+    errors: std::collections::HashMap<String, Error>,
+    observed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) struct BatchDeletePoolErrorInjection {
+    state: Arc<BatchDeletePoolErrorInjectionState>,
+}
+
+#[cfg(test)]
+static BATCH_DELETE_POOL_ERROR_INJECTION: std::sync::OnceLock<std::sync::Mutex<Option<Arc<BatchDeletePoolErrorInjectionState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl BatchDeletePoolErrorInjection {
+    pub(crate) fn install(bucket: &str, pool_idx: usize, errors: Vec<(String, Error)>) -> Self {
+        let state = Arc::new(BatchDeletePoolErrorInjectionState {
+            bucket: bucket.to_string(),
+            pool_idx,
+            errors: errors.into_iter().collect(),
+            observed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        assert!(slot.is_none(), "batch delete pool error injection must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn observed(&self) -> usize {
+        self.state.observed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BatchDeletePoolErrorInjection {
+    fn drop(&mut self) {
+        let mut slot = BATCH_DELETE_POOL_ERROR_INJECTION
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("batch delete pool error injection mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn inject_batch_delete_pool_errors(
+    bucket: &str,
+    pool_idx: usize,
+    object_names: &[String],
+    result: &mut (Vec<DeletedObject>, Vec<Option<Error>>),
+) {
+    let state = BATCH_DELETE_POOL_ERROR_INJECTION
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("batch delete pool error injection mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.pool_idx == pool_idx)
+        .cloned();
+    let Some(state) = state else {
+        return;
+    };
+
+    for (idx, object_name) in object_names.iter().enumerate() {
+        let Some(error) = state.errors.get(object_name) else {
+            continue;
+        };
+        if result.1[idx].is_none() && result.0[idx].found {
+            result.1[idx] = Some(error.clone());
+            state.observed.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn resolve_batch_delete_pool_results<'a>(
+    initial_error: Option<Error>,
+    pool_results: impl IntoIterator<Item = (&'a DeletedObject, &'a Option<Error>)>,
+) -> (Option<DeletedObject>, Option<Error>, bool) {
+    let mut failure = initial_error.map(|err| (None, err));
+    let mut deleted = None;
+    let mut fallback: Option<(DeletedObject, Option<Error>)> = None;
+    let mut attempted = false;
+
+    for (pool_delete, pool_error) in pool_results {
+        attempted = true;
+        match pool_error {
+            Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => {
+                if fallback.as_ref().is_none_or(|(_, error)| error.is_none()) {
+                    fallback = Some(((*pool_delete).clone(), Some(err.clone())));
+                }
+            }
+            Some(err) => {
+                if failure.is_none() {
+                    failure = Some((Some((*pool_delete).clone()), err.clone()));
+                }
+            }
+            None if pool_delete.found => {
+                if deleted.is_none() {
+                    deleted = Some((*pool_delete).clone());
+                }
+            }
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(((*pool_delete).clone(), None));
+                }
+            }
+        }
+    }
+
+    if let Some((failed_delete, err)) = failure {
+        return (failed_delete, Some(err), attempted);
+    }
+    if let Some(deleted) = deleted {
+        return (Some(deleted), None, attempted);
+    }
+    if let Some((deleted, err)) = fallback {
+        return (Some(deleted), err, attempted);
+    }
+
+    (None, None, attempted)
 }
 
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
@@ -1214,6 +1576,14 @@ fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Ve
     let del_errs = objects.iter().map(|_| Some(err.clone())).collect();
 
     (del_objects, del_errs)
+}
+
+fn return_batch_delete_lock_error_with_accounting(
+    objects: &[ObjectToDelete],
+    err: Error,
+) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+    let (deleted, errors) = return_batch_delete_lock_error(objects, err);
+    (deleted, errors, vec![None; objects.len()])
 }
 
 fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
@@ -1531,6 +1901,89 @@ impl ECStore {
             owner,
             ObjectLockDiagMode::Read,
         )))
+    }
+
+    pub(crate) async fn acquire_decommission_object_mutation_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<ObjectLockDiagGuard> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission object migration requires namespace locking"));
+        }
+
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::Migration);
+        let object = encode_dir_object(object);
+        let mut opts = ObjectOptions::default();
+        let guard = self
+            .acquire_object_read_lock_if_needed("decommission_object", bucket, &object, &mut opts)
+            .await?
+            .ok_or_else(|| Error::other("decommission object migration failed to acquire its namespace fence"))?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
+        Ok(guard)
+    }
+
+    pub(super) async fn apply_decommission_target_mutation_fence(
+        &self,
+        target_pool_idx: usize,
+        object: &str,
+        opts: &mut ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
+    ) {
+        let Some(mutation_fence) = mutation_fence else {
+            return;
+        };
+
+        mutation_fence.add_namespace_lock_fence(opts);
+        let fixed_set = self.pools.first().and_then(|pool| pool.disk_set.first());
+        let target_set = self.pools.get(target_pool_idx).map(|pool| pool.get_disks_by_key(object));
+        opts.no_lock = match (fixed_set, target_set) {
+            (Some(fixed), Some(target)) => fixed.shares_namespace_lock_domain(&target).await,
+            _ => false,
+        };
+    }
+
+    pub(crate) async fn acquire_decommission_source_cleanup_fence(
+        &self,
+        bucket: &str,
+        object: &str,
+        source_set: &SetDisks,
+    ) -> Result<SourceCleanupMutationFence> {
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("decommission source cleanup requires namespace locking"));
+        }
+
+        #[cfg(test)]
+        crate::data_movement::notify_source_cleanup_mutation_fence_pending(bucket, object);
+        #[cfg(test)]
+        let test_namespace_lock_fence =
+            decommission_mutation_fence_for_test(bucket, object, DecommissionMutationFenceTestPhase::SourceCleanup);
+        let object = encode_dir_object(object);
+        let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
+        let source_lock_covered = fixed_set.shares_namespace_lock_domain(source_set).await;
+        // Lock order: fixed store mutation domain first; source cleanup takes its
+        // hashed source-domain lock second only when this guard does not cover it.
+        let guard = self
+            .acquire_object_write_lock("decommission_source_cleanup", bucket, &object)
+            .await?;
+        #[cfg(test)]
+        let guard = {
+            let mut guard = guard;
+            guard.test_namespace_lock_fence = test_namespace_lock_fence;
+            guard
+        };
+
+        Ok(SourceCleanupMutationFence {
+            guard,
+            source_lock_covered,
+        })
     }
 
     pub(crate) async fn acquire_all_object_read_locks(
@@ -1986,14 +2439,17 @@ impl ECStore {
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
+        mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(usize, Result<ObjectInfo>)> {
         if !opts.data_movement {
             return Err(Error::other("data movement PUT requires data_movement options"));
         }
-        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let (object, mut opts) = self.prepare_put_object(bucket, object, opts).await?;
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
+        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence)
+            .await;
         let result = self.pools[idx]
             .put_object_with_old_current_size(bucket, &object, data, &opts)
             .await
@@ -2312,6 +2768,22 @@ impl ECStore {
         result
     }
 
+    pub async fn delete_objects_with_tier_delete_journal_and_accounting(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let result = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, Some(Arc::clone(self)))
+            .await;
+        let success_count = result.1.iter().filter(|err| err.is_none()).count();
+        if success_count > 0 {
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+        }
+        result
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         self.handle_delete_object_with_journal(bucket, object, opts, None).await
@@ -2446,6 +2918,10 @@ impl ECStore {
         } else {
             None
         };
+        #[cfg(test)]
+        if _object_lock_guard.is_some() {
+            notify_delete_namespace_acquired(bucket);
+        }
         if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
             let configs = delete_all_configs.as_ref().ok_or(StorageError::PreconditionFailed)?;
             let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
@@ -2479,7 +2955,7 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let gopts = writer_pool_lookup_opts(&opts, true);
+        let gopts = delete_pool_lookup_opts(&opts, true);
 
         if opts.data_movement {
             let existing_pool_info = self.get_pool_info_existing_with_opts(bucket, object, &gopts).await;
@@ -2584,6 +3060,8 @@ impl ECStore {
             Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
                 let target_pool_idx = self.get_pool_idx_no_lock(bucket, object, 0).await?;
                 let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+                #[cfg(test)]
+                pause_versioned_delete_marker_after_commit(bucket, object).await;
                 obj.name = decode_dir_object(object);
                 return Ok(obj);
             }
@@ -2622,7 +3100,7 @@ impl ECStore {
             None
         };
 
-        if !errs.is_empty() && !opts.versioned && !opts.version_suspended {
+        if should_delete_from_all_pools(&opts, errs.len()) {
             let mut obj = match self.delete_object_from_all_pools(bucket, object, &opts, errs).await {
                 Ok(obj) => obj,
                 Err(err) => {
@@ -2646,6 +3124,8 @@ impl ECStore {
 
             match pool.delete_object(bucket, object, opts.clone()).await {
                 Ok(res) => {
+                    #[cfg(test)]
+                    pause_versioned_delete_marker_after_commit(bucket, object).await;
                     if let (Some(api), Some(je)) = (tier_journal_api.as_ref(), journal_entry.as_ref()) {
                         commit_prepared_tier_delete_journal_entry(api, je).await;
                     }
@@ -2689,6 +3169,19 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let (deleted, errors, _) = self
+            .handle_delete_objects_with_journal_and_accounting(bucket, objects, opts, tier_journal_api)
+            .await;
+        (deleted, errors)
+    }
+
+    pub(super) async fn handle_delete_objects_with_journal_and_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
             .iter()
@@ -2701,6 +3194,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
@@ -2714,7 +3208,7 @@ impl ECStore {
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
                 Ok(guard) => Some(guard),
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             }
         };
         if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
@@ -2726,21 +3220,21 @@ impl ECStore {
                 Err(err) => {
                     let message = err.to_string();
                     let errors = (0..objects.len()).map(|_| Some(Error::other(message.clone()))).collect();
-                    return (del_objects, errors);
+                    return (del_objects, errors, accounting);
                 }
             }
         }
         if !is_meta_bucketname(bucket)
             && let Err(err) = get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
         {
-            return return_batch_delete_lock_error(objects.as_slice(), err);
+            return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err);
         }
         let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
             None
         } else {
             Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
                 Ok(guard) => guard,
-                Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             })
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
@@ -2750,7 +3244,7 @@ impl ECStore {
             let (state, incarnation_id, config_revision) =
                 match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
                     Ok(snapshot) => snapshot,
-                    Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+                    Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket(
                 self.id,
@@ -2766,7 +3260,10 @@ impl ECStore {
         if let (Some(expected), Some(current)) = (opts.expected_bucket_incarnation_id, current_bucket_incarnation_id)
             && expected != current
         {
-            return return_batch_delete_lock_error(objects.as_slice(), StorageError::BucketNotFound(bucket.to_string()));
+            return return_batch_delete_lock_error_with_accounting(
+                objects.as_slice(),
+                StorageError::BucketNotFound(bucket.to_string()),
+            );
         }
         #[cfg(test)]
         if current_bucket_incarnation_id.is_some() {
@@ -2774,32 +3271,106 @@ impl ECStore {
         }
         let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
             Ok(guards) => guards,
-            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+            Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
+        #[cfg(test)]
+        if !_object_lock_guards.is_empty() {
+            notify_delete_namespace_acquired(bucket);
+        }
+
+        let delete_config_snapshot = opts
+            .delete_replication_config_snapshot
+            .as_deref()
+            .expect("batch delete replication config snapshot should be loaded");
+        let latest_marker_objects = objects
+            .iter()
+            .map(|object| batch_delete_creates_latest_marker(object, delete_config_snapshot))
+            .collect::<Vec<_>>();
+        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(
+            |(object, creates_marker)| async move {
+                if *creates_marker {
+                    Some(self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await)
+                } else {
+                    None
+                }
+            },
+        ))
+        .await;
+        let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
+        for (idx, target_result) in marker_target_results.into_iter().enumerate() {
+            match target_result {
+                Some(Ok(pool_idx)) => marker_target_pool_indices.push(Some(pool_idx)),
+                Some(Err(err)) => {
+                    del_errs[idx] = Some(err);
+                    marker_target_pool_indices.push(None);
+                }
+                None => marker_target_pool_indices.push(None),
+            }
+        }
 
         let mut futures = Vec::with_capacity(self.pools.len());
-
         for pool in self.pools.iter() {
             if self.is_pool_rebalancing(pool.pool_idx).await {
                 continue;
             }
-            futures.push(pool.delete_objects(bucket, objects.clone(), opts.clone()));
+
+            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| {
+                    batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
+                })
+                .map(|(idx, object)| (idx, object.clone()))
+                .unzip();
+            if pool_objects.is_empty() {
+                continue;
+            }
+
+            let pool_opts = opts.clone();
+            futures.push(async move {
+                #[cfg(test)]
+                let pool_object_names = pool_objects
+                    .iter()
+                    .map(|object| object.object_name.clone())
+                    .collect::<Vec<_>>();
+                let result = pool.delete_objects(bucket, pool_objects, pool_opts).await;
+                #[cfg(test)]
+                let result = {
+                    let mut result = result;
+                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, &mut result);
+                    result
+                };
+                (object_indices, result)
+            });
         }
 
         let results = join_all(futures).await;
 
         for idx in 0..del_objects.len() {
-            for (dels, errs) in results.iter() {
-                if errs[idx].is_none() && dels[idx].found {
-                    del_errs[idx] = None;
-                    del_objects[idx] = dels[idx].clone();
-                    break;
-                }
+            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs))| {
+                let pool_object_idx = object_indices.binary_search(&idx).ok()?;
+                Some((&dels[pool_object_idx], &errs[pool_object_idx]))
+            });
+            let (deleted, error, attempted) = resolve_batch_delete_pool_results(del_errs[idx].take(), pool_results);
+            if let Some(deleted) = deleted {
+                del_objects[idx] = deleted;
+            }
+            del_errs[idx] = error;
 
-                if del_errs[idx].is_none() {
-                    del_errs[idx] = errs[idx].clone();
-                    del_objects[idx] = dels[idx].clone();
-                }
+            if !attempted && del_errs[idx].is_none() && latest_marker_objects[idx] {
+                del_objects[idx] = DeletedObject {
+                    object_name: objects[idx].object_name.clone(),
+                    version_id: objects[idx].version_id,
+                    ..Default::default()
+                };
+                del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
+            }
+        }
+
+        #[cfg(test)]
+        for (idx, object) in objects.iter().enumerate() {
+            if del_errs[idx].is_none() && del_objects[idx].delete_marker {
+                pause_versioned_delete_marker_after_commit(bucket, &object.object_name).await;
             }
         }
 
@@ -2807,7 +3378,7 @@ impl ECStore {
             v.object_name = decode_dir_object(&v.object_name);
         });
 
-        (del_objects, del_errs)
+        (del_objects, del_errs, accounting)
 
         // let mut futures = Vec::with_capacity(objects.len());
 
@@ -3372,6 +3943,80 @@ mod tests {
             &[Arc::clone(&second), Arc::clone(&first)]
         ));
         assert!(!same_distributed_lock_domain(&[first, second], &[other]));
+    }
+
+    #[tokio::test]
+    async fn decommission_fence_covers_dist_sets_with_same_clients_despite_different_namespaces() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original_sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        let mut second_set = (*original_sets.disk_set[1]).clone();
+        second_set.lockers = original_sets.disk_set[0].lockers.clone();
+        let mut sets = (*original_sets).clone();
+        sets.disk_set[1] = Arc::new(second_set);
+        let sets = Arc::new(sets);
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+
+        assert!(
+            sets.disk_set[0]
+                .lockers
+                .iter()
+                .zip(&sets.disk_set[1].lockers)
+                .all(|(fixed, hashed)| Arc::ptr_eq(fixed, hashed)),
+            "the regression requires identical distributed lock clients"
+        );
+        assert_ne!(sets.disk_set[0].set_index, sets.disk_set[1].set_index);
+
+        let pool_config = sets.endpoints.clone();
+        let store = new_prepared_reader_test_store_from_pools(vec![Arc::clone(&sets)], vec![pool_config], ctx);
+        let object = (0..1_000)
+            .map(|index| format!("decommission-dist-domain-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a key should hash to the second set namespace");
+        let mutation_fence = store
+            .acquire_decommission_object_mutation_fence("bucket", &object)
+            .await
+            .expect("the fixed distributed mutation fence should be acquired");
+        let target_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &object)
+            .await
+            .expect("the hashed-set namespace lock should be created");
+        let target_err = target_lock
+            .get_write_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed read fence must conflict through the shared clients");
+        assert!(matches!(target_err, rustfs_lock::LockError::Timeout { .. }));
+
+        let mut put_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut put_opts, Some(&mutation_fence))
+            .await;
+        assert!(put_opts.no_lock, "migration target PUT must reuse the covering fixed fence");
+
+        let mut multipart_opts = ObjectOptions::default();
+        store
+            .apply_decommission_target_mutation_fence(0, &object, &mut multipart_opts, Some(&mutation_fence))
+            .await;
+        assert!(multipart_opts.no_lock, "migration target multipart must reuse the covering fixed fence");
+        drop(mutation_fence);
+
+        let cleanup_object = (0..1_000)
+            .map(|index| format!("decommission-dist-cleanup-{index}.bin"))
+            .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
+            .expect("a cleanup key should hash to the second set namespace");
+        let source_fence = store
+            .acquire_decommission_source_cleanup_fence("bucket", &cleanup_object, sets.disk_set[1].as_ref())
+            .await
+            .expect("the fixed distributed cleanup fence should be acquired");
+        assert!(source_fence.source_lock_covered(), "source cleanup must reuse the covering fixed fence");
+        let source_lock = sets.disk_set[1]
+            .new_ns_lock("bucket", &cleanup_object)
+            .await
+            .expect("the source-set namespace lock should be created");
+        let source_err = source_lock
+            .get_read_lock(Duration::from_millis(50))
+            .await
+            .expect_err("the fixed write fence must conflict through the shared clients");
+        assert!(matches!(source_err, rustfs_lock::LockError::Timeout { .. }));
     }
 
     #[test]
@@ -4431,6 +5076,159 @@ mod tests {
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
         assert_eq!(lookup_opts.version_id.as_deref(), Some("vid-1"));
+    }
+
+    #[test]
+    fn ordinary_delete_lookup_includes_decommission_source_and_skips_rebalance_source() {
+        let lookup_opts = delete_pool_lookup_opts(&ObjectOptions::default(), true);
+
+        assert!(lookup_opts.no_lock);
+        assert!(!lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+
+        let explicit_version = delete_pool_lookup_opts(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(!explicit_version.skip_decommissioned);
+    }
+
+    #[test]
+    fn delete_fans_out_for_unversioned_and_explicit_version_mutations() {
+        assert!(should_delete_from_all_pools(&ObjectOptions::default(), 1));
+        assert!(should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            2,
+        ));
+        assert!(!should_delete_from_all_pools(
+            &ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+            1,
+        ));
+        assert!(!should_delete_from_all_pools(&ObjectOptions::default(), 0));
+    }
+
+    #[test]
+    fn batch_delete_identifies_only_latest_versioned_markers() {
+        let versioned = DeleteReplicationConfigSnapshot::from_configs_for_test(
+            s3s::dto::VersioningConfiguration {
+                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            },
+            None,
+        );
+        let latest = ObjectToDelete {
+            object_name: "latest".to_string(),
+            ..Default::default()
+        };
+        assert!(batch_delete_creates_latest_marker(&latest, &versioned));
+        assert!(!batch_delete_targets_pool(true, Some(1), 0));
+        assert!(batch_delete_targets_pool(true, Some(1), 1));
+        assert!(!batch_delete_targets_pool(true, Some(1), 2));
+
+        let explicit = ObjectToDelete {
+            object_name: "explicit".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(!batch_delete_creates_latest_marker(&explicit, &versioned));
+        assert!(batch_delete_targets_pool(false, Some(1), 0));
+
+        let unversioned = DeleteReplicationConfigSnapshot::default();
+        assert!(!batch_delete_creates_latest_marker(&latest, &unversioned));
+        assert!(batch_delete_targets_pool(false, None, 0));
+    }
+
+    #[test]
+    fn batch_delete_pool_failures_override_success_in_any_pool_order() {
+        let success = DeletedObject {
+            object_name: "object".to_string(),
+            found: true,
+            ..Default::default()
+        };
+        let source_errors = [
+            StorageError::ErasureWriteQuorum,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_objects_commit",
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                required: 1,
+                achieved: 0,
+            },
+        ];
+
+        for source_error in source_errors {
+            for source_first in [true, false] {
+                let failed = (DeletedObject::default(), Some(source_error.clone()));
+                let succeeded = (success.clone(), None);
+                let pool_results = if source_first {
+                    vec![failed, succeeded]
+                } else {
+                    vec![succeeded, failed]
+                };
+
+                let (_, error, attempted) =
+                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+
+                assert!(attempted);
+                assert_eq!(error, Some(source_error.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_delete_ignores_missing_pool_only_after_another_pool_succeeds() {
+        let success = DeletedObject {
+            object_name: "object".to_string(),
+            found: true,
+            ..Default::default()
+        };
+        let missing_errors = [
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+            StorageError::VersionNotFound("bucket".to_string(), "object".to_string(), "version".to_string()),
+        ];
+
+        for missing_error in missing_errors {
+            let missing = (DeletedObject::default(), Some(missing_error.clone()));
+            for missing_first in [true, false] {
+                let succeeded = (success.clone(), None);
+                let pool_results = if missing_first {
+                    vec![missing.clone(), succeeded]
+                } else {
+                    vec![succeeded, missing.clone()]
+                };
+                let (deleted, error, attempted) =
+                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+
+                assert!(attempted);
+                let deleted = deleted.expect("successful pool result should be retained");
+                assert!(deleted.found);
+                assert_eq!(deleted.object_name, success.object_name.as_str());
+                assert!(error.is_none());
+            }
+
+            let missing_only = [missing];
+            let (_, error, attempted) =
+                resolve_batch_delete_pool_results(None, missing_only.iter().map(|(deleted, error)| (deleted, error)));
+            assert!(attempted);
+            assert_eq!(error, Some(missing_error));
+        }
+
+        let silent_missing = [(DeletedObject::default(), None)];
+        let (_, error, attempted) =
+            resolve_batch_delete_pool_results(None, silent_missing.iter().map(|(deleted, error)| (deleted, error)));
+        assert!(attempted);
+        assert!(error.is_none());
     }
 
     #[test]

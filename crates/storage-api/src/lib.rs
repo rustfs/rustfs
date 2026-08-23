@@ -76,6 +76,7 @@ pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOption
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
 pub use object::{DeletedObject, ObjectToDelete};
 pub use object::{ExpirationOptions, TransitionedObject};
