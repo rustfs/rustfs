@@ -34,7 +34,7 @@ use crate::{
     startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
 };
 use rustfs_common::GlobalReadiness;
-use std::{io::Result, sync::Arc};
+use std::{collections::BTreeSet, io::Result, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct StartupServiceRuntime {
@@ -162,15 +162,13 @@ fn inventory_snapshot(
             observed: info.disks.len(),
         });
     }
-    let total = crate::app::storage_api::capacity::get_total_usable_capacity(&info.disks, &info) as u64;
-    let free = crate::app::storage_api::capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
+    let (total, free) = inventory_capacity(&info)?;
     let mut flags = Vec::with_capacity(3);
-    if info
-        .disks
-        .iter()
-        .any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE || disk.state == "disk not found")
-    {
-        flags.extend([InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]);
+    if info.disks.iter().any(|disk| !inventory_disk_is_healthy(disk)) {
+        flags.push(InventoryFlag::ClusterDegraded);
+    }
+    if info.disks.iter().any(inventory_disk_is_offline) {
+        flags.push(InventoryFlag::DriveOffline);
     }
     if info.disks.iter().any(|disk| disk.healing) {
         flags.push(InventoryFlag::ClusterHealing);
@@ -178,9 +176,95 @@ fn inventory_snapshot(
     InventorySnapshot::current(node_count, info.disks.len(), total, free, flags)
 }
 
+fn inventory_disk_is_healthy(disk: &rustfs_madmin::Disk) -> bool {
+    let disk_state_is_healthy = ["ok", rustfs_madmin::ITEM_ONLINE, "unformatted"]
+        .iter()
+        .any(|state| disk.state.eq_ignore_ascii_case(state));
+    let runtime_state_is_healthy = disk.runtime_state.as_deref().is_none_or(|runtime_state| {
+        [rustfs_madmin::ITEM_ONLINE, "returning"]
+            .iter()
+            .any(|state| runtime_state.eq_ignore_ascii_case(state))
+    });
+    disk_state_is_healthy && runtime_state_is_healthy
+}
+
+fn inventory_disk_is_offline(disk: &rustfs_madmin::Disk) -> bool {
+    [rustfs_madmin::ITEM_OFFLINE, "missing", "disk not found"]
+        .iter()
+        .any(|state| disk.state.eq_ignore_ascii_case(state))
+        || disk.runtime_state.as_deref().is_some_and(|runtime_state| {
+            [rustfs_madmin::ITEM_OFFLINE, "missing"]
+                .iter()
+                .any(|state| runtime_state.eq_ignore_ascii_case(state))
+        })
+}
+
+fn inventory_capacity(info: &rustfs_madmin::StorageInfo) -> std::result::Result<(u64, u64), InventoryError> {
+    let configured_data_widths = (!info.backend.standard_sc_data.is_empty()).then_some(info.backend.standard_sc_data.as_slice());
+    let capacity = aggregate_inventory_capacity(&info.disks, configured_data_widths)?;
+    if configured_data_widths.is_some() && capacity.is_none() {
+        return Ok(aggregate_inventory_capacity(&info.disks, None)?.unwrap_or_default());
+    }
+    Ok(capacity.unwrap_or_default())
+}
+
+fn aggregate_inventory_capacity(
+    disks: &[rustfs_madmin::Disk],
+    data_widths: Option<&[usize]>,
+) -> std::result::Result<Option<(u64, u64)>, InventoryError> {
+    let mut seen = BTreeSet::new();
+    let mut total = 0_u64;
+    let mut free = 0_u64;
+    for disk in disks {
+        let (Ok(pool_index), Ok(set_index), Ok(disk_index)) = (
+            usize::try_from(disk.pool_index),
+            usize::try_from(disk.set_index),
+            usize::try_from(disk.disk_index),
+        ) else {
+            continue;
+        };
+        let included = match data_widths {
+            Some(widths) => widths.get(pool_index).is_some_and(|width| *width > 0 && disk_index < *width),
+            None => {
+                let state = disk.state.trim().to_ascii_lowercase();
+                !state.contains("offline") && !state.contains("not found")
+            }
+        };
+        if !included || !seen.insert((pool_index, set_index, disk_index)) {
+            continue;
+        }
+        total = total.checked_add(disk.total_space).ok_or(InventoryError::Capacity)?;
+        free = free.checked_add(disk.available_space).ok_or(InventoryError::Capacity)?;
+    }
+    Ok((!seen.is_empty()).then_some((total, free)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn disk(state: &str, runtime_state: Option<&str>, disk_index: i32) -> rustfs_madmin::Disk {
+        rustfs_madmin::Disk {
+            state: state.to_owned(),
+            runtime_state: runtime_state.map(str::to_owned),
+            pool_index: 0,
+            set_index: 0,
+            disk_index,
+            total_space: 100,
+            available_space: 40,
+            ..Default::default()
+        }
+    }
+
+    fn info(disks: Vec<rustfs_madmin::Disk>) -> rustfs_madmin::StorageInfo {
+        rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![disks.len()],
+                ..Default::default()
+            },
+            disks,
+        }
+    }
 
     #[test]
     fn inventory_rejects_a_partial_startup_storage_snapshot() {
@@ -200,21 +284,108 @@ mod tests {
 
     #[test]
     fn inventory_marks_a_missing_drive_as_offline() {
-        let info = rustfs_madmin::StorageInfo {
-            disks: vec![
-                rustfs_madmin::Disk::default(),
-                rustfs_madmin::Disk {
-                    state: "disk not found".to_string(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
+        let info = info(vec![disk("ok", None, 0), disk("disk not found", None, 1)]);
 
         assert_eq!(
             inventory_snapshot(1, 2, info).expect("complete inventory should encode"),
-            InventorySnapshot::current(1, 2, 0, 0, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
+            InventorySnapshot::current(1, 2, 200, 80, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
                 .expect("expected inventory should encode")
         );
+    }
+
+    #[test]
+    fn inventory_health_uses_the_readiness_allow_list() {
+        let healthy = info(vec![
+            disk("ok", None, 0),
+            disk(rustfs_madmin::ITEM_ONLINE, Some("online"), 1),
+            disk("unformatted", Some("returning"), 2),
+        ]);
+        assert_eq!(
+            inventory_snapshot(1, 3, healthy).expect("healthy inventory should encode"),
+            InventorySnapshot::current(1, 3, 300, 120, []).expect("expected inventory should encode")
+        );
+
+        for (state, runtime_state, offline) in [
+            ("unknown", None, false),
+            ("disk io error", Some("online"), false),
+            ("ok", Some("suspect"), false),
+            (rustfs_madmin::ITEM_OFFLINE, Some("offline"), true),
+        ] {
+            let flags = if offline {
+                vec![InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]
+            } else {
+                vec![InventoryFlag::ClusterDegraded]
+            };
+            assert_eq!(
+                inventory_snapshot(1, 1, info(vec![disk(state, runtime_state, 0)])).expect("degraded inventory should encode"),
+                InventorySnapshot::current(1, 1, 100, 40, flags).expect("expected inventory should encode"),
+                "state={state}, runtime_state={runtime_state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_capacity_uses_numeric_indices_without_logging_identifiers() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("captured log lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+            type Writer = CapturedLogWriter;
+
+            fn make_writer(&'writer self) -> Self::Writer {
+                CapturedLogWriter(self.0.clone())
+            }
+        }
+
+        const ENDPOINT_CANARY: &str = "https://inventory-endpoint-secret.invalid";
+        const PATH_CANARY: &str = "/inventory/path/secret";
+        let mut first = disk("ok", Some("online"), 0);
+        first.endpoint = ENDPOINT_CANARY.to_owned();
+        first.drive_path = PATH_CANARY.to_owned();
+        let mut duplicate = first.clone();
+        duplicate.endpoint = "https://duplicate-secret.invalid".to_owned();
+        duplicate.drive_path = "/duplicate/path/secret".to_owned();
+        duplicate.total_space = 900;
+        duplicate.available_space = 800;
+        let info = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                ..Default::default()
+            },
+            disks: vec![first, duplicate],
+        };
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured.clone())
+            .finish();
+        let snapshot =
+            tracing::subscriber::with_default(subscriber, || inventory_snapshot(1, 2, info).expect("inventory should encode"));
+
+        assert_eq!(
+            snapshot,
+            InventorySnapshot::current(1, 2, 100, 40, []).expect("expected inventory should encode")
+        );
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
+        let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("UTF-8 logs");
+        for canary in [ENDPOINT_CANARY, PATH_CANARY, "duplicate-secret", "/duplicate/path"] {
+            assert!(!encoded.contains(canary), "snapshot exposed {canary}");
+            assert!(!logs.contains(canary), "logs exposed {canary}");
+        }
     }
 }

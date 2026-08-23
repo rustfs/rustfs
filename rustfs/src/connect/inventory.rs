@@ -171,6 +171,8 @@ impl InventorySnapshot {
     }
 
     pub fn content_hash(&self) -> Result<String, InventoryError> {
+        self.validate()?;
+
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Canonical<'a> {
@@ -278,6 +280,7 @@ impl InventorySender {
     }
 
     pub(crate) async fn send(&self, inventory: &PendingInventory) -> Result<InventoryDelivery, InventoryError> {
+        inventory.snapshot.validate()?;
         match self.transport.post("inventorySnapshots", inventory).await? {
             TelemetryDelivery::Accepted { cluster_name, body } => {
                 #[derive(Deserialize)]
@@ -382,6 +385,7 @@ impl InventoryStateStore {
     }
 
     fn prepare_sync(&self, snapshot: InventorySnapshot) -> Result<Option<PendingInventory>, InventoryError> {
+        snapshot.validate()?;
         let mut state = self.read()?;
         if state.pending.is_some() {
             return Ok(state.pending);

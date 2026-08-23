@@ -392,6 +392,40 @@ fn connect_inventory_bounds_fail_instead_of_truncating_or_inventing_values() {
 }
 
 #[tokio::test]
+async fn connect_inventory_rejects_deserialized_invalid_snapshots_before_state_or_network() {
+    let pki = TestPki::new();
+    let server = server(&pki, Vec::new()).await;
+    for rustfs_version in ["1.0".to_owned(), format!("1.{}.0", "1".repeat(4096))] {
+        let invalid: InventorySnapshot = serde_json::from_value(json!({
+            "rustfsVersion": rustfs_version,
+            "osVersion": null,
+            "nodeCount": 1,
+            "driveCount": 1,
+            "capacityTotalBytes": 100,
+            "capacityUsedBytes": 60,
+            "coarseFlags": []
+        }))
+        .expect("serde should not bypass the runtime validation boundary");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shutdown = CancellationToken::new();
+        let runtime = spawn_inventory_runtime(Some(config(&temp, &pki, &server)), schedule(), &shutdown, move || {
+            std::future::ready(Ok(invalid.clone()))
+        })
+        .expect("start inventory")
+        .expect("configured inventory");
+        let mut status = runtime.status();
+
+        assert!(matches!(
+            wait_for(&mut status, |status| matches!(status, InventoryStatus::Failed { .. })).await,
+            InventoryStatus::Failed { reason } if reason.contains("version is outside protocol bounds")
+        ));
+        assert!(!temp.path().join("private-config-secret/inventory/state.json").exists());
+        runtime.shutdown().await;
+    }
+    assert!(server.seen.lock().expect("seen lock").is_empty());
+}
+
+#[tokio::test]
 async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_unchanged_inventory() {
     let pki = TestPki::new();
     let content_hash = snapshot().content_hash().expect("content hash");
