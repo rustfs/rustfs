@@ -236,6 +236,15 @@ pub struct DataUsageInfo {
     /// without relying on synchronized clocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_snapshot_authoritative_baseline: Option<DataUsageSnapshotIdentity>,
+    /// Per-set freshness for an observational aggregate.  A set entry is
+    /// never sufficient to make the aggregate authoritative; it only records
+    /// which last-known-good generation contributed to the view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// An observational view may contain only the sets that completed this
+    /// cycle (or retained a compatible last-known-good cache).
+    #[serde(default)]
+    pub usage_snapshot_partial: bool,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
@@ -250,6 +259,22 @@ pub struct DataUsageSnapshotIdentity {
     pub last_update: Option<SystemTime>,
     pub scanner_cycle: Option<u64>,
     pub scanner_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotSetState {
+    pub pool_index: u64,
+    pub set_index: u64,
+    #[serde(default)]
+    pub scanner_cycle: Option<u64>,
+    #[serde(default)]
+    pub scanner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_plan_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 impl DataUsageInfo {
@@ -291,7 +316,7 @@ pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUs
 /// rollback delete/recreate fences the previous bucket incarnation too.
 pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
     observed.usage_snapshot_converged == Some(false)
-        && observed.is_complete_bucket_usage_snapshot()
+        && (observed.is_complete_bucket_usage_snapshot() || observed.is_valid_partial_snapshot())
         && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
         && data_usage_snapshot_is_newer(observed, authoritative)
 }
@@ -305,6 +330,38 @@ pub struct DiskUsageStatus {
     pub disk_index: Option<usize>,
     pub last_update: Option<SystemTime>,
     pub snapshot_exists: bool,
+}
+
+/// A bounded reconciliation record for an object whose logical size could not
+/// be trusted at the scanner boundary. The scanner persists these records in
+/// its cache; keeping the model here avoids a second, incompatible accounting
+/// representation in storage-facing crates.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SizeReconciliationEntry {
+    /// Stable object/version identity key (not a metrics label).
+    pub key: String,
+    pub bucket: String,
+    pub object: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// Structured reason label; raw metadata values must never be stored here.
+    pub reason: String,
+    #[serde(default)]
+    pub physical_size: Option<u64>,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Object scope refreshed by one scanner pass. Existing debts in this scope
+/// are removed before the pass's unresolved records are inserted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SizeReconciliationScope {
+    pub bucket: String,
+    pub object: String,
 }
 
 /// Size summary for a single object or group of objects
@@ -336,6 +393,16 @@ pub struct SizeSummary {
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
     /// Per-tier accounting, keyed by storage class or remote tier name
     pub tier_stats: HashMap<String, TierStats>,
+    /// Size-resolution debts observed while scanning this summary.
+    pub size_reconciliation: Vec<SizeReconciliationEntry>,
+    /// True when the per-object summary exceeded its bounded debt buffer.
+    /// Callers must retain prior ledger entries rather than treating the
+    /// partial list as a complete refresh.
+    pub size_reconciliation_truncated: bool,
+    /// Object scopes refreshed by this summary. They let the durable ledger
+    /// remove versions that resolved without allocating one key per healthy
+    /// version on the hot path.
+    pub reconciliation_scopes: Vec<SizeReconciliationScope>,
 }
 
 /// Replication target size summary
@@ -833,7 +900,8 @@ impl DataUsageEntry {
 ///
 /// The canonical wire format is written by the hand-written map-encoded
 /// `Serialize` on the scanner-side `DataUsageCacheInfo`
-/// (`crates/scanner/src/data_usage_define.rs`), which carries 16 fields.
+/// (`crates/scanner/src/data_usage_define.rs`), which carries the original 16
+/// fields plus an optional reconciliation field.
 /// This type decodes only the shared subset and is deliberately not
 /// `Serialize`: a derived (array) encoding of this 6-field subset would
 /// corrupt the cache for scanner readers, so no write path may exist here.
@@ -1436,6 +1504,39 @@ impl DataUsageInfo {
             && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
     }
 
+    /// Validate provenance before an observational view can be selected for
+    /// admin display. Partial data is accepted only with unique set states,
+    /// a plan digest for every state, and at least one usable generation.
+    pub fn is_valid_partial_snapshot(&self) -> bool {
+        if !self.usage_snapshot_partial
+            || self.usage_snapshot_converged != Some(false)
+            || self.last_update.is_none()
+            || self.scanner_cycle.is_none()
+            || self.scanner_epoch.is_none()
+            || self.usage_snapshot_set_states.is_empty()
+            || u64::try_from(self.buckets_usage.len()).ok() != Some(self.buckets_count)
+        {
+            return false;
+        }
+
+        let mut previous = None;
+        let mut plan_digest = None;
+        let mut has_source = false;
+        for state in &self.usage_snapshot_set_states {
+            if state.scan_plan_digest.is_none()
+                || plan_digest.is_some_and(|digest| Some(digest) != state.scan_plan_digest)
+                || state.scanner_cycle.is_some() != state.scanner_epoch.is_some()
+                || previous.is_some_and(|(pool, set)| (pool, set) >= (state.pool_index, state.set_index))
+            {
+                return false;
+            }
+            previous = Some((state.pool_index, state.set_index));
+            plan_digest = state.scan_plan_digest;
+            has_source |= state.scanner_cycle.is_some() && !state.tombstone;
+        }
+        has_source
+    }
+
     /// Add object metadata to data usage statistics
     pub fn add_object(&mut self, object_path: &str, meta_object: &rustfs_filemeta::MetaObject) {
         // This method is kept for backward compatibility
@@ -1776,6 +1877,51 @@ impl SizeSummary {
             entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
             entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
             entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
+        }
+
+        for entry in &other.size_reconciliation {
+            self.record_size_reconciliation(entry.clone());
+        }
+        self.size_reconciliation_truncated |= other.size_reconciliation_truncated;
+        for scope in &other.reconciliation_scopes {
+            self.record_reconciliation_scope(&scope.bucket, &scope.object);
+        }
+    }
+
+    /// Add one reconciliation debt, coalescing repeated observations in the
+    /// same object summary. The scanner cache applies its own larger bound.
+    pub fn record_size_reconciliation(&mut self, entry: SizeReconciliationEntry) {
+        const MAX_SUMMARY_RECONCILIATION_ENTRIES: usize = 1024;
+        if let Some(existing) = self.size_reconciliation.iter_mut().find(|value| value.key == entry.key) {
+            existing.reason = entry.reason;
+            existing.physical_size = entry.physical_size;
+            existing.generation = entry.generation;
+            existing.version_id = entry.version_id;
+            return;
+        }
+        if self.size_reconciliation.len() < MAX_SUMMARY_RECONCILIATION_ENTRIES {
+            self.size_reconciliation.push(entry);
+        } else {
+            self.size_reconciliation_truncated = true;
+        }
+    }
+
+    /// Mark one object scope as refreshed. Duplicate scopes are suppressed so
+    /// merging summaries remains bounded and deterministic.
+    pub fn record_reconciliation_scope(&mut self, bucket: &str, object: &str) {
+        if !self
+            .reconciliation_scopes
+            .iter()
+            .any(|scope| scope.bucket == bucket && scope.object == object)
+        {
+            if self.reconciliation_scopes.len() >= 1024 {
+                self.size_reconciliation_truncated = true;
+                return;
+            }
+            self.reconciliation_scopes.push(SizeReconciliationScope {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+            });
         }
     }
 }
@@ -2263,6 +2409,55 @@ mod tests {
         assert!(!observed_data_usage_is_newer(&candidate(2, 9, Some(false), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(true), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(false), false), &authoritative));
+
+        let mut partial = candidate(2, 11, Some(false), false);
+        partial.usage_snapshot_partial = true;
+        partial.usage_snapshot_set_states = vec![DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(10),
+            scanner_epoch: Some(2),
+            scan_plan_digest: Some([1; 32]),
+            complete: false,
+            tombstone: false,
+        }];
+        assert!(observed_data_usage_is_newer(&partial, &authoritative));
+    }
+
+    #[test]
+    fn mixed_topology_snapshot_is_rejected() {
+        let mut partial = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(2),
+            buckets_count: 0,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_partial: true,
+            usage_snapshot_set_states: vec![
+                DataUsageSnapshotSetState {
+                    pool_index: 0,
+                    set_index: 0,
+                    scanner_cycle: Some(11),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([1; 32]),
+                    complete: true,
+                    tombstone: false,
+                },
+                DataUsageSnapshotSetState {
+                    pool_index: 1,
+                    set_index: 0,
+                    scanner_cycle: Some(10),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([2; 32]),
+                    complete: false,
+                    tombstone: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!partial.is_valid_partial_snapshot());
+        partial.usage_snapshot_set_states[1].scan_plan_digest = Some([1; 32]);
+        assert!(partial.is_valid_partial_snapshot());
     }
 
     #[test]

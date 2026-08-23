@@ -14,7 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils},
+    resume::{ReplacementPhase, ResumeGc, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -53,9 +53,11 @@ const EVENT_HEAL_MAINLINE_THROTTLE: &str = "heal_mainline_throttle";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
+const EVENT_HEAL_RESUME_GC: &str = "heal_resume_gc";
 const LEGACY_ROOT_HEAL_PATH: &str = ".";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+const RESUME_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -119,6 +121,9 @@ struct MrfRepairNoticeTarget {
     bucket: Arc<str>,
     object: Arc<str>,
     version_id: Option<[u8; 16]>,
+    kind: rustfs_common::mrf_channel::MrfKind,
+    scope: Option<rustfs_common::mrf_channel::MrfScope>,
+    lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -889,7 +894,19 @@ impl HealManager {
     }
 
     fn remove_mrf_repair_notice_targets_for_task(&self, task_id: &str) {
-        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(task_id);
+        let targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(task_id);
+        if let Some(targets) = targets {
+            for target in targets {
+                rustfs_common::mrf_channel::release_mrf_identity(
+                    target.kind,
+                    &target.bucket,
+                    &target.object,
+                    target.version_id,
+                    target.scope,
+                    target.lease,
+                );
+            }
+        }
     }
 
     fn insert_mrf_repair_notice_target(
@@ -1150,6 +1167,49 @@ impl HealManager {
         Ok(())
     }
 
+    /// Start the bounded resume-state inspector.  Destructive GC remains
+    /// disabled until the durable owner/CAS contract from backlog#1927 is
+    /// available; this task therefore cannot remove an active or stale file.
+    async fn start_resume_gc(&self) {
+        let cancel = self.cancel_token.clone();
+        tokio::spawn(async move {
+            let mut gc_by_disk = HashMap::<String, ResumeGc>::new();
+            let mut ticker = interval(RESUME_GC_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let disks = {
+                            let local_disk_map = local_disk_map_read().await;
+                            local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
+                        };
+                        for disk in disks {
+                            let disk_key = disk.endpoint().to_string();
+                            let gc = gc_by_disk.entry(disk_key).or_default();
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                result = gc.inspect_disk(&disk) => {
+                                    if let Err(error) = result {
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_RESUME_GC,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            state = "inspect_failed",
+                                            endpoint = %disk.endpoint(),
+                                            error = %error,
+                                            "Heal resume GC inspection failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         Self::new_with_workload_provider(storage, config, None)
@@ -1215,6 +1275,9 @@ impl HealManager {
         // competing task for the same set.
         self.process_unclean_shutdown().await;
 
+        // Inspect resume artifacts in a bounded, fail-closed background task.
+        self.start_resume_gc().await;
+
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
             self.start_auto_disk_scanner().await?;
@@ -1279,7 +1342,20 @@ impl HealManager {
         }
         self.task_aliases.lock().await.clear();
         self.retrying_heals.lock().await.clear();
-        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).clear();
+        let mrf_targets = {
+            let mut registry = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+            registry.drain().flat_map(|(_, targets)| targets).collect::<Vec<_>>()
+        };
+        for target in mrf_targets {
+            rustfs_common::mrf_channel::release_mrf_identity(
+                target.kind,
+                &target.bucket,
+                &target.object,
+                target.version_id,
+                target.scope,
+                target.lease,
+            );
+        }
         crate::set_heal_queue_length(0);
 
         // update state
@@ -1311,12 +1387,32 @@ impl HealManager {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn submit_mrf_heal_request_with_receipt(
         &self,
         request: HealRequest,
         bucket: Arc<str>,
         object: Arc<str>,
         version_id: Option<[u8; 16]>,
+    ) -> Result<HealAdmissionReceipt> {
+        let kind = match &request.heal_type {
+            HealType::Metadata { .. } => rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+            HealType::ECDecode { .. } => rustfs_common::mrf_channel::MrfKind::DecodeFailure,
+            _ => rustfs_common::mrf_channel::MrfKind::PartialWrite,
+        };
+        self.submit_mrf_heal_request_with_receipt_and_identity(request, bucket, object, version_id, kind, None, None)
+            .await
+    }
+
+    pub(crate) async fn submit_mrf_heal_request_with_receipt_and_identity(
+        &self,
+        request: HealRequest,
+        bucket: Arc<str>,
+        object: Arc<str>,
+        version_id: Option<[u8; 16]>,
+        kind: rustfs_common::mrf_channel::MrfKind,
+        scope: Option<rustfs_common::mrf_channel::MrfScope>,
+        lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
     ) -> Result<HealAdmissionReceipt> {
         self.submit_heal_request_with_receipt_alias_and_mrf_notice(
             request,
@@ -1325,6 +1421,9 @@ impl HealManager {
                 bucket,
                 object,
                 version_id,
+                kind,
+                scope,
+                lease,
             }),
         )
         .await
@@ -1539,7 +1638,7 @@ impl HealManager {
             Self::insert_mrf_repair_notice_target(&mut targets, &task_id, target);
         }
         if let Some(displaced_task_id) = &displaced_task_id {
-            lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(displaced_task_id);
+            self.remove_mrf_repair_notice_targets_for_task(displaced_task_id);
         }
         drop(retrying_heals);
         drop(queue);
@@ -2011,34 +2110,11 @@ impl HealManager {
             return None;
         }
 
-        let mut snapshot = HealProgress::default();
+        let mut progresses = Vec::with_capacity(active_tasks.len());
         for task in active_tasks {
-            let progress = task.get_progress().await;
-            snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
-            snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
-            snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
-            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
-            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
-            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
-            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
-            snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
-            snapshot.start_time = match (snapshot.start_time, progress.start_time) {
-                (Some(current), Some(next)) => Some(current.min(next)),
-                (None, next) => next,
-                (current, None) => current,
-            };
-            snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
-                (Some(current), Some(next)) => Some(current.max(next)),
-                (None, next) => next,
-                (current, None) => current,
-            };
-            if progress.current_object.is_some() {
-                snapshot.current_object = progress.current_object;
-            }
+            progresses.push(task.get_progress().await);
         }
-        snapshot.refresh_progress_percentage();
-        snapshot.refresh_estimated_completion_time();
-        Some(snapshot)
+        crate::heal::progress::aggregate_heal_progress(progresses)
     }
 }
 

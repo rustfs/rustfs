@@ -18,8 +18,8 @@ use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
-    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, ScannerError, SizeSummary,
-    TierStats,
+    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
+    ScannerError, SizeSummary, TierStats,
 };
 use futures::future::join_all;
 use metrics::counter;
@@ -56,9 +56,10 @@ use crate::storage_api::scan::NamespaceLocking as _;
 use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
 use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
-    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_runtime_free_version,
-    get_lifecycle_config, get_object_lock_config, get_replication_config, runtime_tier_names, storageclass,
+    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerConfigObjectDelete as _, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError,
+    enqueue_runtime_free_version, get_lifecycle_config, get_object_lock_config, get_replication_config, runtime_tier_names,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -143,6 +144,10 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
+    /// Epoch captured once for the whole scanner cycle.  `None` is retained
+    /// for unfenced test implementations; production plans always carry the
+    /// admission token captured before bucket enumeration.
+    publication_epoch: Option<u64>,
     dirty_usage_buckets: Arc<DirtyUsageBuckets>,
     bucket_failures: ScannerBucketFailureState,
     pending_maintenance_work: Arc<AtomicBool>,
@@ -274,6 +279,17 @@ async fn publish_usage_snapshot(
     let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
         return Ok(false);
     };
+    send_data_usage_update(updates, data_usage_info).await?;
+    Ok(true)
+}
+
+async fn publish_observational_snapshot(
+    updates: &mpsc::Sender<DataUsageInfo>,
+    mut data_usage_info: DataUsageInfo,
+) -> Result<bool> {
+    data_usage_info.usage_snapshot_complete = false;
+    data_usage_info.usage_snapshot_partial = true;
+    data_usage_info.usage_snapshot_converged = Some(false);
     send_data_usage_update(updates, data_usage_info).await?;
     Ok(true)
 }
@@ -567,6 +583,7 @@ fn scanner_activity_preflight(
 #[derive(Debug)]
 pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
+    publication_epoch: Option<u64>,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     failed_dirty_usage: bool,
@@ -578,12 +595,22 @@ impl ScannerCycleResult {
     pub(crate) fn new(status: ScannerCycleStatus, dirty_usage_clear: Option<DirtyUsageBuckets>) -> Self {
         Self {
             status,
+            publication_epoch: None,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
         }
+    }
+
+    pub(crate) fn with_publication_epoch(mut self, publication_epoch: Option<u64>) -> Self {
+        self.publication_epoch = publication_epoch;
+        self
+    }
+
+    pub(crate) fn publication_epoch(&self) -> Option<u64> {
+        self.publication_epoch
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
