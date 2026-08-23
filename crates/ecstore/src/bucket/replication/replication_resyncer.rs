@@ -1412,7 +1412,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     };
     let mut replication_state = oi.replication_state();
     replication_state.replicate_decision_str = dsc.to_string();
-    let actual_size = oi.get_actual_size().unwrap_or_default();
+    let actual_size = oi.get_actual_size_or_physical();
 
     Ok(ReplicateObjectInfo {
         name: oi.name.clone(),

@@ -49,4 +49,3 @@ Applies to `crates/ecstore/`.
 ## Suggested Validation
 
 - `cargo test -p rustfs-ecstore`
-- Full gate before commit: `make pre-commit`

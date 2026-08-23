@@ -11,7 +11,7 @@
     {
       "name": "auth",
       "status": "populated",
-      "purpose": "Client certificate profile, RFC 9440 header profile, authentication accept and reject vectors, surface separation, and the frozen error reason registry."
+      "purpose": "Client certificate profile, RFC 9440 header profile, authentication and credential-rotation proof vectors, surface separation, and the frozen error reason registry."
     },
     {
       "name": "version",
@@ -25,7 +25,7 @@
     },
     {
       "name": "heartbeat",
-      "status": "reserved",
+      "status": "populated",
       "purpose": "Heartbeat payloads, Connect receive time, and freshness window behavior."
     },
     {

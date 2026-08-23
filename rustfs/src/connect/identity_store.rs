@@ -32,6 +32,7 @@ use super::identity::{DeviceIdentity, IdentityError};
 
 /// Name of the key file inside the store directory.
 const KEY_FILE: &str = "device.key";
+const NEXT_KEY_FILE: &str = "device.key.next";
 
 /// Owner read/write only. The key is the device's whole identity.
 #[cfg(unix)]
@@ -94,7 +95,15 @@ impl IdentityStore {
     /// been enrolled. Reading never creates anything, so an unconfigured
     /// server can ask without acquiring an identity as a side effect.
     pub fn load(&self) -> Result<Option<DeviceIdentity>, StoreError> {
-        let path = self.key_path();
+        self.load_file(KEY_FILE)
+    }
+
+    pub(crate) fn load_next(&self) -> Result<Option<DeviceIdentity>, StoreError> {
+        self.load_file(NEXT_KEY_FILE)
+    }
+
+    fn load_file(&self, file: &str) -> Result<Option<DeviceIdentity>, StoreError> {
+        let path = self.directory.join(file);
 
         let der = match fs::read(&path) {
             Ok(der) => Zeroizing::new(der),
@@ -142,11 +151,15 @@ impl IdentityStore {
         let candidate = DeviceIdentity::generate();
         let der = candidate.to_pkcs8_der()?;
 
-        match self.publish(&der) {
+        match self.publish(KEY_FILE, &der) {
             Ok(()) => Ok(candidate),
             // Another process published first. Its key is the identity; ours
             // was never written anywhere and simply goes out of scope.
             Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+                fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                    path: self.directory.clone(),
+                    source,
+                })?;
                 self.load()?.ok_or_else(|| StoreError::Io {
                     path: self.key_path(),
                     source: io::Error::new(
@@ -159,35 +172,106 @@ impl IdentityStore {
         }
     }
 
+    pub(crate) fn load_or_create_next(&self) -> Result<DeviceIdentity, StoreError> {
+        if let Some(identity) = self.load_next()? {
+            return Ok(identity);
+        }
+        fs::create_dir_all(&self.directory).map_err(|source| StoreError::Io {
+            path: self.directory.clone(),
+            source,
+        })?;
+        let candidate = DeviceIdentity::generate();
+        let der = candidate.to_pkcs8_der()?;
+        match self.publish(NEXT_KEY_FILE, &der) {
+            Ok(()) => Ok(candidate),
+            Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+                fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                    path: self.directory.clone(),
+                    source,
+                })?;
+                self.load_next()?.ok_or_else(|| StoreError::Io {
+                    path: self.directory.join(NEXT_KEY_FILE),
+                    source: io::Error::new(io::ErrorKind::NotFound, "next device key vanished after publication"),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn commit_next(&self, expected: &DeviceIdentity) -> Result<(), StoreError> {
+        let next_path = self.directory.join(NEXT_KEY_FILE);
+        match fs::rename(&next_path, self.key_path()) {
+            Ok(()) => fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                path: self.directory.clone(),
+                source,
+            }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let current = self.load()?.ok_or_else(|| StoreError::Io {
+                    path: self.key_path(),
+                    source,
+                })?;
+                if current.public_key_der() == expected.public_key_der() {
+                    fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                        path: self.directory.clone(),
+                        source,
+                    })
+                } else {
+                    Err(StoreError::Io {
+                        path: next_path,
+                        source: io::Error::new(io::ErrorKind::NotFound, "next device key is missing"),
+                    })
+                }
+            }
+            Err(source) => Err(StoreError::Io { path: next_path, source }),
+        }
+    }
+
+    pub(crate) fn clear_next(&self) -> Result<(), StoreError> {
+        let path = self.directory.join(NEXT_KEY_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => fsync_dir(&self.directory).map_err(|source| StoreError::Io {
+                path: self.directory.clone(),
+                source,
+            }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io { path, source }),
+        }
+    }
+
     /// Write, seal, fsync, then link into place and fsync the directory. The
     /// key is durable before it is reachable, and it is reachable only once.
-    fn publish(&self, der: &[u8]) -> Result<(), StoreError> {
+    fn publish(&self, file: &str, der: &[u8]) -> Result<(), StoreError> {
         use std::io::Write as _;
 
-        let final_path = self.key_path();
-        let temp_path = self.directory.join(format!(
-            "{KEY_FILE}.{}.{}.tmp",
-            std::process::id(),
-            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let final_path = self.directory.join(file);
 
         let io_at = |path: &Path| {
             let path = path.to_path_buf();
             move |source| StoreError::Io { path, source }
         };
 
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(KEY_MODE);
-        }
-
-        let mut file = options.open(&temp_path).map_err(io_at(&temp_path))?;
+        let (temp_path, mut staging) = loop {
+            let temp_path = self.directory.join(format!(
+                ".{file}.{}.{}.tmp",
+                std::process::id(),
+                STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(KEY_MODE);
+            }
+            match options.open(&temp_path) {
+                Ok(staging) => break (temp_path, staging),
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(io_at(&temp_path)(source)),
+            }
+        };
 
         let result = (|| -> Result<(), StoreError> {
-            file.write_all(der).map_err(io_at(&temp_path))?;
+            staging.write_all(der).map_err(io_at(&temp_path))?;
 
             // The umask can only narrow the creation mode, so set and verify
             // the exact mode before the bytes become durable.
@@ -195,9 +279,10 @@ impl IdentityStore {
             {
                 use std::os::unix::fs::PermissionsExt as _;
 
-                file.set_permissions(fs::Permissions::from_mode(KEY_MODE))
+                staging
+                    .set_permissions(fs::Permissions::from_mode(KEY_MODE))
                     .map_err(io_at(&temp_path))?;
-                let mode = file.metadata().map_err(io_at(&temp_path))?.permissions().mode() & 0o7777;
+                let mode = staging.metadata().map_err(io_at(&temp_path))?.permissions().mode() & 0o7777;
                 if mode != KEY_MODE {
                     return Err(StoreError::Permissions {
                         path: temp_path.clone(),
@@ -207,11 +292,11 @@ impl IdentityStore {
                 }
             }
 
-            file.sync_all().map_err(io_at(&temp_path))?;
+            staging.sync_all().map_err(io_at(&temp_path))?;
             Ok(())
         })();
 
-        drop(file);
+        drop(staging);
 
         if let Err(error) = result {
             let _ = fs::remove_file(&temp_path);

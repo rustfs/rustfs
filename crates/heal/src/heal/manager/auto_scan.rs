@@ -21,6 +21,7 @@ impl HealManager {
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
         let task_aliases = self.task_aliases.clone();
+        let displaced_terminals = self.displaced_terminals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let storage = self.storage.clone();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
@@ -481,6 +482,10 @@ impl HealManager {
                             let admission = admission_decision.result;
                             let should_notify =
                                 matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
+                            let displaced_terminal = admission_decision
+                                .displaced_request
+                                .as_ref()
+                                .map(|request| record_displaced_terminal(&displaced_terminals, request));
                             if matches!(admission, HealAdmissionResult::Accepted)
                                 && let Some(anchor) = recovery_anchor
                             {
@@ -491,8 +496,16 @@ impl HealManager {
                             }
                             drop(queue);
                             drop(config);
-                            if let Some(displaced_task_id) = admission_decision.displaced_task_id {
-                                remove_task_aliases_for_task(&task_aliases, &displaced_task_id).await;
+                            if let (Some(displaced_task_id), Some(displaced_terminal)) =
+                                (admission_decision.displaced_task_id().map(ToOwned::to_owned), displaced_terminal)
+                            {
+                                remove_displaced_task_aliases(
+                                    &task_aliases,
+                                    &displaced_terminals,
+                                    &displaced_task_id,
+                                    &displaced_terminal,
+                                )
+                                .await;
                                 lock_mrf_repair_notice_targets(&mrf_repair_notice_targets).remove(&displaced_task_id);
                             }
                             if matches!(admission, HealAdmissionResult::Accepted) {

@@ -24,7 +24,6 @@ use super::common::{
     test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
-use tokio::time::{Duration, sleep};
 use tracing::info;
 
 /// Comprehensive test: Full KMS workflow with all encryption types
@@ -35,7 +34,7 @@ async fn test_comprehensive_kms_full_workflow() -> Result<(), Box<dyn std::error
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -103,7 +102,7 @@ async fn test_comprehensive_stress_test() -> Result<(), Box<dyn std::error::Erro
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -137,7 +136,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -208,7 +207,7 @@ async fn test_comprehensive_concurrent_operations() -> Result<(), Box<dyn std::e
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -253,7 +252,7 @@ async fn test_comprehensive_performance_benchmark() -> Result<(), Box<dyn std::e
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

@@ -256,6 +256,10 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
         cycle_max_duration_seconds: metrics.cycle_max_duration_seconds,
         cycle_max_objects: metrics.cycle_max_objects,
         cycle_max_directories: metrics.cycle_max_directories,
+        cycle_timeout_total: metrics.cycle_timeout_total,
+        cycle_recovery_required_total: metrics.cycle_recovery_required_total,
+        cycle_last_progress_age: metrics.cycle_last_progress_age,
+        leader_lease_without_progress: metrics.leader_lease_without_progress,
         bitrot_cycle_enabled: metrics.bitrot_cycle_enabled,
         bitrot_cycle_seconds: metrics.bitrot_cycle_seconds,
         scan_checkpoint: metrics.scan_checkpoint.map(|checkpoint| MadminScannerCheckpointReport {
@@ -611,6 +615,10 @@ mod test {
             current_started: chrono_to_jiff_timestamp(current_started),
             last_cycle_partial_source: "usage".to_string(),
             last_cycle_partial_source_code: 1,
+            cycle_timeout_total: 3,
+            cycle_recovery_required_total: 2,
+            cycle_last_progress_age: 17,
+            leader_lease_without_progress: true,
             partial_cycles_by_source: vec![rustfs_common::metrics::ScannerSourceCycleSnapshot {
                 source: "usage".to_string(),
                 cycles: 2,
@@ -622,6 +630,10 @@ mod test {
         assert_eq!(scanner.current_started, chrono_to_jiff_timestamp(current_started));
         assert_eq!(scanner.last_cycle_partial_source, "usage");
         assert_eq!(scanner.last_cycle_partial_source_code, 1);
+        assert_eq!(scanner.cycle_timeout_total, 3);
+        assert_eq!(scanner.cycle_recovery_required_total, 2);
+        assert_eq!(scanner.cycle_last_progress_age, 17);
+        assert!(scanner.leader_lease_without_progress);
         let usage = scanner
             .partial_cycles_by_source
             .iter()

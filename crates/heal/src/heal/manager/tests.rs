@@ -84,6 +84,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         heal_queue: &manager.heal_queue,
         active_heals: &manager.active_heals,
         completed_heals: &manager.completed_heals,
+        displaced_terminals: &manager.displaced_terminals,
         task_aliases: &manager.task_aliases,
         retrying_heals: &manager.retrying_heals,
         mrf_repair_notice_targets: &manager.mrf_repair_notice_targets,
@@ -2778,7 +2779,10 @@ async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
         HealAdmissionResult::Accepted
     );
     assert_eq!(manager.get_queue_length().await, 1);
-    assert!(matches!(manager.get_task_status(&low_id).await, Err(Error::TaskNotFound { .. })));
+    assert!(matches!(
+        manager.get_task_status(&low_id).await,
+        Ok(HealTaskStatus::Failed { error }) if error.contains("reason=displaced")
+    ));
     assert_eq!(
         manager
             .get_task_status(&high_id)
@@ -2786,6 +2790,263 @@ async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
             .expect("high priority request should remain queued"),
         HealTaskStatus::Pending
     );
+}
+
+#[tokio::test]
+async fn displaced_task_remains_queryable() {
+    let manager = HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 1,
+            ..HealConfig::default()
+        }),
+    );
+    let mut displaced = HealRequest::new(
+        HealType::Bucket {
+            bucket: "displaced-bucket".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    displaced.id = "displaced-task".to_string();
+    let displaced_id = displaced.id.clone();
+    manager
+        .submit_heal_request(displaced)
+        .await
+        .expect("displaced request should queue");
+
+    let successor = HealRequest::new(
+        HealType::Bucket {
+            bucket: "successor-bucket".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+    manager
+        .submit_heal_request(successor)
+        .await
+        .expect("successor should displace low work");
+
+    let report = manager
+        .get_task_report(&displaced_id)
+        .await
+        .expect("displaced report should remain queryable");
+    assert!(matches!(report.status, HealTaskStatus::Failed { ref error } if error.contains("reason=displaced")));
+}
+
+#[tokio::test]
+async fn displaced_archive_failure_keeps_queryable_terminal() {
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let mut request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "archive-failure".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.id = "archive-failure-task".to_string();
+    let request_id = request.id.clone();
+    // The synchronous sidecar is the authoritative fallback when the normal
+    // completed-task archive has no entry (the failure window that must not
+    // turn an Accepted ID into NotFound).
+    record_displaced_terminal(&manager.displaced_terminals, &request);
+    assert!(manager.completed_heals.lock().await.is_empty());
+    assert!(matches!(
+        manager.get_task_status(&request_id).await,
+        Ok(HealTaskStatus::Failed { error }) if error.contains("reason=displaced")
+    ));
+}
+
+#[tokio::test]
+async fn scheduler_retry_displacement_keeps_evicted_task_queryable() {
+    let manager = Arc::new(HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 1,
+            event_driven_scheduler_enable: false,
+            ..HealConfig::default()
+        }),
+    ));
+    let mut retry_request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
+    retry_request.priority = HealPriority::High;
+    let retry_id = retry_request.id.clone();
+    manager
+        .submit_heal_request(retry_request)
+        .await
+        .expect("retry request should queue");
+
+    // Process exactly one queue cycle so the retry task is spawned without a
+    // background scheduler consuming the filler request before the retry wakes.
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if manager.retrying_heals.lock().await.contains_key(&retry_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry request should enter backoff");
+
+    let filler = HealRequest::new(
+        HealType::Bucket {
+            bucket: "retry-displaced-filler".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    let filler_id = filler.id.clone();
+    manager
+        .submit_heal_request(filler)
+        .await
+        .expect("filler request should occupy the queue");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                manager.get_task_status(&filler_id).await,
+                Ok(HealTaskStatus::Failed { ref error }) if error.contains("reason=displaced")
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry admission should displace the filler request");
+    assert_eq!(manager.get_queue_length().await, 1);
+    assert_eq!(
+        manager.get_task_status(&retry_id).await.expect("retry should be queued"),
+        HealTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn concurrent_displacers_produce_one_terminal_generation() {
+    let manager = Arc::new(HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 1,
+            ..HealConfig::default()
+        }),
+    ));
+    let mut displaced = HealRequest::new(
+        HealType::Bucket {
+            bucket: "concurrent-displaced".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    displaced.id = "concurrent-displaced-task".to_string();
+    let displaced_id = displaced.id.clone();
+    manager
+        .submit_heal_request(displaced)
+        .await
+        .expect("initial request should queue");
+
+    let first = HealRequest::new(
+        HealType::Bucket {
+            bucket: "concurrent-successor-a".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+    let second = HealRequest::new(
+        HealType::Bucket {
+            bucket: "concurrent-successor-b".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+    let (first_result, second_result) = tokio::join!(manager.submit_heal_request(first), manager.submit_heal_request(second));
+    let accepted = [&first_result, &second_result]
+        .into_iter()
+        .filter(|result| matches!(result, Ok(HealAdmissionResult::Accepted)))
+        .count();
+    assert_eq!(accepted, 1, "exactly one concurrent displacer should win the full queue");
+    assert!(
+        first_result.is_ok() && second_result.is_ok(),
+        "the losing request should receive a typed Full result"
+    );
+    let terminals = lock_displaced_terminals(&manager.displaced_terminals);
+    assert_eq!(terminals.len(), 1);
+    assert!(terminals.contains_key(&displaced_id));
+}
+
+#[tokio::test]
+async fn successor_chain_is_bounded_and_authorized() {
+    let manager = HealManager::new(
+        Arc::new(MockStorage),
+        Some(HealConfig {
+            queue_size: 1,
+            ..HealConfig::default()
+        }),
+    );
+    let mut original = HealRequest::new(
+        HealType::Bucket {
+            bucket: "authorized-original".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    original.id = "authorized-original-task".to_string();
+    let original_id = original.id.clone();
+    manager.submit_heal_request(original).await.expect("original should queue");
+    let mut duplicate = HealRequest::new(
+        HealType::Bucket {
+            bucket: "authorized-original".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    duplicate.id = "authorized-duplicate-task".to_string();
+    let duplicate_id = duplicate.id.clone();
+    manager
+        .submit_heal_request(duplicate)
+        .await
+        .expect("same-target duplicate should merge");
+    let successor = HealRequest::new(
+        HealType::Bucket {
+            bucket: "authorized-successor".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::High,
+    );
+    let successor_id = successor.id.clone();
+    manager.submit_heal_request(successor).await.expect("successor should queue");
+    assert!(manager.task_aliases.lock().await.is_empty());
+    assert!(matches!(manager.get_task_status(&original_id).await, Ok(HealTaskStatus::Failed { .. })));
+    assert!(matches!(manager.get_task_status(&duplicate_id).await, Ok(HealTaskStatus::Failed { .. })));
+    assert_eq!(
+        manager
+            .get_task_status(&successor_id)
+            .await
+            .expect("successor should remain queued"),
+        HealTaskStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn displaced_terminal_expires_after_bounded_ttl() {
+    let manager = HealManager::new(Arc::new(MockStorage), None);
+    let mut request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "expires".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.id = "expires-task".to_string();
+    let request_id = request.id.clone();
+    record_displaced_terminal(&manager.displaced_terminals, &request);
+    {
+        let mut terminals = lock_displaced_terminals(&manager.displaced_terminals);
+        let entry =
+            Arc::get_mut(terminals.get_mut(&request_id).expect("terminal should be retained")).expect("test owns terminal entry");
+        entry.completed_at = SystemTime::now() - KEEP_HEAL_TASK_STATUS_DURATION - Duration::from_secs(1);
+    }
+    assert!(matches!(manager.get_task_status(&request_id).await, Err(Error::TaskNotFound { .. })));
 }
 
 #[tokio::test]

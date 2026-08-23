@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // KMS-specific constants
 pub const TEST_BUCKET: &str = "kms-test-bucket";
@@ -175,6 +175,136 @@ pub async fn get_kms_status(
         kms_admin_request(base_url, http::Method::GET, "/rustfs/admin/v3/kms/status", None, access_key, secret_key).await?;
     info!("KMS status retrieved: {}", status);
     Ok(status)
+}
+
+/// Poll the KMS status endpoint until the backend reports ready or the timeout
+/// expires.  Replaces hard-coded `sleep(Duration::from_secs(3))` startup waits
+/// with an active readiness probe so tests start as soon as KMS is usable
+/// (typically < 1 s) instead of always waiting the full 3 s.
+///
+/// Uses exponential back-off starting at 200 ms (doubling each attempt, capped
+/// at 1 s) up to a total wall-clock budget of 5 s.
+pub async fn wait_for_kms_ready(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_kms_ready_with_timeout(base_url, access_key, secret_key, Duration::from_secs(5)).await
+}
+
+async fn wait_for_kms_ready_with_timeout(
+    base_url: &str,
+    access_key: &str,
+    secret_key: &str,
+    total_deadline: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start = tokio::time::Instant::now();
+    let deadline = start + total_deadline;
+    let mut backoff = Duration::from_millis(200);
+    let max_backoff = Duration::from_secs(1);
+
+    loop {
+        match tokio::time::timeout_at(deadline, get_kms_status(base_url, access_key, secret_key)).await {
+            Ok(Ok(status)) => {
+                let backend_status = serde_json::from_str::<serde_json::Value>(&status)
+                    .ok()
+                    .and_then(|value| value.get("backend_status")?.as_str().map(str::to_owned));
+                if backend_status.as_deref() == Some("healthy") {
+                    info!("KMS is ready (status: {})", status);
+                    return Ok(());
+                }
+                warn!(
+                    backend_status = backend_status.as_deref().unwrap_or("missing"),
+                    elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "KMS not ready yet, retrying…"
+                );
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                warn!(error = %e, elapsed_ms, "KMS not ready yet, retrying…");
+            }
+            Err(_) => return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into()),
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("KMS failed to become ready within {} ms", total_deadline.as_millis()).into());
+        }
+        sleep((now + backoff).min(deadline) - now).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{wait_for_kms_ready, wait_for_kms_ready_with_timeout};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn kms_readiness_retries_http_success_until_backend_is_healthy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            for backend_status in ["error", "healthy"] {
+                let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("read readiness request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                server_requests.fetch_add(1, Ordering::SeqCst);
+
+                let body = format!(r#"{{"backend_status":"{backend_status}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.expect("write readiness response");
+            }
+        });
+
+        wait_for_kms_ready(&format!("http://{address}"), "access-key", "secret-key")
+            .await
+            .expect("KMS should become ready after the healthy response");
+
+        let observed_requests = requests.load(Ordering::SeqCst);
+        server.abort();
+        assert_eq!(observed_requests, 2, "an HTTP 200 unhealthy status must be retried");
+    }
+
+    #[tokio::test]
+    async fn kms_readiness_deadline_covers_a_stalled_status_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind readiness test server");
+        let address = listener.local_addr().expect("read readiness test server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read readiness request");
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_kms_ready_with_timeout(&format!("http://{address}"), "access-key", "secret-key", Duration::from_millis(50)),
+        )
+        .await
+        .expect("readiness helper must enforce its own deadline");
+
+        server.abort();
+        assert!(result.is_err(), "a stalled status request must not outlive the readiness deadline");
+    }
 }
 
 /// Create a default KMS key for testing and return the created key ID
@@ -859,6 +989,13 @@ impl LocalKMSTestEnvironment {
             .start_rustfs_server_with_env(extra_args, &[("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true")])
             .await?;
         Ok(default_key_id.to_string())
+    }
+
+    /// Poll the KMS status endpoint until the backend reports ready.
+    ///
+    /// Prefer this over a fixed `sleep` after calling `start_rustfs_for_local_kms`.
+    pub async fn wait_for_kms_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        wait_for_kms_ready(&self.base_env.url, &self.base_env.access_key, &self.base_env.secret_key).await
     }
 
     /// Configure Local KMS backend with a predefined default key

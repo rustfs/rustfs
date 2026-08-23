@@ -243,6 +243,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/config"),
         admin_route(Method::PUT, "/v3/config"),
         admin_route(Method::GET, "/v3/scanner/status"),
+        admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
         admin_route(Method::GET, "/v3/audit/target/list"),
         admin_route_sample(
             Method::PUT,
@@ -879,6 +880,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/config"));
     assert_route(&router, Method::PUT, &admin_path("/v3/config"));
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/scanner/cycle-state/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/ilm/expiry/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
     assert_route(
@@ -1367,6 +1369,7 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/config")),
         (Method::PUT, compat_admin_alias_path("/v3/config")),
         (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
+        (Method::POST, compat_admin_alias_path("/v3/scanner/cycle-state/reset")),
         (Method::GET, compat_admin_alias_path("/v3/ilm/expiry/status")),
     ] {
         assert!(

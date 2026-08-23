@@ -389,7 +389,7 @@ fn replication_source_object(object_info: &ObjectInfo) -> ReplicationSourceObjec
             .map(|mod_time| OffsetDateTime::from_unix_timestamp(mod_time.unix_timestamp()).unwrap_or(mod_time)),
         version_id: object_info.version_id.map(|version_id| version_id.to_string()),
         etag: object_info.etag.as_deref(),
-        actual_size: object_info.get_actual_size().unwrap_or_default(),
+        actual_size: object_info.get_actual_size_or_physical(),
         delete_marker: object_info.delete_marker,
         content_type: object_info.content_type.as_deref(),
         content_encoding: object_info.content_encoding.as_deref(),
@@ -549,6 +549,20 @@ mod tests {
             "a newer target null-version object should not be overwritten by existing-object replication"
         );
         assert!(replication_target_head_is_newer_null_version(&source, &target));
+    }
+
+    #[test]
+    fn replication_source_uses_physical_size_for_unknown_compressed_object() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_COMPRESSION, "zstd".to_string());
+        let source = ObjectInfo {
+            size: 128,
+            actual_size: -1,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+
+        assert_eq!(replication_source_object(&source).actual_size, 128);
     }
 
     #[test]

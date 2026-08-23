@@ -1,0 +1,11 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "heartbeat",
+  "fixture": "overflow",
+  "description": "Values beyond frozen bounds are rejected before persistence.",
+  "vectors": [
+    {"field": "sequence", "value": 9007199254740992, "maximum": 9007199254740991},
+    {"field": "coarseNodeSummary.total", "value": 4097, "maximum": 4096}
+  ],
+  "expected": {"decision": "REJECT", "httpStatus": 422, "status": "INVALID_ARGUMENT"}
+}

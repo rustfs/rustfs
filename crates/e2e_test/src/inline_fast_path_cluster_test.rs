@@ -46,7 +46,6 @@ use prost::Message;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
@@ -1695,7 +1694,6 @@ fn assert_storage_layout(
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
     init_logging();
 
@@ -1767,7 +1765,6 @@ async fn four_node_inline_storage_and_get_boundaries() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_empty_legacy_volumes_start_as_fresh() -> TestResult {
     init_logging();
 
@@ -1805,7 +1802,6 @@ async fn four_node_empty_legacy_volumes_start_as_fresh() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_inline_fallback_controls() -> TestResult {
     init_logging();
 
@@ -1870,7 +1866,6 @@ async fn four_node_inline_fallback_controls() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_compressed_inline_fallback() -> TestResult {
     init_logging();
 
@@ -1905,7 +1900,6 @@ async fn four_node_compressed_inline_fallback() -> TestResult {
 /// Multipart disk compression is live again, so a compression-enabled cluster classifies multipart objects as compressed and the roundtrip (full GET plus partNumber GET) must still return the original bytes.
 /// Reverting the multipart compression fix must fail this test.
 #[tokio::test]
-#[serial]
 async fn four_node_multipart_disk_compression_roundtrip() -> TestResult {
     init_logging();
 
@@ -1952,7 +1946,6 @@ async fn four_node_multipart_disk_compression_roundtrip() -> TestResult {
 /// read costs on the order of the covering part's block size against a ~5 MiB
 /// object.
 #[tokio::test]
-#[serial]
 async fn four_node_compressed_multipart_tail_range_reads_are_bounded() -> TestResult {
     init_logging();
 
@@ -2019,7 +2012,6 @@ async fn four_node_compressed_multipart_tail_range_reads_are_bounded() -> TestRe
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> TestResult {
     init_logging();
 
@@ -2123,7 +2115,6 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_add_tier_converges() -> TestResult {
     init_logging();
 
@@ -2142,7 +2133,6 @@ async fn four_node_add_tier_converges() -> TestResult {
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_add_tier_converges_after_offline_node_restart_without_second_mutation() -> TestResult {
     init_logging();
 
@@ -2164,7 +2154,6 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_manual_transition_job_status_survives_node_restart() -> TestResult {
     init_logging();
 
@@ -2239,7 +2228,6 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_manual_transition_distributed_admission_conflict_reports_status_and_backpressure() -> TestResult {
     init_logging();
 
@@ -2381,7 +2369,6 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
 }
 
 #[tokio::test]
-#[serial]
 #[ignore = "manual #1508 evidence harness: starts a 4-node cluster, a remote tier, and an in-flight transition job"]
 async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> TestResult {
     init_logging();
@@ -2486,7 +2473,6 @@ async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> Tes
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_transition() -> TestResult {
     init_logging();
 
@@ -2598,7 +2584,6 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
 }
 
 #[tokio::test]
-#[serial]
 async fn four_node_transitioned_inline_fallback() -> TestResult {
     init_logging();
 
