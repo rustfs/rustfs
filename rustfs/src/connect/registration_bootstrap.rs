@@ -18,7 +18,7 @@ use std::path::Path;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write as _,
-    path::PathBuf,
+    path::{Component, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -124,6 +124,9 @@ fn prepare_state_directory_with_sync(
     path: &Path,
     mut sync: impl FnMut(&Path) -> io::Result<()>,
 ) -> Result<PathBuf, RegistrationBootstrapError> {
+    if path.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(RegistrationBootstrapError::StateDirectorySecurity);
+    }
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -441,6 +444,32 @@ mod tests {
         assert_eq!(
             observed.into_inner(),
             vec![state.join("identity"), state.join("credential"), state, ancestor,]
+        );
+    }
+
+    #[test]
+    fn parent_components_fail_before_creation_or_sync_while_current_directory_is_allowed() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let absolute_parent = temp.path().join("secure/connect/..");
+
+        for path in [absolute_parent.as_path(), Path::new("state/../other")] {
+            let calls = Cell::new(0);
+            let error = prepare_state_directory_with_sync(path, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .expect_err("parent components must fail before filesystem preparation");
+
+            assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+            assert_eq!(calls.get(), 0);
+        }
+        assert!(!temp.path().join("secure").exists());
+
+        let dotted_state = temp.path().join("./state");
+        prepare_state_directory_with_sync(&dotted_state, |_| Ok(())).expect("current-directory component is safe");
+        assert_eq!(
+            fs::read(temp.path().join("state").join(BOOTSTRAP_READY_FILE)).expect("read ready marker"),
+            BOOTSTRAP_READY_CONTENTS
         );
     }
 

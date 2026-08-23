@@ -522,6 +522,16 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).expect("restore CA mode");
 
+    let parent_state = temp.path().join("secure/connect/..");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind state gate");
+    let error = register_from_protected_input(endpoint, &root, &parent_state, Some(&token))
+        .await
+        .expect_err("parent state component must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+    assert!(!temp.path().join("secure").exists());
+    assert!(!parent_state.join(".bootstrap-ready").exists());
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after state gate");
+
     let marker_state = temp.path().join("unsafe-marker-state");
     for directory in [
         marker_state.clone(),
