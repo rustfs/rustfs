@@ -414,31 +414,7 @@ async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> Result<(), EcstoreError> {
-    sync_data_usage_backup_from_primary_for_epoch_and_lease(ctx, storeapi, None, None).await
-}
-
-async fn sync_data_usage_backup_from_primary_for_epoch(
-    ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    expected_publication_epoch: Option<u64>,
-) -> Result<(), EcstoreError> {
-    sync_data_usage_backup_from_primary_for_epoch_and_lease(ctx, storeapi, expected_publication_epoch, None).await
-}
-
-async fn sync_data_usage_backup_from_primary_for_epoch_and_lease(
-    ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    expected_publication_epoch: Option<u64>,
-    remote_lease_deadline: Option<std::time::Instant>,
-) -> Result<(), EcstoreError> {
-    sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
-        ctx,
-        storeapi,
-        expected_publication_epoch,
-        remote_lease_deadline,
-        None,
-    )
-    .await
+    sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(ctx, storeapi, None, None, None).await
 }
 
 async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
@@ -1523,20 +1499,22 @@ async fn run_data_scanner_cycle_with_budget(
                     receiver,
                     Some(leader_epoch),
                     Some(usage_persist_baseline),
-                    publication_epoch,
-                    remote_lease_deadline,
-                    remote_lease_fence,
+                    ScannerPublicationFence::new(
+                        publication_epoch,
+                        remote_lease_deadline,
+                        remote_lease_fence,
+                    ),
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();
                         async move {
-                            if let Some((notification_system, grants)) = remote_lease_probe.as_ref() {
-                                if notification_system.validate_scanner_publication_leases(grants).await.is_err() {
-                                    // A remote restart or movement flip invalidates
-                                    // the token proof; usage_store interprets this
-                                    // as a publication barrier and performs no PUT.
-                                    return true;
-                                }
+                            if let Some((notification_system, grants)) = remote_lease_probe.as_ref()
+                                && notification_system.validate_scanner_publication_leases(grants).await.is_err()
+                            {
+                                // A remote restart or movement flip invalidates
+                                // the token proof; usage_store interprets this
+                                // as a publication barrier and performs no PUT.
+                                return true;
                             }
                             storeapi.scanner_data_usage_publication_blocked().await
                         }
@@ -2357,6 +2335,12 @@ async fn run_data_scanner_with_maintenance_state(
         let movement_generation_before_wait = storeapi.scanner_data_movement_generation();
         let movement_changed = storeapi.scanner_data_movement_changed();
         let movement_store = storeapi.clone();
+        let movement = ScannerMovementWaitContext {
+            movement_generation_seen: Some(movement_generation_before_wait),
+            movement_changed,
+            current_movement_generation: move || movement_store.scanner_data_movement_generation(),
+            is_lock_lost: || guard.is_lock_lost(),
+        };
         let wake_reason = wait_for_next_scanner_cycle_with_activity_and_movement(
             &ctx,
             wait_plan.delay,
@@ -2369,10 +2353,7 @@ async fn run_data_scanner_with_maintenance_state(
                 runtime_config_generation_seen,
                 maintenance_generation_before_wait,
             ),
-            Some(movement_generation_before_wait),
-            movement_changed,
-            move || movement_store.scanner_data_movement_generation(),
-            || guard.is_lock_lost(),
+            movement,
             || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
         .await;

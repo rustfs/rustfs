@@ -40,6 +40,30 @@ pub(super) struct DataUsagePersistBaseline {
     pub(super) revision: DataUsageCacheRevision,
 }
 
+/// Short-lived publication inputs captured for one usage persistence attempt.
+/// Keeping the movement epoch, lease deadline, and target fence together makes
+/// it explicit that they are one proof rather than independent options.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ScannerPublicationFence {
+    pub(super) expected_publication_epoch: Option<u64>,
+    pub(super) remote_lease_deadline: Option<std::time::Instant>,
+    pub(super) scanner_publication_lease_fence: Option<String>,
+}
+
+impl ScannerPublicationFence {
+    pub(super) fn new(
+        expected_publication_epoch: Option<u64>,
+        remote_lease_deadline: Option<std::time::Instant>,
+        scanner_publication_lease_fence: Option<String>,
+    ) -> Self {
+        Self {
+            expected_publication_epoch,
+            remote_lease_deadline,
+            scanner_publication_lease_fence,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum DataUsagePersistTaskResult {
     Completed(DataUsagePersistOutcome),
@@ -134,8 +158,7 @@ where
         receiver,
         leader_epoch,
         initial_baseline,
-        None,
-        None,
+        ScannerPublicationFence::default(),
         route_probe,
     )
     .await
@@ -147,11 +170,10 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
 >(
     ctx: CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
-    expected_publication_epoch: Option<u64>,
-    remote_lease_deadline: Option<std::time::Instant>,
+    publication_fence: ScannerPublicationFence,
     route_probe: F,
 ) -> DataUsagePersistOutcome
 where
@@ -164,9 +186,7 @@ where
         receiver,
         leader_epoch,
         initial_baseline,
-        expected_publication_epoch,
-        remote_lease_deadline,
-        None,
+        publication_fence,
         route_probe,
     )
     .await
@@ -181,15 +201,18 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
     mut receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
-    expected_publication_epoch: Option<u64>,
-    remote_lease_deadline: Option<std::time::Instant>,
-    scanner_publication_lease_fence: Option<String>,
+    publication_fence: ScannerPublicationFence,
     route_probe: F,
 ) -> DataUsagePersistOutcome
 where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = bool> + Send,
 {
+    let ScannerPublicationFence {
+        expected_publication_epoch,
+        remote_lease_deadline,
+        scanner_publication_lease_fence,
+    } = publication_fence;
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
     let mut next_baseline = initial_baseline;
 
@@ -708,15 +731,6 @@ where
     }
 
     outcome
-}
-
-pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
-    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    authoritative: &DataUsageInfo,
-    expected_publication_epoch: Option<u64>,
-) -> bool {
-    cleanup_observed_data_usage_snapshot_for_epoch_and_lease(storeapi, authoritative, expected_publication_epoch, None, None)
-        .await
 }
 
 async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(

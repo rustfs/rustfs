@@ -252,6 +252,17 @@ impl ScannerCycleObservedGenerations {
     }
 }
 
+/// Movement state observed while a scanner waits for the next cycle.
+///
+/// Keeping the movement inputs together makes it harder for callers to pair a
+/// generation with the wrong notification or lock predicate.
+pub(super) struct ScannerMovementWaitContext<G, F> {
+    pub(super) movement_generation_seen: Option<u64>,
+    pub(super) movement_changed: Arc<Notify>,
+    pub(super) current_movement_generation: G,
+    pub(super) is_lock_lost: F,
+}
+
 pub(super) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,6 +406,7 @@ pub(super) fn scanner_activity_backoff_blocked_after_wake(currently_blocked: boo
     }
 }
 
+#[cfg(test)]
 pub(super) async fn wait_for_next_scanner_cycle<F>(
     ctx: &CancellationToken,
     delay: Duration,
@@ -406,30 +418,31 @@ pub(super) async fn wait_for_next_scanner_cycle<F>(
 where
     F: Fn() -> bool,
 {
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost,
+    };
     wait_for_next_scanner_cycle_with_movement(
         ctx,
         delay,
-        dirty_usage_generation_seen,
-        runtime_config_generation,
-        maintenance_generation,
-        None,
-        Arc::new(Notify::new()),
-        || 0,
-        is_lock_lost,
+        ScannerCycleObservedGenerations {
+            dirty_usage: dirty_usage_generation_seen,
+            runtime_config: runtime_config_generation,
+            maintenance: maintenance_generation,
+            defer_cluster_activity: false,
+        },
+        &movement,
     )
     .await
 }
 
-pub(super) async fn wait_for_next_scanner_cycle_with_movement<F, G>(
+pub(super) async fn wait_for_next_scanner_cycle_with_movement<G, F>(
     ctx: &CancellationToken,
     delay: Duration,
-    dirty_usage_generation_seen: Option<u64>,
-    runtime_config_generation: u64,
-    maintenance_generation: u64,
-    movement_generation_seen: Option<u64>,
-    movement_changed: Arc<Notify>,
-    current_movement_generation: G,
-    is_lock_lost: F,
+    generations: ScannerCycleObservedGenerations,
+    movement: &ScannerMovementWaitContext<G, F>,
 ) -> ScannerCycleWakeReason
 where
     F: Fn() -> bool,
@@ -441,65 +454,78 @@ where
     tokio::pin!(lock_poll);
 
     loop {
-        if is_lock_lost() {
+        if (movement.is_lock_lost)() {
             return ScannerCycleWakeReason::LeaderLockLost;
         }
-        if scanner_runtime_config_generation() != runtime_config_generation {
+        if scanner_runtime_config_generation() != generations.runtime_config {
             return ScannerCycleWakeReason::RuntimeConfig;
         }
-        if scanner_maintenance_generation() != maintenance_generation {
+        if scanner_maintenance_generation() != generations.maintenance {
             return ScannerCycleWakeReason::MaintenanceConfig;
         }
-        if dirty_usage_generation_seen.is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen) {
+        if generations
+            .dirty_usage
+            .is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen)
+        {
             return ScannerCycleWakeReason::DirtyUsage;
         }
-        if movement_generation_seen.is_some_and(|seen| current_movement_generation() != seen) {
+        if movement
+            .movement_generation_seen
+            .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+        {
             return ScannerCycleWakeReason::MovementGeneration;
         }
 
-        let movement_notification = movement_changed.notified();
+        let movement_notification = movement.movement_changed.notified();
         tokio::pin!(movement_notification);
         movement_notification.as_mut().enable();
         // A transition may finish between the initial generation read and
         // registration with Notify. Re-check after `enable()` so that such a
         // transition cannot be lost when it used `notify_waiters()`.
-        if movement_generation_seen.is_some_and(|seen| current_movement_generation() != seen) {
+        if movement
+            .movement_generation_seen
+            .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+        {
             return ScannerCycleWakeReason::MovementGeneration;
         }
         tokio::select! {
             _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
             _ = &mut sleep => return ScannerCycleWakeReason::Timer,
             _ = &mut lock_poll => {
-                if is_lock_lost() {
+                if (movement.is_lock_lost)() {
                     return ScannerCycleWakeReason::LeaderLockLost;
                 }
                 lock_poll.as_mut().reset(Instant::now() + SCANNER_LEADER_LOCK_POLL_INTERVAL);
             }
             _ = dirty_usage_bucket_notified() => {
-                if scanner_runtime_config_generation() != runtime_config_generation {
+                if scanner_runtime_config_generation() != generations.runtime_config {
                     return ScannerCycleWakeReason::RuntimeConfig;
                 }
-                if scanner_maintenance_generation() != maintenance_generation {
+                if scanner_maintenance_generation() != generations.maintenance {
                     return ScannerCycleWakeReason::MaintenanceConfig;
                 }
-                if dirty_usage_generation_seen
+                if generations
+                    .dirty_usage
                     .is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen)
                 {
                     return ScannerCycleWakeReason::DirtyUsage;
                 }
             }
             _ = scanner_runtime_config_changed() => {
-                if scanner_runtime_config_generation() != runtime_config_generation {
+                if scanner_runtime_config_generation() != generations.runtime_config {
                     return ScannerCycleWakeReason::RuntimeConfig;
                 }
             }
             _ = scanner_maintenance_changed() => {
-                if scanner_maintenance_generation() != maintenance_generation {
+                if scanner_maintenance_generation() != generations.maintenance {
                     return ScannerCycleWakeReason::MaintenanceConfig;
                 }
             }
             _ = &mut movement_notification => {
-                if movement_generation_seen.is_some_and(|seen| current_movement_generation() != seen) {
+                if movement
+                    .movement_generation_seen
+                    .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+                {
                     return ScannerCycleWakeReason::MovementGeneration;
                 }
             }
@@ -507,6 +533,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(super) async fn wait_for_next_scanner_cycle_with_activity<F, Probe, ProbeFuture>(
     ctx: &CancellationToken,
     delay: Duration,
@@ -514,23 +541,26 @@ pub(super) async fn wait_for_next_scanner_cycle_with_activity<F, Probe, ProbeFut
     activity_seen: &mut Option<ScannerActivitySnapshot>,
     generations: ScannerCycleObservedGenerations,
     is_lock_lost: F,
-    mut probe_activity: Probe,
+    probe_activity: Probe,
 ) -> ScannerCycleWakeReason
 where
     F: Fn() -> bool,
     Probe: FnMut() -> ProbeFuture,
     ProbeFuture: Future<Output = Result<ScannerActivitySnapshot, String>>,
 {
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost,
+    };
     wait_for_next_scanner_cycle_with_activity_and_movement(
         ctx,
         delay,
         activity_poll_interval,
         activity_seen,
         generations,
-        None,
-        Arc::new(Notify::new()),
-        || 0,
-        is_lock_lost,
+        movement,
         probe_activity,
     )
     .await
@@ -542,10 +572,7 @@ pub(super) async fn wait_for_next_scanner_cycle_with_activity_and_movement<F, G,
     activity_poll_interval: Option<Duration>,
     activity_seen: &mut Option<ScannerActivitySnapshot>,
     generations: ScannerCycleObservedGenerations,
-    movement_generation_seen: Option<u64>,
-    movement_changed: Arc<Notify>,
-    current_movement_generation: G,
-    is_lock_lost: F,
+    movement: ScannerMovementWaitContext<G, F>,
     mut probe_activity: Probe,
 ) -> ScannerCycleWakeReason
 where
@@ -563,18 +590,7 @@ where
         let wait_slice = activity_poll_interval
             .map(|interval| interval.max(Duration::from_secs(1)).min(remaining))
             .unwrap_or(remaining);
-        let wake_reason = wait_for_next_scanner_cycle_with_movement(
-            ctx,
-            wait_slice,
-            generations.dirty_usage,
-            generations.runtime_config,
-            generations.maintenance,
-            movement_generation_seen,
-            Arc::clone(&movement_changed),
-            &current_movement_generation,
-            &is_lock_lost,
-        )
-        .await;
+        let wake_reason = wait_for_next_scanner_cycle_with_movement(ctx, wait_slice, generations, &movement).await;
         if wake_reason != ScannerCycleWakeReason::Timer || Instant::now() >= deadline {
             return wake_reason;
         }
@@ -582,7 +598,7 @@ where
         let Some(_) = activity_poll_interval else {
             return ScannerCycleWakeReason::Timer;
         };
-        if is_lock_lost() {
+        if (movement.is_lock_lost)() {
             return ScannerCycleWakeReason::LeaderLockLost;
         }
 
@@ -591,7 +607,7 @@ where
         let lock_lost = async {
             loop {
                 tokio::time::sleep(SCANNER_LEADER_LOCK_POLL_INTERVAL).await;
-                if is_lock_lost() {
+                if (movement.is_lock_lost)() {
                     break;
                 }
             }

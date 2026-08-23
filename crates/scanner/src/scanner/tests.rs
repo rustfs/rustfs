@@ -2777,8 +2777,7 @@ async fn coordinator_does_not_put_after_remote_generation_flip() {
             data: None,
             revision: DataUsageCacheRevision::Missing,
         }),
-        Some(0),
-        None,
+        ScannerPublicationFence::new(Some(0), None, None),
         move || {
             let route_store = route_store.clone();
             async move {
@@ -4894,16 +4893,22 @@ async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
         next_changed.notify_waiters();
     });
 
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: Some(7),
+        movement_changed,
+        current_movement_generation: move || movement_generation.load(Ordering::Acquire),
+        is_lock_lost: || false,
+    };
     let reason = wait_for_next_scanner_cycle_with_movement(
         &ctx,
         Duration::from_secs(60),
-        None,
-        crate::runtime_config::scanner_runtime_config_generation(),
-        crate::scanner_io::scanner_maintenance_generation(),
-        Some(7),
-        movement_changed,
-        || movement_generation.load(Ordering::Acquire),
-        || false,
+        ScannerCycleObservedGenerations {
+            dirty_usage: None,
+            runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+            maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            defer_cluster_activity: false,
+        },
+        &movement,
     )
     .await;
 
