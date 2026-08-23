@@ -1235,9 +1235,18 @@ async fn run_data_scanner_cycle_with_budget(
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     }
     let background_heal_read = read_background_heal_info_with_epoch(storeapi.clone()).await;
-    if background_heal_read.publication_blocked {
-        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
-        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    match background_heal_read.status {
+        BackgroundHealInfoReadStatus::Blocked => {
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+        }
+        BackgroundHealInfoReadStatus::Failed => {
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Failed;
+        }
+        BackgroundHealInfoReadStatus::ErasureSd
+        | BackgroundHealInfoReadStatus::Loaded
+        | BackgroundHealInfoReadStatus::Missing => {}
     }
     let mut background_heal_info = background_heal_read.info;
     let background_heal_epoch = background_heal_read.expected_epoch;

@@ -252,6 +252,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     updates: &mpsc::Sender<DataUsageCache>,
     mut cache_snapshot: DataUsageCache,
     cache_cycle_floor: &AtomicU64,
+    expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
     let source = cache_snapshot.info.source?;
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
@@ -346,7 +347,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
 
         let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = cache_snapshot
-            .save_with_revisions(store, DATA_USAGE_CACHE_NAME, &revisions)
+            .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
             .await
         {
             error!(

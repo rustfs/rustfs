@@ -3307,6 +3307,10 @@ impl ECStore {
 
         if promoted && let Err(err) = self.save_current_pool_meta().await {
             drop(movement_guard);
+            // The terminal helper acquires start_gate again. Release the
+            // promotion guard before handing off a failed transition so a
+            // Tokio mutex cannot self-deadlock on the recovery path.
+            drop(_start_guard);
             resolve_decommission_terminal_mark_after_error_result(
                 self.decommission_failed_for_operation(idx, owner).await,
                 idx,
@@ -3321,6 +3325,9 @@ impl ECStore {
         drop(movement_guard);
 
         let generation = self.active_decommission_generation(idx).await?;
+        // Peer reload and terminal recovery must not run while start_gate is
+        // held; the recovery helper serializes its own terminal transition.
+        drop(_start_guard);
         if promoted && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("promote_queued_decommission for pool {idx}");
             if let Err(err) =

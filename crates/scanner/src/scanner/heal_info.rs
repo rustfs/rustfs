@@ -27,10 +27,31 @@ pub struct BackgroundHealInfo {
     pub current_scan_mode: HealScanMode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BackgroundHealInfoReadStatus {
+    ErasureSd,
+    Loaded,
+    Missing,
+    Blocked,
+    Failed,
+}
+
 pub(super) struct BackgroundHealInfoRead {
     pub(super) info: BackgroundHealInfo,
     pub(super) expected_epoch: Option<u64>,
-    pub(super) publication_blocked: bool,
+    pub(super) status: BackgroundHealInfoReadStatus,
+}
+
+pub(super) fn classify_background_heal_read_error(error: &EcstoreError) -> BackgroundHealInfoReadStatus {
+    if matches!(error, EcstoreError::ConfigNotFound) {
+        BackgroundHealInfoReadStatus::Missing
+    } else {
+        BackgroundHealInfoReadStatus::Failed
+    }
+}
+
+pub(super) fn decode_background_heal_info(data: &[u8]) -> Result<BackgroundHealInfo, serde_json::Error> {
+    serde_json::from_slice(data)
 }
 
 /// Read background healing information from storage
@@ -47,7 +68,7 @@ pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>)
         return BackgroundHealInfoRead {
             info: BackgroundHealInfo::default(),
             expected_epoch: None,
-            publication_blocked: false,
+            status: BackgroundHealInfoReadStatus::ErasureSd,
         };
     }
 
@@ -56,28 +77,39 @@ pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>)
         return BackgroundHealInfoRead {
             info: BackgroundHealInfo::default(),
             expected_epoch,
-            publication_blocked: true,
+            status: BackgroundHealInfoReadStatus::Blocked,
         };
     }
 
     // Get last healing information
-    let info = match read_config(storeapi, &BACKGROUND_HEAL_INFO_PATH).await {
-        Ok(buf) => serde_json::from_slice::<BackgroundHealInfo>(&buf).unwrap_or_else(|e| {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
-                path = %&*BACKGROUND_HEAL_INFO_PATH,
-                state = "decode_failed",
-                error = %e,
-                "Scanner background heal decode failed"
-            );
-            BackgroundHealInfo::default()
-        }),
+    match read_config(storeapi, &BACKGROUND_HEAL_INFO_PATH).await {
+        Ok(buf) => match decode_background_heal_info(&buf) {
+            Ok(info) => BackgroundHealInfoRead {
+                info,
+                expected_epoch,
+                status: BackgroundHealInfoReadStatus::Loaded,
+            },
+            Err(e) => {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+                    path = %&*BACKGROUND_HEAL_INFO_PATH,
+                    state = "decode_failed",
+                    error = %e,
+                    "Scanner background heal decode failed"
+                );
+                BackgroundHealInfoRead {
+                    info: BackgroundHealInfo::default(),
+                    expected_epoch,
+                    status: BackgroundHealInfoReadStatus::Failed,
+                }
+            }
+        },
         Err(e) => {
-            // Only log if it's not a ConfigNotFound error
-            if e != EcstoreError::ConfigNotFound {
+            let status = classify_background_heal_read_error(&e);
+            if status == BackgroundHealInfoReadStatus::Failed {
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
@@ -89,13 +121,12 @@ pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>)
                     "Scanner background heal read failed"
                 );
             }
-            BackgroundHealInfo::default()
+            BackgroundHealInfoRead {
+                info: BackgroundHealInfo::default(),
+                expected_epoch,
+                status,
+            }
         }
-    };
-    BackgroundHealInfoRead {
-        info,
-        expected_epoch,
-        publication_blocked: false,
     }
 }
 

@@ -5274,6 +5274,19 @@ fn test_background_heal_info_for_scan_start_marks_deep_active() {
 }
 
 #[test]
+fn background_heal_read_failures_never_become_initializable_defaults() {
+    assert_eq!(
+        classify_background_heal_read_error(&EcstoreError::ConfigNotFound),
+        BackgroundHealInfoReadStatus::Missing
+    );
+    assert_eq!(
+        classify_background_heal_read_error(&EcstoreError::SlowDown),
+        BackgroundHealInfoReadStatus::Failed
+    );
+    assert!(decode_background_heal_info(b"not-json").is_err());
+}
+
+#[test]
 fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
     with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
         let started_at = Utc::now();
