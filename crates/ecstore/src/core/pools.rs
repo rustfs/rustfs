@@ -3592,7 +3592,7 @@ impl ECStore {
             }
             return Err(err);
         }
-        drop(operation_guard);
+        drop(_movement_guard);
 
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
@@ -3601,7 +3601,6 @@ impl ECStore {
         if should_save_pool_meta {
             self.ctx.advance_data_movement_operation_epoch();
         }
-        drop(_movement_guard);
 
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
