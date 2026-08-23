@@ -457,8 +457,9 @@ where
             return ScannerCycleWakeReason::MovementGeneration;
         }
 
-        let mut movement_notification = movement_changed.notified();
-        movement_notification.enable();
+        let movement_notification = movement_changed.notified();
+        tokio::pin!(movement_notification);
+        movement_notification.as_mut().enable();
         // A transition may finish between the initial generation read and
         // registration with Notify. Re-check after `enable()` so that such a
         // transition cannot be lost when it used `notify_waiters()`.

@@ -1335,8 +1335,9 @@ mod tests {
     async fn movement_generation_notifies_waiters_and_fails_closed_at_maximum() {
         let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
         let notify = store.scanner_data_movement_changed();
-        let mut notified = notify.notified();
-        notified.enable();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
         assert_eq!(store.ctx.advance_data_movement_operation_epoch(), 1);
         tokio::time::timeout(std::time::Duration::from_secs(1), notified)
