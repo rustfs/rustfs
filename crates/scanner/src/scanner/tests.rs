@@ -373,18 +373,6 @@ async fn insert_usage_after_first_legacy_backup_read(store: &MemoryConfigStore) 
     );
 }
 
-async fn claim_test_scanner_leadership(store: Arc<MemoryConfigStore>) -> (bool, u64) {
-    let ctx = CancellationToken::new();
-    let mut revision = DataUsageCacheRevision::Missing;
-    let mut cycle = CurrentCycle {
-        next: 12,
-        ..Default::default()
-    };
-    let mut persisted_epoch = 0;
-    let claimed = claim_scanner_leadership(&ctx, store, &mut cycle, &mut revision, &mut persisted_epoch).await;
-    (claimed, persisted_epoch)
-}
-
 #[async_trait::async_trait]
 impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
     type Error = EcstoreError;
@@ -2093,12 +2081,47 @@ async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() 
     store.objects.lock().await.insert(
         memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
         serde_json::to_vec(&DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            scanner_cycle: Some(1),
+            usage_snapshot_bootstrap_pending: true,
+            ..Default::default()
+        })
+        .expect("pending usage marker should encode"),
+    );
+    assert!(
+        persisted_usage_floor(store.clone()).await.is_err(),
+        "a pending marker must never pass the legacy authoritative fallback"
+    );
+
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&DataUsageInfo {
             scanner_cycle: Some(u64::MAX - 1),
             ..Default::default()
         })
         .expect("usage snapshot should encode"),
     );
     assert!(persisted_usage_floor(store).await.is_err());
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_allows_only_explicit_pristine_bootstrap() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("a verified pristine startup should use the empty floor");
+    assert_eq!(floor, PersistedUsageFloor::default());
+    assert_eq!(state, PersistedUsageFloorStartup::Missing);
+    assert!(persisted_usage_floor_for_startup(store.clone(), false).await.is_err());
+
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        b"not-json".to_vec(),
+    );
+    assert!(
+        persisted_usage_floor_for_startup(store, true).await.is_err(),
+        "pristine bootstrap must not hide corrupt persisted state"
+    );
 }
 
 #[tokio::test]
@@ -2160,6 +2183,86 @@ async fn scanner_usage_floor_rejects_publication_change_during_pristine_confirma
     store.block_publication_after_admissions.store(2, Ordering::Release);
 
     assert!(persisted_usage_floor(store).await.is_err());
+}
+
+#[test]
+fn scanner_pristine_cycle_state_requires_no_durable_progress() {
+    let cycle = CurrentCycle::default();
+    assert!(scanner_cycle_state_is_pristine(&cycle, 0, &DataUsageCacheRevision::Missing));
+    assert!(scanner_may_resume_pristine_usage_bootstrap(&cycle));
+    assert!(!scanner_cycle_state_is_pristine(
+        &CurrentCycle {
+            next: 1,
+            ..Default::default()
+        },
+        0,
+        &DataUsageCacheRevision::Missing
+    ));
+    assert!(!scanner_may_resume_pristine_usage_bootstrap(&CurrentCycle {
+        next: 1,
+        ..Default::default()
+    }));
+    assert!(!scanner_cycle_state_is_pristine(&cycle, 1, &DataUsageCacheRevision::Missing));
+    assert!(!scanner_cycle_state_is_pristine(
+        &cycle,
+        0,
+        &DataUsageCacheRevision::Etag("etag".to_string())
+    ));
+}
+
+#[tokio::test]
+async fn scanner_pristine_bootstrap_allows_first_bucket_to_win_startup() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let cycle = CurrentCycle::default();
+    let revision = DataUsageCacheRevision::Missing;
+
+    store
+        .make_bucket("first-user-bucket", &crate::storage_api::scan::MakeBucketOptions::default())
+        .await
+        .expect("test bucket should be created");
+
+    assert!(scanner_may_bootstrap_missing_usage_floor(&cycle, 0, &revision));
+    assert_eq!(
+        persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("first startup should still admit a non-authoritative bootstrap marker")
+            .1,
+        PersistedUsageFloorStartup::Missing
+    );
+    initialize_pristine_usage_baseline(store.clone())
+        .await
+        .expect("first startup should persist its pending marker");
+    let pending = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("pending marker should be stored");
+    let pending = serde_json::from_slice::<DataUsageInfo>(&pending).expect("pending marker should decode");
+    assert!(data_usage_info_is_pristine_bootstrap_pending(&pending));
+    assert!(!data_usage_info_has_persisted_baseline_identity(&pending));
+    assert_eq!(
+        persisted_usage_floor_for_startup(store.clone(), false)
+            .await
+            .expect("the pending marker should be resumable after restart")
+            .1,
+        PersistedUsageFloorStartup::BootstrapPending
+    );
+
+    store
+        .delete_bucket("first-user-bucket", &crate::storage_api::scan::DeleteBucketOptions::default())
+        .await
+        .expect("first user bucket should be deleted");
+    assert!(
+        read_config(store.clone(), &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .await
+            .is_err(),
+        "bucket deletion must not copy the pending marker into the backup slot"
+    );
+    assert_eq!(
+        persisted_usage_floor_for_startup(store, false)
+            .await
+            .expect("the pending marker should remain resumable after bucket deletion")
+            .1,
+        PersistedUsageFloorStartup::BootstrapPending
+    );
 }
 
 #[tokio::test]
@@ -2444,7 +2547,7 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
     );
 
     let mut persisted_epoch = 8;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -2467,50 +2570,111 @@ async fn test_leadership_claim_rejects_terminal_epoch() {
     };
     let mut persisted_epoch = u64::MAX - 1;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
     assert_eq!(persisted_epoch, u64::MAX - 1);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
 #[tokio::test]
-async fn scanner_bootstraps_leadership_when_usage_snapshots_are_stably_absent() {
+async fn scanner_defers_leadership_when_usage_snapshots_are_stably_absent() {
     let store = Arc::new(MemoryConfigStore::default());
-    let floor = persisted_usage_floor(store.clone())
-        .await
-        .expect("pristine usage state should provide the initial floor");
-    assert_eq!(floor, PersistedUsageFloor::default());
-    let (claimed, persisted_epoch) = claim_test_scanner_leadership(store.clone()).await;
-    assert!(claimed);
-    let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
-        .await
-        .expect("pristine leadership claim should persist");
-    let (persisted_cycle, leader_epoch) = decode_scanner_cycle_state(&state).expect("persisted leadership claim should decode");
-    assert_eq!(persisted_cycle.next, 12);
-    assert_eq!(leader_epoch, 1);
-    assert_eq!(persisted_epoch, 1);
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    let mut persisted_epoch = 0;
+
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
     assert!(read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str()).await.is_err());
 }
 
 #[tokio::test]
-async fn leadership_claim_fails_closed_when_usage_appears_during_pristine_confirmation() {
+async fn pristine_usage_bootstrap_pending_unblocks_first_leadership_claim() {
     let store = Arc::new(MemoryConfigStore::default());
-    insert_usage_after_first_legacy_backup_read(store.as_ref()).await;
+    initialize_pristine_usage_baseline(store.clone())
+        .await
+        .expect("verified pristine startup should publish its pending marker");
 
-    let (claimed, persisted_epoch) = claim_test_scanner_leadership(store.clone()).await;
-    assert!(!claimed);
-    assert_eq!(persisted_epoch, 0);
-    assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle::default();
+    let mut persisted_epoch = 0;
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false,).await);
+    assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true).await);
+
+    let usage = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("leadership claim should fence the pristine baseline");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("pristine bootstrap marker should remain valid");
+    assert!(data_usage_info_is_pristine_bootstrap_pending(&usage));
+    assert!(!data_usage_info_has_persisted_baseline_identity(&usage));
+    assert_eq!(usage.scanner_epoch, Some(1));
 }
 
 #[tokio::test]
-async fn leadership_claim_rejects_publication_change_during_pristine_confirmation() {
+async fn existing_pristine_usage_bootstrap_is_resumed_after_restart() {
     let store = Arc::new(MemoryConfigStore::default());
-    store.block_publication_after_admissions.store(2, Ordering::Release);
+    initialize_pristine_usage_baseline(store.clone())
+        .await
+        .expect("verified pristine startup should publish its pending marker");
 
-    let (claimed, persisted_epoch) = claim_test_scanner_leadership(store.clone()).await;
-    assert!(!claimed);
-    assert_eq!(persisted_epoch, 0);
-    assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), false)
+        .await
+        .expect("restart should recognize the pending pristine bootstrap");
+    assert_eq!(floor, PersistedUsageFloor::default());
+    assert_eq!(state, PersistedUsageFloorStartup::BootstrapPending);
+    assert!(persisted_usage_floor(store).await.is_err());
+}
+
+#[tokio::test]
+async fn pristine_usage_bootstrap_reconciles_post_commit_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store.error_after_commit_put_number.lock().await.insert(key, 1);
+
+    initialize_pristine_usage_baseline(store.clone())
+        .await
+        .expect("a committed pending marker should reconcile after a lost response");
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("the reconciled pending marker should remain");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("pending marker should decode");
+    assert!(data_usage_info_is_pristine_bootstrap_pending(&usage));
+    assert!(!data_usage_info_has_persisted_baseline_identity(&usage));
+    assert_eq!(
+        persisted_usage_floor_for_startup(store.clone(), false)
+            .await
+            .expect("restart should resume a committed pending marker")
+            .1,
+        PersistedUsageFloorStartup::BootstrapPending
+    );
+    assert!(persisted_usage_floor(store).await.is_err());
+}
+
+#[tokio::test]
+async fn pristine_usage_bootstrap_does_not_overwrite_concurrent_replacement() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let replacement = serde_json::to_vec(&complete_usage_with_bucket_count(None, 1)).expect("replacement should encode");
+    store
+        .replace_after_successful_puts
+        .lock()
+        .await
+        .insert(key, (1, replacement.clone()));
+
+    initialize_pristine_usage_baseline(store.clone())
+        .await
+        .expect("the bootstrap write completed before the replacement");
+    assert_eq!(
+        read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("newer usage snapshot must remain"),
+        replacement
+    );
 }
 
 #[tokio::test]
@@ -2528,7 +2692,7 @@ async fn leadership_claim_defers_on_corrupt_usage_baseline_without_bloom_write()
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -2548,7 +2712,7 @@ async fn leadership_claim_defers_on_unidentified_usage_baseline_without_bloom_wr
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -2570,7 +2734,7 @@ async fn test_leadership_claim_confirms_commit_after_returned_error() {
     let mut persisted_epoch = 0;
     seed_usage_snapshot_for_leadership_claim(&store).await;
 
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -2626,7 +2790,7 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
         ..Default::default()
     };
     let mut persisted_epoch = 4;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
 
     let (fenced_data, fenced_revision) = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -2691,6 +2855,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
             &mut replacement_cycle,
             &mut replacement_revision,
             &mut replacement_epoch,
+            false,
         )
         .await
     );

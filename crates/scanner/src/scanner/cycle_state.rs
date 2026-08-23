@@ -926,7 +926,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "scanner leader lock was lost after fencing newer cycle state".to_string(),
                 ));
             }
-            fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), fence_epoch, Some(reset_epoch))
+            fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), fence_epoch, Some(reset_epoch), false)
                 .await
                 .map_err(|err| ScannerError::Other(format!("failed to fence preserved scanner usage epoch: {err}")))?;
             if guard.is_lock_lost() {
@@ -1032,7 +1032,8 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             "scanner leader lock was lost after rebuilding cycle state".to_string(),
         ));
     }
-    if let Err(err) = fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), leader_epoch, Some(reset_epoch)).await
+    if let Err(err) =
+        fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), leader_epoch, Some(reset_epoch), false).await
     {
         set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
@@ -1179,6 +1180,13 @@ pub(super) struct PersistedUsageFloor {
     pub(super) leader_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PersistedUsageFloorStartup {
+    Authoritative,
+    Missing,
+    BootstrapPending,
+}
+
 pub(super) fn encode_scanner_cycle_state(
     cycle_info: &CurrentCycle,
     leader_epoch: u64,
@@ -1300,11 +1308,25 @@ pub(super) fn advance_scanner_cycle(cycle_info: &mut CurrentCycle) -> Result<(),
 pub(super) async fn persisted_usage_floor(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> Result<PersistedUsageFloor, ScannerError> {
+    let (floor, state) = persisted_usage_floor_for_startup(storeapi, false).await?;
+    if state != PersistedUsageFloorStartup::Authoritative {
+        return Err(ScannerError::Other(
+            "persisted scanner usage floor has no authoritative baseline".to_string(),
+        ));
+    }
+    Ok(floor)
+}
+
+pub(super) async fn persisted_usage_floor_for_startup(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    allow_missing_for_pristine_startup: bool,
+) -> Result<(PersistedUsageFloor, PersistedUsageFloorStartup), ScannerError> {
     let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
         return Err(ScannerError::Other("scanner usage floor read is blocked by data movement".to_string()));
     };
     let mut floor = PersistedUsageFloor::default();
     let mut found_any = false;
+    let mut bootstrap_pending = false;
     let update_floor = |floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str| -> Result<(), ScannerError> {
         floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
         if let Some(completed_cycle) = usage.scanner_cycle {
@@ -1323,14 +1345,24 @@ pub(super) async fn persisted_usage_floor(
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
                 })?;
-                if !data_usage_info_has_persisted_baseline_identity(&usage) {
+                if data_usage_info_is_pristine_bootstrap_pending(&usage) && primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
+                    if bootstrap_pending {
+                        return Err(ScannerError::Other(
+                            "multiple pristine scanner usage bootstrap markers were found".to_string(),
+                        ));
+                    }
+                    bootstrap_pending = true;
+                    update_floor(&mut floor, &usage, primary_path)?;
+                    None
+                } else if !data_usage_info_has_persisted_baseline_identity(&usage) {
                     return Err(ScannerError::Other(format!(
                         "scanner usage floor from {primary_path} has no persisted baseline identity"
                     )));
+                } else {
+                    let epoch = usage.scanner_epoch.unwrap_or_default();
+                    update_floor(&mut floor, &usage, primary_path)?;
+                    Some(epoch)
                 }
-                let epoch = usage.scanner_epoch.unwrap_or_default();
-                update_floor(&mut floor, &usage, primary_path)?;
-                Some(epoch)
             }
             Ok((None, _)) => None,
             Err(err) => {
@@ -1342,6 +1374,11 @@ pub(super) async fn persisted_usage_floor(
         let mut any_found = primary_epoch.is_some();
         match read_config_with_revision(storeapi.clone(), &backup_path).await {
             Ok((Some(data), _)) => {
+                if bootstrap_pending {
+                    return Err(ScannerError::Other(
+                        "pristine scanner usage bootstrap conflicts with a persisted backup".to_string(),
+                    ));
+                }
                 any_found = true;
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
@@ -1367,12 +1404,22 @@ pub(super) async fn persisted_usage_floor(
             }
         }
         if any_found {
+            if bootstrap_pending {
+                return Err(ScannerError::Other(
+                    "pristine scanner usage bootstrap conflicts with an authoritative usage floor".to_string(),
+                ));
+            }
             found_any = true;
             break;
         }
     }
 
-    if !found_any {
+    if !found_any && !bootstrap_pending {
+        if !allow_missing_for_pristine_startup {
+            return Err(ScannerError::Other(
+                "persisted scanner usage floor has no authoritative baseline".to_string(),
+            ));
+        }
         let Some(publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
             return Err(ScannerError::Other(
                 "scanner usage floor changed before pristine state confirmation".to_string(),
@@ -1405,7 +1452,14 @@ pub(super) async fn persisted_usage_floor(
             "scanner usage floor changed while its epoch proof was being confirmed".to_string(),
         ));
     };
-    Ok(floor)
+    let state = if found_any {
+        PersistedUsageFloorStartup::Authoritative
+    } else if bootstrap_pending {
+        PersistedUsageFloorStartup::BootstrapPending
+    } else {
+        PersistedUsageFloorStartup::Missing
+    };
+    Ok((floor, state))
 }
 
 pub(super) fn apply_persisted_usage_floor(cycle_info: &mut CurrentCycle, leader_epoch: &mut u64, floor: PersistedUsageFloor) {
