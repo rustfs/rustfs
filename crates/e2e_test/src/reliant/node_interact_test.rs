@@ -13,207 +13,228 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::workspace_root;
+use crate::common::RustFSTestEnvironment;
 use crate::storage_api::node_interact::{
     TonicInterceptor, VolumeInfo, WalkDirOptions, gen_tonic_signature_interceptor, node_service_time_out_client,
 };
-use futures::future::join_all;
+use aws_sdk_s3::primitives::ByteStream;
 use rmp_serde::{Deserializer, Serializer};
-use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, MetacacheWriter};
+use rustfs_filemeta::MetaCacheEntry;
 use rustfs_protos::proto_gen::node_service::WalkDirRequest;
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
-    proto_gen::node_service::{
-        ListVolumesRequest, LocalStorageInfoRequest, MakeVolumeRequest, PingRequest, PingResponse, ReadAllRequest,
-    },
+    proto_gen::node_service::{ListVolumesRequest, LocalStorageInfoRequest, MakeVolumeRequest, PingRequest, ReadAllRequest},
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io::Cursor;
-use std::path::PathBuf;
-use tokio::spawn;
 use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
 
-const CLUSTER_ADDR: &str = "http://localhost:9000";
+type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+const TEST_RPC_SECRET: &str = "rustfs-internode-signature-e2e-secret";
 
 fn signature_interceptor() -> TonicInterceptor {
     TonicInterceptor::Signature(gen_tonic_signature_interceptor())
 }
 
+fn rpc_client_error(error: Box<dyn Error>) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
+async fn start_server() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_string());
+    let effective = rustfs_credentials::try_get_rpc_token().expect("RPC secret must resolve in the test process");
+    assert_eq!(effective, TEST_RPC_SECRET, "the test process uses an unexpected RPC secret");
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_without_cleanup_with_env(&[
+        ("RUSTFS_RPC_SECRET", TEST_RPC_SECRET),
+        ("RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT", "false"),
+        ("RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT", "false"),
+        ("RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT", "false"),
+        ("RUST_LOG", "error"),
+    ])
+    .await?;
+    Ok(env)
+}
+
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn ping() -> Result<(), Box<dyn Error>> {
+async fn ping() -> TestResult {
+    let env = start_server().await?;
     let mut fbb = flatbuffers::FlatBufferBuilder::new();
     let payload = fbb.create_vector(b"hello world");
-
     let mut builder = PingBodyBuilder::new(&mut fbb);
     builder.add_payload(payload);
     let root = builder.finish();
     fbb.finish(root, None);
 
-    let finished_data = fbb.finished_data();
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let response = client
+        .ping(Request::new(PingRequest {
+            version: 1,
+            body: bytes::Bytes::copy_from_slice(fbb.finished_data()),
+        }))
+        .await?
+        .into_inner();
 
-    let decoded_payload = flatbuffers::root::<PingBody>(finished_data);
-    assert!(decoded_payload.is_ok());
-
-    // Create client
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-
-    // Construct PingRequest
-    let request = Request::new(PingRequest {
-        version: 1,
-        body: bytes::Bytes::copy_from_slice(finished_data),
-    });
-
-    // Send request and get response
-    let response: PingResponse = client.ping(request).await?.into_inner();
-
-    // Print response
-    let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
-    if let Err(e) = ping_response_body {
-        eprintln!("{e}");
-    } else {
-        println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
-    }
-
+    assert_eq!(response.version, 1);
+    let body = flatbuffers::root::<PingBody>(&response.body)?;
+    assert_eq!(body.payload().expect("ping response must contain a payload").bytes(), b"hello, caller");
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn make_volume() -> Result<(), Box<dyn Error>> {
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-    let request = Request::new(MakeVolumeRequest {
-        disk: "data".to_string(),
-        volume: "dandan".to_string(),
-    });
+async fn make_volume() -> TestResult {
+    let env = start_server().await?;
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let response = client
+        .make_volume(Request::new(MakeVolumeRequest {
+            disk: env.temp_dir.clone(),
+            volume: "node-rpc-volume".to_string(),
+        }))
+        .await?
+        .into_inner();
 
-    let response = client.make_volume(request).await?.into_inner();
-    if response.success {
-        println!("success");
-    } else {
-        println!("failed: {:?}", response.error);
-    }
+    assert!(response.success, "make_volume failed: {:?}", response.error);
+    assert!(std::path::Path::new(&env.temp_dir).join("node-rpc-volume").is_dir());
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn list_volumes() -> Result<(), Box<dyn Error>> {
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-    let request = Request::new(ListVolumesRequest {
-        disk: "data".to_string(),
-    });
+async fn list_volumes() -> TestResult {
+    let env = start_server().await?;
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let created = client
+        .make_volume(Request::new(MakeVolumeRequest {
+            disk: env.temp_dir.clone(),
+            volume: "node-rpc-listed-volume".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert!(created.success, "make_volume failed: {:?}", created.error);
 
-    let response = client.list_volumes(request).await?.into_inner();
-    let volume_infos: Vec<VolumeInfo> = response
+    let response = client
+        .list_volumes(Request::new(ListVolumesRequest {
+            disk: env.temp_dir.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(response.success, "list_volumes failed: {:?}", response.error);
+    let volumes = response
         .volume_infos
-        .into_iter()
-        .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-        .collect();
-
-    println!("{volume_infos:?}");
+        .iter()
+        .map(|json| serde_json::from_str::<VolumeInfo>(json))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(volumes.iter().any(|volume| volume.name == "node-rpc-listed-volume"));
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn walk_dir() -> Result<(), Box<dyn Error>> {
-    println!("walk_dir");
-    // TODO: use writer
+async fn walk_dir() -> TestResult {
+    let env = start_server().await?;
+    let s3 = env.create_s3_client();
+    let bucket = "node-rpc-walk-bucket";
+    let key = "prefix/object.txt";
+    env.create_test_bucket(bucket).await?;
+    s3.put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"walk payload"))
+        .send()
+        .await?;
+
     let opts = WalkDirOptions {
-        bucket: "dandan".to_owned(),
-        base_dir: "".to_owned(),
+        bucket: bucket.to_string(),
         recursive: true,
         ..Default::default()
     };
-    let (rd, mut wr) = tokio::io::duplex(1024);
-    let mut buf = Vec::new();
-    opts.serialize(&mut Serializer::new(&mut buf))?;
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-    let disk_path = std::env::var_os("RUSTFS_DISK_PATH").map(PathBuf::from).unwrap_or_else(|| {
-        let mut path = workspace_root();
-        path.push("target");
-        path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-        path.push("data");
-        path
-    });
-    let request = Request::new(WalkDirRequest {
-        disk: disk_path.to_string_lossy().into_owned(),
-        walk_dir_options: buf.into(),
-    });
-    let mut response = client.walk_dir(request).await?.into_inner();
+    let mut encoded = Vec::new();
+    opts.serialize(&mut Serializer::new(&mut encoded))?;
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let mut stream = client
+        .walk_dir(Request::new(WalkDirRequest {
+            disk: env.temp_dir.clone(),
+            walk_dir_options: encoded.into(),
+        }))
+        .await?
+        .into_inner();
 
-    let job1 = spawn(async move {
-        let mut out = MetacacheWriter::new(&mut wr);
-        loop {
-            match response.next().await {
-                Some(Ok(resp)) => {
-                    if !resp.success {
-                        println!("{}", resp.error_info.unwrap_or_else(|| "".to_string()));
-                    }
-                    let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-                        .map_err(|_e| std::io::Error::other(format!("Unexpected response: {response:?}")))
-                        .unwrap();
-                    out.write_obj(&entry).await.unwrap();
-                }
-                None => {
-                    let _ = out.close().await;
-                    break;
-                }
-                _ => {
-                    println!("Unexpected response: {response:?}");
-                    let _ = out.close().await;
-                    break;
-                }
-            }
-        }
-    });
-    let job2 = spawn(async move {
-        let mut reader = MetacacheReader::new(rd);
-        while let Ok(Some(entry)) = reader.peek().await {
-            println!("{entry:?}");
-        }
-    });
-
-    join_all(vec![job1, job2]).await;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn read_all() -> Result<(), Box<dyn Error>> {
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-    let request = Request::new(ReadAllRequest {
-        disk: "data".to_string(),
-        volume: "ff".to_string(),
-        path: "format.json".to_string(),
-    });
-
-    let response = client.read_all(request).await?.into_inner();
-    let volume_infos = response.data;
-
-    println!("{}", response.success);
-    println!("{volume_infos:?}");
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn storage_info() -> Result<(), Box<dyn Error>> {
-    let mut client = node_service_time_out_client(&CLUSTER_ADDR.to_string(), signature_interceptor()).await?;
-    let request = Request::new(LocalStorageInfoRequest { metrics: true });
-
-    let response = client.local_storage_info(request).await?.into_inner();
-    if !response.success {
-        println!("{:?}", response.error_info);
-        return Ok(());
+    let mut entries = Vec::new();
+    while let Some(response) = stream.next().await {
+        let response = response?;
+        assert!(response.success, "walk_dir failed: {:?}", response.error_info);
+        entries.push(serde_json::from_str::<MetaCacheEntry>(&response.meta_cache_entry)?);
     }
-    let info = response.storage_info;
+    assert!(
+        entries.iter().any(|entry| entry.name == key),
+        "walk_dir did not return {key}: {entries:?}"
+    );
+    Ok(())
+}
 
-    let mut buf = Deserializer::new(Cursor::new(info));
-    let storage_info: rustfs_madmin::StorageInfo = Deserialize::deserialize(&mut buf).unwrap();
-    println!("{storage_info:?}");
+#[tokio::test]
+async fn read_all() -> TestResult {
+    let env = start_server().await?;
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let volume = "node-rpc-read-volume";
+    let created = client
+        .make_volume(Request::new(MakeVolumeRequest {
+            disk: env.temp_dir.clone(),
+            volume: volume.to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert!(created.success, "make_volume failed: {:?}", created.error);
+    tokio::fs::write(std::path::Path::new(&env.temp_dir).join(volume).join("payload.bin"), b"read payload").await?;
+
+    let response = client
+        .read_all(Request::new(ReadAllRequest {
+            disk: env.temp_dir.clone(),
+            volume: volume.to_string(),
+            path: "payload.bin".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert!(response.success, "read_all failed: {:?}", response.error);
+    assert_eq!(response.data.as_ref(), b"read payload");
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_info() -> TestResult {
+    let env = start_server().await?;
+    let mut client = node_service_time_out_client(&env.url, signature_interceptor())
+        .await
+        .map_err(rpc_client_error)?;
+    let response = client
+        .local_storage_info(Request::new(LocalStorageInfoRequest { metrics: true }))
+        .await?
+        .into_inner();
+    assert!(response.success, "local_storage_info failed: {:?}", response.error_info);
+
+    let mut decoder = Deserializer::new(Cursor::new(response.storage_info));
+    let storage_info: rustfs_madmin::StorageInfo = Deserialize::deserialize(&mut decoder)?;
+    let expected_disk = std::fs::canonicalize(&env.temp_dir)?;
+    assert!(!storage_info.disks.is_empty(), "local_storage_info returned no disks");
+    assert!(
+        storage_info
+            .disks
+            .iter()
+            .any(|disk| std::path::Path::new(&disk.drive_path) == expected_disk),
+        "local_storage_info did not include the configured disk: {:?}",
+        storage_info.disks
+    );
     Ok(())
 }
