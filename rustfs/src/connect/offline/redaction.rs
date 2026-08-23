@@ -173,7 +173,6 @@ pub enum RedactionError {
     NotRepresentable,
 }
 
-#[must_use]
 pub(super) fn redact(source: RedactionSource, document: &Map<String, Value>) -> Result<RedactionResult, RedactionError> {
     let encoded = serde_json::to_vec(document).map_err(|_| RedactionError::NotRepresentable)?;
     if encoded.len() > MAX_INPUT_BYTES {

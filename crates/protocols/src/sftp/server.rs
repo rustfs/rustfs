@@ -127,6 +127,7 @@ const SFTP_COMPRESSION: &[russh::compression::Name] = &[russh::compression::NONE
 fn build_preferred() -> russh::Preferred {
     russh::Preferred {
         kex: Cow::Borrowed(SFTP_KEX),
+        host_key_certificates: Cow::Borrowed(&[]),
         key: Cow::Borrowed(SFTP_HOST_KEY_ALGORITHMS),
         cipher: Cow::Borrowed(SFTP_CIPHERS),
         mac: Cow::Borrowed(SFTP_MACS),

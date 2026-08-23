@@ -158,6 +158,15 @@ impl Drop for TestServer {
     }
 }
 
+fn assert_reused_pending_requests(server: &TestServer) {
+    let requests = server.seen.lock().expect("seen lock");
+    assert_eq!(requests.len(), 4);
+    for request in &requests[1..] {
+        assert_eq!(request["requestId"], requests[0]["requestId"]);
+        assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
+    }
+}
+
 async fn server(state_directory: &std::path::Path, replies: Vec<Reply>) -> TestServer {
     let pki = Arc::new(TestPki::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
@@ -375,7 +384,7 @@ async fn production_command_never_echoes_a_remote_reason() {
 async fn response_loss_reuses_the_pending_request_and_existing_credential_is_idempotent() {
     let temp = secure_tempdir();
     let state = temp.path().join("state");
-    let server = server(
+    let flaky_server = server(
         &state,
         vec![
             Reply::DropConnection,
@@ -385,27 +394,21 @@ async fn response_loss_reuses_the_pending_request_and_existing_credential_is_ide
         ],
     )
     .await;
-    let (root, token) = prepare_inputs(&temp, &server.root_pem);
+    let (root, token) = prepare_inputs(&temp, &flaky_server.root_pem);
 
-    while server.seen.lock().expect("seen lock").len() < 3 {
-        let error = register_from_protected_input(&server.endpoint, &root, &state, Some(&token))
+    while flaky_server.seen.lock().expect("seen lock").len() < 3 {
+        let error = register_from_protected_input(&flaky_server.endpoint, &root, &state, Some(&token))
             .await
             .expect_err("lost response must leave a retryable failure");
         assert!(!error.to_string().contains(TOKEN_SECRET));
         assert!(state.join("credential/registration.pending.json").is_file());
     }
 
-    let registered = register_from_protected_input(&server.endpoint, &root, &state, Some(&token))
+    let registered = register_from_protected_input(&flaky_server.endpoint, &root, &state, Some(&token))
         .await
         .expect("retry registration");
     assert_eq!(registered.device_uid, DEVICE_UID);
-    let requests = server.seen.lock().expect("seen lock");
-    assert_eq!(requests.len(), 4);
-    for request in &requests[1..] {
-        assert_eq!(request["requestId"], requests[0]["requestId"]);
-        assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
-    }
-    drop(requests);
+    assert_reused_pending_requests(&flaky_server);
 
     let idle = server(&state, vec![]).await;
     let idempotent = register_from_protected_input(&idle.endpoint, &root, &state, Some(&token))

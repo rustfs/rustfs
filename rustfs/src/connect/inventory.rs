@@ -659,6 +659,10 @@ mod tests {
 
     use super::*;
 
+    fn create_directory(path: &Path) -> io::Result<()> {
+        fs::create_dir(path)
+    }
+
     #[test]
     fn inventory_directory_creation_is_synced_before_state_can_be_committed() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -699,7 +703,7 @@ mod tests {
         fs::create_dir(&root).expect("state root");
         let directory = root.join("inventory");
         let state = directory.join("state.json");
-        let error = prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+        let error = prepare_inventory_directory_with(&directory, create_directory, |path| {
             if path == directory {
                 Err(io::Error::other("injected leaf sync failure"))
             } else {
@@ -710,7 +714,7 @@ mod tests {
         assert!(matches!(error, InventoryError::StateIo { path, .. } if path == directory));
         assert!(!state.exists());
 
-        let error = prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+        let error = prepare_inventory_directory_with(&directory, create_directory, |path| {
             if path == root {
                 Err(io::Error::other("injected parent sync failure"))
             } else {
@@ -722,7 +726,7 @@ mod tests {
         assert!(!state.exists());
 
         let mut synced = Vec::new();
-        prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+        prepare_inventory_directory_with(&directory, create_directory, |path| {
             synced.push(path.to_path_buf());
             Ok(())
         })
@@ -737,7 +741,7 @@ mod tests {
         let directory = root.join("inventory");
 
         assert!(matches!(
-            prepare_inventory_directory_with(&directory, fs::create_dir, |_| Ok(())),
+            prepare_inventory_directory_with(&directory, create_directory, |_| Ok(())),
             Err(InventoryError::StateIo { path, .. }) if path == root
         ));
         assert!(!directory.exists());
