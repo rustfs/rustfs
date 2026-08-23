@@ -87,6 +87,8 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
+pub const SCANNER_PUBLICATION_LEASE_TTL_MS: u64 = 60_000;
+
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
 pub(crate) async fn has_xlmeta_files(path: &std::path::Path) -> std::io::Result<bool> {
@@ -353,15 +355,10 @@ impl ECStore {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.read_owned().await;
         let (active, blocked) = self.scanner_data_movement_snapshot_locked().await;
-        let blocked = blocked
-            || self.ctx.data_movement_operation_epoch_exhausted()
-            || self.ctx.data_movement_generation_exhausted();
+        let blocked =
+            blocked || self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted();
         self.ctx.set_scanner_publication_state(blocked);
-        (
-            active,
-            blocked,
-            self.ctx.data_movement_generation(),
-        )
+        (active, blocked, self.ctx.data_movement_generation())
     }
 
     pub fn scanner_data_movement_generation(&self) -> u64 {
@@ -461,6 +458,53 @@ impl ECStore {
         let (operation_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         drop(operation_guard);
         Some(epoch)
+    }
+
+    /// Acquire a storage-owned read admission for a coordinator's final
+    /// scanner publication.  The guard remains in the context's lease table,
+    /// so a local movement writer cannot pass the peer while its authoritative
+    /// PUT is in flight.
+    pub async fn acquire_scanner_publication_lease(
+        &self,
+        expected_generation: u64,
+        ttl: std::time::Duration,
+    ) -> Result<(Uuid, u64)> {
+        if ttl != crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL {
+            return Err(Error::other("scanner publication lease TTL is not supported"));
+        }
+
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_generation_exhausted()
+            || self.ctx.data_movement_operation_epoch_exhausted()
+            || self.ctx.data_movement_generation() != expected_generation
+        {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+
+        let token = Uuid::new_v4();
+        let expires_at = tokio::time::Instant::now() + ttl;
+        if !self
+            .ctx
+            .install_scanner_publication_lease(token, expires_at, operation_guard)
+            .await
+        {
+            return Err(Error::other("scanner publication lease capacity is exhausted"));
+        }
+
+        let context = Arc::clone(&self.ctx);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(expires_at).await;
+            context.expire_scanner_publication_lease(token, expires_at).await;
+        });
+        Ok((token, expected_generation))
+    }
+
+    pub async fn release_scanner_publication_lease(&self, token: Uuid) -> bool {
+        self.ctx.remove_scanner_publication_lease(token).await
     }
 }
 
@@ -1142,10 +1186,7 @@ mod tests {
         assert!(store.scanner_data_movement_generation_exhausted());
         assert_eq!(store.ctx.advance_data_movement_generation(), None);
         assert!(
-            store
-                .scanner_data_usage_publication_admission_guard()
-                .await
-                .is_none(),
+            store.scanner_data_usage_publication_admission_guard().await.is_none(),
             "generation exhaustion must close publication admission"
         );
     }

@@ -56,13 +56,26 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use tokio::sync::{Notify, OnceCell, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, RwLock};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SCANNER_PUBLICATION_STATE_UNKNOWN: u8 = 0;
 const SCANNER_PUBLICATION_STATE_ALLOWED: u8 = 1;
 const SCANNER_PUBLICATION_STATE_BLOCKED: u8 = 2;
+
+pub(crate) const SCANNER_PUBLICATION_LEASE_MAX_ENTRIES: usize = 256;
+
+/// A lease is deliberately short-lived.  The coordinator treats expiry as a
+/// failed publication rather than silently continuing with a peer that may
+/// have started movement after the lease was abandoned.
+pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) struct ScannerPublicationLeaseEntry {
+    pub(crate) expires_at: Instant,
+    pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+}
 
 /// Runtime state owned by a single `ECStore` instance.
 ///
@@ -171,6 +184,11 @@ pub struct InstanceContext {
     /// Readers are held across one publication commit; movement transitions
     /// take the writer at their durable state commit boundary.
     data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Remote scanner publication leases own a read guard until explicit
+    /// release or bounded expiry.  Keeping the guard in storage-owned state
+    /// makes a remote movement transition wait on the same fence as a local
+    /// scanner commit.
+    scanner_publication_leases: Arc<Mutex<HashMap<Uuid, ScannerPublicationLeaseEntry>>>,
     /// Monotonic admission epoch paired with the operation gate. A
     /// publication admitted before a movement transition must never be
     /// mistaken for one admitted after the transition.
@@ -231,6 +249,7 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
+            scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
             data_movement_generation: AtomicU64::new(0),
@@ -257,6 +276,38 @@ impl InstanceContext {
 
     pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
         Arc::clone(&self.data_movement_operation_gate)
+    }
+
+    pub(crate) async fn install_scanner_publication_lease(
+        &self,
+        token: Uuid,
+        expires_at: Instant,
+        operation_guard: OwnedRwLockReadGuard<()>,
+    ) -> bool {
+        let mut leases = self.scanner_publication_leases.lock().await;
+        if leases.len() >= SCANNER_PUBLICATION_LEASE_MAX_ENTRIES {
+            return false;
+        }
+        leases.insert(
+            token,
+            ScannerPublicationLeaseEntry {
+                expires_at,
+                _operation_guard: operation_guard,
+            },
+        );
+        true
+    }
+
+    pub(crate) async fn remove_scanner_publication_lease(&self, token: Uuid) -> bool {
+        self.scanner_publication_leases.lock().await.remove(&token).is_some()
+    }
+
+    pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
+        let mut leases = self.scanner_publication_leases.lock().await;
+        let should_remove = leases.get(&token).is_some_and(|entry| entry.expires_at <= expires_at);
+        if should_remove {
+            leases.remove(&token);
+        }
     }
 
     pub(crate) fn data_movement_operation_epoch(&self) -> u64 {
