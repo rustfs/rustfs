@@ -475,6 +475,8 @@ EOF
 
 declare -a CANDIDATE_COMPARE_CSVS=()
 declare -a DRIFT_COMPARE_CSVS=()
+declare -a CANDIDATE_COMPARE_LABELS=()
+declare -a DRIFT_COMPARE_LABELS=()
 
 write_manifest
 write_schedule_header
@@ -497,8 +499,14 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
 
       cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")"
       case "$leg" in
-        B1|B2) CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv") ;;
-        A2) DRIFT_COMPARE_CSVS+=("$cell/baseline_compare.csv") ;;
+        B1|B2)
+          CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv")
+          CANDIDATE_COMPARE_LABELS+=("$sync_label/$workload/$leg-vs-A1")
+          ;;
+        A2)
+          DRIFT_COMPARE_CSVS+=("$cell/baseline_compare.csv")
+          DRIFT_COMPARE_LABELS+=("$sync_label/$workload/A2-vs-A1")
+          ;;
       esac
       tear_down
     done
@@ -506,14 +514,14 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
 done
 
 gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/candidate_gate.md")
-for csv in "${CANDIDATE_COMPARE_CSVS[@]}"; do
-  gate_args+=(--compare-csv "$csv")
+for i in "${!CANDIDATE_COMPARE_CSVS[@]}"; do
+  gate_args+=(--labeled-compare-csv "${CANDIDATE_COMPARE_LABELS[$i]}" "${CANDIDATE_COMPARE_CSVS[$i]}")
 done
 [[ "$ALLOW_REGRESSION" == "true" ]] && gate_args+=(--allow-regression --exemption-reason "$EXEMPTION_REASON")
 
 drift_gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
-for csv in "${DRIFT_COMPARE_CSVS[@]}"; do
-  drift_gate_args+=(--compare-csv "$csv")
+for i in "${!DRIFT_COMPARE_CSVS[@]}"; do
+  drift_gate_args+=(--labeled-compare-csv "${DRIFT_COMPARE_LABELS[$i]}" "${DRIFT_COMPARE_CSVS[$i]}")
 done
 
 if [[ "$DRY_RUN" == "true" ]]; then

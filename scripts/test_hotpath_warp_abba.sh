@@ -66,6 +66,10 @@ if rg -q -- 'dataset-setup' "$TRACE_FILE"; then
   exit 1
 fi
 ! rg -q -- 'rustfs-bench' "$TRACE_FILE"
+rg -qF -- '--labeled-compare-csv sync-on/put-4kib/B1-vs-A1' "$TRACE_FILE"
+rg -qF -- '--labeled-compare-csv sync-off/put-4kib/B1-vs-A1' "$TRACE_FILE"
+rg -qF -- '--labeled-compare-csv sync-on/put-4kib/A2-vs-A1' "$TRACE_FILE"
+rg -qF -- '--labeled-compare-csv sync-off/put-4kib/A2-vs-A1' "$TRACE_FILE"
 
 if "$RUNNER" \
   --baseline-bin /usr/bin/true \
