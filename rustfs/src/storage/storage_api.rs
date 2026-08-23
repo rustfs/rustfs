@@ -743,6 +743,14 @@ impl StorageReplicationPoolHandle {
         self.inner.clone().cancel_bucket_resync(opts).await
     }
 
+    pub(crate) async fn cancel_bucket_resync_for_removed_target(
+        &self,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ecstore_bucket::replication::ResyncOpts>> {
+        self.inner.clone().cancel_bucket_resync_for_removed_target(bucket, arn).await
+    }
+
     pub(crate) async fn admit_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<bool> {
         self.inner.clone().admit_bucket_resync(opts).await
     }

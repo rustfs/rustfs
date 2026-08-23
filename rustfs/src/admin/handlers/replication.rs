@@ -22,11 +22,10 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
-use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
 #[cfg(test)]
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
-use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType, ResyncStatusType};
+use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
@@ -884,39 +883,29 @@ impl Operation for RemoveRemoteTargetHandler {
 /// Cancel a pending/started resync intent recorded for `arn` before the target
 /// is removed. Without this the intent outlives its target in `resync.bin`, and
 /// every later startup reconcile finds an accepted intent with no target to
-/// bind it to. Buckets with no resync history are a no-op.
+/// bind it to. The pool reloads and rewrites the status under the bucket
+/// admission lock so other nodes' intents are never clobbered. Buckets with no
+/// resync history are a no-op.
 async fn cancel_active_resync_intent(bucket: &str, arn: &str) -> S3Result<()> {
     let Some(pool) = current_replication_pool_handle() else {
         return Ok(());
     };
-    let status = pool
-        .get_bucket_resync_status(bucket)
+    let canceled = pool
+        .cancel_bucket_resync_for_removed_target(bucket, arn)
         .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to read resync status: {e}")))?;
-    let Some(intent) = status.targets_map.get(arn) else {
-        return Ok(());
-    };
-    if !matches!(intent.resync_status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted) {
-        return Ok(());
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to cancel resync: {e}")))?;
+    if let Some(opts) = canceled {
+        info!(
+            event = "replication_resync_intent_canceled",
+            component = "admin",
+            subsystem = "replication",
+            result = "canceled",
+            bucket,
+            arn,
+            resync_id = %opts.resync_id,
+            "canceled active resync intent for removed remote target"
+        );
     }
-    pool.cancel_bucket_resync(replication::resync_opts(
-        bucket,
-        arn.to_string(),
-        &intent.resync_id,
-        intent.resync_before_date,
-    ))
-    .await
-    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to cancel resync: {e}")))?;
-    info!(
-        event = "replication_resync_intent_canceled",
-        component = "admin",
-        subsystem = "replication",
-        result = "canceled",
-        bucket,
-        arn,
-        resync_id = %intent.resync_id,
-        "canceled active resync intent for removed remote target"
-    );
     Ok(())
 }
 

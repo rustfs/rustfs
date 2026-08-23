@@ -1953,6 +1953,66 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         Ok(true)
     }
 
+    /// Cancel the pending/started resync intent recorded for `arn`, if any,
+    /// because its remote target is being removed. Returns the canceled run.
+    ///
+    /// Runs under the bucket admission lock and reloads `resync.bin` from disk
+    /// before writing, like admission does: this node's `status_map` entry may
+    /// be stale relative to intents admitted by other nodes, and persisting it
+    /// would silently drop their durable restart intents.
+    pub async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        let bucket = bucket.to_string();
+        let arn = arn.to_string();
+        tokio::spawn(async move { self.cancel_bucket_resync_for_removed_target_transaction(bucket, arn).await })
+            .await
+            .map_err(|error| EcstoreError::other(format!("replication resync cancellation task failed: {error}")))?
+    }
+
+    async fn cancel_bucket_resync_for_removed_target_transaction(
+        self: Arc<Self>,
+        bucket: String,
+        arn: String,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        let admission_lock_key = ReplicationMetadataStore::resync_admission_lock_key(&bucket);
+        let admission_lock = self
+            .storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), &admission_lock_key)
+            .await?;
+        // Lock order: bucket resync admission lock -> resync status config-object lock.
+        let _admission_guard = admission_lock
+            .get_write_lock(ReplicationLockTiming::acquire_timeout())
+            .await
+            .map_err(EcstoreError::from)?;
+
+        let bucket_status = load_bucket_resync_metadata(&bucket, self.storage.clone()).await?;
+        let opts = bucket_status
+            .targets_map
+            .get(&arn)
+            .filter(|intent| should_auto_resume_resync(intent.resync_status))
+            .map(|intent| ResyncOpts {
+                bucket: bucket.clone(),
+                arn: arn.clone(),
+                resync_id: intent.resync_id.clone(),
+                resync_before: intent.resync_before_date,
+            });
+        // Publish the freshly loaded map first so `mark_status` mutates and
+        // persists the on-disk view, not this node's cached one.
+        self.resyncer.status_map.write().await.insert(bucket, bucket_status);
+        let Some(opts) = opts else {
+            return Ok(None);
+        };
+
+        self.resyncer.cancel(&opts).await;
+        self.resyncer
+            .mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), self.storage.clone())
+            .await?;
+        Ok(Some(opts))
+    }
+
     pub async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError> {
         let bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
         let Some(target_status) = bucket_status.targets_map.get(&opts.arn) else {
@@ -2710,6 +2770,11 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
+    async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError>;
     async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError>;
     async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError>;
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError>;
@@ -2761,6 +2826,14 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
         self.cancel_bucket_resync(opts).await
+    }
+
+    async fn cancel_bucket_resync_for_removed_target(
+        self: Arc<Self>,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ResyncOpts>, EcstoreError> {
+        ReplicationPool::<S>::cancel_bucket_resync_for_removed_target(self, bucket, arn).await
     }
 
     async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError> {
@@ -3889,6 +3962,70 @@ mod tests {
         assert_eq!(retried_status.start_time, first_status.start_time);
         assert_eq!(retried_status.resync_status, ResyncStatusType::ResyncPending);
         assert_eq!(pool.resyncer.cancel_tokens.read().await.len(), 1);
+    }
+
+    /// Removing a target on node A must cancel only A's intent. Node A's cached
+    /// status map predates node B's admission, so a cancel that persisted the
+    /// cache would erase B's durable restart intent for `arn:second`.
+    #[tokio::test]
+    async fn removed_target_cancel_preserves_intents_admitted_on_other_nodes() {
+        let shared = empty_resync_shared_state();
+        let node_a = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let node_b = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+        let bucket = "removed-target-cancel";
+
+        assert!(
+            node_a
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:first", "run-a"))
+                .await
+                .expect("node A admission should persist")
+        );
+        assert!(
+            node_b
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:second", "run-b"))
+                .await
+                .expect("node B admission should persist")
+        );
+        assert!(
+            !node_a.resyncer.status_map.read().await[bucket]
+                .targets_map
+                .contains_key("arn:second"),
+            "precondition: node A's cache must be stale relative to node B's admission"
+        );
+
+        let canceled = node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel should succeed");
+        assert_eq!(canceled.map(|opts| opts.resync_id), Some("run-a".to_string()));
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(persisted.targets_map["arn:first"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(persisted.targets_map["arn:second"].resync_status, ResyncStatusType::ResyncPending);
+        assert_eq!(persisted.targets_map["arn:second"].resync_id, "run-b");
+        assert_eq!(
+            node_a.resyncer.status_map.read().await[bucket].targets_map["arn:second"].resync_id,
+            "run-b"
+        );
+
+        let untouched = node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel of a terminal intent should be a no-op");
+        assert!(untouched.is_none());
+        assert!(
+            node_a
+                .clone()
+                .cancel_bucket_resync_for_removed_target(bucket, "arn:missing")
+                .await
+                .expect("cancel of an unknown arn should be a no-op")
+                .is_none()
+        );
     }
 
     #[tokio::test]
