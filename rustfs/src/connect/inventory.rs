@@ -204,6 +204,12 @@ impl InventorySnapshot {
         if !valid_version(&self.rustfs_version) {
             return Err(InventoryError::RustfsVersion);
         }
+        if self
+            .os_version
+            .is_some_and(|version| version.major > 9999 || version.minor > 9999)
+        {
+            return Err(InventoryError::OsVersion);
+        }
         if self.node_count == 0 || self.node_count > 4096 {
             return Err(InventoryError::NodeCount);
         }
@@ -212,6 +218,9 @@ impl InventorySnapshot {
         }
         if self.capacity_total_bytes > MAX_SAFE_INTEGER || self.capacity_used_bytes > self.capacity_total_bytes {
             return Err(InventoryError::Capacity);
+        }
+        if self.coarse_flags.len() > 8 || !self.coarse_flags.windows(2).all(|flags| flags[0] < flags[1]) {
+            return Err(InventoryError::CoarseFlags);
         }
         Ok(())
     }
@@ -554,6 +563,8 @@ pub enum InventoryError {
     DriveCount,
     #[error("the RustFS inventory capacity is outside protocol bounds")]
     Capacity,
+    #[error("the RustFS inventory coarse flags are not canonical")]
+    CoarseFlags,
     #[error("the RustFS inventory snapshot is incomplete: observed {observed} of {expected} configured drives")]
     SnapshotIncomplete { expected: usize, observed: usize },
     #[error("the Connect inventory schedule is invalid")]

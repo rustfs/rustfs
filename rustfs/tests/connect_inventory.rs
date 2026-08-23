@@ -693,6 +693,72 @@ async fn connect_inventory_sequence_overflow_fails_before_sampling_or_network_de
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_delivery() {
+    let pki = TestPki::new();
+    let server = server(&pki, Vec::new()).await;
+
+    for invalid_case in ["flags", "os-version"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config(&temp, &pki, &server);
+        let state = temp.path().join("private-config-secret/inventory/state.json");
+        fs::create_dir_all(state.parent().expect("state directory")).expect("create state directory");
+        let mut pending = json!({
+            "protocolVersion": "v1",
+            "requestId": "00000000-0000-4000-8000-000000000001",
+            "sequence": 0,
+            "rustfsVersion": "1.4.2",
+            "osVersion": {"family": "linux", "major": 6, "minor": 8},
+            "nodeCount": 1,
+            "driveCount": 1,
+            "capacityTotalBytes": 1,
+            "capacityUsedBytes": 0,
+            "coarseFlags": ["cluster.degraded", "drive.offline"]
+        });
+        match invalid_case {
+            "flags" => {
+                pending["coarseFlags"] = json!(["drive.offline", "cluster.degraded", "drive.offline"]);
+            }
+            "os-version" => pending["osVersion"]["major"] = json!(10_000),
+            _ => unreachable!(),
+        }
+        fs::write(
+            &state,
+            serde_json::to_vec(&json!({
+                "nextSequence": 0,
+                "pending": pending,
+                "lastAcceptedContentHash": null
+            }))
+            .expect("state JSON"),
+        )
+        .expect("write state");
+        private_mode(&state);
+
+        let samples = Arc::new(AtomicUsize::new(0));
+        let sampled = samples.clone();
+        let shutdown = CancellationToken::new();
+        let runtime = spawn_inventory_runtime(Some(config), schedule(), &shutdown, move || {
+            sampled.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(snapshot()))
+        })
+        .expect("start inventory")
+        .expect("configured inventory");
+        let mut status = runtime.status();
+
+        assert!(matches!(
+            wait_for(&mut status, |status| {
+                matches!(status, InventoryStatus::Failed { .. } | InventoryStatus::BackingOff { .. })
+            })
+            .await,
+            InventoryStatus::Failed { reason } if reason.contains("violates the protocol invariants")
+        ));
+        assert_eq!(samples.load(Ordering::Relaxed), 0);
+        runtime.shutdown().await;
+    }
+
+    assert!(server.seen.lock().expect("seen lock").is_empty());
+}
+
 #[cfg(unix)]
 fn private_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
