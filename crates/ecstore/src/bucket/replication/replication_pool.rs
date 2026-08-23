@@ -3348,11 +3348,17 @@ mod tests {
 
         async fn put_object(
             &self,
-            _bucket: &str,
+            bucket: &str,
             object: &str,
             data: &mut Self::PutObjectReader,
             opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            let _lock_guard = if opts.no_lock {
+                None
+            } else {
+                let lock = self.new_ns_lock(bucket, object).await?;
+                Some(lock.get_write_lock(Duration::from_secs(10)).await?)
+            };
             if opts.http_preconditions.is_some()
                 && let Some(replacement) = self
                     .shared
@@ -4286,6 +4292,77 @@ mod tests {
             pool.resyncer.status_map.read().await["canceled-start"].targets_map["arn:test"].resync_id,
             "run-a"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_resync_status_cas_preserves_both_mutations() {
+        let shared = empty_resync_shared_state();
+        let mut seeded = BucketReplicationResyncStatus::new();
+        for arn in ["arn:a", "arn:b"] {
+            seeded.targets_map.insert(
+                arn.to_string(),
+                TargetReplicationResyncStatus {
+                    bucket: "cas-race".to_string(),
+                    resync_id: format!("run-{arn}"),
+                    resync_status: ResyncStatusType::ResyncPending,
+                    ..Default::default()
+                },
+            );
+        }
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            encode_resync_file(&seeded).expect("seeded resync status should encode");
+        shared.empty_object_exists.store(true, Ordering::SeqCst);
+        shared.etag_revision.store(1, Ordering::SeqCst);
+        shared.block_next_write.store(true, Ordering::SeqCst);
+        let node_a = Arc::new(LoadResyncNodeStore::new("cas-node-a", shared.clone()));
+        let node_b = Arc::new(LoadResyncNodeStore::new("cas-node-b", shared.clone()));
+
+        let writer_a = tokio::spawn(async move {
+            update_resync_status_cas("cas-race", node_a, |status| {
+                status
+                    .targets_map
+                    .get_mut("arn:a")
+                    .expect("seeded target A should exist")
+                    .resync_status = ResyncStatusType::ResyncCanceled;
+                Ok(true)
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), shared.write_started.notified())
+            .await
+            .expect("writer A should pause after its precondition check");
+
+        let mut writer_b = tokio::spawn(async move {
+            update_resync_status_cas("cas-race", node_b, |status| {
+                status
+                    .targets_map
+                    .get_mut("arn:b")
+                    .expect("seeded target B should exist")
+                    .resync_status = ResyncStatusType::ResyncCompleted;
+                Ok(true)
+            })
+            .await
+        });
+        let writer_b_before_release = tokio::time::timeout(Duration::from_millis(250), &mut writer_b).await.ok();
+
+        shared.allow_write.notify_one();
+        writer_a
+            .await
+            .expect("writer A task should finish")
+            .expect("writer A should report a successful conditional save");
+        match writer_b_before_release {
+            Some(result) => result,
+            None => writer_b.await,
+        }
+        .expect("writer B task should finish")
+        .expect("writer B should retry and save its mutation");
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted resync status should decode");
+        assert_eq!(persisted.targets_map["arn:a"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(persisted.targets_map["arn:b"].resync_status, ResyncStatusType::ResyncCompleted);
+        assert!(!shared.last_put_no_lock.load(Ordering::SeqCst));
     }
 
     #[test]

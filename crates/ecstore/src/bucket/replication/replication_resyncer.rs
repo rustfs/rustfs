@@ -1556,13 +1556,8 @@ where
         if !apply(&mut status)? {
             return Ok((status, false));
         }
-        match ReplicationConfigStore::save_conditional_no_lock(
-            api.clone(),
-            &config_file,
-            encode_resync_file(&status)?,
-            preconditions,
-        )
-        .await
+        match ReplicationConfigStore::save_conditional(api.clone(), &config_file, encode_resync_file(&status)?, preconditions)
+            .await
         {
             Ok(()) => return Ok((status, true)),
             Err(Error::PreconditionFailed) => continue,
