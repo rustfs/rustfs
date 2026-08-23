@@ -722,6 +722,10 @@ pub struct DeleteVersionsResponse {
     pub errors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    /// Senders dual-write the legacy strings and typed entries. Receivers prefer typed entries
+    /// when present and fall back to strings for peers that predate this field. Code zero means success.
+    #[prost(message, repeated, tag = "4")]
+    pub item_errors: ::prost::alloc::vec::Vec<Error>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadMultipleRequest {

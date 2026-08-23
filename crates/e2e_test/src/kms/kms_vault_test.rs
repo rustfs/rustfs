@@ -19,8 +19,6 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
-use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 use super::common::{
@@ -46,8 +44,8 @@ impl VaultKmsTestContext {
 
         start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
-        // Allow Vault to finish initialising token auth and transit engine.
-        sleep(Duration::from_secs(2)).await;
+        // Wait for KMS to finish initialising.
+        super::common::wait_for_kms_ready(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
         Ok(Self { env })
     }
@@ -62,7 +60,6 @@ impl VaultKmsTestContext {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_end_to_end") {
@@ -118,7 +115,6 @@ async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_isolation") {
@@ -205,7 +201,6 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_large_file") {
@@ -270,7 +265,6 @@ async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_multipart_upload") {
@@ -301,7 +295,6 @@ async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_operations") {

@@ -1,0 +1,306 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "auth",
+  "fixture": "rotation-proof",
+  "description": "Frozen proof-of-possession transcript for rotating an online device credential. The current certificate key authorizes one new certificate request for one device and one idempotent request.",
+  "operation": {
+    "method": "POST",
+    "path": "/agent/clusterDevices/{device}:rotateCredential",
+    "operationId": "rotateClusterDeviceCredential",
+    "authenticatedSurface": "/agent/*",
+    "currentCredentialRequiredForNewRotation": true,
+    "outgoingOverlapCredentialMayAuthenticateOrdinaryOperations": true,
+    "outgoingOverlapCredentialMayRotate": false,
+    "outgoingOverlapCredentialMayReplayItsCompletedRotation": true
+  },
+  "replayPolicy": {
+    "recordState": "COMPLETED",
+    "bindingFields": [
+      "currentCertificateFingerprint",
+      "clusterDeviceName",
+      "requestId",
+      "certificateRequestSha256"
+    ],
+    "exactMatch": "returnStoredResult",
+    "mismatchReason": "ROTATION_REQUEST_CONFLICT",
+    "retentionLowerBound": "outgoingCredential.validUntil",
+    "sideEffects": "No issuer call, credential write, or overlap extension."
+  },
+  "completedReplayRecord": {
+    "state": "COMPLETED",
+    "currentCertificateFingerprint": "1bc816e2d285c52ee3a0aa06dc7aec17e788626043e795259a67f2436f970d09",
+    "clusterDeviceName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+    "requestId": "7c5d6e2a-8b91-4f03-a4d5-6e7f8091a2b3",
+    "certificateRequestSha256": "kVS-bXYxD6F22cZNy4Vnpgb5gFZbr4EGP5GvIz7uOaw",
+    "resultReference": "credential-rotation-result-01"
+  },
+  "transcript": {
+    "domain": "RUSTFS-CONNECT-CREDENTIAL-ROTATION-V1",
+    "domainTerminator": "0x0a",
+    "fieldSeparator": "0x3a",
+    "fieldTerminator": "0x0a",
+    "fieldCount": 4,
+    "encoding": "US-ASCII",
+    "normalisationPermitted": false,
+    "fieldOrder": [
+      "currentCertificateFingerprint",
+      "clusterDeviceName",
+      "requestId",
+      "certificateRequestSha256"
+    ],
+    "fields": [
+      {
+        "name": "currentCertificateFingerprint",
+        "position": 1,
+        "source": "the exact certificate accepted by trusted ingress and resolved by Connect",
+        "pattern": "^[0-9a-f]{64}$",
+        "binds": "the one currently active credential authorizing the rotation",
+        "absenceWouldAllow": "A proof captured from one current certificate to authorize another credential after the device rotated."
+      },
+      {
+        "name": "clusterDeviceName",
+        "position": 2,
+        "source": "the authenticated identity after it is matched to the target resource",
+        "pattern": "^organizations/[0-9a-f-]{36}/clusters/[0-9a-f-]{36}/clusterDevices/[0-9a-f-]{36}$",
+        "binds": "the organization, cluster, and device being rotated",
+        "absenceWouldAllow": "A proof produced by one device to be presented against another device resource."
+      },
+      {
+        "name": "requestId",
+        "position": 3,
+        "source": "the request body",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "binds": "the single idempotent rotation attempt",
+        "absenceWouldAllow": "A captured proof to be replayed as a fresh attempt instead of the same idempotent request."
+      },
+      {
+        "name": "certificateRequestSha256",
+        "position": 4,
+        "source": "recomputed over the exact PKCS#10 DER octets in certificateRequest",
+        "pattern": "^[A-Za-z0-9_-]{43}$",
+        "binds": "the next device public key and certificate request",
+        "absenceWouldAllow": "A valid proof to be combined with an attacker certificate request."
+      }
+    ]
+  },
+  "signature": {
+    "algorithmField": "proof.algorithm",
+    "algorithmEnumeration": ["ES256"],
+    "curve": "P-256",
+    "signatureEncoding": "fixed-width-r-s",
+    "signatureLengthBytes": 64,
+    "signatureTransferEncoding": "base64url-unpadded",
+    "signatureValuePattern": "^[A-Za-z0-9_-]{86}$",
+    "lowSRequired": true,
+    "verifyingKeySource": "the SubjectPublicKeyInfo of the exact presented certificate accepted by trusted ingress",
+    "newKeyPossession": "the PKCS#10 self-signature is verified separately under the public key inside certificateRequest",
+    "sharedEncodingContract": "protocol/agent/v1/registration-proof.md#the-signature"
+  },
+  "verificationOrder": [
+    {
+      "stage": "protocolVersion",
+      "rule": "protocolVersion must be the supported major version.",
+      "reason": "UNSUPPORTED_PROTOCOL"
+    },
+    {
+      "stage": "encoding",
+      "rule": "proof.algorithm and proof.value obey the shared ES256 fixed-width low-S contract.",
+      "reasons": ["UNSUPPORTED_ALGORITHM", "SIGNATURE_MALFORMED", "SIGNATURE_NOT_CANONICAL"]
+    },
+    {
+      "stage": "certificateRequest",
+      "rule": "certificateRequest is one self-signed PKCS#10 request whose public key is P-256.",
+      "reasons": ["CERTIFICATE_REQUEST_MALFORMED", "DEVICE_KEY_UNSUPPORTED"]
+    },
+    {
+      "stage": "proof",
+      "rule": "Connect rebuilds the transcript and verifies proof.value under the presented certificate public key.",
+      "reason": "ROTATION_PROOF_INVALID"
+    },
+    {
+      "stage": "replay",
+      "rule": "A completed record bound to the presented credential, device, requestId, and CSR digest returns its stored result without issuing again. A requestId bound to different transcript inputs is refused.",
+      "reason": "ROTATION_REQUEST_CONFLICT"
+    },
+    {
+      "stage": "credential",
+      "rule": "After replay lookup misses, the authenticated certificate must be the device current ACTIVE credential, not a credential in the outgoing overlap.",
+      "reason": "ROTATION_CREDENTIAL_NOT_CURRENT"
+    }
+  ],
+  "reasonSources": {
+    "auth": ["UNSUPPORTED_PROTOCOL", "ROTATION_CREDENTIAL_NOT_CURRENT", "ROTATION_REQUEST_CONFLICT", "ROTATION_PROOF_INVALID"],
+    "sharedFromRegistration": [
+      "UNSUPPORTED_ALGORITHM",
+      "SIGNATURE_MALFORMED",
+      "SIGNATURE_NOT_CANONICAL",
+      "CERTIFICATE_REQUEST_MALFORMED",
+      "DEVICE_KEY_UNSUPPORTED"
+    ]
+  },
+  "example": {
+    "inputs": {
+      "currentCertificateFingerprint": "1bc816e2d285c52ee3a0aa06dc7aec17e788626043e795259a67f2436f970d09",
+      "clusterDeviceName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92",
+      "requestId": "7c5d6e2a-8b91-4f03-a4d5-6e7f8091a2b3",
+      "certificateRequestSha256": "kVS-bXYxD6F22cZNy4Vnpgb5gFZbr4EGP5GvIz7uOaw"
+    },
+    "artifacts": {
+      "currentPublicKeySpki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENEpjuFZTqp0Hxh/OWV3TGkluNjCo15dk+4CozuR6aT9Vaxhkb2M9nhaVGfk8+aSiSIiKFSCsYonKl8jh743Qow==",
+      "currentPublicKeyFingerprint": "28608e223c75ed89e72041f12afae4fc1cd3f1d3bcca38cbb62d1a41687610c2",
+      "certificateRequest": "MIIBHjCBxAIBADBiMRswGQYDVQQDDBJpZ25vcmVkLWJ5LWNvbm5lY3QxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQWPosvIKr5V3CpTUdLfMQxDx31B3SglLKyqRg/oH3J+PhUnqf7pDWW1sTkP2aRIDjAwRn0DpLrz405CcvGHvYEoAAwCgYIKoZIzj0EAwIDSQAwRgIhAMJzXo/CK4E9BfjOxP35he9LLlqENhK7HTzZQTuIgLX2AiEAwOZHibk5HEijTWcJ/UT117nssfJesWZVOWwz/KTIpi8=",
+      "otherCertificateRequest": "MIIBHTCBxAIBADBiMRswGQYDVQQDDBJpZ25vcmVkLWJ5LWNvbm5lY3QxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATi0KiZGcbPJixDiQN/aIVky7xqaYhjmwAn1aozrC2eanaDENYQ3D5zw5qoZNIp8YUk/CETZrba3C5KYR5ocdlLoAAwCgYIKoZIzj0EAwIDSAAwRQIhAL0ZtvWyTSu18RF5J4ZVIuOGjJpJwSdP+87CVxNKJJduAiAahIruc3FLtO3RI7B8Ome8IsVDUpSAQilThjdOeDMsYg=="
+    },
+    "canonicalTranscript": "RUSTFS-CONNECT-CREDENTIAL-ROTATION-V1\n64:1bc816e2d285c52ee3a0aa06dc7aec17e788626043e795259a67f2436f970d09\n148:organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92\n36:7c5d6e2a-8b91-4f03-a4d5-6e7f8091a2b3\n43:kVS-bXYxD6F22cZNy4Vnpgb5gFZbr4EGP5GvIz7uOaw\n",
+    "canonicalTranscriptLengthBytes": 346,
+    "canonicalTranscriptSha256": "e5f0e9cd0d5d420bc7e51217512de76e1cf4dceb1d67804b6518c4fb5d9fe434"
+  },
+  "acceptVectors": [
+    {
+      "name": "current credential authorizes one new certificate request",
+      "requestId": "7c5d6e2a-8b91-4f03-a4d5-6e7f8091a2b3",
+      "proof": "vgz7Hm-xZ5JQ7B3oqUEKXB4tQxEzWZ988iPxAklaIZIsd4nSTUv5YriqES5yKGHvKOgWPyWjvrgI0j0T-fYEsQ",
+      "expected": {"accepted": true, "reason": null, "stage": "credential", "replayed": false}
+    },
+    {
+      "name": "the same certificate request under a new requestId needs its own proof",
+      "requestId": "82e1f3a4-9b05-4c67-8d90-1e2f3a4b5c6d",
+      "proof": "s-rkF9w41sqgdQNkOlhjcLYlrNHN_HL5xh4C3k_1a9ZQu7Uq0LoET_x7i4Rw3xQ75ec6B6tfqZ3XsHTS0FfN7Q",
+      "expected": {"accepted": true, "reason": null, "stage": "credential", "replayed": false}
+    },
+    {
+      "name": "outgoing credential replays its completed byte-equivalent rotation",
+      "requestId": "7c5d6e2a-8b91-4f03-a4d5-6e7f8091a2b3",
+      "proof": "vgz7Hm-xZ5JQ7B3oqUEKXB4tQxEzWZ988iPxAklaIZIsd4nSTUv5YriqES5yKGHvKOgWPyWjvrgI0j0T-fYEsQ",
+      "replayRecord": "completedExample",
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": true, "reason": null, "stage": "replay", "replayedResultReference": "credential-rotation-result-01"}
+    }
+  ],
+  "rejectVectors": [
+    {
+      "name": "outgoing overlap credential attempts another rotation",
+      "stage": "credential",
+      "requestId": "82e1f3a4-9b05-4c67-8d90-1e2f3a4b5c6d",
+      "proof": "s-rkF9w41sqgdQNkOlhjcLYlrNHN_HL5xh4C3k_1a9ZQu7Uq0LoET_x7i4Rw3xQ75ec6B6tfqZ3XsHTS0FfN7Q",
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": false, "reason": "ROTATION_CREDENTIAL_NOT_CURRENT"}
+    },
+    {
+      "name": "rotation declares protocol v2",
+      "stage": "protocolVersion",
+      "mutation": {"protocolVersion": "v2"},
+      "expected": {"accepted": false, "reason": "UNSUPPORTED_PROTOCOL"}
+    },
+    {
+      "name": "proof declares ES384",
+      "stage": "encoding",
+      "mutation": {"proofAlgorithm": "ES384"},
+      "expected": {"accepted": false, "reason": "UNSUPPORTED_ALGORITHM"}
+    },
+    {
+      "name": "DER encoded proof",
+      "stage": "encoding",
+      "mutation": {"proofValue": "MEUCIQC-DPseb7FnklDsHeipQQpcHi1DETNZn3zyI_ECSVohkgIgLHeJ0k1L-WK4qhEucihh7yjoFj8lo764CNI9E_n2BLE"},
+      "expected": {"accepted": false, "reason": "SIGNATURE_MALFORMED"}
+    },
+    {
+      "name": "padded base64url proof",
+      "stage": "encoding",
+      "mutation": {"proofValue": "vgz7Hm-xZ5JQ7B3oqUEKXB4tQxEzWZ988iPxAklaIZIsd4nSTUv5YriqES5yKGHvKOgWPyWjvrgI0j0T-fYEsQ=="},
+      "expected": {"accepted": false, "reason": "SIGNATURE_MALFORMED"}
+    },
+    {
+      "name": "protocol negotiation precedes proof encoding and stale credential state",
+      "stage": "protocolVersion",
+      "mutation": {"currentCredential": false, "protocolVersion": "v2", "proofValue": "not-a-signature"},
+      "expected": {"accepted": false, "reason": "UNSUPPORTED_PROTOCOL"}
+    },
+    {
+      "name": "declared algorithm precedes signature bytes",
+      "stage": "encoding",
+      "mutation": {"proofAlgorithm": "ES384", "proofValue": "not-a-signature"},
+      "expected": {"accepted": false, "reason": "UNSUPPORTED_ALGORITHM"}
+    },
+    {
+      "name": "malleated high-S proof",
+      "stage": "encoding",
+      "mutation": {"proofValue": "vgz7Hm-xZ5JQ7B3oqUEKXB4tQxEzWZ988iPxAklaIZLTiHYssrQGnkdV7tGN154Qk_7kboFz38zq542vAm0goA"},
+      "expected": {"accepted": false, "reason": "SIGNATURE_NOT_CANONICAL"}
+    },
+    {
+      "name": "proof over the rotation fields uses the registration domain",
+      "stage": "proof",
+      "mutation": {"proofValue": "as27GKXEKXtym-BU8NUl0BYhJkEUooZWPadrxwOWa40pAaN6p4VxKCCFggZl4ZQsl5CUtaMoMaxM_HzT1c1qUA"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "proof verification precedes stale credential state",
+      "stage": "proof",
+      "mutation": {"currentCredential": false, "proofValue": "as27GKXEKXtym-BU8NUl0BYhJkEUooZWPadrxwOWa40pAaN6p4VxKCCFggZl4ZQsl5CUtaMoMaxM_HzT1c1qUA"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "new certificate request key signs instead of the current credential key",
+      "stage": "proof",
+      "mutation": {"proofValue": "QEN8wMQQk5HjriDw2aeAxIfsRvrWgIjGR3KlpK81Y34kaTAacO-6_bOMAjQ0hMMIk-YYN6MDCw0Via_Ri0X0BA"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "proof is moved to another current certificate",
+      "stage": "proof",
+      "mutation": {"currentCertificateFingerprint": "2bc816e2d285c52ee3a0aa06dc7aec17e788626043e795259a67f2436f970d09"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "proof is moved to another device",
+      "stage": "proof",
+      "mutation": {"clusterDeviceName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e93"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "proof is replayed under another requestId",
+      "stage": "proof",
+      "mutation": {"requestId": "82e1f3a4-9b05-4c67-8d90-1e2f3a4b5c6d"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "proof is combined with another certificate request",
+      "stage": "proof",
+      "mutation": {"certificateRequest": "otherCertificateRequest"},
+      "expected": {"accepted": false, "reason": "ROTATION_PROOF_INVALID"}
+    },
+    {
+      "name": "completed replay belongs to another certificate fingerprint",
+      "stage": "replay",
+      "replayRecord": "completedExample",
+      "replayRecordMutation": {"currentCertificateFingerprint": "2bc816e2d285c52ee3a0aa06dc7aec17e788626043e795259a67f2436f970d09"},
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": false, "reason": "ROTATION_REQUEST_CONFLICT"}
+    },
+    {
+      "name": "completed replay belongs to another device",
+      "stage": "replay",
+      "replayRecord": "completedExample",
+      "replayRecordMutation": {"clusterDeviceName": "organizations/0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70/clusters/0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81/clusterDevices/0198f4b0-3c00-7e30-8f41-4a5b6c7d8e93"},
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": false, "reason": "ROTATION_REQUEST_CONFLICT"}
+    },
+    {
+      "name": "completed replay belongs to another requestId",
+      "stage": "replay",
+      "replayRecord": "completedExample",
+      "replayRecordMutation": {"requestId": "82e1f3a4-9b05-4c67-8d90-1e2f3a4b5c6d"},
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": false, "reason": "ROTATION_REQUEST_CONFLICT"}
+    },
+    {
+      "name": "completed replay belongs to another CSR digest",
+      "stage": "replay",
+      "replayRecord": "completedExample",
+      "replayRecordMutation": {"certificateRequestSha256": "PXxfNGWtIbrqVocag6lOLDDR41AjpHXJ7UcAWkbTSAs"},
+      "mutation": {"currentCredential": false},
+      "expected": {"accepted": false, "reason": "ROTATION_REQUEST_CONFLICT"}
+    }
+  ]
+}

@@ -61,7 +61,7 @@ async fn test_metadata_replace_self_copy_of_sse_object_stays_decryptable() {
         )
         .await
         .expect("failed to start RustFS with local KMS");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     let client = kms_env.base_env.create_s3_client();
     // Deliberately an UNVERSIONED bucket: that is the branch where the store layer can service
@@ -160,7 +160,7 @@ async fn test_metadata_replace_self_copy_dropping_sse_rewrites_plaintext() {
         )
         .await
         .expect("failed to start RustFS with local KMS");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     let client = kms_env.base_env.create_s3_client();
     // Unversioned, and deliberately WITHOUT a bucket default-encryption rule, so the copy below
@@ -256,7 +256,7 @@ async fn test_metadata_replace_self_copy_under_bucket_default_sse_stays_decrypta
         )
         .await
         .expect("failed to start RustFS with local KMS");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await.expect("KMS ready");
 
     let client = kms_env.base_env.create_s3_client();
     let bucket = "copy-object-self-copy-bucket-default-sse-test";

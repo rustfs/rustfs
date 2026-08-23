@@ -21,12 +21,26 @@
 //! canonical transcript frozen by
 //! `protocol/agent/v1/registration-proof.md`.
 //!
-//! Nothing here contacts the network or starts a task. A deployment that has
-//! not been enrolled into a Connect control plane never calls into it, so an
-//! unconfigured server generates no key and holds no identity.
+//! Enrolled deployments may start the optional outbound heartbeat runtime.
+//! An unconfigured server starts no Connect task, generates no key, and holds
+//! no Connect identity.
 
+pub mod client;
+pub mod config;
+pub mod credential_store;
+pub mod heartbeat;
 pub mod identity;
 pub mod identity_store;
+pub mod offline;
+pub mod registration;
+pub mod runtime;
 
+pub use client::{ClientError, ConnectClient, ConnectConfig};
+pub use config::{HeartbeatConfig, HeartbeatConfigError, HeartbeatSchedule};
+pub use credential_store::{CredentialStore, DeviceCredential};
+pub use heartbeat::{CoarseNodeSummary, HeartbeatError, HeartbeatStatus};
 pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, RegistrationTranscript};
 pub use identity_store::{IdentityStore, StoreError};
+pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
+pub use registration::{RegistrationToken, TokenError};
+pub use runtime::{HeartbeatRuntime, spawn_heartbeat_runtime};

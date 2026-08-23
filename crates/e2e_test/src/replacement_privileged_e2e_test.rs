@@ -29,7 +29,6 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
     use http::Method;
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::error::Error;
@@ -1061,7 +1060,6 @@ mod tests {
     /// Linux mount namespaces are per-thread; keep mount setup and process
     /// spawning on one OS thread so child RustFS nodes inherit the test mounts.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_REPLACEMENT_E2E=1"]
     async fn test_privileged_3x4_auto_replacement_rebuilds_ec8_plus_4_without_admin_heal()
     -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1075,7 +1073,6 @@ mod tests {
     /// Linux mount namespaces are per-thread; keep mount setup and process
     /// spawning on one OS thread so child RustFS nodes inherit the test mounts.
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     #[ignore = "requires Linux root/CAP_SYS_ADMIN and RUSTFS_PRIVILEGED_REPLACEMENT_E2E=1"]
     async fn test_privileged_3x4_auto_replacement_rebuilds_ec6_plus_6_without_admin_heal()
     -> Result<(), Box<dyn Error + Send + Sync>> {

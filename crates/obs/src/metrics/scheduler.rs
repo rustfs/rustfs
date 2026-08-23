@@ -2811,14 +2811,14 @@ mod tests {
     #[test]
     fn replication_proxy_bucket_keys_detect_removed_buckets() {
         let previous = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
-            stats: crate::metrics::BucketReplicationStats {
+            stats: crate::metrics::BucketReplicationMetricsSnapshot {
                 bucket: "photos".to_string(),
                 ..Default::default()
             },
             ..Default::default()
         }]);
         let current = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
-            stats: crate::metrics::BucketReplicationStats {
+            stats: crate::metrics::BucketReplicationMetricsSnapshot {
                 bucket: "logs".to_string(),
                 ..Default::default()
             },

@@ -1858,9 +1858,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.3"
+version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "509591b7bcd67f4ef775afad7662703b4935daaa6ec0e5605cfb1090b32a2b6d"
+checksum = "0ad534f4357a5264cce5019c989cf66a4f0dc4e0d1b1d15f8aacec0ff7360273"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -2521,12 +2521,6 @@ dependencies = [
  "cmov",
  "subtle",
 ]
-
-[[package]]
-name = "cty"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
 name = "curve25519-dalek"
@@ -3843,7 +3837,6 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
- "serial_test",
  "sha2 0.11.0",
  "suppaftp",
  "time",
@@ -5990,15 +5983,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libmimalloc-sys"
-version = "0.1.49"
-source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11#6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11"
-dependencies = [
- "cc",
- "cty",
-]
-
-[[package]]
 name = "libredox"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6396,14 +6380,6 @@ dependencies = [
  "str_inflector",
  "syn 2.0.119",
  "synstructure 0.13.2",
-]
-
-[[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "git+https://github.com/xonatius/mimalloc_rust.git?rev=6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11#6d4c41bb10c6d9da1d1b6f07b38c4cc051667f11"
-dependencies = [
- "libmimalloc-sys",
 ]
 
 [[package]]
@@ -9163,13 +9139,11 @@ dependencies = [
  "insta",
  "jiff",
  "libc",
- "libmimalloc-sys",
  "libsystemd",
  "matchit 0.9.2",
  "md-5 0.11.0",
  "metrics",
  "metrics-util",
- "mimalloc",
  "mime_guess",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -9205,6 +9179,8 @@ dependencies = [
  "rustfs-lock",
  "rustfs-log-analyzer",
  "rustfs-madmin",
+ "rustfs-mimalloc",
+ "rustfs-mimalloc-sys",
  "rustfs-notify",
  "rustfs-object-capacity",
  "rustfs-object-data-cache",
@@ -9257,6 +9233,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "x509-parser",
  "zeroize",
  "zip",
  "zstd",
@@ -9876,6 +9853,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-mimalloc"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a406f4aa07084301d485beec873af6dccc8e3f8762da244743df92038b1db1a6"
+dependencies = [
+ "rustfs-mimalloc-sys",
+]
+
+[[package]]
+name = "rustfs-mimalloc-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3051b819175f58445d4c369a72f0ab88149f3885ba8bea2aff3be01f53fe7cd"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "rustfs-notify"
 version = "1.0.0-rc.3"
 dependencies = [
@@ -9920,7 +9915,6 @@ dependencies = [
  "rustfs-config",
  "rustfs-io-metrics",
  "rustfs-utils",
- "serial_test",
  "temp-env",
  "tempfile",
  "tokio",
@@ -10293,7 +10287,6 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
- "serial_test",
  "sha2 0.11.0",
  "temp-env",
  "tempfile",
@@ -12690,6 +12683,7 @@ dependencies = [
  "js-sys",
  "rand 0.10.2",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

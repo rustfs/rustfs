@@ -43,9 +43,6 @@ allow-git = [
     # RustFS fork carrying presigned expiry and constant-time authentication fixes.
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/rustfs/s3s.git",
-    # MiMalloc fork pinned for hotpath allocation counting support.
-    # owner: houseme  review: 2026-10
-    "https://github.com/xonatius/mimalloc_rust.git",
 ]
 
 [bans]

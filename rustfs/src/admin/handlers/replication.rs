@@ -73,6 +73,8 @@ enum TargetUpdateOp {
     /// Connection group: credentials plus endpoint, target bucket, and TLS settings.
     Credentials,
     Sync,
+    /// Per-target read-proxy opt-out (`disableProxy`).
+    Proxy,
     Bandwidth,
     Path,
 }
@@ -81,12 +83,13 @@ fn parse_remote_target_update_ops(queries: &HashMap<String, String>) -> S3Result
     const SUPPORTED_OPS: &[(&str, TargetUpdateOp)] = &[
         ("creds", TargetUpdateOp::Credentials),
         ("sync", TargetUpdateOp::Sync),
+        ("proxy", TargetUpdateOp::Proxy),
         ("bandwidth", TargetUpdateOp::Bandwidth),
         ("path", TargetUpdateOp::Path),
     ];
     // Present in the MinIO wire contract, but they drive target fields this
     // version rejects as unsupported — fail loudly instead of silently ignoring.
-    const UNSUPPORTED_OPS: &[&str] = &["proxy", "healthcheck", "edge", "edgeSyncBeforeExpiry"];
+    const UNSUPPORTED_OPS: &[&str] = &["healthcheck", "edge", "edgeSyncBeforeExpiry"];
 
     for key in UNSUPPORTED_OPS {
         if queries.get(*key).is_some_and(|value| value == "true") {
@@ -312,11 +315,10 @@ impl RemoteTargetRequest {
             ));
         }
 
-        for (unsupported, configured) in
-            REMOTE_TARGET_UNSUPPORTED_FIELDS
-                .iter()
-                .copied()
-                .zip([self.disable_proxy, self.edge, self.edge_sync_before_expiry])
+        for (unsupported, configured) in REMOTE_TARGET_UNSUPPORTED_FIELDS
+            .iter()
+            .copied()
+            .zip([self.edge, self.edge_sync_before_expiry])
         {
             if configured {
                 return Err(s3_error!(
@@ -716,6 +718,7 @@ impl Operation for SetRemoteTargetHandler {
                         target.deployment_id = remote_target.deployment_id.clone();
                     }
                     TargetUpdateOp::Sync => target.replication_sync = remote_target.replication_sync,
+                    TargetUpdateOp::Proxy => target.disable_proxy = remote_target.disable_proxy,
                     TargetUpdateOp::Bandwidth => target.bandwidth_limit = remote_target.bandwidth_limit,
                     TargetUpdateOp::Path => target.path = remote_target.path.clone(),
                 }
@@ -1534,6 +1537,7 @@ mod tests {
             ("update", "true"),
             ("creds", "true"),
             ("sync", "true"),
+            ("proxy", "true"),
             ("bandwidth", "true"),
             ("path", "true"),
         ]))
@@ -1543,6 +1547,7 @@ mod tests {
             vec![
                 TargetUpdateOp::Credentials,
                 TargetUpdateOp::Sync,
+                TargetUpdateOp::Proxy,
                 TargetUpdateOp::Bandwidth,
                 TargetUpdateOp::Path
             ]
@@ -2084,7 +2089,6 @@ mod tests {
             ("credentials.session_token", serde_json::json!("session-token")),
             ("credentials.expiration", serde_json::json!("2026-01-01T00:00:00Z")),
             ("api", serde_json::json!("s3v2")),
-            ("disableProxy", serde_json::json!(true)),
             ("edge", serde_json::json!(true)),
             ("edgeSyncBeforeExpiry", serde_json::json!(true)),
         ] {
@@ -2435,6 +2439,44 @@ mod tests {
     fn remote_target_health_check_duration_is_declared_writable() {
         assert!(REMOTE_TARGET_WRITABLE_FIELDS.contains(&"healthCheckDuration"));
         assert!(!REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(&"healthCheckDuration"));
+    }
+
+    #[test]
+    fn remote_target_disable_proxy_is_declared_writable_edge_stays_unsupported() {
+        assert!(REMOTE_TARGET_WRITABLE_FIELDS.contains(&"disableProxy"));
+        assert!(!REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(&"disableProxy"));
+        // edge sync has no implementation behind it — it must stay rejected.
+        assert!(REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(&"edge"));
+        assert!(REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(&"edgeSyncBeforeExpiry"));
+    }
+
+    #[test]
+    fn remote_target_create_accepts_disable_proxy() {
+        let mut request = valid_remote_target_request();
+        request["disableProxy"] = serde_json::json!(true);
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect("disableProxy is a supported per-target read-proxy opt-out");
+
+        assert!(target.disable_proxy);
+    }
+
+    #[test]
+    fn update_body_with_proxy_op_toggles_disable_proxy_without_credentials() {
+        // Mirrors the other partial-update groups: a proxy-only update body may
+        // omit the connection fields entirely.
+        let body = serde_json::json!({
+            "arn": "arn:rustfs:replication:us-east-1:dep:target",
+            "type": "replication",
+            "disableProxy": true
+        });
+        let request: RemoteTargetRequest = serde_json::from_value(body).expect("partial update body should deserialize");
+        let target = request
+            .into_update_bucket_target(&[TargetUpdateOp::Proxy])
+            .expect("proxy-only update must not require credentials");
+        assert!(target.disable_proxy);
     }
 
     #[test]
