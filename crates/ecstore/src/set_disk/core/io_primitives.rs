@@ -3472,7 +3472,7 @@ type RenameDataLegacyTuple = (
 );
 
 fn put_rename_early_ack_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, false)
+    rustfs_utils::get_env_bool(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, true)
 }
 
 impl RenameDataCommit {
@@ -8631,17 +8631,21 @@ mod tests {
         inline_fi.mod_time = Some(OffsetDateTime::now_utc());
         std::fs::create_dir_all(disk_root.join(RUSTFS_META_TMP_BUCKET).join("tmp-inline"))
             .expect("inline staging dir should be created");
-        SetDisks::rename_data(
+        // Use rename_data_owned so we can await the tail_drain for cleanup.
+        let commit = SetDisks::rename_data_owned(
             std::slice::from_ref(&online_disk),
             RUSTFS_META_TMP_BUCKET,
             "tmp-inline",
-            std::slice::from_ref(&inline_fi),
+            vec![inline_fi],
             bucket,
             object,
             1,
         )
         .await
         .expect("inline version should commit");
+        if let Some(td) = commit.tail_drain {
+            td.await.expect("inline commit tail drain must succeed");
+        }
 
         // Overwrite the same (nil) version with a non-inline one.
         let new_data_dir = Uuid::new_v4();
@@ -8654,17 +8658,20 @@ mod tests {
             .join(new_data_dir.to_string());
         std::fs::create_dir_all(&staged_data_dir).expect("streaming staging dir should be created");
         std::fs::write(staged_data_dir.join("part.1"), b"streamed-body").expect("staged part should be written");
-        SetDisks::rename_data(
+        let commit = SetDisks::rename_data_owned(
             std::slice::from_ref(&online_disk),
             RUSTFS_META_TMP_BUCKET,
             "tmp-streaming",
-            std::slice::from_ref(&streaming_fi),
+            vec![streaming_fi],
             bucket,
             object,
             1,
         )
         .await
         .expect("non-inline overwrite should commit");
+        if let Some(td) = commit.tail_drain {
+            td.await.expect("non-inline overwrite tail drain must succeed");
+        }
 
         let mut leftovers: Vec<String> = std::fs::read_dir(disk_root.join(bucket).join(object))
             .expect("committed object dir should be readable")
@@ -8825,49 +8832,54 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(rename_quorum_ack)]
     async fn rename_data_waits_for_tail_disk_after_write_quorum() {
-        const DISKS: usize = 4;
-        let bucket = "rename-tail-success-bucket";
-        let object = "rename-tail-success-object";
-        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
-        prepare_rename_source_dirs(&dirs, &disks, "source").await;
-        let file_infos = rename_commit_fileinfos(object, DISKS, "tail-success-etag");
-        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+        // Explicitly test the serial (join_all) path: early ack is now the
+        // default, so disable it to verify the legacy behaviour still works.
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+            const DISKS: usize = 4;
+            let bucket = "rename-tail-success-bucket";
+            let object = "rename-tail-success-object";
+            let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+            prepare_rename_source_dirs(&dirs, &disks, "source").await;
+            let file_infos = rename_commit_fileinfos(object, DISKS, "tail-success-etag");
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
 
-        let rename = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 3);
-        tokio::pin!(rename);
-        tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
-            tokio::select! {
-                () = barrier.wait_until_paused() => {}
-                result = &mut rename => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
-            }
-        })
-        .await
-        .expect("paused disk must reach the armed rename barrier");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut rename).await.is_err(),
-            "current rename_data waits for the paused fan-out disk even after the other three disks can reach write quorum"
-        );
-
-        barrier.release();
-        rename
+            let rename = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, "source", &file_infos, bucket, object, 3);
+            tokio::pin!(rename);
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, async {
+                tokio::select! {
+                    () = barrier.wait_until_paused() => {}
+                    result = &mut rename => panic!("rename_data returned before the armed fan-out barrier: {result:?}"),
+                }
+            })
             .await
-            .expect("tail success must complete the rename after the barrier is released");
+            .expect("paused disk must reach the armed rename barrier");
 
-        for (idx, dir) in dirs.iter().enumerate() {
-            let reopened = reopen_local_disk(dir).await;
-            let stored = reopened
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .unwrap_or_else(|err| panic!("disk {idx} must contain the tail-success commit after reopen: {err:?}"));
-            assert_eq!(
-                stored.metadata.get("etag").map(String::as_str),
-                Some("tail-success-etag"),
-                "disk {idx} must expose the same committed metadata after tail success and reopen"
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut rename).await.is_err(),
+                "serial rename_data waits for the paused fan-out disk even after write quorum"
             );
-        }
 
-        drop(dirs);
+            barrier.release();
+            rename
+                .await
+                .expect("tail success must complete the rename after the barrier is released");
+
+            for (idx, dir) in dirs.iter().enumerate() {
+                let reopened = reopen_local_disk(dir).await;
+                let stored = reopened
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {idx} must contain the tail-success commit after reopen: {err:?}"));
+                assert_eq!(
+                    stored.metadata.get("etag").map(String::as_str),
+                    Some("tail-success-etag"),
+                    "disk {idx} must expose the same committed metadata after tail success and reopen"
+                );
+            }
+
+            drop(dirs);
+        })
+        .await;
     }
 
     #[tokio::test]
