@@ -564,6 +564,7 @@ fn spawn_decommission_index_cancelers(
                     error = %err,
                     "Decommission routine failed"
                 );
+                store.quiesce_decommission_worker_after_join_error(&canceler).await;
                 store.retry_decommission_failed_for_operation(idx, &canceler).await;
                 stop_queue = true;
                 continue;
@@ -3302,6 +3303,11 @@ impl ECStore {
         let _operation_guard = operation_gate.write().await;
     }
 
+    async fn quiesce_decommission_worker_after_join_error(&self, canceler: &DecommissionCanceler) {
+        canceler.cancel();
+        self.wait_for_decommission_side_effects().await;
+    }
+
     async fn reserve_decommission_routines(
         &self,
         rx: &CancellationToken,
@@ -3338,6 +3344,19 @@ impl ECStore {
         Ok(index_cancelers)
     }
 
+    async fn reserve_missing_local_decommission_routines(
+        &self,
+        rx: &CancellationToken,
+        endpoints: &EndpointServerPools,
+    ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
+        let indices = {
+            let pool_meta = self.pool_meta.read().await;
+            resumable_decommission_queue_indices(&pool_meta)
+        };
+        let indices = local_decommission_queue_prefix(endpoints, &indices)?;
+        self.reserve_decommission_routines(rx, indices.as_slice()).await
+    }
+
     pub(crate) async fn spawn_decommission_routines(
         &self,
         store: Arc<ECStore>,
@@ -3358,17 +3377,9 @@ impl ECStore {
     }
 
     pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
-        let indices = {
-            let pool_meta = self.pool_meta.read().await;
-            resumable_decommission_queue_indices(&pool_meta)
-        };
-        let indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
-        if indices.is_empty() {
-            return Ok(());
-        }
-
         let rx = CancellationToken::new();
-        let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
+        let endpoints = self.endpoints();
+        let index_cancelers = self.reserve_missing_local_decommission_routines(&rx, &endpoints).await?;
         if index_cancelers.is_empty() {
             return Ok(());
         }
@@ -6957,6 +6968,33 @@ mod pools_tests {
             .expect("transition task should not panic");
     }
 
+    #[tokio::test]
+    async fn test_join_error_quiesces_side_effects_before_failure_transition() {
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let store = decommission_worker_test_store(PoolMeta::default(), vec![Some(canceler.clone())]);
+        let operation_gate = store.ctx.decommission_operation_gate();
+        let operation_guard = operation_gate.read().await;
+        let transition = tokio::spawn({
+            let store = store.clone();
+            let canceler = canceler.clone();
+            async move { store.quiesce_decommission_worker_after_join_error(&canceler).await }
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), canceler.token().cancelled())
+            .await
+            .expect("join error handling should cancel the detached worker");
+        assert!(
+            !transition.is_finished(),
+            "failure transition must wait for the detached worker's in-flight side effect"
+        );
+
+        drop(operation_guard);
+        tokio::time::timeout(StdDuration::from_secs(1), transition)
+            .await
+            .expect("failure transition should finish after the side effect")
+            .expect("failure transition task should not panic");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_run_decommission_listing_with_retry_drains_before_each_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -9441,8 +9479,8 @@ mod pools_tests {
         assert_eq!(resumable_decommission_queue_indices(&meta), vec![1, 2]);
     }
 
-    #[test]
-    fn test_runtime_and_startup_use_the_same_resumable_queue() {
+    #[tokio::test]
+    async fn test_runtime_recovery_reserves_the_startup_resumable_queue() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9476,16 +9514,79 @@ mod pools_tests {
             ],
             ..Default::default()
         };
-
-        let runtime_indices = resumable_decommission_queue_indices(&meta);
         let startup_ids = meta
             .return_resumable_pools()
             .into_iter()
             .map(|pool| pool.id)
             .collect::<Vec<_>>();
+        let store = decommission_worker_test_store(meta, vec![None, None, None, None]);
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, true),
+            decommission_test_pool_endpoint(2, true),
+            decommission_test_pool_endpoint(3, true),
+        ]);
+        let reserved = store
+            .reserve_missing_local_decommission_routines(&CancellationToken::new(), &endpoints)
+            .await
+            .expect("runtime recovery reservation should succeed");
+        let runtime_indices = reserved.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
 
         assert_eq!(runtime_indices, vec![2, 3]);
         assert_eq!(startup_ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_recovery_does_not_reserve_behind_active_predecessor() {
+        let meta = PoolMeta {
+            pools: vec![
+                decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    1,
+                    Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    3,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+        let active = DecommissionCanceler::new(CancellationToken::new());
+        let store = decommission_worker_test_store(meta, vec![None, None, Some(active.clone()), None]);
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, true),
+            decommission_test_pool_endpoint(2, true),
+            decommission_test_pool_endpoint(3, true),
+        ]);
+
+        let reserved = store
+            .reserve_missing_local_decommission_routines(&CancellationToken::new(), &endpoints)
+            .await
+            .expect("runtime recovery reservation should succeed");
+
+        assert!(reserved.is_empty());
+        assert!(active.is_active());
     }
 
     #[test]
