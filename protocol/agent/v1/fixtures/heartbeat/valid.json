@@ -1,0 +1,21 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "heartbeat",
+  "fixture": "valid",
+  "description": "A bounded L0 heartbeat. clientTime is advisory; Connect's receivedAt is online authority.",
+  "request": {
+    "protocolVersion": "v1",
+    "requestId": "550e8400-e29b-41d4-a716-446655440000",
+    "agentVersion": "rustfs-agent/1.19.4",
+    "capabilities": ["heartbeat", "inventory"],
+    "sequence": 42,
+    "clientTime": "2026-08-22T01:02:03Z",
+    "coarseNodeSummary": {"total": 8, "healthy": 7, "degraded": 1}
+  },
+  "expected": {
+    "decision": "ACCEPT",
+    "acceptedVersion": "v1",
+    "responseFields": ["serverTime", "acceptedVersion", "capabilityHints"],
+    "onlineAuthority": "serverTime"
+  }
+}

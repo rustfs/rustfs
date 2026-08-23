@@ -69,7 +69,11 @@ fuzz_target!(|data: &[u8]| {
         && let Some(object) = value.as_object()
     {
         let mut legacy_doc = Map::new();
-        if let Some(policy) = object.get("Policy").or_else(|| object.get("policy")) {
+        if let Some(policy) = object
+            .get("Policy")
+            .or_else(|| object.get("policy"))
+            .filter(|policy| serde_json::from_value::<Policy>((*policy).clone()).is_ok())
+        {
             legacy_doc.insert("version".to_string(), json!(1));
             legacy_doc.insert("policy".to_string(), policy.clone());
             legacy_doc.insert("create_date".to_string(), json!("2025-03-07T12:00:00Z"));

@@ -27,7 +27,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::error::Error;
@@ -157,7 +156,6 @@ mod tests {
     /// content, degraded writes must succeed, and everything must still
     /// verify after the disk returns.
     #[tokio::test]
-    #[serial]
     async fn test_degraded_read_write_with_one_disk_offline() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         info!("Reliability: degraded read/write with one of four disks offline");
@@ -210,7 +208,6 @@ mod tests {
     /// bytes to a reader: per-shard bitrot checksums reject the bad shard and
     /// the object is reconstructed from the remaining shards.
     #[tokio::test]
-    #[serial]
     async fn test_bitrot_corrupted_shard_read_returns_correct_data() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         info!("Reliability: GET must read through a bitrot-corrupted shard");
@@ -253,7 +250,6 @@ mod tests {
     /// heal, and require the replaced disk to be rebuilt and all content to
     /// verify against the sha256 manifest.
     #[tokio::test]
-    #[serial]
     async fn test_fresh_disk_replacement_heals_after_sigkill_restart() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         init_logging();
         info!("Reliability: fresh-disk replacement heals after SIGKILL restart");
@@ -327,7 +323,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_versioned_shard_census_selects_each_version_data_dir() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
         info!("Reliability: physical shard census selects the requested object version");

@@ -622,7 +622,8 @@ mod test {
         let _resolver_lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
         reset_dns_resolver_inner();
 
-        let err = resolve_domain("rustfs-resolver-provenance.invalid").unwrap_err();
+        // DNS labels are limited to 63 bytes, so the system resolver rejects this before lookup.
+        let err = resolve_domain("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.invalid").unwrap_err();
 
         assert_ne!(err.kind(), std::io::ErrorKind::Other, "system resolver error was wrapped: {err}");
     }

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nightly full replication e2e lane (backlog#1147 repl-1, deps: ci-4).
+# Consolidated nightly e2e lane for replication, cluster faults, and protocols.
 #
 # The per-PR gate (ci.yml `e2e-tests` job, `--profile e2e-smoke`) runs the
 # FAST replication tests. This scheduled lane runs the remaining heavier
@@ -28,27 +28,28 @@
 # add ad-hoc cargo-test steps here; change the filterset instead. The
 # authoritative membership and count come from
 # `cargo nextest list -p e2e_test --profile e2e-repl-nightly`; the PR/nightly
-# count invariant is maintained next to the filtersets in .config/nextest.toml
-# (deliberately not duplicated here).
+# selection digest is committed under .config/.
 #
-# Explicit division of labor: the nightly subset runs ONLY here, never double-run
-# in ci-5's future e2e-full merge gate. TODO(ci-7): once the ci domain's
-# consolidated scheduled e2e workflow exists, fold this interim repl-owned lane
-# into it rather than growing a second scheduled entrypoint.
+# Explicit division of labor: these subsets run only here and never double-run
+# in the e2e-full merge gate.
 
-name: e2e-replication-nightly
+name: e2e-nightly
 
 on:
   workflow_dispatch:
   schedule:
     # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00),
     # stale (01:30) and performance-ab (06:00).
-    - cron: "0 4 * * *"
+    - cron: "29 4 * * *"
 
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   repl-nightly:
@@ -97,9 +98,20 @@ jobs:
       # demand otherwise, but a single explicit build avoids several parallel
       # nextest test processes racing to build it at once.
       - name: Build rustfs binary
-        run: cargo build -p rustfs --bins
+        run: |
+          cargo build -p rustfs --bins
+          : > target/debug/rustfs.features
+
+      - name: Verify replication e2e membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-repl-nightly-list.json
+        run: |
+          cargo nextest list --profile e2e-repl-nightly -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-repl-nightly "${NEXTEST_LISTING}"
 
       - name: Run replication e2e nightly suite
+        env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-repl-nightly-logs
         run: cargo nextest run --profile e2e-repl-nightly -p e2e_test
 
       - name: Upload nextest junit report
@@ -107,13 +119,115 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-replication-nightly-junit-${{ github.run_number }}
-          path: target/nextest/e2e-repl-nightly/junit.xml
+          path: |
+            target/nextest/e2e-repl-nightly/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-repl-nightly-list.json
+            ${{ runner.temp }}/rustfs-e2e-repl-nightly-logs/
           retention-days: 7
           if-no-files-found: ignore
 
+  cluster-nightly:
+    name: Cluster fault e2e (nightly)
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e-nightly
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Build rustfs binary
+        run: |
+          cargo build -p rustfs --bins --features e2e-test-hooks
+          : > target/debug/rustfs.features
+
+      - name: Verify cluster fault e2e membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-nightly-list.json
+        run: |
+          cargo nextest list --profile e2e-nightly -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-nightly "${NEXTEST_LISTING}"
+
+      - name: Run cluster fault e2e nightly suite
+        env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-nightly-logs
+        run: cargo nextest run --profile e2e-nightly -p e2e_test
+
+      - name: Upload cluster fault diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-cluster-nightly-${{ github.run_number }}
+          path: |
+            target/nextest/e2e-nightly/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-nightly-list.json
+            ${{ runner.temp }}/rustfs-e2e-nightly-logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  protocols-nightly:
+    name: Protocol e2e (nightly)
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFS_BUILD_FEATURES: ftps,webdav,sftp
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e-protocols
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Verify protocol socket oracle
+        run: ss -tn state CLOSE-WAIT >/dev/null
+
+      # The suite owns fixed protocol ports and serializes its internal cases.
+      - name: Verify protocol e2e membership
+        env:
+          NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-protocols-list.json
+        run: |
+          cargo nextest list --profile e2e-protocols -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-protocols "${NEXTEST_LISTING}"
+
+      - name: Run protocol e2e nightly suite
+        env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-protocol-e2e-logs
+        run: >-
+          cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
+
+      - name: Upload protocol diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-protocol-nightly-${{ github.run_number }}
+          path: |
+            target/nextest/e2e-protocols/junit.xml
+            ${{ runner.temp }}/rustfs-e2e-protocols-list.json
+            ${{ runner.temp }}/rustfs-protocol-e2e-logs/
+          retention-days: 7
+          if-no-files-found: warn
+
   alert-on-failure:
     name: Alert on scheduled failure
-    needs: [repl-nightly]
+    needs: [repl-nightly, cluster-nightly, protocols-nightly]
     # Only scheduled runs open/append the tracking issue (backlog#1149 ci-8);
     # manual workflow_dispatch runs stay quiet so a debugging run never files a
     # spurious alert.

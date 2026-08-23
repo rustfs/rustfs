@@ -1,6 +1,6 @@
 ---
 name: rustfs-release-version-bump
-description: "Publish a RustFS alpha/beta/stable release with an auditable flow: confirm target version and scope, update workspace and release assets (including strict rustfs.spec changelog identity/date/version format), run required verification, and finish with commit, push, and GitHub PR creation."
+description: "Prepare the version-file and release-asset bump for an exact RustFS alpha/beta/stable target, with verification and optional commit/push/PR delivery. Use for an explicit version bump or when invoked by the release-publish workflow."
 ---
 # RustFS Release Version Bump
 
@@ -81,10 +81,7 @@ Only drop a file when the current repository release process clearly no longer r
 
 4. Verify before shipping
 - Run:
-- `cargo fmt --all`
-- `cargo fmt --all --check`
 - `make pre-commit`
-- If verification passes, run `cargo clean`.
 - If `make pre-commit` fails, return `BLOCKED` with root cause and do not silently widen scope to fix unrelated issues unless user asks.
 
 5. Commit strategy
@@ -109,10 +106,7 @@ Only drop a file when the current repository release process clearly no longer r
 - `git diff --name-only origin/main...HEAD`
 - `git diff --stat origin/main...HEAD`
 - `rg -n "<old_version>|<new_version>" Cargo.toml Cargo.lock README.md README_ZH.md flake.nix helm/rustfs/Chart.yaml rustfs.spec`
-- `cargo fmt --all`
-- `cargo fmt --all --check`
 - `make pre-commit`
-- `cargo clean`
 
 ## Output contract
 

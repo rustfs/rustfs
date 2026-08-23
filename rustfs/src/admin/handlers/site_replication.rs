@@ -41,7 +41,7 @@ use crate::admin::storage_api::config::save_admin_config;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
-use crate::admin::storage_api::error::Error as StorageError;
+use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::constant_time_eq;
@@ -55,6 +55,7 @@ use crate::storage::storage_api::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
@@ -2109,6 +2110,18 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
             format!("invalid site replication metainfo from `{}`: {e}", site.endpoint),
         )
     })?;
+    if info.deployment_id.is_empty() {
+        // The peer will be tracked under a locally derived fallback ID
+        // (deployment_id_for_endpoint) instead of its real deployment ID.
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "peer_deployment_id_missing",
+            peer_endpoint = %site.endpoint,
+            "admin site replication state"
+        );
+    }
 
     let idp_body = send_peer_admin_get_request_with_client(
         &client,
@@ -2240,20 +2253,30 @@ fn site_replication_bootstrap_token(uri: &Uri) -> Option<String> {
     query_pairs(uri).get("bootstrapToken").cloned()
 }
 
-fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
+/// Query for a peer `make-with-versioning` bucket op. `versioningEnabled`
+/// always travels so the outbound query matches MinIO's site-replication
+/// make-bucket wire contract: MinIO's own create-bucket hook sends
+/// `versioningEnabled=true` on this op. RustFS's inbound handler
+/// force-enables versioning either way.
+fn make_with_versioning_bucket_op_path(bucket: &str, created_at: Option<&str>, lock_enabled: bool) -> String {
     let mut query = form_urlencoded::Serializer::new(String::new());
-    query.append_pair("bucket", &bucket.bucket);
-    query.append_pair("operation", "make-with-versioning");
-    if let Some(created_at) = bucket
-        .created_at
-        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok())
-    {
-        query.append_pair("createdAt", &created_at);
+    query.append_pair("bucket", bucket);
+    query.append_pair("operation", SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING);
+    query.append_pair("versioningEnabled", "true");
+    if let Some(created_at) = created_at {
+        query.append_pair("createdAt", created_at);
     }
-    if bucket.object_lock_config.is_some() {
+    if lock_enabled {
         query.append_pair("lockEnabled", "true");
     }
-    format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
+    format!("{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?{}", query.finish())
+}
+
+fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
+    let created_at = bucket
+        .created_at
+        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok());
+    make_with_versioning_bucket_op_path(&bucket.bucket, created_at.as_deref(), bucket.object_lock_config.is_some())
 }
 
 fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at: Option<OffsetDateTime>) -> SRBucketMeta {
@@ -4280,16 +4303,7 @@ async fn broadcast_site_replication_make_bucket(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
 
-    let path = {
-        let mut query = form_urlencoded::Serializer::new(String::new());
-        query.append_pair("bucket", bucket);
-        query.append_pair("operation", "make-with-versioning");
-        query.append_pair("createdAt", &created_at);
-        if lock_enabled {
-            query.append_pair("lockEnabled", "true");
-        }
-        format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
-    };
+    let path = make_with_versioning_bucket_op_path(bucket, Some(&created_at), lock_enabled);
     let path = if let Some(token) = bootstrap_token {
         with_site_replication_bootstrap_token(&path, token)
     } else {
@@ -10233,13 +10247,25 @@ impl Operation for SiteReplicationStatusHandler {
     }
 }
 
+/// `POST /v3/site-replication/devnull` — peer link-check upload drain.
+/// MinIO streams multi-megabyte probe bodies here during site netperf link
+/// checks and expects an unbounded discard (its handler copies to io.Discard);
+/// buffering through the 1MB admin body cap turned any larger probe into a
+/// 400 and a false link failure. Stream and discard instead — no size cap.
+async fn drain_site_replication_devnull(mut input: Body) -> S3Result<()> {
+    while let Some(chunk) = input.next().await {
+        chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+    }
+    Ok(())
+}
+
 pub struct SiteReplicationDevNullHandler {}
 
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let _ = read_plain_admin_body(req.input).await?;
+        drain_site_replication_devnull(req.input).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
@@ -10498,6 +10524,19 @@ impl Operation for SRPeerJoinHandler {
     }
 }
 
+/// Outcome of a peer-driven `purge-deleted-bucket` replay. A bucket that is
+/// already gone means the purge raced an earlier replay or a local delete —
+/// that is success — but any other failure must reach the sender like the
+/// sibling delete branches do: swallowing it answered 200 while the bucket
+/// survived on this site.
+fn purge_deleted_bucket_result(result: Result<(), StorageError>) -> S3Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_err_bucket_not_found(&err) => Ok(()),
+        Err(err) => Err(ApiError::from(err).into()),
+    }
+}
+
 pub struct SRPeerBucketOpsHandler {}
 
 #[async_trait::async_trait]
@@ -10597,16 +10636,18 @@ impl Operation for SRPeerBucketOpsHandler {
                     .map_err(ApiError::from)?;
             }
             "purge-deleted-bucket" => {
-                let _ = store
-                    .delete_bucket(
-                        &bucket,
-                        &DeleteBucketOptions {
-                            force: true,
-                            srdelete_op: SRBucketDeleteOp::Purge,
-                            ..Default::default()
-                        },
-                    )
-                    .await;
+                purge_deleted_bucket_result(
+                    store
+                        .delete_bucket(
+                            &bucket,
+                            &DeleteBucketOptions {
+                                force: true,
+                                srdelete_op: SRBucketDeleteOp::Purge,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                )?;
             }
             _ => return Err(s3_error!(InvalidRequest, "unsupported site replication bucket operation")),
         }
@@ -13950,6 +13991,54 @@ mod tests {
 
         assert!(query_flag(&uri, "lockEnabled"));
         assert!(!query_flag(&uri, "missing"));
+    }
+
+    /// A5 red-light: a `purge-deleted-bucket` replay must report success when
+    /// the bucket is already gone, and must propagate every other failure —
+    /// the swallowed error answered 200 while the bucket survived.
+    #[test]
+    fn test_purge_deleted_bucket_result_tolerates_only_missing_bucket() {
+        assert!(purge_deleted_bucket_result(Ok(())).is_ok());
+        assert!(purge_deleted_bucket_result(Err(StorageError::BucketNotFound("photos".to_string()))).is_ok());
+        assert!(purge_deleted_bucket_result(Err(StorageError::VolumeNotFound)).is_ok());
+        let err = purge_deleted_bucket_result(Err(StorageError::StorageFull))
+            .expect_err("non-not-found delete failures must propagate");
+        assert_ne!(*err.code(), S3ErrorCode::NoSuchBucket);
+    }
+
+    /// C5 red-light: the site-replication devnull drain must accept bodies
+    /// beyond the 1MB admin body cap — MinIO's link check streams large
+    /// probe bodies and treats a 400 as a broken link.
+    #[tokio::test]
+    async fn test_site_replication_devnull_drains_body_beyond_admin_cap() {
+        let body = Body::from(vec![0u8; MAX_ADMIN_REQUEST_BODY_SIZE + 1]);
+        drain_site_replication_devnull(body)
+            .await
+            .expect("devnull must drain bodies larger than the admin body cap");
+    }
+
+    /// A3 red-light: `versioningEnabled` must travel on every outbound
+    /// make-with-versioning bucket op so the query matches MinIO's
+    /// site-replication make-bucket wire contract (MinIO's own hook sends
+    /// `versioningEnabled=true` on this op).
+    #[test]
+    fn test_make_with_versioning_op_paths_send_versioning_enabled() {
+        let bucket = SRBucketInfo {
+            bucket: "photos".to_string(),
+            created_at: Some(OffsetDateTime::UNIX_EPOCH),
+            object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
+            ..Default::default()
+        };
+        let bootstrap = bootstrap_bucket_make_op_path(&bucket);
+        assert!(bootstrap.contains("operation=make-with-versioning"), "{bootstrap}");
+        assert!(bootstrap.contains("versioningEnabled=true"), "{bootstrap}");
+        assert!(bootstrap.contains("createdAt="), "{bootstrap}");
+        assert!(bootstrap.contains("lockEnabled=true"), "{bootstrap}");
+
+        // The broadcast path (create-bucket hook) shares the same builder.
+        let broadcast = make_with_versioning_bucket_op_path("photos", Some("1970-01-01T00:00:00Z"), false);
+        assert!(broadcast.contains("versioningEnabled=true"), "{broadcast}");
+        assert!(!broadcast.contains("lockEnabled"), "{broadcast}");
     }
 
     #[tokio::test]

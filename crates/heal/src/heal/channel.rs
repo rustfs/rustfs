@@ -1641,6 +1641,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_query_request_reports_displaced_terminal_detail() {
+        let heal_manager = Arc::new(HealManager::new(
+            Arc::new(MockStorage),
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        ));
+        let mut displaced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "displaced-channel".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        displaced.id = "displaced-channel-task".to_string();
+        let displaced_id = displaced.id.clone();
+        heal_manager
+            .submit_heal_request(displaced)
+            .await
+            .expect("initial channel task should queue");
+        heal_manager
+            .submit_heal_request(HealRequest::new(
+                HealType::Bucket {
+                    bucket: "successor-channel".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            ))
+            .await
+            .expect("successor channel task should displace the initial task");
+
+        let processor = HealChannelProcessor::new(heal_manager);
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_query_request("displaced-channel".to_string(), displaced_id, None, tx)
+            .await
+            .expect("displaced query should process");
+        let response = rx
+            .await
+            .expect("query response should be returned")
+            .expect("displaced query should remain successful");
+        let payload: serde_json::Value = serde_json::from_slice(response.data.as_deref().expect("status payload should exist"))
+            .expect("status payload should be json");
+        assert_eq!(payload["summary"], "stopped");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("reason=displaced"))
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_query_request_reports_running_for_queued_task() {
         let heal_manager = create_test_heal_manager();
         let request = HealRequest::bucket("bucket".to_string());

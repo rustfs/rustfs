@@ -369,14 +369,8 @@ pub fn allocator_reclaim_controller_snapshot(ctx: &CancellationToken) -> Allocat
 }
 
 #[cfg(not(target_os = "windows"))]
-#[allow(unsafe_code)]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
-    // SAFETY: `mi_collect` is provided by the active global allocator backend
-    // on this target family. It is explicitly intended to reclaim retained
-    // pages/segments and does not require additional invariants from the caller.
-    unsafe {
-        libmimalloc_sys::mi_collect(force);
-    }
+    rustfs_mimalloc::MiMalloc::collect(force);
     Ok(())
 }
 

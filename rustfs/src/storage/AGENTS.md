@@ -25,4 +25,3 @@ Applies to `rustfs/src/storage/`.
 ## Suggested Validation
 
 - Targeted module tests in `rustfs/src/storage/*_test.rs`
-- Full gate before commit: `make pre-commit`

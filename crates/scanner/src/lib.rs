@@ -75,7 +75,10 @@ pub use remote_scanner::{
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
-pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status, scanner_topology_digest};
+pub use scanner::{
+    ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, init_data_scanner,
+    reset_scanner_cycle_recovery, scanner_cycle_recovery_status, scanner_cycle_schedule_status, scanner_topology_digest,
+};
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageState, acknowledge_dirty_usage_generation, clear_dirty_usage_bucket,
     record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_state,
@@ -599,10 +602,8 @@ impl ScannerConfigObjectDelete for ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[tokio::test]
-    #[serial]
     async fn runtime_tier_names_serves_cached_arc_within_ttl() {
         reset_tier_name_cache_for_test();
         // The tier config manager is unconfigured in unit tests, so the
@@ -616,7 +617,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn foreground_read_guard_tracks_stream_lifetime() {
         reset_foreground_read_activity_for_test();
         assert_eq!(current_foreground_read_activity(), 0);
@@ -630,7 +630,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn foreground_read_activity_keeps_larger_signal() {
         reset_foreground_read_activity_for_test();
         let _guard = ForegroundReadGuard::new();
@@ -643,7 +642,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_guard_tracks_runtime_lifetime() {
         reset_scanner_runtime_instances_for_test();
         assert!(!scanner_runtime_initialized());

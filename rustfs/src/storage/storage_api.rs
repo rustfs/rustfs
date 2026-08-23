@@ -429,6 +429,8 @@ pub(crate) mod ecstore_config {
 }
 
 pub(crate) mod ecstore_data_usage {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::data_usage::get_bucket_usage_memory;
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
         load_data_usage_from_backend, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
@@ -1096,6 +1098,10 @@ pub(crate) fn shutdown_background_services() {
 
 pub(crate) fn shutdown_background_monitors() {
     rustfs_ecstore::shutdown_background_monitors();
+}
+
+pub(crate) fn mark_get_metadata_read_version_coalescing_service_ready() {
+    rustfs_ecstore::mark_get_metadata_read_version_coalescing_service_ready();
 }
 
 pub(crate) fn set_global_rustfs_port(value: u16) {

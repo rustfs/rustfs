@@ -21,7 +21,7 @@ use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
-    object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    object::{DeleteAccounting, DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::{
@@ -249,7 +249,7 @@ impl Sets {
 
         self.connect_disks().await;
 
-        // TODO: config interval
+        // TODO(backlog): make monitor_and_connect interval configurable instead of hardcoded 15s
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
@@ -411,6 +411,66 @@ fn apply_delete_objects_results(
             .get(i)
             .expect("delete_objects should return objects aligned with input objects")
             .clone();
+    }
+}
+
+fn apply_delete_accounting_results(
+    accounting: &mut [Option<DeleteAccounting>],
+    set_objects: &[DelObj],
+    set_accounting: &[Option<DeleteAccounting>],
+) {
+    for (obj, value) in set_objects.iter().zip(set_accounting.iter()) {
+        accounting[obj.orig_idx] = value.clone();
+    }
+}
+
+impl Sets {
+    pub(crate) async fn delete_objects_with_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut del_errs = vec![None; objects.len()];
+        let mut accounting = vec![None; objects.len()];
+        let mut set_obj_map = HashMap::new();
+
+        for (i, obj) in objects.iter().enumerate() {
+            let idx = self.get_hashed_set_index(obj.object_name.as_str());
+            set_obj_map.entry(idx).or_insert_with(Vec::new).push(DelObj {
+                orig_idx: i,
+                obj: obj.clone(),
+            });
+        }
+
+        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut futures = FuturesUnordered::new();
+        let bucket = bucket.to_owned();
+
+        for (set_index, set_objects) in set_obj_map {
+            let disks = self.get_disks(set_index);
+            let objects = set_objects.iter().map(|entry| entry.obj.clone()).collect::<Vec<_>>();
+            let bucket = bucket.clone();
+            let opts = opts.clone();
+            let semaphore = semaphore.clone();
+            futures.push(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("delete_objects semaphore should remain open");
+                let (deleted, errors, accounting) = disks.delete_objects_with_accounting(&bucket, objects, opts).await;
+                (set_objects, deleted, errors, accounting)
+            });
+        }
+
+        while let Some((set_objects, deleted, errors, set_accounting)) = futures.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &set_objects, &deleted, errors);
+            apply_delete_accounting_results(&mut accounting, &set_objects, &set_accounting);
+        }
+
+        (del_objects, del_errs, accounting)
     }
 }
 
@@ -655,65 +715,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        // Default return value
-        let mut del_objects = vec![DeletedObject::default(); objects.len()];
-
-        let mut del_errs = Vec::with_capacity(objects.len());
-        for _ in 0..objects.len() {
-            del_errs.push(None)
-        }
-
-        let mut set_obj_map = HashMap::new();
-
-        // hash key
-        for (i, obj) in objects.iter().enumerate() {
-            let idx = self.get_hashed_set_index(obj.object_name.as_str());
-
-            if !set_obj_map.contains_key(&idx) {
-                set_obj_map.insert(
-                    idx,
-                    vec![DelObj {
-                        // set_idx: idx,
-                        orig_idx: i,
-                        obj: obj.clone(),
-                    }],
-                );
-            } else if let Some(val) = set_obj_map.get_mut(&idx) {
-                val.push(DelObj {
-                    // set_idx: idx,
-                    orig_idx: i,
-                    obj: obj.clone(),
-                });
-            }
-        }
-
-        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let mut futures = FuturesUnordered::new();
-        let bucket = bucket.to_string();
-
-        for (k, v) in set_obj_map {
-            let disks = self.get_disks(k);
-            let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let bucket = bucket.clone();
-            let opts = opts.clone();
-            let semaphore = semaphore.clone();
-
-            futures.push(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("delete_objects semaphore should remain open");
-                let (dobjects, errs) = disks.delete_objects(&bucket, objs, opts).await;
-                (v, dobjects, errs)
-            });
-        }
-
-        while let Some((v, dobjects, errs)) = futures.next().await {
-            apply_delete_objects_results(&mut del_objects, &mut del_errs, &v, &dobjects, errs);
-        }
-
-        (del_objects, del_errs)
+        let (deleted, errors, _) = self.delete_objects_with_accounting(bucket, objects, opts).await;
+        (deleted, errors)
     }
 
     #[tracing::instrument(skip(self))]
@@ -985,14 +988,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::heal::HealOperations for Sets {
-    type Error = Error;
-    type HealResultItem = HealResultItem;
-    type HealOptions = HealOpts;
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+impl Sets {
+    pub(crate) async fn heal_format_with_fence<F>(&self, dry_run: bool, fence_lost: F) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: Fn() -> bool + Send + Sync,
+    {
         let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
             &DiskOption {
@@ -1065,6 +1065,9 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             // Save new formats `format.json` on unformatted disks.
             for (index, (fm, disk)) in tmp_new_formats.iter_mut().zip(disks.iter()).enumerate() {
                 if fm.is_some() && disk.is_some() {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     if let Err(err) = save_format_file(disk, fm).await {
                         if let Some(disk) = disk.as_ref() {
                             let _ = disk.close().await;
@@ -1097,6 +1100,18 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             }
         }
         Ok((res, None))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::heal::HealOperations for Sets {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
+    #[tracing::instrument(skip(self))]
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_format_with_fence(dry_run, || false).await
     }
     #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {

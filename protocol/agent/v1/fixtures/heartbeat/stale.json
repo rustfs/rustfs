@@ -1,0 +1,9 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "heartbeat",
+  "fixture": "stale",
+  "description": "A lower heartbeat sequence is retained as history and cannot replace the current projection.",
+  "head": {"requestId": "550e8400-e29b-41d4-a716-446655440000", "sequence": 42},
+  "late": {"requestId": "7c4d2e10-9f83-4a5b-b6c7-d8e9f0a1b2c3", "sequence": 9},
+  "expected": {"decision": "ACCEPT_HISTORY", "currentSequence": 42, "historySequence": 9}
+}
