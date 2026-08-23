@@ -150,6 +150,7 @@ where
                 state = "publication_blocked_before_reconcile",
                 "Scanner data usage publication deferred by the pool-state fence"
             );
+            global_metrics().record_scanner_usage_deferred(ScannerCycleDeferReason::DataMovement.as_str());
             outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             break;
         }
