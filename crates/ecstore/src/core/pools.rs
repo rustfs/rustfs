@@ -33,7 +33,7 @@ use crate::bucket::{
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{
     CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
-    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config, save_config_with_opts,
+    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config_with_opts,
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
@@ -2264,6 +2264,32 @@ impl PoolMetaReplicaState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolMetaWriteState {
+    write_blocked: bool,
+}
+
+impl Default for PoolMetaWriteState {
+    fn default() -> Self {
+        Self { write_blocked: false }
+    }
+}
+
+impl PoolMetaWriteState {
+    pub(crate) fn observe_replicas(&mut self, replica_state: PoolMetaReplicaState) {
+        self.write_blocked |= !replica_state.repair_write_safe;
+    }
+
+    fn ensure_write_safe(self, operation: &str) -> Result<()> {
+        if !self.write_blocked {
+            return Ok(());
+        }
+        Err(Error::other(format!(
+            "{operation}: pool metadata writes remain blocked after an unreadable replica; restart after all replicas are readable and consistent"
+        )))
+    }
+}
+
 #[derive(Debug)]
 struct PoolMetaSelection {
     meta: PoolMeta,
@@ -2888,9 +2914,11 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn load(&mut self, _pool: Arc<Sets>, pools: Vec<Arc<Sets>>) -> Result<()> {
-        let selection = load_pool_meta_replicas(pools, false).await?;
-        *self = selection.meta;
+    pub async fn load(&mut self, pool: Arc<Sets>, pools: Vec<Arc<Sets>>) -> Result<()> {
+        let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+        let _pool_meta_guard = pool_meta_lock.get_read_lock(get_lock_acquire_timeout()).await?;
+        let replica_state = self.load_no_lock_from_replicas(pools).await?;
+        replica_state.ensure_write_safe("pool metadata load failed")?;
         Ok(())
     }
 
@@ -2919,15 +2947,15 @@ impl PoolMeta {
     }
 
     pub async fn save(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
-        let data = self.encode_config_data()?;
-        if data.is_empty() {
-            return Ok(());
-        }
-        for pool in pools {
-            save_config(pool, POOL_META_NAME, data.clone()).await?;
-        }
-
-        Ok(())
+        let pool = pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other("pool metadata save failed: no storage pools available"))?;
+        let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+        let _pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let selection = load_pool_meta_replicas(pools.clone(), true).await?;
+        selection.replica_state.ensure_write_safe("pool metadata save failed")?;
+        self.save_no_lock(pools).await
     }
 
     /// Startup has a single elected local writer, so it must not depend on namespace locks here.
@@ -3675,19 +3703,47 @@ impl ECStore {
         Ok(apply_expiry_rule_in(self.clone(), &event, &LcEventSrc::Scanner, &object_info).await)
     }
 
+    async fn acquire_pool_meta_write_guard(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        operation: &str,
+    ) -> Result<rustfs_lock::NamespaceLockGuard> {
+        write_state.ensure_write_safe(operation)?;
+        let pool = self
+            .pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other(format!("{operation}: no storage pools available")))?;
+        let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+        let pool_meta_guard = pool_meta_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(decommission_pool_meta_lock_error)?;
+        let selection = load_pool_meta_replicas(self.pools.clone(), true).await?;
+        write_state.observe_replicas(selection.replica_state);
+        write_state.ensure_write_safe(operation)?;
+        Ok(pool_meta_guard)
+    }
+
     async fn save_current_pool_meta(&self) -> Result<()> {
-        let _save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let _pool_meta_guard = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "pool metadata save failed")
+            .await?;
         let snapshot = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta.clone()
         };
-        snapshot.save(self.pools.clone()).await
+        snapshot.save_no_lock(self.pools.clone()).await
     }
 
     async fn save_decommission_progress_checkpoint(&self, idx: usize, generation: OffsetDateTime) -> Result<bool> {
         // Lock order: save gate, then the short pool metadata read/write sections. Peer
         // reloads are intentionally performed by the caller after both locks are released.
-        let _save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let _pool_meta_guard = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "decommission progress save failed")
+            .await?;
         let (snapshot, checkpoint) = {
             let pool_meta = self.pool_meta.read().await;
             ensure_decommission_generation(&pool_meta, idx, generation)?;
@@ -3708,7 +3764,7 @@ impl ECStore {
             (snapshot, checkpoint)
         };
 
-        if let Err(err) = snapshot.save(self.pools.clone()).await {
+        if let Err(err) = snapshot.save_no_lock(self.pools.clone()).await {
             let retry_after = OffsetDateTime::now_utc() + DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
             let mut pool_meta = self.pool_meta.write().await;
             pool_meta.defer_decommission_progress_checkpoint(idx, checkpoint, retry_after);
@@ -3725,7 +3781,8 @@ impl ECStore {
         space_infos: Vec<(usize, PoolSpaceInfo)>,
         decom_buckets: Vec<DecomBucketInfo>,
     ) -> Result<PoolMeta> {
-        let _save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        save_guard.ensure_write_safe("decommission start failed")?;
         let rebalance_pool = self
             .pools
             .first()
@@ -3768,7 +3825,8 @@ impl ECStore {
         };
         let mut latest_pool_meta = PoolMeta::default();
         let replica_state = latest_pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
-        replica_state.ensure_write_safe("decommission start failed")?;
+        save_guard.observe_replicas(replica_state);
+        save_guard.ensure_write_safe("decommission start failed")?;
         if latest_pool_meta.pools.is_empty() {
             latest_pool_meta = current_pool_meta;
         }
@@ -8034,6 +8092,27 @@ mod tests {
     }
 
     #[test]
+    fn pool_meta_write_state_remains_blocked_after_unreadable_replica() {
+        let mut write_state = PoolMetaWriteState::default();
+        write_state.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+        write_state.observe_replicas(PoolMetaReplicaState {
+            needs_repair: false,
+            repair_write_safe: true,
+        });
+
+        let err = write_state
+            .ensure_write_safe("pool metadata save failed")
+            .expect_err("a later clean read must not clear the startup write block");
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+    }
+
+    #[test]
     fn pool_meta_replica_selection_rejects_same_version_tuple_extension() {
         #[derive(Serialize)]
         struct FuturePersistedPoolMeta {
@@ -9228,7 +9307,7 @@ mod pools_tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(cancelers),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

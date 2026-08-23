@@ -666,7 +666,7 @@ mod tests {
             })),
             decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         });

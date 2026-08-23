@@ -2719,7 +2719,7 @@ fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECSt
         rebalance_meta: tokio::sync::RwLock::new(Some(meta)),
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),
-        pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        pool_meta_save_gate: tokio::sync::Mutex::default(),
         ctx: crate::runtime::instance::bootstrap_ctx(),
         bucket_fence_registry: std::sync::Arc::default(),
     })

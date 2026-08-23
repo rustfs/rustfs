@@ -431,7 +431,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -476,6 +476,10 @@ impl ECStore {
         runtime_sources::ensure_boot_time().await;
 
         let (meta, pool_meta_replica_state) = load_pool_meta_for_startup(self.pools.clone()).await?;
+        {
+            let mut write_state = self.pool_meta_save_gate.lock().await;
+            write_state.observe_replicas(pool_meta_replica_state);
+        }
         let update = meta.validate(self.pools.clone())?;
         let endpoints = runtime_sources::endpoint_pools_or_default();
         let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
