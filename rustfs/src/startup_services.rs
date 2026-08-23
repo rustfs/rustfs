@@ -156,12 +156,7 @@ fn inventory_snapshot(
     expected_drive_count: usize,
     info: rustfs_madmin::StorageInfo,
 ) -> std::result::Result<InventorySnapshot, InventoryError> {
-    if info.disks.len() != expected_drive_count {
-        return Err(InventoryError::SnapshotIncomplete {
-            expected: expected_drive_count,
-            observed: info.disks.len(),
-        });
-    }
+    let drive_count = inventory_topology_slot_count(&info.disks, expected_drive_count)?;
     let (total, free) = inventory_capacity(&info)?;
     let mut flags = Vec::with_capacity(3);
     if info.disks.iter().any(|disk| !inventory_disk_is_healthy(disk)) {
@@ -173,7 +168,38 @@ fn inventory_snapshot(
     if info.disks.iter().any(|disk| disk.healing) {
         flags.push(InventoryFlag::ClusterHealing);
     }
-    InventorySnapshot::current(node_count, info.disks.len(), total, free, flags)
+    InventorySnapshot::current(node_count, drive_count, total, free, flags)
+}
+
+fn inventory_topology_slot_count(
+    disks: &[rustfs_madmin::Disk],
+    expected_drive_count: usize,
+) -> std::result::Result<usize, InventoryError> {
+    let mut slots = BTreeSet::new();
+    let mut invalid = false;
+    for disk in disks {
+        let key = match (
+            usize::try_from(disk.pool_index),
+            usize::try_from(disk.set_index),
+            usize::try_from(disk.disk_index),
+        ) {
+            (Ok(pool_index), Ok(set_index), Ok(disk_index)) => (pool_index, set_index, disk_index),
+            _ => {
+                invalid = true;
+                continue;
+            }
+        };
+        if !slots.insert(key) {
+            invalid = true;
+        }
+    }
+    if invalid || slots.len() != expected_drive_count {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: expected_drive_count,
+            observed: slots.len(),
+        });
+    }
+    Ok(slots.len())
 }
 
 fn inventory_disk_is_healthy(disk: &rustfs_madmin::Disk) -> bool {
@@ -305,6 +331,28 @@ mod tests {
     }
 
     #[test]
+    fn inventory_rejects_duplicate_or_invalid_topology_slots() {
+        let valid = disk("ok", Some("online"), 0);
+        let duplicate = valid.clone();
+        assert!(matches!(
+            inventory_snapshot(1, 2, info(vec![valid.clone(), duplicate])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+
+        let invalid = disk("ok", Some("online"), -1);
+        assert!(matches!(
+            inventory_snapshot(1, 2, info(vec![valid, invalid])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+    }
+
+    #[test]
     fn inventory_marks_a_missing_drive_as_offline() {
         let info = info(vec![disk("ok", None, 0), disk("disk not found", None, 1)]);
 
@@ -377,17 +425,17 @@ mod tests {
         let mut first = disk("ok", Some("online"), 0);
         first.endpoint = ENDPOINT_CANARY.to_owned();
         first.drive_path = PATH_CANARY.to_owned();
-        let mut duplicate = first.clone();
-        duplicate.endpoint = "https://duplicate-secret.invalid".to_owned();
-        duplicate.drive_path = "/duplicate/path/secret".to_owned();
-        duplicate.total_space = 900;
-        duplicate.available_space = 800;
+        let mut second = disk("ok", Some("online"), 1);
+        second.endpoint = "https://second-secret.invalid".to_owned();
+        second.drive_path = "/second/path/secret".to_owned();
+        second.total_space = 900;
+        second.available_space = 800;
         let info = rustfs_madmin::StorageInfo {
             backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![1],
+                standard_sc_data: vec![2],
                 ..Default::default()
             },
-            disks: vec![first, duplicate],
+            disks: vec![first, second],
         };
         let captured = CapturedLog::default();
         let subscriber = tracing_subscriber::fmt()
@@ -401,11 +449,11 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            InventorySnapshot::current(1, 2, 100, 40, []).expect("expected inventory should encode")
+            InventorySnapshot::current(1, 2, 1_000, 840, []).expect("expected inventory should encode")
         );
         let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
         let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("UTF-8 logs");
-        for canary in [ENDPOINT_CANARY, PATH_CANARY, "duplicate-secret", "/duplicate/path"] {
+        for canary in [ENDPOINT_CANARY, PATH_CANARY, "second-secret", "/second/path"] {
             assert!(!encoded.contains(canary), "snapshot exposed {canary}");
             assert!(!logs.contains(canary), "logs exposed {canary}");
         }
@@ -435,12 +483,8 @@ mod tests {
         pool_one.set_index = 2;
         pool_one.total_space = 200;
         pool_one.available_space = 80;
-        let mut duplicate = pool_one.clone();
-        duplicate.total_space = 900;
-        duplicate.available_space = 800;
-
         let empty_widths = rustfs_madmin::StorageInfo {
-            disks: vec![pool_zero.clone(), pool_one.clone(), duplicate.clone()],
+            disks: vec![pool_zero.clone(), pool_one.clone()],
             ..Default::default()
         };
         assert_eq!(inventory_capacity(&empty_widths).expect("numeric fallback"), (300, 120));
@@ -450,7 +494,7 @@ mod tests {
                 standard_sc_data: vec![1],
                 ..Default::default()
             },
-            disks: vec![pool_zero, pool_one, duplicate],
+            disks: vec![pool_zero, pool_one],
         };
         assert_eq!(inventory_capacity(&incomplete_widths).expect("numeric fallback"), (300, 120));
     }
@@ -466,13 +510,12 @@ mod tests {
         pool_one.pool_index = 1;
         pool_one.total_space = 200;
         pool_one.available_space = 80;
-        let duplicate = pool_one.clone();
         let info = rustfs_madmin::StorageInfo {
             backend: rustfs_madmin::BackendInfo {
                 standard_sc_data: vec![1, 1],
                 ..Default::default()
             },
-            disks: vec![pool_zero_set_zero, pool_zero_set_one, pool_one, duplicate],
+            disks: vec![pool_zero_set_zero, pool_zero_set_one, pool_one],
         };
 
         assert_eq!(inventory_capacity(&info).expect("configured topology"), (400, 160));
