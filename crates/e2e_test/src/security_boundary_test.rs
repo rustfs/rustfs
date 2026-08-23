@@ -21,12 +21,11 @@
 //! - SSRF prevention (internal/private endpoints rejected for tiering)
 //! - Race condition handling (concurrent writes converge without corruption)
 
-use crate::common::{RustFSTestEnvironment, awscurl_put, init_logging};
+use crate::common::{RustFSTestEnvironment, awscurl_put, init_logging, require_awscurl};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Tag, Tagging};
 use std::error::Error;
-use tracing::info;
 
 /// Oversized tagging payloads must be rejected by the per-object tag limit.
 ///
@@ -230,6 +229,7 @@ async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send 
 #[tokio::test]
 async fn test_tiering_url_validation() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
+    require_awscurl()?;
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
 

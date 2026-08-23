@@ -494,6 +494,22 @@ fn awscurl_binary_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("awscurl"))
 }
 
+fn verify_awscurl_path(path: &Path) -> std::io::Result<()> {
+    let output = Command::new(path).arg("--help").output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(std::io::Error::other(format!(
+        "awscurl prerequisite check failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+pub fn require_awscurl() -> std::io::Result<()> {
+    verify_awscurl_path(&awscurl_binary_path())
+}
+
 // Global initialization
 static INIT: Once = Once::new();
 
@@ -1734,6 +1750,22 @@ mod tests {
             Some("sftp,ftps,webdav".to_string())
         );
         assert_eq!(normalize_rustfs_build_features(" , "), None);
+    }
+
+    #[test]
+    fn missing_awscurl_is_a_prerequisite_failure() {
+        let missing = std::env::temp_dir().join(format!("missing-awscurl-{}", Uuid::new_v4()));
+
+        let error = verify_awscurl_path(&missing).expect_err("a missing awscurl binary must fail the test prerequisite");
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn available_awscurl_client_passes_prerequisite_check() {
+        let executable = std::env::current_exe().expect("the test executable should have a path");
+
+        verify_awscurl_path(&executable).expect("an available client with a working help command should pass");
     }
 
     #[test]
