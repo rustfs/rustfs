@@ -96,14 +96,14 @@ const KEY_RULES: &[&str] = &[
 
 static VALUE_RULES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
-        r"\b(?:A3T[A-Z0-9]{2}|ABIA|ACCA|AKIA|ASIA)[A-Z0-9]{16}\b",
-        r"(?i:\bbearer\s{1,8}[A-Za-z0-9\-._~+/]{8,4096}={0,2})",
-        r#"(?i:\b[a-z0-9_.-]{0,24}(?:access[_.-]?key(?:[_.-]?id)?|api[_.-]?key|credentials?|passphrase|secret(?:[_.-]?key)?|token)\b\s{0,8}[:=]\s{0,8}["']?[A-Za-z0-9\-._~+/=]{8,4096})"#,
-        r"\beyJ[A-Za-z0-9_-]{4,4096}\.[A-Za-z0-9_-]{4,4096}\.[A-Za-z0-9_-]{4,4096}",
-        r"(?i:\b(?:passwd|password|pwd)\b\s{0,8}[:=]\s{0,8}\S)",
+        r"(?-u:\b)(?:A3T[A-Z0-9]{2}|ABIA|ACCA|AKIA|ASIA)[A-Z0-9]{16}(?-u:\b)",
+        r"(?i:(?-u:\b)bearer\s{1,8}[A-Za-z0-9\-._~+/]{8,4096}={0,2})",
+        r#"(?i:(?-u:\b)[a-z0-9_.-]{0,24}(?:access[_.-]?key(?:[_.-]?id)?|api[_.-]?key|credentials?|passphrase|secret(?:[_.-]?key)?|token)(?-u:\b)\s{0,8}[:=]\s{0,8}["']?[A-Za-z0-9\-._~+/=]{8,4096})"#,
+        r"(?-u:\b)eyJ[A-Za-z0-9_-]{4,4096}\.[A-Za-z0-9_-]{4,4096}\.[A-Za-z0-9_-]{4,4096}",
+        r"(?i:(?-u:\b)(?:passwd|password|pwd)(?-u:\b)\s{0,8}[:=]\s{0,8}\S)",
         r"-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY(?: BLOCK)?-----",
-        r#"(?i:\b(?:csrf[_.-]?token|jsessionid|phpsessid|sess|session|sid|xsrf[_.-]?token)(?:[_.-]?id)?\b\s{0,8}[:=]\s{0,8}["']?[A-Za-z0-9%\-._~+/]{12,4096})"#,
-        r"\b[a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s/@:]{1,256}(?::[^\s/@]{0,256})?@",
+        r#"(?i:(?-u:\b)(?:csrf[_.-]?token|jsessionid|phpsessid|sess|session|sid|xsrf[_.-]?token)(?:[_.-]?id)?(?-u:\b)\s{0,8}[:=]\s{0,8}["']?[A-Za-z0-9%\-._~+/]{12,4096})"#,
+        r"(?-u:\b)[a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s/@:]{1,256}(?::[^\s/@]{0,256})?@",
     ]
     .into_iter()
     .map(|pattern| Regex::new(pattern).expect("the frozen redaction patterns are valid"))
@@ -174,7 +174,7 @@ pub enum RedactionError {
 }
 
 #[must_use]
-pub fn redact(source: RedactionSource, document: &Map<String, Value>) -> Result<RedactionResult, RedactionError> {
+pub(super) fn redact(source: RedactionSource, document: &Map<String, Value>) -> Result<RedactionResult, RedactionError> {
     let encoded = serde_json::to_vec(document).map_err(|_| RedactionError::NotRepresentable)?;
     if encoded.len() > MAX_INPUT_BYTES {
         return Err(RedactionError::InputTooLarge);
@@ -210,6 +210,9 @@ pub fn redact(source: RedactionSource, document: &Map<String, Value>) -> Result<
 /// Redact a JSON object received at a protocol boundary. Invalid JSON and
 /// non-object JSON are refused without including any input bytes in the error.
 pub fn redact_json(source: RedactionSource, encoded: &[u8]) -> Result<RedactionResult, RedactionError> {
+    if encoded.len() > MAX_INPUT_BYTES {
+        return Err(RedactionError::InputTooLarge);
+    }
     let Value::Object(document) = serde_json::from_slice(encoded).map_err(|_| RedactionError::NotRepresentable)? else {
         return Err(RedactionError::NotRepresentable);
     };

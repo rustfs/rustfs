@@ -17,8 +17,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use rustfs::connect::offline::{CollectorError, RedactionSource, collect_offline_diagnostics, redact, redact_json};
-use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_ONLINE, StorageInfo};
+use rustfs::connect::offline::{CollectorError, RedactionSource, collect_offline_diagnostics, redact_json};
+use rustfs_madmin::{Disk, ITEM_OFFLINE, StorageInfo};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -53,6 +53,11 @@ fn object(value: &Value) -> Map<String, Value> {
     value.as_object().expect("fixture document is an object").clone()
 }
 
+fn redact_document(source: RedactionSource, document: &Map<String, Value>) -> rustfs::connect::offline::RedactionResult {
+    let encoded = serde_json::to_vec(document).expect("fixture document is representable");
+    redact_json(source, &encoded).expect("fixture document must be accepted")
+}
+
 #[test]
 fn connect_offline_collectors_match_every_allowed_and_secret_redaction_vector() {
     let ruleset = fixture_json("ruleset.json");
@@ -61,8 +66,7 @@ fn connect_offline_collectors_match_every_allowed_and_secret_redaction_vector() 
             let name = vector["name"].as_str().expect("vector name");
             let source = RedactionSource::try_from(vector["source"].as_str().expect("vector source"))
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let result =
-                redact(source, &object(&vector["document"])).unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+            let result = redact_document(source, &object(&vector["document"]));
             assert_eq!(result.redaction_version, ruleset["redactionVersion"], "{name}: redaction version");
             assert_eq!(result.ruleset_hash, ruleset["rulesetHash"], "{name}: ruleset hash");
             assert_eq!(result.canonical_json, vector["expectedCanonicalJson"], "{name}: canonical bytes");
@@ -136,11 +140,12 @@ fn connect_offline_collectors_enforce_the_frozen_rejection_budgets() {
             kind => panic!("unknown fixture builder {kind}"),
         };
         match expected {
-            Some(message) => assert_eq!(redact(source, &document).expect_err(name).to_string(), message, "{name}"),
+            Some(message) => {
+                let encoded = serde_json::to_vec(&document).expect("rejection fixture document is representable");
+                assert_eq!(redact_json(source, &encoded).expect_err(name).to_string(), message, "{name}")
+            }
             None => assert_eq!(
-                redact(source, &document)
-                    .unwrap_or_else(|error| panic!("{name}: {error}"))
-                    .redacted_count,
+                redact_document(source, &document).redacted_count,
                 vector["expected"]["redactedCount"],
                 "{name}"
             ),
@@ -148,26 +153,46 @@ fn connect_offline_collectors_enforce_the_frozen_rejection_budgets() {
     }
 }
 
+#[test]
+fn connect_offline_collectors_reject_oversize_raw_input_before_parsing() {
+    let invalid = vec![b'!'; 262_145];
+    assert_eq!(
+        redact_json(RedactionSource::OfflineDiagnostic, &invalid)
+            .expect_err("oversize raw input")
+            .to_string(),
+        "Redaction refused the document: its size in bytes exceeds the frozen budget of 262144."
+    );
+}
+
 #[tokio::test]
 async fn connect_offline_collectors_emit_only_fixed_redacted_entries_and_honor_cancellation() {
     let storage = StorageInfo {
         disks: vec![
             Disk {
-                endpoint: "node-a.private.example".to_owned(),
+                endpoint: "https://node-a.private.example:9000/data-a".to_owned(),
                 drive_path: "/secret/customer/path-a".to_owned(),
                 uuid: "private-drive-a".to_owned(),
-                state: ITEM_ONLINE.to_owned(),
+                state: "ok".to_owned(),
                 total_space: 1_000,
                 used_space: 400,
                 ..Disk::default()
             },
             Disk {
-                endpoint: "node-b.private.example".to_owned(),
+                endpoint: "https://node-a.private.example:9000/data-b".to_owned(),
                 drive_path: "/secret/customer/path-b".to_owned(),
                 uuid: "private-drive-b".to_owned(),
-                state: ITEM_OFFLINE.to_owned(),
+                state: "unformatted".to_owned(),
                 total_space: 2_000,
                 used_space: 500,
+                ..Disk::default()
+            },
+            Disk {
+                endpoint: "https://node-b.private.example:9000/data-c".to_owned(),
+                drive_path: "/secret/customer/path-c".to_owned(),
+                uuid: "private-drive-c".to_owned(),
+                state: ITEM_OFFLINE.to_owned(),
+                total_space: 3_000,
+                used_space: 600,
                 healing: true,
                 ..Disk::default()
             },
@@ -185,13 +210,55 @@ async fn connect_offline_collectors_emit_only_fixed_redacted_entries_and_honor_c
         "node-b.private.example",
         "/secret/customer/path-a",
         "/secret/customer/path-b",
+        "/secret/customer/path-c",
         "private-drive-a",
         "private-drive-b",
+        "private-drive-c",
     ] {
         assert!(!encoded.contains(forbidden), "private storage metadata must not leave the collector");
     }
     assert!(entries.iter().all(|entry| entry.field_id.starts_with("offline.")));
     assert!(entries.iter().all(|entry| entry.canonical_json.len() <= 16 * 1024));
+    let canonical = |field_id| {
+        entries
+            .iter()
+            .find(|entry| entry.field_id == field_id)
+            .unwrap_or_else(|| panic!("missing {field_id}"))
+            .canonical_json
+            .as_str()
+    };
+    assert_eq!(canonical("offline.nodeCount"), r#"{"nodeCount":2}"#);
+    assert_eq!(canonical("offline.driveCount"), r#"{"driveCount":3}"#);
+    assert_eq!(canonical("offline.capacityUsedBytes"), r#"{"capacityUsedBytes":1500}"#);
+    assert_eq!(canonical("offline.capacityTotalBytes"), r#"{"capacityTotalBytes":6000}"#);
+    assert_eq!(
+        canonical("offline.coarseHealthFlags"),
+        r#"{"coarseHealthFlags":{"degraded":true,"healing":true,"offlineDrives":1,"scanning":false}}"#
+    );
+
+    let healthy = StorageInfo {
+        disks: ["ok", "unformatted", "online"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| Disk {
+                endpoint: format!("https://healthy.example:9000/data-{index}"),
+                state: state.to_owned(),
+                ..Disk::default()
+            })
+            .collect(),
+        ..StorageInfo::default()
+    };
+    let healthy_entries = collect_offline_diagnostics(&healthy, &CancellationToken::new())
+        .await
+        .expect("collect healthy storage summary");
+    assert_eq!(
+        healthy_entries
+            .iter()
+            .find(|entry| entry.field_id == "offline.coarseHealthFlags")
+            .expect("healthy coarse health entry")
+            .canonical_json,
+        r#"{"coarseHealthFlags":{"degraded":false,"healing":false,"offlineDrives":0,"scanning":false}}"#
+    );
 
     cancel.cancel();
     assert!(matches!(
@@ -207,5 +274,17 @@ async fn connect_offline_collectors_emit_only_fixed_redacted_entries_and_honor_c
     assert!(matches!(
         collect_offline_diagnostics(&oversized, &active).await,
         Err(CollectorError::StorageTopologyTooLarge)
+    ));
+
+    let invalid_endpoint = StorageInfo {
+        disks: vec![Disk {
+            endpoint: "not-an-endpoint".to_owned(),
+            ..Disk::default()
+        }],
+        ..StorageInfo::default()
+    };
+    assert!(matches!(
+        collect_offline_diagnostics(&invalid_endpoint, &active).await,
+        Err(CollectorError::InvalidStorageEndpoint)
     ));
 }

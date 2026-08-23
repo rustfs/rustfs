@@ -38,4 +38,4 @@ pub use collectors::{CollectorError, OfflineCollector, collect_offline_diagnosti
 pub use enrollment::{EnrollmentError, OfflineEnrollment, VerifiedChallenge};
 pub use key_store::OfflineKeyStore;
 pub use manifest_entry::ManifestEntry;
-pub use redaction::{RedactionError, RedactionResult, RedactionSource, redact, redact_json};
+pub use redaction::{RedactionError, RedactionResult, RedactionSource, redact_json};

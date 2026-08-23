@@ -15,6 +15,7 @@
 //! Fixed Q07 L0/L1 collectors for an operator-triggered offline diagnostic.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use rustfs_madmin::{ITEM_OFFLINE, StorageInfo};
@@ -22,7 +23,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sysinfo::{Disks, Networks, RefreshKind, System};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::manifest_entry::ManifestEntry;
 use super::redaction::RedactionError;
@@ -30,6 +33,7 @@ use super::redaction::RedactionError;
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 const MAX_DRIVES: usize = 4_096;
+static SYSTEM_SCAN_PERMIT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum DataClassification {
@@ -154,6 +158,8 @@ pub enum CollectorError {
     TaskFailed,
     #[error("offline diagnostic storage topology exceeds its 4096 drive budget")]
     StorageTopologyTooLarge,
+    #[error("offline diagnostic storage topology contains an invalid endpoint")]
+    InvalidStorageEndpoint,
     #[error("offline diagnostic field {field_id} exceeds its {limit} byte entry budget")]
     EntryTooLarge { field_id: &'static str, limit: usize },
     #[error("offline diagnostic entry is not representable as JSON")]
@@ -184,8 +190,12 @@ impl TryFrom<&StorageInfo> for StorageSnapshot {
         let node_count = info
             .disks
             .iter()
-            .filter_map(|disk| (!disk.endpoint.is_empty()).then_some(disk.endpoint.as_str()))
-            .collect::<BTreeSet<_>>()
+            .map(|disk| {
+                let endpoint = Url::parse(&disk.endpoint).map_err(|_| CollectorError::InvalidStorageEndpoint)?;
+                let host = endpoint.host_str().ok_or(CollectorError::InvalidStorageEndpoint)?;
+                Ok((host.to_owned(), endpoint.port_or_known_default()))
+            })
+            .collect::<Result<BTreeSet<_>, CollectorError>>()?
             .len();
         let offline_drives = info.disks.iter().filter(|disk| disk.state == ITEM_OFFLINE).count();
         Ok(Self {
@@ -200,7 +210,10 @@ impl TryFrom<&StorageInfo> for StorageSnapshot {
                 .iter()
                 .fold(0_u64, |total, disk| total.saturating_add(disk.total_space)),
             offline_drives,
-            degraded: info.disks.iter().any(|disk| disk.state != rustfs_madmin::ITEM_ONLINE),
+            degraded: info
+                .disks
+                .iter()
+                .any(|disk| !matches!(disk.state.as_str(), "ok" | "unformatted" | rustfs_madmin::ITEM_ONLINE)),
             healing: info.disks.iter().any(|disk| disk.healing),
             scanning: info.disks.iter().any(|disk| disk.scanning),
         })
@@ -222,6 +235,9 @@ struct SystemSnapshot {
 
 impl SystemSnapshot {
     fn collect() -> Self {
+        #[cfg(test)]
+        let _scan = test_support::ScanGuard::start();
+
         // Do not enumerate processes: Q07 allows only CPU and memory summaries.
         let system = System::new_with_specifics(RefreshKind::everything().without_processes());
         let total_memory_bytes = system.total_memory();
@@ -247,6 +263,36 @@ impl SystemSnapshot {
     }
 }
 
+async fn collect_system_snapshot(cancel: &CancellationToken) -> Result<SystemSnapshot, CollectorError> {
+    let deadline = tokio::time::Instant::now() + COLLECT_TIMEOUT;
+    let permit = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(CollectorError::Cancelled),
+        result = tokio::time::timeout_at(deadline, SYSTEM_SCAN_PERMIT.clone().acquire_owned()) => {
+            match result {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => return Err(CollectorError::TaskFailed),
+                Err(_) => return Err(CollectorError::TimedOut),
+            }
+        }
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        SystemSnapshot::collect()
+    });
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(CollectorError::Cancelled),
+        result = tokio::time::timeout_at(deadline, task) => {
+            match result {
+                Ok(Ok(snapshot)) => Ok(snapshot),
+                Ok(Err(_)) => Err(CollectorError::TaskFailed),
+                Err(_) => Err(CollectorError::TimedOut),
+            }
+        }
+    }
+}
+
 /// Collect all and only the Q07 offline L0/L1 fields, with one independently
 /// bounded and redacted manifest entry per field.
 pub async fn collect_offline_diagnostics(
@@ -257,29 +303,115 @@ pub async fn collect_offline_diagnostics(
         return Err(CollectorError::Cancelled);
     }
     let storage = StorageSnapshot::try_from(storage_info)?;
-    let task = tokio::task::spawn_blocking(SystemSnapshot::collect);
-    let mut task = std::pin::pin!(task);
-    let system = tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            task.as_mut().abort();
-            return Err(CollectorError::Cancelled);
-        }
-        result = tokio::time::timeout(COLLECT_TIMEOUT, &mut task) => {
-            match result {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(_)) => return Err(CollectorError::TaskFailed),
-                Err(_) => {
-                    task.as_mut().abort();
-                    return Err(CollectorError::TimedOut);
-                }
-            }
-        }
-    };
+    let system = collect_system_snapshot(cancel).await?;
 
     let mut entries = Vec::with_capacity(COLLECTORS.len());
     for collector in COLLECTORS {
         entries.push(ManifestEntry::from_value(collector, collector.value(&storage, &system), cancel)?);
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    pub(super) static DELAY_MILLIS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static MAX_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) struct ScanGuard;
+
+    impl ScanGuard {
+        pub(super) fn start() -> Self {
+            let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            MAX_ACTIVE.fetch_max(active, Ordering::SeqCst);
+            let delay = DELAY_MILLIS.load(Ordering::SeqCst);
+            if delay != 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            Self
+        }
+    }
+
+    impl Drop for ScanGuard {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use rustfs_madmin::StorageInfo;
+
+    use super::*;
+
+    async fn wait_for_active(expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while test_support::ACTIVE.load(Ordering::SeqCst) != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("system scan reaches expected state");
+    }
+
+    #[tokio::test]
+    async fn connect_offline_collectors_timeout_and_cancel_never_overlap_system_scans() {
+        test_support::MAX_ACTIVE.store(0, Ordering::SeqCst);
+        test_support::DELAY_MILLIS.store((COLLECT_TIMEOUT + Duration::from_millis(200)).as_millis() as u64, Ordering::SeqCst);
+
+        let first_cancel = CancellationToken::new();
+        assert!(matches!(
+            collect_offline_diagnostics(&StorageInfo::default(), &first_cancel).await,
+            Err(CollectorError::TimedOut)
+        ));
+        assert_eq!(test_support::ACTIVE.load(Ordering::SeqCst), 1, "timed-out blocking scan remains active");
+
+        let second_cancel = CancellationToken::new();
+        let second = tokio::spawn({
+            let second_cancel = second_cancel.clone();
+            async move { collect_offline_diagnostics(&StorageInfo::default(), &second_cancel).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            test_support::MAX_ACTIVE.load(Ordering::SeqCst),
+            1,
+            "a timed-out scan keeps the single-flight permit"
+        );
+        second_cancel.cancel();
+        assert!(matches!(second.await.expect("second collector task"), Err(CollectorError::Cancelled)));
+        wait_for_active(0).await;
+
+        test_support::MAX_ACTIVE.store(0, Ordering::SeqCst);
+        test_support::DELAY_MILLIS.store(250, Ordering::SeqCst);
+        let third_cancel = CancellationToken::new();
+        let third = tokio::spawn({
+            let third_cancel = third_cancel.clone();
+            async move { collect_offline_diagnostics(&StorageInfo::default(), &third_cancel).await }
+        });
+        wait_for_active(1).await;
+        third_cancel.cancel();
+        assert!(matches!(third.await.expect("third collector task"), Err(CollectorError::Cancelled)));
+
+        let fourth_cancel = CancellationToken::new();
+        let fourth = tokio::spawn({
+            let fourth_cancel = fourth_cancel.clone();
+            async move { collect_offline_diagnostics(&StorageInfo::default(), &fourth_cancel).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            test_support::MAX_ACTIVE.load(Ordering::SeqCst),
+            1,
+            "a cancelled scan keeps the single-flight permit"
+        );
+        fourth_cancel.cancel();
+        assert!(matches!(fourth.await.expect("fourth collector task"), Err(CollectorError::Cancelled)));
+        wait_for_active(0).await;
+        test_support::DELAY_MILLIS.store(0, Ordering::SeqCst);
+    }
 }
