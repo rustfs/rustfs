@@ -1373,9 +1373,32 @@ pub(super) async fn persisted_usage_floor(
     }
 
     if !found_any {
-        return Err(ScannerError::Other(
-            "persisted scanner usage floor has no authoritative baseline".to_string(),
-        ));
+        let Some(publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
+            return Err(ScannerError::Other(
+                "scanner usage floor changed before pristine state confirmation".to_string(),
+            ));
+        };
+        for path in [
+            DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        ] {
+            match read_config(storeapi.clone(), &path).await {
+                Err(EcstoreError::ConfigNotFound) => {}
+                Ok(_) => {
+                    return Err(ScannerError::Other(format!(
+                        "scanner usage floor changed while confirming pristine state: {path} appeared"
+                    )));
+                }
+                Err(err) => {
+                    return Err(ScannerError::Other(format!(
+                        "failed to confirm pristine scanner usage floor at {path}: {err}"
+                    )));
+                }
+            }
+        }
+        drop(publication_admission);
     }
     let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi, read_epoch).await else {
         return Err(ScannerError::Other(
