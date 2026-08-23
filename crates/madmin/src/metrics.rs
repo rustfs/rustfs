@@ -322,6 +322,8 @@ pub struct ScannerUsageFreshnessSnapshot {
 
 impl ScannerUsageFreshnessSnapshot {
     fn merge(&mut self, other: &Self) {
+        let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
+        let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
         self.dirty_pending_buckets = self.dirty_pending_buckets.saturating_add(other.dirty_pending_buckets);
         self.last_dirty_mark_unix_secs = self.last_dirty_mark_unix_secs.max(other.last_dirty_mark_unix_secs);
         self.last_dirty_clear_unix_secs = self.last_dirty_clear_unix_secs.max(other.last_dirty_clear_unix_secs);
@@ -341,8 +343,6 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_publication_reason = other.last_publication_reason.clone();
         }
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
-        let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
-        let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
         if other_deferred_state_at > self_deferred_state_at {
             self.deferred_pending = other.deferred_pending;
         } else if other_deferred_state_at == self_deferred_state_at {
