@@ -15,16 +15,28 @@
 use crate::common::RustFSTestClusterEnvironment;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use tracing::{info, warn};
 
 const BUCKET: &str = "conditional-put-race-bucket";
+const BUCKET_METADATA_RELOAD_BUCKET: &str = "bucket-metadata-reload-barrier";
 
 async fn cleanup_object(client: &Client, key: &str) {
     if let Err(e) = client.delete_object().bucket(BUCKET).key(key).send().await {
         warn!("Failed to delete object '{}' from bucket '{}' during cleanup: {:?}", key, BUCKET, e);
+    }
+}
+
+async fn assert_bucket_cors_missing(client: &Client) {
+    let result = client.get_bucket_cors().bucket(BUCKET_METADATA_RELOAD_BUCKET).send().await;
+    match result {
+        Err(SdkError::ServiceError(error)) => {
+            assert_eq!(error.err().meta().code(), Some("NoSuchCORSConfiguration"));
+        }
+        result => panic!("expected the peer to report a missing CORS configuration: {result:?}"),
     }
 }
 
@@ -234,5 +246,50 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
     }
 
     cleanup_object(&client, test_key).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bucket_cors_write_is_visible_on_peer_before_response() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::common::init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET_METADATA_RELOAD_BUCKET).await?;
+
+    let writer = cluster.create_s3_client(0)?;
+    let reader = cluster.create_s3_client(1)?;
+    assert_bucket_cors_missing(&reader).await;
+
+    let rule = CorsRule::builder()
+        .allowed_methods("GET")
+        .allowed_origins("https://example.com")
+        .build()?;
+    let configuration = CorsConfiguration::builder().cors_rules(rule).build()?;
+
+    writer
+        .put_bucket_cors()
+        .bucket(BUCKET_METADATA_RELOAD_BUCKET)
+        .cors_configuration(configuration)
+        .send()
+        .await?;
+
+    let response = reader.get_bucket_cors().bucket(BUCKET_METADATA_RELOAD_BUCKET).send().await?;
+    let rules = response.cors_rules();
+    assert_eq!(
+        rules.len(),
+        1,
+        "peer should observe the committed CORS rule before the write response returns"
+    );
+    assert_eq!(rules[0].allowed_methods(), ["GET"]);
+    assert_eq!(rules[0].allowed_origins(), ["https://example.com"]);
+
+    writer
+        .delete_bucket_cors()
+        .bucket(BUCKET_METADATA_RELOAD_BUCKET)
+        .send()
+        .await?;
+    assert_bucket_cors_missing(&reader).await;
+    writer.delete_bucket().bucket(BUCKET_METADATA_RELOAD_BUCKET).send().await?;
     Ok(())
 }

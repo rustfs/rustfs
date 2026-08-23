@@ -3739,17 +3739,55 @@ impl ManualTransitionRunReport {
     }
 
     pub fn merge_scan_report_preserving_worker(&mut self, scan_report: &ManualTransitionRunReport) {
+        let previous = self.clone();
+        let resumed_after_checkpoint = previous.continuation_token.is_some() && scan_report.scanned < previous.scanned;
         let mut tier_failure_by_reason = self.tier_failure_by_reason.clone();
         for (reason, count) in &scan_report.tier_failure_by_reason {
             let current = tier_failure_by_reason.get(reason).copied().unwrap_or_default();
-            tier_failure_by_reason.insert(*reason, current.max(*count));
+            let merged = if resumed_after_checkpoint {
+                current.saturating_add(*count)
+            } else {
+                current.max(*count)
+            };
+            tier_failure_by_reason.insert(*reason, merged);
         }
         let transition_completed = self.transition_completed;
         let transition_failed = self.transition_failed;
         *self = scan_report.clone();
+        if resumed_after_checkpoint {
+            self.scanned = previous.scanned.saturating_add(scan_report.scanned);
+            self.eligible = previous.eligible.saturating_add(scan_report.eligible);
+            self.enqueued = previous.enqueued.saturating_add(scan_report.enqueued);
+            self.dry_run_eligible = previous.dry_run_eligible.saturating_add(scan_report.dry_run_eligible);
+            self.skipped_not_transition = previous
+                .skipped_not_transition
+                .saturating_add(scan_report.skipped_not_transition);
+            self.skipped_tier = previous.skipped_tier.saturating_add(scan_report.skipped_tier);
+            self.skipped_delete_marker = previous
+                .skipped_delete_marker
+                .saturating_add(scan_report.skipped_delete_marker);
+            self.skipped_directory = previous.skipped_directory.saturating_add(scan_report.skipped_directory);
+            self.skipped_replication = previous.skipped_replication.saturating_add(scan_report.skipped_replication);
+            self.skipped_already_transitioned = previous
+                .skipped_already_transitioned
+                .saturating_add(scan_report.skipped_already_transitioned);
+            self.skipped_already_in_flight = previous
+                .skipped_already_in_flight
+                .saturating_add(scan_report.skipped_already_in_flight);
+            self.skipped_queue_full = previous.skipped_queue_full.saturating_add(scan_report.skipped_queue_full);
+            self.skipped_queue_closed = previous.skipped_queue_closed.saturating_add(scan_report.skipped_queue_closed);
+            self.skipped_queue_timeout = previous
+                .skipped_queue_timeout
+                .saturating_add(scan_report.skipped_queue_timeout);
+            self.tier_failure = previous.tier_failure.saturating_add(scan_report.tier_failure);
+        }
+        self.lifecycle_config_found = previous.lifecycle_config_found || scan_report.lifecycle_config_found;
+        self.truncated_by_limit = previous.truncated_by_limit || scan_report.truncated_by_limit;
+        self.truncated_by_duration = previous.truncated_by_duration || scan_report.truncated_by_duration;
+        self.cancelled = previous.cancelled || scan_report.cancelled;
         self.transition_completed = transition_completed;
         self.transition_failed = transition_failed;
-        self.tier_failure = scan_report.tier_failure.saturating_add(transition_failed);
+        self.tier_failure = self.tier_failure.saturating_add(transition_failed);
         self.tier_failure_by_reason = tier_failure_by_reason;
     }
 
@@ -3765,7 +3803,10 @@ struct ManualTransitionContinuationToken {
     version_marker: Option<String>,
 }
 
-fn encode_manual_transition_continuation_token(marker: Option<String>, version_marker: Option<String>) -> Option<String> {
+pub(super) fn encode_manual_transition_continuation_token(
+    marker: Option<String>,
+    version_marker: Option<String>,
+) -> Option<String> {
     if marker.is_none() && version_marker.is_none() {
         return None;
     }
@@ -9136,6 +9177,7 @@ mod tests {
         assert_eq!(loaded.report.scanned, 37);
         assert_eq!(loaded.report.eligible, 11);
         assert_eq!(loaded.report.enqueued, 5);
+        assert_eq!(loaded.cursor_revision, Some(37));
         assert!(loaded.lease_expires_at_unix_nanos > 0);
         let token = loaded
             .report
@@ -9153,6 +9195,30 @@ mod tests {
         assert_eq!(admission.job_id, job_id);
         assert_eq!(admission.lease_id, loaded.lease_id);
         assert_eq!(admission.lease_expires_at_unix_nanos, loaded.lease_expires_at_unix_nanos);
+
+        let mut same_marker_report = report.clone();
+        same_marker_report.scanned += 1;
+        persist_manual_transition_page_checkpoint(
+            &checkpoint_options,
+            &same_marker_report,
+            Some("logs/page-end".to_string()),
+            Some("opaque-next-version".to_string()),
+        )
+        .await
+        .expect("same-marker version checkpoint should persist through the durable progress sink");
+        let same_marker_checkpointed = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("same-marker version checkpoint should reload");
+        assert_eq!(same_marker_checkpointed.cursor_revision, Some(38));
+        let (_, version_marker) = decode_manual_transition_continuation_token(
+            same_marker_checkpointed
+                .report
+                .continuation_token
+                .as_deref()
+                .expect("same-marker version checkpoint should persist a cursor"),
+        )
+        .expect("same-marker version cursor should decode");
+        assert_eq!(version_marker.as_deref(), Some("opaque-next-version"));
 
         create_test_bucket(&ecstore, &bucket).await;
         let lifecycle_xml = format!(
@@ -9210,6 +9276,7 @@ mod tests {
         assert_eq!(checkpointed.report.scanned, 1000);
         assert_eq!(checkpointed.report.eligible, 1000);
         assert_eq!(checkpointed.report.dry_run_eligible, 1000);
+        assert_eq!(checkpointed.cursor_revision, Some(1000));
         let token = checkpointed
             .report
             .continuation_token

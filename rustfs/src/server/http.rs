@@ -1831,6 +1831,13 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
         } else if hyper_err.is_parse() {
             log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
+            // is_user() = "error from user's Body stream": the application
+            // returned a streaming body that failed mid-flight. Log the full
+            // error source chain so the underlying cause (disk read failure,
+            // upstream RPC error, deleted object, etc.) is visible.
+            let cause = std::error::Error::source(hyper_err)
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             error!(
                 event = EVENT_HTTP_TRANSPORT_FAILED,
                 component = LOG_COMPONENT_SERVER,
@@ -1838,6 +1845,7 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
                 peer_addr = %peer_addr,
                 error_kind = "service_error",
                 error = %hyper_err,
+                cause = %cause,
                 result = "transport_error",
                 "HTTP transport failed"
             );

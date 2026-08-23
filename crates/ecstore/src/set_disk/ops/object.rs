@@ -37,7 +37,7 @@ use crate::bucket::lifecycle::{
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
-        save_transition_transaction_record,
+        load_transition_transaction_record, save_transition_transaction_record,
     },
 };
 use crate::bucket::quota::reservation;
@@ -4248,7 +4248,12 @@ fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, 
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
     if let Some(api) = api {
-        return delete_transition_transaction_record(api.clone(), transaction_id).await;
+        let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
+            Ok(transaction) => transaction,
+            Err(Error::ConfigNotFound) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        return delete_transition_transaction_record(api.clone(), &transaction).await;
     }
     Ok(())
 }
@@ -6637,12 +6642,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
         // MRF journal intent: partial-write recovery must survive a restart
         // (HS-01); the heal request below remains the in-memory fast path.
-        rustfs_common::mrf_channel::try_send_mrf_intent(
-            rustfs_common::mrf_channel::MrfKind::PartialWrite,
-            bucket,
-            object,
-            uuid::Uuid::try_parse(version_id).ok(),
-        );
+        let version_uuid = if version_id.is_empty() {
+            Some(None)
+        } else {
+            uuid::Uuid::try_parse(version_id).ok().map(Some)
+        };
+        if let Some(version_uuid) = version_uuid
+            && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(self.pool_index), u32::try_from(self.set_index))
+        {
+            let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+            let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
+                rustfs_common::mrf_channel::MrfKind::PartialWrite,
+                bucket,
+                object,
+                version_uuid,
+                Some(scope),
+            );
+        }
         let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),
