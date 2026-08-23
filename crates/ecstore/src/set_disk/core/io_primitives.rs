@@ -140,6 +140,21 @@ struct CoalescedReadVersionRequest {
     tx: oneshot::Sender<disk::error::Result<FileInfo>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedBatchReadVersionItem {
+    path: String,
+    version_id: String,
+}
+
+impl From<&BatchReadVersionItem> for ExpectedBatchReadVersionItem {
+    fn from(item: &BatchReadVersionItem) -> Self {
+        Self {
+            path: item.path.clone(),
+            version_id: item.version_id.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ReadVersionCoalescerKey {
     disk: usize,
@@ -266,7 +281,7 @@ async fn flush_read_version_coalescer_pending(
         items.push(request.item);
     }
 
-    let expected_items = items.clone();
+    let expected_items = items.iter().map(ExpectedBatchReadVersionItem::from).collect::<Vec<_>>();
     record_read_version_coalescer_event("attempted_batch", items.len());
     let result =
         match tokio::time::timeout(get_drive_metadata_timeout(), disk.batch_read_version(BatchReadVersionReq { items, opts }))
@@ -292,7 +307,7 @@ async fn flush_read_version_coalescer_pending(
 }
 
 fn map_batch_read_version_responses(
-    expected_items: &[BatchReadVersionItem],
+    expected_items: &[ExpectedBatchReadVersionItem],
     responses: Vec<BatchReadVersionResp>,
 ) -> Vec<crate::disk::error::Result<FileInfo>> {
     let mut results = (0..expected_items.len())
@@ -6878,6 +6893,7 @@ mod tests {
             },
         ];
 
+        let expected_items = expected_batch_read_version_items(&expected_items);
         let mut results = map_batch_read_version_responses(&expected_items, responses).into_iter();
         let first = results
             .next()
@@ -6918,6 +6934,7 @@ mod tests {
                 version_id: "v-b".to_string(),
             },
         ];
+        let expected_items = expected_batch_read_version_items(&expected_items);
         let results = map_batch_read_version_responses(
             &expected_items,
             vec![
@@ -6957,6 +6974,7 @@ mod tests {
             path: "object-a".to_string(),
             version_id: "v-a".to_string(),
         }];
+        let expected_items = expected_batch_read_version_items(&expected_items);
         let mismatched = map_batch_read_version_responses(
             &expected_items,
             vec![BatchReadVersionResp {
@@ -7016,6 +7034,10 @@ mod tests {
             duplicate.to_string().contains("duplicate index"),
             "unexpected duplicate error: {duplicate}"
         );
+    }
+
+    fn expected_batch_read_version_items(items: &[BatchReadVersionItem]) -> Vec<ExpectedBatchReadVersionItem> {
+        items.iter().map(ExpectedBatchReadVersionItem::from).collect()
     }
 
     /// Isolation guard: unobserved objects record nothing (so parallel tests do
