@@ -7143,7 +7143,7 @@ async fn wait_for_proxy_replication_requests(
 /// rustfs/backlog#1953 (audit A4/P1-6): receiver-side LWW for replicated
 /// metadata categories, exercised end to end over the real dual-node
 /// active-active site-replication control plane — sender, worker, status
-/// bookkeeping and MRF replay all participate (the single-server
+/// bookkeeping and persisted failure recovery all participate (the single-server
 /// `replication_lww_receiver_test` only injects authorized replication PUTs).
 ///
 /// Scenario on one versioned object:
@@ -7153,19 +7153,21 @@ async fn wait_for_proxy_replication_requests(
 ///    authors a newer edit that reaches A first; releasing the stale delivery
 ///    must NOT roll B back — both sites settle on B's value and stay there
 ///    through a quiet window, with no FAILED/PENDING status left behind;
-/// 3. MRF replay: B is stopped, A tags again (delivery fails -> MRF), B is
-///    restarted in place and the replayed edit converges both sites forward.
+/// 3. persisted retry: B is stopped, A's delivery reaches FAILED, A restarts,
+///    then B returns and the scanner-replayed edit converges both sites forward.
+/// Durable metadata-MRF serialization/reconstruction is covered separately by
+/// `metadata_mrf_roundtrip_preserves_tags_and_admitted_targets`.
 #[tokio::test]
 async fn test_site_replication_tagging_lww_converges_active_active_real_dual_node() -> TestResult {
     init_logging();
 
     match tokio::time::timeout(Duration::from_secs(420), async {
-        // Fast health-check / MRF flush only; the scanner keeps its default
-        // cycle so no scanner re-drive can re-deliver the source's *current*
-        // state behind the deliberately stale delivery in step 2 (which would
-        // mask a receiver-side LWW regression by accident).
+        // The scanner is fast for the final persisted-failure recovery phase.
+        // Step 2 finishes and proves a quiet stable winner before that phase,
+        // so a later scanner pass cannot mask its stale-delivery assertion.
         let mut site_env = replication_fast_env();
         site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+        site_env.extend_from_slice(FAST_SCANNER_ENV);
 
         let mut site_a_env = RustFSTestEnvironment::new().await?;
         site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
@@ -7331,10 +7333,12 @@ async fn test_site_replication_tagging_lww_converges_active_active_real_dual_nod
             );
         }
 
-        // --- 3. MRF replay: B is down while A edits; the replay converges forward
+        // --- 3. persisted FAILED state survives a source restart ------------
         site_b_env.stop_server();
         put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a3").await?;
-        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["PENDING", "FAILED"], "site A").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["FAILED"], "site A").await?;
+        site_a_env.restart_server_preserving_data(vec![], &site_env).await?;
+        wait_for_site_replication_enabled(&site_a_env, 2).await?;
         site_b_env.restart_server_preserving_data(vec![], &site_env).await?;
         wait_for_site_replication_enabled(&site_b_env, 2).await?;
 

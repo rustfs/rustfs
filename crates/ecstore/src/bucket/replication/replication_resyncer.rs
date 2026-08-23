@@ -174,6 +174,10 @@ fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
     err.raw_response().is_some_and(|r| r.status().as_u16() == status)
 }
 
+fn replica_metadata_requires_existing_target(op_type: ReplicationType, status: &ReplicationStatusType) -> bool {
+    op_type == ReplicationType::Metadata && *status == ReplicationStatusType::Replica
+}
+
 const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_identity_drift_total";
 
 /// Targets that already produced a version-identity-drift warning this
@@ -2934,6 +2938,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         let mut replication_action = replication_action;
+        let require_existing_target = replica_metadata_requires_existing_target(self.op_type, &self.replication_status);
         match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
             .await
         {
@@ -2957,6 +2962,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
             Err(e) => {
                 if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+                    if require_existing_target {
+                        rinfo.error = Some("replica metadata target does not contain this object version".to_string());
+                        return rinfo;
+                    }
                     // Object not on target yet → fall through to PUT.
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
@@ -2971,6 +2980,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
                             rinfo.size = size;
+                            return rinfo;
+                        }
+                        Ok(_) if require_existing_target => {
+                            rinfo.error = Some("replica metadata target does not contain matching object data".to_string());
                             return rinfo;
                         }
                         Ok(_) => {}
@@ -3896,6 +3909,22 @@ mod tests {
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn replica_metadata_requires_target_possession_before_full_put() {
+        assert!(replica_metadata_requires_existing_target(
+            ReplicationType::Metadata,
+            &ReplicationStatusType::Replica
+        ));
+        assert!(!replica_metadata_requires_existing_target(
+            ReplicationType::Metadata,
+            &ReplicationStatusType::Completed
+        ));
+        assert!(!replica_metadata_requires_existing_target(
+            ReplicationType::Object,
+            &ReplicationStatusType::Replica
+        ));
+    }
 
     fn test_target_client(endpoint: String) -> Arc<TargetClient> {
         let config = aws_sdk_s3::Config::builder()
