@@ -192,8 +192,11 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Verify protocol socket oracle
-        run: ss -tn state CLOSE-WAIT >/dev/null
+      - name: Install and verify protocol socket oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2
+          ss -tn state CLOSE-WAIT >/dev/null
 
       # The suite owns fixed protocol ports and serializes its internal cases.
       - name: Verify protocol e2e membership

@@ -8963,6 +8963,7 @@ impl DiskAPI for LocalDisk {
         )
         .await?;
 
+        out.close().await?;
         Ok(())
     }
 
