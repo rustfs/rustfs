@@ -3599,7 +3599,6 @@ impl ECStore {
         if should_save_pool_meta {
             self.ctx.advance_data_movement_operation_epoch();
         }
-        drop(_movement_guard);
 
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
