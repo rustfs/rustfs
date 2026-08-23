@@ -121,7 +121,7 @@ struct DecommissionOperation {
 }
 
 impl DecommissionCanceler {
-    fn new(token: CancellationToken) -> Self {
+    pub(crate) fn new(token: CancellationToken) -> Self {
         Self {
             operation: Arc::new(DecommissionOperation {
                 token,
