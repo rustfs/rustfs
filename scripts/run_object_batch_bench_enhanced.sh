@@ -459,7 +459,7 @@ write_manifest_entry() {
 
 write_run_manifest() {
   local manifest_file="$OUT_DIR/run_manifest.env"
-  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
+  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv report_operation
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   git_commit="$(git_value unknown rev-parse --short HEAD)"
   git_branch="$(git_value unknown branch --show-current)"
@@ -467,6 +467,10 @@ write_run_manifest() {
   rustc_version="$(rustc --version 2>/dev/null || echo unknown)"
   uname_s="$(uname -a 2>/dev/null || echo unknown)"
   service_metrics_csv="${SERVICE_METRICS_CSV:-}"
+  report_operation="N/A"
+  if [[ "$TOOL" == "warp" ]]; then
+    report_operation="$(warp_report_operation)"
+  fi
 
   cat >"$manifest_file" <<EOF
 started_at_utc=${started_at_utc}
@@ -494,6 +498,7 @@ retry_sleep_secs=${RETRY_SLEEP_SECS}
 cooldown_secs=${COOLDOWN_SECS}
 warp_bin=${WARP_BIN}
 warp_mode=${WARP_MODE}
+warp_report_operation=${report_operation}
 duration=${DURATION}
 s3bench_bin=${S3BENCH_BIN}
 samples=${SAMPLES}
@@ -662,24 +667,23 @@ to_ms() {
   awk -v n="$number" -v f="$factor" 'BEGIN { printf "%.6f\n", n * f }'
 }
 
-extract_first() {
-  local regex="$1"
-  local file="$2"
-  rg -o "$regex" "$file" | head -n1 || true
+warp_report_operation() {
+  case "$WARP_MODE" in
+    get) echo GET ;;
+    put|mixed) echo PUT ;;
+  esac
 }
 
-extract_report_line() {
-  local regex="$1"
+extract_warp_report() {
+  local operation="$1"
   local file="$2"
-  awk -v regex="$regex" '
+  awk -v operation="$operation" '
     /^(Report|Operation):/ {
-      in_report = 1
+      target = "^(Report|Operation):[[:space:]]*" operation "([[:space:].-]|$)"
+      in_report = ($0 ~ target || $0 ~ /^Report:[[:space:]]*$/)
       next
     }
-    in_report && $0 ~ regex {
-      print
-      exit
-    }
+    in_report { print }
   ' "$file"
 }
 
@@ -703,16 +707,25 @@ normalize_duration_metric() {
 extract_metrics() {
   local log_file="$1"
 
-  local average_line request_line throughput reqps latency req_p90 req_p99 reqps_num
-  average_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Average:' "$log_file")"
-  request_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+(Reqs:[[:space:]]+)?Avg:' "$log_file")"
+  local report average_line throughput_line request_line throughput reqps latency req_p90 req_p99 reqps_num
+  if [[ "$TOOL" == "warp" ]]; then
+    report="$(extract_warp_report "$(warp_report_operation)" "$log_file")"
+  else
+    report="$(<"$log_file")"
+  fi
+  average_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Average:/ { print; exit }')"
+  throughput_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Throughput:/ { print; exit }')"
+  request_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+(Reqs:[[:space:]]+)?Avg:/ { print; exit }')"
 
   if [[ -n "$average_line" ]]; then
     throughput="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*//; s/,[[:space:]]*.*$//')"
     reqps="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*[^,]+,[[:space:]]*//; s/[[:space:]]*$//')"
+  elif [[ -n "$throughput_line" ]]; then
+    throughput="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   else
-    throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
-    reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
+    throughput="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   fi
 
   if [[ -n "$request_line" ]]; then
@@ -720,9 +733,9 @@ extract_metrics() {
     req_p90="$(echo "$request_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
     req_p99="$(echo "$request_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
   else
-    latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
-    req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
-    req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
+    latency="$(printf '%s\n' "$report" | rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//' || true)"
+    req_p90="$(printf '%s\n' "$report" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^90%:[[:space:]]+//' || true)"
+    req_p99="$(printf '%s\n' "$report" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^99%:[[:space:]]+//' || true)"
   fi
 
   throughput="$(trim "${throughput:-N/A}")"
