@@ -246,6 +246,9 @@ pub(crate) struct ClusterUsageFreshnessStatus {
     pub last_usage_save_result: String,
     pub last_success_unix_secs: Option<u64>,
     pub last_durable_success_unix_secs: u64,
+    pub last_publication_unix_secs: u64,
+    pub last_publication_state: String,
+    pub last_publication_reason: String,
     pub last_error: Option<String>,
     pub deferred_pending: bool,
     pub deferred_total: u64,
@@ -717,7 +720,12 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
         now.saturating_sub(freshness.last_deferred_unix_secs)
     });
     let deferred_stale = deferred_age_secs.is_some_and(|age| age > USAGE_DEFERRED_STALE_THRESHOLD_SECS);
-    let (condition, status) = if freshness.deferred_pending && deferred_stale {
+    let (condition, status) = if freshness.last_publication_state == "no_update" {
+        (
+            "no_update",
+            CapabilityStatus::unknown().with_reason("usage cache publication produced no update"),
+        )
+    } else if freshness.deferred_pending && deferred_stale {
         (
             "stale",
             CapabilityStatus::unknown().with_reason(format!(
@@ -781,6 +789,9 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
         last_usage_save_result: freshness.last_usage_save_result.clone(),
         last_success_unix_secs,
         last_durable_success_unix_secs: freshness.last_durable_success_unix_secs,
+        last_publication_unix_secs: freshness.last_publication_unix_secs,
+        last_publication_state: freshness.last_publication_state.clone(),
+        last_publication_reason: freshness.last_publication_reason.clone(),
         last_error,
         deferred_pending: freshness.deferred_pending,
         deferred_total: freshness.deferred_total,

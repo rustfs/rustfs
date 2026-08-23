@@ -447,7 +447,14 @@ where
                 global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::PriorCycleDurable;
             }
-            DataUsagePersistOutcome::Failed | DataUsagePersistOutcome::NoUpdate => {
+            DataUsagePersistOutcome::NoUpdate => {
+                global_metrics().record_scanner_usage_publication("no_update", "no_update");
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+                outcome = DataUsagePersistOutcome::NoUpdate;
+                continue;
+            }
+            DataUsagePersistOutcome::Failed => {
+                global_metrics().record_scanner_usage_publication("failed", "save_failed");
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
                 outcome = DataUsagePersistOutcome::Failed;
                 continue;

@@ -304,6 +304,12 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_result_code: u64,
     #[serde(rename = "last_durable_success_unix_secs", default)]
     pub last_durable_success_unix_secs: u64,
+    #[serde(rename = "last_publication_unix_secs", default)]
+    pub last_publication_unix_secs: u64,
+    #[serde(rename = "last_publication_state", default)]
+    pub last_publication_state: String,
+    #[serde(rename = "last_publication_reason", default)]
+    pub last_publication_reason: String,
     #[serde(rename = "deferred_pending", default)]
     pub deferred_pending: bool,
     #[serde(rename = "deferred_total", default)]
@@ -329,6 +335,11 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_usage_save_result_code = other.last_usage_save_result_code;
         }
         self.last_durable_success_unix_secs = self.last_durable_success_unix_secs.max(other.last_durable_success_unix_secs);
+        if other.last_publication_unix_secs > self.last_publication_unix_secs {
+            self.last_publication_unix_secs = other.last_publication_unix_secs;
+            self.last_publication_state = other.last_publication_state.clone();
+            self.last_publication_reason = other.last_publication_reason.clone();
+        }
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
         let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
         let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
@@ -1621,10 +1632,13 @@ mod tests {
         merged.merge(&ScannerUsageFreshnessSnapshot {
             deferred_pending: false,
             last_durable_success_unix_secs: 30,
+            last_publication_unix_secs: 30,
+            last_publication_state: "success".to_string(),
             ..Default::default()
         });
         assert!(!merged.deferred_pending);
         assert_eq!(merged.last_durable_success_unix_secs, 30);
+        assert_eq!(merged.last_publication_state, "success");
     }
 
     #[test]
