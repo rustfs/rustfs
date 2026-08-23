@@ -134,7 +134,7 @@ impl DecommissionCanceler {
         &self.operation.token
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.operation.active.load(Ordering::Acquire)
     }
 
