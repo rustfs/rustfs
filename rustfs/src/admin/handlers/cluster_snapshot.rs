@@ -769,8 +769,15 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
             ),
         }
     };
-    let last_success_unix_secs =
-        (freshness.last_durable_success_unix_secs > 0).then_some(freshness.last_durable_success_unix_secs);
+    // Mixed-version nodes do not publish the additive durable timestamp yet;
+    // retain the legacy successful-save timestamp until all peers are upgraded.
+    let last_success_unix_secs = if freshness.last_durable_success_unix_secs > 0 {
+        Some(freshness.last_durable_success_unix_secs)
+    } else if freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0 {
+        Some(freshness.last_usage_save_unix_secs)
+    } else {
+        None
+    };
     let last_error = match freshness.last_usage_save_result.as_str() {
         "failed" | "skipped_stale" | "encode_failed" => Some(freshness.last_usage_save_result.clone()),
         _ => None,
@@ -1350,6 +1357,11 @@ mod tests {
         assert_eq!(component.last_usage_save_unix_secs, 456);
         assert_eq!(component.last_usage_save_result, "success");
         assert_eq!(component.last_success_unix_secs, Some(450));
+
+        let mut legacy_snapshot = snapshot.clone();
+        legacy_snapshot.usage_freshness.last_durable_success_unix_secs = 0;
+        let legacy_component = super::summarize_usage_freshness(&legacy_snapshot);
+        assert_eq!(legacy_component.last_success_unix_secs, Some(456));
     }
 
     #[test]
