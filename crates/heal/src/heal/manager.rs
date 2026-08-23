@@ -1414,7 +1414,7 @@ impl HealManager {
         .await
     }
 
-    pub(crate) async fn submit_mrf_heal_request_with_receipt_and_identity(
+    pub(super) async fn submit_mrf_heal_request_with_receipt_and_identity(
         &self,
         request: HealRequest,
         mrf_notice_target: MrfRepairNoticeTarget,
