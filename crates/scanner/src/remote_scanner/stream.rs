@@ -796,6 +796,9 @@ async fn scan_and_persist_local_bucket(
         .await
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
     let done_save = Metrics::time(Metric::SaveUsage);
+    // DataUsageCache persistence acquires movement admission separately for
+    // each physical main/backup PUT, so a transition between those writes
+    // fails closed instead of being hidden by one outer guard.
     let save_result = cache.save_with_revisions(set, &cache_name, &revisions).await;
     done_save();
     save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;

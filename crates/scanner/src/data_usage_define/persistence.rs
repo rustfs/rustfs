@@ -13,7 +13,33 @@
 // limitations under the License.
 
 use super::*;
+use crate::ScannerConfigObjectDelete as _;
 use std::sync::Arc;
+
+#[derive(Debug)]
+struct CachePublicationAdmissionUnavailable;
+
+impl std::fmt::Display for CachePublicationAdmissionUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("scanner cache publication admission is unavailable")
+    }
+}
+
+impl std::error::Error for CachePublicationAdmissionUnavailable {}
+
+fn cache_publication_admission_unavailable() -> Error {
+    Error::Io(std::io::Error::other(CachePublicationAdmissionUnavailable))
+}
+
+fn is_cache_publication_admission_unavailable(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Io(io_error)
+            if io_error
+                .get_ref()
+                .is_some_and(|source| source.downcast_ref::<CachePublicationAdmissionUnavailable>().is_some())
+    )
+}
 
 pub(super) enum DataUsageCacheLoadAttempt {
     Loaded {
@@ -368,6 +394,9 @@ impl DataUsageCache {
     fn should_retry_save_error(err: &StorageError) -> bool {
         // Usage-cache files are best-effort scanner checkpoints. Retrying namespace
         // lock failures immediately only adds more lock traffic to the same hot object.
+        if is_cache_publication_admission_unavailable(err) {
+            return false;
+        }
         !matches!(
             err,
             StorageError::Lock(_)
@@ -423,7 +452,7 @@ impl DataUsageCache {
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
     }
 
-    async fn save_path_with_retry<S: ScannerObjectIO>(
+    async fn save_path_with_retry<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         store: Arc<S>,
         path: &str,
         buf: &[u8],
@@ -441,6 +470,9 @@ impl DataUsageCache {
             let buf_clone = buf.to_vec();
             let revision = revision.clone();
             async move {
+                let Some(_publication_admission) = store_clone.scanner_data_usage_publication_admission().await else {
+                    return Err(cache_publication_admission_unavailable());
+                };
                 if let Some(revision) = revision {
                     save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
                 } else {
@@ -486,11 +518,11 @@ impl DataUsageCache {
         Err(save_err)
     }
 
-    pub async fn save<S: ScannerObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn save<S: ScannerObjectIO + ScannerConfigObjectDelete>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         self.save_inner(store, name, None).await
     }
 
-    pub(crate) async fn save_with_revisions<S: ScannerObjectIO>(
+    pub(crate) async fn save_with_revisions<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
@@ -499,7 +531,7 @@ impl DataUsageCache {
         self.save_inner(store, name, Some(revisions)).await
     }
 
-    async fn save_inner<S: ScannerObjectIO>(
+    async fn save_inner<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
@@ -548,6 +580,9 @@ impl DataUsageCache {
                 error = %e,
                 "Scanner cache backup save failed"
             );
+            if is_cache_publication_admission_unavailable(&e) {
+                return Err(e);
+            }
         }
         Ok(())
     }

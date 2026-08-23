@@ -35,13 +35,13 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{debug, warn};
 
-use crate::ScannerObjectIO;
 use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
     ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError, TRANSITION_COMPLETE, save_config,
     save_config_with_preconditions, storageclass,
 };
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;

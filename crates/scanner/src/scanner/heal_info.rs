@@ -13,6 +13,7 @@
 // limitations under the License.
 /// The background-heal info object persisted between scanner cycles.
 use super::*;
+use crate::ScannerConfigObjectDelete as _;
 
 /// Background healing information
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -93,7 +94,21 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
         }
     };
 
-    // Save configuration
+    // Save configuration only after storage-owned movement admission. The
+    // read path may return an in-memory default for a missing object, but a
+    // movement transition must not let that default become durable state.
+    let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_BACKGROUND_HEAL,
+            path = %&*BACKGROUND_HEAL_INFO_PATH,
+            state = "publication_admission_unavailable",
+            "Scanner background heal save skipped without movement admission"
+        );
+        return;
+    };
     if let Err(e) = save_config(storeapi, &BACKGROUND_HEAL_INFO_PATH, data).await {
         warn!(
             target: "rustfs::scanner",

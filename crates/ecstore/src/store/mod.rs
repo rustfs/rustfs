@@ -349,10 +349,16 @@ impl ECStore {
     /// remain suspended until an operator clears or retries them, so they are
     /// a publication barrier even after the worker has stopped.
     pub async fn scanner_data_usage_publication_blocked(&self) -> bool {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
         self.scanner_data_usage_publication_snapshot_blocked().await
     }
 
     async fn scanner_data_usage_publication_snapshot_blocked(&self) -> bool {
+        if self.ctx.data_movement_operation_epoch_exhausted() {
+            self.ctx.set_scanner_publication_state(true);
+            return true;
+        }
         let decommission_cancelers = self.decommission_cancelers.read().await;
         let decommission_active = decommission_cancelers
             .iter()
@@ -378,7 +384,9 @@ impl ECStore {
             .as_ref()
             .is_some_and(is_rebalance_conflicting_with_decommission);
 
-        decommission_active || decommission_terminal || rebalance_active
+        let blocked = decommission_active || decommission_terminal || rebalance_active;
+        self.ctx.set_scanner_publication_state(blocked);
+        blocked
     }
 
     /// Admit one short data-usage publication commit under the same
@@ -399,6 +407,9 @@ impl ECStore {
     pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_operation_epoch_exhausted() {
+            return None;
+        }
         if self.scanner_data_usage_publication_snapshot_blocked().await {
             return None;
         }
@@ -1085,6 +1096,23 @@ mod tests {
             store.scanner_data_usage_publication_admission_guard().await.is_none(),
             "active rebalance must fail closed at the storage-owned admission boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_epoch_exhaustion_fails_closed_after_max() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        store.ctx.set_data_movement_operation_epoch_for_test(u64::MAX - 1);
+
+        assert_eq!(store.ctx.advance_data_movement_operation_epoch(), u64::MAX);
+        assert!(store.ctx.data_movement_operation_epoch_exhausted());
+        assert!(
+            store.scanner_data_usage_publication_admission_guard().await.is_none(),
+            "publication must fail closed at the reserved terminal epoch"
+        );
+
+        assert_eq!(store.ctx.advance_data_movement_operation_epoch(), u64::MAX);
+        assert!(store.ctx.data_movement_operation_epoch_exhausted());
+        assert!(store.scanner_data_usage_publication_blocked().await);
     }
 
     // The object graph is the isolation carrier: two ECStore instances holding

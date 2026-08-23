@@ -511,6 +511,39 @@ where
     .await
 }
 
+/// Save one scanner-owned metadata object only while storage-owned movement
+/// admission is held. Callers should perform reads and encoding before calling
+/// this helper so the fence covers only the final conditional write.
+pub(crate) async fn save_config_with_publication_admission<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    preconditions: HTTPPreconditions,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = api.scanner_data_usage_publication_admission().await else {
+        return Err(EcstoreError::other("scanner publication admission is unavailable"));
+    };
+    save_config_with_preconditions(api, file, data, preconditions).await
+}
+
+pub(crate) async fn delete_config_with_publication_admission<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    opts: ScannerObjectOptions,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = api.scanner_data_usage_publication_admission().await else {
+        return Err(EcstoreError::other("scanner publication admission is unavailable"));
+    };
+    api.delete_config_object(bucket, object, opts).await
+}
+
 pub(crate) async fn save_config_shared_with_preconditions<S>(
     api: Arc<S>,
     file: &str,
@@ -621,6 +654,23 @@ impl ScannerDataUsagePublicationAdmission {
 
 #[async_trait::async_trait]
 impl ScannerConfigObjectDelete for ECStore {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for SetDisks {
     async fn delete_config_object(
         &self,
         bucket: &str,

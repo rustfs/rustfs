@@ -495,6 +495,11 @@ impl ECStore {
             );
         }
 
+        // Initialize the storage-owned scanner publication state only after
+        // both movement metadata sources have been loaded. SetDisks cache
+        // writers remain fail-closed until this snapshot is available.
+        let _ = self.scanner_data_usage_publication_blocked().await;
+
         let pools = installed_pool_meta.return_resumable_pools();
         let mut pool_indices = Vec::with_capacity(pools.len());
 

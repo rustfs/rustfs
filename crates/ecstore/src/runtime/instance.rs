@@ -54,11 +54,15 @@ use s3s::region::Region;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const SCANNER_PUBLICATION_STATE_UNKNOWN: u8 = 0;
+const SCANNER_PUBLICATION_STATE_ALLOWED: u8 = 1;
+const SCANNER_PUBLICATION_STATE_BLOCKED: u8 = 2;
 
 /// Runtime state owned by a single `ECStore` instance.
 ///
@@ -171,6 +175,14 @@ pub struct InstanceContext {
     /// publication admitted before a movement transition must never be
     /// mistaken for one admitted after the transition.
     data_movement_operation_epoch: AtomicU64,
+    /// Once the admission epoch reaches its reserved terminal value, no new
+    /// publication may be admitted. Keeping this state separate from the
+    /// saturating counter prevents an unchanged `u64::MAX` value from being
+    /// mistaken for a fresh epoch after overflow.
+    data_movement_operation_epoch_exhausted: AtomicBool,
+    /// Last storage-owned movement snapshot observed under the operation
+    /// gate. SetDisks cache writers fail closed until ECStore refreshes it.
+    scanner_publication_state: AtomicU8,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
@@ -213,6 +225,8 @@ impl InstanceContext {
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
             data_movement_operation_epoch: AtomicU64::new(0),
+            data_movement_operation_epoch_exhausted: AtomicBool::new(false),
+            scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -239,10 +253,46 @@ impl InstanceContext {
         self.data_movement_operation_epoch.load(Ordering::Acquire)
     }
 
+    pub(crate) fn data_movement_operation_epoch_exhausted(&self) -> bool {
+        self.data_movement_operation_epoch_exhausted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn scanner_publication_state_allowed(&self) -> bool {
+        !self.data_movement_operation_epoch_exhausted()
+            && self.scanner_publication_state.load(Ordering::Acquire) == SCANNER_PUBLICATION_STATE_ALLOWED
+    }
+
+    pub(crate) fn set_scanner_publication_state(&self, blocked: bool) {
+        self.scanner_publication_state.store(
+            if blocked {
+                SCANNER_PUBLICATION_STATE_BLOCKED
+            } else {
+                SCANNER_PUBLICATION_STATE_ALLOWED
+            },
+            Ordering::Release,
+        );
+    }
+
     pub(crate) fn advance_data_movement_operation_epoch(&self) -> u64 {
-        self.data_movement_operation_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)))
-            .unwrap_or_else(|epoch| epoch)
+        self.scanner_publication_state
+            .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
+        let _ = self
+            .data_movement_operation_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)));
+        let result = self.data_movement_operation_epoch.load(Ordering::Acquire);
+        if result == u64::MAX {
+            self.data_movement_operation_epoch_exhausted.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_data_movement_operation_epoch_for_test(&self, epoch: u64) {
+        self.data_movement_operation_epoch.store(epoch, Ordering::Release);
+        self.data_movement_operation_epoch_exhausted
+            .store(epoch == u64::MAX, Ordering::Release);
+        self.scanner_publication_state
+            .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
     }
 
     /// Install the application-owned object-encryption resolver once.

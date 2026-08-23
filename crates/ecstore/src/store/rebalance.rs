@@ -685,15 +685,26 @@ impl ECStore {
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
+        // Serialize the durable reload with local movement transitions. Loading
+        // before acquiring this gate would allow a stale disk snapshot to
+        // overwrite a newer local transition after the writer commits.
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let mut meta = PoolMeta::default();
         resolve_store_rebalance_pool_meta_reload_result(
             meta.load(self.pools[0].clone(), self.pools.clone()).await,
             "reload_pool_meta",
         )?;
 
+        let movement_changed = {
+            let current = self.pool_meta.read().await;
+            crate::core::pools::pool_meta_movement_snapshot_changed(&current, &meta)
+        };
         let mut pool_meta = self.pool_meta.write().await;
         *pool_meta = meta;
-        // *self.pool_meta.write().expect("operation should succeed") = meta;
+        if movement_changed {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
         Ok(())
     }
 

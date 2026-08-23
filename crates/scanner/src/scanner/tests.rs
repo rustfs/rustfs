@@ -2274,6 +2274,7 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
         started: Utc::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+    seed_usage_snapshot_for_leadership_claim(&store).await;
 
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
     let old_epoch_commit = CurrentCycle {
@@ -2318,6 +2319,61 @@ async fn test_leadership_claim_rejects_terminal_epoch() {
 }
 
 #[tokio::test]
+async fn leadership_claim_defers_without_usage_baseline_before_bloom_write() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    let mut persisted_epoch = 0;
+
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+    assert!(read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str()).await.is_err());
+}
+
+#[tokio::test]
+async fn leadership_claim_defers_on_corrupt_usage_baseline_without_bloom_write() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let usage_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store.objects.lock().await.insert(usage_key.clone(), b"not-json".to_vec());
+    store.revisions.lock().await.insert(usage_key, 1);
+
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    let mut persisted_epoch = 0;
+
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+}
+
+#[tokio::test]
+async fn leadership_claim_defers_on_unidentified_usage_baseline_without_bloom_write() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let usage_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let data = serde_json::to_vec(&DataUsageInfo::default()).expect("default usage should encode");
+    store.objects.lock().await.insert(usage_key.clone(), data);
+    store.revisions.lock().await.insert(usage_key, 1);
+
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    let mut persisted_epoch = 0;
+
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+    assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+}
+
+#[tokio::test]
 async fn test_leadership_claim_confirms_commit_after_returned_error() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
@@ -2333,6 +2389,7 @@ async fn test_leadership_claim_confirms_commit_after_returned_error() {
         started: Utc::now(),
     };
     let mut persisted_epoch = 0;
+    seed_usage_snapshot_for_leadership_claim(&store).await;
 
     assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
 
@@ -2423,6 +2480,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
         started: Utc::now(),
     };
     assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+    seed_usage_snapshot_for_leadership_claim(&store).await;
 
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
     store
@@ -3427,6 +3485,13 @@ fn complete_usage_with_bucket_count(last_update: Option<std::time::SystemTime>, 
         info.bucket_sizes.insert(bucket, 0);
     }
     info
+}
+
+async fn seed_usage_snapshot_for_leadership_claim(store: &Arc<MemoryConfigStore>) {
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let data = serde_json::to_vec(&complete_usage_with_bucket_count(None, 0)).expect("leadership usage baseline should encode");
+    store.objects.lock().await.insert(key.clone(), data);
+    store.revisions.lock().await.insert(key, 1);
 }
 
 fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {

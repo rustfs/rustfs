@@ -499,9 +499,6 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     authoritative: &DataUsageInfo,
 ) {
-    let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
-        return;
-    };
     let (observed_data, revision) =
         match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
             Ok((Some(data), revision)) => (data, revision),
@@ -540,18 +537,18 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
         return;
     }
 
-    let result = storeapi
-        .delete_config_object(
-            RUSTFS_META_BUCKET,
-            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
-            ScannerObjectOptions {
-                delete_prefix: true,
-                delete_prefix_object: true,
-                http_preconditions: Some(revision.preconditions()),
-                ..Default::default()
-            },
-        )
-        .await;
+    let result = delete_config_with_publication_admission(
+        storeapi,
+        RUSTFS_META_BUCKET,
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+        ScannerObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            http_preconditions: Some(revision.preconditions()),
+            ..Default::default()
+        },
+    )
+    .await;
 
     match result {
         Ok(_)

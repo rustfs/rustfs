@@ -67,9 +67,10 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, invalidate_admin_data_usage_snapshot_cache,
-    invalidate_data_usage_snapshot_cache, read_config, replace_bucket_usage_memory_from_info, save_config,
-    save_config_shared_with_preconditions, save_config_with_preconditions, scanner_is_erasure_sd,
+    delete_config_with_publication_admission, get_lifecycle_config, get_replication_config,
+    invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
+    save_config_with_publication_admission, scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -1055,7 +1056,7 @@ async fn fence_scanner_epoch_after_cycle_timeout<Store, LockLost>(
     lock_lost: LockLost,
 ) -> bool
 where
-    Store: ScannerObjectIO,
+    Store: ScannerObjectIO + ScannerConfigObjectDelete,
     LockLost: Future<Output = ()>,
 {
     let fence_ctx = ctx.child_token();
@@ -1092,7 +1093,7 @@ async fn handle_scanner_cycle_deadline<Store>(
     worker_stopped: bool,
     guard: &mut NamespaceLockGuard,
 ) where
-    Store: ScannerObjectIO,
+    Store: ScannerObjectIO + ScannerConfigObjectDelete,
 {
     let fenced = fence_scanner_epoch_after_cycle_timeout(
         ctx,
@@ -1185,6 +1186,13 @@ async fn run_data_scanner_cycle_with_budget(
 
     let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
+    // Refresh the storage-owned movement snapshot before reading background
+    // heal state. A missing heal object yields an in-memory default; do not
+    // let that default influence a cycle while publication is blocked.
+    if storeapi.scanner_data_usage_publication_blocked().await {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    }
     let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
 
     let scan_mode = get_cycle_scan_mode(

@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Scanner cycle-state codec, persisted usage floors, and cycle-state persistence.
 use super::*;
+use crate::ScannerConfigObjectDelete as _;
 use crate::ScannerGetObjectReader;
 use crate::data_usage_define::DATA_USAGE_BLOOM_RECOVERY_PATH;
 use crate::storage_api::owner::ObjectIO as _;
@@ -162,6 +163,8 @@ pub(crate) enum ScannerCycleStateStartup {
 enum CycleRecoveryMarkerReadError {
     #[error("cycle recovery marker backend read failed: {0}")]
     Backend(#[source] EcstoreError),
+    #[error("cycle recovery marker publication is blocked by data movement")]
+    PublicationBlocked,
     #[error("invalid cycle recovery marker: {0}")]
     Invalid(&'static str),
     #[error("cycle recovery marker revision changed while publishing")]
@@ -326,7 +329,7 @@ fn cycle_state_generation_and_epoch(buf: &[u8]) -> (u64, u64) {
 }
 
 async fn persist_cycle_recovery_marker(
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     primary_revision: &DataUsageCacheRevision,
     generation: u64,
     leader_epoch: u64,
@@ -370,6 +373,9 @@ async fn persist_cycle_recovery_marker(
         state: "blocked".to_string(),
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| CycleRecoveryMarkerReadError::Invalid("marker serialization failed"))?;
+    let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+        return Err(CycleRecoveryMarkerReadError::PublicationBlocked);
+    };
     let save_result = save_config_with_preconditions(
         storeapi.clone(),
         DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
@@ -478,7 +484,7 @@ async fn read_cycle_recovery_marker_revision(
 }
 
 async fn quarantine_invalid_cycle_state(
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     revision: &DataUsageCacheRevision,
     buf: &[u8],
 ) -> ScannerCycleStateStartup {
@@ -488,7 +494,7 @@ async fn quarantine_invalid_cycle_state(
 }
 
 async fn quarantine_invalid_cycle_state_with_reason(
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     revision: &DataUsageCacheRevision,
     generation: u64,
     leader_epoch: u64,
@@ -524,6 +530,16 @@ async fn quarantine_invalid_cycle_state_with_reason(
                 "failed to persist scanner cycle recovery marker".to_string(),
             ));
         }
+        Err(CycleRecoveryMarkerReadError::PublicationBlocked) => {
+            set_scanner_cycle_recovery_status(recovery_status(
+                "transient",
+                Some("cycle recovery marker publication is blocked by data movement"),
+                true,
+            ));
+            return ScannerCycleStateStartup::Transient(ScannerError::Other(
+                "cycle recovery marker publication is blocked by data movement".to_string(),
+            ));
+        }
         Err(CycleRecoveryMarkerReadError::Conflict) => {
             set_scanner_cycle_recovery_status(recovery_status(
                 "transient",
@@ -551,7 +567,7 @@ async fn mark_cycle_recovery_cleanup_pending(
     marker.last_attempt_at_unix_secs = unix_now_secs();
     let bytes = serde_json::to_vec(&marker)
         .map_err(|err| ScannerError::Other(format!("failed to encode cycle recovery marker: {err}")))?;
-    let info = save_config_with_preconditions(
+    let info = save_config_with_publication_admission(
         storeapi.clone(),
         DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
         bytes,
@@ -567,7 +583,9 @@ async fn mark_cycle_recovery_cleanup_pending(
     Ok((marker, revision))
 }
 
-pub(crate) async fn load_scanner_cycle_state_for_startup(storeapi: Arc<impl ScannerObjectIO>) -> ScannerCycleStateStartup {
+pub(crate) async fn load_scanner_cycle_state_for_startup(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> ScannerCycleStateStartup {
     let marker = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
         Ok((None, _)) => None,
         Ok((Some(data), marker_revision)) => match serde_json::from_slice::<ScannerCycleRecoveryMarker>(&data) {
@@ -855,7 +873,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "preserved scanner cycle state exceeds the bounded object size".to_string(),
                 ));
             }
-            let preserved_info = save_config_with_preconditions(
+            let preserved_info = save_config_with_publication_admission(
                 storeapi.clone(),
                 DATA_USAGE_BLOOM_NAME_PATH.as_str(),
                 preserved_data,
@@ -889,20 +907,20 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "scanner cycle state changed before recovery marker cleanup".to_string(),
                 ));
             }
-            storeapi
-                .delete_config_object(
-                    RUSTFS_META_BUCKET,
-                    DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
-                    ScannerObjectOptions {
-                        // This is one exact metadata object. Prefix-delete mode
-                        // bypasses HTTP preconditions in the ECStore path.
-                        delete_prefix: false,
-                        http_preconditions: Some(cleanup_marker_revision.preconditions()),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|err| ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}")))?;
+            delete_config_with_publication_admission(
+                storeapi.clone(),
+                RUSTFS_META_BUCKET,
+                DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+                ScannerObjectOptions {
+                    // This is one exact metadata object. Prefix-delete mode
+                    // bypasses HTTP preconditions in the ECStore path.
+                    delete_prefix: false,
+                    http_preconditions: Some(cleanup_marker_revision.preconditions()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}")))?;
             set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
             super::notify_scanner_cycle_recovery_wake();
             return Ok(());
@@ -948,7 +966,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     } else {
         mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker, &marker_revision).await?
     };
-    let rebuilt_info = save_config_with_preconditions(
+    let rebuilt_info = save_config_with_publication_admission(
         storeapi.clone(),
         DATA_USAGE_BLOOM_NAME_PATH.as_str(),
         data,
@@ -1034,19 +1052,19 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ));
     }
 
-    if let Err(err) = storeapi
-        .delete_config_object(
-            RUSTFS_META_BUCKET,
-            DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
-            ScannerObjectOptions {
-                // This is one exact metadata object. Prefix-delete mode
-                // bypasses HTTP preconditions in the ECStore path.
-                delete_prefix: false,
-                http_preconditions: Some(marker_revision.preconditions()),
-                ..Default::default()
-            },
-        )
-        .await
+    if let Err(err) = delete_config_with_publication_admission(
+        storeapi.clone(),
+        RUSTFS_META_BUCKET,
+        DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+        ScannerObjectOptions {
+            // This is one exact metadata object. Prefix-delete mode
+            // bypasses HTTP preconditions in the ECStore path.
+            delete_prefix: false,
+            http_preconditions: Some(marker_revision.preconditions()),
+            ..Default::default()
+        },
+    )
+    .await
     {
         set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
@@ -1276,7 +1294,7 @@ pub(super) fn apply_persisted_usage_floor(cycle_info: &mut CurrentCycle, leader_
 
 pub(super) async fn persist_scanner_cycle_state(
     ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
@@ -1315,9 +1333,23 @@ pub(super) async fn persist_scanner_cycle_state(
 
         #[cfg(test)]
         notify_scanner_cycle_state_persist_test_hook(leader_epoch);
-        match save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
-            .await
-        {
+        let save_result = {
+            let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "publication_admission_unavailable",
+                    "Scanner state persistence skipped without movement admission"
+                );
+                return false;
+            };
+            save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
+                .await
+        };
+        match save_result {
             Ok(object_info) => {
                 let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) else {
                     error!(
@@ -1498,7 +1530,7 @@ pub(super) async fn persist_scanner_cycle_state(
 
 pub(super) async fn finalize_partial_scan_cycle(
     ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
@@ -1531,7 +1563,7 @@ pub(super) async fn finalize_partial_scan_cycle(
 
 pub(super) async fn persist_required_scanner_cycle_floor(
     ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
