@@ -249,6 +249,10 @@ fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
 }
 
 fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
+    if rule_id.is_empty() {
+        return false;
+    }
+
     let filter_has_size = |filter: &s3s::dto::LifecycleRuleFilter| {
         filter.object_size_greater_than.is_some()
             || filter.object_size_less_than.is_some()
@@ -260,21 +264,19 @@ fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule
     lifecycle
         .rules
         .iter()
-        .find(|rule| rule.id.as_deref().unwrap_or_default() == rule_id)
+        .find(|rule| rule.id.as_deref() == Some(rule_id))
         .and_then(|rule| rule.filter.as_ref())
         .is_some_and(filter_has_size)
 }
 
 fn lifecycle_event_allowed(resolution: &SizeResolution, event: &Event, lifecycle: &BucketLifecycleConfiguration) -> bool {
     match resolution {
-        // Corrupt metadata cannot safely authorize a destructive action, even
-        // when the evaluator happened to produce a time-only event.
-        SizeResolution::Corrupt { .. } => false,
-        // A valid-but-unknown logical size may still execute lifecycle
-        // actions whose rule is independent of object-size predicates. The
-        // evaluator has already selected the rule; only that rule's filter
-        // can make the missing logical value action-critical.
-        SizeResolution::Unknown { .. } => !lifecycle_rule_has_size_filter(lifecycle, &event.rule_id),
+        // Missing or invalid logical size only defers actions whose selected
+        // rule actually depends on that size. Time/version-only actions retain
+        // their existing semantics, including intrinsic events without a rule ID.
+        SizeResolution::Unknown { .. } | SizeResolution::Corrupt { .. } => {
+            !lifecycle_rule_has_size_filter(lifecycle, &event.rule_id)
+        }
         SizeResolution::Known { .. } => true,
     }
 }
@@ -1571,7 +1573,7 @@ mod tests {
             },
             &BucketLifecycleConfiguration::default()
         ));
-        assert!(!lifecycle_event_allowed(
+        assert!(lifecycle_event_allowed(
             &SizeResolution::Corrupt {
                 physical: 12,
                 reason: SizeResolutionReason::InvalidDeclaredSize,
@@ -1581,6 +1583,39 @@ mod tests {
                 ..Default::default()
             },
             &BucketLifecycleConfiguration::default()
+        ));
+        assert!(!lifecycle_event_allowed(
+            &SizeResolution::Corrupt {
+                physical: 12,
+                reason: SizeResolutionReason::InvalidDeclaredSize,
+            },
+            &Event {
+                action: IlmAction::DeleteAction,
+                rule_id: "size".to_string(),
+                ..Default::default()
+            },
+            &size_filtered
+        ));
+        assert!(!lifecycle_rule_has_size_filter(
+            &BucketLifecycleConfiguration {
+                rules: vec![s3s::dto::LifecycleRule {
+                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                    expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    id: None,
+                    filter: Some(s3s::dto::LifecycleRuleFilter {
+                        object_size_greater_than: Some(1),
+                        ..Default::default()
+                    }),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+                ..Default::default()
+            },
+            ""
         ));
         assert!(lifecycle_event_allowed(
             &SizeResolution::Known {
