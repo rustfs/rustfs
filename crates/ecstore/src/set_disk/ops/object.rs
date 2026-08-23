@@ -2675,10 +2675,12 @@ impl SetDisks {
                         // overwrites; an authorized replication write passes it
                         // only when the LWW merge below will judge every
                         // locking category (see
-                        // `replication_write_may_pass_worm_gate`). Gate first so
+                        // `replication_write_may_pass_worm_gate`, which judges
+                        // the same authoritative lock state as the gate,
+                        // bucket default retention included). Gate first so
                         // malformed lock metadata still fails closed.
                         if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some()
-                            && !replication_write_may_pass_worm_gate(&existing.user_defined, opts)
+                            && !replication_write_may_pass_worm_gate(object_lock_config.state(), &existing, opts)?
                         {
                             return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
                         }
@@ -8729,6 +8731,76 @@ mod replication_lww_tests {
 
         let info = version_info(&set_disks, bucket, object, &version_id).await;
         assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
+    }
+
+    fn default_retention_snapshot(mode: &'static str) -> Arc<ObjectLockConfigSnapshot> {
+        Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
+            config: s3s::dto::ObjectLockConfiguration {
+                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
+                rule: Some(s3s::dto::ObjectLockRule {
+                    default_retention: Some(s3s::dto::DefaultRetention {
+                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(mode)),
+                        days: Some(1),
+                        years: None,
+                    }),
+                }),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        }))
+    }
+
+    /// The bucket default retention locks a version that carries no explicit
+    /// retention keys. A tagging-only authorized replication write carries no
+    /// source retention decision, so it must stay WORM-rejected exactly like
+    /// it does for an explicitly retained version; with the retention source
+    /// timestamp the write passes and LWW judges it.
+    #[tokio::test]
+    async fn inbound_without_retention_timestamp_stays_rejected_under_bucket_default_retention() {
+        for mode in [
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
+            s3s::dto::ObjectLockRetentionMode::GOVERNANCE,
+        ] {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "lww-locked-default-retention";
+            let object = "object";
+            let version_id = Uuid::new_v4().to_string();
+            make_bucket(&disk_stores, bucket).await;
+            seed_local_tagged_version(&set_disks, bucket, object, &version_id).await;
+            let seeded = version_info(&set_disks, bucket, object, &version_id).await;
+            assert!(
+                !seeded.user_defined.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER),
+                "the seeded version must be protected by the bucket default only"
+            );
+
+            let tagging_only = ObjectOptions {
+                object_lock_config_snapshot: Some(default_retention_snapshot(mode)),
+                ..inbound_tagging_opts(&version_id, "site=remote", T_NEW)
+            };
+            let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+            let err = set_disks
+                .put_object(bucket, object, &mut reader, &tagging_only)
+                .await
+                .expect_err("{mode}: a tagging-only replication write must not pass the bucket default retention lock");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{mode}: unexpected error: {err}");
+            let info = version_info(&set_disks, bucket, object, &version_id).await;
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=local",
+                "{mode}: the default-protected version must be untouched"
+            );
+
+            let with_retention_decision = ObjectOptions {
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                ..tagging_only
+            };
+            put_version(&set_disks, bucket, object, &version_id, &with_retention_decision).await;
+            let info = version_info(&set_disks, bucket, object, &version_id).await;
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=remote",
+                "{mode}: with the retention source timestamp the newer inbound tags win"
+            );
+        }
     }
 
     /// The gate runs before the replication bypass, so malformed persisted

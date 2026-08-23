@@ -153,22 +153,31 @@ fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> b
 /// more recently here is kept, otherwise the source's newer state wins. A write
 /// without that timestamp carries no source decision for the category — the
 /// metadata replace would lift the lock unjudged — so it stays WORM-rejected.
+///
+/// The locking categories come from the same authoritative evaluation as the
+/// commit-time WORM gate (`check_object_lock_for_deletion_with_state`): the
+/// bucket default retention locks a version that carries no explicit
+/// retention keys, so it is judged here too rather than read off the keys.
+/// Malformed persisted lock metadata or a non-authoritative bucket
+/// configuration is an error, never a pass.
 pub fn replication_write_may_pass_worm_gate(
-    user_defined: &std::collections::HashMap<String, String>,
+    state: &ObjectLockConfigState,
+    obj_info: &ObjectInfo,
     opts: &ObjectOptions,
-) -> bool {
+) -> Result<bool> {
     if !opts.replication_request {
-        return false;
+        return Ok(false);
     }
-    if has_legal_hold(user_defined) && opts.replication_legalhold_timestamp.is_none() {
-        return false;
+    if obj_info.delete_marker {
+        // Delete markers are never locked (same as the WORM gate).
+        return Ok(true);
     }
-    let ret = objectlock::get_object_retention_meta(user_defined);
-    let retention_locked = ret
-        .mode
-        .as_ref()
-        .is_some_and(|mode| is_retention_active(mode.as_str(), ret.retain_until_date.as_ref()));
-    !(retention_locked && opts.replication_retention_timestamp.is_none())
+    let config = object_lock_config_from_state(state)?;
+    if legal_hold_locks(obj_info)? && opts.replication_legalhold_timestamp.is_none() {
+        return Ok(false);
+    }
+    let retention_locked = active_retention(config, obj_info)?.is_some();
+    Ok(!(retention_locked && opts.replication_retention_timestamp.is_none()))
 }
 
 /// Check if an object is locked based on its metadata.
@@ -268,74 +277,101 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
         return Ok(None);
     }
 
-    // A cleared retention / legal hold is persisted as empty strings (the
-    // MinIO on-disk shape, `parse_object_lock_retention`); read it as "no lock"
-    // rather than as corrupt metadata.
-    let persisted = |key: &str| obj_info.user_defined.get(key).filter(|value| !value.is_empty());
-
-    if let Some(status) = persisted(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) {
-        if status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::ON) {
-            return Ok(Some(ObjectLockBlockReason::LegalHold));
-        }
-        if !status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::OFF) {
-            return Err(Error::other("persisted object legal-hold metadata is invalid"));
-        }
+    if legal_hold_locks(obj_info)? {
+        return Ok(Some(ObjectLockBlockReason::LegalHold));
     }
 
-    let mode = persisted(X_AMZ_OBJECT_LOCK_MODE.as_str());
-    let retain_until = persisted(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
-    let explicit_ret = match (mode, retain_until) {
-        (None, None) => None,
+    if let Some((mode_str, retain_until)) = active_retention(config, obj_info)?
+        && let Some(reason) = check_retention_blocks_deletion(mode_str, Some(retain_until), bypass_governance)
+    {
+        return Ok(Some(reason));
+    }
+
+    Ok(None)
+}
+
+/// A cleared retention / legal hold is persisted as empty strings (the MinIO
+/// on-disk shape, `parse_object_lock_retention`); read it as "no lock" rather
+/// than as corrupt metadata.
+fn persisted_lock_value<'a>(obj_info: &'a ObjectInfo, key: &str) -> Option<&'a String> {
+    obj_info.user_defined.get(key).filter(|value| !value.is_empty())
+}
+
+/// Whether the version's persisted legal hold is ON. Any other non-empty
+/// value than ON/OFF is malformed metadata and fails closed.
+fn legal_hold_locks(obj_info: &ObjectInfo) -> Result<bool> {
+    let Some(status) = persisted_lock_value(obj_info, X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()) else {
+        return Ok(false);
+    };
+    if status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::ON) {
+        return Ok(true);
+    }
+    if !status.eq_ignore_ascii_case(ObjectLockLegalHoldStatus::OFF) {
+        return Err(Error::other("persisted object legal-hold metadata is invalid"));
+    }
+    Ok(false)
+}
+
+/// The retention that currently locks the version, if any: the explicit
+/// persisted retention when the keys are present, otherwise the bucket
+/// default retention computed from the version's modification time. Returns
+/// `(mode, retain_until)` only while the retention is still active.
+fn active_retention<'a>(
+    config: Option<&'a ObjectLockConfiguration>,
+    obj_info: &ObjectInfo,
+) -> Result<Option<(&'a str, OffsetDateTime)>> {
+    let mode = persisted_lock_value(obj_info, X_AMZ_OBJECT_LOCK_MODE.as_str());
+    let retain_until = persisted_lock_value(obj_info, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
+    match (mode, retain_until) {
+        (None, None) => {}
         (Some(mode), Some(retain_until)) => {
             let mode =
                 objectlock::parse_ret_mode(mode).ok_or_else(|| Error::other("persisted object retention mode is invalid"))?;
             let retain_until = OffsetDateTime::parse(retain_until, &time::format_description::well_known::Iso8601::DEFAULT)
                 .map(Date::from)
                 .map_err(|_| Error::other("persisted object retention date is invalid"))?;
-            Some((mode, retain_until))
+            let mode_str = match mode.as_str() {
+                ObjectLockRetentionMode::COMPLIANCE => ObjectLockRetentionMode::COMPLIANCE,
+                ObjectLockRetentionMode::GOVERNANCE => ObjectLockRetentionMode::GOVERNANCE,
+                _ => return Err(Error::other("persisted object retention mode is invalid")),
+            };
+            return Ok(is_retention_active(mode_str, Some(&retain_until)).then(|| (mode_str, OffsetDateTime::from(retain_until))));
         }
         _ => return Err(Error::other("persisted object retention metadata is incomplete")),
+    }
+
+    let Some(default_retention) = config.and_then(|config| config.rule.as_ref()?.default_retention.as_ref()) else {
+        return Ok(None);
     };
-
-    if let Some((mode, retain_until)) = &explicit_ret {
-        let mode_str = mode.as_str();
-        if is_retention_active(mode_str, Some(retain_until))
-            && let Some(reason) =
-                check_retention_blocks_deletion(mode_str, Some(OffsetDateTime::from(retain_until.clone())), bypass_governance)
-        {
-            return Ok(Some(reason));
-        }
+    let Some(mode) = &default_retention.mode else {
+        return Ok(None);
+    };
+    let mode_str = mode.as_str();
+    if mode_str != ObjectLockRetentionMode::COMPLIANCE && mode_str != ObjectLockRetentionMode::GOVERNANCE {
+        return Ok(None);
     }
+    // Calculate retention expiration date from object modification time
+    let mod_time = obj_info
+        .mod_time
+        .ok_or_else(|| Error::other("persisted object modification time is missing"))?;
+    let now = objectlock::utc_now_ntp();
+    let retain_until = if let Some(days) = default_retention.days {
+        mod_time.saturating_add(time::Duration::days(i64::from(days)))
+    } else {
+        let years = default_retention
+            .years
+            .ok_or_else(|| Error::other("persisted bucket Object Lock retention period is invalid"))?;
+        add_years(mod_time, years)
+    };
+    Ok((retain_until.unix_timestamp() > now.unix_timestamp()).then_some((mode_str, retain_until)))
+}
 
-    if explicit_ret.is_none()
-        && let Some(default_retention) = config.and_then(|config| config.rule.as_ref()?.default_retention.as_ref())
-        && let Some(mode) = &default_retention.mode
-    {
-        let mode_str = mode.as_str();
-        if mode_str == ObjectLockRetentionMode::COMPLIANCE || mode_str == ObjectLockRetentionMode::GOVERNANCE {
-            // Calculate retention expiration date from object modification time
-            let mod_time = obj_info
-                .mod_time
-                .ok_or_else(|| Error::other("persisted object modification time is missing"))?;
-            let now = objectlock::utc_now_ntp();
-            let retain_until = if let Some(days) = default_retention.days {
-                mod_time.saturating_add(time::Duration::days(i64::from(days)))
-            } else {
-                let years = default_retention
-                    .years
-                    .ok_or_else(|| Error::other("persisted bucket Object Lock retention period is invalid"))?;
-                add_years(mod_time, years)
-            };
-
-            if retain_until.unix_timestamp() > now.unix_timestamp()
-                && let Some(reason) = check_retention_blocks_deletion(mode_str, Some(retain_until), bypass_governance)
-            {
-                return Ok(Some(reason));
-            }
-        }
+fn object_lock_config_from_state(state: &ObjectLockConfigState) -> Result<Option<&ObjectLockConfiguration>> {
+    match state {
+        ObjectLockConfigState::Configured { config, .. } => Ok(Some(config)),
+        ObjectLockConfigState::ConfirmedAbsent => Ok(None),
+        ObjectLockConfigState::Fabricated => Err(Error::other("bucket Object Lock metadata is not authoritative")),
     }
-
-    Ok(None)
 }
 
 pub(crate) fn check_object_lock_for_deletion_with_state(
@@ -343,13 +379,7 @@ pub(crate) fn check_object_lock_for_deletion_with_state(
     obj_info: &ObjectInfo,
     bypass_governance: bool,
 ) -> Result<Option<ObjectLockBlockReason>> {
-    match state {
-        ObjectLockConfigState::Configured { config, .. } => {
-            check_object_lock_for_deletion_with_config(Some(config), obj_info, bypass_governance)
-        }
-        ObjectLockConfigState::ConfirmedAbsent => check_object_lock_for_deletion_with_config(None, obj_info, bypass_governance),
-        ObjectLockConfigState::Fabricated => Err(Error::other("bucket Object Lock metadata is not authoritative")),
-    }
+    check_object_lock_for_deletion_with_config(object_lock_config_from_state(state)?, obj_info, bypass_governance)
 }
 
 /// Compatibility wrapper for callers that predate fallible metadata lookup.
@@ -520,6 +550,31 @@ mod tests {
         }
     }
 
+    fn replication_opts(hold_ts: bool, retention_ts: bool) -> ObjectOptions {
+        ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: hold_ts.then_some(OffsetDateTime::UNIX_EPOCH),
+            replication_retention_timestamp: retention_ts.then_some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        }
+    }
+
+    fn lock_metadata(entries: &[&[(&str, &str)]]) -> std::collections::HashMap<String, String> {
+        entries
+            .iter()
+            .flat_map(|entries| entries.iter())
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn lock_object_info(user_defined: std::collections::HashMap<String, String>) -> ObjectInfo {
+        ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        }
+    }
+
     /// A replication write passes the WORM gate only when it carries the
     /// source timestamp of every category that currently locks the version.
     #[test]
@@ -537,40 +592,127 @@ mod tests {
             (AMZ_OBJECT_LOCK_MODE_LOWER, "COMPLIANCE"),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, "2000-01-01T00:00:00Z"),
         ];
-        let metadata = |entries: &[&[(&str, &str)]]| -> std::collections::HashMap<String, String> {
-            entries
-                .iter()
-                .flat_map(|entries| entries.iter())
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect()
-        };
-        let opts = |hold_ts: bool, retention_ts: bool| ObjectOptions {
-            replication_request: true,
-            replication_legalhold_timestamp: hold_ts.then_some(OffsetDateTime::UNIX_EPOCH),
-            replication_retention_timestamp: retention_ts.then_some(OffsetDateTime::UNIX_EPOCH),
-            ..Default::default()
+        let absent = ObjectLockConfigState::ConfirmedAbsent;
+        let passes = |state: &ObjectLockConfigState, entries: &[&[(&str, &str)]], opts: &ObjectOptions| {
+            replication_write_may_pass_worm_gate(state, &lock_object_info(lock_metadata(entries)), opts)
+                .expect("well-formed lock metadata must be judged")
         };
 
-        let locked_by_both = metadata(&[&hold, &retention]);
-        assert!(replication_write_may_pass_worm_gate(&locked_by_both, &opts(true, true)));
-        assert!(!replication_write_may_pass_worm_gate(&locked_by_both, &opts(true, false)));
-        assert!(!replication_write_may_pass_worm_gate(&locked_by_both, &opts(false, true)));
+        assert!(passes(&absent, &[&hold, &retention], &replication_opts(true, true)));
+        assert!(!passes(&absent, &[&hold, &retention], &replication_opts(true, false)));
+        assert!(!passes(&absent, &[&hold, &retention], &replication_opts(false, true)));
 
-        assert!(replication_write_may_pass_worm_gate(&metadata(&[&hold]), &opts(true, false)));
-        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&hold]), &opts(false, true)));
-        assert!(replication_write_may_pass_worm_gate(&metadata(&[&retention]), &opts(false, true)));
-        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&retention]), &opts(true, false)));
+        assert!(passes(&absent, &[&hold], &replication_opts(true, false)));
+        assert!(!passes(&absent, &[&hold], &replication_opts(false, true)));
+        assert!(passes(&absent, &[&retention], &replication_opts(false, true)));
+        assert!(!passes(&absent, &[&retention], &replication_opts(true, false)));
 
         // Expired retention and a released hold no longer lock anything.
-        let unlocked = metadata(&[&expired, &[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "OFF")]]);
-        assert!(replication_write_may_pass_worm_gate(&unlocked, &opts(false, false)));
+        assert!(passes(
+            &absent,
+            &[&expired, &[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "OFF")]],
+            &replication_opts(false, false)
+        ));
 
         // Never for a non-replication write, whatever it carries.
         let local = ObjectOptions {
             replication_request: false,
-            ..opts(true, true)
+            ..replication_opts(true, true)
         };
-        assert!(!replication_write_may_pass_worm_gate(&metadata(&[&hold]), &local));
+        assert!(!passes(&absent, &[&hold], &local));
+    }
+
+    /// The bucket default retention locks a version that carries no explicit
+    /// retention keys (`check_object_lock_for_deletion_with_config` judges it
+    /// from the modification time), so the replication bypass must demand the
+    /// retention source timestamp for it too — a tagging-only replication
+    /// write must not overwrite the default-protected version unjudged.
+    #[test]
+    fn replication_write_under_bucket_default_retention_requires_retention_timestamp() {
+        use rustfs_utils::http::headers::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER};
+
+        for mode in [ObjectLockRetentionMode::COMPLIANCE, ObjectLockRetentionMode::GOVERNANCE] {
+            let state = ObjectLockConfigState::Configured {
+                config: default_retention_config(mode),
+                updated_at: OffsetDateTime::now_utc(),
+            };
+            let no_keys = lock_object_info(std::collections::HashMap::new());
+            assert!(
+                check_object_lock_for_deletion_with_state(&state, &no_keys, false)
+                    .expect("default retention must be judged")
+                    .is_some(),
+                "{mode}: the gate must report the default retention lock"
+            );
+
+            let tagging_only = ObjectOptions {
+                replication_request: true,
+                replication_tagging_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            };
+            assert!(
+                !replication_write_may_pass_worm_gate(&state, &no_keys, &tagging_only).expect("judged"),
+                "{mode}: a tagging-only replication write must not pass the default retention lock"
+            );
+            assert!(
+                replication_write_may_pass_worm_gate(&state, &no_keys, &replication_opts(false, true)).expect("judged"),
+                "{mode}: the retention source timestamp lets LWW judge the default retention"
+            );
+
+            // Default retention plus a legal hold: both categories need a timestamp.
+            let held = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON")]]));
+            assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(false, true)).expect("judged"));
+            assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, false)).expect("judged"));
+            assert!(replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, true)).expect("judged"));
+
+            // A version whose default retention has already expired (old
+            // mod_time) is not locked by the default any more.
+            let expired_default = ObjectInfo {
+                mod_time: Some(make_datetime(2000, 1, 1)),
+                ..lock_object_info(std::collections::HashMap::new())
+            };
+            assert!(replication_write_may_pass_worm_gate(&state, &expired_default, &tagging_only).expect("judged"));
+
+            // A delete marker is never locked, so there is nothing to judge.
+            let delete_marker = ObjectInfo {
+                delete_marker: true,
+                ..lock_object_info(std::collections::HashMap::new())
+            };
+            assert!(replication_write_may_pass_worm_gate(&state, &delete_marker, &tagging_only).expect("judged"));
+
+            // Cleared (empty) explicit keys fall back to the bucket default.
+            let cleared = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_MODE_LOWER, "")]]));
+            assert!(!replication_write_may_pass_worm_gate(&state, &cleared, &tagging_only).expect("judged"));
+        }
+    }
+
+    /// The replication bypass never judges from a non-authoritative bucket
+    /// state or malformed persisted lock metadata; both are errors, not a pass.
+    #[test]
+    fn replication_write_worm_gate_fails_closed_on_unverifiable_lock_state() {
+        use rustfs_utils::http::headers::AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER;
+
+        let opts = replication_opts(true, true);
+        let err = replication_write_may_pass_worm_gate(
+            &ObjectLockConfigState::Fabricated,
+            &lock_object_info(std::collections::HashMap::new()),
+            &opts,
+        )
+        .expect_err("fabricated bucket lock metadata must not be judged");
+        assert!(err.to_string().contains("not authoritative"));
+
+        let malformed = lock_object_info(lock_metadata(&[&[(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "MAYBE")]]));
+        let err = replication_write_may_pass_worm_gate(&ObjectLockConfigState::ConfirmedAbsent, &malformed, &opts)
+            .expect_err("malformed legal hold must not be judged");
+        assert!(err.to_string().contains("legal-hold"));
+
+        let state = ObjectLockConfigState::Configured {
+            config: default_retention_config(ObjectLockRetentionMode::COMPLIANCE),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let no_mod_time = ObjectInfo::default();
+        let err = replication_write_may_pass_worm_gate(&state, &no_mod_time, &opts)
+            .expect_err("default retention without a modification time must not be judged");
+        assert!(err.to_string().contains("modification time"));
     }
 
     /// A local PutObjectRetention / PutObjectLegalHold "clear" persists the

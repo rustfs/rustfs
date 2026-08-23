@@ -3934,15 +3934,32 @@ fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
-pub(crate) fn validate_existing_object_lock_for_write(existing_obj_info: &ObjectInfo, opts: &ObjectOptions) -> S3Result<()> {
+pub(crate) fn validate_existing_object_lock_for_write(
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
+    existing_obj_info: &ObjectInfo,
+    opts: &ObjectOptions,
+) -> S3Result<()> {
     if put_like_write_creates_new_version(opts) {
         return Ok(());
     }
-    // An authorized replication write may replace the locked version when the
-    // set layer's commit-lock LWW will judge every locking category; the set
-    // layer re-checks the same rule under the lock.
-    if replication_write_may_pass_worm_gate(&existing_obj_info.user_defined, opts) {
-        return Ok(());
+    // An authorized replication write may replace the locked version only
+    // when the set layer's commit-lock LWW will judge every locking category,
+    // judged against the bucket's authoritative lock state (default retention
+    // included) exactly like the set-layer gate, which re-checks the same
+    // rule under the lock. A non-authoritative state or malformed lock
+    // metadata fails closed here.
+    if opts.replication_request {
+        let may_pass = replication_write_may_pass_worm_gate(object_lock_config_state, existing_obj_info, opts).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::AccessDenied, "Object Lock state could not be verified.".to_string())
+        })?;
+        return if may_pass {
+            Ok(())
+        } else {
+            Err(S3Error::with_message(
+                S3ErrorCode::AccessDenied,
+                "Object is locked and the replication write carries no source lock decision for it.".to_string(),
+            ))
+        };
     }
 
     let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
@@ -6110,7 +6127,7 @@ impl DefaultObjectUsecase {
             };
             Some(match previous_current_info {
                 Ok(existing_obj_info) => {
-                    validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?;
                     Some(if quota_enabled {
                         quota_object_size(&existing_obj_info).map_err(ApiError::from)?
                     } else {
@@ -7796,7 +7813,7 @@ impl DefaultObjectUsecase {
         }
         let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info, &dst_opts)?;
+                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
                 if let Some(expected) = expected_current_version_id.as_deref()
                     && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
                 {
@@ -10996,9 +11013,28 @@ mod tests {
         assert_eq!(err.message(), Some(ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED));
     }
 
+    const NO_BUCKET_LOCK: metadata_sys::ObjectLockConfigState = metadata_sys::ObjectLockConfigState::ConfirmedAbsent;
+
+    fn bucket_default_retention_state(mode: &'static str) -> metadata_sys::ObjectLockConfigState {
+        metadata_sys::ObjectLockConfigState::Configured {
+            config: s3s::dto::ObjectLockConfiguration {
+                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
+                rule: Some(s3s::dto::ObjectLockRule {
+                    default_retention: Some(s3s::dto::DefaultRetention {
+                        mode: Some(ObjectLockRetentionMode::from_static(mode)),
+                        days: Some(1),
+                        years: None,
+                    }),
+                }),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        }
+    }
+
     fn object_info_with_lock_metadata(metadata: HashMap<String, String>) -> ObjectInfo {
         ObjectInfo {
             user_defined: Arc::new(metadata),
+            mod_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         }
     }
@@ -11037,7 +11073,7 @@ mod tests {
             ..Default::default()
         };
 
-        validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+        validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
             .expect("versioned put should create a new version");
     }
 
@@ -11049,14 +11085,18 @@ mod tests {
             ..Default::default()
         };
 
-        validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+        validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &legal_hold_object_info(), &opts)
             .expect("versioned put should create a new version");
     }
 
     #[test]
     fn validate_existing_object_lock_blocks_unversioned_compliance_overwrite() {
-        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &ObjectOptions::default())
-            .expect_err("unversioned overwrite should still be blocked");
+        let err = validate_existing_object_lock_for_write(
+            &NO_BUCKET_LOCK,
+            &compliance_retained_object_info(),
+            &ObjectOptions::default(),
+        )
+        .expect_err("unversioned overwrite should still be blocked");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
@@ -11069,7 +11109,7 @@ mod tests {
             version_id: None,
             ..Default::default()
         };
-        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
             .expect_err("suspended versioning overwrite should still be blocked");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -11082,7 +11122,7 @@ mod tests {
             version_id: Some(Uuid::new_v4().to_string()),
             ..Default::default()
         };
-        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
             .expect_err("explicit version overwrite should still be blocked");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -11103,9 +11143,9 @@ mod tests {
             ..Default::default()
         };
 
-        validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+        validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
             .expect("replication write must bypass the destination COMPLIANCE lock");
-        validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+        validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &legal_hold_object_info(), &opts)
             .expect("replication write must bypass the destination legal hold");
     }
 
@@ -11121,12 +11161,45 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_existing_object_lock_for_write(&compliance_retained_object_info(), &opts)
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
             .expect_err("COMPLIANCE lock must hold without a retention source timestamp");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
-        let err = validate_existing_object_lock_for_write(&legal_hold_object_info(), &opts)
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &legal_hold_object_info(), &opts)
             .expect_err("legal hold must hold without a legal-hold source timestamp");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    /// The bucket default retention locks a version without explicit
+    /// retention keys; the pre-check judges the same authoritative state as
+    /// the set-layer gate, so a tagging-only replication write is rejected
+    /// and one carrying the retention source timestamp passes to LWW.
+    #[test]
+    fn validate_existing_object_lock_judges_bucket_default_retention_for_replication_overwrite() {
+        let default_protected = object_info_with_lock_metadata(HashMap::new());
+        let tagging_only = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            replication_request: true,
+            replication_tagging_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let with_retention_decision = ObjectOptions {
+            replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+            ..tagging_only.clone()
+        };
+
+        for mode in [ObjectLockRetentionMode::COMPLIANCE, ObjectLockRetentionMode::GOVERNANCE] {
+            let state = bucket_default_retention_state(mode);
+            let err = validate_existing_object_lock_for_write(&state, &default_protected, &tagging_only)
+                .expect_err("bucket default retention must hold without a retention source timestamp");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{mode}");
+            validate_existing_object_lock_for_write(&state, &default_protected, &with_retention_decision)
+                .expect("the retention source timestamp hands the default retention to LWW");
+        }
+
+        // Without a bucket default the same version is simply unlocked.
+        validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &default_protected, &tagging_only)
+            .expect("no bucket default, no lock");
     }
 
     #[test]
