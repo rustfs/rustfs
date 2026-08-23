@@ -66,9 +66,10 @@ use crate::storage_api::scan::{
     SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
-    ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    delete_config_with_publication_admission, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
-    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
+    ScannerReplicationConfigExt as _, delete_config_with_publication_admission,
+    delete_config_with_publication_admission_for_epoch, get_lifecycle_config, get_replication_config,
+    invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
     replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
     save_config_with_publication_admission, save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd,
     scanner_publication_admission_for_epoch, scanner_publication_epoch, scanner_publication_epoch_changed,
@@ -349,7 +350,20 @@ fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
 }
 
 pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageInfo) -> bool {
-    info.last_update.is_some() || info.scanner_cycle.is_some() || info.scanner_epoch.is_some() || info.usage_snapshot_complete
+    if info.is_complete_bucket_usage_snapshot() {
+        return true;
+    }
+
+    // Pre-marker snapshots remain readable only when their legacy identity is
+    // complete: a timestamp, a scanner cycle, and an exact bucket cardinality.
+    // A current snapshot with only scanner_epoch/scanner_cycle (or an explicit
+    // incomplete marker) is not evidence of a durable usage baseline.
+    !info.usage_snapshot_complete
+        && info.scanner_epoch.is_none()
+        && info.usage_snapshot_converged != Some(false)
+        && info.last_update.is_some()
+        && info.scanner_cycle.is_some()
+        && u64::try_from(info.buckets_usage.len()).ok() == Some(info.buckets_count)
 }
 
 fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option<&DataUsageInfo>) -> bool {
@@ -398,7 +412,7 @@ async fn sync_data_usage_backup_from_primary(
         }
 
         let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
-            return Err(EcstoreError::other("data usage publication is blocked by data movement"));
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
         };
         let (primary, _) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
         let primary = primary.ok_or(EcstoreError::ConfigNotFound)?;
@@ -422,7 +436,7 @@ async fn sync_data_usage_backup_from_primary(
             if retry < SCANNER_PERSIST_CAS_RETRIES {
                 continue;
             }
-            return Err(EcstoreError::other("data usage publication epoch changed during backup synchronization"));
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
         }
 
         let sha256hex = Some(hex_simd::encode_to_string(Sha256::digest(&primary), hex_simd::AsciiCase::Lower));
@@ -431,7 +445,7 @@ async fn sync_data_usage_backup_from_primary(
                 if retry < SCANNER_PERSIST_CAS_RETRIES {
                     continue;
                 }
-                return Err(EcstoreError::other("data usage publication epoch changed during backup synchronization"));
+                return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
             };
             save_config_shared_with_preconditions(
                 storeapi.clone(),
@@ -1220,7 +1234,13 @@ async fn run_data_scanner_cycle_with_budget(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     }
-    let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
+    let background_heal_read = read_background_heal_info_with_epoch(storeapi.clone()).await;
+    if background_heal_read.publication_blocked {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    }
+    let mut background_heal_info = background_heal_read.info;
+    let background_heal_epoch = background_heal_read.expected_epoch;
 
     let scan_mode = get_cycle_scan_mode(
         cycle_info.current,
@@ -1247,7 +1267,7 @@ async fn run_data_scanner_cycle_with_budget(
         configured_bitrot_cycle,
     ) {
         background_heal_info = new_heal_info.clone();
-        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
 
     let cycle_start = std::time::Instant::now();
@@ -1382,7 +1402,7 @@ async fn run_data_scanner_cycle_with_budget(
             if !ctx.is_cancelled()
                 && let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, false)
             {
-                save_background_heal_info(storeapi.clone(), new_heal_info).await;
+                save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
             }
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
@@ -1658,7 +1678,7 @@ async fn run_data_scanner_cycle_with_budget(
     done_cycle();
     emit_scan_cycle_complete(true, cycle_start.elapsed());
     if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, true) {
-        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
 
     info!(

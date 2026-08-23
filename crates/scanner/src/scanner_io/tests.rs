@@ -180,6 +180,13 @@ async fn scanner_set_cache_admission_tracks_owner_snapshot_and_fails_closed() {
         set.scanner_data_usage_publication_admission_guard().await.is_none(),
         "active movement must keep set cache publication blocked"
     );
+
+    *store.rebalance_meta.write().await = None;
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "an idle owner refresh must make set cache publication live again"
+    );
 }
 
 #[tokio::test]

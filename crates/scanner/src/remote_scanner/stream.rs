@@ -22,7 +22,7 @@ use crate::scanner_io::{
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
-    DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
+    DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle, scanner_publication_epoch,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_common::heal_channel::HealScanMode;
@@ -686,6 +686,9 @@ async fn scan_and_persist_local_bucket(
                 source.pool_index, source.set_index
             ))
         })?;
+    let expected_publication_epoch = scanner_publication_epoch(set.clone()).await.ok_or_else(|| {
+        RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
+    })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
     let guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
@@ -796,10 +799,12 @@ async fn scan_and_persist_local_bucket(
         .await
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
     let done_save = Metrics::time(Metric::SaveUsage);
-    // DataUsageCache persistence acquires movement admission separately for
-    // each physical main/backup PUT, so a transition between those writes
-    // fails closed instead of being hidden by one outer guard.
-    let save_result = cache.save_with_revisions(set, &cache_name, &revisions).await;
+    // Each physical main/backup PUT must still prove the epoch captured before
+    // the scan. A movement transition that starts and ends during the scan
+    // therefore cannot admit the stale cache under the new epoch.
+    let save_result = cache
+        .save_with_revisions_for_epoch(set, &cache_name, &revisions, expected_publication_epoch)
+        .await;
     done_save();
     save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store)

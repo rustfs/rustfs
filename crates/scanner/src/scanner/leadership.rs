@@ -218,8 +218,11 @@ pub(super) async fn complete_scanner_leadership_claim(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     claimed_epoch: u64,
+    expected_publication_epoch: Option<u64>,
 ) -> bool {
-    if let Err(err) = fence_scanner_usage_epoch(ctx, storeapi, claimed_epoch).await {
+    if let Err(err) =
+        fence_scanner_usage_epoch_with_expected_epoch(ctx, storeapi, claimed_epoch, expected_publication_epoch).await
+    {
         error!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_PERSIST_STATE,
@@ -339,7 +342,7 @@ pub(super) async fn claim_scanner_leadership(
                 if let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) {
                     *revision = DataUsageCacheRevision::Etag(etag);
                     *persisted_epoch = claimed_epoch;
-                    return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                    return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
                 }
 
                 match reconcile_scanner_leadership_claim(
@@ -354,7 +357,7 @@ pub(super) async fn claim_scanner_leadership(
                 .await
                 {
                     Ok(ScannerLeadershipClaimReconcile::Durable) => {
-                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => continue,
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
@@ -398,7 +401,7 @@ pub(super) async fn claim_scanner_leadership(
                 .await
                 {
                     Ok(ScannerLeadershipClaimReconcile::Durable) => {
-                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch, Some(read_epoch)).await;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed)
                         if retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>

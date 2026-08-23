@@ -22,6 +22,7 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use temp_env::{with_var, with_var_unset};
 use tokio::io::AsyncReadExt;
@@ -343,6 +344,7 @@ struct MemoryConfigStore {
     cancel_after_successful_puts: Mutex<HashMap<String, (usize, CancellationToken)>>,
     replace_after_successful_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
     put_counts: Mutex<HashMap<String, usize>>,
+    publication_admission_blocked: AtomicBool,
 }
 
 fn memory_config_key(bucket: &str, object: &str) -> String {
@@ -1350,7 +1352,7 @@ async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
     let old_usage = DataUsageInfo {
         scanner_epoch: Some(7),
         scanner_cycle: Some(41),
-        ..Default::default()
+        ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0)
     };
     let old_usage_data = serde_json::to_vec(&old_usage).expect("usage snapshot should encode");
     save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), old_usage_data.clone())
@@ -1424,7 +1426,7 @@ async fn full_rescan_reset_resumes_cleanup_pending_preserved_primary() {
     let usage = DataUsageInfo {
         scanner_epoch: Some(7),
         scanner_cycle: Some(41),
-        ..Default::default()
+        ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0)
     };
     save_config(
         store.clone(),
@@ -1695,7 +1697,7 @@ async fn full_rescan_reset_rejects_usage_floor_that_would_be_terminal() {
         DATA_USAGE_OBJ_NAME_PATH.as_str(),
         serde_json::to_vec(&DataUsageInfo {
             scanner_epoch: Some(u64::MAX - 1),
-            ..Default::default()
+            ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0)
         })
         .expect("usage floor should encode"),
     )
@@ -1847,14 +1849,12 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for (path, epoch, cycle) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), 8, 100), (backup_path.as_str(), 11, 103)] {
+        let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+        usage.scanner_epoch = Some(epoch);
+        usage.scanner_cycle = Some(cycle);
         store.objects.lock().await.insert(
             memory_config_key(RUSTFS_META_BUCKET, path),
-            serde_json::to_vec(&DataUsageInfo {
-                scanner_epoch: Some(epoch),
-                scanner_cycle: Some(cycle),
-                ..Default::default()
-            })
-            .expect("usage snapshot should encode"),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
         );
     }
 
@@ -1879,14 +1879,12 @@ async fn scanner_usage_floor_ignores_older_backup_after_primary_epoch_fence() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for (path, epoch, cycle) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), 8, 100), (backup_path.as_str(), 7, 10_000)] {
+        let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+        usage.scanner_epoch = Some(epoch);
+        usage.scanner_cycle = Some(cycle);
         store.objects.lock().await.insert(
             memory_config_key(RUSTFS_META_BUCKET, path),
-            serde_json::to_vec(&DataUsageInfo {
-                scanner_epoch: Some(epoch),
-                scanner_cycle: Some(cycle),
-                ..Default::default()
-            })
-            .expect("usage snapshot should encode"),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
         );
     }
 
@@ -1914,6 +1912,24 @@ fn scanner_startup_treats_incomplete_usage_snapshot_as_cold() {
         usage_snapshot_complete: true,
         ..Default::default()
     }));
+}
+
+#[test]
+fn scanner_baseline_identity_requires_complete_or_strict_legacy_shape() {
+    assert!(!data_usage_info_has_persisted_baseline_identity(&DataUsageInfo {
+        scanner_epoch: Some(3),
+        scanner_cycle: Some(7),
+        ..Default::default()
+    }));
+
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.usage_snapshot_complete = false;
+    legacy.scanner_cycle = Some(7);
+    assert!(data_usage_info_has_persisted_baseline_identity(&legacy));
+
+    let mut incomplete = legacy.clone();
+    incomplete.scanner_epoch = Some(3);
+    assert!(!data_usage_info_has_persisted_baseline_identity(&incomplete));
 }
 
 #[test]
@@ -1948,12 +1964,9 @@ fn scanner_startup_prompts_only_for_a_newer_valid_observation() {
 #[tokio::test]
 async fn scanner_startup_prefers_v2_over_legacy_usage() {
     let store = Arc::new(MemoryConfigStore::default());
-    let legacy = DataUsageInfo {
-        scanner_epoch: Some(19),
-        scanner_cycle: Some(41),
-        last_update: Some(std::time::SystemTime::now()),
-        ..Default::default()
-    };
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(19);
+    legacy.scanner_cycle = Some(41);
     let legacy_data = serde_json::to_vec(&legacy).expect("legacy usage snapshot should encode");
     store.objects.lock().await.insert(
         memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
@@ -1976,13 +1989,9 @@ async fn scanner_startup_prefers_v2_over_legacy_usage() {
         }
     );
 
-    let authoritative = DataUsageInfo {
-        scanner_epoch: Some(23),
-        scanner_cycle: Some(51),
-        last_update: Some(std::time::SystemTime::now()),
-        usage_snapshot_complete: true,
-        ..Default::default()
-    };
+    let mut authoritative = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    authoritative.scanner_epoch = Some(23);
+    authoritative.scanner_cycle = Some(51);
     let authoritative_data = serde_json::to_vec(&authoritative).expect("v2 usage snapshot should encode");
     store.objects.lock().await.insert(
         memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
@@ -2089,6 +2098,39 @@ async fn scanner_usage_backup_uses_durable_cycle_cadence_across_tasks() {
     }
 }
 
+#[tokio::test]
+async fn scanner_backup_sync_distinguishes_movement_from_missing_or_corrupt_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    store.objects.lock().await.insert(
+        primary_key.clone(),
+        serde_json::to_vec(&primary).expect("primary usage snapshot should encode"),
+    );
+    store.revisions.lock().await.insert(primary_key.clone(), 1);
+
+    store.publication_admission_blocked.store(true, Ordering::Release);
+    let movement_error = sync_data_usage_backup_from_primary(&CancellationToken::new(), store.clone())
+        .await
+        .expect_err("movement admission loss should fail backup synchronization");
+    assert!(scanner_publication_epoch_changed(&movement_error));
+
+    store.publication_admission_blocked.store(false, Ordering::Release);
+    store.objects.lock().await.remove(&primary_key);
+    store.revisions.lock().await.remove(&primary_key);
+    assert!(matches!(
+        sync_data_usage_backup_from_primary(&CancellationToken::new(), store.clone()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+
+    store.objects.lock().await.insert(primary_key.clone(), b"not-json".to_vec());
+    store.revisions.lock().await.insert(primary_key, 1);
+    let corrupt_error = sync_data_usage_backup_from_primary(&CancellationToken::new(), store)
+        .await
+        .expect_err("corrupt primary should fail backup synchronization");
+    assert!(!scanner_publication_epoch_changed(&corrupt_error));
+}
+
 #[async_trait::async_trait]
 impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
     async fn delete_config_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> EcstoreResult<ObjectInfo> {
@@ -2114,7 +2156,7 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
-        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+        (!self.publication_admission_blocked.load(Ordering::Acquire)).then(crate::ScannerDataUsagePublicationAdmission::unfenced)
     }
 }
 
@@ -2436,6 +2478,7 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
     );
     old_usage.buckets_count = 1;
     old_usage.calculate_totals();
+    old_usage.usage_snapshot_complete = true;
     let old_data = serde_json::to_vec(&old_usage).expect("old usage snapshot should encode");
     store.objects.lock().await.insert(usage_key.clone(), old_data.clone());
     store.revisions.lock().await.insert(usage_key, 1);
@@ -3520,7 +3563,8 @@ fn complete_usage_with_bucket_count(last_update: Option<std::time::SystemTime>, 
 
 async fn seed_usage_snapshot_for_leadership_claim(store: &Arc<MemoryConfigStore>) {
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-    let data = serde_json::to_vec(&complete_usage_with_bucket_count(None, 0)).expect("leadership usage baseline should encode");
+    let data = serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+        .expect("leadership usage baseline should encode");
     store.objects.lock().await.insert(key.clone(), data);
     store.revisions.lock().await.insert(key, 1);
 }

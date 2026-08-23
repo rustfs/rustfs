@@ -3620,11 +3620,20 @@ impl SetDisks {
     pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
-        if !self.ctx.scanner_publication_state_allowed() {
-            return None;
+        if self.ctx.scanner_publication_state_allowed() {
+            let epoch = self.ctx.data_movement_operation_epoch();
+            return Some((operation_guard, epoch));
         }
-        let epoch = self.ctx.data_movement_operation_epoch();
-        Some((operation_guard, epoch))
+
+        // The owner deliberately marks the cached state UNKNOWN after every
+        // movement epoch advance. Do not strand remote scanner writers in that
+        // state: release this guard before asking the storage owner to refresh
+        // its durable movement snapshot, since the owner uses the same gate.
+        drop(operation_guard);
+        let Some(owner) = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx)) else {
+            return None;
+        };
+        owner.scanner_data_usage_publication_admission_guard().await
     }
 
     /// Whether both sets' namespace-lock implementations cover the same object key.

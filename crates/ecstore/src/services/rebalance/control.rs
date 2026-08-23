@@ -659,6 +659,8 @@ impl ECStore {
             return Ok(());
         }
 
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let encoded_error = encode_rebalance_stop_propagation_record(&record);
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -672,6 +674,7 @@ impl ECStore {
                     .await,
                 "record_rebalance_stop_propagation",
             )?;
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())

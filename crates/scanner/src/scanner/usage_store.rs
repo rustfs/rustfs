@@ -517,7 +517,9 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            if let Err(e) = sync_data_usage_backup_from_primary(&ctx, storeapi.clone()).await {
+            let backup_result = sync_data_usage_backup_from_primary(&ctx, storeapi.clone()).await;
+            done_save();
+            if let Err(e) = backup_result {
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_PERSIST_STATE,
@@ -528,12 +530,13 @@ where
                     error = %e,
                     "Scanner data usage backup save failed"
                 );
-                if matches!(e, EcstoreError::ConfigNotFound) {
+                if scanner_publication_epoch_changed(&e) {
                     outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
                     break 'updates;
                 }
+                outcome = DataUsagePersistOutcome::Failed;
+                break 'updates;
             }
-            done_save();
         }
     }
 
