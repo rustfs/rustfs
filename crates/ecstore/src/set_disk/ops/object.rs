@@ -1294,7 +1294,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             (prepared.snapshot, prepared.object_info)
         } else {
             match self
-                .get_object_fileinfo(
+                .get_object_fileinfo_for_get_object_reader(
                     bucket,
                     object,
                     opts,
@@ -2123,14 +2123,27 @@ impl SetDisks {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
+            let shard_file_size_raw = erasure.shard_file_size(put_object_size);
             let is_inline_buffer =
-                storage_class_config.should_inline(erasure.shard_file_size(put_object_size), erasure.data_shards, opts.versioned);
+                storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
-            let shard_file_size = erasure.shard_file_size(put_object_size);
+            let shard_file_size = shard_file_size_raw;
             let shard_size = erasure.shard_size();
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
+            {
+                use std::io::Write;
+                let msg = format!(
+                    "INLINE_DEBUG: bucket={} obj={} size={} shard_fs={} ds={} bs={} inline={} direct={} path={} iblock={} ver={}\n",
+                    bucket, object, put_object_size, shard_file_size_raw, erasure.data_shards, fi.erasure.block_size,
+                    is_inline_buffer, direct_inline_commit, write_path.metric_label(), storage_class_config.inline_block(), opts.versioned
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rustfs_inline_debug.log") {
+                    let _ = f.write_all(msg.as_bytes());
+                }
+                let _ = std::io::stderr().write_all(msg.as_bytes());
+            }
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
             let (mut writers, errors) = if direct_inline_commit {
@@ -2484,6 +2497,7 @@ impl SetDisks {
                         })
                         .await?,
                     );
+                    notify_put_object_commit_namespace_acquired(bucket, object);
                 }
                 #[cfg(not(any(test, feature = "test-util")))]
                 {
@@ -4631,6 +4645,7 @@ struct PutObjectCommitBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
     namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -4652,6 +4667,7 @@ impl PutObjectCommitBarrier {
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -4685,6 +4701,10 @@ impl PutObjectCommitBarrier {
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
             .await
             .expect("put object should wait for the namespace lock after leaving the commit barrier");
+    }
+
+    pub fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -4742,6 +4762,22 @@ fn notify_put_object_commit_namespace_pending(bucket: &str, object: &str) {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == PutObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 struct DeleteObjectCommitBarrierState {
     bucket: String,
@@ -4751,7 +4787,7 @@ struct DeleteObjectCommitBarrierState {
 }
 
 #[cfg(test)]
-struct DeleteObjectCommitBarrier {
+pub(crate) struct DeleteObjectCommitBarrier {
     state: Arc<DeleteObjectCommitBarrierState>,
 }
 
@@ -4761,7 +4797,7 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
-    fn install(bucket: &str, object: &str) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
@@ -4777,13 +4813,13 @@ impl DeleteObjectCommitBarrier {
         Self { state }
     }
 
-    async fn wait_until_paused(&self) {
+    pub(crate) async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("delete object should reach the deterministic commit barrier");
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
 }
@@ -5905,6 +5941,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if dobj.version_id.is_none() && (version_suspended || versioned) {
                 vr.mod_time = Some(OffsetDateTime::now_utc());
                 vr.deleted = true;
+                vr.mark_deleted = true;
                 if versioned {
                     vr.version_id = Some(Uuid::new_v4());
                 }
@@ -11791,6 +11828,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    ..Default::default()
                 },
                 "test_data_movement",
             )

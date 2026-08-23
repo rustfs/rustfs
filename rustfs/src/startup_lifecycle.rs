@@ -128,6 +128,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     } = lifecycle;
     let StartupServiceRuntime {
         optional_runtimes,
+        heartbeat,
         iam_bootstrap,
         enable_scanner,
     } = service_runtime;
@@ -162,6 +163,9 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         shutdown_token,
     )
     .await;
+    if let Some(heartbeat) = heartbeat {
+        heartbeat.shutdown().await;
+    }
     if let Err(err) = event_notifier_reconciler.await {
         tracing::warn!(
             target: "rustfs::main::run",

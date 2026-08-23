@@ -1100,6 +1100,10 @@ pub(crate) fn shutdown_background_monitors() {
     rustfs_ecstore::shutdown_background_monitors();
 }
 
+pub(crate) fn mark_get_metadata_read_version_coalescing_service_ready() {
+    rustfs_ecstore::mark_get_metadata_read_version_coalescing_service_ready();
+}
+
 pub(crate) fn set_global_rustfs_port(value: u16) {
     ecstore_global::set_global_rustfs_port(value);
 }

@@ -16,7 +16,7 @@ use super::persistence::DataUsageCacheLoadAttempt;
 use super::*;
 use crate::storage_api::scanner_io::{HTTPRangeSpec, ObjectIO};
 use crate::{ScannerGetObjectReader, ScannerPutObjReader};
-use rustfs_data_usage::{ReplicationAllStats, ReplicationStats};
+use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
 use serde_json::Value;
 use std::io::Cursor;
 use std::pin::Pin;
@@ -1675,7 +1675,7 @@ fn size_recursive_prunes_empty_and_preserves_threshold_replication_stats() {
             replication_stats: Some(ReplicationAllStats {
                 targets: HashMap::from([(
                     "arn:test:threshold".to_string(),
-                    ReplicationStats {
+                    ReplicationTargetUsage {
                         after_threshold_count: 1,
                         ..Default::default()
                     },

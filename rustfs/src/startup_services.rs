@@ -16,6 +16,7 @@ use crate::site_replication_reconcile::spawn_site_replication_reconcile_task;
 use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
 use crate::{
     config::Config,
+    connect::{CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, spawn_heartbeat_runtime},
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
     startup_audit::init_audit_runtime,
@@ -35,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct StartupServiceRuntime {
     pub(crate) optional_runtimes: OptionalRuntimeServices,
+    pub(crate) heartbeat: Option<HeartbeatRuntime>,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
     pub(crate) enable_scanner: bool,
 }
@@ -73,6 +75,8 @@ pub(crate) async fn init_startup_runtime_services(
     init_kms_system(config).await?;
 
     let optional_runtimes = init_optional_runtime_services().await?;
+    let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
+    let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
 
     init_buffer_profile_system(config);
     init_deadlock_detector_runtime();
@@ -92,10 +96,27 @@ pub(crate) async fn init_startup_runtime_services(
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
     init_observability_runtime(store.clone(), ctx.clone()).await;
+    let heartbeat = start_heartbeat_runtime(heartbeat_config, heartbeat_nodes, &ctx)?;
 
     Ok(StartupServiceRuntime {
         optional_runtimes,
+        heartbeat,
         iam_bootstrap,
         enable_scanner,
     })
+}
+
+fn start_heartbeat_runtime(
+    config: Option<HeartbeatConfig>,
+    node_count: Option<usize>,
+    shutdown: &CancellationToken,
+) -> Result<Option<HeartbeatRuntime>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let summary = u16::try_from(node_count.unwrap_or_default())
+        .ok()
+        .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
+        .ok_or_else(|| std::io::Error::other("Connect heartbeat node count is outside protocol bounds"))?;
+    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(std::io::Error::other)
 }

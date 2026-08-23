@@ -14,17 +14,16 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use std::time::Instant;
-
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 const BUDGET_REASON_NONE: u8 = 0;
 const BUDGET_REASON_RUNTIME: u8 = 1;
 const BUDGET_REASON_OBJECTS: u8 = 2;
 const BUDGET_REASON_DIRECTORIES: u8 = 3;
+const PROGRESS_CLOCK_SAMPLE_INTERVAL: u64 = 128;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScannerCycleBudgetConfig {
@@ -63,29 +62,51 @@ pub struct ScannerCycleBudget {
     token: CancellationToken,
     reason: Arc<AtomicU8>,
     started_at: Instant,
+    deadline: Option<Instant>,
     max_duration: Option<Duration>,
     max_objects: Option<u64>,
     max_directories: Option<u64>,
     track_progress: bool,
+    track_unbounded_counts: bool,
     objects_scanned: AtomicU64,
     directories_started: AtomicU64,
     entries_visited: AtomicU64,
+    last_progress_millis: AtomicU64,
+    cycle_state_persisted: AtomicBool,
 }
 
 impl ScannerCycleBudget {
+    #[cfg(test)]
     pub(crate) fn new(parent: &CancellationToken, config: ScannerCycleBudgetConfig) -> Arc<Self> {
-        Self::new_inner(parent, config, false)
+        Self::new_inner(parent, config, false, false)
     }
 
     pub(crate) fn new_with_progress_tracking(parent: &CancellationToken, config: ScannerCycleBudgetConfig) -> Arc<Self> {
-        Self::new_inner(parent, config, true)
+        Self::new_inner(parent, config, true, true)
     }
 
-    fn new_inner(parent: &CancellationToken, config: ScannerCycleBudgetConfig, track_progress: bool) -> Arc<Self> {
+    pub(crate) fn new_with_runtime_progress_tracking(parent: &CancellationToken, config: ScannerCycleBudgetConfig) -> Arc<Self> {
+        let track_progress = config.max_duration.is_some();
+        Self::new_inner(parent, config, track_progress, false)
+    }
+
+    fn new_inner(
+        parent: &CancellationToken,
+        config: ScannerCycleBudgetConfig,
+        track_progress: bool,
+        track_unbounded_counts: bool,
+    ) -> Arc<Self> {
         let token = parent.child_token();
         let reason = Arc::new(AtomicU8::new(BUDGET_REASON_NONE));
+        let started_at = Instant::now();
+        let deadline = config.max_duration.map(|duration| match started_at.checked_add(duration) {
+            Some(deadline) => deadline,
+            // Runtime config rejects this range, but keep programmatic callers
+            // fail-closed instead of panicking or silently disabling the wall clock.
+            None => started_at,
+        });
 
-        if let Some(duration) = config.max_duration {
+        if let Some(deadline) = deadline {
             let parent = parent.clone();
             let token_wait = token.clone();
             let token_cancel = token.clone();
@@ -94,7 +115,7 @@ impl ScannerCycleBudget {
                 tokio::select! {
                     _ = parent.cancelled() => {}
                     _ = token_wait.cancelled() => {}
-                    _ = tokio::time::sleep(duration) => {
+                    _ = tokio::time::sleep_until(deadline) => {
                         Self::cancel_for_reason(&reason, &token_cancel, ScannerCycleBudgetReason::Runtime);
                     }
                 }
@@ -104,14 +125,18 @@ impl ScannerCycleBudget {
         Arc::new(Self {
             token,
             reason,
-            started_at: Instant::now(),
+            started_at,
+            deadline,
             max_duration: config.max_duration,
             max_objects: config.max_objects,
             max_directories: config.max_directories,
             track_progress,
+            track_unbounded_counts,
             objects_scanned: AtomicU64::new(0),
             directories_started: AtomicU64::new(0),
             entries_visited: AtomicU64::new(0),
+            last_progress_millis: AtomicU64::new(0),
+            cycle_state_persisted: AtomicBool::new(false),
         })
     }
 
@@ -129,6 +154,14 @@ impl ScannerCycleBudget {
 
     pub(crate) fn max_duration(&self) -> Option<Duration> {
         self.max_duration
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub(crate) fn cancel_for_runtime(&self) {
+        self.cancel_for(ScannerCycleBudgetReason::Runtime);
     }
 
     pub(crate) fn max_objects(&self) -> Option<u64> {
@@ -173,15 +206,43 @@ impl ScannerCycleBudget {
         self.entries_visited.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn mark_cycle_state_persisted(&self) {
+        self.cycle_state_persisted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn cycle_state_persisted(&self) -> bool {
+        self.cycle_state_persisted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn progress_age(&self) -> Duration {
+        let elapsed_millis = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last_progress = self.last_progress_millis.load(Ordering::Relaxed);
+        Duration::from_millis(elapsed_millis.saturating_sub(last_progress))
+    }
+
+    fn record_progress_sample(&self, event: u64) {
+        // Clock reads are sampled at batch/count boundaries; the scanner's
+        // per-object path does not add a second progress atomic.
+        if event == 0 || (event != 1 && !event.is_multiple_of(PROGRESS_CLOCK_SAMPLE_INTERVAL)) {
+            return;
+        }
+        let elapsed_millis = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_progress_millis.store(elapsed_millis, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_entries_visited(&self, entries_visited: u64) {
         if self.track_progress {
-            saturating_fetch_add(&self.entries_visited, entries_visited);
+            let entries = saturating_fetch_add(&self.entries_visited, entries_visited);
+            self.record_progress_sample(entries);
         }
     }
 
     pub(crate) fn record_remote_progress(&self, objects_scanned: u64, directories_started: u64) {
         if self.track_progress || self.max_objects.is_some() {
             let objects = saturating_fetch_add(&self.objects_scanned, objects_scanned);
+            if self.track_progress {
+                self.record_progress_sample(objects);
+            }
             if self.max_objects.is_some_and(|max_objects| objects >= max_objects) {
                 self.cancel_for(ScannerCycleBudgetReason::Objects);
             }
@@ -189,9 +250,12 @@ impl ScannerCycleBudget {
 
         if self.track_progress || self.max_directories.is_some() {
             let directories = saturating_fetch_add(&self.directories_started, directories_started);
+            if self.track_progress {
+                self.record_progress_sample(directories);
+            }
             if self
                 .max_directories
-                .is_some_and(|max_directories| directories > max_directories)
+                .is_some_and(|max_directories| directory_budget_exhausted(directories, max_directories))
             {
                 self.cancel_for(ScannerCycleBudgetReason::Directories);
             }
@@ -207,14 +271,17 @@ impl ScannerCycleBudget {
     }
 
     pub(crate) fn try_start_directory(&self) -> bool {
-        if !self.track_progress && self.max_directories.is_none() {
+        if self.max_directories.is_none() && !self.track_unbounded_counts {
             return true;
         }
 
         let directories = saturating_fetch_add(&self.directories_started, 1);
+        if self.track_progress {
+            self.record_progress_sample(directories);
+        }
         if self
             .max_directories
-            .is_some_and(|max_directories| directories > max_directories)
+            .is_some_and(|max_directories| directory_budget_exhausted(directories, max_directories))
         {
             self.cancel_for(ScannerCycleBudgetReason::Directories);
             return false;
@@ -224,11 +291,14 @@ impl ScannerCycleBudget {
     }
 
     pub(crate) fn record_object_scanned(&self) {
-        if !self.track_progress && self.max_objects.is_none() {
+        if self.max_objects.is_none() && !self.track_unbounded_counts {
             return;
         }
 
         let objects = saturating_fetch_add(&self.objects_scanned, 1);
+        if self.track_progress {
+            self.record_progress_sample(objects);
+        }
         if self.max_objects.is_some_and(|max_objects| objects >= max_objects) {
             self.cancel_for(ScannerCycleBudgetReason::Objects);
         }
@@ -257,6 +327,13 @@ fn saturating_fetch_add(value: &AtomicU64, delta: u64) -> u64 {
             Err(observed) => current = observed,
         }
     }
+}
+
+fn directory_budget_exhausted(directories: u64, max_directories: u64) -> bool {
+    // Saturation hides a remote max+1 update when the configured limit is the
+    // largest representable counter. Treat that boundary as exhausted rather
+    // than allowing work to continue indefinitely.
+    directories > max_directories || (directories == u64::MAX && max_directories == u64::MAX)
 }
 
 impl Drop for ScannerCycleBudget {
@@ -402,6 +479,35 @@ mod tests {
     }
 
     #[test]
+    fn directory_budget_fails_closed_when_progress_saturates() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_directories: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+
+        budget.record_remote_progress(0, u64::MAX);
+
+        assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Directories));
+        assert!(budget.token().is_cancelled());
+
+        let local_budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_directories: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+        local_budget.record_remote_progress(0, u64::MAX - 1);
+        assert!(!local_budget.budget_elapsed());
+        assert!(!local_budget.try_start_directory());
+        assert_eq!(local_budget.reason(), Some(ScannerCycleBudgetReason::Directories));
+    }
+
+    #[test]
     fn explicit_progress_tracking_counts_unbounded_remote_work_without_cancelling() {
         let parent = CancellationToken::new();
         let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, ScannerCycleBudgetConfig::default());
@@ -460,5 +566,30 @@ mod tests {
         assert!(!runtime_only.requires_serial_progress_accounting());
         assert!(object_limited.requires_serial_progress_accounting());
         assert!(directory_limited.requires_serial_progress_accounting());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_age_uses_virtual_time_and_sampled_progress() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_runtime_progress_tracking(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(budget.progress_age(), Duration::from_secs(5));
+        budget.record_entries_visited(1);
+        assert_eq!(budget.progress_age(), Duration::ZERO);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..126 {
+            budget.record_entries_visited(1);
+        }
+        assert_eq!(budget.progress_age(), Duration::from_secs(2));
+        budget.record_entries_visited(1);
+        assert_eq!(budget.progress_age(), Duration::ZERO);
     }
 }

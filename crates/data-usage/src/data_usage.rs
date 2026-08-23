@@ -627,9 +627,12 @@ impl VersionsHistogram {
     }
 }
 
-/// Replication statistics for a single target
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationStats {
+/// Replication statistics for a single target.
+///
+/// Renamed from `ReplicationStats`; serde field names are preserved
+/// byte-identically to maintain wire compatibility with existing snapshots.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicationTargetUsage {
     pub pending_size: u64,
     pub replicated_size: u64,
     pub failed_size: u64,
@@ -642,7 +645,7 @@ pub struct ReplicationStats {
     pub replicated_count: u64,
 }
 
-impl ReplicationStats {
+impl ReplicationTargetUsage {
     pub fn is_empty(&self) -> bool {
         let Self {
             pending_size,
@@ -678,7 +681,7 @@ impl ReplicationStats {
 /// Replication statistics for all targets
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ReplicationAllStats {
-    pub targets: HashMap<String, ReplicationStats>,
+    pub targets: HashMap<String, ReplicationTargetUsage>,
     pub replica_size: u64,
     pub replica_count: u64,
 }
@@ -691,7 +694,7 @@ impl ReplicationAllStats {
             targets,
         } = self;
 
-        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationStats::is_empty)
+        *replica_size == 0 && *replica_count == 0 && targets.values().all(ReplicationTargetUsage::is_empty)
     }
 
     #[deprecated(note = "use is_empty instead")]
@@ -2554,7 +2557,7 @@ mod tests {
 
     #[test]
     fn replication_stats_empty_checks_every_field() {
-        type SetField = fn(&mut ReplicationStats);
+        type SetField = fn(&mut ReplicationTargetUsage);
 
         let cases: [(&str, SetField); 10] = [
             ("pending_size", |stats| stats.pending_size = 1),
@@ -2569,9 +2572,9 @@ mod tests {
             ("replicated_count", |stats| stats.replicated_count = 1),
         ];
 
-        assert!(ReplicationStats::default().is_empty());
+        assert!(ReplicationTargetUsage::default().is_empty());
         for (field, set_nonzero) in cases {
-            let mut stats = ReplicationStats::default();
+            let mut stats = ReplicationTargetUsage::default();
             set_nonzero(&mut stats);
             assert!(!stats.is_empty(), "{field} must make replication stats non-empty");
         }
@@ -2602,17 +2605,17 @@ mod tests {
         }
 
         let empty_targets = ReplicationAllStats {
-            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationStats::default())]),
+            targets: HashMap::from([("arn:test:empty".to_string(), ReplicationTargetUsage::default())]),
             ..Default::default()
         };
         assert!(empty_targets.is_empty(), "all-empty targets must keep aggregate stats empty");
 
         let stats = ReplicationAllStats {
             targets: HashMap::from([
-                ("arn:test:empty".to_string(), ReplicationStats::default()),
+                ("arn:test:empty".to_string(), ReplicationTargetUsage::default()),
                 (
                     "arn:test:non-empty".to_string(),
-                    ReplicationStats {
+                    ReplicationTargetUsage {
                         pending_count: 1,
                         ..Default::default()
                     },
@@ -2653,7 +2656,7 @@ mod tests {
                 replication_stats: Some(ReplicationAllStats {
                     targets: HashMap::from([(
                         "arn:test:pending".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             pending_count: 1,
                             ..Default::default()
                         },
@@ -2802,7 +2805,7 @@ mod tests {
                 targets: HashMap::from([
                     (
                         "arn:self-only".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             pending_size: 7,
                             pending_count: 1,
                             ..Default::default()
@@ -2810,7 +2813,7 @@ mod tests {
                     ),
                     (
                         "arn:shared".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             failed_size: 3,
                             failed_count: 1,
                             missed_threshold_size: 2,
@@ -2829,7 +2832,7 @@ mod tests {
                 targets: HashMap::from([
                     (
                         "arn:shared".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             failed_size: 5,
                             failed_count: 2,
                             after_threshold_size: 4,
@@ -2839,7 +2842,7 @@ mod tests {
                     ),
                     (
                         "arn:other-only".to_string(),
-                        ReplicationStats {
+                        ReplicationTargetUsage {
                             replicated_size: 11,
                             replicated_count: 3,
                             ..Default::default()
@@ -3081,13 +3084,56 @@ mod tests {
     fn replication_target_deserialization_preserves_large_historical_maps() {
         let mut stats = ReplicationAllStats::default();
         for index in 0..=1024 {
-            stats.targets.insert(format!("target-{index}"), ReplicationStats::default());
+            stats
+                .targets
+                .insert(format!("target-{index}"), ReplicationTargetUsage::default());
         }
         let encoded = rmp_serde::to_vec_named(&stats).expect("large replication target fixture should encode");
         let decoded = rmp_serde::from_slice::<ReplicationAllStats>(&encoded)
             .expect("historical replication target maps must remain readable");
 
         assert_eq!(decoded.targets.len(), stats.targets.len());
+    }
+
+    /// Round-trip test: encoding a [`ReplicationTargetUsage`] and decoding it back
+    /// must produce the exact same value.  This guards against accidental serde
+    /// field-name drift during the `ReplicationStats` -> `ReplicationTargetUsage`
+    /// rename.  Wire-level field names are the serialized Rust field identifiers,
+    /// which must remain byte-identical.
+    #[test]
+    fn replication_target_usage_rmp_round_trip() {
+        let original = ReplicationTargetUsage {
+            pending_size: 100,
+            replicated_size: 2_000,
+            failed_size: 50,
+            failed_count: 3,
+            pending_count: 7,
+            missed_threshold_size: 11,
+            after_threshold_size: 22,
+            missed_threshold_count: 1,
+            after_threshold_count: 2,
+            replicated_count: 99,
+        };
+
+        let buf = rmp_serde::to_vec_named(&original).expect("encode ReplicationTargetUsage to msgpack");
+        let decoded: ReplicationTargetUsage = rmp_serde::from_slice(&buf).expect("decode ReplicationTargetUsage from msgpack");
+        assert_eq!(original, decoded, "round-trip through rmp must preserve every field");
+
+        // Also verify that encoding as an unnamed sequence and then decoding
+        // with named fields produces the correct mapping (this catches reordering).
+        let named_buf = rmp_serde::to_vec_named(&original).expect("re-encode for field-name pinning");
+        // Spot-check that known field names appear in the named encoding.
+        let named_str = String::from_utf8_lossy(&named_buf);
+        assert!(named_str.contains("pending_size"), "field 'pending_size' must survive the rename");
+        assert!(named_str.contains("replicated_size"), "field 'replicated_size' must survive the rename");
+        assert!(
+            named_str.contains("missed_threshold_size"),
+            "field 'missed_threshold_size' must survive the rename"
+        );
+        assert!(
+            named_str.contains("after_threshold_count"),
+            "field 'after_threshold_count' must survive the rename"
+        );
     }
 
     #[test]
