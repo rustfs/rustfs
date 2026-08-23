@@ -894,6 +894,7 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.init().await?;
         rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
         self.flush().await?;
         Ok(())
@@ -1283,6 +1284,16 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[tokio::test]
+    async fn empty_writer_emits_a_valid_stream() {
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.close().await.expect("empty stream should close");
+
+        let mut reader = MetacacheReader::new(Cursor::new(output.into_inner()));
+        assert!(reader.read_all().await.expect("empty stream should decode").is_empty());
     }
 
     fn corrupt_stream_with_metadata_len(len_marker: u8, len: u32) -> Vec<u8> {
