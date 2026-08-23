@@ -824,6 +824,14 @@ mod test {
                 last_usage_save_unix_secs: 12,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
+                last_durable_success_unix_secs: 13,
+                last_publication_unix_secs: 14,
+                last_publication_state: "published".to_string(),
+                last_publication_reason: "complete".to_string(),
+                deferred_pending: true,
+                deferred_total: 15,
+                last_deferred_unix_secs: 16,
+                last_deferred_reason: "data_movement".to_string(),
             },
             ..Default::default()
         });
@@ -836,6 +844,14 @@ mod test {
         assert_eq!(scanner.usage_freshness.last_usage_save_unix_secs, 12);
         assert_eq!(scanner.usage_freshness.last_usage_save_result, "success");
         assert_eq!(scanner.usage_freshness.last_usage_save_result_code, 1);
+        assert_eq!(scanner.usage_freshness.last_durable_success_unix_secs, 13);
+        assert_eq!(scanner.usage_freshness.last_publication_unix_secs, 14);
+        assert_eq!(scanner.usage_freshness.last_publication_state, "published");
+        assert_eq!(scanner.usage_freshness.last_publication_reason, "complete");
+        assert!(scanner.usage_freshness.deferred_pending);
+        assert_eq!(scanner.usage_freshness.deferred_total, 15);
+        assert_eq!(scanner.usage_freshness.last_deferred_unix_secs, 16);
+        assert_eq!(scanner.usage_freshness.last_deferred_reason, "data_movement");
     }
 
     #[test]
