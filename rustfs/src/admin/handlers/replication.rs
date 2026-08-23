@@ -16,16 +16,17 @@ use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    AppContext, app_context_from_req, current_notification_system_for_context, current_replication_stats_handle_for_context,
-    current_runtime_port, object_store_from_req,
+    AppContext, app_context_from_req, current_notification_system_for_context, current_replication_pool_handle,
+    current_replication_stats_handle_for_context, current_runtime_port, object_store_from_req,
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
+use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
 #[cfg(test)]
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
-use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
+use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType, ResyncStatusType};
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
@@ -861,6 +862,8 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
+        cancel_active_resync_intent(bucket, arn_str).await?;
+
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -876,6 +879,45 @@ impl Operation for RemoveRemoteTargetHandler {
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
+}
+
+/// Cancel a pending/started resync intent recorded for `arn` before the target
+/// is removed. Without this the intent outlives its target in `resync.bin`, and
+/// every later startup reconcile finds an accepted intent with no target to
+/// bind it to. Buckets with no resync history are a no-op.
+async fn cancel_active_resync_intent(bucket: &str, arn: &str) -> S3Result<()> {
+    let Some(pool) = current_replication_pool_handle() else {
+        return Ok(());
+    };
+    let status = pool
+        .get_bucket_resync_status(bucket)
+        .await
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to read resync status: {e}")))?;
+    let Some(intent) = status.targets_map.get(arn) else {
+        return Ok(());
+    };
+    if !matches!(intent.resync_status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted) {
+        return Ok(());
+    }
+    pool.cancel_bucket_resync(replication::resync_opts(
+        bucket,
+        arn.to_string(),
+        &intent.resync_id,
+        intent.resync_before_date,
+    ))
+    .await
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to cancel resync: {e}")))?;
+    info!(
+        event = "replication_resync_intent_canceled",
+        component = "admin",
+        subsystem = "replication",
+        result = "canceled",
+        bucket,
+        arn,
+        resync_id = %intent.resync_id,
+        "canceled active resync intent for removed remote target"
+    );
+    Ok(())
 }
 
 /// Upper bound on the number of object versions scanned per `POST
