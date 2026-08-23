@@ -14,7 +14,7 @@
 
 use std::env;
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -118,26 +118,26 @@ impl HeartbeatConfig {
         if state_dir.as_os_str().is_empty() || endpoint.is_some() != root_ca_file.is_some() {
             return Err(HeartbeatConfigError::Partial);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         return Err(HeartbeatConfigError::PlatformSecurity);
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let (Some(endpoint), Some(root_ca_file)) = (endpoint, root_ca_file) else {
             return Ok(Some(Self::state_only(state_dir)));
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let endpoint = endpoint.into_string().map_err(|_| HeartbeatConfigError::EndpointEncoding)?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let root_ca_file = PathBuf::from(root_ca_file);
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         if endpoint.is_empty() || root_ca_file.as_os_str().is_empty() {
             return Err(HeartbeatConfigError::Partial);
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let root_ca_pem = fs::read(&root_ca_file).map_err(|source| HeartbeatConfigError::RootCertificate {
             path: root_ca_file,
             source,
         })?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         Ok(Some(Self::new(
             endpoint,
             root_ca_pem,
@@ -162,7 +162,7 @@ pub enum HeartbeatConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("Connect inventory persistence requires Unix filesystem security guarantees")]
+    #[error("Connect inventory persistence requires Linux filesystem security guarantees")]
     PlatformSecurity,
 }
 
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn state_directory_alone_enables_local_inventory_without_transport() {
         let state = tempfile::tempdir().expect("tempdir").keep();
         let config = HeartbeatConfig::from_env_values(None, None, Some(state.clone().into_os_string()))
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn complete_environment_builds_the_durable_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("root.pem");
@@ -235,10 +235,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(unix))]
-    fn configured_inventory_fails_without_unix_filesystem_guarantees() {
+    #[cfg(not(target_os = "linux"))]
+    fn configured_inventory_fails_without_linux_filesystem_guarantees() {
         assert!(matches!(
             HeartbeatConfig::from_env_values(None, None, Some(OsString::from("state"))),
+            Err(HeartbeatConfigError::PlatformSecurity)
+        ));
+        assert!(matches!(
+            HeartbeatConfig::from_env_values(
+                Some(OsString::from("https://connect.example/agent/")),
+                Some(OsString::from("missing-root.pem")),
+                Some(OsString::from("state")),
+            ),
             Err(HeartbeatConfigError::PlatformSecurity)
         ));
     }
