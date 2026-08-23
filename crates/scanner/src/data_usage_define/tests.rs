@@ -1327,6 +1327,24 @@ fn usage_cache_wire_format_is_pinned() {
 }
 
 #[test]
+fn usage_cache_lkg_fields_round_trip_when_present() {
+    let mut cache = wire_fixture_cache();
+    cache.info.lkg_snapshot_complete = true;
+    cache.info.lkg_next_cycle = Some(6);
+    cache.info.lkg_last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_699_999_999));
+    cache.info.lkg_leader_epoch = Some(8);
+    cache.info.lkg_scan_plan_digest = Some(DataUsageScanPlanDigest([2; 32]));
+
+    let encoded = cache.marshal_msg().expect("marshal cache with LKG metadata");
+    let decoded = DataUsageCache::unmarshal(&encoded).expect("decode cache with LKG metadata");
+    assert!(decoded.info.lkg_snapshot_complete);
+    assert_eq!(decoded.info.lkg_next_cycle, Some(6));
+    assert_eq!(decoded.info.lkg_last_update, cache.info.lkg_last_update);
+    assert_eq!(decoded.info.lkg_leader_epoch, Some(8));
+    assert_eq!(decoded.info.lkg_scan_plan_digest, Some(DataUsageScanPlanDigest([2; 32])));
+}
+
+#[test]
 fn data_usage_cache_prepare_for_scan_rejects_unscoped_distributed_cache() {
     let mut cache = DataUsageCache {
         info: DataUsageCacheInfo {
