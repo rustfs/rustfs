@@ -784,6 +784,24 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
 ///
 /// # Returns
 /// A Result containing the BitrotWriterWrapper or an error
+/// Size hint handed to `DiskAPI::create_file` for a bitrot-wrapped shard.
+///
+/// A known length is grown by one checksum per shard so the on-disk file size
+/// matches what the bitrot writer emits. A negative length is the
+/// unknown-size sentinel (`HashReader::SIZE_PRESERVE_LAYER`, used by SSE and
+/// compression) and must be preserved: `RemoteDisk::create_file` forwards it
+/// in the `put_file_stream` query, and the receiver only treats `size > 0` as
+/// a fixed body length when locating the authenticated trailer. Clamping it
+/// to `0` would claim an empty body and misframe the stream. `0` stays `0`
+/// because a genuinely empty object still means an empty body.
+fn bitrot_create_file_size(length: i64, shard_size: usize, checksum_algo: &HashAlgorithm) -> i64 {
+    if length <= 0 {
+        return length;
+    }
+    let length = length as usize;
+    (length.div_ceil(shard_size) * checksum_algo.size() + length) as i64
+}
+
 pub async fn create_bitrot_writer(
     is_inline_buffer: bool,
     disk: Option<&DiskStore>,
@@ -796,12 +814,7 @@ pub async fn create_bitrot_writer(
     let writer = if is_inline_buffer {
         CustomWriter::new_inline_buffer()
     } else if let Some(disk) = disk {
-        let length = if length > 0 {
-            let length = length as usize;
-            (length.div_ceil(shard_size) * checksum_algo.size() + length) as i64
-        } else {
-            0
-        };
+        let length = bitrot_create_file_size(length, shard_size, &checksum_algo);
 
         let file = disk.create_file("", volume, path, length).await?;
         #[cfg(feature = "hotpath")]
@@ -819,6 +832,25 @@ mod tests {
     use super::*;
     use rustfs_rio::ChunkReader;
     use std::collections::VecDeque;
+
+    #[test]
+    fn bitrot_create_file_size_grows_known_length_by_checksums() {
+        // 10 bytes over 4-byte shards = 3 shards, each followed by a 32-byte hash.
+        assert_eq!(bitrot_create_file_size(10, 4, &HashAlgorithm::HighwayHash256), 10 + 3 * 32);
+        assert_eq!(bitrot_create_file_size(10, 4, &HashAlgorithm::None), 10);
+    }
+
+    #[test]
+    fn bitrot_create_file_size_keeps_empty_and_unknown_distinct() {
+        assert_eq!(bitrot_create_file_size(0, 4, &HashAlgorithm::HighwayHash256), 0);
+        // SSE/compression streams advertise SIZE_PRESERVE_LAYER (-1); the remote
+        // put_file_stream receiver relies on a non-positive size to parse the auth
+        // trailer from the stream tail, so the sentinel must survive untouched.
+        assert_eq!(
+            bitrot_create_file_size(rustfs_rio::HashReader::SIZE_PRESERVE_LAYER, 4, &HashAlgorithm::HighwayHash256),
+            rustfs_rio::HashReader::SIZE_PRESERVE_LAYER
+        );
+    }
 
     struct TestChunkReader {
         chunks: VecDeque<Bytes>,

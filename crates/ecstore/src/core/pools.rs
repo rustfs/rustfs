@@ -2026,7 +2026,7 @@ impl PoolMeta {
         self.load_no_lock(pool).await
     }
 
-    async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
+    pub(crate) async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
     where
         S: EcstoreObjectIO,
     {

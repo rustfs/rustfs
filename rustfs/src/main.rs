@@ -26,22 +26,22 @@ struct MiMallocAllocator;
 unsafe impl GlobalAlloc for MiMallocAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller upholds GlobalAlloc's contract for layout.
-        unsafe { mimalloc::MiMalloc.alloc(layout) }
+        unsafe { rustfs_mimalloc::MiMalloc.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller upholds GlobalAlloc's contract for layout.
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        unsafe { rustfs_mimalloc::MiMalloc.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
-        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        unsafe { rustfs_mimalloc::MiMalloc.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
-        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        unsafe { rustfs_mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
     }
 }
 
@@ -51,7 +51,7 @@ static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::Counting
 
 #[cfg(not(all(feature = "hotpath", feature = "hotpath-alloc")))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
 fn main() {
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
@@ -71,8 +71,9 @@ mod tests {
         allocation.extend_from_slice(&[7_u8; 64]);
 
         assert_eq!(allocation.len(), 64);
+        let heap = rustfs_mimalloc::heap::Heap::main();
         // SAFETY: the live Vec pointer is valid to inspect for heap ownership.
-        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(allocation.as_ptr().cast()) });
+        assert!(unsafe { heap.contains(allocation.as_ptr()) });
     }
 
     #[test]
@@ -85,12 +86,13 @@ mod tests {
         let layout = Layout::from_size_align(32, 8).expect("valid test allocation layout");
         let grown_layout = Layout::from_size_align(64, 8).expect("valid grown test allocation layout");
         let allocator = super::MiMallocAllocator;
+        let heap = rustfs_mimalloc::heap::Heap::main();
 
         // SAFETY: The pointer is checked for null before use and later released
         // through the same allocator with the corresponding layout.
         let ptr = unsafe { allocator.alloc_zeroed(layout) };
         assert!(!ptr.is_null());
-        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(ptr.cast()) });
+        assert!(unsafe { heap.contains(ptr) });
         assert!(unsafe { std::slice::from_raw_parts(ptr, 32).iter().all(|byte| *byte == 0) });
 
         // SAFETY: `ptr` was allocated by `allocator` with `layout`; on failure
@@ -102,7 +104,7 @@ mod tests {
             panic!("mimalloc realloc failed in allocator smoke test");
         }
 
-        assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(grown_ptr.cast()) });
+        assert!(unsafe { heap.contains(grown_ptr) });
         // SAFETY: `grown_ptr` was reallocated by `allocator` and is released
         // with the matching grown layout.
         unsafe { allocator.dealloc(grown_ptr, grown_layout) };
