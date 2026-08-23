@@ -2183,11 +2183,11 @@ async fn erasure_sets_from_one_usage_snapshot_share_baseline_generation() {
     let second = task_for_set("pool_0_set_1");
 
     first
-        .apply_erasure_set_usage_baseline(&buckets, "pool_0_set_0")
+        .apply_erasure_set_usage_baseline(&buckets)
         .await
         .expect("first baseline");
     second
-        .apply_erasure_set_usage_baseline(&buckets, "pool_0_set_1")
+        .apply_erasure_set_usage_baseline(&buckets)
         .await
         .expect("second baseline");
     first.progress.write().await.update_object_progress(0, 0, 0, 0, 0);

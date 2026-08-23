@@ -444,7 +444,7 @@ impl HealTask {
         Ok(())
     }
 
-    pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String], _set_disk_id: &str) -> Result<()> {
+    pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<()> {
         if matches!(self.options.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal) {
             return Ok(());
         }

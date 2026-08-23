@@ -13,6 +13,8 @@
 // limitations under the License.
 /// Per-object scan actions: ScannerItem, the get-size failure policy, and the heal/ILM admission helpers.
 use super::*;
+#[cfg(test)]
+use rustfs_filemeta::MetadataResolutionParams;
 
 /// Cached folder information for scanning
 #[derive(Clone, Debug)]
@@ -50,11 +52,12 @@ pub(super) enum CorruptMetadataRecording {
     ImmediateAndLedger,
 }
 
-pub(super) fn corrupt_metadata_recording(mrf_accepted: bool) -> CorruptMetadataRecording {
-    if mrf_accepted {
-        CorruptMetadataRecording::LedgerOnly
-    } else {
-        CorruptMetadataRecording::ImmediateAndLedger
+pub(super) fn corrupt_metadata_recording(result: rustfs_common::mrf_channel::MrfIngressResult) -> CorruptMetadataRecording {
+    match result {
+        rustfs_common::mrf_channel::MrfIngressResult::Enqueued | rustfs_common::mrf_channel::MrfIngressResult::Coalesced => {
+            CorruptMetadataRecording::LedgerOnly
+        }
+        rustfs_common::mrf_channel::MrfIngressResult::Dropped(_) => CorruptMetadataRecording::ImmediateAndLedger,
     }
 }
 
@@ -88,6 +91,22 @@ pub(super) fn build_object_heal_request(
     }
 }
 
+/// Build the versionless inspection request used when discovery cannot prove
+/// a destructive version identity (for example an unversioned object or a
+/// bounded candidate overflow). The explicit flag is the fail-closed safety
+/// boundary; callers must not reconstruct it with the destructive default.
+pub(super) fn build_non_destructive_object_heal_request(
+    bucket: String,
+    object: String,
+    scan_mode: HealScanMode,
+    priority: HealChannelPriority,
+) -> HealChannelRequest {
+    let mut request = build_object_heal_request(bucket, object, None, scan_mode, priority);
+    request.remove_corrupted = Some(false);
+    request
+}
+
+#[cfg(test)]
 pub(super) fn resolve_object_heal_entry(
     entries: &MetaCacheEntries,
     resolver: MetadataResolutionParams,

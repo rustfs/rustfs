@@ -373,6 +373,11 @@ impl ErasureSetHealer {
         set_disk_id: &str,
         buckets: &[String],
     ) -> Result<(ResumeManager, CheckpointManager)> {
+        if self.replacement_task_id.is_none() && CheckpointManager::is_blocked(&self.disk, task_id).await {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Resume task {task_id} has a blocked checkpoint"),
+            });
+        }
         // check if resume state exists
         let has_resume_state = if self.replacement_task_id.is_some() {
             ResumeManager::has_replacement_intent(&self.disk, task_id).await

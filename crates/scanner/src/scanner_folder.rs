@@ -43,7 +43,10 @@ use rustfs_common::metrics::{
     UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
-use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_filemeta::{
+    MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
+    MetaCacheHealCandidateKind,
+};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
 use time::OffsetDateTime;
@@ -96,6 +99,11 @@ const METRIC_SCANNER_EXCESS_OBJECT_VERSION_SIZE_TOTAL: &str = "rustfs_scanner_ex
 const METRIC_SCANNER_EXCESS_FOLDERS_TOTAL: &str = "rustfs_scanner_excess_folders_total";
 const METRIC_SCANNER_PENDING_HEAL_PRUNE_TOTAL: &str = "rustfs_scanner_pending_heal_prune_total";
 const METRIC_SCANNER_PENDING_HEAL_MALFORMED_TOTAL: &str = "rustfs_scanner_pending_heal_malformed_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL: &str = "rustfs_scanner_heal_discovery_candidates_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL: &str = "rustfs_scanner_heal_discovery_sub_quorum_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL: &str = "rustfs_scanner_heal_discovery_unverified_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL: &str = "rustfs_scanner_heal_discovery_queued_total";
+const METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL: &str = "rustfs_scanner_heal_discovery_truncated_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
 
 // --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
@@ -883,7 +891,7 @@ impl FolderScanner {
         object: Option<String>,
         version_id: Option<String>,
         request: HealChannelRequest,
-    ) -> Result<(), ScannerError> {
+    ) -> Result<HealAdmissionResult, ScannerError> {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
@@ -911,7 +919,7 @@ impl FolderScanner {
                     error = %err,
                     "Scanner deferred heal request after channel error"
                 );
-                return Ok(());
+                return Ok(HealAdmissionResult::Full);
             }
         };
         self.update_pending_scanner_heal_after_admission(
@@ -923,7 +931,7 @@ impl FolderScanner {
             result,
         );
         if result.is_admitted() {
-            return Ok(());
+            return Ok(result);
         }
 
         record_high_priority_heal_escalation(candidate_type, priority, result);
@@ -944,7 +952,7 @@ impl FolderScanner {
             state = "high_priority_not_admitted",
             "Scanner high-priority heal admission failed"
         );
-        Ok(())
+        Ok(result)
     }
 
     pub fn set_heal_object_select(&mut self, prob: u32) {
@@ -1375,13 +1383,14 @@ impl FolderScanner {
                             // Single-flight (backlog#1894 axis A) — the
                             // recording mode and its guarantees are pinned by
                             // corrupt_metadata_recording below.
-                            let mrf_accepted = rustfs_common::mrf_channel::try_send_mrf_intent(
+                            let mrf_result = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
                                 rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
                                 &item.bucket,
                                 &object,
                                 None,
+                                None,
                             );
-                            match corrupt_metadata_recording(mrf_accepted) {
+                            match corrupt_metadata_recording(mrf_result) {
                                 CorruptMetadataRecording::LedgerOnly => {
                                     // Recorded as Full (retry-later): admission
                                     // for this target happens in the MRF
@@ -1736,14 +1745,7 @@ impl FolderScanner {
                 break;
             }
 
-            let mut resolver = MetadataResolutionParams {
-                dir_quorum: self.disks_quorum,
-                obj_quorum: self.disks_quorum,
-                bucket: "".to_string(),
-                strict: false,
-                ..Default::default()
-            };
-
+            let mut previous_bucket = String::new();
             for name in abandoned_children {
                 if !self.should_heal().await {
                     break;
@@ -1751,7 +1753,7 @@ impl FolderScanner {
 
                 let (bucket, prefix) = path2_bucket_object(name.as_str());
 
-                if bucket != resolver.bucket {
+                if bucket != previous_bucket {
                     self.send_required_scanner_heal_request(
                         PendingScannerHealKind::Bucket,
                         bucket.clone(),
@@ -1760,9 +1762,8 @@ impl FolderScanner {
                         build_bucket_heal_request(bucket.clone(), HealChannelPriority::High),
                     )
                     .await?;
+                    previous_bucket = bucket.clone();
                 }
-
-                resolver.bucket = bucket.clone();
 
                 let child_ctx = ctx.child_token();
 
@@ -1880,6 +1881,8 @@ impl FolderScanner {
                 let mut agreed_closed = false;
                 let mut partial_closed = false;
                 let mut finished_closed = false;
+                let mut seen_heal_candidates: HashSet<(String, Option<String>, MetaCacheHealCandidateKind)> = HashSet::new();
+                let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
                     if agreed_closed && partial_closed && finished_closed {
@@ -1904,65 +1907,112 @@ impl FolderScanner {
                                 break;
                             }
 
-                            let Some(entry) = resolve_object_heal_entry(&entries, resolver.clone()) else {
-                                continue;
-                            };
-
-                            (self.update_current_path)(&entry.name).await;
-
-                            if entry.is_dir() {
-                                continue;
+                            let discovery = entries.discover_heal_candidates(&bucket, MAX_META_CACHE_HEAL_CANDIDATES);
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL)
+                                .increment(u64::try_from(discovery.candidates.len()).unwrap_or(u64::MAX));
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL).increment(
+                                u64::try_from(
+                                    discovery
+                                        .candidates
+                                        .iter()
+                                        .filter(|candidate| candidate.replica_count < disks_quorum)
+                                        .count(),
+                                )
+                                .unwrap_or(u64::MAX),
+                            );
+                            counter!(METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL).increment(
+                                u64::try_from(discovery.unverified_count).unwrap_or(u64::MAX),
+                            );
+                            if discovery.truncated {
+                                counter!(METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL).increment(1);
                             }
 
-                            let fivs = match entry.file_info_versions(&bucket) {
-                                Ok(fivs) => fivs,
-                                Err(e) => {
-                                    error!(
-                                        target: "rustfs::scanner::folder",
-                                        event = EVENT_SCANNER_FOLDER_STATE,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_FOLDER,
-                                        bucket = %bucket,
-                                        entry = %entry.name,
-                                        state = "file_info_versions_failed",
-                                        error = %e,
-                                        "Scanner list_path_raw failed to resolve file versions"
-                                    );
-                                    self.send_required_scanner_heal_request(
-                                        PendingScannerHealKind::Object,
-                                        bucket.clone(),
-                                        Some(entry.name.clone()),
-                                        None,
-                                        build_object_heal_request(
-                                            bucket.clone(),
-                                            entry.name.clone(),
-                                            None,
-                                            self.scan_mode,
-                                            HealChannelPriority::High,
-                                        ),
-                                    )
-                                    .await?;
-                                    found_objects = true;
+                            for candidate in discovery.candidates {
+                                let sub_quorum_candidate = candidate.replica_count < disks_quorum;
+                                let version_id = candidate.validated_version().map(|id| id.to_string());
+                                let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
+                                if seen_heal_candidates.len() >= MAX_META_CACHE_HEAL_CANDIDATES
+                                    && !seen_heal_candidates.contains(&identity)
+                                {
                                     continue;
                                 }
-                            };
-
-                            for fiv in fivs.versions {
-                                let version_id = fiv.version_id.and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) });
-                                self.send_required_scanner_heal_request(
-                                    PendingScannerHealKind::Object,
-                                    bucket.clone(),
-                                    Some(entry.name.clone()),
-                                    version_id.clone(),
-                                    build_object_heal_request(
+                                if !seen_heal_candidates.insert(identity) {
+                                    continue;
+                                }
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
                                         bucket.clone(),
-                                        entry.name.clone(),
-                                        version_id,
+                                        candidate.object.clone(),
                                         self.scan_mode,
                                         HealChannelPriority::High,
-                                    ),
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
+                                (self.update_current_path)(&candidate.object).await;
+                                let admission = self.send_required_scanner_heal_request(
+                                    PendingScannerHealKind::Object,
+                                    bucket.clone(),
+                                    Some(candidate.object.clone()),
+                                    version_id.clone(),
+                                    request,
                                 )
                                 .await?;
+                                if admission.is_admitted() {
+                                    counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
+                                } else if sub_quorum_candidate {
+                                    self.mark_pending_scanner_heal_reason(
+                                        PendingScannerHealKind::Object,
+                                        &bucket,
+                                        Some(&candidate.object),
+                                        version_id.as_deref(),
+                                        "sub_quorum_metadata",
+                                    );
+                                }
+                                found_objects = true;
+                            }
+
+                            // Candidates beyond the main cap remain exact
+                            // version requests; never downgrade them to a
+                            // latest-version (version_id=None) heal.
+                            for candidate in discovery.truncated_candidates {
+                                let version_id = candidate.validated_version().map(|id| id.to_string());
+                                let identity = (candidate.object.clone(), version_id.clone(), candidate.kind.clone());
+                                if seen_truncated_objects.len() >= MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
+                                    && !seen_truncated_objects.contains(&candidate.object)
+                                {
+                                    continue;
+                                }
+                                seen_truncated_objects.insert(candidate.object.clone());
+                                if !seen_heal_candidates.insert(identity) {
+                                    continue;
+                                }
+                                let request = build_object_heal_request(
+                                    bucket.clone(),
+                                    candidate.object.clone(),
+                                    version_id.clone(),
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                );
+                                (self.update_current_path)(&candidate.object).await;
+                                let admission = self
+                                    .send_required_scanner_heal_request(
+                                        PendingScannerHealKind::Object,
+                                        bucket.clone(),
+                                        Some(candidate.object.clone()),
+                                        version_id,
+                                        request,
+                                    )
+                                    .await?;
+                                if admission.is_admitted() {
+                                    counter!(METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL).increment(1);
+                                }
                                 found_objects = true;
                             }
 

@@ -158,7 +158,7 @@ impl HealTask {
             None
         };
 
-        self.apply_erasure_set_usage_baseline(&buckets, &set_disk_id).await?;
+        self.apply_erasure_set_usage_baseline(&buckets).await?;
 
         let healing_marker = format!("{set_disk_id}:{}", self.id);
         if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
