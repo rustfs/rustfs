@@ -157,6 +157,38 @@ where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = bool> + Send,
 {
+    store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+        ctx,
+        storeapi,
+        receiver,
+        leader_epoch,
+        initial_baseline,
+        expected_publication_epoch,
+        remote_lease_deadline,
+        None,
+        route_probe,
+    )
+    .await
+}
+
+pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence<
+    F,
+    Fut,
+>(
+    ctx: CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    leader_epoch: Option<u64>,
+    initial_baseline: Option<DataUsagePersistBaseline>,
+    expected_publication_epoch: Option<u64>,
+    remote_lease_deadline: Option<std::time::Instant>,
+    scanner_publication_lease_fence: Option<String>,
+    route_probe: F,
+) -> DataUsagePersistOutcome
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = bool> + Send,
+{
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
     let mut next_baseline = initial_baseline;
 
@@ -456,12 +488,13 @@ where
                     done_save();
                     break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
                 }
-                save_config_shared_with_preconditions(
+                save_config_shared_with_preconditions_and_lease_fence(
                     storeapi.clone(),
                     target_path,
                     data.clone(),
                     sha256hex.clone(),
                     revision.preconditions(),
+                    scanner_publication_lease_fence.as_deref(),
                 )
                 .await
             };
@@ -640,11 +673,12 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease(
+            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
                 &ctx,
                 storeapi.clone(),
                 expected_publication_epoch,
                 remote_lease_deadline,
+                scanner_publication_lease_fence.as_deref(),
             )
             .await;
             done_save();

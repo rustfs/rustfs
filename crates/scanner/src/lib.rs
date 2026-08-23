@@ -806,7 +806,28 @@ pub(crate) async fn save_config_shared_with_preconditions<S>(
 where
     S: ScannerObjectIO,
 {
+    save_config_shared_with_preconditions_and_lease_fence(api, file, data, sha256hex, preconditions, None).await
+}
+
+pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Bytes,
+    sha256hex: Option<String>,
+    preconditions: HTTPPreconditions,
+    scanner_publication_lease_fence: Option<&str>,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO,
+{
     let mut reader = ScannerPutObjReader::from_prehashed_bytes(data, sha256hex)?;
+    let mut user_defined = HashMap::new();
+    if let Some(fence) = scanner_publication_lease_fence {
+        user_defined.insert(
+            storage_api::owner::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            fence.to_string(),
+        );
+    }
     api.put_object(
         RUSTFS_META_BUCKET,
         file,
@@ -814,6 +835,7 @@ where
         &ScannerObjectOptions {
             max_parity: true,
             http_preconditions: Some(preconditions),
+            user_defined,
             ..Default::default()
         },
     )

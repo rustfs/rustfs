@@ -393,6 +393,8 @@ pub struct RenameDataRequest {
     pub dst_path: ::prost::alloc::string::String,
     #[prost(bytes = "bytes", tag = "7")]
     pub file_info_bin: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub scanner_publication_lease_token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameDataResponse {

@@ -2901,6 +2901,7 @@ mod tests {
                 dst_volume: "dst".into(),
                 dst_path: "dp".into(),
                 file_info_bin: vec![0x80].into(),
+                scanner_publication_lease_token: Vec::new().into(),
             },
             rustfs_protos::canonical_rename_data_request_body
         );
@@ -4072,6 +4073,7 @@ mod tests {
             dst_path: "dst-path".to_string(),
             file_info: "{}".to_string(),
             file_info_bin: Vec::new().into(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -4094,6 +4096,7 @@ mod tests {
             dst_path: "dst-path".to_string(),
             file_info: "invalid json".to_string(),
             file_info_bin: Vec::new().into(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;

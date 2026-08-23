@@ -912,6 +912,11 @@ pub fn canonical_rename_data_request_body(
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
     body.push_bytes(&request.file_info_bin)?;
+    // Keep legacy rename requests byte-for-byte compatible.  The optional
+    // token is included only for the scanner's target-side lease fence.
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -1156,6 +1161,7 @@ mod disk_mutation_canonical_tests {
             dst_volume: "dst-vol".into(),
             dst_path: "dst-path".into(),
             file_info_bin: vec![0x81, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
         for mutate in [
@@ -1167,6 +1173,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);

@@ -74,6 +74,7 @@ pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time:
 
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
+    pub(crate) movement_generation: u64,
     pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
 }
 
@@ -282,6 +283,7 @@ impl InstanceContext {
         &self,
         token: Uuid,
         expires_at: Instant,
+        movement_generation: u64,
         operation_guard: OwnedRwLockReadGuard<()>,
     ) -> bool {
         let mut leases = self.scanner_publication_leases.lock().await;
@@ -292,6 +294,7 @@ impl InstanceContext {
             token,
             ScannerPublicationLeaseEntry {
                 expires_at,
+                movement_generation,
                 _operation_guard: operation_guard,
             },
         );
@@ -319,6 +322,22 @@ impl InstanceContext {
             return false;
         }
         true
+    }
+
+    /// Return the generation bound to a live lease.  The lease entry owns the
+    /// movement read guard, so a successful lookup remains valid for the
+    /// caller's guard-protected operation; expiry is still fail-closed.
+    pub(crate) async fn scanner_publication_lease_generation(&self, token: Uuid) -> Option<u64> {
+        let mut leases = self.scanner_publication_leases.lock().await;
+        let now = Instant::now();
+        let Some(entry) = leases.get(&token) else {
+            return None;
+        };
+        if entry.expires_at <= now {
+            leases.remove(&token);
+            return None;
+        }
+        Some(entry.movement_generation)
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {

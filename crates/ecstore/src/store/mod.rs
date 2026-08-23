@@ -489,7 +489,7 @@ impl ECStore {
         let expires_at = tokio::time::Instant::now() + ttl;
         if !self
             .ctx
-            .install_scanner_publication_lease(token, expires_at, operation_guard)
+            .install_scanner_publication_lease(token, expires_at, expected_generation, operation_guard)
             .await
         {
             return Err(Error::other("scanner publication lease capacity is exhausted"));
@@ -513,8 +513,7 @@ impl ECStore {
     /// admission; a restarted context has no old token and therefore fails
     /// closed even if its generation counter has returned to zero.
     pub async fn validate_scanner_publication_lease(&self, token: Uuid, expected_generation: u64) -> Result<()> {
-        let operation_gate = self.ctx.data_movement_operation_gate();
-        let _operation_guard = operation_gate.read_owned().await;
+        let _operation_guard = self.acquire_scanner_publication_lease_guard(token).await?;
         if self.ctx.data_movement_generation_exhausted()
             || self.ctx.data_movement_operation_epoch_exhausted()
             || self.ctx.data_movement_generation() != expected_generation
@@ -528,6 +527,29 @@ impl ECStore {
             return Err(Error::other("scanner publication lease is unknown or expired"));
         }
         Ok(())
+    }
+
+    /// Acquire the target-side read guard bound to a previously granted lease.
+    /// The guard is returned to the RPC handler and must remain alive through
+    /// the complete rename/write operation.  A lease token is process-owned;
+    /// restart, expiry, generation changes, or blocked movement all reject it
+    /// before the target disk is touched.
+    pub async fn acquire_scanner_publication_lease_guard(&self, token: Uuid) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_generation_exhausted() || self.ctx.data_movement_operation_epoch_exhausted() {
+            return Err(Error::other("scanner publication lease generation is exhausted"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+        let Some(lease_generation) = self.ctx.scanner_publication_lease_generation(token).await else {
+            return Err(Error::other("scanner publication lease is unknown or expired"));
+        };
+        if lease_generation != self.ctx.data_movement_generation() {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        Ok(operation_guard)
     }
 }
 
@@ -1254,6 +1276,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_target_guard_keeps_movement_writer_fenced_after_lease_release() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, _) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+        let target_guard = store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect("the target-side rename should acquire its short guard");
+        assert!(store.release_scanner_publication_lease(token).await);
+
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let movement_writer = tokio::spawn(async move { movement_gate.write_owned().await });
+        tokio::task::yield_now().await;
+        assert!(!movement_writer.is_finished(), "the target guard must span the rename operation");
+        drop(target_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), movement_writer)
+            .await
+            .expect("movement writer should proceed after the target rename guard is dropped")
+            .expect("movement writer task should not panic");
+    }
+
+    #[tokio::test]
     async fn scanner_publication_lease_rejects_restart_aba_token() {
         let first_store = build_store_with_ctx(Arc::new(InstanceContext::new()));
         let (token, generation) = first_store
@@ -1264,6 +1310,10 @@ mod tests {
             .validate_scanner_publication_lease(token, generation)
             .await
             .expect("the current instance should validate its own live token");
+        first_store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect("the current instance should admit the target-side rename");
 
         // A restarted storage instance starts its local generation at zero,
         // but its process-owned lease table is empty.  The old token must not
@@ -1273,6 +1323,11 @@ mod tests {
             .validate_scanner_publication_lease(token, generation)
             .await
             .expect_err("a token from a prior instance must fail closed after restart");
+        assert!(error.to_string().contains("unknown or expired"));
+        let error = restarted_store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect_err("a restarted instance must reject the target-side rename token");
         assert!(error.to_string().contains("unknown or expired"));
     }
 

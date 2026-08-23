@@ -281,6 +281,10 @@ message RenameDataRequest {
   string dst_volume = 5;
   string dst_path = 6;
   bytes file_info_bin = 7;
+  // Optional target-side scanner publication lease.  Empty preserves the
+  // legacy rename request body; a non-empty token is checked at the target's
+  // rename linearization point.
+  bytes scanner_publication_lease_token = 8;
 }
 
 message RenameDataResponse {

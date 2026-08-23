@@ -70,11 +70,13 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
-    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
-    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
-    save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd, scanner_publication_admission_for_epoch,
-    scanner_publication_epoch, scanner_publication_epoch_changed,
+    ScannerReplicationConfigExt as _, delete_config_with_publication_admission,
+    delete_config_with_publication_admission_for_epoch, get_lifecycle_config, get_replication_config,
+    invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions,
+    save_config_shared_with_preconditions_and_lease_fence, save_config_with_preconditions,
+    save_config_with_publication_admission, save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch, scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -126,6 +128,8 @@ const MAINTENANCE_FEATURE_INSPECTION_RETRY_MAX_INTERVAL: Duration = Duration::fr
 const MAX_MAINTENANCE_FEATURE_INSPECTION_ATTEMPTS: usize = 2;
 const SCANNER_PERSIST_CAS_RETRIES: usize = 2;
 const DATA_USAGE_BACKUP_INTERVAL_CYCLES: u64 = 10;
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_CYCLE_STATE_MAGIC: &[u8; 8] = b"RSCYC001";
 const SCANNER_CYCLE_STATE_HEADER_LEN: usize = 24;
 #[cfg(test)]
@@ -137,6 +141,10 @@ static SCANNER_CYCLE_STATE_PERSIST_TEST_HOOK: LazyLock<StdMutex<Option<ScannerCy
     LazyLock::new(|| StdMutex::new(None));
 
 static SCANNER_CYCLE_RECOVERY_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+fn remote_publication_lease_fence_targets_are_required(target_count: usize, grants_present: bool, fence_present: bool) -> bool {
+    target_count > 0 && (!grants_present || !fence_present)
+}
 
 pub(super) fn notify_scanner_cycle_recovery_wake() {
     SCANNER_CYCLE_RECOVERY_WAKE.notify_one();
@@ -425,6 +433,23 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease(
     expected_publication_epoch: Option<u64>,
     remote_lease_deadline: Option<std::time::Instant>,
 ) -> Result<(), EcstoreError> {
+    sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
+        ctx,
+        storeapi,
+        expected_publication_epoch,
+        remote_lease_deadline,
+        None,
+    )
+    .await
+}
+
+async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    expected_publication_epoch: Option<u64>,
+    remote_lease_deadline: Option<std::time::Instant>,
+    scanner_publication_lease_fence: Option<&str>,
+) -> Result<(), EcstoreError> {
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
         if ctx.is_cancelled() {
@@ -488,12 +513,13 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease(
                 }
                 return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
             };
-            save_config_shared_with_preconditions(
+            save_config_shared_with_preconditions_and_lease_fence(
                 storeapi.clone(),
                 &backup_path,
                 primary.clone(),
                 sha256hex,
                 revision.preconditions(),
+                scanner_publication_lease_fence,
             )
             .await
         };
@@ -1416,7 +1442,7 @@ async fn run_data_scanner_cycle_with_budget(
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     } else if let Some(notification_system) = storeapi.notification_system() {
         match notification_system
-            .acquire_scanner_publication_leases(remote_publication_lease_targets)
+            .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
             .await
         {
             Ok(grants) => {
@@ -1431,12 +1457,47 @@ async fn run_data_scanner_cycle_with_budget(
     let remote_lease_deadline = remote_publication_leases
         .as_ref()
         .and_then(|(_, grants)| grants.iter().map(|grant| grant.lease.expires_at).min());
+    // The transient fence is carried only to the SetDisks rename boundary;
+    // it is never inserted into FileInfo metadata.  Keep the representation
+    // bounded and require one authenticated token per remote target so a
+    // partial grant can never silently fall back to an unfenced rename.
+    let remote_lease_fence = remote_publication_leases.as_ref().and_then(|(_, grants)| {
+        if grants.len() != remote_publication_lease_targets.len() || grants.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES {
+            return None;
+        }
+        let mut fence = BTreeMap::new();
+        for grant in grants {
+            if grant.host.is_empty() || grant.host.len() > 1024 {
+                return None;
+            }
+            if fence.insert(grant.host.clone(), grant.lease.token.to_string()).is_some() {
+                return None;
+            }
+        }
+        if remote_publication_lease_targets
+            .iter()
+            .any(|(host, _, _)| !fence.contains_key(host))
+        {
+            return None;
+        }
+        serde_json::to_string(&fence)
+            .ok()
+            .filter(|encoded| encoded.len() <= SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES)
+    });
+    let remote_lease_fence_defer_reason = (remote_publication_lease_fence_targets_are_required(
+        remote_publication_lease_targets.len(),
+        remote_publication_leases.is_some(),
+        remote_lease_fence.is_some(),
+    ))
+    .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable);
     let remote_lease_covers_persistence = remote_lease_deadline.is_none_or(|deadline| {
         std::time::Instant::now()
             .checked_add(usage_persist_timeout)
             .is_some_and(|latest_finish| latest_finish < deadline)
     });
-    let publication_defer_reason = publication_defer_reason.or(remote_lease_defer_reason);
+    let publication_defer_reason = publication_defer_reason
+        .or(remote_lease_defer_reason)
+        .or(remote_lease_fence_defer_reason);
     let publication_defer_reason = (!remote_lease_covers_persistence)
         .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
         .or(publication_defer_reason);
@@ -1456,8 +1517,9 @@ async fn run_data_scanner_cycle_with_budget(
             let storeapi_clone = storeapi.clone();
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
+            let remote_lease_fence = remote_lease_fence.clone();
             let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
-                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch(
+                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
                     ctx_clone,
                     storeapi_clone,
                     receiver,
@@ -1465,6 +1527,7 @@ async fn run_data_scanner_cycle_with_budget(
                     Some(usage_persist_baseline),
                     publication_epoch,
                     remote_lease_deadline,
+                    remote_lease_fence,
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();

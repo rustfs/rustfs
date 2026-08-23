@@ -2994,6 +2994,7 @@ mod tests {
             dst_volume: "bucket".to_string(),
             dst_path: "object".to_string(),
             file_info_bin: vec![0x81, 0xA1, 0x76, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let body = rustfs_protos::canonical_rename_data_request_body(&message).expect("small request should encode");
         let mut request = tonic::Request::new(());

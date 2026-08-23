@@ -1982,6 +1982,20 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+            .await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -2013,9 +2027,18 @@ impl RemoteDisk {
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                     file_info_bin: file_info_bin.into(),
+                    scanner_publication_lease_token: scanner_publication_lease_token
+                        .map(|token| token.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                if scanner_publication_lease_token.is_some() {
+                    let canonical_body =
+                        canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                }
 
                 let response = client.rename_data(request).await?.into_inner();
 

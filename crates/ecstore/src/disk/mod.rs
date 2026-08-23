@@ -685,6 +685,19 @@ impl Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+            .await
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
         match self {
             Disk::Local(local_disk) => {
                 local_disk
@@ -693,7 +706,14 @@ impl Disk {
             }
             Disk::Remote(remote_disk) => {
                 remote_disk
-                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        scanner_publication_lease_token,
+                    )
                     .await
             }
         }

@@ -36,6 +36,7 @@ use std::io::Cursor;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
+use uuid::Uuid;
 
 /// Initial capacity hint (bytes) for typical small msgpack requests and responses.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
@@ -1188,6 +1189,16 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease rename requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(
             &request,
             rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
@@ -1205,6 +1216,42 @@ impl NodeService {
                         error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
+            };
+            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+                None
+            } else {
+                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+                if token.is_nil() {
+                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+                }
+                Some(token)
+            };
+            // The target owns this read guard.  It must span the complete
+            // disk rename, not merely the preflight, so a movement transition
+            // cannot restart after validation and before rename linearization.
+            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
+                let Some(store) = self.resolve_object_store() else {
+                    return Ok(Response::new(RenameDataResponse {
+                        success: false,
+                        rename_data_resp: String::new(),
+                        rename_data_resp_bin: Vec::new().into(),
+                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                    }));
+                };
+                match store.acquire_scanner_publication_lease_guard(token).await {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        return Ok(Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(DiskError::other(err.to_string()).into()),
+                        }));
+                    }
+                }
+            } else {
+                None
             };
             let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
             match disk
