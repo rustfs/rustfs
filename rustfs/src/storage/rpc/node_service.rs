@@ -1987,8 +1987,10 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
+        // Recover missing workers only after the reload merged newer state; a
+        // stale or duplicate reload must not spawn workers for an older generation.
         match store.reload_pool_meta().await {
-            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+            Ok(true) => match store.spawn_missing_local_decommission_routines().await {
                 Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
                     success: true,
                     error_info: None,
@@ -1998,6 +2000,10 @@ impl Node for NodeService {
                     error_info: Some(err.to_string()),
                 })),
             },
+            Ok(false) => Ok(Response::new(ReloadPoolMetaResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
