@@ -76,7 +76,8 @@ use metrics::counter;
 use rmp_serde;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
+    has_internal_suffix, insert_str,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
@@ -174,8 +175,12 @@ fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
     err.raw_response().is_some_and(|r| r.status().as_u16() == status)
 }
 
-fn metadata_requires_existing_target(op_type: ReplicationType) -> bool {
+fn metadata_requires_existing_target(op_type: ReplicationType, object_info: &ObjectInfo) -> bool {
     op_type == ReplicationType::Metadata
+        && object_info
+            .user_defined
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
 }
 
 const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_identity_drift_total";
@@ -3498,7 +3503,7 @@ async fn resolve_replicate_all_action(
         start_time,
         ssec_audit_required,
     } = ctx;
-    let require_existing_target = metadata_requires_existing_target(roi.op_type);
+    let require_existing_target = metadata_requires_existing_target(roi.op_type, &object_info);
     let replication_action;
     match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, roi.version_id.map(|v| v.to_string())).await {
         Ok(oi) => {
@@ -3979,6 +3984,10 @@ mod tests {
             name: roi.name.clone(),
             version_id: roi.version_id,
             etag: Some("source-etag".to_string()),
+            user_defined: Arc::new(HashMap::from([(
+                AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+                ReplicationStatusType::Replica.as_str().to_string(),
+            )])),
             ..Default::default()
         };
         let mut rinfo = replicate_all_target_info(&roi, &target);
@@ -4003,6 +4012,46 @@ mod tests {
             rinfo.error.as_deref(),
             Some("replica metadata target does not contain this object version")
         );
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn source_metadata_missing_target_rebuilds_object() {
+        let (endpoint, server) = spawn_head_status_server(404);
+        let target = test_target_client(endpoint);
+        let roi = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::Metadata,
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            bucket: roi.bucket.clone(),
+            name: roi.name.clone(),
+            version_id: roi.version_id,
+            etag: Some("source-etag".to_string()),
+            ..Default::default()
+        };
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))));
+        assert!(rinfo.error.is_none());
         server.join().expect("test HTTP server should finish");
     }
 

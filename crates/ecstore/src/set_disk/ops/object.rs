@@ -2177,6 +2177,14 @@ impl SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
+        if replication_lww_applicable(opts) {
+            // Object Lock evaluation stamps category timestamps with this
+            // receiver's clock. Pin them back to the source-authored times
+            // before the first copy of a version is committed; the existing-
+            // version branch below may still replace them with newer local
+            // state.
+            merge_replication_metadata_lww(&mut user_defined, &HashMap::new(), opts);
+        }
         if expected_restore_operation_id.is_some() {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
         }
@@ -8505,6 +8513,36 @@ mod replication_lww_tests {
             "the stored category timestamp must be the source-authored time, not the receiver's clock"
         );
         assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+    }
+
+    #[tokio::test]
+    async fn first_inbound_version_pins_source_authored_timestamp() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-first-version-ts-pinned";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_string());
+        let mut evaluated = inbound.clone();
+        insert_str(&mut evaluated, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_NEW.to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: Some(parse_ts(T_OLD)),
+            eval_metadata: Some(evaluated),
+            ..versioned_opts(&version_id, inbound)
+        };
+
+        put_version(&set_disks, bucket, object, &version_id, &opts).await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(),
+            Some(T_OLD),
+            "the first copy must store the source timestamp, not the receiver evaluation time"
+        );
     }
 
     #[tokio::test]
