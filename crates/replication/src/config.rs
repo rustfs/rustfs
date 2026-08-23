@@ -286,10 +286,10 @@ pub fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
 /// derives (`site-repl-<peer deployment id>`).
 pub const SITE_REPLICATION_RULE_ID_PREFIX: &str = "site-repl-";
 
-/// Whether `rule` carries a site-replication rule id (`site-repl-*`). The
-/// reconciler and the peer ingestion path treat the whole namespace as theirs
-/// on a site-replication bucket; the S3 edit path must not — rule ids are not
-/// reserved, so see [`site_replication_rule_deployment_id`].
+/// Whether `rule` carries a site-replication rule id (`site-repl-*`). Rule
+/// ids are not reserved, so this is only the pre-contract classification a
+/// peer running older code still applies; every current path classifies by
+/// [`site_replication_rule_deployment_id`].
 pub fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
     rule.id
         .as_deref()
@@ -318,21 +318,28 @@ pub fn is_reconciler_owned_site_replication_rule(rule: &ReplicationRule, peer_de
     site_replication_rule_deployment_id(rule).is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
 }
 
-/// Merge an incoming replication config into the local one.
+/// Merge a peer's replication config into the local one.
 ///
-/// `site-repl-*` rules encode the *holder's* outbound direction — their
+/// Reconciler-derived rules encode the *holder's* outbound direction — their
 /// destination ARN names another site — so applying an external rule set
 /// verbatim replaces the local reverse rule with one this site can never
 /// satisfy (no bucket target backs it) and replication silently stops. Only
-/// operator-authored rules travel: the site-replication peer ingestion path
-/// and the S3 put/delete-bucket-replication path both keep the local site's
-/// `site-repl-*` rules through this merge. `incoming == None` models a
-/// delete of the operator-authored rules.
+/// operator-authored rules travel: the sender's derived rules are dropped
+/// and the local site's survive. `site_deployment_ids` is every site of the
+/// cluster, the receiver included — the sender's rule towards the receiver
+/// names the receiver's own id. Rules are classified by the derived id/ARN
+/// contract ([`is_reconciler_owned_site_replication_rule`]), the same one
+/// the S3 edit merge applies, so an operator-authored `site-repl-*` id
+/// persists on every site. `incoming == None` models a delete of the
+/// operator-authored rules.
 pub fn merge_incoming_replication_config(
     incoming: Option<ReplicationConfiguration>,
     local: Option<ReplicationConfiguration>,
+    site_deployment_ids: &HashSet<String>,
 ) -> Option<ReplicationConfiguration> {
-    merge_replication_config_keeping_site_rules(incoming, local, is_site_replication_rule)
+    merge_replication_config_keeping_site_rules(incoming, local, |rule| {
+        is_reconciler_owned_site_replication_rule(rule, site_deployment_ids)
+    })
 }
 
 /// [`merge_incoming_replication_config`] for the S3 put/delete-bucket-replication
@@ -1767,7 +1774,7 @@ mod tests {
         assert_eq!(decisions, vec![(user_arn.to_string(), true)]);
 
         // The peer ingestion merge follows the same rule.
-        let merged = merge_incoming_replication_config(Some(incoming), Some(local)).expect("rules");
+        let merged = merge_incoming_replication_config(Some(incoming), Some(local), &peers).expect("rules");
         let priorities: Vec<_> = merged.rules.iter().map(|rule| rule.priority).collect();
         assert_eq!(priorities, vec![Some(5), Some(1), Some(2)]);
     }
@@ -1791,5 +1798,43 @@ mod tests {
         let settled = rules.clone();
         assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
         assert_eq!(rules, settled);
+    }
+
+    fn operator_rule_ids(config: &ReplicationConfiguration) -> Vec<(&str, Option<i32>)> {
+        config
+            .rules
+            .iter()
+            .filter(|rule| site_replication_rule_deployment_id(rule).is_none())
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect()
+    }
+
+    // Issue #1948 review: an owner-authored `site-repl-user` rule is operator
+    // state. Site A's S3 merge keeps it; the broadcast payload must survive
+    // site B's peer ingestion too, or the sites persist different configs.
+    #[test]
+    fn peer_ingestion_keeps_owner_site_repl_user_rule_and_sites_agree() {
+        let user_arn = "arn:minio:replication:us-east-1:2f1c-remote:bucket";
+        let put = structure_config(vec![
+            delete_marker_rule("site-repl-user", user_arn, "logs/", 3, true),
+            delete_marker_rule("nightly", user_arn, "", 1, true),
+        ]);
+        let a_local = structure_config(vec![replication_rule("site-repl-b-dep", "arn:rustfs:replication::b-dep:bucket")]);
+        let a_peers = HashSet::from(["b-dep".to_string()]);
+        let a_merged = merge_user_replication_config(Some(put), Some(a_local), &a_peers).expect("rules");
+        assert_eq!(operator_rule_ids(&a_merged), vec![("site-repl-user", Some(3)), ("nightly", Some(1))]);
+
+        // Site B ingests A's broadcast; its own reverse rule names A.
+        let b_local = structure_config(vec![replication_rule("site-repl-a-dep", "arn:rustfs:replication::a-dep:bucket")]);
+        let b_sites = HashSet::from(["a-dep".to_string(), "b-dep".to_string()]);
+        let b_merged = merge_incoming_replication_config(Some(a_merged.clone()), Some(b_local), &b_sites).expect("rules");
+
+        let ids: Vec<_> = b_merged.rules.iter().map(|rule| rule.id.as_deref().unwrap()).collect();
+        assert_eq!(ids, vec!["site-repl-user", "nightly", "site-repl-a-dep"]);
+        assert_eq!(
+            operator_rule_ids(&b_merged),
+            operator_rule_ids(&a_merged),
+            "both sites must persist the same operator rules"
+        );
     }
 }

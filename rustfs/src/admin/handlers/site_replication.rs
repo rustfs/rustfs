@@ -32,8 +32,8 @@ use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
-    assign_site_replication_rule_priorities, is_site_replication_rule, merge_incoming_replication_config,
-    replication_target_arn_deployment_id,
+    assign_site_replication_rule_priorities, merge_incoming_replication_config, replication_target_arn_deployment_id,
+    site_replication_rule_deployment_id,
 };
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
@@ -1149,6 +1149,17 @@ pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<Ha
         })
         .map(|peer| peer.deployment_id.clone())
         .collect())
+}
+
+/// Deployment ids of every site in the cluster, this one included: the set
+/// a peer's derived rules can name (its rule towards this site carries this
+/// site's id). Empty when site replication is not enabled.
+async fn site_replication_deployment_ids() -> S3Result<HashSet<String>> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(HashSet::new());
+    }
+    Ok(state.peers.values().map(|peer| peer.deployment_id.clone()).collect())
 }
 
 async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
@@ -7818,7 +7829,7 @@ async fn site_replication_targets_online(bucket: &str, replication_config_xml: &
         return true;
     };
 
-    for rule in config.rules.iter().filter(|rule| is_site_replication_rule(rule)) {
+    for rule in config.rules.iter().filter(|rule| is_derived_site_replication_rule(rule)) {
         if BucketTargetSys::get()
             .get_remote_target_client_by_arn(bucket, &rule.destination.bucket)
             .await
@@ -8125,6 +8136,17 @@ fn lifecycle_expiry_statement(
     }
 }
 
+/// Whether `rule` is in the shape the reconciler derives (`site-repl-<id>`
+/// naming the deployment its ARN targets). The reconciler rebuilds every such
+/// rule from the current peer set — current peer or not, so a leftover from a
+/// removed peer or a self-pointing rule is rebuilt away — while the merges
+/// keep only the current peers' rules and treat a leftover as operator state
+/// the edit replaces. An operator-authored `site-repl-*` id on an operator
+/// ARN is outside the shape and survives every pass.
+fn is_derived_site_replication_rule(rule: &ReplicationRule) -> bool {
+    site_replication_rule_deployment_id(rule).is_some()
+}
+
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
@@ -8169,7 +8191,7 @@ fn prune_removed_site_replication_rules(
         return (None, removed);
     }
 
-    assign_site_replication_rule_priorities(&mut config.rules, is_site_replication_rule);
+    assign_site_replication_rule_priorities(&mut config.rules, is_derived_site_replication_rule);
 
     (Some(config), removed)
 }
@@ -8329,24 +8351,24 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
         return Ok(());
     };
 
-    // `site-repl-*` rules are derived state owned by this site: rebuild them from the
-    // current peer set on every pass instead of preserving whatever is on disk. A rule
-    // left over from a removed peer — or one whose destination ARN names this very
-    // deployment, which no bucket target can ever satisfy — must not survive, otherwise
-    // objects are queued against an ARN that resolves to nothing.
+    // Derived rules are state owned by this site: rebuild them from the current peer
+    // set on every pass instead of preserving whatever is on disk. A rule left over
+    // from a removed peer — or one whose destination ARN names this very deployment,
+    // which no bucket target can ever satisfy — must not survive, otherwise objects
+    // are queued against an ARN that resolves to nothing.
     let (existing_role, existing_rules) = existing
         .map(|config| (config.role, config.rules))
         .unwrap_or_else(|| (String::new(), Vec::new()));
     let mut rules: Vec<ReplicationRule> = existing_rules
         .iter()
-        .filter(|rule| !is_site_replication_rule(rule))
+        .filter(|rule| !is_derived_site_replication_rule(rule))
         .cloned()
         .collect();
     rules.extend(desired.rules);
     // Operator priorities are the operator's policy; only the derived rules
     // take free slots, by the same function as the config merges so a merged
     // write and this pass agree byte for byte.
-    assign_site_replication_rule_priorities(&mut rules, is_site_replication_rule);
+    assign_site_replication_rule_priorities(&mut rules, is_derived_site_replication_rule);
 
     // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
     // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
@@ -9239,7 +9261,8 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                 Err(err) => return Err(ApiError::from(err).into()),
             };
             let local_absent = local.is_none();
-            match merge_incoming_replication_config(incoming, local) {
+            let site_deployment_ids = site_replication_deployment_ids().await?;
+            match merge_incoming_replication_config(incoming, local, &site_deployment_ids) {
                 Some(config) => Some(serialize(&config).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
                 })?),
@@ -16066,6 +16089,10 @@ mod tests {
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
     }
 
+    fn home_office() -> HashSet<String> {
+        HashSet::from(["home".to_string(), "office".to_string()])
+    }
+
     fn site_repl_config(peer: &str) -> ReplicationConfiguration {
         ReplicationConfiguration {
             role: String::new(),
@@ -16164,8 +16191,9 @@ mod tests {
     // itself. No bucket target backs that ARN, so every object was dropped without a log.
     #[test]
     fn test_merge_incoming_replication_config_keeps_local_reverse_rule() {
-        let merged = merge_incoming_replication_config(Some(site_repl_config("home")), Some(site_repl_config("office")))
-            .expect("merge should keep the local rule");
+        let merged =
+            merge_incoming_replication_config(Some(site_repl_config("home")), Some(site_repl_config("office")), &home_office())
+                .expect("merge should keep the local rule");
 
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
@@ -16176,7 +16204,7 @@ mod tests {
     // either — the delete travels as `replication-config` with no payload.
     #[test]
     fn test_merge_incoming_replication_config_survives_peer_delete() {
-        let merged = merge_incoming_replication_config(None, Some(site_repl_config("office")))
+        let merged = merge_incoming_replication_config(None, Some(site_repl_config("office")), &home_office())
             .expect("local site rules must survive a peer delete");
 
         assert_eq!(merged.rules.len(), 1);
@@ -16189,7 +16217,7 @@ mod tests {
         incoming.rules.push(operator_rule("nightly-backup"));
         incoming.role = "arn:rustfs:replication::home:photos".to_string();
 
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
+        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &home_office())
             .expect("merge should produce rules");
 
         let ids: Vec<_> = merged.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
@@ -16204,7 +16232,7 @@ mod tests {
 
     #[test]
     fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
-        assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
+        assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None, &home_office()).is_none());
     }
 
     fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
@@ -16624,7 +16652,7 @@ mod tests {
 
         let mut incoming = site_repl_config("home");
         incoming.role = operator_role.to_string();
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
+        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &home_office())
             .expect("merge should produce rules");
         assert_eq!(merged.role, operator_role, "operator role must survive the merge");
     }
@@ -16989,6 +17017,38 @@ mod tests {
         assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
         assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
+    }
+
+    // Issue #1948 review: an owner's `site-repl-user` rule on an operator ARN
+    // is outside the derived shape, so neither the prune nor the reconciler
+    // treats it as theirs; a leftover in the derived shape still is.
+    #[test]
+    fn test_derived_shape_excludes_owner_site_repl_user_rule() {
+        let owner_rule = build_site_replication_rule("arn:minio:replication:us-east-1:2f1c-remote:photos", 9, "site-repl-user");
+        assert!(!is_derived_site_replication_rule(&owner_rule));
+        assert!(is_derived_site_replication_rule(&build_site_replication_rule(
+            "arn:rustfs:replication::gone-dep:photos",
+            1,
+            "site-repl-gone-dep"
+        )));
+
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep"),
+                owner_rule,
+                build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 2, "site-repl-kept-dep"),
+            ],
+        };
+        let (updated, removed) = prune_removed_site_replication_rules(config, &HashSet::from(["removed-dep".to_string()]));
+        let updated = updated.expect("rules remain");
+        assert_eq!(removed, 1);
+        let rules: Vec<_> = updated
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(rules, vec![("site-repl-user", Some(9)), ("site-repl-kept-dep", Some(1))]);
     }
 
     #[test]
