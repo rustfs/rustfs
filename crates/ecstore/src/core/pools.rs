@@ -1838,7 +1838,9 @@ where
     let limit = limit.max(1);
 
     for _ in 0..limit {
-        decommission_cancel_signal_result(rx.is_cancelled())?;
+        if rx.is_cancelled() {
+            break;
+        }
         let Some(bucket) = pending.next() else {
             break;
         };
@@ -1863,11 +1865,13 @@ where
             continue;
         };
 
-        decommission_cancel_signal_result(rx.is_cancelled())?;
+        if rx.is_cancelled() {
+            continue;
+        }
         active.push(start_bucket(bucket, rx.clone()));
     }
 
-    if first_err.is_none() && rx.is_cancelled() && pending.len() > 0 {
+    if first_err.is_none() && rx.is_cancelled() {
         return decommission_cancel_signal_result(true);
     }
 
