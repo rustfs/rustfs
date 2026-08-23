@@ -4058,7 +4058,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
-    fn resync_target(resync_id: &str, status: ResyncStatusType, replicated_count: i64) -> TargetReplicationResyncStatus {
+    fn resync_target_state(resync_id: &str, status: ResyncStatusType, replicated_count: i64) -> TargetReplicationResyncStatus {
         TargetReplicationResyncStatus {
             resync_id: resync_id.to_string(),
             resync_status: status,
@@ -4073,29 +4073,36 @@ mod tests {
     #[test]
     fn merge_local_resync_keeps_peer_terminal_and_newer_states() {
         let mut persisted = BucketReplicationResyncStatus::new();
-        persisted
-            .targets_map
-            .insert("arn:same-run".to_string(), resync_target("run-1", ResyncStatusType::ResyncStarted, 1));
-        persisted
-            .targets_map
-            .insert("arn:canceled".to_string(), resync_target("run-1", ResyncStatusType::ResyncCanceled, 0));
-        persisted
-            .targets_map
-            .insert("arn:new-run".to_string(), resync_target("run-2", ResyncStatusType::ResyncPending, 0));
+        persisted.targets_map.insert(
+            "arn:same-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 1),
+        );
+        persisted.targets_map.insert(
+            "arn:canceled".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncCanceled, 0),
+        );
+        persisted.targets_map.insert(
+            "arn:new-run".to_string(),
+            resync_target_state("run-2", ResyncStatusType::ResyncPending, 0),
+        );
 
         let mut local = BucketReplicationResyncStatus::new();
-        local
-            .targets_map
-            .insert("arn:same-run".to_string(), resync_target("run-1", ResyncStatusType::ResyncStarted, 9));
-        local
-            .targets_map
-            .insert("arn:canceled".to_string(), resync_target("run-1", ResyncStatusType::ResyncPending, 0));
-        local
-            .targets_map
-            .insert("arn:new-run".to_string(), resync_target("run-1", ResyncStatusType::ResyncStarted, 3));
-        local
-            .targets_map
-            .insert("arn:local-only".to_string(), resync_target("run-1", ResyncStatusType::ResyncPending, 0));
+        local.targets_map.insert(
+            "arn:same-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 9),
+        );
+        local.targets_map.insert(
+            "arn:canceled".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncPending, 0),
+        );
+        local.targets_map.insert(
+            "arn:new-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 3),
+        );
+        local.targets_map.insert(
+            "arn:local-only".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncPending, 0),
+        );
         local.last_update = Some(OffsetDateTime::now_utc());
 
         assert!(merge_local_resync_into_persisted(&mut persisted, &local));
@@ -4120,14 +4127,14 @@ mod tests {
         let mut persisted = BucketReplicationResyncStatus::new();
         persisted
             .targets_map
-            .insert("arn:same".to_string(), resync_target("run-1", ResyncStatusType::ResyncStarted, 5));
+            .insert("arn:same".to_string(), resync_target_state("run-1", ResyncStatusType::ResyncStarted, 5));
         let local = persisted.clone();
         assert!(!merge_local_resync_into_persisted(&mut persisted, &local));
 
         let mut local = local.clone();
         local
             .targets_map
-            .insert("arn:same".to_string(), resync_target("run-1", ResyncStatusType::ResyncCompleted, 5));
+            .insert("arn:same".to_string(), resync_target_state("run-1", ResyncStatusType::ResyncCompleted, 5));
         assert!(merge_local_resync_into_persisted(&mut persisted, &local));
         assert_eq!(persisted.targets_map["arn:same"].resync_status, ResyncStatusType::ResyncCompleted);
     }
