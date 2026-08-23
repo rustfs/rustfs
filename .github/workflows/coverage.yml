@@ -37,7 +37,7 @@ on:
     # build (01:00), e2e-s3tests (02:00), audit (03:00), nix-flake-update
     # (05:00), mint (06:00), and the daily fuzz (02:00), minio-interop (03:17),
     # e2e-replication-nightly (04:00) and performance-ab (06:00) lanes.
-    - cron: "0 7 * * 0"
+    - cron: "43 7 * * 0"
 
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.

@@ -64,3 +64,25 @@ if [ "$status" -ne 0 ]; then
 fi
 
 echo "OK: every ./.github/actions/setup call states cache-save-if explicitly"
+
+# rust-cache hashes every CARGO*, CC*, CFLAGS*, CXX*, CMAKE*, and RUST*
+# variable that is present when the setup action runs. The dedicated writer
+# and the CI readers therefore need identical workflow-level compiler env.
+compiler_env() {
+    awk '
+        /^env:[[:space:]]*$/ { in_env = 1; next }
+        in_env && /^[^[:space:]]/ { exit }
+        in_env && /^  (CARGO|CC|CFLAGS|CXX|CMAKE|RUST)[A-Z0-9_]*:/ { print }
+    ' "$1" | sort
+}
+
+ci_env="$(compiler_env .github/workflows/ci.yml)"
+warm_env="$(compiler_env .github/workflows/cache-warm.yml)"
+
+if [ "$ci_env" != "$warm_env" ]; then
+    echo "CI and cache-warm compiler environments differ; rust-cache keys will not match:" >&2
+    diff -u <(printf '%s\n' "$ci_env") <(printf '%s\n' "$warm_env") >&2 || true
+    exit 1
+fi
+
+echo "OK: cache-warm and CI compiler environments match"

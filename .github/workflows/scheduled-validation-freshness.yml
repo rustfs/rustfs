@@ -1,0 +1,57 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Scheduled Validation Freshness
+
+on:
+  schedule:
+    - cron: "47 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-validation-freshness
+  cancel-in-progress: false
+
+jobs:
+  check-freshness:
+    name: Check scheduled validation freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Check latest scheduled runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          python3 scripts/check_scheduled_validation_freshness.py \
+            --report "${RUNNER_TEMP}/scheduled-validation-freshness.md"
+          status=$?
+          cat "${RUNNER_TEMP}/scheduled-validation-freshness.md" >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Open or update freshness issue
+        if: failure()
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          details-file: ${{ runner.temp }}/scheduled-validation-freshness.md

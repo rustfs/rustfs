@@ -55,7 +55,6 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::error::Error;
     use tokio::time::{Duration, timeout};
@@ -269,7 +268,6 @@ mod tests {
     /// stripes) and a multipart object (3 parts × 5 MiB) must GET back as a
     /// full, byte-identical body with the correct Content-Length. No early EOF.
     #[tokio::test]
-    #[serial]
     async fn degraded_read_large_objects_with_one_disk_offline_return_full_body() -> TestResult {
         init_logging();
         info!("dist-13 (a): large-object degraded read with one of four disks offline");
@@ -335,7 +333,6 @@ mod tests {
     /// mid-stream — the exact window the fixes had to reconstruct through rather
     /// than truncate.
     #[tokio::test]
-    #[serial]
     async fn degraded_read_reconstructs_through_midstream_bitrot_within_quorum() -> TestResult {
         init_logging();
         info!("dist-13 (b): mid-stream bitrot within quorum must reconstruct a full body");
@@ -393,7 +390,6 @@ mod tests {
     /// Content-Length. `get_checked` panics on that forbidden outcome, so this
     /// test fails loudly if the truncation bug ever returns.
     #[tokio::test]
-    #[serial]
     async fn beyond_quorum_degraded_read_never_silently_truncates() -> TestResult {
         init_logging();
         info!("dist-13 (c): beyond-quorum degraded read must fail, never 200+truncated");

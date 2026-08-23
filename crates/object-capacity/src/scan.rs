@@ -1069,7 +1069,6 @@ mod tests {
     #[cfg(unix)]
     use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
     use rustfs_config::{ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_SAMPLE_RATE};
-    use serial_test::serial;
 
     /// Reference implementation using unbounded `u128` arithmetic, clamped to
     /// `u64::MAX`, used as the source of truth for the sampling extrapolation.
@@ -1274,7 +1273,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_get_dir_size_async_nonexistent_directory() {
         let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
         assert!(result.is_err());
@@ -1648,7 +1646,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_metadata_incomplete_aggregate_does_not_replace_disk_cache() {
         use std::fs::File;
         use std::io::Write;
@@ -1783,7 +1780,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial]
     async fn test_get_dir_size_async_ignores_symlink_targets_when_follow_disabled() {
         use std::fs::File;
         use std::io::Write;
@@ -1809,7 +1805,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[serial]
     async fn test_get_dir_size_async_counts_symlink_targets_when_follow_enabled() {
         use std::fs::File;
         use std::io::Write;

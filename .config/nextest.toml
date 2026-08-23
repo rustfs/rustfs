@@ -38,10 +38,11 @@ e2e-vault = { max-threads = 1 }
 # replacement_privileged_e2e_test when explicitly run as root on Linux). They
 # are correct in isolation but resource-heavy; serialize them under nextest's
 # process boundary (serial_test's #[serial] does not cross it) so several 4-disk
-# servers never run at once. ci-7's nightly picks these up via the e2e suite;
+# servers never run at once. The e2e-full merge/main lane picks these up;
 # they are deliberately NOT in the fast PR `e2e-smoke` filter.
 e2e-reliability = { max-threads = 1 }
 e2e-inline-boundaries = { max-threads = 1 }
+e2e-cluster-nightly = { max-threads = 1 }
 
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
@@ -161,7 +162,7 @@ retries = 2
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
-# run concurrently when ci-7's nightly runs the full e2e suite.
+# run concurrently when e2e-full runs the suite.
 [[profile.ci.overrides]]
 filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression|replacement_privileged_e2e)_test::/)'
 test-group = 'e2e-reliability'
@@ -230,8 +231,8 @@ test-group = 'ecstore-serial-flaky'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 49 nightly = 69 total
-# (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
+# regexes byte-identical. The committed profile selection digests make changes
+# visible in CI; current counts live in docs/testing/e2e-suite-inventory.md.
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
 # SSRF egress guard rejected on every PR after repl-1 (#4712). That is fixed —
@@ -327,9 +328,8 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 # the STS dual-node test actually exercises its path (it skips gracefully with
 # a visible log line when awscurl is absent), and routes scheduled failures
 # through .github/actions/schedule-failure-issue (ci-8). Explicit division of
-# labor with ci-5's future e2e-full merge gate: these tests run ONLY here, not
-# double-run there. TODO(ci-7): fold this interim repl-owned lane into the ci
-# domain's consolidated scheduled e2e workflow once it exists.
+# labor with e2e-full: these tests run only in the consolidated nightly
+# workflow, not in the merge/main lane.
 [profile.e2e-repl-nightly]
 default-filter = """
     package(e2e_test)
@@ -344,25 +344,59 @@ fail-fast = false
 path = "junit.xml"
 
 # ---------------------------------------------------------------------------
+# e2e-nightly profile — destructive multi-process cluster fault domains
+# ---------------------------------------------------------------------------
+# These seven modules are deliberately outside e2e-full's merge budget. Each
+# starts a real multi-process or multi-disk topology and exercises node/disk
+# loss, quorum, cleanup, notification fan-in, or admin-timeout behavior. The
+# consolidated nightly workflow runs them serially to avoid resource
+# starvation; failures are never retried.
+[profile.e2e-nightly]
+default-filter = """
+    package(e2e_test)
+    & test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+"""
+fail-fast = false
+
+[profile.e2e-nightly.junit]
+path = "junit.xml"
+
+[[profile.e2e-nightly.overrides]]
+filter = 'package(e2e_test)'
+test-group = 'e2e-cluster-nightly'
+
+# ---------------------------------------------------------------------------
+# e2e-protocols profile — serial protocol lane
+# ---------------------------------------------------------------------------
+# The suite owns fixed ports, so the nightly workflow runs this exact profile
+# with one nextest worker.
+[profile.e2e-protocols]
+default-filter = 'package(e2e_test) & test(/^protocols::/)'
+fail-fast = false
+
+[profile.e2e-protocols.junit]
+path = "junit.xml"
+
+# ---------------------------------------------------------------------------
 # e2e-full profile — merge-gate full single-node e2e lane (backlog#1149 ci-5)
 # ---------------------------------------------------------------------------
 # The merge gate (ci.yml `e2e-full` job: push main + merge_group +
-# workflow_dispatch). Runs the never-automated user-visible suites — KMS (40),
-# object_lock (33), multipart_auth (109), quota, checksum, encryption,
+# workflow_dispatch). Runs the user-visible KMS, object-lock, multipart-auth,
+# quota, checksum, encryption,
 # security-boundary, ... — that the fast PR `e2e-smoke` subset deliberately
 # skips. Budget <= 45 min; authority for the suite count is `cargo nextest list
 # --profile e2e-full` (see docs/testing/e2e-suite-inventory.md).
 #
 # The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
-#   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
-#     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
+#   * protocols:: — FTPS/SFTP/WebDAV, run from the dedicated protocol profile
+#     with one worker because the suite owns fixed ports.
 #   * the 7 cluster suites that spin up a RustFSTestClusterEnvironment
 #     (cluster_concurrency, cluster_multidrive_pool, stale_multipart_cleanup_cluster,
 #     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
-#     object_lambda) — too heavy for the merge budget; they run in ci-7's
-#     nightly 4-node lane.
+#     object_lambda) — too heavy for the merge budget; they run in the
+#     e2e-nightly serial cluster-fault lane.
 #   * replication_extension_test — repl-1 already splits it into the PR
-#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (49 slow) lanes and reserves
+#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (55 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
 #   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
 #     manual-localhost:9000 reliant/policy tests are ci-13's migration.

@@ -385,7 +385,7 @@ impl ECStore {
     }
 
     pub(super) async fn is_suspended(&self, idx: usize) -> bool {
-        // TODO: LOCK
+        // TODO(backlog): acquire pool metadata lock for consistent suspension check
 
         let pool_meta = self.pool_meta.read().await;
 
@@ -859,6 +859,7 @@ fn lifecycle_delete_all_test_failure(phase: crate::object_api::LifecycleDeleteAl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
@@ -1423,6 +1424,14 @@ mod tests {
         }
     }
 
+    fn object_info_with_identity(unix_ts: i64, delete_marker: bool, version_id: Uuid, etag: Option<String>) -> ObjectInfo {
+        ObjectInfo {
+            version_id: Some(version_id),
+            etag,
+            ..object_info_with_mod_time(unix_ts, delete_marker)
+        }
+    }
+
     #[test]
     fn resolve_latest_object_info_candidates_returns_latest_delete_marker() {
         let candidates = vec![
@@ -1446,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time() {
+    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time_for_equivalent_candidates() {
         let candidates = vec![
             LatestObjectInfoCandidate {
                 info: Some(object_info_with_mod_time(10, false)),
@@ -1464,6 +1473,382 @@ mod tests {
             .expect("operation should succeed");
 
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_keeps_index_fallback_for_fully_equivalent_identities() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 2,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 7,
+                err: None,
+            },
+        ];
+
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("equivalent replicas must resolve deterministically");
+
+        assert_eq!(idx, 7);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_version_id_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(2), Some("etag-a".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("divergent version ids must not silently resolve to the higher pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_etag_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-old".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-new".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("divergent etags must not silently resolve to the higher pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_delete_marker_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), None)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, true, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("a delete marker tied with a live version must not be masked by the pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    fn assert_equal_time_identity_conflict(left: ObjectInfo, right: ObjectInfo) {
+        let err = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(left),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(right),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect_err("equal-time identity divergence must fail closed");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_payload_identity_conflicts() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let mut data_dir = base.clone();
+        data_dir.data_dir = Some(Uuid::from_u128(2));
+        assert_equal_time_identity_conflict(base.clone(), data_dir);
+
+        let mut size = base.clone();
+        size.size = 1;
+        assert_equal_time_identity_conflict(base.clone(), size);
+
+        let mut actual_size = base.clone();
+        actual_size.actual_size = 1;
+        assert_equal_time_identity_conflict(base.clone(), actual_size);
+
+        let mut checksum = base.clone();
+        checksum.checksum = Some(bytes::Bytes::from_static(b"checksum"));
+        assert_equal_time_identity_conflict(base.clone(), checksum);
+
+        let mut parts = base.clone();
+        parts.parts = std::sync::Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+            etag: "part-etag".to_string(),
+            number: 1,
+            size: 1,
+            ..Default::default()
+        }]);
+        assert_equal_time_identity_conflict(base.clone(), parts);
+
+        let mut transition = base;
+        transition.transitioned_object.tier = "tier-a".to_string();
+        assert_equal_time_identity_conflict(
+            object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
+            transition,
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_internal_metadata_aliases() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut rustfs_alias = base.clone();
+        rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+        let mut minio_alias = base.clone();
+        minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "X-MINIO-INTERNAL-COMPRESSION".to_string(),
+            "zstd".to_string(),
+        )]));
+
+        let (_, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(rustfs_alias),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(minio_alias),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("same-value internal aliases should resolve");
+        assert_eq!(idx, 1);
+
+        let mut dual_alias = base.clone();
+        dual_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([
+            ("x-rustfs-internal-compression".to_string(), "zstd".to_string()),
+            ("x-minio-internal-compression".to_string(), "zstd".to_string()),
+        ]));
+        let mut single_alias = base;
+        single_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+
+        let (_, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(dual_alias),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(single_alias),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("dual-key and single-key internal metadata should resolve");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_different_internal_metadata_alias_values() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut rustfs_alias = base.clone();
+        rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+        let mut minio_alias = base;
+        minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-minio-internal-compression".to_string(),
+            "snappy".to_string(),
+        )]));
+
+        assert_equal_time_identity_conflict(rustfs_alias, minio_alias);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_preserves_dynamic_internal_metadata_identity_case() {
+        for suffix_prefix in ["replication-reset-", "replication-delete-marker-version-"] {
+            let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+            let mut rustfs_alias = base.clone();
+            rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!(
+                    "X-RUSTFS-INTERNAL-{}{suffix}",
+                    suffix_prefix.to_uppercase(),
+                    suffix = "arn:aws:s3:::Bucket"
+                ),
+                "value".to_string(),
+            )]));
+            let mut minio_alias = base.clone();
+            minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::Bucket"),
+                "value".to_string(),
+            )]));
+
+            let (_, idx) = resolve_latest_object_info_candidates(
+                vec![
+                    LatestObjectInfoCandidate {
+                        info: Some(rustfs_alias.clone()),
+                        idx: 0,
+                        err: None,
+                    },
+                    LatestObjectInfoCandidate {
+                        info: Some(minio_alias),
+                        idx: 1,
+                        err: None,
+                    },
+                ],
+                "bucket",
+                "object",
+                &ObjectOptions::default(),
+            )
+            .expect("dynamic internal aliases with the same target should resolve");
+            assert_eq!(idx, 1);
+
+            let mut different_target_case = base;
+            different_target_case.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::bucket"),
+                "value".to_string(),
+            )]));
+
+            assert_equal_time_identity_conflict(rustfs_alias, different_target_case);
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_conflicting_internal_metadata_aliases_in_one_candidate() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut first = base.clone();
+        first.user_defined = std::sync::Arc::new(std::collections::HashMap::from([
+            ("x-rustfs-internal-compression".to_string(), "zstd".to_string()),
+            ("x-minio-internal-compression".to_string(), "snappy".to_string()),
+        ]));
+        let mut second = base;
+        second.user_defined = first.user_defined.clone();
+
+        assert_equal_time_identity_conflict(first, second);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_replication_identity_conflict() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let mut replication = base.clone();
+        replication.replication_status_internal = Some("PENDING".to_string());
+        replication.replication_status = ReplicationStatusType::Pending;
+        assert_equal_time_identity_conflict(base.clone(), replication);
+
+        let mut purge = base.clone();
+        purge.version_purge_status_internal = Some("PENDING".to_string());
+        purge.version_purge_status = VersionPurgeStatusType::Pending;
+        assert_equal_time_identity_conflict(base.clone(), purge);
+
+        let mut decision = base;
+        decision.replication_decision = "replicate".to_string();
+        assert_equal_time_identity_conflict(
+            object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
+            decision,
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_none_vs_unix_epoch_mod_time() {
+        let mut without_mod_time = object_info_with_identity(0, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        without_mod_time.mod_time = None;
+        let with_unix_epoch = object_info_with_identity(0, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        assert_equal_time_identity_conflict(without_mod_time, with_unix_epoch);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_ignores_older_identity_conflicts() {
+        let latest = object_info_with_identity(20, false, Uuid::from_u128(1), Some("etag-latest".to_string()));
+        let mut older = object_info_with_identity(10, true, Uuid::from_u128(2), Some("etag-old".to_string()));
+        older.data_dir = Some(Uuid::from_u128(2));
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(latest),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(older),
+                    idx: 9,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("older identity divergence must not affect the latest candidate");
+
+        assert_eq!(idx, 0);
+        assert_eq!(
+            info.mod_time,
+            Some(OffsetDateTime::from_unix_timestamp(20).expect("operation should succeed"))
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_ignores_not_found_pools_when_resolving() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: None,
+                idx: 1,
+                err: Some(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+            },
+        ];
+
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("not-found pools must not block resolution of found candidates");
+
+        assert_eq!(idx, 0);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
     }
 
     #[test]

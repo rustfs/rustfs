@@ -18,10 +18,9 @@
 # runs only the implemented_tests.txt whitelist. This workflow complements it:
 #
 #   - Scheduled weekly full sweep (TEST_SCOPE=all): runs the ENTIRE upstream
-#     suite and reports promotion candidates (tests that newly pass) and
-#     unclassified tests. The job fails only on regressions in the implemented
-#     whitelist or on infrastructure errors — expected failures from
-#     not-yet-implemented features do not turn the run red.
+#     suite and reports promotion candidates. Regressions, unclassified tests,
+#     incomplete execution, and infrastructure errors fail the job; classified
+#     failures for not-yet-implemented features remain informational.
 #   - Manual runs (workflow_dispatch): same, with configurable mode/scope.
 #
 # All test execution is delegated to scripts/s3-tests/run.sh (single source of
@@ -45,13 +44,6 @@
 # The PR gate (ci.yml s3-implemented-tests) is unaffected: it avoids Docker
 # via DEPLOY_MODE=binary and defers all pip setup to run.sh's self-bootstrap.
 
-# DISABLED. This workflow is switched off in the repository's Actions settings
-# (state: disabled_manually) and does not run on any trigger, including its cron
-# and workflow_dispatch. That state lives in GitHub's UI and is invisible when
-# reading this file, which has already misled at least one audit — hence this
-# banner. Re-enabling is a UI action; anyone doing so should first check that the
-# workflow still matches the current CI layout. See rustfs/backlog#1603.
-#
 name: e2e-s3tests
 
 on:
@@ -81,14 +73,31 @@ on:
         description: "Stop after N failures. '0' to run everything."
         required: false
         default: "0"
+      shard-count:
+        description: "Exact-node-ID shard count for a targeted manual run"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+      shard-index:
+        description: "Zero-based shard index for a targeted manual run"
+        required: false
+        default: "0"
       markexpr:
         description: "Optional pytest -m expression"
+        required: false
+        default: ""
+      testexpr:
+        description: "Optional pytest -k expression"
         required: false
         default: ""
   schedule:
     # Weekly full sweep (Sunday 02:00 UTC): full suite, run against BOTH the
     # single-node and the 4-node distributed topologies (matrix below).
-    - cron: "0 2 * * 0"
+    - cron: "19 2 * * 0"
 
 env:
   # main user
@@ -111,6 +120,9 @@ env:
   XDIST: ${{ github.event.inputs.xdist || '4' }}
   MAXFAIL: ${{ github.event.inputs.maxfail || '0' }}
   MARKEXPR: ${{ github.event.inputs.markexpr || '' }}
+  TESTEXPR: ${{ github.event.inputs.testexpr || '' }}
+  S3_SHARD_COUNT: ${{ github.event_name == 'schedule' && '4' || github.event.inputs.shard-count || '1' }}
+  TEST_TIMEOUT: "300"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs['test-mode'] || 'single' }}
@@ -127,19 +139,22 @@ defaults:
 
 jobs:
   s3tests:
+    name: s3tests (${{ matrix.test-mode }}, shard ${{ matrix.shard-index }})
     # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
     # See the header note (ci-1) for why the self-hosted sm-standard-4 label
-    # was abandoned. TODO(ci-8): scheduled-failure alerting (auto-open issue)
-    # is added by the ci-8 composite action; do not implement it here.
+    # was abandoned. Scheduled failures are handled by alert-on-failure below.
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         # Scheduled sweeps cover both topologies; manual runs use the input.
         test-mode: ${{ github.event_name == 'schedule' && fromJSON('["single", "multi"]') || fromJSON(format('["{0}"]', github.event.inputs.test-mode || 'single')) }}
+        shard-index: ${{ github.event_name == 'schedule' && fromJSON('[0, 1, 2, 3]') || fromJSON(format('[{0}]', github.event.inputs.shard-index || '0')) }}
     env:
       TEST_MODE: ${{ matrix.test-mode }}
+      S3_SHARD_INDEX: ${{ matrix.shard-index }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -181,6 +196,7 @@ jobs:
       - name: Start single RustFS
         if: env.TEST_MODE == 'single'
         run: |
+          SSE_KEY="$(head -c 32 /dev/zero | base64 -w0)"
           docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
           docker rm -f rustfs-single >/dev/null 2>&1 || true
           # The four disks share one physical device on the runner (a single
@@ -193,6 +209,7 @@ jobs:
             -e RUSTFS_ADDRESS=0.0.0.0:9000 \
             -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
             -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
+            -e RUSTFS_SSE_S3_MASTER_KEY="${SSE_KEY}" \
             -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
             -e RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
             -v /tmp/rustfs-single:/data \
@@ -201,6 +218,7 @@ jobs:
       - name: Start 4-node distributed cluster
         if: env.TEST_MODE == 'multi'
         run: |
+          SSE_KEY="$(head -c 32 /dev/zero | base64 -w0)"
           # A real distributed deployment: every node lists all endpoints in
           # RUSTFS_VOLUMES so data is erasure-coded ACROSS nodes. Do not use
           # node-local volume paths here — that would create four independent
@@ -213,6 +231,7 @@ jobs:
               RUSTFS_ADDRESS: "0.0.0.0:9000"
               RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
               RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+              RUSTFS_SSE_S3_MASTER_KEY: "${SSE_KEY}"
               RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
               # Each node's four disks share one physical device inside its
               # container, so bypass the local physical-disk-independence guard
@@ -255,14 +274,20 @@ jobs:
           EOF
 
           cat > haproxy.cfg <<'EOF'
+          global
+            log stdout format raw local0 info
+
           defaults
             mode http
+            log global
+            log-format '%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %tsc %HM %HP'
             timeout connect 5s
             timeout client  30s
             timeout server  30s
 
           frontend fe_s3
             bind *:9000
+            option http-buffer-request
             default_backend be_s3
 
           backend be_s3
@@ -294,34 +319,14 @@ jobs:
 
       - name: Run ceph s3-tests
         run: |
-          set +e
           DEPLOY_MODE=existing \
           TEST_MODE="${TEST_MODE}" \
           TEST_SCOPE="${TEST_SCOPE}" \
           XDIST="${XDIST}" \
           MAXFAIL="${MAXFAIL}" \
           MARKEXPR="${MARKEXPR}" \
+          TESTEXPR="${TESTEXPR}" \
           ./scripts/s3-tests/run.sh
-          RC=$?
-          set -e
-
-          if [ "${TEST_SCOPE}" = "implemented" ]; then
-            # Whitelist run: every failure is a regression.
-            exit "${RC}"
-          fi
-
-          # Full sweep: failures outside the implemented whitelist are
-          # inventory (promotion candidates / unimplemented features), not a
-          # gate. Fail only on whitelist regressions or infrastructure errors.
-          JUNIT="artifacts/s3tests-${TEST_MODE}/junit.xml"
-          if [ ! -f "${JUNIT}" ]; then
-            echo "No junit.xml produced — infrastructure failure (exit ${RC})" >&2
-            exit "${RC}"
-          fi
-          python3 scripts/s3-tests/report_compat.py \
-            --junit "${JUNIT}" \
-            --lists-dir scripts/s3-tests \
-            --fail-on-regression
 
       - name: Publish compatibility report
         if: always()
@@ -346,7 +351,7 @@ jobs:
         if: always() && env.ACT != 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: s3tests-${{ env.TEST_MODE }}
+          name: s3tests-${{ env.TEST_MODE }}-shard-${{ matrix.shard-index }}
           path: artifacts/**
 
   alert-on-failure:

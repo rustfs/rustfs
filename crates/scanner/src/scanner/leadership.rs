@@ -196,7 +196,7 @@ pub(super) async fn claim_scanner_leadership(
         if ctx.is_cancelled() {
             return false;
         }
-        let Some(claimed_epoch) = persisted_epoch.checked_add(1) else {
+        let Some(claimed_epoch) = persisted_epoch.checked_add(1).filter(|epoch| *epoch < u64::MAX) else {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,

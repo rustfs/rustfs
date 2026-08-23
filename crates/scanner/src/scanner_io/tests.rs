@@ -27,7 +27,6 @@ use crate::{
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
 use rustfs_filemeta::FileInfo;
-use serial_test::serial;
 use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -103,7 +102,6 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cache_locks_block_same_source_workers() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let set = &store.pools[0].disk_set[0];
@@ -130,7 +128,6 @@ async fn scanner_cache_locks_block_same_source_workers() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cache_locks_allow_cross_source_workers() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let first_set = &store.pools[0].disk_set[0];
@@ -149,7 +146,6 @@ async fn scanner_cache_locks_allow_cross_source_workers() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
@@ -185,7 +181,6 @@ async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
 }
 
 #[tokio::test]
-#[serial]
 async fn scanner_cycle_is_deferred_while_terminal_decommission_is_blocked() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     for decommission in [
@@ -230,7 +225,6 @@ async fn data_usage_publish_fails_when_receiver_is_closed() {
 }
 
 #[tokio::test]
-#[serial]
 async fn multi_pool_scanner_cycle_publishes_combined_usage() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let bucket = format!("scanner-union-{}", Uuid::new_v4().simple());
@@ -278,7 +272,6 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
 }
 
 #[tokio::test]
-#[serial]
 async fn multi_pool_scanner_cycle_zero_fills_bucket_absent_from_first_pool() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let bucket = format!("scanner-second-pool-{}", Uuid::new_v4().simple());
@@ -366,7 +359,6 @@ fn object_lock_config_enabled_accepts_enabled_only() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_snapshot_clear_preserves_newer_generation() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -381,7 +373,6 @@ fn dirty_usage_snapshot_clear_preserves_newer_generation() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_generation_acknowledgement_preserves_newer_mutations() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -407,7 +398,6 @@ fn dirty_usage_generation_acknowledgement_preserves_newer_mutations() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_generation_acknowledgement_rejects_stale_process_and_future_generation() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -437,7 +427,6 @@ fn dirty_usage_generation_acknowledgement_rejects_stale_process_and_future_gener
 }
 
 #[test]
-#[serial]
 fn dirty_usage_snapshot_detects_uncovered_generation() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -462,7 +451,6 @@ fn generation_saturates_instead_of_wrapping() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_snapshot_clears_a_stably_absent_bucket_after_durable_save() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -484,7 +472,6 @@ fn dirty_usage_snapshot_clears_a_stably_absent_bucket_after_durable_save() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_snapshot_preserves_an_absent_bucket_recorded_after_listing_started() {
     clear_dirty_usage_buckets_for_tests();
     let generation_before_bucket_list = dirty_usage_generation();
@@ -499,7 +486,6 @@ fn dirty_usage_snapshot_preserves_an_absent_bucket_recorded_after_listing_starte
 }
 
 #[test]
-#[serial]
 fn deleting_a_clean_bucket_invalidates_an_inflight_usage_snapshot() {
     clear_dirty_usage_buckets_for_tests();
     let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], dirty_usage_generation());
@@ -513,7 +499,6 @@ fn deleting_a_clean_bucket_invalidates_an_inflight_usage_snapshot() {
 }
 
 #[test]
-#[serial]
 fn deleting_a_bucket_during_listing_invalidates_the_resulting_usage_snapshot() {
     clear_dirty_usage_buckets_for_tests();
     let generation_before_bucket_list = dirty_usage_generation();
@@ -527,7 +512,6 @@ fn deleting_a_bucket_during_listing_invalidates_the_resulting_usage_snapshot() {
 }
 
 #[test]
-#[serial]
 fn scanner_maintenance_change_advances_generation_and_marks_usage_dirty() {
     clear_dirty_usage_buckets_for_tests();
     let generation = scanner_maintenance_generation();
@@ -540,7 +524,6 @@ fn scanner_maintenance_change_advances_generation_and_marks_usage_dirty() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_clear_excludes_failed_buckets() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -572,7 +555,6 @@ fn dirty_usage_clear_plan_excludes_cache_save_failures() {
 }
 
 #[test]
-#[serial]
 fn dirty_usage_is_acknowledged_only_after_durable_usage_confirmation() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -590,7 +572,6 @@ fn dirty_usage_is_acknowledged_only_after_durable_usage_confirmation() {
 }
 
 #[test]
-#[serial]
 fn clear_dirty_usage_bucket_removes_deleted_bucket_marker() {
     clear_dirty_usage_buckets_for_tests();
     record_dirty_usage_bucket("photos");
@@ -917,35 +898,30 @@ async fn bucket_cache_pending_heal_reaches_cycle_maintenance_state() {
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_preserves_available_when_unconfigured() {
     crate::reset_foreground_read_activity_for_test();
     assert_eq!(scanner_concurrency_limit(0, 4), 4);
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_caps_to_configured_value() {
     crate::reset_foreground_read_activity_for_test();
     assert_eq!(scanner_concurrency_limit(2, 4), 2);
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_never_exceeds_available_work() {
     crate::reset_foreground_read_activity_for_test();
     assert_eq!(scanner_concurrency_limit(8, 4), 4);
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_handles_no_available_work() {
     crate::reset_foreground_read_activity_for_test();
     assert_eq!(scanner_concurrency_limit(2, 0), 0);
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_yields_to_foreground_reads() {
     crate::reset_foreground_read_activity_for_test();
     crate::set_foreground_read_activity(8);
@@ -955,7 +931,6 @@ fn scanner_concurrency_limit_yields_to_foreground_reads() {
 }
 
 #[test]
-#[serial]
 fn scanner_concurrency_limit_yields_to_streaming_reads() {
     crate::reset_foreground_read_activity_for_test();
     let _guard = crate::ForegroundReadGuard::new();
@@ -979,7 +954,6 @@ fn increment_atomic_usize_saturates_at_max() {
 }
 
 #[test]
-#[serial]
 fn scanner_max_concurrent_set_scans_uses_env_cap() {
     with_var(ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("2"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -989,7 +963,6 @@ fn scanner_max_concurrent_set_scans_uses_env_cap() {
 }
 
 #[test]
-#[serial]
 fn scanner_max_concurrent_disk_scans_uses_env_cap() {
     with_var(ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("1"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
