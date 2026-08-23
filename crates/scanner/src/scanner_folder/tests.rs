@@ -425,7 +425,9 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     summary.record_size_reconciliation(entry.clone());
     summary.record_reconciliation_scope("b", "object");
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
 
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
     assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
@@ -440,6 +442,7 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     let mut resolved = SizeSummary::default();
     resolved.record_reconciliation_scope("b", "object");
     scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
     assert!(scanner.update_cache.info.size_reconciliation.is_empty());
 }
@@ -453,18 +456,20 @@ async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
     let entry = SizeReconciliationEntry {
         key: "long-object-key".to_string(),
         bucket: "b".to_string(),
-        object: bounded_object,
+        object: bounded_object.clone(),
         reason: "invalid_declared_size".to_string(),
         ..Default::default()
     };
     let mut summary = SizeSummary::default();
     summary.record_size_reconciliation(entry);
     scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
 
     let mut resolved = SizeSummary::default();
-    resolved.record_reconciliation_scope("b", &long_object);
+    resolved.record_reconciliation_scope("b", &bounded_object);
     scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
 }
 

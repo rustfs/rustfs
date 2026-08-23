@@ -69,6 +69,14 @@ async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     .await
     .expect("scanner cycle test ECStore should initialize");
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+            .expect("scanner cycle usage baseline should encode"),
+    )
+    .await
+    .expect("scanner cycle usage baseline should persist");
 
     (temp_dir, store)
 }
