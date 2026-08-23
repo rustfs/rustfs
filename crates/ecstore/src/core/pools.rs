@@ -8936,28 +8936,29 @@ mod pools_tests {
         ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index,
-        get_by_index, guard_decommission_cancelers, has_active_decommission_canceler,
-        is_decommission_active, is_decommission_cancel_requested, load_decommission_entry_versions,
-        local_decommission_queue_prefix, mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts,
-        merge_pool_status_refresh, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
-        pool_meta_has_active_decommission, reconcile_decommission_meta_buckets, require_decommission_store,
-        reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result, resumable_decommission_queue_indices,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
-        run_decommission_listing_with_retry_and_drain, run_decommission_side_effect, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed,
-        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
-        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
-        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
-        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_retry_backoff,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index, guard_decommission_cancelers,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
+        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
+        merge_decommission_durable_ilm_receipts, merge_pool_status_refresh, missing_decommission_worker_prefix,
+        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, reconcile_decommission_meta_buckets,
+        require_decommission_store, reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
+        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_side_effect,
+        should_cleanup_decommission_source_entry, should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_fail_decommission_pool_after_exhausted_source_changed, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
+        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
+        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
+        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
+        validate_start_decommission_request, wait_decommission_retry_backoff, wait_decommission_worker_drain,
+        with_decommission_entry_context,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -12620,7 +12621,7 @@ mod pools_tests {
                 .as_ref()
                 .is_some_and(|info| info.canceled && info.start_time.is_none())
         );
-        assert!(first_resumable_decommission_queue_indices(&restarted).is_empty());
+        assert!(resumable_decommission_queue_indices(&restarted).is_empty());
     }
 
     #[tokio::test]
