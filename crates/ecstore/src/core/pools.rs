@@ -7958,20 +7958,20 @@ mod pools_tests {
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
         resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
         run_decommission_buckets_bounded, run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain,
-        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
-        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
-        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
-        validate_start_decommission_request, wait_decommission_listing_retry, wait_decommission_worker_drain,
-        with_decommission_entry_context,
+        run_decommission_phases, run_decommission_side_effect, should_cleanup_decommission_source_entry,
+        should_continue_decommission_queue, should_count_decommission_version_complete,
+        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
+        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
+        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
+        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_listing_retry,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
         bucket_lifecycle_ops::{ManualTransitionQueueSnapshot, ManualTransitionRunOptions},
         manual_transition_job::{ManualTransitionJobRecord, manual_transition_job_record_object_name},
-        run_decommission_phases, validate_durable_ilm_record,
+        validate_durable_ilm_record,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
