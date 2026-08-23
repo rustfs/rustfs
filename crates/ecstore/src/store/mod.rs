@@ -416,6 +416,15 @@ impl ECStore {
 
         Some((operation_guard, self.ctx.data_movement_operation_epoch()))
     }
+
+    /// Capture the current publication epoch without holding the movement
+    /// gate across backend I/O. Callers must re-admit the same epoch before a
+    /// mutation commits.
+    pub(crate) async fn scanner_data_usage_publication_epoch(&self) -> Option<u64> {
+        let (operation_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        drop(operation_guard);
+        Some(epoch)
+    }
 }
 
 // impl Clone for ECStore {
@@ -1075,6 +1084,21 @@ mod tests {
             .await
             .expect("idle store should admit the next publication");
         assert_eq!(next_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_data_usage_publication_epoch_releases_gate_before_backend_io() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let epoch = store
+            .scanner_data_usage_publication_epoch()
+            .await
+            .expect("idle store should expose a publication epoch");
+        assert_eq!(epoch, 0);
+
+        let operation_gate = store.ctx.data_movement_operation_gate();
+        let _movement_guard = tokio::time::timeout(Duration::from_secs(1), operation_gate.write())
+            .await
+            .expect("epoch capture must not hold the movement gate across backend I/O");
     }
 
     #[tokio::test]
