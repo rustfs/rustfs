@@ -722,9 +722,8 @@ impl ECStore {
         // overwrite a newer local transition after the writer commits.
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
-        let mut reloaded = PoolMeta::default();
-        resolve_store_rebalance_pool_meta_reload_result(
-            reloaded.load(self.pools[0].clone(), self.pools.clone()).await,
+        let reloaded = resolve_store_rebalance_pool_meta_reload_result(
+            self.load_runtime_pool_meta("store rebalance pool meta reload failed").await,
             "reload_pool_meta",
         )?;
 
@@ -2123,7 +2122,7 @@ mod tests {
 
     #[test]
     fn resolve_store_rebalance_pool_meta_reload_result_wraps_error_context() {
-        let err = resolve_store_rebalance_pool_meta_reload_result(Err(Error::SlowDown), "reload_pool_meta")
+        let err = resolve_store_rebalance_pool_meta_reload_result::<()>(Err(Error::SlowDown), "reload_pool_meta")
             .expect_err("failed pool meta reload should be wrapped");
         let err_message = err.to_string();
         assert!(err_message.contains("store rebalance pool meta reload failed during reload_pool_meta"));
@@ -2350,9 +2349,7 @@ mod tests {
             let started = started.clone();
             async move {
                 started.notify_one();
-                let mut loaded = PoolMeta::default();
-                loaded.load(store.pools[0].clone(), store.pools.clone()).await?;
-                Result::<PoolMeta>::Ok(loaded)
+                store.load_runtime_pool_meta("test runtime pool metadata load").await
             }
         });
         started.notified().await;
