@@ -2301,7 +2301,9 @@ mod tests {
     #[serial_test::serial]
     async fn peer_pool_meta_reload_keeps_active_worker_progress_over_newer_snapshot() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-worker", &[2]).await;
-        *store.decommission_cancelers.write().await = vec![Some(CancellationToken::new())];
+        *store.decommission_cancelers.write().await = vec![Some(crate::core::pools::DecommissionCanceler::new_for_test(
+            CancellationToken::new(),
+        ))];
 
         let worker_time = OffsetDateTime::now_utc();
         let newer_time = worker_time + TimeDuration::seconds(30);

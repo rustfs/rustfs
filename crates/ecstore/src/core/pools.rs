@@ -144,6 +144,11 @@ impl DecommissionCanceler {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(token: CancellationToken) -> Self {
+        Self::new(token)
+    }
+
     fn token(&self) -> &CancellationToken {
         &self.operation.token
     }
