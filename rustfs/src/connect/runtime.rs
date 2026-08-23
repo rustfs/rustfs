@@ -47,6 +47,9 @@ impl HeartbeatRuntime {
 
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
+        if let Some(inventory) = self.inventory.as_ref() {
+            inventory.shutdown.cancel();
+        }
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -316,5 +319,49 @@ async fn sleep_or_cancel(shutdown: &CancellationToken, delay: Duration) -> bool 
         biased;
         () = shutdown.cancelled() => true,
         () = tokio::time::sleep(delay) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn heartbeat_shutdown_cancels_inventory_before_waiting_for_heartbeat() {
+        let heartbeat_shutdown = CancellationToken::new();
+        let inventory_shutdown = CancellationToken::new();
+        let task_inventory_shutdown = inventory_shutdown.clone();
+        let (release_heartbeat, wait_for_release) = tokio::sync::oneshot::channel();
+        let (inventory_stopped, stopped) = tokio::sync::oneshot::channel();
+        let (_, heartbeat_status) = watch::channel(HeartbeatStatus::Starting);
+        let (_, inventory_status) = watch::channel(InventoryStatus::Starting);
+        let heartbeat_task = tokio::spawn(async move {
+            let _ = wait_for_release.await;
+        });
+        let inventory_task = tokio::spawn(async move {
+            task_inventory_shutdown.cancelled().await;
+            let _ = inventory_stopped.send(());
+        });
+        let runtime = HeartbeatRuntime {
+            shutdown: heartbeat_shutdown,
+            status: heartbeat_status,
+            task: Some(heartbeat_task),
+            inventory: Some(InventoryRuntime {
+                shutdown: inventory_shutdown,
+                status: inventory_status,
+                task: Some(inventory_task),
+            }),
+        };
+
+        let shutdown = tokio::spawn(runtime.shutdown());
+        tokio::time::timeout(Duration::from_millis(250), stopped)
+            .await
+            .expect("inventory cancellation must not wait for heartbeat")
+            .expect("inventory task reports cancellation");
+        release_heartbeat.send(()).expect("release heartbeat task");
+        tokio::time::timeout(Duration::from_millis(250), shutdown)
+            .await
+            .expect("runtime shutdown")
+            .expect("shutdown task");
     }
 }

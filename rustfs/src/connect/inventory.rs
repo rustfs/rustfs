@@ -349,7 +349,7 @@ impl InventoryStateStore {
 
     pub(crate) fn try_runtime_lock(&self) -> Result<fs::File, InventoryError> {
         let directory = parent(&self.path)?;
-        fs::create_dir_all(directory).map_err(|source| state_io(directory, source))?;
+        prepare_inventory_directory(directory)?;
         let name = filename(&self.path)?;
         let path = directory.join(format!(".{name}.lock"));
         let mut options = fs::OpenOptions::new();
@@ -454,7 +454,7 @@ impl InventoryStateStore {
             source,
         })?;
         let directory = parent(&self.path)?;
-        fs::create_dir_all(directory).map_err(|source| state_io(directory, source))?;
+        prepare_inventory_directory(directory)?;
         let temp = stage(directory, &self.path, &bytes)?;
         let result = fs::rename(&temp, &self.path)
             .map_err(|source| state_io(&self.path, source))
@@ -482,6 +482,50 @@ fn filename(path: &Path) -> Result<&str, InventoryError> {
     path.file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| state_io(path, io::Error::new(io::ErrorKind::InvalidInput, "state filename is invalid")))
+}
+
+fn prepare_inventory_directory(directory: &Path) -> Result<(), InventoryError> {
+    prepare_inventory_directory_with(directory, create_inventory_directory, fsync_dir)
+}
+
+fn prepare_inventory_directory_with(
+    directory: &Path,
+    create: impl FnOnce(&Path) -> io::Result<()>,
+    mut sync: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<(), InventoryError> {
+    let root = parent(directory)?;
+    let root_metadata = fs::symlink_metadata(root).map_err(|source| state_io(root, source))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(state_io(
+            root,
+            io::Error::new(io::ErrorKind::InvalidInput, "inventory state root is not a directory"),
+        ));
+    }
+    match create(directory) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(directory).map_err(|source| state_io(directory, source))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(state_io(
+                    directory,
+                    io::Error::new(io::ErrorKind::InvalidInput, "inventory state path is not a directory"),
+                ));
+            }
+        }
+        Err(source) => return Err(state_io(directory, source)),
+    }
+    sync(directory).map_err(|source| state_io(directory, source))?;
+    sync(root).map_err(|source| state_io(root, source))
+}
+
+fn create_inventory_directory(directory: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(directory)
 }
 
 fn stage(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<PathBuf, InventoryError> {
@@ -605,5 +649,97 @@ pub enum InventoryError {
 impl From<TelemetryError> for InventoryError {
     fn from(error: TelemetryError) -> Self {
         Self::Telemetry(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[test]
+    fn inventory_directory_creation_is_synced_before_state_can_be_committed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).expect("state root");
+        let directory = root.join("inventory");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let create_events = events.clone();
+        let sync_events = events.clone();
+
+        prepare_inventory_directory_with(
+            &directory,
+            move |path| {
+                create_events.borrow_mut().push(format!("mkdir:{}", path.display()));
+                fs::create_dir(path)
+            },
+            move |path| {
+                sync_events.borrow_mut().push(format!("sync:{}", path.display()));
+                Ok(())
+            },
+        )
+        .expect("durable directory");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                format!("mkdir:{}", directory.display()),
+                format!("sync:{}", directory.display()),
+                format!("sync:{}", root.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn inventory_directory_sync_failure_prevents_state_commit_and_is_retried() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).expect("state root");
+        let directory = root.join("inventory");
+        let state = directory.join("state.json");
+        let error = prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+            if path == directory {
+                Err(io::Error::other("injected leaf sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("sync failure");
+        assert!(matches!(error, InventoryError::StateIo { path, .. } if path == directory));
+        assert!(!state.exists());
+
+        let error = prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+            if path == root {
+                Err(io::Error::other("injected parent sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("parent sync failure");
+        assert!(matches!(error, InventoryError::StateIo { path, .. } if path == root));
+        assert!(!state.exists());
+
+        let mut synced = Vec::new();
+        prepare_inventory_directory_with(&directory, fs::create_dir, |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .expect("retry must sync an already-created leaf");
+        assert_eq!(synced, [directory, root]);
+    }
+
+    #[test]
+    fn inventory_directory_requires_its_fixed_root_to_exist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("missing-root");
+        let directory = root.join("inventory");
+
+        assert!(matches!(
+            prepare_inventory_directory_with(&directory, fs::create_dir, |_| Ok(())),
+            Err(InventoryError::StateIo { path, .. }) if path == root
+        ));
+        assert!(!directory.exists());
     }
 }

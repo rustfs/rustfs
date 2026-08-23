@@ -201,42 +201,64 @@ fn inventory_disk_is_offline(disk: &rustfs_madmin::Disk) -> bool {
 
 fn inventory_capacity(info: &rustfs_madmin::StorageInfo) -> std::result::Result<(u64, u64), InventoryError> {
     let configured_data_widths = (!info.backend.standard_sc_data.is_empty()).then_some(info.backend.standard_sc_data.as_slice());
-    let capacity = aggregate_inventory_capacity(&info.disks, configured_data_widths)?;
-    if configured_data_widths.is_some() && capacity.is_none() {
-        return Ok(aggregate_inventory_capacity(&info.disks, None)?.unwrap_or_default());
-    }
-    Ok(capacity.unwrap_or_default())
+    aggregate_inventory_capacity(&info.disks, configured_data_widths)
 }
 
 fn aggregate_inventory_capacity(
     disks: &[rustfs_madmin::Disk],
     data_widths: Option<&[usize]>,
-) -> std::result::Result<Option<(u64, u64)>, InventoryError> {
+) -> std::result::Result<(u64, u64), InventoryError> {
     let mut seen = BTreeSet::new();
-    let mut total = 0_u64;
-    let mut free = 0_u64;
+    let mut indexed = Vec::with_capacity(disks.len());
     for disk in disks {
-        let (Ok(pool_index), Ok(set_index), Ok(disk_index)) = (
+        let key = match (
             usize::try_from(disk.pool_index),
             usize::try_from(disk.set_index),
             usize::try_from(disk.disk_index),
-        ) else {
-            continue;
+        ) {
+            (Ok(pool_index), Ok(set_index), Ok(disk_index)) => (pool_index, set_index, disk_index),
+            _ => {
+                return Err(InventoryError::SnapshotIncomplete {
+                    expected: disks.len(),
+                    observed: indexed.len(),
+                });
+            }
         };
-        let included = match data_widths {
-            Some(widths) => widths.get(pool_index).is_some_and(|width| *width > 0 && disk_index < *width),
+        if seen.insert(key) {
+            indexed.push((key, disk));
+        }
+    }
+
+    let usable_widths = data_widths.filter(|widths| {
+        indexed
+            .iter()
+            .all(|((pool_index, _, _), _)| widths.get(*pool_index).is_some_and(|width| *width > 0))
+    });
+    let mut total = 0_u64;
+    let mut free = 0_u64;
+    let mut included = 0;
+    for ((pool_index, _, disk_index), disk) in indexed {
+        let include = match usable_widths {
+            Some(widths) => disk_index < widths[pool_index],
             None => {
                 let state = disk.state.trim().to_ascii_lowercase();
                 !state.contains("offline") && !state.contains("not found")
             }
         };
-        if !included || !seen.insert((pool_index, set_index, disk_index)) {
+        if !include {
             continue;
         }
+        included += 1;
         total = total.checked_add(disk.total_space).ok_or(InventoryError::Capacity)?;
         free = free.checked_add(disk.available_space).ok_or(InventoryError::Capacity)?;
     }
-    Ok((!seen.is_empty()).then_some((total, free)))
+    if !disks.is_empty() && included == 0 {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: disks.len(),
+            observed: 0,
+        });
+    }
+    Ok((total, free))
 }
 
 #[cfg(test)]
@@ -387,5 +409,86 @@ mod tests {
             assert!(!encoded.contains(canary), "snapshot exposed {canary}");
             assert!(!logs.contains(canary), "logs exposed {canary}");
         }
+    }
+
+    #[test]
+    fn inventory_capacity_rejects_invalid_numeric_topology() {
+        let mut invalid = disk("ok", Some("online"), -1);
+        invalid.pool_index = -1;
+
+        assert!(matches!(
+            inventory_capacity(&info(vec![invalid])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 1,
+                observed: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn inventory_capacity_falls_back_to_unique_numeric_topology() {
+        let mut pool_zero = disk("ok", Some("online"), 0);
+        pool_zero.total_space = 100;
+        pool_zero.available_space = 40;
+        let mut pool_one = disk("ok", Some("online"), 0);
+        pool_one.pool_index = 1;
+        pool_one.set_index = 2;
+        pool_one.total_space = 200;
+        pool_one.available_space = 80;
+        let mut duplicate = pool_one.clone();
+        duplicate.total_space = 900;
+        duplicate.available_space = 800;
+
+        let empty_widths = rustfs_madmin::StorageInfo {
+            disks: vec![pool_zero.clone(), pool_one.clone(), duplicate.clone()],
+            ..Default::default()
+        };
+        assert_eq!(inventory_capacity(&empty_widths).expect("numeric fallback"), (300, 120));
+
+        let incomplete_widths = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                ..Default::default()
+            },
+            disks: vec![pool_zero, pool_one, duplicate],
+        };
+        assert_eq!(inventory_capacity(&incomplete_widths).expect("numeric fallback"), (300, 120));
+    }
+
+    #[test]
+    fn inventory_capacity_aggregates_multiple_pools_and_sets_once() {
+        let mut pool_zero_set_zero = disk("ok", Some("online"), 0);
+        pool_zero_set_zero.total_space = 100;
+        pool_zero_set_zero.available_space = 40;
+        let mut pool_zero_set_one = pool_zero_set_zero.clone();
+        pool_zero_set_one.set_index = 1;
+        let mut pool_one = pool_zero_set_zero.clone();
+        pool_one.pool_index = 1;
+        pool_one.total_space = 200;
+        pool_one.available_space = 80;
+        let duplicate = pool_one.clone();
+        let info = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1, 1],
+                ..Default::default()
+            },
+            disks: vec![pool_zero_set_zero, pool_zero_set_one, pool_one, duplicate],
+        };
+
+        assert_eq!(inventory_capacity(&info).expect("configured topology"), (400, 160));
+    }
+
+    #[test]
+    fn inventory_capacity_overflow_is_rejected() {
+        let mut first = disk("ok", Some("online"), 0);
+        first.total_space = u64::MAX;
+        let mut second = disk("ok", Some("online"), 1);
+        second.total_space = 1;
+        let info = rustfs_madmin::StorageInfo {
+            disks: vec![first, second],
+            ..Default::default()
+        };
+
+        assert!(matches!(inventory_capacity(&info), Err(InventoryError::Capacity)));
     }
 }

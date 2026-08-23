@@ -241,6 +241,9 @@ async fn server(pki: &TestPki, replies: Vec<Reply>) -> TestServer {
 
 fn config(temp: &tempfile::TempDir, pki: &TestPki, server: &TestServer) -> HeartbeatConfig {
     let (identity_store, credential_store) = pki.stores(temp);
+    if let Err(error) = fs::create_dir(temp.path().join("private-config-secret")) {
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "Connect state root");
+    }
     HeartbeatConfig {
         endpoint: server.endpoint.clone(),
         root_ca_pem: pki.root_pem.as_bytes().to_vec(),
