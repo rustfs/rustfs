@@ -241,7 +241,7 @@ env \
   RUSTFS_TEST_VAULT_FAILOVER_MARKER="$MARKER" \
   RUSTFS_TEST_VAULT_OLD_LEADER="$OLD_LEADER" \
   cargo test -p rustfs-kms --test vault_ha_failover_live \
-    vault_raft_leader_failure_preserves_kv2_and_transit_decrypts -- \
+    vault_raft_leader_failure_recovers_kv2_and_transit_decrypts -- \
     --ignored --nocapture --test-threads=1 &
 TEST_PID=$!
 

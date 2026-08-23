@@ -70,6 +70,8 @@ make pre-pr
 
 > For the full test-layer taxonomy (unit / ecstore black-box / e2e / s3s-e2e / S3 compatibility / chaos / fuzz / bench), each layer's entry command, the naming conventions the migration gate depends on, and the serial/nextest rules, see [docs/testing/README.md](docs/testing/README.md).
 
+> For the event, timeout, required-status, and local reproduction matrix, see [docs/testing/ci-gates.md](docs/testing/ci-gates.md).
+
 ### 🔒 Automated Pre-commit Hooks
 #### What `make pre-commit` and `make pre-pr` actually run
 
