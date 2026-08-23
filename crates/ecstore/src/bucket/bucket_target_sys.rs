@@ -58,8 +58,8 @@ use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RU
 use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
-    is_rustfs_header, is_standard_header, is_storageclass_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING_LOWER, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header,
+    is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header,
 };
 use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
@@ -1774,6 +1774,22 @@ impl PutObjectOptions {
             Self::insert_checked(&mut header, AMZ_BUCKET_REPLICATION_STATUS, self.internal.replication_status.as_str());
         }
 
+        // MinIO PutObjectOptions.Header parity: object tags travel on the
+        // `x-amz-tagging` header (form-urlencoded). `replication_put_object_options`
+        // fills `user_tags` from the source version; without this header the
+        // whole-object transport delivered a tagless replica, so tag edits
+        // never reached the peer and the receiver-side LWW comparison
+        // (rustfs/backlog#1953) had nothing to judge.
+        if !self.user_tags.is_empty() {
+            let mut tags: Vec<(&String, &String)> = self.user_tags.iter().collect();
+            tags.sort();
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in tags {
+                encoded.append_pair(key, value);
+            }
+            Self::insert_checked(&mut header, AMZ_OBJECT_TAGGING_LOWER, &encoded.finish());
+        }
+
         for (k, v) in &self.user_metadata {
             let Ok(header_value) = HeaderValue::from_str(v) else {
                 warn!("skipping user metadata header with invalid value: {}", k);
@@ -3193,6 +3209,29 @@ mod tests {
                 "replication put requests must carry the {suffix} header"
             );
         }
+    }
+
+    #[test]
+    fn put_object_headers_carry_user_tags_on_x_amz_tagging() {
+        // rustfs/backlog#1953: tag edits replicate through the whole-object
+        // transport, so the source tags must travel on x-amz-tagging.
+        let mut opts = PutObjectOptions::default();
+        opts.user_tags.insert("owner".to_string(), "site a".to_string());
+        opts.user_tags.insert("env".to_string(), "prod".to_string());
+
+        let header = opts.header();
+        let tagging = header
+            .get(AMZ_OBJECT_TAGGING_LOWER)
+            .expect("user tags must be transported on x-amz-tagging")
+            .to_str()
+            .expect("tag header must be ASCII");
+        // Deterministic key order; values are form-urlencoded.
+        assert_eq!(tagging, "env=prod&owner=site+a");
+
+        assert!(
+            PutObjectOptions::default().header().get(AMZ_OBJECT_TAGGING_LOWER).is_none(),
+            "a tagless source must not send an empty x-amz-tagging header"
+        );
     }
 
     #[test]
