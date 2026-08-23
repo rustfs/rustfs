@@ -117,13 +117,13 @@ async fn pause_duplicate_admission_after_active_lock(request_id: &str) {
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MrfRepairNoticeTarget {
-    bucket: Arc<str>,
-    object: Arc<str>,
-    version_id: Option<[u8; 16]>,
-    kind: rustfs_common::mrf_channel::MrfKind,
-    scope: Option<rustfs_common::mrf_channel::MrfScope>,
-    lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
+pub(super) struct MrfRepairNoticeTarget {
+    pub(super) bucket: Arc<str>,
+    pub(super) object: Arc<str>,
+    pub(super) version_id: Option<[u8; 16]>,
+    pub(super) kind: rustfs_common::mrf_channel::MrfKind,
+    pub(super) scope: Option<rustfs_common::mrf_channel::MrfScope>,
+    pub(super) lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -1400,33 +1400,27 @@ impl HealManager {
             HealType::ECDecode { .. } => rustfs_common::mrf_channel::MrfKind::DecodeFailure,
             _ => rustfs_common::mrf_channel::MrfKind::PartialWrite,
         };
-        self.submit_mrf_heal_request_with_receipt_and_identity(request, bucket, object, version_id, kind, None, None)
-            .await
+        self.submit_mrf_heal_request_with_receipt_and_identity(
+            request,
+            MrfRepairNoticeTarget {
+                bucket,
+                object,
+                version_id,
+                kind,
+                scope: None,
+                lease: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn submit_mrf_heal_request_with_receipt_and_identity(
         &self,
         request: HealRequest,
-        bucket: Arc<str>,
-        object: Arc<str>,
-        version_id: Option<[u8; 16]>,
-        kind: rustfs_common::mrf_channel::MrfKind,
-        scope: Option<rustfs_common::mrf_channel::MrfScope>,
-        lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
+        mrf_notice_target: MrfRepairNoticeTarget,
     ) -> Result<HealAdmissionReceipt> {
-        self.submit_heal_request_with_receipt_alias_and_mrf_notice(
-            request,
-            true,
-            Some(MrfRepairNoticeTarget {
-                bucket,
-                object,
-                version_id,
-                kind,
-                scope,
-                lease,
-            }),
-        )
-        .await
+        self.submit_heal_request_with_receipt_alias_and_mrf_notice(request, true, Some(mrf_notice_target))
+            .await
     }
 
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
