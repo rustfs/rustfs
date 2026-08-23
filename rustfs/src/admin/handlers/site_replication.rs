@@ -32,8 +32,8 @@ use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
-    assign_site_replication_rule_priorities, merge_incoming_replication_config, replication_target_arn_deployment_id,
-    site_replication_rule_deployment_id,
+    assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
+    replication_target_arn_deployment_id, site_replication_rule_deployment_id,
 };
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
@@ -1140,15 +1140,18 @@ pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<Ha
     if !state.enabled() {
         return Ok(HashSet::new());
     }
-    let local_peer = current_local_runtime_peer(&state);
-    Ok(state
+    Ok(remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state)))
+}
+
+fn remote_peer_deployment_ids(state: &SiteReplicationState, local_peer: &PeerInfo) -> HashSet<String> {
+    state
         .peers
         .values()
         .filter(|peer| {
             peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
         })
         .map(|peer| peer.deployment_id.clone())
-        .collect())
+        .collect()
 }
 
 /// Deployment ids of every site in the cluster, this one included: the set
@@ -8370,12 +8373,13 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
     // write and this pass agree byte for byte.
     assign_site_replication_rule_priorities(&mut rules, is_derived_site_replication_rule);
 
-    // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
+    // Only a `role` naming a current peer is ours to drop — an operator-authored role is
     // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
     // quietly rewrite it. Same rule as `merge_incoming_replication_config`.
-    let role = match replication_target_arn_deployment_id(&existing_role) {
-        Some(_) => String::new(),
-        None => existing_role.clone(),
+    let role = if is_site_replication_role(&existing_role, &remote_peer_deployment_ids(state, local_peer)) {
+        String::new()
+    } else {
+        existing_role.clone()
     };
 
     if rules == existing_rules && role == existing_role {
@@ -16635,26 +16639,26 @@ mod tests {
     }
 
     // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
-    // drop only a sender-owned site-replication ARN, never an operator's own role — the same
-    // rule the merge path applies, so both paths agree on what is ours to rewrite.
+    // drop only a role naming a current peer, never an operator's own role — an IAM role or
+    // a remote target whose ARN carries an empty region — the same rule the merge path
+    // applies, so both paths agree on what is ours to rewrite.
     #[test]
-    fn test_replication_role_is_only_cleared_when_it_is_a_site_replication_arn() {
-        let operator_role = "arn:aws:iam::123456789012:role/replication";
-        assert!(
-            replication_target_arn_deployment_id(operator_role).is_none(),
-            "an operator IAM role is not a site-replication ARN and must be preserved"
-        );
-        assert_eq!(
-            replication_target_arn_deployment_id("arn:rustfs:replication::home:photos").as_deref(),
-            Some("home"),
-            "a site-replication ARN is sender-owned and gets cleared"
-        );
+    fn test_replication_role_is_only_cleared_when_it_names_a_peer() {
+        let sites = home_office();
+        assert!(!is_site_replication_role("arn:aws:iam::123456789012:role/replication", &sites));
+        assert!(!is_site_replication_role("arn:minio:replication::operator-dep:photos", &sites));
+        assert!(is_site_replication_role("arn:rustfs:replication::home:photos", &sites));
 
-        let mut incoming = site_repl_config("home");
-        incoming.role = operator_role.to_string();
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &home_office())
-            .expect("merge should produce rules");
-        assert_eq!(merged.role, operator_role, "operator role must survive the merge");
+        for operator_role in [
+            "arn:aws:iam::123456789012:role/replication",
+            "arn:minio:replication::operator-dep:photos",
+        ] {
+            let mut incoming = site_repl_config("home");
+            incoming.role = operator_role.to_string();
+            let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &sites)
+                .expect("merge should produce rules");
+            assert_eq!(merged.role, operator_role, "operator role must survive the merge");
+        }
     }
 
     // Rules and targets are keyed off the same ARN. Minting a fresh one while

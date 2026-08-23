@@ -318,6 +318,16 @@ pub fn is_reconciler_owned_site_replication_rule(rule: &ReplicationRule, peer_de
     site_replication_rule_deployment_id(rule).is_some_and(|deployment_id| peer_deployment_ids.contains(deployment_id))
 }
 
+/// Whether a config's `Role` is a site-replication ARN naming a site in
+/// `deployment_ids`. Such a role is the holder's identity, not policy: the
+/// reconciler's per-peer target lookup reads it, so carrying it across sites
+/// would pin the receiver's targets to the sender's. Any other role — an IAM
+/// role, or an operator remote target whose ARN happens to carry an empty
+/// region — passed target validation and drives target selection.
+pub fn is_site_replication_role(role: &str, deployment_ids: &HashSet<String>) -> bool {
+    replication_target_arn_deployment_id(role).is_some_and(|deployment_id| deployment_ids.contains(&deployment_id))
+}
+
 /// Merge a peer's replication config into the local one.
 ///
 /// Reconciler-derived rules encode the *holder's* outbound direction — their
@@ -337,7 +347,7 @@ pub fn merge_incoming_replication_config(
     local: Option<ReplicationConfiguration>,
     site_deployment_ids: &HashSet<String>,
 ) -> Option<ReplicationConfiguration> {
-    merge_replication_config_keeping_site_rules(incoming, local, |rule| {
+    merge_replication_config_keeping_site_rules(incoming, local, site_deployment_ids, |rule| {
         is_reconciler_owned_site_replication_rule(rule, site_deployment_ids)
     })
 }
@@ -364,7 +374,7 @@ pub fn merge_user_replication_config(
         });
         config
     });
-    merge_replication_config_keeping_site_rules(incoming, local, |rule| {
+    merge_replication_config_keeping_site_rules(incoming, local, peer_deployment_ids, |rule| {
         is_reconciler_owned_site_replication_rule(rule, peer_deployment_ids)
     })
 }
@@ -372,6 +382,7 @@ pub fn merge_user_replication_config(
 fn merge_replication_config_keeping_site_rules(
     incoming: Option<ReplicationConfiguration>,
     local: Option<ReplicationConfiguration>,
+    deployment_ids: &HashSet<String>,
     is_site_rule: impl Fn(&ReplicationRule) -> bool,
 ) -> Option<ReplicationConfiguration> {
     let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
@@ -391,12 +402,10 @@ fn merge_replication_config_keeping_site_rules(
 
     assign_site_replication_rule_priorities(&mut rules, &is_site_rule);
 
-    // A site-replication ARN in `role` is the sender's, and the reconciler's
-    // per-peer target lookup reads it — carrying it over would pin the
-    // receiver's targets to the sender's identity.
-    let role = match replication_target_arn_deployment_id(&incoming_role) {
-        Some(_) => String::new(),
-        None => incoming_role,
+    let role = if is_site_replication_role(&incoming_role, deployment_ids) {
+        String::new()
+    } else {
+        incoming_role
     };
 
     Some(ReplicationConfiguration { role, rules })
@@ -1836,5 +1845,41 @@ mod tests {
             operator_rule_ids(&a_merged),
             "both sites must persist the same operator rules"
         );
+    }
+
+    // Issue #1948 review: `Role` is only the sender's when it names a
+    // current site-replication peer; an owner-submitted role target has
+    // already passed target validation and drives target selection.
+    #[test]
+    fn merge_keeps_operator_role_target_for_target_selection() {
+        let role = "arn:minio:replication::operator-dep:bucket";
+        let peers = HashSet::from(["peer-dep".to_string()]);
+        let incoming = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![delete_marker_rule("nightly", role, "", 1, true)],
+        };
+        let local = structure_config(vec![replication_rule(
+            "site-repl-peer-dep",
+            "arn:rustfs:replication::peer-dep:bucket",
+        )]);
+        let opts = ObjectOpts {
+            name: "logs/app.log".to_string(),
+            ..Default::default()
+        };
+
+        let merged = merge_user_replication_config(Some(incoming.clone()), Some(local.clone()), &peers).expect("rules");
+        assert_eq!(merged.role, role);
+        assert_eq!(replication_target_arns(&merged), HashSet::from([role.to_string()]));
+        assert_eq!(merged.filter_target_arns(&opts), vec![role.to_string()]);
+
+        let ingested = merge_incoming_replication_config(Some(incoming.clone()), Some(local.clone()), &peers).expect("rules");
+        assert_eq!(ingested.role, role);
+        assert_eq!(ingested.filter_target_arns(&opts), vec![role.to_string()]);
+
+        // A role naming a current peer is the sender's identity and still goes.
+        let mut derived_role = incoming;
+        derived_role.role = "arn:rustfs:replication::peer-dep:bucket".to_string();
+        let merged = merge_user_replication_config(Some(derived_role), Some(local), &peers).expect("rules");
+        assert!(merged.role.is_empty());
     }
 }

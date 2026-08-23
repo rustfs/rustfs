@@ -443,8 +443,8 @@ pub(crate) mod replication {
     pub(crate) use super::ecstore_bucket::replication::{
         REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
         REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
-        assign_site_replication_rule_priorities, merge_incoming_replication_config, replication_target_arn_deployment_id,
-        site_replication_rule_deployment_id,
+        assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
+        replication_target_arn_deployment_id, site_replication_rule_deployment_id,
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
