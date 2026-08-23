@@ -514,13 +514,15 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
     }
 }
 
-fn notify_bucket_metadata_reload(
+async fn notify_bucket_metadata_reload(
     bucket: String,
     operation: &'static str,
     request_context: Option<request_context::RequestContext>,
     scanner_maintenance_change: bool,
 ) {
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
+    // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     spawn_background_with_context(request_context, async move {
         if let Some(notification_sys) = current_notification_system() {
             let result = if scanner_maintenance_change {
@@ -532,7 +534,9 @@ fn notify_bucket_metadata_reload(
                 warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
             }
         }
+        let _ = completed_tx.send(());
     });
+    let _ = completed_rx.await;
 }
 
 fn record_local_scanner_maintenance_reload(bucket: &str, scanner_maintenance_change: bool) {
@@ -1522,7 +1526,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1554,7 +1558,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1586,7 +1590,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1618,7 +1622,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "policy");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1697,7 +1701,7 @@ impl DefaultBucketUsecase {
         }
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1722,7 +1726,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false).await;
 
         let item = sr_bucket_meta_item(bucket.clone(), "tags");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1755,7 +1759,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context, false).await;
 
         Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
@@ -2210,7 +2214,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         item.sse_config = Some(
@@ -2289,7 +2293,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
@@ -2374,7 +2378,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false).await;
 
         let region = resolve_notification_region(self.global_region(), request_region);
         let notify = current_notify_interface_for_context(self.context.as_deref());
@@ -2479,7 +2483,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
         item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
@@ -2514,7 +2518,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
@@ -2569,7 +2573,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         item.replication_config = Some(
@@ -2609,7 +2613,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context, false).await;
 
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
@@ -2638,7 +2642,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
         item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
@@ -2671,7 +2675,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false).await;
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
         item.versioning = Some(
@@ -3122,7 +3126,7 @@ mod tests {
                 "{method} should identify the bucket metadata operation in reload logs"
             );
             let expected_reload = format!(
-                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change});"
+                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change}).await;"
             );
             assert!(
                 body.contains(&expected_reload),
