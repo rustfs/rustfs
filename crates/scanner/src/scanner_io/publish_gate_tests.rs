@@ -111,6 +111,160 @@ fn completed_data_usage_info_for_test(
     completed_data_usage_info(results, &expected_sources, all_buckets, &[], true, budget_elapsed, cancelled)
 }
 
+fn lkg_root_cache(bucket: &str, objects: usize, source: DataUsageCacheSource) -> DataUsageCache {
+    let mut cache = completed_root_cache(bucket, objects, 10, source);
+    cache.info.snapshot_complete = false;
+    cache.info.next_cycle = 8;
+    cache.info.leader_epoch = 3;
+    cache.info.lkg_snapshot_complete = true;
+    cache.info.lkg_next_cycle = Some(7);
+    cache.info.lkg_last_update = cache.info.last_update;
+    cache.info.lkg_leader_epoch = Some(3);
+    cache.info.lkg_scan_plan_digest = Some(TEST_PLAN_DIGEST);
+    cache
+}
+
+#[test]
+fn partial_usage_is_observational_not_authoritative_for_quota() {
+    let all_buckets = vec!["bucket".to_string()];
+    let current_source = DataUsageCacheSource::new(0, 0);
+    let stalled_source = DataUsageCacheSource::new(1, 0);
+    let mut current = completed_root_cache("bucket", 2, 20, current_source);
+    current.info.next_cycle = 8;
+    current.info.leader_epoch = 3;
+    let stalled = lkg_root_cache("bucket", 1, stalled_source);
+    let expected = HashSet::from([current_source, stalled_source]);
+
+    assert!(
+        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false).is_none()
+    );
+    let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("a completed set should produce an observational view");
+    assert!(observed.usage_snapshot_partial);
+    assert!(!observed.usage_snapshot_complete);
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
+    assert_eq!(observed.usage_snapshot_set_states.len(), 2);
+}
+
+#[test]
+fn lkg_scope_does_not_count_as_current_cycle_completion() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut lkg = lkg_root_cache("bucket", 1, source);
+    lkg.info.last_update = None;
+    let expected = HashSet::from([source]);
+    assert!(!scanner_results_form_complete_snapshot(&[lkg], &expected));
+}
+
+#[test]
+fn stale_quota_uses_complete_baseline_plus_positive_deltas() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut current = completed_root_cache("bucket", 3, 20, source);
+    current.info.next_cycle = 8;
+    current.info.leader_epoch = 3;
+    let expected = HashSet::from([source]);
+    let (observed, _) = observational_data_usage_info(&[current], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("complete set data is a valid observational baseline");
+    assert_eq!(observed.objects_total_size, 30);
+    assert_eq!(observed.usage_snapshot_set_states[0].complete, true);
+}
+
+#[test]
+fn negative_delta_waits_for_set_reconciliation() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut stalled = lkg_root_cache("bucket", 4, source);
+    stalled.info.lkg_scan_plan_digest = Some(DataUsageScanPlanDigest([9; 32]));
+    let expected = HashSet::from([source]);
+    assert!(observational_data_usage_info(&[stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3).is_none());
+}
+
+#[test]
+fn set_membership_add_remove_uses_generation_and_tombstone() {
+    let state = DataUsageSnapshotSetState {
+        pool_index: 1,
+        set_index: 2,
+        scanner_cycle: Some(9),
+        scanner_epoch: Some(4),
+        scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
+        complete: false,
+        tombstone: true,
+    };
+    let encoded = serde_json::to_vec(&state).expect("set state should serialize");
+    let decoded: DataUsageSnapshotSetState = serde_json::from_slice(&encoded).expect("set state should deserialize");
+    assert_eq!(decoded, state);
+
+    let snapshot = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        scanner_cycle: Some(9),
+        scanner_epoch: Some(4),
+        buckets_count: 0,
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_partial: true,
+        usage_snapshot_set_states: vec![
+            DataUsageSnapshotSetState {
+                pool_index: 0,
+                set_index: 0,
+                scanner_cycle: Some(9),
+                scanner_epoch: Some(4),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
+                complete: true,
+                tombstone: false,
+            },
+            state,
+        ],
+        ..Default::default()
+    };
+    assert!(snapshot.is_valid_partial_snapshot());
+}
+
+#[test]
+fn old_set_completion_cannot_overwrite_new_aggregate() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut old = completed_root_cache("bucket", 1, 20, source);
+    old.info.next_cycle = 7;
+    old.info.leader_epoch = 2;
+    let expected = HashSet::from([source]);
+    assert!(observational_data_usage_info(&[old], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3).is_none());
+}
+
+#[test]
+fn usage_aggregate_survives_restart_and_leader_failover() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut lkg = lkg_root_cache("bucket", 5, source);
+    lkg.info.lkg_leader_epoch = Some(4);
+    lkg.info.lkg_next_cycle = Some(9);
+    let expected = HashSet::from([source]);
+    let (observed, _) = observational_data_usage_info(&[lkg], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 10, 5)
+        .expect("compatible LKG should survive a leader change");
+    assert_eq!(observed.usage_snapshot_set_states[0].scanner_epoch, Some(4));
+    assert_eq!(observed.objects_total_size, 50);
+}
+
+#[test]
+fn usage_aggregate_cost_is_linear_in_set_count() {
+    let all_buckets = vec!["bucket".to_string()];
+    let mut results = Vec::new();
+    let mut expected = HashSet::new();
+    for index in 0..32 {
+        let source = DataUsageCacheSource::new(index, 0);
+        expected.insert(source);
+        let mut cache = completed_root_cache("bucket", 1, 20, source);
+        cache.info.next_cycle = 8;
+        cache.info.leader_epoch = 3;
+        results.push(cache);
+    }
+    let (observed, _) = observational_data_usage_info(&results, &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("all set snapshots should aggregate");
+    assert_eq!(observed.objects_total_count, 32);
+    let reversed = results.iter().rev().cloned().collect::<Vec<_>>();
+    let (reversed_observed, _) = observational_data_usage_info(&reversed, &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("reordered set snapshots should aggregate");
+    assert_eq!(observed.usage_snapshot_set_states, reversed_observed.usage_snapshot_set_states);
+}
+
 #[test]
 fn completed_data_usage_info_publishes_tier_stats_across_sets() {
     let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];

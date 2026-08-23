@@ -431,6 +431,12 @@ pub struct SRBucketMeta {
     pub cors: Option<String>,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Set by a sender that merges replication configs under the derived
+    /// site-rule contract (operator rule priorities verbatim, `site-repl-*`
+    /// ids classified by id/ARN). A receiver merges a payload without it the
+    /// pre-contract way; a pre-contract receiver ignores the field.
+    #[serde(rename = "derivedRuleContract", default, skip_serializing_if = "std::ops::Not::not")]
+    pub derived_rule_contract: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

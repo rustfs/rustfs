@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::super::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
 use super::replacement::{ReplacementPhase, ReplacementRecoveryRecord};
 use super::{
-    EVENT_HEAL_RESUME_STATE, LOG_COMPONENT_HEAL, LOG_SUBSYSTEM_RESUME, REPLACEMENT_COMPLETION_PROOF_FILE,
+    CheckpointManager, EVENT_HEAL_RESUME_STATE, LOG_COMPONENT_HEAL, LOG_SUBSYSTEM_RESUME, REPLACEMENT_COMPLETION_PROOF_FILE,
     REPLACEMENT_INTENT_FILE, RESUME_STATE_FILE, ResumeManager, ResumeStateFile, is_replacement_intent, path_to_str,
     replacement_recovery_corruption_for_state_load, replacement_recovery_dir, validate_resume_task_id,
 };
@@ -67,6 +67,7 @@ impl ResumeUtils {
                 // Extract task ID from filename: {task_id}_ahm_resume_state.json
                 if let Some(task_id) = entry.strip_suffix(&format!("_{RESUME_STATE_FILE}"))
                     && validate_resume_task_id(task_id).is_ok()
+                    && CheckpointManager::is_resumable(disk, task_id).await?
                 {
                     task_ids.push(task_id.to_string());
                 }

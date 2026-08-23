@@ -406,6 +406,25 @@ where
     Ok(data)
 }
 
+pub(crate) async fn read_config_limited_preserve_empty<S>(api: Arc<S>, file: &str, max_bytes: usize) -> Result<Vec<u8>>
+where
+    S: EcstoreObjectIO,
+{
+    let (data, _obj) = read_config_limited_preserve_empty_with_metadata(api, file, max_bytes).await?;
+    Ok(data)
+}
+
+pub(crate) async fn read_config_limited_preserve_empty_with_metadata<S>(
+    api: Arc<S>,
+    file: &str,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: EcstoreObjectIO,
+{
+    read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true, Some(max_bytes)).await
+}
+
 /// Read an existing config object without treating an empty payload as absent.
 /// Callers that validate their own payload format need to distinguish corruption
 /// from `ConfigNotFound`.

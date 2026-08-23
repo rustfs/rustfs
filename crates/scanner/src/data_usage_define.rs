@@ -28,9 +28,10 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
-    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
-    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
-    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSnapshotSetState, LEGACY_DATA_USAGE_OBJECT_NAME,
+    PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierAccountingProof, TierStats,
+    UNKNOWN_TIER, UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path,
+    prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -408,6 +409,18 @@ pub struct DataUsageCacheInfo {
     /// process-local audit data; older cache writers omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_registry_generation: Option<u64>,
+    /// Whether the entries retained while a set scan was incomplete come
+    /// from a prior complete set snapshot.  This is observational input only.
+    #[serde(default)]
+    pub lkg_snapshot_complete: bool,
+    #[serde(default)]
+    pub lkg_next_cycle: Option<u64>,
+    #[serde(default)]
+    pub lkg_last_update: Option<SystemTime>,
+    #[serde(default)]
+    pub lkg_leader_epoch: Option<u64>,
+    #[serde(default)]
+    pub lkg_scan_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -417,7 +430,7 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let field_count = 16 + usize::from(self.tier_registry_generation.is_some());
+        let field_count = 21 + usize::from(self.tier_registry_generation.is_some());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -438,6 +451,11 @@ impl Serialize for DataUsageCacheInfo {
         if let Some(generation) = self.tier_registry_generation {
             state.serialize_entry("tier_registry_generation", &generation)?;
         }
+        state.serialize_entry("lkg_snapshot_complete", &self.lkg_snapshot_complete)?;
+        state.serialize_entry("lkg_next_cycle", &self.lkg_next_cycle)?;
+        state.serialize_entry("lkg_last_update", &self.lkg_last_update)?;
+        state.serialize_entry("lkg_leader_epoch", &self.lkg_leader_epoch)?;
+        state.serialize_entry("lkg_scan_plan_digest", &self.lkg_scan_plan_digest)?;
         state.end()
     }
 }

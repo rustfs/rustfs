@@ -28,10 +28,12 @@ use super::{
 };
 
 mod checkpoint;
+mod gc;
 mod replacement;
 mod utils;
 
 pub use checkpoint::{CheckpointManager, ResumeCheckpoint};
+pub(crate) use gc::ResumeGc;
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
@@ -51,6 +53,7 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const REPLACEMENT_INTENT_FILE: &str = "ahm_replacement_intent.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
+pub(super) const RESUME_CHECKPOINT_BLOCKED_FILE: &str = "ahm_checkpoint.blocked";
 const REPLACEMENT_COMPLETION_PROOF_FILE: &str = "ahm_replacement_completion_proof.json";
 const REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 const REPLACEMENT_INTENT_SEAL_FILE: &str = "ahm_replacement_intent_seal";

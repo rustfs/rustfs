@@ -85,6 +85,7 @@ const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
 const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+const BUCKET_METADATA_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error for a peer that reported `success = false` without an `error_info` payload.
 ///
@@ -1328,27 +1329,38 @@ impl PeerRestClient {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
-        self.finalize_result(
-            async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(LoadBucketMetadataRequest {
-                    bucket: bucket.to_string(),
-                    scanner_maintenance_change,
-                });
-                set_tonic_mutation_body_digest(&mut request)?;
-
-                let response = client.load_bucket_metadata(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
-                }
-                Ok(())
+        let result = tokio::time::timeout(BUCKET_METADATA_RELOAD_TIMEOUT, async {
+            let result = self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;
+            if let Err(err) = &result
+                && Self::is_network_like_error(err)
+            {
+                self.prepare_retry().await;
+                return self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;
             }
-            .await,
-        )
+            result
+        })
         .await
+        .unwrap_or_else(|_| Err(Error::other(format!("load_bucket_metadata({bucket}) timed out"))));
+        self.finalize_result(result).await
+    }
+
+    async fn load_bucket_metadata_once(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
+        let mut client = self.get_client().await?;
+        let mut request = Request::new(LoadBucketMetadataRequest {
+            bucket: bucket.to_string(),
+            scanner_maintenance_change,
+        });
+        set_tonic_mutation_body_digest(&mut request)?;
+        request.set_timeout(BUCKET_METADATA_RELOAD_TIMEOUT);
+
+        let response = client.load_bucket_metadata(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
+        }
+        Ok(())
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {
