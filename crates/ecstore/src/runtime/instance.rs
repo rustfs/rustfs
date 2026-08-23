@@ -52,7 +52,10 @@ use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -160,10 +163,14 @@ pub struct InstanceContext {
     /// workers (scanner/heal/tier/lifecycle) without touching another instance.
     /// Replaces the process-global cancel-token static.
     background_cancel_token: OnceLock<CancellationToken>,
-    /// Serializes decommission data-movement operations with cancellation and
-    /// a subsequent restart. Readers are held across one object side effect;
-    /// the transition path takes the writer after cancelling the routine.
-    decommission_operation_gate: Arc<RwLock<()>>,
+    /// Serializes data-movement transitions with scanner publication commits.
+    /// Readers are held across one publication commit; movement transitions
+    /// take the writer at their durable state commit boundary.
+    data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Monotonic admission epoch paired with the operation gate. A
+    /// publication admitted before a movement transition must never be
+    /// mistaken for one admitted after the transition.
+    data_movement_operation_epoch: AtomicU64,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
@@ -204,7 +211,8 @@ impl InstanceContext {
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
-            decommission_operation_gate: Arc::new(RwLock::new(())),
+            data_movement_operation_gate: Arc::new(RwLock::new(())),
+            data_movement_operation_epoch: AtomicU64::new(0),
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -223,8 +231,18 @@ impl InstanceContext {
         self.lock_manager.clone()
     }
 
-    pub(crate) fn decommission_operation_gate(&self) -> Arc<RwLock<()>> {
-        Arc::clone(&self.decommission_operation_gate)
+    pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.data_movement_operation_gate)
+    }
+
+    pub(crate) fn data_movement_operation_epoch(&self) -> u64 {
+        self.data_movement_operation_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn advance_data_movement_operation_epoch(&self) -> u64 {
+        self.data_movement_operation_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)))
+            .unwrap_or_else(|epoch| epoch)
     }
 
     /// Install the application-owned object-encryption resolver once.

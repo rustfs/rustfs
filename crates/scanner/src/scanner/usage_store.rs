@@ -328,6 +328,10 @@ where
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
 
+            let Some(publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            };
+            let _admission_epoch = publication_admission.epoch();
             let done_save = Metrics::time(Metric::SaveUsage);
             let save_result = save_config_shared_with_preconditions(
                 storeapi.clone(),
@@ -338,6 +342,7 @@ where
             )
             .await;
             done_save();
+            drop(publication_admission);
 
             match save_result {
                 Ok(object_info) => {
@@ -494,6 +499,9 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     authoritative: &DataUsageInfo,
 ) {
+    let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+        return;
+    };
     let (observed_data, revision) =
         match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
             Ok((Some(data), revision)) => (data, revision),

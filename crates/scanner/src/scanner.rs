@@ -383,7 +383,7 @@ fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
 
 async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> Result<(), EcstoreError> {
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
@@ -402,6 +402,9 @@ async fn sync_data_usage_backup_from_primary(
             return Ok(());
         }
 
+        let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+            return Err(EcstoreError::other("data usage publication is blocked by data movement"));
+        };
         let sha256hex = Some(hex_simd::encode_to_string(Sha256::digest(&primary), hex_simd::AsciiCase::Lower));
         let save_result = save_config_shared_with_preconditions(
             storeapi.clone(),

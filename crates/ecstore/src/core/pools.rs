@@ -1056,16 +1056,17 @@ fn should_replace_pool_status_for_status_refresh(
     !has_active_worker && persisted.last_update > current.last_update
 }
 
-fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) {
+fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) -> bool {
     if persisted.pools.is_empty() {
-        return;
+        return false;
     }
 
     if current.pools.is_empty() {
         *current = persisted;
-        return;
+        return true;
     }
 
+    let mut changed = false;
     for (idx, persisted_pool) in persisted.pools.into_iter().enumerate() {
         if persisted_pool.id != idx {
             continue;
@@ -1075,11 +1076,15 @@ fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active
         if idx < current.pools.len() {
             if should_replace_pool_status_for_status_refresh(current.pools.get(idx), &persisted_pool, has_active_worker) {
                 current.pools[idx] = persisted_pool;
+                changed = true;
             }
         } else if idx == current.pools.len() && !has_active_worker {
             current.pools.push(persisted_pool);
+            changed = true;
         }
     }
+
+    changed
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -2972,8 +2977,12 @@ impl ECStore {
                 .collect::<Vec<_>>()
         };
 
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let mut pool_meta = self.pool_meta.write().await;
-        merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers);
+        if merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers) {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
         Ok(())
     }
 
@@ -3092,6 +3101,13 @@ impl ECStore {
     async fn decommission_cancel_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
         let _start_guard = self.start_gate.lock().await;
+        if let Some(owner) = owner {
+            owner.cancel();
+        } else if let Some(canceler) = self.decommission_cancelers.read().await.get(idx).and_then(Option::as_ref) {
+            canceler.cancel();
+        }
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         // Lock order: decommission_cancelers before pool_meta. Holding both makes
         // owner validation and the terminal transition one atomic operation.
@@ -3150,8 +3166,6 @@ impl ECStore {
             );
         }
 
-        self.wait_for_decommission_side_effects().await;
-
         if should_save_pool_meta && let Err(err) = self.save_current_pool_meta().await {
             if let Some(previous_pool_meta) = previous_pool_meta {
                 let mut pool_meta = self.pool_meta.write().await;
@@ -3167,6 +3181,10 @@ impl ECStore {
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
             resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+        }
+
+        if should_save_pool_meta {
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())
@@ -3191,7 +3209,9 @@ impl ECStore {
                 .unwrap_or((false, false, false, false));
             ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled)?;
         }
-        self.cancel_decommission_routines_and_wait(&[idx]).await;
+        self.cancel_decommission_routines(&[idx]).await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
@@ -3213,31 +3233,27 @@ impl ECStore {
             resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
 
+        if should_reload_pool_meta {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+
         Ok(())
     }
 
     async fn promote_queued_decommission(&self, idx: usize, owner: &DecommissionCanceler) -> Result<OffsetDateTime> {
         // Serialize promotion and generation capture with clear/restart transitions.
-        let (promoted, generation, save_error) = {
-            let _start_guard = self.start_gate.lock().await;
-            let mut pool_meta = self.pool_meta.write().await;
-            if pool_meta.pools.get(idx).is_none() {
-                return Err(Error::other("failed to start decommission: target pool was not found"));
-            }
-            let promoted = pool_meta.promote_queued_decommission(idx);
-            drop(pool_meta);
+        let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let movement_guard = movement_gate.write().await;
+        let mut pool_meta = self.pool_meta.write().await;
+        if pool_meta.pools.get(idx).is_none() {
+            return Err(Error::other("failed to start decommission: target pool was not found"));
+        }
+        let promoted = pool_meta.promote_queued_decommission(idx);
+        drop(pool_meta);
 
-            let save_error = if promoted {
-                self.save_current_pool_meta().await.err()
-            } else {
-                None
-            };
-
-            let generation = self.active_decommission_generation(idx).await?;
-            (promoted, generation, save_error)
-        };
-
-        if let Some(err) = save_error {
+        if promoted && let Err(err) = self.save_current_pool_meta().await {
+            drop(movement_guard);
             resolve_decommission_terminal_mark_after_error_result(
                 self.decommission_failed_for_operation(idx, owner).await,
                 idx,
@@ -3246,11 +3262,15 @@ impl ECStore {
             return Err(err);
         }
 
+        let generation = self.active_decommission_generation(idx).await?;
+        let mut movement_reload_succeeded = true;
         if promoted && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("promote_queued_decommission for pool {idx}");
             if let Err(err) =
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
             {
+                movement_reload_succeeded = false;
+                drop(movement_guard);
                 resolve_decommission_terminal_mark_after_error_result(
                     self.decommission_failed_for_operation(idx, owner).await,
                     idx,
@@ -3258,6 +3278,10 @@ impl ECStore {
                 )?;
                 return Err(err);
             }
+        }
+
+        if promoted && movement_reload_succeeded {
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(generation)
@@ -3305,17 +3329,21 @@ impl ECStore {
     }
 
     async fn cancel_decommission_routines_and_wait(&self, indices: &[usize]) {
+        self.cancel_decommission_routines(indices).await;
+        self.wait_for_decommission_side_effects().await;
+    }
+
+    async fn cancel_decommission_routines(&self, indices: &[usize]) {
         {
             let mut cancelers = self.decommission_cancelers.write().await;
             for idx in indices {
                 take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), *idx);
             }
         }
-        self.wait_for_decommission_side_effects().await;
     }
 
     async fn wait_for_decommission_side_effects(&self) {
-        let operation_gate = self.ctx.decommission_operation_gate();
+        let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.write().await;
     }
 
@@ -3808,7 +3836,7 @@ impl ECStore {
         }
         decommission_cancel_signal_result(rx.is_cancelled())?;
         self.ensure_decommission_generation_current(idx, generation).await?;
-        let operation_gate = self.ctx.decommission_operation_gate();
+        let operation_gate = self.ctx.data_movement_operation_gate();
 
         let bucket_incarnation_fence = match expected_bucket_incarnation_id {
             Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
@@ -4680,6 +4708,8 @@ impl ECStore {
     {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "mark decommission failed")?;
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         // Lock order: decommission_cancelers before pool_meta. Holding both makes
         // owner validation and the terminal transition one atomic operation.
@@ -4718,12 +4748,14 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
+        let mut movement_reload_succeeded = true;
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_failed for pool {idx}");
             if let Some(err) = observe_decommission_terminal_reload_result(
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
                 stage.as_str(),
             ) {
+                movement_reload_succeeded = false;
                 if let Err(record_err) = self
                     .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
                     .await
@@ -4751,6 +4783,10 @@ impl ECStore {
             }
         }
 
+        if should_reload_pool_meta && movement_reload_succeeded {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+
         Ok(())
     }
 
@@ -4766,6 +4802,8 @@ impl ECStore {
     async fn complete_decommission_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         // Lock order: decommission_cancelers before pool_meta. Holding both makes
         // owner validation and the terminal transition one atomic operation.
@@ -4804,12 +4842,14 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
+        let mut movement_reload_succeeded = true;
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("complete_decommission for pool {idx}");
             if let Some(err) = observe_decommission_terminal_reload_result(
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
                 stage.as_str(),
             ) {
+                movement_reload_succeeded = false;
                 if let Err(record_err) = self
                     .record_decommission_terminal_reload_failure(idx, stage.as_str(), err.clone())
                     .await
@@ -4835,6 +4875,10 @@ impl ECStore {
                     "Decommission terminal state saved but pool meta reload failed"
                 );
             }
+        }
+
+        if should_reload_pool_meta && movement_reload_succeeded {
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())
@@ -5023,7 +5067,9 @@ impl ECStore {
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
         let all_space_infos = self.get_decommission_all_pool_space_infos().await?;
-        self.cancel_decommission_routines_and_wait(&indices).await;
+        self.cancel_decommission_routines(&indices).await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         let index_cancelers = if let Some((rx, local_indices)) = reservation {
             // Lock order matches terminal transitions: decommission_cancelers
@@ -5112,6 +5158,8 @@ impl ECStore {
             );
             return Err(Error::other(format!("{err}; decommission start rollback succeeded")));
         }
+
+        self.ctx.advance_data_movement_operation_epoch();
 
         Ok(index_cancelers)
     }
@@ -6954,7 +7002,7 @@ mod pools_tests {
     #[tokio::test]
     async fn test_decommission_transition_waits_without_registered_canceler() {
         let store = decommission_worker_test_store(PoolMeta::default(), vec![None]);
-        let operation_gate = store.ctx.decommission_operation_gate();
+        let operation_gate = store.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read().await;
         let transition = tokio::spawn({
             let store = store.clone();

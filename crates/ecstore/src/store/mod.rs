@@ -44,7 +44,7 @@ use crate::error::{
 use crate::runtime::global::DISK_RESERVE_FRACTION;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
-use crate::services::rebalance::RebalanceMeta;
+use crate::services::rebalance::{RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -349,16 +349,61 @@ impl ECStore {
     /// remain suspended until an operator clears or retries them, so they are
     /// a publication barrier even after the worker has stopped.
     pub async fn scanner_data_usage_publication_blocked(&self) -> bool {
-        if self.scanner_data_movement_active().await {
-            return true;
-        }
+        self.scanner_data_usage_publication_snapshot_blocked().await
+    }
 
+    async fn scanner_data_usage_publication_snapshot_blocked(&self) -> bool {
+        let decommission_cancelers = self.decommission_cancelers.read().await;
+        let decommission_active = decommission_cancelers
+            .iter()
+            .any(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active));
         let pool_meta = self.pool_meta.read().await;
-        pool_meta.pools.iter().any(|pool| {
+        let decommission_active = decommission_active
+            || pool_meta.pools.iter().any(|pool| {
+                pool.decommission
+                    .as_ref()
+                    .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
+            });
+        let decommission_terminal = pool_meta.pools.iter().any(|pool| {
             pool.decommission
                 .as_ref()
                 .is_some_and(|info| !info.queued && (info.failed || info.canceled))
-        })
+        });
+        drop(pool_meta);
+
+        let rebalance_active = self
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(is_rebalance_conflicting_with_decommission);
+
+        decommission_active || decommission_terminal || rebalance_active
+    }
+
+    /// Admit one short data-usage publication commit under the same
+    /// per-instance gate used by decommission side effects and transitions.
+    /// The epoch is sampled while the read guard is held, so a transition
+    /// cannot cross this admission without waiting for the commit to finish.
+    pub async fn scanner_data_usage_publication_read_guard(&self) -> (tokio::sync::OwnedRwLockReadGuard<()>, u64) {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        let epoch = self.ctx.data_movement_operation_epoch();
+        (operation_guard, epoch)
+    }
+
+    /// Acquire the movement gate and inspect the movement owner once. The
+    /// state inspection is performed after acquiring the read guard so a
+    /// transition cannot update its durable state between the check and the
+    /// publication commit.
+    pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.scanner_data_usage_publication_snapshot_blocked().await {
+            return None;
+        }
+
+        Some((operation_guard, self.ctx.data_movement_operation_epoch()))
     }
 }
 
@@ -993,6 +1038,53 @@ mod tests {
                 "unexpected scanner publication barrier state for {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scanner_data_usage_publication_admission_is_fenced_and_epoch_monotonic() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let operation_gate = store.ctx.data_movement_operation_gate();
+        let movement_guard = operation_gate.write().await;
+        let pending = {
+            let store = store.clone();
+            tokio::spawn(async move { store.scanner_data_usage_publication_admission_guard().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished(), "publication admission must wait for a movement writer");
+        drop(movement_guard);
+
+        let (_, epoch) = pending
+            .await
+            .expect("publication admission task should not panic")
+            .expect("idle store should admit publication");
+        assert_eq!(epoch, 0);
+        assert_eq!(store.ctx.advance_data_movement_operation_epoch(), 1);
+        let (_, next_epoch) = store
+            .scanner_data_usage_publication_admission_guard()
+            .await
+            .expect("idle store should admit the next publication");
+        assert_eq!(next_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_data_usage_publication_admission_blocks_active_rebalance_snapshot() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            pool_stats: vec![crate::services::rebalance::RebalanceStats {
+                participating: true,
+                info: crate::services::rebalance::RebalanceInfo {
+                    status: crate::services::rebalance::RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(
+            store.scanner_data_usage_publication_admission_guard().await.is_none(),
+            "active rebalance must fail closed at the storage-owned admission boundary"
+        );
     }
 
     // The object graph is the isolation carrier: two ECStore instances holding

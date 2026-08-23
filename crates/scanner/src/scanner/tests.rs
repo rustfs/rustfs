@@ -2110,6 +2110,10 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
         revisions.remove(&key);
         Ok(ObjectInfo::default())
     }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+    }
 }
 
 #[test]

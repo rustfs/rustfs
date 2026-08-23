@@ -585,6 +585,38 @@ pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
         object: &str,
         opts: ScannerObjectOptions,
     ) -> EcstoreResult<ScannerObjectInfo>;
+
+    /// Acquire storage-owned admission for one short data-usage publication
+    /// commit. Implementations without a storage-owned movement owner fail
+    /// closed; test fixtures opt into the explicit unfenced helper.
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        None
+    }
+}
+
+pub struct ScannerDataUsagePublicationAdmission {
+    epoch: u64,
+    _read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl ScannerDataUsagePublicationAdmission {
+    pub(crate) fn unfenced() -> Self {
+        Self {
+            epoch: 0,
+            _read_guard: None,
+        }
+    }
+
+    fn fenced(read_guard: tokio::sync::OwnedRwLockReadGuard<()>, epoch: u64) -> Self {
+        Self {
+            epoch,
+            _read_guard: Some(read_guard),
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 #[async_trait::async_trait]
@@ -596,6 +628,11 @@ impl ScannerConfigObjectDelete for ECStore {
         opts: ScannerObjectOptions,
     ) -> EcstoreResult<ScannerObjectInfo> {
         ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
     }
 }
 
