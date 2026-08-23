@@ -1057,6 +1057,24 @@ impl ScannerIOCache for SetDisks {
                         continue;
                     }
 
+                    if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch_clone)
+                        .await
+                        .is_none()
+                    {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        error!(
+                            target: "rustfs::scanner::io",
+                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_IO,
+                            bucket = %bucket.name,
+                            cache_name = %cache_name,
+                            state = "publication_epoch_changed_after_save",
+                            "Scanner bucket cache root publish skipped after movement epoch change"
+                        );
+                        continue;
+                    }
+
                     debug!(
                         target: "rustfs::scanner::io",
                         event = EVENT_SCANNER_DATA_USAGE_STREAM,
