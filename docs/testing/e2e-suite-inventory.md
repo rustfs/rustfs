@@ -84,7 +84,7 @@
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 4 |  |
-| reliant | 25 | 19 ✅ |
+| reliant | 29 | 19 ✅ |
 | replication_extension_test | 75 | 20 ✅ +55 🌙 |
 | security_boundary_test | 4 |  |
 | server_startup_failfast_test | 1 |  |
