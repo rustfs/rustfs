@@ -327,7 +327,7 @@ impl ECStore {
     async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
         run_bucket_usage_cleanup(guard, bucket, async {
             crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
-            crate::data_usage::remove_bucket_usage_from_backend_with_guard(self, bucket, guard).await
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, guard).await
         })
         .await
     }
