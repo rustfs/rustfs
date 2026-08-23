@@ -182,24 +182,24 @@ fn prepare_state_directory_with_sync_and_missing_observer(
         validate_directory(directory, true)?;
     }
 
-    path.parent().ok_or_else(|| {
+    let state_parent = path.parent().ok_or_else(|| {
         RegistrationBootstrapError::Input(io::Error::new(io::ErrorKind::InvalidInput, "state directory has no parent"))
     })?;
 
     // Without a ready marker, an existing directory may be residue from an
     // interrupted or concurrent creation. Re-sync the complete leaf-up chain;
     // only the validated marker makes the zero-sync fast path safe.
-    let mut durability_directories = vec![store_directories[0].clone(), store_directories[1].clone(), path.clone()];
+    let mut durability_directories = vec![
+        store_directories[0].clone(),
+        store_directories[1].clone(),
+        path.clone(),
+        state_parent.to_path_buf(),
+    ];
     for created in directories_observed_missing.iter().rev() {
         for directory in [Some(created.as_path()), created.parent()].into_iter().flatten() {
             if !durability_directories.iter().any(|candidate| candidate == directory) {
                 durability_directories.push(directory.to_path_buf());
             }
-        }
-    }
-    for ancestor in path.ancestors().skip(1) {
-        if !durability_directories.iter().any(|candidate| candidate == ancestor) {
-            durability_directories.push(ancestor.to_path_buf());
         }
     }
     for directory in durability_directories {
@@ -482,15 +482,16 @@ mod tests {
 
         assert_eq!(prepared, state);
         let observed = observed.into_inner();
-        assert!(
-            observed.starts_with(&[
+        assert_eq!(
+            observed,
+            [
                 state.join("identity"),
                 state.join("credential"),
                 state,
                 ancestor,
                 temp.path().to_path_buf(),
-            ]),
-            "new state trees must sync every created directory and immediate parent leaf-up: {observed:?}"
+            ],
+            "new state trees must sync only created directories and immediate parents leaf-up"
         );
     }
 
@@ -557,15 +558,15 @@ mod tests {
         .expect("retry must repeat durability preparation");
 
         assert_eq!(prepared, state);
-        let retry = retry.into_inner();
-        assert!(
-            retry.starts_with(&[
+        assert_eq!(
+            retry.into_inner(),
+            [
                 state.join("identity"),
                 state.join("credential"),
                 state.clone(),
                 temp.path().to_path_buf(),
-            ]),
-            "an interrupted complete tree must resync its managed path before older ancestors: {retry:?}"
+            ],
+            "an interrupted complete tree must resync only its managed path and direct parent"
         );
         assert_eq!(fs::read(&ready).expect("read ready marker"), BOOTSTRAP_READY_CONTENTS);
 
@@ -639,9 +640,31 @@ mod tests {
                 Ok(())
             })
             .expect("retry must complete every interrupted directory sync");
-            assert!(retry.into_inner().starts_with(&expected));
+            assert_eq!(retry.into_inner(), expected);
             assert!(ready_marker_exists(&state.join(BOOTSTRAP_READY_FILE)).expect("validate ready marker"));
         }
+
+        let safe = temp.path().join("safe-no-seventh-sync");
+        let connect = safe.join("connect");
+        let state = connect.join("state");
+        let expected = [
+            state.join("identity"),
+            state.join("credential"),
+            state.clone(),
+            connect,
+            safe,
+            temp.path().to_path_buf(),
+        ];
+        let calls = Cell::new(0);
+        prepare_state_directory_with_sync(&state, |path| {
+            let call = calls.get();
+            assert!(call < expected.len(), "system ancestors must not be synced");
+            assert_eq!(path, &expected[call]);
+            calls.set(call + 1);
+            Ok(())
+        })
+        .expect("the required six syncs must complete without a seventh callback");
+        assert_eq!(calls.get(), expected.len());
     }
 
     #[test]
