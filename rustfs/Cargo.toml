@@ -322,7 +322,7 @@ thiserror = { workspace = true }
 tracing.workspace = true
 url = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 zip = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
@@ -336,16 +336,16 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
-mimalloc = { workspace = true }
+rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-libmimalloc-sys.workspace = true
+rustfs-mimalloc-sys.workspace = true
 
 [dev-dependencies]
-uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

@@ -988,14 +988,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::heal::HealOperations for Sets {
-    type Error = Error;
-    type HealResultItem = HealResultItem;
-    type HealOptions = HealOpts;
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+impl Sets {
+    pub(crate) async fn heal_format_with_fence<F>(&self, dry_run: bool, fence_lost: F) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: Fn() -> bool + Send + Sync,
+    {
         let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
             &DiskOption {
@@ -1068,6 +1065,9 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             // Save new formats `format.json` on unformatted disks.
             for (index, (fm, disk)) in tmp_new_formats.iter_mut().zip(disks.iter()).enumerate() {
                 if fm.is_some() && disk.is_some() {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     if let Err(err) = save_format_file(disk, fm).await {
                         if let Some(disk) = disk.as_ref() {
                             let _ = disk.close().await;
@@ -1100,6 +1100,18 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             }
         }
         Ok((res, None))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::heal::HealOperations for Sets {
+    type Error = Error;
+    type HealResultItem = HealResultItem;
+    type HealOptions = HealOpts;
+
+    #[tracing::instrument(skip(self))]
+    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_format_with_fence(dry_run, || false).await
     }
     #[tracing::instrument(skip(self))]
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
