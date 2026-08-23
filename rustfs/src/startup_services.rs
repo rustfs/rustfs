@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StartupServiceRuntime {
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
+    pub(crate) inventory: Option<InventoryRuntime>,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
     pub(crate) enable_scanner: bool,
 }
@@ -104,11 +105,11 @@ pub(crate) async fn init_startup_runtime_services(
     init_observability_runtime(store.clone(), ctx.clone()).await;
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
     let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
-    let heartbeat = heartbeat.map(|heartbeat| heartbeat.with_inventory(inventory));
 
     Ok(StartupServiceRuntime {
         optional_runtimes,
         heartbeat,
+        inventory,
         iam_bootstrap,
         enable_scanner,
     })
@@ -122,6 +123,9 @@ fn start_heartbeat_runtime(
     let Some(config) = config else {
         return Ok(None);
     };
+    if !config.transport_enabled() {
+        return Ok(None);
+    }
     let summary = u16::try_from(node_count.unwrap_or_default())
         .ok()
         .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
