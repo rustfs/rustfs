@@ -399,13 +399,14 @@ async fn response_loss_reuses_the_pending_request_and_existing_credential_is_ide
         .await
         .expect("retry registration");
     assert_eq!(registered.device_uid, DEVICE_UID);
-    let requests = flaky_server.seen.lock().expect("seen lock");
-    assert_eq!(requests.len(), 4);
-    for request in &requests[1..] {
-        assert_eq!(request["requestId"], requests[0]["requestId"]);
-        assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
+    {
+        let requests = flaky_server.seen.lock().expect("seen lock");
+        assert_eq!(requests.len(), 4);
+        for request in &requests[1..] {
+            assert_eq!(request["requestId"], requests[0]["requestId"]);
+            assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
+        }
     }
-    drop(requests);
 
     let idle = server(&state, vec![]).await;
     let idempotent = register_from_protected_input(&idle.endpoint, &root, &state, Some(&token))
