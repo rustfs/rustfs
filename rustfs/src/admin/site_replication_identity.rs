@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use rustfs_madmin::{PeerInfo, SyncStatus};
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
 use url::Url;
+use uuid::Uuid;
 
 fn has_http_scheme(endpoint: &str) -> bool {
     endpoint.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
@@ -66,10 +66,12 @@ pub fn site_identity_key(endpoint: &str) -> String {
         .unwrap_or_else(|| trimmed.to_ascii_lowercase())
 }
 
+/// Fallback deployment ID for a peer that reported none. UUIDv5 over the
+/// canonical endpoint: the ID is persisted in site-replication state and
+/// broadcast to peers, so it must be identical across Rust toolchains
+/// (`DefaultHasher` is not) and across spellings of the same endpoint.
 pub fn deployment_id_for_endpoint(endpoint: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    endpoint.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, canonical_endpoint(endpoint).as_bytes()).to_string()
 }
 
 pub fn same_identity_endpoint(left: &str, right: &str) -> bool {
@@ -172,6 +174,23 @@ mod tests {
             ca_cert_pem: String::new(),
             api_version: None,
         }
+    }
+
+    /// B8 red-light: the fallback deployment ID must be a toolchain-stable
+    /// UUIDv5 over the canonical endpoint — `DefaultHasher` output is not
+    /// guaranteed stable across Rust releases, yet the ID is persisted in
+    /// site-replication state and broadcast to peers.
+    #[test]
+    fn deployment_id_for_endpoint_is_stable_uuid_v5_over_canonical_endpoint() {
+        let endpoint = "https://node-a.example.com:9000";
+        let id = deployment_id_for_endpoint(endpoint);
+        let parsed = uuid::Uuid::parse_str(&id).expect("fallback deployment ID must be a UUID");
+        assert_eq!(parsed.get_version_num(), 5, "fallback deployment ID must be UUIDv5");
+        // Deterministic for the same endpoint and for spelling variants that
+        // share a canonical form; distinct endpoints stay distinct.
+        assert_eq!(id, deployment_id_for_endpoint(endpoint));
+        assert_eq!(id, deployment_id_for_endpoint(" HTTPS://Node-A.Example.Com:9000/ "));
+        assert_ne!(id, deployment_id_for_endpoint("https://node-b.example.com:9000"));
     }
 
     #[test]

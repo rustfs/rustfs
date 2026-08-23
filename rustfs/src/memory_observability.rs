@@ -17,10 +17,7 @@ use rustfs_io_metrics::{
     record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
-#[cfg(any(test, not(target_os = "windows")))]
 use serde_json::Value;
-#[cfg(not(target_os = "windows"))]
-use std::ffi::CStr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -231,7 +228,18 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    let json = rustfs_mimalloc::MiMalloc::stats_json();
+    if json.is_empty() {
+        return None;
+    }
+    let observation = parse_mimalloc_stats_json(&json)?;
+    Some(AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation,
+    })
+}
+
 fn numeric_json_value(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
@@ -242,7 +250,6 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
 fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => fields
@@ -254,7 +261,6 @@ fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
@@ -271,12 +277,10 @@ fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> 
     }
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
     mimalloc_stat_field(value, metric, "current")
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
 fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
     metrics
         .iter()
@@ -285,7 +289,6 @@ fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64
         .filter(|value| *value > 0)
 }
 
-#[cfg(any(test, not(target_os = "windows")))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
     let malloc_metrics = ["malloc_normal", "malloc_huge"];
@@ -310,33 +313,6 @@ fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservat
     } else {
         Some(observation)
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(unsafe_code)]
-fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
-    // SAFETY: `mi_stats_get_json` returns a null-terminated JSON buffer owned by
-    // mimalloc when called with a null input buffer. The mimalloc API requires
-    // freeing that buffer with `mi_free`; parsing finishes before the buffer is freed.
-    let observation = unsafe {
-        let stats_ptr = libmimalloc_sys::mi_stats_get_json(0, std::ptr::null_mut());
-        if stats_ptr.is_null() {
-            return None;
-        }
-
-        let observation = CStr::from_ptr(stats_ptr).to_str().ok().and_then(parse_mimalloc_stats_json);
-        libmimalloc_sys::mi_free(stats_ptr.cast());
-        observation?
-    };
-    Some(AllocatorMemorySnapshot {
-        backend: crate::allocator_reclaim::allocator_backend(),
-        observation,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
-    None
 }
 
 fn configured_memory_observability_interval_secs() -> u64 {
@@ -564,6 +540,13 @@ mod tests {
     #[test]
     fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
         assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
+    }
+
+    #[test]
+    fn read_allocator_memory_snapshot_uses_mimalloc_stats_json() {
+        let snapshot = super::read_allocator_memory_snapshot();
+        #[cfg(not(target_os = "windows"))]
+        assert!(snapshot.is_some(), "allocator snapshot should be available on non-Windows");
     }
 
     #[test]

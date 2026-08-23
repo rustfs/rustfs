@@ -866,7 +866,7 @@ impl BucketTargetSys {
             return Some(cli);
         }
 
-        // TODO: spawn a task to reload the target
+        // TODO(backlog): spawn an async task to proactively reload the replication target
         if self.is_reloading_target(bucket, arn).await {
             return None;
         }
@@ -3423,6 +3423,44 @@ mod tests {
         let mutexes = sys.target_update_mutexes.lock().await;
         assert!(!mutexes.contains_key("first"));
         assert!(mutexes.contains_key("second"));
+    }
+
+    #[tokio::test]
+    async fn update_all_targets_publishes_disable_proxy_on_target_client() {
+        // The read-proxy selector (replication_proxy::get_proxy_targets) skips
+        // targets whose TargetClient carries disable_proxy — the persisted
+        // per-target opt-out must survive client publication.
+        let sys = BucketTargetSys::default();
+        let target = |arn: &str, disable_proxy: bool| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            disable_proxy,
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+        let targets = BucketTargets {
+            targets: vec![target("arn:proxied", false), target("arn:opted-out", true)],
+        };
+
+        sys.update_all_targets("bucket", Some(&targets)).await;
+
+        let proxied = sys
+            .get_remote_target_client("bucket", "arn:proxied")
+            .await
+            .expect("client should be published");
+        assert!(!proxied.disable_proxy);
+        let opted_out = sys
+            .get_remote_target_client("bucket", "arn:opted-out")
+            .await
+            .expect("client should be published");
+        assert!(opted_out.disable_proxy, "disable_proxy must reach the published TargetClient");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

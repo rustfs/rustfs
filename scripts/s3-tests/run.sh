@@ -58,6 +58,19 @@ if [[ "${TEST_SCOPE}" != "implemented" && "${TEST_SCOPE}" != "all" ]]; then
     echo "[ERROR] Invalid TEST_SCOPE: ${TEST_SCOPE} (must be \"implemented\" or \"all\")" >&2
     exit 1
 fi
+S3_SHARD_COUNT="${S3_SHARD_COUNT:-1}"
+S3_SHARD_INDEX="${S3_SHARD_INDEX:-0}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-300}"
+if [[ ! "${S3_SHARD_COUNT}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${S3_SHARD_INDEX}" =~ ^[0-9]+$ ]] \
+    || (( S3_SHARD_INDEX >= S3_SHARD_COUNT )); then
+    echo "[ERROR] Invalid S3 shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT}" >&2
+    exit 1
+fi
+if [[ ! "${TEST_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Invalid TEST_TIMEOUT: ${TEST_TIMEOUT}" >&2
+    exit 1
+fi
 
 # Upstream ceph/s3-tests suite, pinned for reproducible runs.
 # Bump S3TESTS_REV deliberately: upstream changes can rename tests or change
@@ -94,55 +107,6 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*"
-}
-
-summarize_junit_failures() {
-    local junit_path="$1"
-
-    if [ ! -f "${junit_path}" ]; then
-        log_warn "JUnit report not found: ${junit_path}"
-        return 0
-    fi
-
-    python3 - "${junit_path}" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-
-junit_path = sys.argv[1]
-try:
-    root = ET.parse(junit_path).getroot()
-except Exception as exc:
-    print(f"[WARN] Failed to parse JUnit report {junit_path}: {exc}")
-    raise SystemExit(0)
-
-failures = []
-for case in root.iter("testcase"):
-    failure = case.find("failure")
-    error = case.find("error")
-    node = failure if failure is not None else error
-    if node is None:
-        continue
-
-    classname = case.attrib.get("classname", "")
-    name = case.attrib.get("name", "")
-    duration = case.attrib.get("time", "0")
-    message = node.attrib.get("message") or (node.text or "").strip().splitlines()[0:1]
-    if isinstance(message, list):
-        message = message[0] if message else ""
-    failures.append((classname, name, duration, message))
-
-if not failures:
-    print("[INFO] No failed testcases found in JUnit report")
-    raise SystemExit(0)
-
-print("[ERROR] s3-tests failed testcase summary:")
-for classname, name, duration, message in failures[:20]:
-    nodeid = f"{classname}::{name}" if classname else name
-    print(f"[ERROR] - {nodeid} ({duration}s): {message}")
-
-if len(failures) > 20:
-    print(f"[ERROR] - ... {len(failures) - 20} additional failed testcases omitted")
-PY
 }
 
 # =============================================================================
@@ -322,6 +286,9 @@ Environment Variables:
   MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
   TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
+  S3_SHARD_COUNT         - Number of deterministic exact-node-ID shards (default: 1)
+  S3_SHARD_INDEX         - Zero-based shard index (default: 0)
+  TEST_TIMEOUT           - Per-test timeout in seconds (default: 300)
   S3TESTS_REPO           - s3-tests repository URL (default: https://github.com/ceph/s3-tests.git)
   S3TESTS_REV            - Pinned s3-tests commit; bump deliberately and reclassify test lists
   MARKEXPR               - pytest marker expression (default: no marker filtering)
@@ -982,9 +949,10 @@ mkdir -p "${ARTIFACTS_DIR}"
 XDIST_ARGS=""
 if [ "${XDIST}" != "0" ]; then
     # Add pytest-xdist to requirements.txt so tox installs it inside its virtualenv
-    echo "pytest-xdist" >> requirements.txt
+    grep -qxF "pytest-xdist" requirements.txt || echo "pytest-xdist" >> requirements.txt
     XDIST_ARGS="-n ${XDIST} --dist=loadgroup"
 fi
+grep -qxF "pytest-timeout" requirements.txt || echo "pytest-timeout" >> requirements.txt
 
 # Resolve config path (absolute path for tox)
 if [[ "${S3TESTS_CONF}" = /* ]]; then
@@ -1003,12 +971,70 @@ else
     PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}")
 fi
 
+collect_nodeids() {
+    local output_path="$1"
+    shift
+    local collect_log="${output_path%.txt}.log"
+    local collect_rc=0
+    local node_prefix="${S3_TEST_FILE//./\\.}::"
+
+    set +e
+    S3TEST_CONF="${CONF_OUTPUT_PATH}" tox -- -q --collect-only "$@" 2>&1 | tee "${collect_log}"
+    collect_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "${collect_rc}" -ne 0 ]; then
+        log_error "pytest collection failed with exit code ${collect_rc}"
+        return "${collect_rc}"
+    fi
+    grep -E "^${node_prefix}" "${collect_log}" > "${output_path}" || true
+    if [ ! -s "${output_path}" ]; then
+        log_error "pytest collection produced no S3 test node IDs"
+        return 1
+    fi
+}
+
+ALL_COLLECTED_NODEIDS="${ARTIFACTS_DIR}/all-collected-nodeids.txt"
+UNSHARDED_SELECTED_NODEIDS="${ARTIFACTS_DIR}/unsharded-selected-nodeids.txt"
+SELECTED_NODEIDS="${ARTIFACTS_DIR}/selected-nodeids.txt"
+collect_nodeids "${ALL_COLLECTED_NODEIDS}" "${S3_TEST_FILE}" -m "not rustfs_never_marker"
+python3 "${SCRIPT_DIR}/report_compat.py" \
+    --lists-dir "${SCRIPT_DIR}" \
+    --collected-nodeids "${ALL_COLLECTED_NODEIDS}" \
+    --check-classifications-only || {
+    log_error "S3 test classifications do not match pinned revision ${S3TESTS_REV}"
+    exit 1
+}
+if [[ "${TEST_SCOPE}" == "all" && -z "${TESTEXPR}" && "${MARKEXPR}" == "not rustfs_never_marker" ]]; then
+    cp "${ALL_COLLECTED_NODEIDS}" "${UNSHARDED_SELECTED_NODEIDS}"
+else
+    collect_nodeids "${UNSHARDED_SELECTED_NODEIDS}" "${PYTEST_SELECTION_ARGS[@]}" -m "${MARKEXPR}"
+fi
+
+if (( S3_SHARD_COUNT > 1 )); then
+    awk -v count="${S3_SHARD_COUNT}" -v shard_index="${S3_SHARD_INDEX}" \
+        '((NR - 1) % count) == shard_index' \
+        "${UNSHARDED_SELECTED_NODEIDS}" > "${SELECTED_NODEIDS}"
+    if [[ ! -s "${SELECTED_NODEIDS}" ]]; then
+        log_error "Shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT} selected no tests"
+        exit 1
+    fi
+    PYTEST_SELECTION_ARGS=()
+    while IFS= read -r nodeid; do
+        PYTEST_SELECTION_ARGS+=("${nodeid}")
+    done < "${SELECTED_NODEIDS}"
+    log_info "Selected shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT}: ${#PYTEST_SELECTION_ARGS[@]} exact cases"
+else
+    cp "${UNSHARDED_SELECTED_NODEIDS}" "${SELECTED_NODEIDS}"
+fi
+
 # Run tests from s3tests/functional
+# Failure locals can contain multi-MiB request bodies; keep tracebacks without expanding local values.
 set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
-    -vv -ra --showlocals --tb=long \
+    -vv -ra --tb=long \
     --maxfail="${MAXFAIL}" \
+    --timeout="${TEST_TIMEOUT}" \
     --junitxml="${ARTIFACTS_DIR}/junit.xml" \
     ${XDIST_ARGS} \
     "${PYTEST_SELECTION_ARGS[@]}" \
@@ -1033,19 +1059,22 @@ elif [ "${DEPLOY_MODE}" = "existing" ]; then
     echo "{\"host\": \"${S3_HOST}\", \"port\": ${S3_PORT}, \"mode\": \"existing\"}" > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/inspect.json" || true
 fi
 
-# Step 11: Classification report (informational, never fails the run)
+# Step 11: Classification report and gate
 REPORT_SCRIPT="${SCRIPT_DIR}/report_compat.py"
-if [ -f "${REPORT_SCRIPT}" ] && [ -f "${ARTIFACTS_DIR}/junit.xml" ]; then
-    python3 "${REPORT_SCRIPT}" \
-        --junit "${ARTIFACTS_DIR}/junit.xml" \
-        --lists-dir "${SCRIPT_DIR}" \
-        --output "${ARTIFACTS_DIR}/compat-report.md" \
-        || log_warn "Compatibility report generation failed"
+REPORT_ARGS=(
+    --junit "${ARTIFACTS_DIR}/junit.xml"
+    --lists-dir "${SCRIPT_DIR}"
+    --collected-nodeids "${SELECTED_NODEIDS}"
+    --output "${ARTIFACTS_DIR}/compat-report.md"
+    --fail-on-regression
+)
+if [[ "${TEST_SCOPE}" == "all" ]]; then
+    REPORT_ARGS+=(--fail-on-unclassified)
 fi
-
-if [ ${TEST_EXIT_CODE} -ne 0 ]; then
-    summarize_junit_failures "${ARTIFACTS_DIR}/junit.xml"
-fi
+set +e
+python3 "${REPORT_SCRIPT}" "${REPORT_ARGS[@]}"
+REPORT_EXIT_CODE=$?
+set -e
 
 # Summary
 if [ ${TEST_EXIT_CODE} -eq 0 ]; then
@@ -1059,4 +1088,10 @@ else
     log_info "Check RustFS logs: ${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/rustfs.log"
 fi
 
-exit ${TEST_EXIT_CODE}
+if [[ "${TEST_EXIT_CODE}" -ne 0 && "${TEST_EXIT_CODE}" -ne 1 ]]; then
+    exit "${TEST_EXIT_CODE}"
+fi
+if [[ "${TEST_SCOPE}" == "implemented" && "${TEST_EXIT_CODE}" -ne 0 ]]; then
+    exit "${TEST_EXIT_CODE}"
+fi
+exit "${REPORT_EXIT_CODE}"

@@ -125,7 +125,10 @@ impl Default for ScannerRuntimeConfig {
             cycle_interval_source: ScannerRuntimeConfigSource::Default,
             bitrot_cycle: Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS)),
             bitrot_cycle_source: ScannerRuntimeConfigSource::Default,
-            cycle_budget: ScannerCycleBudgetConfig::default(),
+            cycle_budget: ScannerCycleBudgetConfig {
+                max_duration: Some(Duration::from_secs(DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)),
+                ..Default::default()
+            },
             cycle_max_duration_source: ScannerRuntimeConfigSource::Default,
             cycle_max_objects_source: ScannerRuntimeConfigSource::Default,
             cycle_max_directories_source: ScannerRuntimeConfigSource::Default,
@@ -374,7 +377,10 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
     }
     validate_optional_config_u64(scanner_kvs, SCANNER_START_DELAY, "")?;
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE, "")?;
-    validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)?;
+    if let Some(value) = config_value(scanner_kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
+        let secs = parse_config_u64(SCANNER_CYCLE_MAX_DURATION, value)?;
+        cycle_duration_from_secs(SCANNER_CYCLE_MAX_DURATION, secs)?;
+    }
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_OBJECTS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS)?;
     validate_optional_config_u64(scanner_kvs, SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES)?;
     if let Some(value) = config_value(heal_kvs, HEAL_BITROT_CYCLE, DEFAULT_HEAL_BITROT_CYCLE_SECS) {
@@ -436,19 +442,46 @@ fn lookup_max_wait(
     Ok((speed.max_sleep(), speed_source))
 }
 
-fn lookup_optional_seconds(
-    kvs: Option<&KVS>,
-    key: &'static str,
-    env_key: &'static str,
-    default: u64,
-) -> Result<(Option<Duration>, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
-    if let Some(secs) = rustfs_utils::get_env_opt_u64(env_key) {
-        return Ok((Some(Duration::from_secs(secs)), ScannerRuntimeConfigSource::Env));
+fn lookup_cycle_duration(kvs: Option<&KVS>) -> Result<(Option<Duration>, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
+    match rustfs_utils::get_env_parse_outcome::<u64>(ENV_SCANNER_CYCLE_MAX_DURATION_SECS) {
+        rustfs_utils::EnvParseOutcome::Parsed(secs) => {
+            return cycle_duration_from_secs(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, secs)
+                .map(|duration| (duration, ScannerRuntimeConfigSource::Env));
+        }
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            // Do not include the raw environment value in the typed error:
+            // deployments occasionally put sensitive material in inherited
+            // environment snapshots. The key still identifies the control.
+            return Err(invalid_value(
+                ENV_SCANNER_CYCLE_MAX_DURATION_SECS,
+                "<invalid>",
+                "expected unsigned integer seconds",
+            ));
+        }
+        rustfs_utils::EnvParseOutcome::Absent => {}
     }
-    if let Some(value) = config_value(kvs, key, default) {
-        return parse_config_u64(key, value).map(|secs| (Some(Duration::from_secs(secs)), ScannerRuntimeConfigSource::Config));
+
+    if let Some(value) = config_value(kvs, SCANNER_CYCLE_MAX_DURATION, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS) {
+        let secs = parse_config_u64(SCANNER_CYCLE_MAX_DURATION, value)?;
+        return cycle_duration_from_secs(SCANNER_CYCLE_MAX_DURATION, secs)
+            .map(|duration| (duration, ScannerRuntimeConfigSource::Config));
     }
-    Ok((None, ScannerRuntimeConfigSource::Default))
+
+    Ok((
+        Some(Duration::from_secs(DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS)),
+        ScannerRuntimeConfigSource::Default,
+    ))
+}
+
+fn cycle_duration_from_secs(key: &'static str, secs: u64) -> Result<Option<Duration>, ScannerRuntimeConfigError> {
+    if secs == 0 {
+        return Ok(None);
+    }
+    let duration = Duration::from_secs(secs);
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(invalid_value(key, "<overflow>", "duration exceeds the timer range"));
+    }
+    Ok(Some(duration))
 }
 
 fn lookup_start_delay(kvs: Option<&KVS>) -> Result<(Option<Duration>, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
@@ -553,12 +586,7 @@ pub(crate) fn lookup_scanner_runtime_config(
         (speed.cycle_interval(), speed_source)
     };
 
-    let (cycle_max_duration, cycle_max_duration_source) = lookup_optional_seconds(
-        scanner_kvs,
-        SCANNER_CYCLE_MAX_DURATION,
-        ENV_SCANNER_CYCLE_MAX_DURATION_SECS,
-        DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS,
-    )?;
+    let (cycle_max_duration, cycle_max_duration_source) = lookup_cycle_duration(scanner_kvs)?;
     let (cycle_max_objects, cycle_max_objects_source) = lookup_count_budget(
         scanner_kvs,
         SCANNER_CYCLE_MAX_OBJECTS,
@@ -863,12 +891,11 @@ mod tests {
     use rustfs_config::server_config::{Config as ServerConfig, KVS};
     use rustfs_config::{
         DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
-        ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
-        HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE,
-        SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE,
-        SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
+        ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
+        ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE,
+        SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
+        SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
     };
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::time::Duration;
     use temp_env::{with_var, with_var_unset};
@@ -916,7 +943,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_uses_persisted_values_when_env_is_unset() {
         let config = server_config_with_scanner(&[
             (SCANNER_SPEED, "slow"),
@@ -944,7 +970,50 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    fn scanner_unset_budget_uses_safe_default_but_explicit_zero_is_unbounded() {
+        let config = server_config_with_scanner(&[]);
+        with_var_unset(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+            assert_eq!(resolved.cycle_budget.max_duration, Some(Duration::from_secs(1800)));
+            assert_eq!(resolved.cycle_max_duration_source, ScannerRuntimeConfigSource::Default);
+        });
+
+        let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "0")]);
+        with_var_unset(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, || {
+            let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+            assert_eq!(resolved.cycle_budget.max_duration, None);
+            assert_eq!(resolved.cycle_max_duration_source, ScannerRuntimeConfigSource::Config);
+        });
+    }
+
+    #[test]
+    fn cycle_budget_invalid_or_overflow_config_is_rejected() {
+        with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("invalid"), || {
+            let error = lookup_scanner_runtime_config(None).expect_err("invalid duration env must be rejected");
+            assert!(error.to_string().contains(ENV_SCANNER_CYCLE_MAX_DURATION_SECS));
+            assert!(error.to_string().contains("<invalid>"));
+            assert!(!error.to_string().contains(": invalid ("));
+        });
+        with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("18446744073709551616"), || {
+            assert!(lookup_scanner_runtime_config(None).is_err());
+        });
+        with_var(ENV_SCANNER_CYCLE_MAX_DURATION_SECS, Some("18446744073709551615"), || {
+            assert!(lookup_scanner_runtime_config(None).is_err());
+        });
+        let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "not-a-duration")]);
+        assert!(lookup_scanner_runtime_config(Some(&config)).is_err());
+    }
+
+    #[test]
+    fn scanner_runtime_config_validation_rejects_overflow_persisted_duration() {
+        let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "18446744073709551615")]);
+
+        let error = validate_scanner_runtime_config(&config)
+            .expect_err("persisted duration that exceeds the timer range must be rejected");
+        assert!(error.to_string().contains(SCANNER_CYCLE_MAX_DURATION));
+    }
+
+    #[test]
     fn scanner_runtime_config_normalizes_persisted_default_speed() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "default")]);
 
@@ -960,7 +1029,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_prefers_env_over_persisted_config() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "slowest"), (SCANNER_CYCLE, "600")]);
 
@@ -977,7 +1045,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_prefers_heal_bitrot_cycle_over_scanner_compat_config() {
         let config = server_config_with_scanner_and_heal(&[(SCANNER_BITROT_CYCLE, "3600")], &[(HEAL_BITROT_CYCLE, "off")]);
 
@@ -990,7 +1057,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_marks_scanner_bitrot_cycle_as_compat_source() {
         let config = server_config_with_scanner(&[(SCANNER_BITROT_CYCLE, "3600")]);
 
@@ -1007,7 +1073,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_normalizes_persisted_default_bitrot_cycles() {
         let default_cycle = DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string();
         for config in [
@@ -1032,7 +1097,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_validation_rejects_invalid_persisted_speed_with_env_override() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "warp")]);
 
@@ -1066,7 +1130,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_uses_derived_delay_for_excessive_env_override() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "slow")]);
 
@@ -1087,7 +1150,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_reports_value_sources() {
         let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_OBJECTS, "100"), (SCANNER_CACHE_SAVE_TIMEOUT, "5")]);
 
@@ -1108,7 +1170,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn applied_runtime_config_is_the_authoritative_scheduler_state() {
         let config = server_config_with_scanner(&[(SCANNER_CYCLE, "321")]);
 
@@ -1125,7 +1186,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_reports_persisted_pacing_overrides() {
         let config = server_config_with_scanner(&[("delay", "3.5"), ("max_wait", "7")]);
 
@@ -1147,7 +1207,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_prefers_env_pacing_overrides() {
         let config = server_config_with_scanner(&[("delay", "3.5"), ("max_wait", "7")]);
 
@@ -1169,7 +1228,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn scanner_runtime_config_status_preserves_subsecond_max_wait() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "fast")]);
 

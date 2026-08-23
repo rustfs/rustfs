@@ -249,7 +249,7 @@ impl PoolEndpointList {
             endpoint.set_set_index(0);
             endpoint.set_disk_index(0);
 
-            // TODO Check for cross device mounts if any.
+            // TODO(backlog): check for cross-device mounts in single-drive setup
 
             return Ok(Self {
                 inner: vec![Endpoints::from(vec![endpoint])],
@@ -264,7 +264,7 @@ impl PoolEndpointList {
                 // Convert args to endpoints
                 let mut eps = Endpoints::try_from(set_layout.as_slice())?;
 
-                // TODO Check for cross device mounts if any.
+                // TODO(backlog): check for cross-device mounts in multi-pool setup
 
                 for (disk_idx, ep) in eps.as_mut().iter_mut().enumerate() {
                     ep.set_pool_index(pool_idx);

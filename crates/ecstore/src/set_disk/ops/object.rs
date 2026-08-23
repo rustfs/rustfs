@@ -45,6 +45,7 @@ use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, ReplicationLifecycleBridge, ReplicationStatusType, VersionPurgeStatusType,
     replication_state_to_filemeta, replication_status_from_filemeta, version_purge_status_to_filemeta,
 };
+use crate::data_usage::quota_object_size;
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
@@ -1293,7 +1294,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             (prepared.snapshot, prepared.object_info)
         } else {
             match self
-                .get_object_fileinfo(
+                .get_object_fileinfo_for_get_object_reader(
                     bucket,
                     object,
                     opts,
@@ -2226,11 +2227,11 @@ impl SetDisks {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
-            let is_inline_buffer =
-                storage_class_config.should_inline(erasure.shard_file_size(put_object_size), erasure.data_shards, opts.versioned);
+            let shard_file_size_raw = erasure.shard_file_size(put_object_size);
+            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
-            let shard_file_size = erasure.shard_file_size(put_object_size);
+            let shard_file_size = shard_file_size_raw;
             let shard_size = erasure.shard_size();
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
@@ -2587,6 +2588,7 @@ impl SetDisks {
                         })
                         .await?,
                     );
+                    notify_put_object_commit_namespace_acquired(bucket, object);
                 }
                 #[cfg(not(any(test, feature = "test-util")))]
                 {
@@ -4750,6 +4752,7 @@ struct PutObjectCommitBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
     namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -4771,6 +4774,7 @@ impl PutObjectCommitBarrier {
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -4804,6 +4808,10 @@ impl PutObjectCommitBarrier {
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
             .await
             .expect("put object should wait for the namespace lock after leaving the commit barrier");
+    }
+
+    pub fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -4861,6 +4869,22 @@ fn notify_put_object_commit_namespace_pending(bucket: &str, object: &str) {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
+    let barrier = PUT_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("put object commit barrier mutex should not poison")
+        .iter()
+        .find(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == PutObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 struct DeleteObjectCommitBarrierState {
     bucket: String,
@@ -4870,7 +4894,7 @@ struct DeleteObjectCommitBarrierState {
 }
 
 #[cfg(test)]
-struct DeleteObjectCommitBarrier {
+pub(crate) struct DeleteObjectCommitBarrier {
     state: Arc<DeleteObjectCommitBarrierState>,
 }
 
@@ -4880,7 +4904,7 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
-    fn install(bucket: &str, object: &str) -> Self {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
@@ -4896,13 +4920,13 @@ impl DeleteObjectCommitBarrier {
         Self { state }
     }
 
-    async fn wait_until_paused(&self) {
+    pub(crate) async fn wait_until_paused(&self) {
         tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
             .await
             .expect("delete object should reach the deterministic commit barrier");
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
 }
@@ -5775,7 +5799,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        let (deleted, errors, _) = self.delete_objects_with_accounting(bucket, objects, opts).await;
+        (deleted, errors)
+    }
+
+    async fn delete_objects_with_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
+        let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
             .delete_replication_config_snapshot
             .clone()
@@ -5865,7 +5900,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 *item = Some(Error::other(message.clone()));
                             }
                         }
-                        return (del_objects, del_errs);
+                        return (del_objects, del_errs, accounting);
                     }
                 },
             }
@@ -5912,6 +5947,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            // Resolve accounting from the generation selected under this
+            // object's write lock. A request-layer pre-stat is only an
+            // optimization and cannot identify a concurrent overwrite.
+            let (accounting_size, accounting_version_id, removed_current_object) = if source_missing
+                || dobj.synthetic_version_id
+                || set_disk_delete_creates_delete_marker(&check_opts)
+                || goi.delete_marker
+            {
+                (None, None, false)
+            } else {
+                (
+                    quota_object_size(&goi).ok(),
+                    goi.version_id.filter(|version_id| !version_id.is_nil()),
+                    (dobj.version_id.is_none() || is_explicit_null_version(dobj.version_id)) && !dobj.synthetic_version_id,
+                )
+            };
             // Normalize both sides before comparing. `goi.version_id` is the
             // client-facing identity, where `from_file_info` synthesizes
             // `Some(Uuid::nil())` for a null version on a versioned or
@@ -5997,6 +6048,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if dobj.version_id.is_none() && (version_suspended || versioned) {
                 vr.mod_time = Some(OffsetDateTime::now_utc());
                 vr.deleted = true;
+                vr.mark_deleted = true;
                 if versioned {
                     vr.version_id = Some(Uuid::new_v4());
                 }
@@ -6040,7 +6092,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     },
                     replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
-                }
+                };
+                accounting[i] = Some(DeleteAccounting {
+                    size: accounting_size,
+                    version_id: accounting_version_id,
+                    removed_current_object,
+                });
             }
 
             // Only add to vers_map if we hold the lock
@@ -6086,7 +6143,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     });
                 }
             }
-            return (del_objects, del_errs);
+            return (del_objects, del_errs, accounting);
         }
 
         let mut persisted_journal_entries = Vec::with_capacity(journal_entries.len());
@@ -6281,7 +6338,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         join_all(rollback_futures).await;
 
-        // TODO: add_partial
+        // TODO(backlog): support partial object deletion for multi-part objects
 
         if let Some(api) = opts.tier_delete_journal_api.as_ref() {
             for (idx, je) in persisted_journal_entries {
@@ -6324,7 +6381,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        (del_objects, del_errs)
+        // An accounting identity is actionable only when the delete result is
+        // successful. Never let a failed commit (including a partial quorum
+        // failure) reach the request-layer fast delta path.
+        for (index, err) in del_errs.iter().enumerate() {
+            if err.is_some() {
+                accounting[index] = None;
+            }
+        }
+
+        (del_objects, del_errs, accounting)
     }
 
     #[tracing::instrument(skip(self))]
@@ -6491,7 +6557,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        // TODO: Lifecycle
+        // TODO(backlog): integrate lifecycle evaluation before object deletion
 
         let mut version_found = true;
         // delete_object_version below derives its own majority quorum from the
@@ -6585,7 +6651,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 mark_deleted: mark_delete,
                 mod_time: Some(mod_time),
                 replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
-                ..Default::default() // TODO: Transition
+                ..Default::default() // TODO(backlog): populate transition state on delete markers
             };
 
             fi.set_tier_free_version_id(&find_vid.to_string());
@@ -6653,6 +6719,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
+        // Keep the committed source metadata on the internal delete result so
+        // the request layer can derive canonical accounting for this exact
+        // generation. Delete responses do not expose these fields.
+        obj_info.actual_size = goi.actual_size;
+        obj_info.user_defined = Arc::clone(&goi.user_defined);
+        obj_info.parts = Arc::clone(&goi.parts);
         obj_info.user_tags = Arc::clone(&goi.user_tags);
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(obj_info)
@@ -7942,6 +8014,113 @@ mod replication_quota_safety_tests {
             .await
             .expect("server-observed exact quota boundary should succeed");
         assert_eq!(stored.get_actual_size().expect("stored logical size should parse"), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_returns_canonical_compressed_accounting_size() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "compressed-delete-accounting";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, "1000".to_string());
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(vec![0x5a; 400]), 400, 1000, None, None, false)
+                .expect("compressed fixture reader should be valid"),
+        );
+        set_disks
+            .put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    user_defined,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("compressed object should be written");
+
+        let (deleted, errors, accounting) = set_disks
+            .delete_objects_with_accounting(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "object".to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(errors[0].is_none(), "compressed delete should succeed: {:?}", errors[0]);
+        assert!(deleted[0].found, "the committed object must be reported as found");
+        assert_eq!(accounting[0].as_ref().and_then(|value| value.size), Some(1000));
+        assert!(accounting[0].as_ref().is_some_and(|value| value.version_id.is_none()));
+        assert!(accounting[0].as_ref().is_some_and(|value| value.removed_current_object));
+    }
+
+    #[tokio::test]
+    async fn suspended_delete_marker_does_not_return_body_accounting() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "suspended-delete-accounting";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, "1000".to_string());
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(vec![0x5a; 400]), 400, 1000, None, None, false)
+                .expect("compressed fixture reader should be valid"),
+        );
+        let suspended_opts = ObjectOptions {
+            version_suspended: true,
+            delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
+                s3s::dto::VersioningConfiguration {
+                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                    ..Default::default()
+                },
+                None,
+            ))),
+            user_defined,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set_disks
+            .put_object(bucket, "object", &mut reader, &suspended_opts)
+            .await
+            .expect("compressed object should be written");
+
+        let (deleted, errors, accounting) = set_disks
+            .delete_objects_with_accounting(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "object".to_string(),
+                    ..Default::default()
+                }],
+                suspended_opts,
+            )
+            .await;
+        assert!(errors[0].is_none(), "suspended delete should create a marker: {:?}", errors[0]);
+        assert!(deleted[0].delete_marker);
+        assert!(accounting[0].is_none(), "a delete marker must not carry body accounting");
     }
 
     #[tokio::test]
@@ -12107,6 +12286,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    ..Default::default()
                 },
                 "test_data_movement",
             )
