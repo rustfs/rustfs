@@ -198,7 +198,7 @@ where
             data_usage_info.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
         }
 
-        if !data_usage_info.is_complete_bucket_usage_snapshot() {
+        if !data_usage_info.is_complete_bucket_usage_snapshot() && !data_usage_info.usage_snapshot_partial {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
