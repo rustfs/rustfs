@@ -844,6 +844,10 @@ message ScannerActivityResponse {
   bytes response_proof = 7;
   uint64 dirty_usage_generation = 8;
   bool dirty_usage_pending = 9;
+  // v7 fields.  They are optional so v6 peers can continue to decode the
+  // response shape while newer readers fail closed when they are absent.
+  optional uint64 movement_generation = 10;
+  optional bool publication_blocked = 11;
 }
 
 message BackgroundHealStatusRequest {

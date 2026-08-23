@@ -2725,6 +2725,8 @@ mod tests {
             data_movement_active: Some(false),
             dirty_usage_generation: Some(2),
             dirty_usage_pending,
+            movement_generation: Some(1),
+            publication_blocked: Some(false),
         };
 
         let pending = aggregate_scanner_dirty_usage_acknowledgement_results(

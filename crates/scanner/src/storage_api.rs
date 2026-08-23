@@ -274,13 +274,13 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    pub use super::storage_contracts::SCANNER_ACTIVITY_PROTOCOL_VERSION;
     pub(crate) use super::storage_contracts::{
         BucketOperations, BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
     };
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions, ObjectIO};
+    pub use super::storage_contracts::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
 }
 
 pub(crate) mod scanner_io {

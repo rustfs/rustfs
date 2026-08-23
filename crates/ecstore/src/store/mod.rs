@@ -344,6 +344,38 @@ impl ECStore {
         decommission || rebalance
     }
 
+    /// Return the storage-owned movement state and generation as one
+    /// authenticated activity snapshot.  The read lock is acquired before
+    /// the state locks (cancelers, pool metadata, then rebalance metadata),
+    /// matching the transition writer order and preventing a terminal state
+    /// from being reported with the preceding generation.
+    pub async fn scanner_data_movement_activity(&self) -> (bool, bool, u64) {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
+        let (active, blocked) = self.scanner_data_movement_snapshot_locked().await;
+        let blocked = blocked
+            || self.ctx.data_movement_operation_epoch_exhausted()
+            || self.ctx.data_movement_generation_exhausted();
+        self.ctx.set_scanner_publication_state(blocked);
+        (
+            active,
+            blocked,
+            self.ctx.data_movement_generation(),
+        )
+    }
+
+    pub fn scanner_data_movement_generation(&self) -> u64 {
+        self.ctx.data_movement_generation()
+    }
+
+    pub fn scanner_data_movement_generation_exhausted(&self) -> bool {
+        self.ctx.data_movement_generation_exhausted()
+    }
+
+    pub fn scanner_data_movement_changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.ctx.data_movement_generation_notify()
+    }
+
     /// Returns whether scanner metadata may still be hidden by a local
     /// data-movement state. Terminal failed/canceled decommission entries
     /// remain suspended until an operator clears or retries them, so they are
@@ -355,10 +387,16 @@ impl ECStore {
     }
 
     async fn scanner_data_usage_publication_snapshot_blocked(&self) -> bool {
-        if self.ctx.data_movement_operation_epoch_exhausted() {
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
             self.ctx.set_scanner_publication_state(true);
             return true;
         }
+        let (_, blocked) = self.scanner_data_movement_snapshot_locked().await;
+        self.ctx.set_scanner_publication_state(blocked);
+        blocked
+    }
+
+    async fn scanner_data_movement_snapshot_locked(&self) -> (bool, bool) {
         let decommission_cancelers = self.decommission_cancelers.read().await;
         let decommission_active = decommission_cancelers
             .iter()
@@ -385,8 +423,7 @@ impl ECStore {
             .is_some_and(is_rebalance_conflicting_with_decommission);
 
         let blocked = decommission_active || decommission_terminal || rebalance_active;
-        self.ctx.set_scanner_publication_state(blocked);
-        blocked
+        (decommission_active || rebalance_active, blocked)
     }
 
     /// Admit one short data-usage publication commit under the same
@@ -407,7 +444,7 @@ impl ECStore {
     pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
-        if self.ctx.data_movement_operation_epoch_exhausted() {
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
             return None;
         }
         if self.scanner_data_usage_publication_snapshot_blocked().await {
@@ -1084,6 +1121,33 @@ mod tests {
             .await
             .expect("idle store should admit the next publication");
         assert_eq!(next_epoch, 1);
+        assert_eq!(store.scanner_data_movement_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn movement_generation_notifies_waiters_and_fails_closed_at_maximum() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let notify = store.scanner_data_movement_changed();
+        let mut notified = notify.notified();
+        notified.enable();
+
+        assert_eq!(store.ctx.advance_data_movement_operation_epoch(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("movement transition should wake scanner waiters");
+        assert_eq!(store.scanner_data_movement_generation(), 1);
+
+        store.ctx.set_data_movement_generation_for_test(u64::MAX - 1);
+        assert_eq!(store.ctx.advance_data_movement_generation(), Some(u64::MAX));
+        assert!(store.scanner_data_movement_generation_exhausted());
+        assert_eq!(store.ctx.advance_data_movement_generation(), None);
+        assert!(
+            store
+                .scanner_data_usage_publication_admission_guard()
+                .await
+                .is_none(),
+            "generation exhaustion must close publication admission"
+        );
     }
 
     #[tokio::test]

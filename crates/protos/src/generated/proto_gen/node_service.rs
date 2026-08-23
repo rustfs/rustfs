@@ -1213,6 +1213,10 @@ pub struct ScannerActivityResponse {
     pub dirty_usage_generation: u64,
     #[prost(bool, tag = "9")]
     pub dirty_usage_pending: bool,
+    #[prost(uint64, optional, tag = "10")]
+    pub movement_generation: ::core::option::Option<u64>,
+    #[prost(bool, optional, tag = "11")]
+    pub publication_blocked: ::core::option::Option<bool>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusRequest {

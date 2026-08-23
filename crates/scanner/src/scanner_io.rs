@@ -252,7 +252,13 @@ fn classify_nsscanner_cycle(
 
     match (activity_status, dirty_usage_status) {
         (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        (ScannerCycleActivityStatus::Unverified, _) => ScannerCycleStatus::Incomplete,
+        // A post-scan activity probe is part of the publication proof.  An
+        // unverifiable result must not be treated as an ordinary partial
+        // scan, otherwise the usage store can acknowledge the cycle and the
+        // next retry waits behind the long convergence backoff.
+        (ScannerCycleActivityStatus::Unverified, _) => {
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
         _ => ScannerCycleStatus::Superseded,
     }
 }

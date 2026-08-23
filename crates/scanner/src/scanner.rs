@@ -65,7 +65,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
@@ -2199,7 +2199,10 @@ async fn run_data_scanner_with_maintenance_state(
         );
 
         let activity_poll_interval = backoff_enabled.then_some(runtime_config.cycle_interval.max(Duration::from_secs(1)));
-        let wake_reason = wait_for_next_scanner_cycle_with_activity(
+        let movement_generation_before_wait = storeapi.scanner_data_movement_generation();
+        let movement_changed = storeapi.scanner_data_movement_changed();
+        let movement_store = storeapi.clone();
+        let wake_reason = wait_for_next_scanner_cycle_with_activity_and_movement(
             &ctx,
             wait_plan.delay,
             activity_poll_interval,
@@ -2211,6 +2214,9 @@ async fn run_data_scanner_with_maintenance_state(
                 runtime_config_generation_seen,
                 maintenance_generation_before_wait,
             ),
+            Some(movement_generation_before_wait),
+            movement_changed,
+            move || movement_store.scanner_data_movement_generation(),
             || guard.is_lock_lost(),
             || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
@@ -2237,6 +2243,10 @@ async fn run_data_scanner_with_maintenance_state(
                 continue;
             }
             ScannerCycleWakeReason::ClusterMaintenance => {
+                clean_idle_backoff.reset();
+            }
+            ScannerCycleWakeReason::MovementGeneration => {
+                scanner_activity_seen = None;
                 clean_idle_backoff.reset();
             }
             ScannerCycleWakeReason::Timer

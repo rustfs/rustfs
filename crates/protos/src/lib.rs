@@ -486,6 +486,42 @@ pub fn canonical_scanner_activity_response_body(
     Ok(body)
 }
 
+/// Builds the protocol-v7 response body.  The optional movement fields are
+/// presence-bound so a missing terminal-generation proof cannot authenticate
+/// as the value zero.
+pub fn canonical_scanner_activity_v7_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v3\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 8 + 4);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    body.push(u8::from(response.movement_generation.is_some()));
+    if let Some(generation) = response.movement_generation {
+        body.extend_from_slice(&generation.to_be_bytes());
+    }
+    body.push(u8::from(response.publication_blocked.is_some()));
+    if let Some(blocked) = response.publication_blocked {
+        body.push(u8::from(blocked));
+    }
+    Ok(body)
+}
+
 /// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
 /// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
 /// distinct field values can never collide into the same canonical bytes.
@@ -1565,7 +1601,7 @@ mod non_disk_mutation_canonical_tests {
 mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
-        canonical_scanner_activity_v4_response_body,
+        canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
         proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
     };
 
@@ -1617,6 +1653,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         let baseline =
             canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
@@ -1667,6 +1705,25 @@ mod scanner_activity_tests {
             canonical_scanner_activity_response_body(&[2; 16], &response)
                 .expect("scanner activity response with a different challenge should encode")
         );
+
+        let v7_baseline =
+            canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("scanner activity v7 response should encode");
+        for variant in [
+            ScannerActivityResponse {
+                movement_generation: Some(20),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                publication_blocked: Some(true),
+                ..response.clone()
+            },
+        ] {
+            assert_ne!(
+                v7_baseline,
+                canonical_scanner_activity_v7_response_body(&[1; 16], &variant)
+                    .expect("scanner activity v7 response variant should encode")
+            );
+        }
     }
 
     #[test]
@@ -1681,6 +1738,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         let baseline =
             canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");

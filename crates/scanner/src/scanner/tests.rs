@@ -23,7 +23,7 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use temp_env::{with_var, with_var_unset};
 use tokio::io::AsyncReadExt;
@@ -4839,6 +4839,35 @@ async fn test_wait_for_next_scanner_cycle_stops_after_leader_lock_loss() {
     assert_eq!(reason, ScannerCycleWakeReason::LeaderLockLost);
 }
 
+#[tokio::test]
+async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
+    let ctx = CancellationToken::new();
+    let movement_generation = Arc::new(AtomicU64::new(7));
+    let movement_changed = Arc::new(Notify::new());
+    let next_generation = Arc::clone(&movement_generation);
+    let next_changed = Arc::clone(&movement_changed);
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        next_generation.store(8, Ordering::Release);
+        next_changed.notify_waiters();
+    });
+
+    let reason = wait_for_next_scanner_cycle_with_movement(
+        &ctx,
+        Duration::from_secs(60),
+        None,
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+        Some(7),
+        movement_changed,
+        || movement_generation.load(Ordering::Acquire),
+        || false,
+    )
+    .await;
+
+    assert_eq!(reason, ScannerCycleWakeReason::MovementGeneration);
+}
+
 fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {
     ScannerNodeActivity {
         instance_id: epoch.to_string(),
@@ -4849,6 +4878,8 @@ fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_gen
         data_movement_active: false,
         dirty_usage_generation: 5,
         dirty_usage_pending: false,
+        movement_generation: 9,
+        publication_blocked: false,
     }
 }
 
@@ -4889,6 +4920,7 @@ fn scanner_activity_snapshot_fences_data_movement() {
     let mut moving = idle.clone();
     moving.get_mut("node-2").expect("node should exist").data_movement_active = true;
 
+    assert!(!scanner_activity_allows_usage_publication(&BTreeMap::new()));
     assert!(scanner_activity_allows_usage_publication(&idle));
     assert!(!scanner_activity_allows_usage_publication(&moving));
     assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
@@ -5008,6 +5040,24 @@ fn remote_maintenance_change_is_distinct_from_namespace_activity() {
 }
 
 #[test]
+fn remote_movement_generation_change_is_distinct_from_cluster_activity() {
+    let previous = BTreeMap::from([("node-2".to_string(), scanner_node_activity("remote", 7, 3))]);
+    let movement_changed = BTreeMap::from([(
+        "node-2".to_string(),
+        ScannerNodeActivity {
+            movement_generation: 10,
+            ..scanner_node_activity("remote", 7, 3)
+        },
+    )]);
+
+    assert_eq!(
+        compare_scanner_activity(&previous, &movement_changed),
+        ScannerActivityObservation::MovementChanged
+    );
+    assert!(scanner_activity_observed_work(ScannerActivityObservation::MovementChanged));
+}
+
+#[test]
 fn local_maintenance_wakeup_releases_a_remote_maintenance_block() {
     let blocked = scanner_activity_backoff_blocked_after_wake(false, ScannerCycleWakeReason::ClusterMaintenance);
     assert!(blocked);
@@ -5093,6 +5143,39 @@ async fn superseded_retry_wait_defers_dirty_cluster_activity_until_timer() {
     .await;
 
     assert_eq!(reason, ScannerCycleWakeReason::Timer);
+    assert_eq!(seen, Some(changed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_retry_wait_wakes_for_remote_movement_generation() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let ctx = CancellationToken::new();
+    let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("remote", 7, 3))]));
+    let changed = BTreeMap::from([(
+        "node-2".to_string(),
+        ScannerNodeActivity {
+            movement_generation: 10,
+            ..scanner_node_activity("remote", 7, 3)
+        },
+    )]);
+
+    let reason = wait_for_next_scanner_cycle_with_activity(
+        &ctx,
+        Duration::from_secs(120),
+        Some(Duration::from_secs(60)),
+        &mut seen,
+        ScannerCycleObservedGenerations {
+            dirty_usage: None,
+            runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+            maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            defer_cluster_activity: true,
+        },
+        || false,
+        || std::future::ready(Ok(changed.clone())),
+    )
+    .await;
+
+    assert_eq!(reason, ScannerCycleWakeReason::ClusterActivity);
     assert_eq!(seen, Some(changed));
 }
 

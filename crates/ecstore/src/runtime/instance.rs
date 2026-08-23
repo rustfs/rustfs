@@ -56,7 +56,7 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Notify, OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -180,6 +180,13 @@ pub struct InstanceContext {
     /// saturating counter prevents an unchanged `u64::MAX` value from being
     /// mistaken for a fresh epoch after overflow.
     data_movement_operation_epoch_exhausted: AtomicBool,
+    /// Storage-owned generation for movement state changes.  This is separate
+    /// from the publication admission epoch so scanners can wait for a
+    /// terminal/clear transition without treating the wake as a publication
+    /// permit.
+    data_movement_generation: AtomicU64,
+    data_movement_generation_exhausted: AtomicBool,
+    data_movement_generation_notify: Arc<Notify>,
     /// Last storage-owned movement snapshot observed under the operation
     /// gate. SetDisks cache writers fail closed until ECStore refreshes it.
     scanner_publication_state: AtomicU8,
@@ -226,6 +233,9 @@ impl InstanceContext {
             data_movement_operation_gate: Arc::new(RwLock::new(())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
+            data_movement_generation: AtomicU64::new(0),
+            data_movement_generation_exhausted: AtomicBool::new(false),
+            data_movement_generation_notify: Arc::new(Notify::new()),
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -257,8 +267,21 @@ impl InstanceContext {
         self.data_movement_operation_epoch_exhausted.load(Ordering::Acquire)
     }
 
+    pub(crate) fn data_movement_generation(&self) -> u64 {
+        self.data_movement_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn data_movement_generation_exhausted(&self) -> bool {
+        self.data_movement_generation_exhausted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn data_movement_generation_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.data_movement_generation_notify)
+    }
+
     pub(crate) fn scanner_publication_state_allowed(&self) -> bool {
         !self.data_movement_operation_epoch_exhausted()
+            && !self.data_movement_generation_exhausted()
             && self.scanner_publication_state.load(Ordering::Acquire) == SCANNER_PUBLICATION_STATE_ALLOWED
     }
 
@@ -276,6 +299,7 @@ impl InstanceContext {
     pub(crate) fn advance_data_movement_operation_epoch(&self) -> u64 {
         self.scanner_publication_state
             .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
+        let previous = self.data_movement_operation_epoch.load(Ordering::Acquire);
         let _ = self
             .data_movement_operation_epoch
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)));
@@ -283,7 +307,40 @@ impl InstanceContext {
         if result == u64::MAX {
             self.data_movement_operation_epoch_exhausted.store(true, Ordering::Release);
         }
+        if result != previous {
+            let _ = self.advance_data_movement_generation();
+        }
         result
+    }
+
+    /// Advance the movement generation after a durable movement transition.
+    /// The generation is deliberately bounded: once it reaches `u64::MAX`,
+    /// publication and generation-based waits fail closed rather than reusing
+    /// an indistinguishable saturated value.
+    pub(crate) fn advance_data_movement_generation(&self) -> Option<u64> {
+        if self.data_movement_generation_exhausted.load(Ordering::Acquire) {
+            return None;
+        }
+        let updated = self
+            .data_movement_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| generation.checked_add(1));
+        match updated {
+            Ok(previous) => {
+                let Some(generation) = previous.checked_add(1) else {
+                    self.data_movement_generation_exhausted.store(true, Ordering::Release);
+                    return None;
+                };
+                if generation == u64::MAX {
+                    self.data_movement_generation_exhausted.store(true, Ordering::Release);
+                }
+                self.data_movement_generation_notify.notify_waiters();
+                Some(generation)
+            }
+            Err(_) => {
+                self.data_movement_generation_exhausted.store(true, Ordering::Release);
+                None
+            }
+        }
     }
 
     #[cfg(test)]
@@ -293,6 +350,13 @@ impl InstanceContext {
             .store(epoch == u64::MAX, Ordering::Release);
         self.scanner_publication_state
             .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_data_movement_generation_for_test(&self, generation: u64) {
+        self.data_movement_generation.store(generation, Ordering::Release);
+        self.data_movement_generation_exhausted
+            .store(generation == u64::MAX, Ordering::Release);
     }
 
     /// Install the application-owned object-encryption resolver once.

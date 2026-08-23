@@ -24,9 +24,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_S
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
-    reload_transition_tier_config,
+    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path,
+    find_local_disk_by_ref, reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
 use crate::storage::storage_api::{
@@ -237,7 +237,23 @@ fn scanner_activity_response(
         response_proof: Bytes::new(),
         dirty_usage_generation: dirty_usage.generation,
         dirty_usage_pending: dirty_usage.pending,
+        movement_generation: None,
+        publication_blocked: None,
     }
+}
+
+fn scanner_activity_response_v7(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+    movement_generation: u64,
+    publication_blocked: bool,
+) -> ScannerActivityResponse {
+    let mut response = scanner_activity_response(namespace_generation, topology_digest, data_movement_active, dirty_usage);
+    response.movement_generation = Some(movement_generation);
+    response.publication_blocked = Some(publication_blocked);
+    response
 }
 
 fn previous_scanner_activity_response(
@@ -255,6 +271,8 @@ fn previous_scanner_activity_response(
         response_proof: Bytes::new(),
         dirty_usage_generation: 0,
         dirty_usage_pending: false,
+        movement_generation: None,
+        publication_blocked: None,
     }
 }
 
@@ -269,6 +287,29 @@ fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivit
         response_proof: Bytes::new(),
         dirty_usage_generation: 0,
         dirty_usage_pending: false,
+        movement_generation: None,
+        publication_blocked: None,
+    }
+}
+
+fn v6_scanner_activity_response(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+        topology_digest: topology_digest.to_vec().into(),
+        data_movement_active,
+        response_proof: Bytes::new(),
+        dirty_usage_generation: dirty_usage.generation,
+        dirty_usage_pending: dirty_usage.pending,
+        movement_generation: None,
+        publication_blocked: None,
     }
 }
 
@@ -1826,7 +1867,7 @@ impl Node for NodeService {
                     return Err(Status::invalid_argument("scanner activity protocol v4 cannot acknowledge dirty usage"));
                 }
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION | rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
                 let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
                     .map_err(|_| Status::invalid_argument("scanner activity request is too large to authenticate"))?;
                 verify_tonic_canonical_body_digest(&request, &canonical)
@@ -1873,16 +1914,24 @@ impl Node for NodeService {
         }
         let namespace_generation = store.scanner_namespace_mutation_generation();
         let topology_digest = rustfs_scanner::scanner_topology_digest(store.as_ref());
-        let data_movement_active = store.scanner_data_movement_active().await;
+        let (data_movement_active, publication_blocked, movement_generation) = store.scanner_data_movement_activity().await;
         let mut response = match request_protocol {
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION | SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 previous_scanner_activity_response(namespace_generation, topology_digest, data_movement_active)
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response(
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => v6_scanner_activity_response(
                 namespace_generation,
                 topology_digest,
                 data_movement_active,
                 rustfs_scanner::scanner_dirty_usage_state(),
+            ),
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response_v7(
+                namespace_generation,
+                topology_digest,
+                data_movement_active,
+                rustfs_scanner::scanner_dirty_usage_state(),
+                movement_generation,
+                publication_blocked || store.scanner_data_movement_generation_exhausted(),
             ),
             version => {
                 return Err(Status::failed_precondition(format!(
@@ -1894,8 +1943,11 @@ impl Node for NodeService {
             SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_v4_response_body(&challenge, &response)
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_response_body(&challenge, &response)
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                rustfs_protos::canonical_scanner_activity_v7_response_body(&challenge, &response)
             }
             version => {
                 return Err(Status::internal(format!(
@@ -2209,7 +2261,7 @@ mod tests {
         execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint,
         initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response, make_heal_control_server,
         make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
-        previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
+        previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response_v7, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
@@ -5489,7 +5541,7 @@ mod tests {
 
     #[test]
     fn test_scanner_activity_response_uses_process_epoch_and_generations() {
-        let response = scanner_activity_response(
+        let response = scanner_activity_response_v7(
             17,
             [7; 32],
             true,
@@ -5497,6 +5549,8 @@ mod tests {
                 generation: 11,
                 pending: true,
             },
+            23,
+            true,
         );
 
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
@@ -5507,6 +5561,8 @@ mod tests {
         assert!(response.data_movement_active);
         assert_eq!(response.dirty_usage_generation, 11);
         assert!(response.dirty_usage_pending);
+        assert_eq!(response.movement_generation, Some(23));
+        assert_eq!(response.publication_blocked, Some(true));
     }
 
     #[test]

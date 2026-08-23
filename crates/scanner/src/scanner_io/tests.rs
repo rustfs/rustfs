@@ -736,7 +736,7 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
         ),
-        ScannerCycleStatus::Incomplete
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
 
     for status in [
@@ -803,6 +803,15 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
         !publish_usage_snapshot(&updates, ScannerCycleStatus::Incomplete, DataUsageInfo::default())
             .await
             .expect("incomplete snapshot suppression should succeed")
+    );
+    assert!(
+        !publish_usage_snapshot(
+            &updates,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            DataUsageInfo::default(),
+        )
+        .await
+        .expect("unverified activity suppression should succeed")
     );
 
     assert_eq!(
