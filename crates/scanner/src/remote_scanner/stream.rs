@@ -16,8 +16,8 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare, scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
+    cache_root_entry_info, current_cache_root_or_prepare_with_generation, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -213,6 +213,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
     pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
 }
@@ -223,6 +224,7 @@ struct RemoteScannerResponseExpectation<'a> {
     source: DataUsageCacheSource,
     next_cycle: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    tier_registry_generation: u64,
 }
 
 #[derive(Debug)]
@@ -669,6 +671,11 @@ async fn scan_and_persist_local_bucket(
         scan_mode,
         ..
     } = request;
+    // Keep the worker's cycle snapshot alive through cache reuse, scanning,
+    // and persistence. Without the guard, a later cycle can prune this key
+    // while this request is still running and allow a second registry to be
+    // selected for the same cycle.
+    let _tier_cycle_guard = crate::begin_tier_registry_cycle(next_cycle, leader_epoch);
     let store = resolve_scanner_object_store_handle()
         .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
@@ -704,7 +711,25 @@ async fn scan_and_persist_local_bucket(
     let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
-    let scan_state = current_cache_root_or_prepare(&mut cache, &bucket, source, next_cycle, leader_epoch, scan_plan_digest, true);
+    // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
+    // Requiring its generation here prevents a cache snapshot classified by an
+    // older registry from being reused before the folder scan gets a chance to
+    // refresh it.
+    let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
+        .await
+        .generation;
+    let scan_state = current_cache_root_or_prepare_with_generation(
+        &mut cache,
+        &bucket,
+        source,
+        next_cycle,
+        leader_epoch,
+        scan_plan_digest,
+        DataUsageCacheReuseOptions {
+            require_source: true,
+            tier_registry_generation: Some(tier_registry_generation),
+        },
+    );
     match scan_state {
         DataUsageCacheScanState::Current(usage) => {
             if guard.is_lock_lost() {
@@ -869,6 +894,7 @@ pub(crate) async fn scan_remote_bucket(
         session_id,
         session_sequence,
         scan_plan_digest,
+        tier_registry_generation,
         skip_healing,
         scan_mode,
     } = spec;
@@ -957,6 +983,7 @@ pub(crate) async fn scan_remote_bucket(
             source: expected_source,
             next_cycle,
             scan_plan_digest,
+            tier_registry_generation,
         },
         authenticator,
         rpc_deadline,
@@ -1012,6 +1039,7 @@ where
             source: expected_source,
             next_cycle: TEST_NEXT_CYCLE,
             scan_plan_digest: expected_scan_plan_digest,
+            tier_registry_generation: 0,
         },
         authenticator,
         Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME,
@@ -1109,6 +1137,11 @@ where
                 if complete.scan_plan_digest != expected.scan_plan_digest {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned usage for a different bucket plan",
+                    )));
+                }
+                if complete.usage.tier_registry_generation != Some(expected.tier_registry_generation) {
+                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned usage for a different tier registry generation",
                     )));
                 }
                 if !complete.usage.entry.children.is_empty() {
