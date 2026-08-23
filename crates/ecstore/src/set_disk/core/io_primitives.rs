@@ -71,6 +71,9 @@ use crate::set_disk::shard_source::ShardReadCost;
 use futures::FutureExt as _;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
+use rustfs_io_metrics::internode_metrics::{
+    INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
@@ -193,6 +196,16 @@ fn record_read_version_coalescer_event(event: &'static str, item_count: usize) {
     .increment(1);
 }
 
+fn batch_read_version_stage_timer() -> Option<Instant> {
+    rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now)
+}
+
+fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_stage(stage, started_at.elapsed());
+    }
+}
+
 async fn read_version_via_coalescer(
     disk: DiskStore,
     org_bucket: &str,
@@ -242,8 +255,12 @@ async fn read_version_via_coalescer(
         flush_read_version_coalescer_pending(lane_key, disk, *opts, pending).await;
     }
 
-    rx.await
-        .unwrap_or_else(|_| Err(DiskError::other("coalesced read_version response channel closed")))
+    let wait_started = batch_read_version_stage_timer();
+    let response = rx
+        .await
+        .unwrap_or_else(|_| Err(DiskError::other("coalesced read_version response channel closed")));
+    record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT, wait_started);
+    response
 }
 
 async fn flush_read_version_coalescer_lane(lane_key: ReadVersionCoalescerKey, disk: DiskStore, opts: ReadOptions) {
@@ -292,7 +309,9 @@ async fn flush_read_version_coalescer_pending(
         };
     match result {
         Ok(responses) => {
+            let map_started = batch_read_version_stage_timer();
             let results = map_batch_read_version_responses(&expected_items, responses);
+            record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP, map_started);
             for (tx, result) in senders.into_iter().zip(results) {
                 let _ = tx.send(result);
             }
