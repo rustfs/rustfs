@@ -4824,21 +4824,16 @@ impl ECStore {
             .await
     }
 
-    #[tracing::instrument(skip(self, rx))]
-    pub async fn do_decommission_in_routine(self: &Arc<Self>, rx: CancellationToken, idx: usize) -> Result<()> {
-        defer!(|| async {
-            let mut cancelers = self.decommission_cancelers.write().await;
-            if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    state = "canceler_already_cleared",
-                    "Decommission canceler already cleared"
-                );
-            }
-        });
+    #[tracing::instrument(skip(self, canceler))]
+    pub async fn do_decommission_in_routine(
+        self: &Arc<Self>,
+        canceler: DecommissionCanceler,
+        idx: usize,
+        entry_budget: Arc<Semaphore>,
+    ) -> Result<()> {
+        let rx = canceler.token().clone();
+        self.run_decommission_in_routine(rx, idx, &canceler, entry_budget).await
+    }
 
     async fn run_decommission_in_routine(
         self: &Arc<Self>,
