@@ -63,9 +63,10 @@ jobs:
     runs-on: sm-standard-4
     # The instrumented build cannot reuse the regular CI cache (different
     # RUSTFLAGS), so a cold run rebuilds the workspace before running the
-    # full suite. Exact-head run 32573798257 needed 119m42s including reports
-    # and artifact upload, so keep a bounded 30-minute publication margin.
-    timeout-minutes: 150
+    # full suite. Two later exact-head runs exhausted 150 minutes before the
+    # report steps, so allow one additional 90-minute cold-run margin while
+    # keeping the calibration job bounded.
+    timeout-minutes: 240
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Match the PR gate's nextest semantics (ci.yml runs `--profile ci`):
