@@ -2587,13 +2587,13 @@ impl ECStore {
         };
 
         if cp_src_dst_same {
-            let pool_idx = self
-                .get_pool_info_existing_with_opts(src_bucket, &src_object, &writer_pool_lookup_opts(src_opts, true))
-                .await?
-                .0
-                .index;
+            let (_, pool_idx) = self
+                .get_latest_accessible_object_info_with_idx(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+                .await?;
+            let source_pool_writable = !self.is_suspended(pool_idx).await && !self.is_pool_rebalancing(pool_idx).await;
 
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+            if source_pool_writable
+                && let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
                 && src_vid == dst_vid
             {
                 return self.pools[pool_idx]
@@ -2601,7 +2601,7 @@ impl ECStore {
                     .await;
             }
 
-            if !dst_opts.versioned && src_opts.version_id.is_none() {
+            if source_pool_writable && !dst_opts.versioned && src_opts.version_id.is_none() {
                 if src_info.metadata_only {
                     // Zero-copy update: only xl.meta is rewritten, the data blocks stay as they
                     // are. The caller must therefore guarantee that the destination metadata
@@ -2644,7 +2644,7 @@ impl ECStore {
                 };
             }
 
-            if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+            if source_pool_writable && dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
                 // Restoring a specific historical version onto the current key creates a NEW
                 // version. When the caller supplies a reader (S3 CopyObject), write the fetched
                 // bytes through put_object so any re-encryption/compression applied to the reader
