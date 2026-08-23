@@ -109,7 +109,8 @@ impl ECStore {
         }
 
         let mut pool_meta = PoolMeta::default();
-        pool_meta.load_no_lock(metadata_pool.clone()).await?;
+        let replica_state = pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
+        replica_state.ensure_write_safe("heal format fence failed")?;
         if pool_meta.pools.len() != self.pools.len()
             || pool_meta.pools.iter().enumerate().any(|(pool_idx, pool)| {
                 pool.id != pool_idx || pool.cmd_line.is_empty() || pool.cmd_line != self.pools[pool_idx].endpoints.cmd_line
