@@ -310,6 +310,17 @@ pub fn rustfs_binary_path() -> PathBuf {
     rustfs_binary_path_with_features(requested_rustfs_build_features().as_deref())
 }
 
+fn resolve_rustfs_binary_path(workspace: &Path, configured_target_dir: Option<&Path>) -> PathBuf {
+    let mut path = match configured_target_dir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => workspace.join(path),
+        None => workspace.join("target"),
+    };
+    path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+    path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
 /// Resolve the RustFS binary relative to the workspace, optionally requesting build features.
 pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rustfs") {
@@ -317,11 +328,9 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     }
     let requested_features = requested_features.and_then(normalize_rustfs_build_features);
 
-    let mut binary_path = workspace_root();
-    binary_path.push("target");
-    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
-    binary_path.push(profile_dir);
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
+    let workspace = workspace_root();
+    let configured_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let binary_path = resolve_rustfs_binary_path(&workspace, configured_target_dir.as_deref());
 
     let features_match = binary_features_match(&binary_path, requested_features.as_deref());
     let source_is_newer = workspace_sources_newer_than_binary(&binary_path);
@@ -338,7 +347,7 @@ pub fn rustfs_binary_path_with_features(requested_features: Option<&str>) -> Pat
     }
 
     info!("Building RustFS binary to ensure it's up to date...");
-    build_rustfs_binary(requested_features.as_deref());
+    build_rustfs_binary(requested_features.as_deref(), &binary_path);
 
     info!("Using RustFS binary at {:?}", binary_path);
     binary_path
@@ -440,7 +449,7 @@ fn path_is_newer_than(binary_modified: std::time::SystemTime, path: &Path) -> bo
 }
 
 /// Build the RustFS binary using cargo
-fn build_rustfs_binary(requested_features: Option<&str>) {
+fn build_rustfs_binary(requested_features: Option<&str>, binary_path: &Path) {
     let workspace = workspace_root();
     info!("Building RustFS binary from workspace: {:?}", workspace);
 
@@ -476,11 +485,7 @@ fn build_rustfs_binary(requested_features: Option<&str>) {
         panic!("Failed to build RustFS binary. Error: {stderr}");
     }
 
-    let mut binary_path = workspace;
-    binary_path.push("target");
-    binary_path.push(if cfg!(debug_assertions) { "debug" } else { "release" });
-    binary_path.push(format!("rustfs{}", std::env::consts::EXE_SUFFIX));
-    let stamp_path = rustfs_binary_features_stamp_path(&binary_path);
+    let stamp_path = rustfs_binary_features_stamp_path(binary_path);
     if let Err(err) = stdfs::write(&stamp_path, requested_features.unwrap_or_default()) {
         warn!("Failed to write RustFS feature stamp {:?}: {}", stamp_path, err);
     }
@@ -1752,6 +1757,27 @@ mod tests {
         assert_eq!(
             capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
             Some(PathBuf::from("/tmp/e2e-logs/rustfs_e2e_test_abc.log"))
+        );
+    }
+
+    #[test]
+    fn resolves_rustfs_binary_in_configured_cargo_target_directory() {
+        let workspace = Path::new("workspace");
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+        let binary = format!("rustfs{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, None),
+            workspace.join("target").join(profile).join(&binary)
+        );
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, Some(Path::new("custom-target"))),
+            workspace.join("custom-target").join(profile).join(&binary)
+        );
+
+        let absolute = std::env::temp_dir().join("rustfs-e2e-custom-target");
+        assert_eq!(
+            resolve_rustfs_binary_path(workspace, Some(&absolute)),
+            absolute.join(profile).join(binary)
         );
     }
 
