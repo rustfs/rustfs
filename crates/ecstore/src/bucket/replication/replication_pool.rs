@@ -39,7 +39,7 @@ use super::replication_resync_boundary::{
 };
 use super::replication_resyncer::{
     ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_delete_with_outcome, replicate_object,
-    replicate_object_with_outcome, save_resync_status,
+    replicate_object_with_outcome, update_resync_status_cas,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
@@ -1898,7 +1898,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             }
         };
 
-        let mut bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
+        let bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
         if let Some(active) = bucket_status.targets_map.get(&opts.arn) {
             if active.resync_id == opts.resync_id {
                 self.resyncer
@@ -1924,26 +1924,43 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         }
 
         let now = OffsetDateTime::now_utc();
-        bucket_status.last_update = Some(now);
-        bucket_status.targets_map.insert(
-            opts.arn.clone(),
-            TargetReplicationResyncStatus {
-                start_time: Some(now),
-                last_update: Some(now),
-                resync_id: opts.resync_id.clone(),
-                resync_before_date: opts.resync_before,
-                resync_status: ResyncStatusType::ResyncPending,
-                failed_size: 0,
-                failed_count: 0,
-                replicated_size: 0,
-                replicated_count: 0,
-                bucket: opts.bucket.clone(),
-                object: String::new(),
-                error: None,
-            },
-        );
+        let admitted = TargetReplicationResyncStatus {
+            start_time: Some(now),
+            last_update: Some(now),
+            resync_id: opts.resync_id.clone(),
+            resync_before_date: opts.resync_before,
+            resync_status: ResyncStatusType::ResyncPending,
+            failed_size: 0,
+            failed_count: 0,
+            replicated_size: 0,
+            replicated_count: 0,
+            bucket: opts.bucket.clone(),
+            object: String::new(),
+            error: None,
+        };
 
-        save_resync_status(&opts.bucket, &bucket_status, self.storage.clone()).await?;
+        // The admission lock serializes competing admissions, but status
+        // writers (mark_status, the periodic saver) do not take it — write
+        // through the CAS so their concurrent updates to other targets are
+        // never lost, re-checking the conflict gate on each retry.
+        let (bucket_status, _) = update_resync_status_cas(&opts.bucket, self.storage.clone(), |persisted| {
+            if let Some(active) = persisted.targets_map.get(&opts.arn) {
+                if active.resync_id == opts.resync_id {
+                    return Ok(false);
+                }
+                if should_auto_resume_resync(active.resync_status) {
+                    return Err(EcstoreError::other(ResyncActiveConflictError {
+                        bucket: opts.bucket.clone(),
+                        arn: opts.arn.clone(),
+                        active_resync_id: active.resync_id.clone(),
+                    }));
+                }
+            }
+            persisted.last_update = Some(now);
+            persisted.targets_map.insert(opts.arn.clone(), admitted.clone());
+            Ok(true)
+        })
+        .await?;
         self.resyncer
             .status_map
             .write()
@@ -1988,29 +2005,46 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             .await
             .map_err(EcstoreError::from)?;
 
-        let bucket_status = load_bucket_resync_metadata(&bucket, self.storage.clone()).await?;
-        let opts = bucket_status
-            .targets_map
-            .get(&arn)
-            .filter(|intent| should_auto_resume_resync(intent.resync_status))
-            .map(|intent| ResyncOpts {
+        let mut canceled: Option<ResyncOpts> = None;
+        let (final_map, _) = update_resync_status_cas(&bucket, self.storage.clone(), |persisted| {
+            canceled = None;
+            let Some(intent) = persisted.targets_map.get_mut(&arn) else {
+                return Ok(false);
+            };
+            if !should_auto_resume_resync(intent.resync_status) {
+                return Ok(false);
+            }
+            let now = OffsetDateTime::now_utc();
+            canceled = Some(ResyncOpts {
                 bucket: bucket.clone(),
                 arn: arn.clone(),
                 resync_id: intent.resync_id.clone(),
                 resync_before: intent.resync_before_date,
             });
-        // Publish the freshly loaded map first so `mark_status` mutates and
-        // persists the on-disk view, not this node's cached one.
-        self.resyncer.status_map.write().await.insert(bucket, bucket_status);
-        let Some(opts) = opts else {
-            return Ok(None);
-        };
+            intent.resync_status = ResyncStatusType::ResyncCanceled;
+            intent.last_update = Some(now);
+            persisted.last_update = Some(now);
+            Ok(true)
+        })
+        .await?;
 
-        self.resyncer.cancel(&opts).await;
-        self.resyncer
-            .mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), self.storage.clone())
-            .await?;
-        Ok(Some(opts))
+        // Converge only the removed target's cached entry: cached progress
+        // counters for this node's other running targets stay authoritative.
+        {
+            let mut status_map = self.resyncer.status_map.write().await;
+            let cached = status_map
+                .entry(bucket.clone())
+                .or_insert_with(BucketReplicationResyncStatus::new);
+            if let Some(final_target) = final_map.targets_map.get(&arn) {
+                cached.targets_map.insert(arn.clone(), final_target.clone());
+                cached.last_update = final_map.last_update.or(cached.last_update);
+            }
+        }
+
+        if let Some(opts) = &canceled {
+            self.resyncer.cancel(opts).await;
+        }
+        Ok(canceled)
     }
 
     pub async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError> {
@@ -4007,9 +4041,13 @@ mod tests {
         assert_eq!(persisted.targets_map["arn:first"].resync_status, ResyncStatusType::ResyncCanceled);
         assert_eq!(persisted.targets_map["arn:second"].resync_status, ResyncStatusType::ResyncPending);
         assert_eq!(persisted.targets_map["arn:second"].resync_id, "run-b");
+        // Cache convergence is per-target: only the removed ARN is written
+        // back (a running target's cached progress counters stay
+        // authoritative), so node A's cache reflects the cancel while the
+        // persisted document remains the authority for `arn:second`.
         assert_eq!(
-            node_a.resyncer.status_map.read().await[bucket].targets_map["arn:second"].resync_id,
-            "run-b"
+            node_a.resyncer.status_map.read().await[bucket].targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled
         );
 
         let untouched = node_a
@@ -4025,6 +4063,89 @@ mod tests {
                 .await
                 .expect("cancel of an unknown arn should be a no-op")
                 .is_none()
+        );
+    }
+
+    /// The reviewer's resurrect scenario: after node A cancels `arn:first`, a
+    /// status write from node B — whose cache still holds the pre-cancel map —
+    /// must not flip `arn:first` back to `Pending` on disk. `mark_status` now
+    /// persists through the CAS with per-target guards instead of blind-saving
+    /// its cached whole-bucket map.
+    #[tokio::test]
+    async fn stale_peer_status_write_cannot_resurrect_canceled_intent() {
+        let shared = empty_resync_shared_state();
+        let node_a = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let node_b = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+        let bucket = "stale-peer-write";
+
+        assert!(
+            node_a
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:first", "run-a"))
+                .await
+                .expect("node A admission should persist")
+        );
+        assert!(
+            node_b
+                .clone()
+                .admit_bucket_resync(test_resync_opts(bucket, "arn:second", "run-b"))
+                .await
+                .expect("node B admission should persist")
+        );
+        // Seed node B's stale cache: it saw the map before A's cancel.
+        let pre_cancel = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("pre-cancel status should decode");
+        node_b
+            .resyncer
+            .status_map
+            .write()
+            .await
+            .insert(bucket.to_string(), pre_cancel);
+
+        node_a
+            .clone()
+            .cancel_bucket_resync_for_removed_target(bucket, "arn:first")
+            .await
+            .expect("cancel should succeed")
+            .expect("cancel should report the canceled run");
+
+        node_b
+            .resyncer
+            .mark_status(
+                ResyncStatusType::ResyncStarted,
+                test_resync_opts(bucket, "arn:second", "run-b"),
+                node_b.storage.clone(),
+            )
+            .await
+            .expect("peer status write should succeed");
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(
+            persisted.targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled,
+            "peer's stale cache must not resurrect the canceled intent"
+        );
+        assert_eq!(persisted.targets_map["arn:second"].resync_status, ResyncStatusType::ResyncStarted);
+
+        // And the reverse guard: a stale write for the canceled target itself
+        // is refused outright.
+        node_b
+            .resyncer
+            .mark_status(
+                ResyncStatusType::ResyncStarted,
+                test_resync_opts(bucket, "arn:first", "run-a"),
+                node_b.storage.clone(),
+            )
+            .await
+            .expect("guarded status write should be skipped, not fail");
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("persisted status should decode");
+        assert_eq!(persisted.targets_map["arn:first"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(
+            node_b.resyncer.status_map.read().await[bucket].targets_map["arn:first"].resync_status,
+            ResyncStatusType::ResyncCanceled,
+            "the refused writer's cache must converge to the persisted terminal state"
         );
     }
 
