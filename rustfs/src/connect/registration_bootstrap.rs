@@ -122,7 +122,16 @@ fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrap
 #[cfg(unix)]
 fn prepare_state_directory_with_sync(
     path: &Path,
+    sync: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<PathBuf, RegistrationBootstrapError> {
+    prepare_state_directory_with_sync_and_missing_observer(path, sync, |_| {})
+}
+
+#[cfg(unix)]
+fn prepare_state_directory_with_sync_and_missing_observer(
+    path: &Path,
     mut sync: impl FnMut(&Path) -> io::Result<()>,
+    mut observed_missing: impl FnMut(&Path),
 ) -> Result<PathBuf, RegistrationBootstrapError> {
     if path.components().any(|component| matches!(component, Component::ParentDir)) {
         return Err(RegistrationBootstrapError::StateDirectorySecurity);
@@ -155,11 +164,16 @@ fn prepare_state_directory_with_sync(
         return Ok(path);
     }
 
+    let mut directories_observed_missing = Vec::new();
     for directory in &directories {
-        ensure_directory(directory, directory == &path)?;
+        if ensure_directory(directory, directory == &path, &mut observed_missing)? {
+            directories_observed_missing.push(directory.clone());
+        }
     }
     for directory in &store_directories {
-        ensure_directory(directory, true)?;
+        if ensure_directory(directory, true, &mut observed_missing)? {
+            directories_observed_missing.push(directory.clone());
+        }
     }
     for directory in &directories {
         validate_directory(directory, directory == &path)?;
@@ -168,13 +182,29 @@ fn prepare_state_directory_with_sync(
         validate_directory(directory, true)?;
     }
 
-    for directory in [&store_directories[0], &store_directories[1], &path] {
-        sync(directory).map_err(RegistrationBootstrapError::Input)?;
-    }
-    let parent = path.parent().ok_or_else(|| {
+    path.parent().ok_or_else(|| {
         RegistrationBootstrapError::Input(io::Error::new(io::ErrorKind::InvalidInput, "state directory has no parent"))
     })?;
-    sync(parent).map_err(RegistrationBootstrapError::Input)?;
+
+    // Without a ready marker, an existing directory may be residue from an
+    // interrupted or concurrent creation. Re-sync the complete leaf-up chain;
+    // only the validated marker makes the zero-sync fast path safe.
+    let mut durability_directories = vec![store_directories[0].clone(), store_directories[1].clone(), path.clone()];
+    for created in directories_observed_missing.iter().rev() {
+        for directory in [Some(created.as_path()), created.parent()].into_iter().flatten() {
+            if !durability_directories.iter().any(|candidate| candidate == directory) {
+                durability_directories.push(directory.to_path_buf());
+            }
+        }
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if !durability_directories.iter().any(|candidate| candidate == ancestor) {
+            durability_directories.push(ancestor.to_path_buf());
+        }
+    }
+    for directory in durability_directories {
+        sync(&directory).map_err(RegistrationBootstrapError::Input)?;
+    }
     publish_ready_marker(&path, &ready)?;
     Ok(path)
 }
@@ -262,20 +292,29 @@ fn publish_ready_marker(state_directory: &Path, ready: &Path) -> Result<(), Regi
 }
 
 #[cfg(unix)]
-fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
+fn ensure_directory(
+    path: &Path,
+    require_process_owner: bool,
+    observed_missing: &mut impl FnMut(&Path),
+) -> Result<bool, RegistrationBootstrapError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_directory(path, require_process_owner),
+        Ok(_) => {
+            validate_directory(path, require_process_owner)?;
+            Ok(false)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            observed_missing(path);
             let mut builder = fs::DirBuilder::new();
             use std::os::unix::fs::DirBuilderExt as _;
             builder.mode(0o700);
             match builder.create(path) {
                 Ok(()) => {
                     validate_directory(path, true)?;
-                    Ok(())
+                    Ok(true)
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    Err(RegistrationBootstrapError::StateDirectorySecurity)
+                    validate_directory(path, require_process_owner)?;
+                    Ok(true)
                 }
                 Err(error) => Err(RegistrationBootstrapError::Input(error)),
             }
@@ -380,7 +419,8 @@ mod tests {
 
     use super::{
         BOOTSTRAP_READY_CONTENTS, BOOTSTRAP_READY_FILE, RegistrationBootstrapError, prepare_state_directory_with_sync,
-        ready_marker_exists, sync_directory, unix_ca_file_is_trusted, unix_directory_is_trusted, unix_ready_marker_is_trusted,
+        prepare_state_directory_with_sync_and_missing_observer, ready_marker_exists, sync_directory, unix_ca_file_is_trusted,
+        unix_directory_is_trusted, unix_ready_marker_is_trusted,
     };
 
     fn create_secure_state_tree(state: &Path) {
@@ -427,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn new_state_chain_syncs_only_managed_directories_and_state_parent() {
+    fn new_state_chain_syncs_created_directories_and_parents_leaf_up() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let ancestor = temp.path().join("connect");
         let state = ancestor.join("state");
@@ -441,9 +481,16 @@ mod tests {
         .expect("new state tree must become ready");
 
         assert_eq!(prepared, state);
-        assert_eq!(
-            observed.into_inner(),
-            vec![state.join("identity"), state.join("credential"), state, ancestor,]
+        let observed = observed.into_inner();
+        assert!(
+            observed.starts_with(&[
+                state.join("identity"),
+                state.join("credential"),
+                state,
+                ancestor,
+                temp.path().to_path_buf(),
+            ]),
+            "new state trees must sync every created directory and immediate parent leaf-up: {observed:?}"
         );
     }
 
@@ -510,14 +557,15 @@ mod tests {
         .expect("retry must repeat durability preparation");
 
         assert_eq!(prepared, state);
-        assert_eq!(
-            retry.into_inner(),
-            vec![
+        let retry = retry.into_inner();
+        assert!(
+            retry.starts_with(&[
                 state.join("identity"),
                 state.join("credential"),
                 state.clone(),
                 temp.path().to_path_buf(),
-            ]
+            ]),
+            "an interrupted complete tree must resync its managed path before older ancestors: {retry:?}"
         );
         assert_eq!(fs::read(&ready).expect("read ready marker"), BOOTSTRAP_READY_CONTENTS);
 
@@ -552,6 +600,88 @@ mod tests {
             assert_eq!(calls.get(), fail_at);
             assert!(!state.join(BOOTSTRAP_READY_FILE).exists());
         }
+    }
+
+    #[test]
+    fn multi_level_creation_retries_every_required_directory_sync() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+
+        for fail_at in 1..=6 {
+            let safe = temp.path().join(format!("safe-{fail_at}"));
+            let connect = safe.join("connect");
+            let state = connect.join("state");
+            let expected = [
+                state.join("identity"),
+                state.join("credential"),
+                state.clone(),
+                connect,
+                safe,
+                temp.path().to_path_buf(),
+            ];
+            let calls = Cell::new(0);
+            let error = prepare_state_directory_with_sync(&state, |path| {
+                assert_eq!(path, &expected[calls.get()]);
+                calls.set(calls.get() + 1);
+                if calls.get() == fail_at {
+                    return Err(io::Error::other("injected multi-level sync failure"));
+                }
+                Ok(())
+            })
+            .expect_err("every new-directory durability failure must stop preparation");
+
+            assert!(matches!(error, RegistrationBootstrapError::Input(_)));
+            assert_eq!(calls.get(), fail_at);
+            assert!(!state.join(BOOTSTRAP_READY_FILE).exists());
+
+            let retry = RefCell::new(Vec::new());
+            prepare_state_directory_with_sync(&state, |path| {
+                retry.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            })
+            .expect("retry must complete every interrupted directory sync");
+            assert!(retry.into_inner().starts_with(&expected));
+            assert!(ready_marker_exists(&state.join(BOOTSTRAP_READY_FILE)).expect("validate ready marker"));
+        }
+    }
+
+    #[test]
+    fn missing_directory_replacement_is_revalidated_after_create_race() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("create symlink target");
+        let linked_state = temp.path().join("linked-state");
+        let error = prepare_state_directory_with_sync_and_missing_observer(
+            &linked_state,
+            |_| panic!("a raced symlink must fail before syncing"),
+            |missing| {
+                if missing == linked_state {
+                    symlink(&target, missing).expect("replace missing state with symlink");
+                }
+            },
+        )
+        .expect_err("raced symlink must fail closed");
+        assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+        assert!(!target.join("identity").exists());
+        assert!(!target.join("credential").exists());
+        assert!(!target.join(BOOTSTRAP_READY_FILE).exists());
+
+        let shared_state = temp.path().join("shared-state-race");
+        let error = prepare_state_directory_with_sync_and_missing_observer(
+            &shared_state,
+            |_| panic!("a raced shared directory must fail before syncing"),
+            |missing| {
+                if missing == shared_state {
+                    fs::create_dir(missing).expect("replace missing state with directory");
+                    fs::set_permissions(missing, fs::Permissions::from_mode(0o770)).expect("share raced directory");
+                }
+            },
+        )
+        .expect_err("raced shared directory must fail closed");
+        assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+        assert!(!shared_state.join("identity").exists());
+        assert!(!shared_state.join("credential").exists());
+        assert!(!shared_state.join(BOOTSTRAP_READY_FILE).exists());
     }
 
     #[test]
@@ -613,22 +743,21 @@ mod tests {
     #[test]
     fn concurrent_preparation_publishes_one_safe_ready_marker() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let state = temp.path().join("state");
-        create_secure_state_tree(&state);
+        let first_missing = temp.path().join("safe");
+        let state = first_missing.join("connect/state");
         let barrier = Arc::new(Barrier::new(2));
 
         std::thread::scope(|scope| {
             let handles = (0..2)
                 .map(|_| {
                     let barrier = barrier.clone();
+                    let first_missing = first_missing.clone();
                     let state = state.clone();
                     scope.spawn(move || {
-                        let first = Cell::new(true);
-                        prepare_state_directory_with_sync(&state, |path| {
-                            if first.replace(false) {
+                        prepare_state_directory_with_sync_and_missing_observer(&state, sync_directory, |missing| {
+                            if missing == first_missing {
                                 barrier.wait();
                             }
-                            sync_directory(path)
                         })
                     })
                 })
