@@ -342,6 +342,10 @@ jobs:
         if: always()
         run: |
           status="${{ steps.ab.outputs.status }}"
+          if [[ -z "$status" ]]; then
+            echo "::error::warp A/B setup failed before the rig ran. Check the first failed workflow step." >&2
+            exit 1
+          fi
           if [[ "$status" != "0" ]]; then
             echo "::error::warp A/B budget gate failed (exit $status). See the step summary / gate.md artifact." >&2
             exit "$status"
