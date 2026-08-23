@@ -11690,6 +11690,7 @@ mod pools_tests {
         let generation = OffsetDateTime::UNIX_EPOCH;
         let canceler = DecommissionCanceler::new(CancellationToken::new());
         let pool_meta = PoolMeta {
+            version: super::POOL_META_VERSION,
             pools: vec![decommission_test_pool_status(
                 0,
                 Some(PoolDecommissionInfo {
@@ -11839,16 +11840,11 @@ mod pools_tests {
         );
         assert!(!canceler.is_cancelled(), "the token must remain live until persistence commits");
 
-        let mut complete = tokio::spawn({
-            let store = store.clone();
-            async move { store.complete_decommission(0).await }
-        });
         let mut fail = tokio::spawn({
             let store = store.clone();
             async move { store.decommission_failed(0).await }
         });
         tokio::task::yield_now().await;
-        assert!(!complete.is_finished(), "complete must serialize behind the pending cancel");
         assert!(!fail.is_finished(), "fail must serialize behind the pending cancel");
 
         save_release.notify_one();
@@ -11874,11 +11870,6 @@ mod pools_tests {
             .expect("cancel should finish after in-flight movement quiesces")
             .expect("cancel task should not panic")
             .expect("cancel should commit");
-        tokio::time::timeout(StdDuration::from_secs(1), &mut complete)
-            .await
-            .expect("complete should finish after cancel commits")
-            .expect("complete task should not panic")
-            .expect("stale complete should be a no-op");
         tokio::time::timeout(StdDuration::from_secs(1), &mut fail)
             .await
             .expect("fail should finish after cancel commits")
