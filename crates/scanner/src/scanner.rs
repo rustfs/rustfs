@@ -63,6 +63,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::storage_api::owner::SCANNER_PUBLICATION_LEASE_TTL_MS;
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
     SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -407,7 +408,7 @@ async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> Result<(), EcstoreError> {
-    sync_data_usage_backup_from_primary_for_epoch(ctx, storeapi, None).await
+    sync_data_usage_backup_from_primary_for_epoch_and_lease(ctx, storeapi, None, None).await
 }
 
 async fn sync_data_usage_backup_from_primary_for_epoch(
@@ -415,10 +416,22 @@ async fn sync_data_usage_backup_from_primary_for_epoch(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     expected_publication_epoch: Option<u64>,
 ) -> Result<(), EcstoreError> {
+    sync_data_usage_backup_from_primary_for_epoch_and_lease(ctx, storeapi, expected_publication_epoch, None).await
+}
+
+async fn sync_data_usage_backup_from_primary_for_epoch_and_lease(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    expected_publication_epoch: Option<u64>,
+    remote_lease_deadline: Option<std::time::Instant>,
+) -> Result<(), EcstoreError> {
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
         if ctx.is_cancelled() {
             return Ok(());
+        }
+        if remote_lease_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
         }
 
         let read_epoch = match expected_publication_epoch {
@@ -446,6 +459,10 @@ async fn sync_data_usage_backup_from_primary_for_epoch(
         }
         let primary = Bytes::from(primary);
 
+        if remote_lease_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+        }
+
         let (backup, revision) = read_config_with_revision(storeapi.clone(), &backup_path).await?;
         if backup.as_deref() == Some(primary.as_ref()) {
             if scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
@@ -462,6 +479,9 @@ async fn sync_data_usage_backup_from_primary_for_epoch(
 
         let sha256hex = Some(hex_simd::encode_to_string(Sha256::digest(&primary), hex_simd::AsciiCase::Lower));
         let save_result = {
+            if remote_lease_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+            }
             let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
                 if retry < SCANNER_PERSIST_CAS_RETRIES {
                     continue;
@@ -1377,8 +1397,51 @@ async fn run_data_scanner_cycle_with_budget(
     };
     let publication_deferred = publication_defer_reason.is_some();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
+    let remote_publication_lease_targets = if publication_defer_reason.is_none() {
+        scan_result
+            .as_ref()
+            .ok()
+            .map(|result| result.remote_publication_lease_targets().to_vec())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut remote_publication_leases = None;
+    let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
+        None
+    } else if usage_persist_timeout >= Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS) {
+        // The lease is intentionally fixed-duration and has no renewal path.
+        // Refuse a persistence budget that could outlive it instead of
+        // allowing the peer to admit movement while a local PUT is in flight.
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    } else if let Some(notification_system) = storeapi.notification_system() {
+        match notification_system
+            .acquire_scanner_publication_leases(remote_publication_lease_targets)
+            .await
+        {
+            Ok(grants) => {
+                remote_publication_leases = Some((notification_system, grants));
+                None
+            }
+            Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        }
+    } else {
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    };
+    let remote_lease_deadline = remote_publication_leases
+        .as_ref()
+        .and_then(|(_, grants)| grants.iter().map(|grant| grant.lease.expires_at).min());
+    let remote_lease_covers_persistence = remote_lease_deadline.is_none_or(|deadline| {
+        std::time::Instant::now()
+            .checked_add(usage_persist_timeout)
+            .is_some_and(|latest_finish| latest_finish < deadline)
+    });
+    let publication_defer_reason = publication_defer_reason.or(remote_lease_defer_reason);
+    let publication_defer_reason = (!remote_lease_covers_persistence)
+        .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        .or(publication_defer_reason);
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
-    let usage_persist_outcome = match publication_defer_reason {
+    let mut usage_persist_outcome = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
             DataUsagePersistOutcome::Deferred(reason)
@@ -1398,6 +1461,7 @@ async fn run_data_scanner_cycle_with_budget(
                     Some(leader_epoch),
                     Some(usage_persist_baseline),
                     publication_epoch,
+                    remote_lease_deadline,
                     move || {
                         let storeapi = route_probe_store.clone();
                         async move { storeapi.scanner_data_usage_publication_blocked().await }
@@ -1448,6 +1512,22 @@ async fn run_data_scanner_cycle_with_budget(
             }
         }
     };
+    let lease_expired = remote_publication_leases
+        .as_ref()
+        .is_some_and(|(_, grants)| grants.iter().any(|grant| !grant.lease.is_valid()));
+    if let Some((notification_system, grants)) = remote_publication_leases.take() {
+        let release_result = notification_system.release_scanner_publication_leases(grants).await;
+        if lease_expired || release_result.is_err() {
+            // A lease that expired or could not be released is never treated
+            // as a successful authoritative publication. The peer may have
+            // admitted movement immediately after the lease ended.
+            usage_persist_outcome = if usage_persist_outcome == DataUsagePersistOutcome::Failed {
+                DataUsagePersistOutcome::Failed
+            } else {
+                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+            };
+        }
+    }
     let unresolved_heal_work = global_metrics().current_scan_cycle_has_unresolved_heal_work();
 
     let scan_cycle_result = match scan_result {
@@ -2622,7 +2702,7 @@ use usage_store::*;
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
     ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_snapshot_digest, scanner_dirty_usage_acknowledgements,
+    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_dirty_usage_acknowledgements,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 #[cfg(test)]

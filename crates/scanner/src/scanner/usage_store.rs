@@ -29,6 +29,10 @@ pub(super) enum DataUsagePersistOutcome {
     Failed,
 }
 
+fn remote_lease_expired(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DataUsagePersistBaseline {
     pub(super) data: Option<Bytes>,
@@ -130,6 +134,7 @@ where
         leader_epoch,
         initial_baseline,
         None,
+        None,
         route_probe,
     )
     .await
@@ -145,6 +150,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
     expected_publication_epoch: Option<u64>,
+    remote_lease_deadline: Option<std::time::Instant>,
     route_probe: F,
 ) -> DataUsagePersistOutcome
 where
@@ -161,6 +167,10 @@ where
         }
         if let Some(leader_epoch) = leader_epoch {
             data_usage_info.scanner_epoch = Some(leader_epoch);
+        }
+        if remote_lease_expired(remote_lease_deadline) {
+            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+            break 'updates;
         }
         if let Some(expected_epoch) = expected_publication_epoch
             && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
@@ -430,6 +440,9 @@ where
                 );
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
+            if remote_lease_expired(remote_lease_deadline) {
+                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+            }
 
             let done_save = Metrics::time(Metric::SaveUsage);
             let save_result = {
@@ -439,6 +452,10 @@ where
                     done_save();
                     break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
                 };
+                if remote_lease_expired(remote_lease_deadline) {
+                    done_save();
+                    break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                }
                 save_config_shared_with_preconditions(
                     storeapi.clone(),
                     target_path,
@@ -538,10 +555,11 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
                         storeapi.clone(),
                         &data_usage_info,
                         expected_publication_epoch,
+                        remote_lease_deadline,
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -559,10 +577,11 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
                         storeapi.clone(),
                         &data_usage_info,
                         expected_publication_epoch,
+                        remote_lease_deadline,
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -599,10 +618,11 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
                         storeapi.clone(),
                         &data_usage_info,
                         expected_publication_epoch,
+                        remote_lease_deadline,
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -620,8 +640,13 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            let backup_result =
-                sync_data_usage_backup_from_primary_for_epoch(&ctx, storeapi.clone(), expected_publication_epoch).await;
+            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease(
+                &ctx,
+                storeapi.clone(),
+                expected_publication_epoch,
+                remote_lease_deadline,
+            )
+            .await;
             done_save();
             if let Err(e) = backup_result {
                 warn!(
@@ -652,6 +677,18 @@ pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
     authoritative: &DataUsageInfo,
     expected_publication_epoch: Option<u64>,
 ) -> bool {
+    cleanup_observed_data_usage_snapshot_for_epoch_and_lease(storeapi, authoritative, expected_publication_epoch, None).await
+}
+
+async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    authoritative: &DataUsageInfo,
+    expected_publication_epoch: Option<u64>,
+    remote_lease_deadline: Option<std::time::Instant>,
+) -> bool {
+    if remote_lease_expired(remote_lease_deadline) {
+        return false;
+    }
     let read_epoch = match expected_publication_epoch {
         Some(expected_epoch) => {
             if scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
@@ -667,10 +704,11 @@ pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
             None => return false,
         },
     };
-    if expected_publication_epoch.is_some()
-        && scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
-            .await
-            .is_none()
+    if remote_lease_expired(remote_lease_deadline)
+        || expected_publication_epoch.is_some()
+            && scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+                .await
+                .is_none()
     {
         return false;
     }
@@ -710,6 +748,9 @@ pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
     };
     if observed_data_usage_is_newer(&observed, authoritative) {
         return true;
+    }
+    if remote_lease_expired(remote_lease_deadline) {
+        return false;
     }
 
     let result = delete_config_with_publication_admission_for_epoch(

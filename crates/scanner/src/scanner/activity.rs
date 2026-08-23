@@ -745,6 +745,14 @@ pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivi
         })
 }
 
+pub(crate) fn scanner_activity_publication_lease_targets(snapshot: &ScannerActivitySnapshot) -> Vec<(String, String, u64)> {
+    snapshot
+        .iter()
+        .filter(|(host, _)| host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE)
+        .map(|(host, activity)| (host.clone(), activity.instance_id.clone(), activity.movement_generation))
+        .collect()
+}
+
 pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySnapshot) -> Vec<ScannerDirtyUsageAcknowledgement> {
     snapshot
         .iter()
