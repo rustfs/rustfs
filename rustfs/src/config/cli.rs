@@ -56,7 +56,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect", "connect"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -118,6 +118,42 @@ pub enum Commands {
     Diagnose(DiagnoseOpts),
     /// Offline, read-only inspection of on-disk data (no server required)
     Inspect(InspectOpts),
+    /// Configure outbound RustFS Connect integration
+    Connect(ConnectOpts),
+}
+
+/// RustFS Connect subcommand options
+#[derive(Args, Clone)]
+pub struct ConnectOpts {
+    #[command(subcommand)]
+    pub command: ConnectCommands,
+}
+
+/// Allow-listed RustFS Connect operations
+#[derive(Subcommand, Clone)]
+pub enum ConnectCommands {
+    /// Exchange a protected one-time token for a durable device credential (Unix only)
+    Register(ConnectRegisterOpts),
+}
+
+/// `connect register` options
+#[derive(Args, Clone)]
+pub struct ConnectRegisterOpts {
+    /// Connect agent API HTTPS base URL
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub endpoint: String,
+
+    /// PEM root CA file used only for this Connect endpoint
+    #[arg(long = "ca-file")]
+    pub ca_file: PathBuf,
+
+    /// Explicit directory shared with the Connect heartbeat runtime
+    #[arg(long = "state-dir")]
+    pub state_dir: PathBuf,
+
+    /// Owner-only regular token file; omit to read the token from stdin
+    #[arg(long = "token-file")]
+    pub token_file: Option<PathBuf>,
 }
 
 /// Offline inspection subcommand options
@@ -412,6 +448,8 @@ pub enum CommandResult {
     Diagnose(DiagnoseOpts),
     /// Inspect command with options
     Inspect(InspectOpts),
+    /// One-time Connect registration command
+    ConnectRegister(ConnectRegisterOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -451,7 +489,7 @@ pub fn default_server_opts() -> ServerOpts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InspectCommands, preprocess_args_for_legacy};
+    use super::{Cli, Commands, ConnectCommands, InspectCommands, preprocess_args_for_legacy};
     use clap::Parser;
     use clap::error::ErrorKind;
 
@@ -514,5 +552,64 @@ mod tests {
         };
 
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn connect_register_accepts_only_paths_and_endpoint_configuration() {
+        let cli = Cli::try_parse_from([
+            "rustfs",
+            "connect",
+            "register",
+            "--endpoint",
+            "https://connect.example/agent/",
+            "--ca-file",
+            "/etc/rustfs/connect-ca.pem",
+            "--state-dir",
+            "/var/lib/rustfs/connect",
+        ])
+        .expect("connect register arguments should parse");
+
+        let Some(Commands::Connect(connect)) = cli.command else {
+            panic!("connect command expected");
+        };
+        let ConnectCommands::Register(register) = connect.command;
+        assert_eq!(register.endpoint, "https://connect.example/agent/");
+        assert_eq!(register.ca_file, std::path::Path::new("/etc/rustfs/connect-ca.pem"));
+        assert_eq!(register.state_dir, std::path::Path::new("/var/lib/rustfs/connect"));
+        assert!(register.token_file.is_none());
+    }
+
+    #[test]
+    fn connect_register_has_no_token_value_or_environment_option() {
+        for forbidden in ["--token", "--registration-token", "--token-env"] {
+            let result = Cli::try_parse_from([
+                "rustfs",
+                "connect",
+                "register",
+                "--endpoint",
+                "https://connect.example/agent/",
+                "--ca-file",
+                "/etc/rustfs/connect-ca.pem",
+                "--state-dir",
+                "/var/lib/rustfs/connect",
+                forbidden,
+                "secret",
+            ]);
+            let Err(error) = result else {
+                panic!("secret-bearing command-line options must be rejected");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn connect_register_help_states_the_unix_only_security_scope() {
+        let result = Cli::try_parse_from(["rustfs", "connect", "register", "--help"]);
+        let Err(help) = result else {
+            panic!("help exits without running registration");
+        };
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("Unix only"));
     }
 }

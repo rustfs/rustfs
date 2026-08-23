@@ -61,6 +61,11 @@ mod get_codec_streaming_compat_test;
 #[cfg(test)]
 mod version_id_regression_test;
 
+// Receiver-side replication LWW (rustfs/backlog#1953): stale inbound
+// replication metadata must not overwrite a newer local category state.
+#[cfg(test)]
+mod replication_lww_receiver_test;
+
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;

@@ -4756,7 +4756,15 @@ impl SetDisks {
                 achieved: 0,
             });
         }
-        let parts_metadata = vec![fi.clone(); disks.len()];
+        // Rebuilt tiered metadata starts with index zero, but shuffling validates
+        // each source slot before assigning the shuffled index below.
+        let parts_metadata: Vec<FileInfo> = (0..disks.len())
+            .map(|disk_index| {
+                let mut part = fi.clone();
+                part.erasure.index = fi.erasure.distribution[disk_index];
+                part
+            })
+            .collect();
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mut errs = Vec::with_capacity(shuffle_disks.len());

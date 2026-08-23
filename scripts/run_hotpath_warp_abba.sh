@@ -34,8 +34,8 @@ CONCURRENCY=8
 DURATION="60s"
 ROUNDS=3
 COOLDOWN_SECS=20
-DATASET_SETUP_DURATION="10s"
 HEALTH_TIMEOUT_SECS=180
+DATASET_OBJECTS_PER_WORKER=8
 FAIL_PCT=10
 WARN_PCT=5
 ALLOW_REGRESSION=false
@@ -100,9 +100,6 @@ Benchmark:
   --duration <dur>          warp duration per cell (default 60s).
   --rounds <n>              rounds per cell; must be >= 3 (default 3).
   --cooldown <n>            cooldown seconds between rounds/sizes (default 20).
-  --dataset-setup-duration <dur>
-                            isolated Warp PUT warm-up for get/mixed legs
-                            (default 10s; not included in the measurement).
   --concurrency <n>         warp concurrency (default 8).
   --warp-bin <path>         warp binary (default warp).
 
@@ -173,7 +170,6 @@ while [[ $# -gt 0 ]]; do
     --duration) DURATION="$2"; shift 2 ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
     --cooldown) COOLDOWN_SECS="$2"; shift 2 ;;
-    --dataset-setup-duration) DATASET_SETUP_DURATION="$2"; shift 2 ;;
     --health-timeout) HEALTH_TIMEOUT_SECS="$2"; shift 2 ;;
     --fail-pct) FAIL_PCT="$2"; shift 2 ;;
     --warn-pct) WARN_PCT="$2"; shift 2 ;;
@@ -366,27 +362,16 @@ measure() {
     --duration "$DURATION" --rounds "$ROUNDS" --cooldown-secs "$COOLDOWN_SECS"
     --out-dir "$cell"
   )
-  [[ "$mode" == "put" ]] || args+=(--extra-args "--noclear")
+  if [[ "$mode" != "put" ]]; then
+    # Warp defaults to 2,500 setup objects per round. At 10 MiB that writes
+    # 25 GiB before every 12-second measurement, so the matrix cannot finish
+    # inside the workflow budget. Eight objects per worker keeps preparation
+    # bounded while retaining a multi-object working set for relative A/B.
+    args+=(--extra-args "--objects $((CONCURRENCY * DATASET_OBJECTS_PER_WORKER)) --noclear")
+  fi
   [[ -n "$baseline_csv" ]] && args+=(--baseline-csv "$baseline_csv")
   run "$ENHANCED_BENCH" "${args[@]}" >&2
   echo "$cell"
-}
-
-prepare_dataset() {
-  local leg="$1" workload="$2" mode="$3" size="$4" sync_label="$5" bucket="$6"
-  [[ "$mode" != "put" ]] || return 0
-
-  local setup_cell="$OUT_DIR/$workload/$sync_label/$leg/dataset-setup"
-  local args=(
-    --tool warp --warp-bin "$WARP_BIN" --warp-mode put
-    --endpoint "$ADDRESS" --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY"
-    --region "$REGION" --bucket "$bucket" --sizes "$size" --concurrency "$CONCURRENCY"
-    --duration "$DATASET_SETUP_DURATION" --rounds 1 --cooldown-secs 0
-    --extra-args "--noclear"
-    --out-dir "$setup_cell"
-  )
-  log "preparing isolated dataset: $sync_label/$workload/$leg bucket=$bucket"
-  run "$ENHANCED_BENCH" "${args[@]}" >&2
 }
 
 write_schedule_header() {
@@ -399,7 +384,7 @@ append_schedule() {
   phase="$(phase_for_leg "$leg")"
   bin="$(binary_for_leg "$leg")"
   local dataset_setup="none"
-  [[ "$mode" == "put" ]] || dataset_setup="warp-put"
+  [[ "$mode" == "put" ]] || dataset_setup="warp-native-bounded"
   echo "$sync_label,$drive_sync,$workload,$mode,$size,$leg,$phase,$bin,$OUT_DIR/$workload/$sync_label/$leg,$bucket,$dataset_setup" >>"$OUT_DIR/abba_schedule.csv"
 }
 
@@ -481,7 +466,8 @@ dataset_namespace=$DATASET_NAMESPACE
 local_run_data_root=$RUN_DATA_ROOT
 bucket_isolation=per-leg
 bucket_prefix=rustfs-abba-$DATASET_NAMESPACE
-dataset_setup=get-and-mixed-via-warp-put
+dataset_setup=get-and-mixed-via-bounded-warp-native
+dataset_objects=$((CONCURRENCY * DATASET_OBJECTS_PER_WORKER))
 endpoint=$ADDRESS
 warp_version=$("$WARP_BIN" --version 2>/dev/null | head -n1 || echo unknown)
 EOF
@@ -489,6 +475,8 @@ EOF
 
 declare -a CANDIDATE_COMPARE_CSVS=()
 declare -a DRIFT_COMPARE_CSVS=()
+declare -a CANDIDATE_COMPARE_LABELS=()
+declare -a DRIFT_COMPARE_LABELS=()
 
 write_manifest
 write_schedule_header
@@ -502,7 +490,6 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
       log "=== $sync_label $workload leg $leg ($(phase_for_leg "$leg")) ==="
       bucket="$(bucket_for_leg "$sync_label" "$workload" "$leg")"
       bring_up "$leg" "$drive_sync" "$workload" "$mode" "$size" "$sync_label" "$bucket"
-      prepare_dataset "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket"
       append_schedule "$sync_label" "$drive_sync" "$workload" "$mode" "$size" "$leg" "$bucket"
 
       baseline_csv=""
@@ -512,8 +499,14 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
 
       cell="$(measure "$leg" "$workload" "$mode" "$size" "$sync_label" "$bucket" "$baseline_csv")"
       case "$leg" in
-        B1|B2) CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv") ;;
-        A2) DRIFT_COMPARE_CSVS+=("$cell/baseline_compare.csv") ;;
+        B1|B2)
+          CANDIDATE_COMPARE_CSVS+=("$cell/baseline_compare.csv")
+          CANDIDATE_COMPARE_LABELS+=("$sync_label/$workload/$leg-vs-A1")
+          ;;
+        A2)
+          DRIFT_COMPARE_CSVS+=("$cell/baseline_compare.csv")
+          DRIFT_COMPARE_LABELS+=("$sync_label/$workload/A2-vs-A1")
+          ;;
       esac
       tear_down
     done
@@ -521,14 +514,14 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
 done
 
 gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/candidate_gate.md")
-for csv in "${CANDIDATE_COMPARE_CSVS[@]}"; do
-  gate_args+=(--compare-csv "$csv")
+for i in "${!CANDIDATE_COMPARE_CSVS[@]}"; do
+  gate_args+=(--labeled-compare-csv "${CANDIDATE_COMPARE_LABELS[$i]}" "${CANDIDATE_COMPARE_CSVS[$i]}")
 done
 [[ "$ALLOW_REGRESSION" == "true" ]] && gate_args+=(--allow-regression --exemption-reason "$EXEMPTION_REASON")
 
 drift_gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --require-tail-error --markdown "$OUT_DIR/baseline_drift_gate.md")
-for csv in "${DRIFT_COMPARE_CSVS[@]}"; do
-  drift_gate_args+=(--compare-csv "$csv")
+for i in "${!DRIFT_COMPARE_CSVS[@]}"; do
+  drift_gate_args+=(--labeled-compare-csv "${DRIFT_COMPARE_LABELS[$i]}" "${DRIFT_COMPARE_CSVS[$i]}")
 done
 
 if [[ "$DRY_RUN" == "true" ]]; then
