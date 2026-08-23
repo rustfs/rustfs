@@ -522,6 +522,25 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).expect("restore CA mode");
 
+    let marker_state = temp.path().join("unsafe-marker-state");
+    for directory in [
+        marker_state.clone(),
+        marker_state.join("identity"),
+        marker_state.join("credential"),
+    ] {
+        fs::create_dir_all(&directory).expect("create marker state directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("secure marker state directory");
+    }
+    let marker_target = temp.path().join("unsafe-marker-target");
+    write_file(&marker_target, b"v1\n", 0o600);
+    symlink(marker_target, marker_state.join(".bootstrap-ready")).expect("ready marker symlink");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind marker gate");
+    let error = register_from_protected_input(endpoint, &root, &marker_state, Some(&token))
+        .await
+        .expect_err("unsafe marker must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateMarkerSecurity));
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after marker gate");
+
     let shared_state = temp.path().join("shared-state");
     fs::create_dir(&shared_state).expect("shared state directory");
     fs::set_permissions(&shared_state, fs::Permissions::from_mode(0o770)).expect("make state group-writable");
@@ -616,6 +635,7 @@ fn assert_owner_only_files(state: &std::path::Path) {
 
     for path in [
         state.to_path_buf(),
+        state.join(".bootstrap-ready"),
         state.join("identity"),
         state.join("credential"),
         state.join("identity/device.key"),
