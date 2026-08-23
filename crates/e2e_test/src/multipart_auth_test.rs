@@ -4278,10 +4278,6 @@ async fn test_signed_put_object_extract_preserves_pax_metadata_and_version_id()
 async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retention_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if !crate::common::awscurl_available() {
-        return Ok(());
-    }
-
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
 

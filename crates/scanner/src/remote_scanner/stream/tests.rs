@@ -195,6 +195,7 @@ fn test_usage(bucket: &str, objects: usize) -> DataUsageEntryInfo {
         name: bucket.to_string(),
         parent: crate::DATA_USAGE_ROOT.to_string(),
         entry,
+        tier_registry_generation: Some(0),
     }
 }
 
@@ -749,6 +750,43 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
     assert_eq!(usage.entry.objects, 3);
     assert!(pending_maintenance_work);
     assert_eq!(budget.progress(), (3, 2));
+}
+
+#[tokio::test]
+async fn terminal_usage_from_a_different_tier_generation_is_rejected() {
+    let request_id = Uuid::new_v4();
+    let writer_auth = FrameAuthenticator::for_test(request_id);
+    let reader_auth = FrameAuthenticator::for_test(request_id);
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let mut usage = test_usage("bucket", 1);
+        usage.tier_registry_generation = Some(1);
+        let mut sequence = 0;
+        write_frame(
+            &mut writer,
+            &writer_auth,
+            &mut sequence,
+            &RemoteScannerFrame::terminal(
+                RemoteScannerProgress::default(),
+                RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
+                    source: TEST_SOURCE,
+                    scan_plan_digest: TEST_PLAN_DIGEST,
+                    usage,
+                    pending_maintenance_work: false,
+                })),
+            ),
+        )
+        .await
+        .expect("terminal frame should write");
+    });
+
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let error = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+        .await
+        .expect_err("generation mismatch must fail closed");
+
+    assert!(error.to_string().contains("tier registry generation"));
 }
 
 #[tokio::test]

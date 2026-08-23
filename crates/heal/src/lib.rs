@@ -19,7 +19,7 @@ pub use error::{Error, Result};
 pub use heal::{
     HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
     channel::HealChannelProcessor,
-    progress::HealProgress,
+    progress::{HealProgress, aggregate_heal_progress},
     resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
