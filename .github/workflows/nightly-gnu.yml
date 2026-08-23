@@ -39,11 +39,10 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
-      - name: Checkout main branch
+      - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: main
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -89,11 +88,10 @@ jobs:
       # either casing.
       NO_PROXY: 127.0.0.1,localhost
     steps:
-      - name: Checkout main branch
+      - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: main
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -178,11 +176,10 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       NO_PROXY: 127.0.0.1,localhost
     steps:
-      - name: Checkout main branch
+      - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
-          ref: main
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
