@@ -80,11 +80,11 @@ pub async fn register_from_protected_input(
     })
     .map_err(|_| RegistrationBootstrapError::Configuration)?;
 
+    let state_directory = prepare_state_directory(state_directory)?;
     let token = match token_file {
         Some(path) => RegistrationToken::from_reader(open_regular_file(path, true)?),
         None => RegistrationToken::from_reader(io::stdin().lock()),
     }?;
-    let state_directory = prepare_state_directory(state_directory)?;
     let cluster_name = format!("organizations/{}/clusters/{}", token.organization_uid, token.cluster_uid);
     let credential = client
         .register(
@@ -123,11 +123,23 @@ fn prepare_state_directory_with_sync(
     let mut directories = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
     directories.reverse();
     for directory in &directories {
-        ensure_directory(directory, directory == &path)?;
+        if ensure_directory(directory, directory == &path)? {
+            sync(directory).map_err(RegistrationBootstrapError::Input)?;
+            let parent = directory.parent().ok_or_else(|| {
+                RegistrationBootstrapError::Input(io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent"))
+            })?;
+            sync(parent).map_err(RegistrationBootstrapError::Input)?;
+        }
     }
     let store_directories = [path.join("identity"), path.join("credential")];
     for directory in &store_directories {
-        ensure_directory(directory, true)?;
+        if ensure_directory(directory, true)? {
+            sync(directory).map_err(RegistrationBootstrapError::Input)?;
+            let parent = directory.parent().ok_or_else(|| {
+                RegistrationBootstrapError::Input(io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent"))
+            })?;
+            sync(parent).map_err(RegistrationBootstrapError::Input)?;
+        }
     }
     for directory in &directories {
         validate_directory(directory, directory == &path)?;
@@ -135,26 +147,28 @@ fn prepare_state_directory_with_sync(
     for directory in &store_directories {
         validate_directory(directory, true)?;
     }
-    // Repeat the complete leaf-to-root sync chain even for existing entries. A retry after a
-    // previous sync failure must not reach registration while an ancestor is still non-durable.
-    for directory in store_directories.iter().chain(directories.iter().rev()) {
-        sync(directory).map_err(RegistrationBootstrapError::Input)?;
-    }
-
     Ok(path)
 }
 
 #[cfg(unix)]
-fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
+fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<bool, RegistrationBootstrapError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_directory(path, require_process_owner),
+        Ok(_) => {
+            validate_directory(path, require_process_owner)?;
+            Ok(false)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
             use std::os::unix::fs::DirBuilderExt as _;
             builder.mode(0o700);
             match builder.create(path) {
-                Ok(()) => validate_directory(path, true),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => validate_directory(path, require_process_owner),
+                Ok(()) => {
+                    validate_directory(path, true)?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    Err(RegistrationBootstrapError::StateDirectorySecurity)
+                }
                 Err(error) => Err(RegistrationBootstrapError::Input(error)),
             }
         }
@@ -244,8 +258,10 @@ fn unix_ca_file_is_trusted(owner_uid: u32, mode: u32, process_uid: u32) -> bool 
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::fs;
     use std::io;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::{
         RegistrationBootstrapError, prepare_state_directory_with_sync, unix_ca_file_is_trusted, unix_directory_is_trusted,
@@ -276,15 +292,19 @@ mod tests {
     }
 
     #[test]
-    fn state_directories_are_synced_leaf_first_and_sync_failures_propagate() {
+    fn new_state_chain_syncs_each_created_directory_then_parent_and_propagates_failure() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let state = temp.path().join("state");
+        let ancestor = temp.path().join("connect");
+        let state = ancestor.join("state");
         let observed = RefCell::new(Vec::new());
+        let calls = Cell::new(0);
 
         let error = prepare_state_directory_with_sync(&state, |path| {
+            assert!(path.is_dir(), "directory must exist before it is synced");
             observed.borrow_mut().push(path.to_path_buf());
-            if path == temp.path() {
-                return Err(io::Error::other("injected parent sync failure"));
+            calls.set(calls.get() + 1);
+            if calls.get() == 8 {
+                return Err(io::Error::other("injected final parent sync failure"));
             }
             Ok(())
         })
@@ -294,12 +314,37 @@ mod tests {
         assert_eq!(
             observed.into_inner(),
             vec![
+                ancestor.clone(),
+                temp.path().to_path_buf(),
+                state.clone(),
+                ancestor,
                 state.join("identity"),
+                state.clone(),
                 state.join("credential"),
                 state,
-                temp.path().to_path_buf(),
             ]
         );
+    }
+
+    #[test]
+    fn existing_state_tree_is_validated_without_syncing() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state = temp.path().join("state");
+        let directories = [state.clone(), state.join("identity"), state.join("credential")];
+        for directory in &directories {
+            fs::create_dir_all(directory).expect("create existing state directory");
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).expect("secure existing state directory");
+        }
+        let calls = Cell::new(0);
+
+        let prepared = prepare_state_directory_with_sync(&state, |_| {
+            calls.set(calls.get() + 1);
+            Err(io::Error::other("existing directories must not be synced"))
+        })
+        .expect("existing secure state tree should be ready");
+
+        assert_eq!(prepared, state);
+        assert_eq!(calls.get(), 0);
     }
 }
 
