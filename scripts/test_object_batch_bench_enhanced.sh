@@ -105,9 +105,10 @@ Operation: STAT - total: 600, 30.0%, Concurrency: 8, Ran 7s
 Requests considered: 600:
  * Avg: 0s, 50%: 0s, 90%: 1ms, 99%: 1ms, Fastest: 0s, Slowest: 150ms, StdDev: 3ms
 LOG
-if [[ "${FAKE_WARP_ERRORS:-0}" == "1" ]]; then
-  echo 'Total Errors: 1.'
-fi
+case "${FAKE_WARP_ERRORS:-}" in
+  spaced) echo 'Total Errors: 1.' ;;
+  compact) echo 'Total Errors:1.' ;;
+esac
 EOF
 chmod +x "$FAKE_WARP"
 
@@ -146,23 +147,25 @@ EOF
 "$RUNNER" --warp-mode put --extract-metrics-from-log "${TMP_DIR}/warp-legacy-report.log" >"${TMP_DIR}/warp-legacy-report.csv"
 rg -qx '10.00 MiB/s,10485760.000000,40.00,2 ms,2.000000,3 ms,3.000000,4 ms,4.000000' "${TMP_DIR}/warp-legacy-report.csv"
 
-if FAKE_WARP_ERRORS=1 "$RUNNER" \
-  --tool warp \
-  --endpoint http://127.0.0.1:9000 \
-  --access-key test-access \
-  --secret-key test-secret \
-  --sizes 32767B \
-  --rounds 1 \
-  --retry-per-round 1 \
-  --retry-sleep-secs 1 \
-  --cooldown-secs 0 \
-  --duration 1s \
-  --out-dir "${TMP_DIR}/fake-warp-errors" \
-  --warp-bin "$FAKE_WARP" >/dev/null 2>&1; then
-  echo "expected Warp request errors to fail the benchmark" >&2
-  exit 1
-fi
-rg -q ',failed,1,' "${TMP_DIR}/fake-warp-errors/round_results.csv"
+for error_format in spaced compact; do
+  if FAKE_WARP_ERRORS="$error_format" "$RUNNER" \
+    --tool warp \
+    --endpoint http://127.0.0.1:9000 \
+    --access-key test-access \
+    --secret-key test-secret \
+    --sizes 32767B \
+    --rounds 1 \
+    --retry-per-round 1 \
+    --retry-sleep-secs 1 \
+    --cooldown-secs 0 \
+    --duration 1s \
+    --out-dir "${TMP_DIR}/fake-warp-errors-${error_format}" \
+    --warp-bin "$FAKE_WARP" >/dev/null 2>&1; then
+    echo "expected Warp ${error_format} request errors to fail the benchmark" >&2
+    exit 1
+  fi
+  rg -q ',failed,1,' "${TMP_DIR}/fake-warp-errors-${error_format}/round_results.csv"
+done
 
 "$RUNNER" \
   --tool warp \

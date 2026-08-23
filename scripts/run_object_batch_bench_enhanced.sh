@@ -1224,7 +1224,7 @@ run_one_attempt() {
   fi
 
   if [[ "$DRY_RUN" != "true" && "$TOOL" == "warp" && "$status" == "ok" ]] \
-    && rg -q '^[[:space:]]*(Total[[:space:]]+)?Errors:[[:space:]]+[1-9][0-9]*[.]?([[:space:]]|$)' "$log_file"; then
+    && rg -q '^[[:space:]]*(Total[[:space:]]+)?Errors:[[:space:]]*[1-9][0-9]*[.]?([[:space:]]|$)' "$log_file"; then
     status="failed"
     exit_code=1
   fi
