@@ -362,6 +362,8 @@ impl InventorySender {
 pub(crate) struct InventoryStateStore {
     #[cfg(unix)]
     directory: Arc<fs::File>,
+    #[cfg(unix)]
+    state_root: Arc<fs::File>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -380,9 +382,13 @@ impl InventoryStateStore {
             return Err(InventoryError::PlatformSecurity);
         }
         #[cfg(unix)]
-        Ok(Self {
-            directory: Arc::new(open_inventory_directory(path)?),
-        })
+        {
+            let (state_root, directory) = open_inventory_directory(path)?;
+            Ok(Self {
+                directory: Arc::new(directory),
+                state_root: Arc::new(state_root),
+            })
+        }
     }
 
     pub(crate) fn try_runtime_lock(&self) -> Result<fs::File, InventoryError> {
@@ -392,7 +398,7 @@ impl InventoryStateStore {
         }
         #[cfg(unix)]
         {
-            validate_directory(&self.directory, true)?;
+            self.validate_anchor()?;
             let lock = open_file_at(&self.directory, ".state.lock", true, true)?;
             validate_regular_file(&lock)?;
             lock.try_lock().map_err(|_| InventoryError::AlreadyRunning)?;
@@ -442,21 +448,59 @@ impl InventoryStateStore {
 
     #[allow(dead_code)] // R06 reads this after the server has stopped.
     pub(crate) fn read_latest(&self, now: chrono::DateTime<chrono::Utc>) -> Result<PersistedInventory, InventoryError> {
+        self.read_latest_inner(now, || {})
+    }
+
+    #[cfg(test)]
+    fn read_latest_after_open(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        after_open: impl FnOnce(),
+    ) -> Result<PersistedInventory, InventoryError> {
+        self.read_latest_inner(now, after_open)
+    }
+
+    fn read_latest_inner(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        after_open: impl FnOnce(),
+    ) -> Result<PersistedInventory, InventoryError> {
         #[cfg(not(unix))]
-        return Err(InventoryError::PlatformSecurity);
+        {
+            let _ = (now, after_open);
+            return Err(InventoryError::PlatformSecurity);
+        }
         #[cfg(unix)]
         {
-            validate_directory(&self.directory, true)?;
+            self.validate_anchor()?;
             let mut file = open_file_at(&self.directory, "latest.json", false, false)?;
             validate_regular_file(&file)?;
             let before = file_identity(&file)?;
+            after_open();
             let bytes = read_bounded(&mut file)?;
             validate_regular_file(&file)?;
             if before != file_identity(&file)? {
                 return Err(InventoryError::PersistenceSecurity);
             }
+            let current = open_file_at(&self.directory, "latest.json", false, false)?;
+            validate_regular_file(&current)?;
+            if before != file_identity(&current)? {
+                return Err(InventoryError::PersistenceSecurity);
+            }
             decode_envelope(&bytes, now)
         }
+    }
+
+    #[cfg(unix)]
+    fn validate_anchor(&self) -> Result<(), InventoryError> {
+        validate_directory(&self.state_root, true)?;
+        validate_directory(&self.directory, true)?;
+        let current = open_directory_at(&self.state_root, "inventory")?;
+        validate_directory(&current, true)?;
+        if file_identity(&self.directory)? != file_identity(&current)? {
+            return Err(InventoryError::PersistenceSecurity);
+        }
+        Ok(())
     }
 
     fn prepare_sync(&self, snapshot: InventorySnapshot) -> Result<Option<PendingInventory>, InventoryError> {
@@ -496,7 +540,7 @@ impl InventoryStateStore {
         }
         #[cfg(unix)]
         {
-            validate_directory(&self.directory, true)?;
+            self.validate_anchor()?;
             let mut file = match open_file_at(&self.directory, "state.json", false, false) {
                 Ok(file) => file,
                 Err(InventoryError::StateMissing) => return Ok(InventoryState::default()),
@@ -560,7 +604,7 @@ impl InventoryStateStore {
         }
         #[cfg(unix)]
         {
-            validate_directory(&self.directory, true)?;
+            self.validate_anchor()?;
             match open_file_at(&self.directory, destination, false, false) {
                 Ok(existing) => validate_regular_file(&existing)?,
                 Err(InventoryError::StateMissing) => {}
@@ -568,7 +612,7 @@ impl InventoryStateStore {
             }
             let (temp_name, mut temp) = stage_at(&self.directory, destination)?;
             #[cfg(test)]
-            let injected_write = matches!(fault, Some(PersistFault::Write));
+            let injected_write = matches!(fault.as_ref(), Some(PersistFault::Write));
             #[cfg(not(test))]
             let injected_write = false;
             let staged = if injected_write {
@@ -578,7 +622,7 @@ impl InventoryStateStore {
             }
             .and_then(|()| {
                 #[cfg(test)]
-                if matches!(fault, Some(PersistFault::TempSync)) {
+                if matches!(fault.as_ref(), Some(PersistFault::TempSync)) {
                     return Err(InventoryError::StateIo);
                 }
                 temp.sync_all().map_err(|_| InventoryError::StateIo)
@@ -592,7 +636,11 @@ impl InventoryStateStore {
                 return Err(error);
             }
             #[cfg(test)]
-            let rename_failed = matches!(fault, Some(PersistFault::Rename));
+            if let Some(PersistFault::CancelDuringCommit(token)) = fault.as_ref() {
+                token.cancel();
+            }
+            #[cfg(test)]
+            let rename_failed = matches!(fault.as_ref(), Some(PersistFault::Rename));
             #[cfg(not(test))]
             let rename_failed = false;
             if rename_failed || rename_at(&self.directory, &temp_name, destination).is_err() {
@@ -600,7 +648,7 @@ impl InventoryStateStore {
                 return Err(InventoryError::StateIo);
             }
             #[cfg(test)]
-            if matches!(fault, Some(PersistFault::DirectorySync)) {
+            if matches!(fault.as_ref(), Some(PersistFault::DirectorySync)) {
                 return Err(InventoryError::DurabilityAfterCommit);
             }
             self.directory.sync_all().map_err(|_| InventoryError::DurabilityAfterCommit)
@@ -609,12 +657,12 @@ impl InventoryStateStore {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy)]
 enum PersistFault {
     Write,
     TempSync,
     Rename,
     DirectorySync,
+    CancelDuringCommit(tokio_util::sync::CancellationToken),
 }
 
 fn encode_envelope(snapshot: InventorySnapshot, captured_at: String) -> Result<Vec<u8>, InventoryError> {
@@ -702,7 +750,7 @@ fn read_bounded(file: &mut fs::File) -> Result<Vec<u8>, InventoryError> {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn open_inventory_directory(path: &Path) -> Result<fs::File, InventoryError> {
+fn open_inventory_directory(path: &Path) -> Result<(fs::File, fs::File), InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::path::Component;
 
@@ -755,7 +803,7 @@ fn open_inventory_directory(path: &Path) -> Result<fs::File, InventoryError> {
     let child = open_directory_at(&directory, "inventory")?;
     validate_directory(&child, true)?;
     sync_inventory_anchor(&child, &directory)?;
-    Ok(child)
+    Ok((directory, child))
 }
 
 #[cfg(unix)]
@@ -799,7 +847,7 @@ fn open_directory_at(parent: &fs::File, name: &str) -> Result<fs::File, Inventor
 fn validate_directory(directory: &fs::File, dedicated: bool) -> Result<(), InventoryError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let metadata = directory.metadata().map_err(|_| InventoryError::StateIo)?;
-    let mode = metadata.permissions().mode() & 0o777;
+    let mode = metadata.permissions().mode() & 0o7777;
     let uid = process_uid();
     if !metadata.is_dir() || !unix_directory_is_trusted(metadata.uid(), mode, uid, dedicated) {
         return Err(InventoryError::PersistenceSecurity);
@@ -810,7 +858,7 @@ fn validate_directory(directory: &fs::File, dedicated: bool) -> Result<(), Inven
 #[cfg(unix)]
 fn unix_directory_is_trusted(owner: u32, mode: u32, process: u32, dedicated: bool) -> bool {
     let trusted_owner = owner == process || (!dedicated && owner == 0);
-    let trusted_mode = if dedicated { mode == 0o700 } else { mode & 0o022 == 0 };
+    let trusted_mode = if dedicated { mode == 0o700 } else { mode & 0o7022 == 0 };
     trusted_owner && trusted_mode
 }
 
@@ -905,7 +953,7 @@ fn validate_regular_file(file: &fs::File) -> Result<(), InventoryError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let metadata = file.metadata().map_err(|_| InventoryError::StateIo)?;
     if !metadata.is_file()
-        || !unix_regular_file_is_secure(metadata.uid(), metadata.permissions().mode() & 0o777, metadata.nlink(), process_uid())
+        || !unix_regular_file_is_secure(metadata.uid(), metadata.permissions().mode() & 0o7777, metadata.nlink(), process_uid())
     {
         return Err(InventoryError::PersistenceSecurity);
     }
@@ -1071,6 +1119,13 @@ mod tests {
             Err(InventoryError::EnvelopeHash)
         ));
 
+        let mut timestamp_tampered: serde_json::Value = serde_json::from_slice(&valid).expect("JSON");
+        timestamp_tampered["capturedAt"] = "2026-08-23T01:02:04Z".into();
+        assert!(matches!(
+            decode_envelope(&serde_json::to_vec(&timestamp_tampered).expect("JSON"), now),
+            Err(InventoryError::EnvelopeHash)
+        ));
+
         let mut unknown: serde_json::Value = serde_json::from_slice(&valid).expect("JSON");
         unknown["extra"] = true.into();
         assert!(matches!(
@@ -1163,10 +1218,13 @@ mod tests {
             .publish_latest_sync(snapshot(), "2026-08-23T01:02:03Z".to_owned(), &tokio_util::sync::CancellationToken::new())
             .expect("publish");
         let latest = temp.path().join("inventory/latest.json");
-        fs::set_permissions(&latest, fs::Permissions::from_mode(0o644)).expect("mode");
+        fs::set_permissions(&latest, fs::Permissions::from_mode(0o4600)).expect("special-bit mode");
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T01:02:03Z")
             .expect("time")
             .with_timezone(&chrono::Utc);
+        assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
+
+        fs::set_permissions(&latest, fs::Permissions::from_mode(0o644)).expect("mode");
         assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
 
         fs::set_permissions(&latest, fs::Permissions::from_mode(0o600)).expect("mode");
@@ -1197,6 +1255,11 @@ mod tests {
 
         let safe_state = temp.path().join("safe-state");
         fs::create_dir(&safe_state).expect("safe state root");
+        fs::set_permissions(&safe_state, fs::Permissions::from_mode(0o1700)).expect("special-bit state mode");
+        assert!(matches!(
+            InventoryStateStore::from_state_root(&safe_state),
+            Err(InventoryError::PersistenceSecurity)
+        ));
         fs::set_permissions(&safe_state, fs::Permissions::from_mode(0o700)).expect("state mode");
         symlink(temp.path(), safe_state.join("inventory")).expect("inventory symlink");
         assert!(matches!(
@@ -1212,13 +1275,63 @@ mod tests {
         assert!(unix_directory_is_trusted(uid, 0o700, uid, true));
         assert!(!unix_directory_is_trusted(uid + 1, 0o700, uid, true));
         assert!(!unix_directory_is_trusted(uid, 0o755, uid, true));
+        assert!(!unix_directory_is_trusted(uid, 0o1700, uid, true));
         assert!(unix_directory_is_trusted(0, 0o755, uid, false));
         assert!(!unix_directory_is_trusted(0, 0o777, uid, false));
+        assert!(!unix_directory_is_trusted(0, 0o1755, uid, false));
 
         assert!(unix_regular_file_is_secure(uid, 0o600, 1, uid));
         assert!(!unix_regular_file_is_secure(uid + 1, 0o600, 1, uid));
         assert!(!unix_regular_file_is_secure(uid, 0o644, 1, uid));
+        assert!(!unix_regular_file_is_secure(uid, 0o4600, 1, uid));
         assert!(!unix_regular_file_is_secure(uid, 0o600, 2, uid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_rejects_a_real_wrong_owner_when_chown_is_permitted() {
+        use std::os::unix::fs::chown;
+
+        let temp = safe_tempdir();
+        let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
+        store
+            .publish_latest_sync(snapshot(), "2026-08-23T01:02:03Z".to_owned(), &tokio_util::sync::CancellationToken::new())
+            .expect("publish");
+        let latest = temp.path().join("inventory/latest.json");
+        let wrong_uid = process_uid().checked_add(1).unwrap_or_else(|| process_uid() - 1);
+        if let Err(error) = chown(&latest, Some(wrong_uid), None) {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "unexpected chown failure");
+            return;
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T01:02:03Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_component_exchange_is_rejected_by_the_open_anchor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = safe_tempdir();
+        let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
+        store
+            .publish_latest_sync(snapshot(), "2026-08-23T01:02:03Z".to_owned(), &tokio_util::sync::CancellationToken::new())
+            .expect("publish");
+        fs::rename(temp.path().join("inventory"), temp.path().join("original-inventory")).expect("exchange original");
+        fs::create_dir(temp.path().join("inventory")).expect("replacement inventory");
+        fs::set_permissions(temp.path().join("inventory"), fs::Permissions::from_mode(0o700)).expect("replacement mode");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T01:02:03Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
+        assert!(matches!(
+            store.publish_latest_sync(snapshot(), "2026-08-23T02:02:03Z".to_owned(), &tokio_util::sync::CancellationToken::new()),
+            Err(InventoryError::PersistenceSecurity)
+        ));
+        assert!(!temp.path().join("inventory/latest.json").exists());
     }
 
     #[cfg(unix)]
@@ -1299,6 +1412,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_during_commit_does_not_interrupt_rename_or_sync() {
+        let temp = safe_tempdir();
+        let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
+        let replacement = encode_envelope(snapshot(), "2026-08-23T01:02:03Z".to_owned()).expect("envelope");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+
+        store
+            .replace_file_inner(
+                "latest.json",
+                &replacement,
+                || cancellation.is_cancelled(),
+                Some(PersistFault::CancelDuringCommit(cancellation.clone())),
+            )
+            .expect("commit ignores cancellation after its cancellation gate");
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            fs::read(temp.path().join("inventory/latest.json")).expect("committed latest"),
+            replacement
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_rejects_replacement_of_the_file_it_opened() {
+        let temp = safe_tempdir();
+        let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
+        let captured_at = "2026-08-23T01:02:03Z";
+        let first = encode_envelope(snapshot(), captured_at.to_owned()).expect("first envelope");
+        let second_snapshot = InventorySnapshot::new("1.2.3", None, 2, 4, 1_001, 401, []).expect("second snapshot");
+        let second = encode_envelope(second_snapshot.clone(), captured_at.to_owned()).expect("second envelope");
+        store.replace_file("latest.json", &first, || false).expect("seed latest");
+        let now = chrono::DateTime::parse_from_rfc3339(captured_at)
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+
+        assert!(matches!(
+            store.read_latest_after_open(now, || {
+                store
+                    .replace_file("latest.json", &second, || false)
+                    .expect("replace opened file");
+            }),
+            Err(InventoryError::PersistenceSecurity)
+        ));
+        assert_eq!(store.read_latest(now).expect("replacement").snapshot, second_snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn concurrent_reader_observes_only_complete_old_or_new_envelopes() {
         let temp = safe_tempdir();
         let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
@@ -1334,9 +1496,14 @@ mod tests {
             .with_timezone(&chrono::Utc);
         start.wait();
         for _ in 0..100 {
-            let observed = store.read_latest(now).expect("complete envelope").snapshot;
-            assert!(observed == first || observed == second);
+            match store.read_latest(now) {
+                Ok(observed) => assert!(observed.snapshot == first || observed.snapshot == second),
+                Err(InventoryError::PersistenceSecurity) => {}
+                Err(error) => panic!("reader observed neither a complete envelope nor a replacement: {error}"),
+            }
         }
         thread.join().expect("writer");
+        let observed = store.read_latest(now).expect("stable final envelope").snapshot;
+        assert!(observed == first || observed == second);
     }
 }

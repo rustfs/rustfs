@@ -146,14 +146,13 @@ where
                     let _ = status_tx.send(HeartbeatStatus::BackingOff { delay });
                     delay
                 }
-                Delivery::AuthenticationStopped { status, reason } => {
-                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped { status, reason });
+                Delivery::AuthenticationStopped { status, .. } => {
+                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped { status, reason: None });
                     return;
                 }
-                Delivery::Rejected { status, reason } => {
-                    let suffix = reason.map_or_else(String::new, |reason| format!("; reason={reason}"));
+                Delivery::Rejected { status, .. } => {
                     let _ = status_tx.send(HeartbeatStatus::Failed {
-                        reason: format!("Connect rejected heartbeat with HTTP {status}{suffix}"),
+                        reason: format!("connect_heartbeat_rejected_http_{status}"),
                     });
                     return;
                 }
@@ -299,17 +298,13 @@ where
                     let _ = status_tx.send(InventoryStatus::BackingOff { delay });
                     delay
                 }
-                InventoryDelivery::AuthenticationStopped { status, reason } => {
-                    let _ = status_tx.send(InventoryStatus::AuthenticationStopped {
-                        status,
-                        reason: stable_reason(reason),
-                    });
+                InventoryDelivery::AuthenticationStopped { status, .. } => {
+                    let _ = status_tx.send(InventoryStatus::AuthenticationStopped { status, reason: None });
                     return;
                 }
-                InventoryDelivery::Rejected { status, reason } => {
-                    let suffix = stable_reason(reason).map_or_else(String::new, |reason| format!("; reason={reason}"));
+                InventoryDelivery::Rejected { status, .. } => {
                     let _ = status_tx.send(InventoryStatus::Failed {
-                        reason: format!("Connect rejected inventory with HTTP {status}{suffix}"),
+                        reason: format!("connect_inventory_rejected_http_{status}"),
                     });
                     return;
                 }
@@ -329,24 +324,54 @@ where
 
 fn failed(status: &watch::Sender<HeartbeatStatus>, error: HeartbeatError) {
     let _ = status.send(HeartbeatStatus::Failed {
-        reason: error.to_string(),
+        reason: heartbeat_failure_reason(&error).to_owned(),
     });
+}
+
+fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
+    use super::registration::CredentialValidationError;
+
+    match error {
+        HeartbeatError::Endpoint => "connect_heartbeat_endpoint",
+        HeartbeatError::RootCertificate => "connect_heartbeat_root_certificate",
+        HeartbeatError::Schedule => "connect_heartbeat_schedule",
+        HeartbeatError::NotRegistered => "connect_heartbeat_not_registered",
+        HeartbeatError::IdentityMissing => "connect_heartbeat_identity_missing",
+        HeartbeatError::IdentityCertificate => "connect_heartbeat_identity_certificate",
+        HeartbeatError::CredentialName => "connect_heartbeat_credential_name",
+        HeartbeatError::CredentialExpired => "connect_heartbeat_credential_expired: not currently valid",
+        HeartbeatError::NodeSummary => "connect_heartbeat_node_summary",
+        HeartbeatError::SequenceExhausted => "connect_heartbeat_sequence_exhausted",
+        HeartbeatError::AlreadyRunning => "connect_heartbeat_already_running",
+        HeartbeatError::StateConflict => "connect_heartbeat_state_conflict",
+        HeartbeatError::StateIo { .. } => "connect_heartbeat_state_io",
+        HeartbeatError::StateInvalid { .. } => "connect_heartbeat_state_invalid",
+        HeartbeatError::StateCorrupt { .. } => "connect_heartbeat_state_corrupt: violates the protocol invariants",
+        #[cfg(unix)]
+        HeartbeatError::StatePermissions { .. } => "connect_heartbeat_state_permissions",
+        HeartbeatError::ResponseTooLarge => "connect_heartbeat_response_too_large",
+        HeartbeatError::Response => "connect_heartbeat_response",
+        HeartbeatError::Url(_) => "connect_heartbeat_url",
+        HeartbeatError::Transport(_) => "connect_heartbeat_transport",
+        HeartbeatError::Identity(_) => "connect_heartbeat_identity",
+        HeartbeatError::IdentityStore(_) => "connect_heartbeat_identity_store",
+        HeartbeatError::CredentialStore(_) => "connect_heartbeat_credential_store",
+        HeartbeatError::CredentialValidation(error) => match error {
+            CredentialValidationError::Certificate => "connect_heartbeat_credential_certificate",
+            CredentialValidationError::Chain => "connect_heartbeat_credential_chain",
+            CredentialValidationError::Identity => "connect_heartbeat_credential_identity: wrong device identity",
+            CredentialValidationError::Key => "connect_heartbeat_credential_key: different device key",
+            CredentialValidationError::Validity => "connect_heartbeat_credential_validity",
+            CredentialValidationError::CertificateRequest => "connect_heartbeat_credential_request",
+            CredentialValidationError::RotationTranscript => "connect_heartbeat_credential_rotation_transcript",
+        },
+    }
 }
 
 fn failed_inventory(status: &watch::Sender<InventoryStatus>, error: InventoryError) {
     let _ = status.send(InventoryStatus::Failed {
         reason: error.to_string(),
     });
-}
-
-fn stable_reason(reason: Option<String>) -> Option<String> {
-    reason.filter(|reason| {
-        !reason.is_empty()
-            && reason.len() <= 64
-            && reason
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    })
 }
 
 fn jitter(maximum: Duration) -> Duration {
@@ -391,10 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn inventory_runtime_exposes_only_stable_machine_reasons() {
-        assert_eq!(stable_reason(Some("DEVICE_REVOKED".to_owned())).as_deref(), Some("DEVICE_REVOKED"));
-        assert_eq!(stable_reason(Some("secret.example/path".to_owned())), None);
-        assert_eq!(stable_reason(Some("A".repeat(65))), None);
+    fn runtimes_expose_only_stable_machine_reasons() {
+        let error = HeartbeatError::StateIo {
+            path: std::path::PathBuf::from("/private/connect/state.json"),
+            source: std::io::Error::other("transport.internal"),
+        };
+        assert_eq!(heartbeat_failure_reason(&error), "connect_heartbeat_state_io");
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
+                super::super::registration::CredentialValidationError::Identity
+            )),
+            "connect_heartbeat_credential_identity: wrong device identity"
+        );
     }
 
     #[tokio::test]

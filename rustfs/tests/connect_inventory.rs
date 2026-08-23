@@ -736,7 +736,10 @@ async fn connect_inventory_revoked_device_stops_without_retrying() {
 
     assert!(matches!(
         wait_for(&mut status, |status| matches!(status, InventoryStatus::AuthenticationStopped { .. })).await,
-        InventoryStatus::AuthenticationStopped { status: 401, reason: Some(reason) } if reason == "DEVICE_REVOKED"
+        InventoryStatus::AuthenticationStopped {
+            status: 401,
+            reason: None
+        }
     ));
     assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
     runtime.shutdown().await;
