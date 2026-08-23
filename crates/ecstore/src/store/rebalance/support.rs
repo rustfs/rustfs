@@ -273,7 +273,6 @@ pub(super) fn resolve_latest_object_info_candidates(
 
         latest_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.idx));
 
-
         let Some(winner) = latest_candidates.first() else {
             return Err(Error::ErasureReadQuorum);
         };
