@@ -71,7 +71,6 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, Replicatio
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::future::Future;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
@@ -956,7 +955,7 @@ where
     usize::try_from(size).unwrap_or_default()
 }
 
-fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
+fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
@@ -1743,7 +1742,7 @@ fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
 
     // A not-found surfacing from inside a data-movement stage is the same
     // condition once the wrapper is unwrapped (backlog#1827 T2).
-    crate::data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
 }
 
 fn is_decommission_target_capacity_error(err: &Error) -> bool {
@@ -1754,7 +1753,7 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
     // A stage failure keeps the error it wrapped, so classify by type rather
     // than by the rendered message (backlog#1827 T2). The substring fallback
     // stays for errors that reached here through some other wrapper.
-    if let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+    if let Some(source) = data_movement::data_movement_stage_source(err) {
         return is_decommission_target_capacity_error(source);
     }
 
@@ -3101,7 +3100,7 @@ fn decommission_remote_tiered_opts(
         src_pool_idx,
         data_movement: true,
         include_part_checksums: true,
-        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        http_preconditions: Some(data_movement::data_movement_target_precondition()),
         expected_bucket_incarnation_id,
         ..Default::default()
     }
@@ -3592,7 +3591,6 @@ impl ECStore {
             }
             return Err(err);
         }
-        drop(operation_guard);
 
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
@@ -3850,7 +3848,7 @@ impl ECStore {
     ) -> Result<()> {
         let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
         if !index_cancelers.is_empty() {
-            std::mem::drop(spawn_decommission_index_cancelers(
+            drop(spawn_decommission_index_cancelers(
                 store,
                 rx,
                 index_cancelers,
@@ -3877,7 +3875,7 @@ impl ECStore {
             return Ok(());
         }
 
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             self.clone(),
             rx,
             index_cancelers,
@@ -3907,7 +3905,7 @@ impl ECStore {
         let index_cancelers = self
             .start_decommission_with_routines(indices, &rx, local_indices.as_slice())
             .await?;
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             store,
             rx,
             index_cancelers,
@@ -6982,7 +6980,7 @@ mod tests {
     #[test]
     fn decommission_classifiers_see_through_a_stage_wrapper() {
         let wrap = |inner: Error| {
-            crate::data_movement::data_movement_stage_error_for_test(
+            data_movement::data_movement_stage_error_for_test(
                 "decommission_object",
                 "put_object",
                 "bucket-a",
@@ -7120,7 +7118,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            metadata: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
         };
 
@@ -11359,8 +11357,6 @@ mod pools_tests {
     async fn test_decommission_supervisor_observes_worker_panic() {
         let worker = tokio::spawn(async move {
             panic!("injected decommission worker panic");
-            #[allow(unreachable_code)]
-            Ok(())
         });
 
         let err = await_decommission_worker(4, worker)
