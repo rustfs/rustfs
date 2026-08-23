@@ -165,7 +165,11 @@ fn inventory_snapshot(
     let total = crate::app::storage_api::capacity::get_total_usable_capacity(&info.disks, &info) as u64;
     let free = crate::app::storage_api::capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
     let mut flags = Vec::with_capacity(3);
-    if info.disks.iter().any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE) {
+    if info
+        .disks
+        .iter()
+        .any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE || disk.state == "disk not found")
+    {
         flags.extend([InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]);
     }
     if info.disks.iter().any(|disk| disk.healing) {
@@ -192,5 +196,25 @@ mod tests {
                 observed: 1
             })
         ));
+    }
+
+    #[test]
+    fn inventory_marks_a_missing_drive_as_offline() {
+        let info = rustfs_madmin::StorageInfo {
+            disks: vec![
+                rustfs_madmin::Disk::default(),
+                rustfs_madmin::Disk {
+                    state: "disk not found".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            inventory_snapshot(1, 2, info).expect("complete inventory should encode"),
+            InventorySnapshot::current(1, 2, 0, 0, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
+                .expect("expected inventory should encode")
+        );
     }
 }
