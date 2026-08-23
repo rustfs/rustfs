@@ -6864,7 +6864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_disk_walk_dir_preserves_skip_total_timeout_option() {
+    async fn test_remote_disk_walk_dir_preserves_control_options() {
         let transport = RecordingInternodeDataTransport::default();
         let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
         let opts = WalkDirOptions {
@@ -6872,6 +6872,7 @@ mod tests {
             base_dir: "prefix".to_string(),
             recursive: true,
             skip_total_timeout: true,
+            skip_hidden_prefix_check: true,
             ..Default::default()
         };
         let mut writer = Vec::new();
@@ -6888,6 +6889,7 @@ mod tests {
                 let sent_opts: WalkDirOptions =
                     serde_json::from_slice(&request.body).expect("walk_dir request body should deserialize");
                 assert!(sent_opts.skip_total_timeout);
+                assert!(sent_opts.skip_hidden_prefix_check);
                 assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),

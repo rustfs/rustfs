@@ -218,6 +218,7 @@ pub struct ListPathRawOptions {
     pub path: String,
     pub recursive: bool,
     pub incl_deleted: bool,
+    pub skip_hidden_prefix_check: bool,
     pub filter_prefix: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
@@ -249,6 +250,7 @@ impl Clone for ListPathRawOptions {
             path: self.path.clone(),
             recursive: self.recursive,
             incl_deleted: self.incl_deleted,
+            skip_hidden_prefix_check: self.skip_hidden_prefix_check,
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
@@ -274,6 +276,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         base_dir: opts.path.clone(),
         recursive: opts.recursive,
         incl_deleted: opts.incl_deleted,
+        skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
         report_notfound: opts.report_not_found,
         filter_prefix: opts.filter_prefix.clone(),
         forward_to: opts.forward_to.clone(),
@@ -1098,11 +1101,13 @@ mod tests {
     #[test]
     fn walk_dir_options_preserve_zero_total_and_inherited_stall_timeouts() {
         let options = walk_dir_options(&ListPathRawOptions {
+            skip_hidden_prefix_check: true,
             walkdir_timeout: Some(Duration::ZERO),
             walkdir_stall_timeout: None,
             ..Default::default()
         });
 
+        assert!(options.skip_hidden_prefix_check);
         assert_eq!(options.timeout_ms, Some(0));
         assert_eq!(options.stall_timeout_ms, None);
         assert!(!options.skip_total_timeout);

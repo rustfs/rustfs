@@ -1194,6 +1194,11 @@ pub struct WalkDirOptions {
     #[serde(default)]
     pub incl_deleted: bool,
 
+    // Skip recursive prefix visibility probes only when authoritative bucket
+    // metadata proves versioning was never enabled.
+    #[serde(default)]
+    pub skip_hidden_prefix_check: bool,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -1532,6 +1537,7 @@ mod tests {
             base_dir: "/path/to/dir".to_string(),
             recursive: true,
             incl_deleted: false,
+            skip_hidden_prefix_check: false,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
@@ -1546,6 +1552,7 @@ mod tests {
         assert_eq!(opts.base_dir, "/path/to/dir");
         assert!(opts.recursive);
         assert!(!opts.incl_deleted);
+        assert!(!opts.skip_hidden_prefix_check);
         assert!(!opts.report_notfound);
         assert_eq!(opts.filter_prefix, Some("prefix_".to_string()));
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
@@ -1554,6 +1561,23 @@ mod tests {
         assert!(!opts.skip_total_timeout);
         assert_eq!(opts.timeout_duration(), Some(std::time::Duration::from_secs(10)));
         assert_eq!(opts.stall_timeout_duration(), Some(std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn test_walk_dir_options_default_hidden_prefix_check_for_old_peers() {
+        let mut encoded = serde_json::to_value(WalkDirOptions {
+            skip_hidden_prefix_check: true,
+            ..Default::default()
+        })
+        .expect("walk options should serialize");
+        encoded
+            .as_object_mut()
+            .expect("walk options should serialize as an object")
+            .remove("skip_hidden_prefix_check");
+
+        let decoded: WalkDirOptions = serde_json::from_value(encoded).expect("old peer options should deserialize");
+
+        assert!(!decoded.skip_hidden_prefix_check);
     }
 
     /// Test DeleteOptions structure
