@@ -36,7 +36,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("{bucket}/{object}")));
-            progress.update_progress(0, 4, 0, 0);
+            progress.update_stage(0, 4);
         }
 
         // Step 1: Check if object exists and get metadata
@@ -132,7 +132,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
+            progress.update_stage(1, 3);
         }
 
         // Step 2: directly call ecstore to perform heal
@@ -187,7 +187,7 @@ impl HealTask {
                         );
                         {
                             let mut progress = self.progress.write().await;
-                            progress.update_progress(3, 3, 0, 0);
+                            progress.update_stage(3, 3);
                         }
                         return Ok(());
                     }
@@ -207,7 +207,7 @@ impl HealTask {
 
                     {
                         let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
+                        progress.update_stage(3, 3);
                     }
 
                     if Self::should_return_typed_heal_error(&e) {
@@ -249,7 +249,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, object_size);
+                    progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())
@@ -275,7 +275,7 @@ impl HealTask {
                     );
                     {
                         let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
+                        progress.update_stage(3, 3);
                     }
                     return Ok(());
                 }
@@ -295,7 +295,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
 
                 if Self::should_return_typed_heal_error(&e) {
@@ -414,7 +414,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(4, 4, 0, object_size);
+                    progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())
