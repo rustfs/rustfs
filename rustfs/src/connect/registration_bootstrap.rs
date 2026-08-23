@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
+#[cfg(unix)]
+use std::{
+    fs::{self, File, OpenOptions},
+    path::PathBuf,
+    time::Duration,
+};
 
-use super::{ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken, TokenError};
+use super::TokenError;
+#[cfg(unix)]
+use super::{ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken};
 
+#[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,10 +48,24 @@ pub enum RegistrationBootstrapError {
     Configuration,
     #[error("Connect registration exchange failed")]
     Exchange,
+    #[error("Connect registration bootstrap requires Unix owner and permission guarantees")]
+    PlatformSecurity,
     #[error(transparent)]
     Token(#[from] TokenError),
 }
 
+#[cfg(not(unix))]
+pub async fn register_from_protected_input(
+    endpoint: &str,
+    root_ca_file: &Path,
+    state_directory: &Path,
+    token_file: Option<&Path>,
+) -> Result<RegistrationBootstrapResult, RegistrationBootstrapError> {
+    let _ = (endpoint, root_ca_file, state_directory, token_file);
+    Err(RegistrationBootstrapError::PlatformSecurity)
+}
+
+#[cfg(unix)]
 pub async fn register_from_protected_input(
     endpoint: &str,
     root_ca_file: &Path,
@@ -83,6 +104,7 @@ pub async fn register_from_protected_input(
     })
 }
 
+#[cfg(unix)]
 fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrapError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -108,16 +130,14 @@ fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrap
     Ok(path)
 }
 
+#[cfg(unix)]
 fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_directory(path, require_process_owner),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
             match builder.create(path) {
                 Ok(()) => validate_directory(path, true),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => validate_directory(path, require_process_owner),
@@ -128,25 +148,24 @@ fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), Regi
     }
 }
 
+#[cfg(unix)]
 fn validate_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
     let metadata = fs::symlink_metadata(path).map_err(RegistrationBootstrapError::Input)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(RegistrationBootstrapError::StateDirectorySecurity);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let process_uid = process_uid();
-        let owner_is_trusted = metadata.uid() == process_uid || (!require_process_owner && metadata.uid() == 0);
-        let mode = metadata.permissions().mode() & 0o777;
-        if !owner_is_trusted || mode & 0o022 != 0 {
-            return Err(RegistrationBootstrapError::StateDirectorySecurity);
-        }
+    let mode = metadata.permissions().mode() & 0o777;
+    if !unix_directory_is_trusted(metadata.uid(), mode, process_uid(), require_process_owner) {
+        return Err(RegistrationBootstrapError::StateDirectorySecurity);
     }
-    #[cfg(not(unix))]
-    let _ = require_process_owner;
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_directory_is_trusted(owner_uid: u32, mode: u32, process_uid: u32, require_process_owner: bool) -> bool {
+    (owner_uid == process_uid || (!require_process_owner && owner_uid == 0)) && mode & 0o022 == 0
 }
 
 #[cfg(unix)]
@@ -155,6 +174,7 @@ fn process_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+#[cfg(unix)]
 fn read_regular_file(path: &Path, owner_only: bool) -> Result<Vec<u8>, RegistrationBootstrapError> {
     let mut file = open_regular_file(path, owner_only)?;
     let mut contents = Vec::new();
@@ -162,6 +182,7 @@ fn read_regular_file(path: &Path, owner_only: bool) -> Result<Vec<u8>, Registrat
     Ok(contents)
 }
 
+#[cfg(unix)]
 fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, RegistrationBootstrapError> {
     let insecure = || {
         if owner_only {
@@ -170,10 +191,6 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
             RegistrationBootstrapError::RootCaFileSecurity
         }
     };
-    #[cfg(not(unix))]
-    if owner_only {
-        return Err(RegistrationBootstrapError::TokenFileSecurity);
-    }
     let initial = fs::symlink_metadata(path).map_err(RegistrationBootstrapError::Input)?;
     if initial.file_type().is_symlink() || !initial.is_file() {
         return Err(insecure());
@@ -181,17 +198,13 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
 
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     let file = options.open(path).map_err(RegistrationBootstrapError::Input)?;
     let metadata = file.metadata().map_err(RegistrationBootstrapError::Input)?;
     if !metadata.is_file() {
         return Err(insecure());
     }
-    #[cfg(unix)]
     if owner_only {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -201,4 +214,45 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
         }
     }
     Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::unix_directory_is_trusted;
+
+    #[test]
+    fn unix_directory_policy_rejects_wrong_owners_and_writable_modes_only() {
+        let process_uid = 501;
+
+        assert!(unix_directory_is_trusted(process_uid, 0o700, process_uid, true));
+        assert!(unix_directory_is_trusted(process_uid, 0o755, process_uid, true));
+        assert!(unix_directory_is_trusted(0, 0o755, process_uid, false));
+        assert!(!unix_directory_is_trusted(0, 0o755, process_uid, true));
+        assert!(!unix_directory_is_trusted(process_uid + 1, 0o700, process_uid, false));
+        assert!(!unix_directory_is_trusted(process_uid, 0o720, process_uid, true));
+        assert!(!unix_directory_is_trusted(process_uid, 0o702, process_uid, true));
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_tests {
+    use std::path::Path;
+
+    use super::{RegistrationBootstrapError, register_from_protected_input};
+
+    #[tokio::test]
+    async fn bootstrap_fails_closed_for_stdin_and_token_files_without_unix_guarantees() {
+        let root = Path::new("unreadable-root-ca");
+        let state = Path::new("registration-bootstrap-must-not-create-state");
+        let token = Path::new("unreadable-token");
+        assert!(!state.exists());
+
+        for token_file in [None, Some(token)] {
+            let error = register_from_protected_input("https://connect.invalid/agent/", root, state, token_file)
+                .await
+                .expect_err("non-Unix bootstrap must fail closed");
+            assert!(matches!(error, RegistrationBootstrapError::PlatformSecurity));
+        }
+        assert!(!state.exists());
+    }
 }

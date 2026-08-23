@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(unix)]
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write as _};
@@ -41,6 +43,7 @@ const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const TOKEN_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const REMOTE_REASON: &str = "remote-reason-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 struct TestPki {
     root_params: CertificateParams,
@@ -335,8 +338,20 @@ async fn production_command_registers_once_and_emits_only_stable_identifiers() {
 async fn production_command_never_echoes_a_remote_reason() {
     let temp = secure_tempdir();
     let state = temp.path().join("state");
-    let server = server(&state, vec![Reply::Reject(StatusCode::BAD_REQUEST, TOKEN_SECRET)]).await;
-    let (root, _) = prepare_inputs(&temp, &server.root_pem);
+    let server = server(
+        &state,
+        vec![
+            Reply::Reject(StatusCode::BAD_REQUEST, REMOTE_REASON),
+            Reply::Reject(StatusCode::BAD_REQUEST, REMOTE_REASON),
+        ],
+    )
+    .await;
+    let (root, token_file) = prepare_inputs(&temp, &server.root_pem);
+    let error = register_from_protected_input(&server.endpoint, &root, &temp.path().join("direct-state"), Some(&token_file))
+        .await
+        .expect_err("remote rejection must fail");
+    assert_sanitized_error(&error, &[TOKEN_SECRET, REMOTE_REASON]);
+
     let token = token_document(OffsetDateTime::now_utc().unix_timestamp() + 3600);
     let output = tokio::task::spawn_blocking({
         let endpoint = server.endpoint.clone();
@@ -348,11 +363,12 @@ async fn production_command_never_echoes_a_remote_reason() {
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
-        "[FATAL] Server runtime failed: Connect registration exchange failed\n"
-    );
-    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert_eq!(stderr, "[FATAL] Server runtime failed: Connect registration exchange failed\n");
+    for forbidden in [TOKEN_SECRET, REMOTE_REASON] {
+        assert!(!stderr.contains(forbidden));
+    }
+    assert_eq!(server.seen.lock().expect("seen lock").len(), 2);
 }
 
 #[tokio::test]
@@ -447,6 +463,7 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
         .expect_err("expired token must be refused by Connect");
     assert!(matches!(&error, RegistrationBootstrapError::Exchange));
     assert_eq!(error.to_string(), "Connect registration exchange failed");
+    assert_sanitized_error(&error, &[TOKEN_SECRET, "REGISTRATION_TOKEN_EXPIRED"]);
     assert!(!rejected_state.join("credential/device.crt.json").exists());
     assert!(!rejected_state.join("credential/registration.pending.json").exists());
 
@@ -527,6 +544,31 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
             .await
             .expect_err("nested store symlink must fail");
         assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+    }
+
+    for (nested, mode) in [("identity", 0o720), ("credential", 0o702)] {
+        let state = temp.path().join(format!("writable-{nested}"));
+        fs::create_dir(&state).expect("state directory");
+        let nested = state.join(nested);
+        fs::create_dir(&nested).expect("nested store directory");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(mode)).expect("make nested store writable");
+        let error = register_from_protected_input(endpoint, &root, &state, Some(&token))
+            .await
+            .expect_err("writable nested store must fail");
+        assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+    }
+}
+
+fn assert_sanitized_error(error: &(dyn std::error::Error + 'static), forbidden: &[&str]) {
+    let mut current = Some(error);
+    while let Some(candidate) = current {
+        let display = candidate.to_string();
+        let debug = format!("{candidate:?}");
+        for forbidden in forbidden {
+            assert!(!display.contains(forbidden), "error Display leaked forbidden text");
+            assert!(!debug.contains(forbidden), "error Debug leaked forbidden text");
+        }
+        current = candidate.source();
     }
 }
 
