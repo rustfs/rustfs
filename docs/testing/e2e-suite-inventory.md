@@ -28,9 +28,9 @@
 | bucket_stats_regression_test | 3 |  |
 | chaos | 2 |  |
 | checksum_upload_test | 7 |  |
-| cluster_concurrency_test | 2 | 🌙 |
+| cluster_concurrency_test | 3 | 🌙 |
 | cluster_multidrive_pool_test | 2 | 🌙 |
-| common | 14 |  |
+| common | 16 |  |
 | compression_test | 6 | ✅ |
 | connection_cap_test | 2 |  |
 | console_smoke_test | 1 | ✅ |
@@ -52,13 +52,13 @@
 | fault_proxy | 7 |  |
 | get_codec_streaming_compat_test | 1 |  |
 | get_stream_failure_observability_test | 1 |  |
-| group_delete_test | 1 |  |
+| group_delete_test | 4 |  |
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
 | heal_erasure_disk_rebuild_test | 4 | 🌙 |
 | inline_fast_path_cluster_test | 16 |  |
 | internode_rpc_signature_e2e_test | 5 |  |
-| kms | 46 |  |
+| kms | 48 |  |
 | leading_slash_key_test | 2 | ✅ |
 | lifecycle_regression_test | 4 |  |
 | list_buckets_auth_test | 1 | ✅ |
@@ -84,8 +84,9 @@
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 4 |  |
-| reliant | 25 | 19 ✅ |
-| replication_extension_test | 75 | 20 ✅ +55 🌙 |
+| reliant | 31 | 19 ✅ |
+| replication_extension_test | 76 | 20 ✅ +56 🌙 |
+| replication_lww_receiver_test | 1 |  |
 | security_boundary_test | 4 |  |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
@@ -99,4 +100,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 575 tests across 82 modules · PR smoke: 163 tests / 36 modules · merge/main full: 453 tests / 73 modules · nightly replication: 55 tests · nightly cluster faults: 28 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 591 tests across 83 modules · PR smoke: 163 tests / 36 modules · merge/main full: 467 tests / 74 modules · nightly replication: 56 tests · nightly cluster faults: 29 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.

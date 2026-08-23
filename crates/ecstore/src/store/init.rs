@@ -495,6 +495,11 @@ impl ECStore {
             );
         }
 
+        // Initialize the storage-owned scanner publication state only after
+        // both movement metadata sources have been loaded. SetDisks cache
+        // writers remain fail-closed until this snapshot is available.
+        let _ = self.scanner_data_usage_publication_blocked().await;
+
         let pools = installed_pool_meta.return_resumable_pools();
         let mut pool_indices = Vec::with_capacity(pools.len());
 
@@ -555,10 +560,18 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::{
         bucket::lifecycle::{
+            DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord,
+            bucket_lifecycle_ops::{ManualTransitionRunOptions, recover_manual_transition_jobs_once},
             lifecycle::{TRANSITION_PENDING, TransitionOptions},
+            manual_transition_job::{
+                ManualTransitionJobRecord, ManualTransitionScopeAdmission, ManualTransitionTaskRecord,
+                ManualTransitionWorkerResult, ManualTransitionWorkerResultRecord, manual_transition_job_record_object_name,
+                manual_transition_scope_record_object_name, manual_transition_task_object_name,
+                manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
+            },
             tier_delete_journal::{
-                TIER_DELETE_JOURNAL_PREFIX, persist_tier_delete_journal_entry, recover_tier_delete_journal_entries,
-                tier_delete_journal_object_name,
+                TIER_DELETE_JOURNAL_PREFIX, encode_tier_delete_journal_entry, persist_tier_delete_journal_entry,
+                recover_tier_delete_journal_entries, tier_delete_journal_object_name,
             },
             tier_sweeper::{
                 Jentry, TierDeleteJournalState, TierDeleteSourceIdentity, transitioned_delete_journal_entry_for_source,
@@ -570,12 +583,16 @@ mod tests {
                 delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
                 inspect_transition_transaction_for_operator, load_transition_transaction_record,
                 recover_transition_transaction_records, save_transition_transaction_record,
+                transition_transaction_record_object_name,
             },
+            validate_durable_ilm_record,
         },
         bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG},
         client::transition_api::ReaderImpl,
         config::com,
-        disk::{RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
+        core::pools::DecomBucketInfo,
+        data_movement::SourceCleanupDeleteBarrier,
+        disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
@@ -608,6 +625,8 @@ mod tests {
             range::HTTPRangeSpec,
         },
     };
+    #[cfg(feature = "test-util")]
+    use futures::{StreamExt as _, TryStreamExt as _};
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
     #[cfg(feature = "test-util")]
@@ -626,7 +645,7 @@ mod tests {
         io::Cursor,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1305,6 +1324,85 @@ mod tests {
             start_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         });
+    }
+
+    const DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER: &str = "delete_marker_copy";
+    const DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
+    #[cfg(feature = "test-util")]
+    const DECOMMISSION_TEST_FAULT_STAGE_TIERED: &str = "decommission_tiered_object";
+
+    async fn seed_decommission_source(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        body: Vec<u8>,
+        opts: &ObjectOptions,
+    ) {
+        let mut reader = PutObjReader::from_vec(body);
+        store.pools[0]
+            .put_object(bucket, object, &mut reader, opts)
+            .await
+            .expect("seed decommission source object");
+    }
+
+    async fn run_decommission_entry_retry_test(
+        store: &Arc<crate::store::ECStore>,
+        rx: CancellationToken,
+        bucket: &str,
+        object: &str,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
+    ) -> crate::error::Result<()> {
+        let source_set = store.pools[0].get_disks_by_key(object);
+        store
+            .decommission_entry_with_retry_state_for_test(
+                rx,
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.to_string(),
+                source_set,
+                expected_bucket_incarnation_id,
+                source_changed_exhaustions,
+            )
+            .await
+    }
+
+    async fn read_decommission_target_body(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Vec<u8> {
+        let mut reader = store.pools[1]
+            .get_object_reader(bucket, object, None, HeaderMap::new(), opts)
+            .await
+            .expect("read decommission target object");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("drain decommission target body");
+        body
+    }
+
+    async fn assert_decommission_source_absent(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) {
+        let err = store.pools[0]
+            .get_object_info(bucket, object, opts)
+            .await
+            .expect_err("decommission source must be retained until target commit, then removed");
+        assert!(
+            matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)),
+            "unexpected decommission source result: {err:?}"
+        );
     }
 
     async fn write_decommission_test_multipart_source(
@@ -3273,6 +3371,537 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_retries_source_changed_without_canceling_other_bucket() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_retries_source_changed_without_canceling_other_bucket".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create decommission retry store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-entry-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let changed_bucket = format!("decom-retry-a-{}", uuid::Uuid::new_v4());
+                    let other_bucket = format!("decom-retry-b-{}", uuid::Uuid::new_v4());
+                    for bucket in [&changed_bucket, &other_bucket] {
+                        store
+                            .make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create decommission retry bucket");
+                    }
+
+                    let changed_object = "changed.bin";
+                    let first_version = uuid::Uuid::new_v4();
+                    let second_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &changed_bucket,
+                        changed_object,
+                        b"first generation".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(first_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    let other_object = "other.bin";
+                    seed_decommission_source(
+                        &store,
+                        &other_bucket,
+                        other_object,
+                        b"other bucket generation".to_vec(),
+                        &ObjectOptions::default(),
+                    )
+                    .await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let mutation_calls = Arc::new(AtomicUsize::new(0));
+                    let mutation_calls_for_hook = Arc::clone(&mutation_calls);
+                    let mutation_store = Arc::clone(&store);
+                    let mutation_bucket = changed_bucket.clone();
+                    let _mutation_guard = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(
+                        move |bucket, object, attempt| {
+                            let is_target = bucket == mutation_bucket.as_str() && object == changed_object;
+                            let calls = Arc::clone(&mutation_calls_for_hook);
+                            let store = Arc::clone(&mutation_store);
+                            let bucket = mutation_bucket.clone();
+                            Box::pin(async move {
+                                if !is_target {
+                                    return;
+                                }
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                if attempt == 1 {
+                                    seed_decommission_source(
+                                        &store,
+                                        &bucket,
+                                        changed_object,
+                                        b"second generation".to_vec(),
+                                        &ObjectOptions {
+                                            versioned: true,
+                                            version_id: Some(second_version.to_string()),
+                                            mod_time: Some(base_time + time::Duration::seconds(1)),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                }
+                            })
+                        },
+                    ));
+
+                    let ordinary_faults = Arc::new(AtomicUsize::new(0));
+                    let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
+                    let fault_bucket = other_bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, bucket, object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                                && bucket == fault_bucket.as_str()
+                                && object == other_object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                ordinary_faults_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let rx = CancellationToken::new();
+                    let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
+                    let changed_incarnation = Some(
+                        store
+                            .bucket_incarnation_id(&changed_bucket)
+                            .await
+                            .expect("changed bucket incarnation"),
+                    );
+                    let other_incarnation = Some(
+                        store
+                            .bucket_incarnation_id(&other_bucket)
+                            .await
+                            .expect("other bucket incarnation"),
+                    );
+                    let (changed_result, other_result) = tokio::join!(
+                        run_decommission_entry_retry_test(
+                            &store,
+                            rx.clone(),
+                            &changed_bucket,
+                            changed_object,
+                            changed_incarnation,
+                            Arc::clone(&source_changed_exhaustions),
+                        ),
+                        run_decommission_entry_retry_test(
+                            &store,
+                            rx.clone(),
+                            &other_bucket,
+                            other_object,
+                            other_incarnation,
+                            Arc::clone(&source_changed_exhaustions),
+                        )
+                    );
+                    changed_result.expect("SourceChanged entry retry must converge");
+                    other_result.expect("other bucket entry must continue through ordinary copy retries");
+
+                    assert!(!rx.is_cancelled(), "entry-level SourceChanged must not cancel the shared worker token");
+                    assert_eq!(mutation_calls.load(Ordering::SeqCst), 2, "entry must be re-listed after SourceChanged");
+                    assert_eq!(ordinary_faults.load(Ordering::SeqCst), 2, "ordinary copy must consume the retry budget");
+                    assert_eq!(source_changed_exhaustions.load(Ordering::SeqCst), 0);
+
+                    for (version_id, expected_body) in [
+                        (first_version, b"first generation".as_slice()),
+                        (second_version, b"second generation".as_slice()),
+                    ] {
+                        let opts = ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version_id.to_string()),
+                            ..Default::default()
+                        };
+                        assert_decommission_source_absent(&store, &changed_bucket, changed_object, &opts).await;
+                        assert_eq!(
+                            read_decommission_target_body(&store, &changed_bucket, changed_object, &opts).await,
+                            expected_body
+                        );
+                    }
+                    assert_decommission_source_absent(&store, &other_bucket, other_object, &ObjectOptions::default()).await;
+                    assert_eq!(
+                        read_decommission_target_body(&store, &other_bucket, other_object, &ObjectOptions::default()).await,
+                        b"other bucket generation"
+                    );
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_exhausted_source_changed_retains_source_and_records_failure() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_exhausted_source_changed_retains_source_and_records_failure".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create decommission exhaustion store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-entry-exhaustion",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-exhausted-{}", uuid::Uuid::new_v4());
+                    let object = "exhausted.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create decommission exhaustion bucket");
+                    let original_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &bucket,
+                        object,
+                        b"original generation".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(original_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let mutation_calls = Arc::new(AtomicUsize::new(0));
+                    let mutation_calls_for_hook = Arc::clone(&mutation_calls);
+                    let mutation_store = Arc::clone(&store);
+                    let mutation_bucket = bucket.clone();
+                    let _mutation_guard = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(
+                        move |called_bucket, called_object, _attempt| {
+                            let is_target = called_bucket == mutation_bucket.as_str() && called_object == object;
+                            let calls = Arc::clone(&mutation_calls_for_hook);
+                            let store = Arc::clone(&mutation_store);
+                            let bucket = mutation_bucket.clone();
+                            Box::pin(async move {
+                                if !is_target {
+                                    return;
+                                }
+                                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                                let offset = i64::try_from(call).expect("entry retry count should fit i64");
+                                seed_decommission_source(
+                                    &store,
+                                    &bucket,
+                                    object,
+                                    format!("concurrent generation {call}").into_bytes(),
+                                    &ObjectOptions {
+                                        versioned: true,
+                                        version_id: Some(uuid::Uuid::new_v4().to_string()),
+                                        mod_time: Some(base_time + time::Duration::seconds(offset)),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                            })
+                        },
+                    ));
+
+                    let rx = CancellationToken::new();
+                    let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        rx.clone(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::clone(&source_changed_exhaustions),
+                    )
+                    .await
+                    .expect("entry-level exhaustion must stay local below the pool threshold");
+
+                    assert!(!rx.is_cancelled(), "one exhausted entry must not cancel other bucket workers");
+                    assert_eq!(mutation_calls.load(Ordering::SeqCst), crate::core::pools::DECOMMISSION_ENTRY_MAX_ATTEMPTS);
+                    assert_eq!(source_changed_exhaustions.load(Ordering::SeqCst), 1);
+                    store.pools[0]
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: Some(original_version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("retry exhaustion must retain the original source version");
+                    let pool_meta = store.pool_meta.read().await;
+                    let info = pool_meta.pools[0]
+                        .decommission
+                        .as_ref()
+                        .expect("decommission progress must be initialized");
+                    assert_eq!(info.items_decommission_failed, 1, "exhausted entry must be visible as failed");
+                    drop(pool_meta);
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_delete_marker_copy_retries_real_path() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_delete_marker_copy_retries_real_path".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create delete marker retry store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-delete-marker-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-marker-{}", uuid::Uuid::new_v4());
+                    let object = "marker.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create delete marker retry bucket");
+                    let data_version = uuid::Uuid::new_v4();
+                    let marker_version = uuid::Uuid::new_v4();
+                    let base_time = OffsetDateTime::now_utc();
+                    seed_decommission_source(
+                        &store,
+                        &bucket,
+                        object,
+                        b"delete marker data".to_vec(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(data_version.to_string()),
+                            mod_time: Some(base_time),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    store.pools[0]
+                        .delete_object(
+                            &bucket,
+                            object,
+                            ObjectOptions {
+                                versioned: true,
+                                version_id: Some(marker_version.to_string()),
+                                delete_marker: true,
+                                mod_time: Some(base_time + time::Duration::seconds(1)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("seed source delete marker");
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let fault_calls = Arc::new(AtomicUsize::new(0));
+                    let fault_calls_for_hook = Arc::clone(&fault_calls);
+                    let fault_bucket = bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, called_bucket, called_object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
+                                && called_bucket == fault_bucket.as_str()
+                                && called_object == object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                fault_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        CancellationToken::new(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+                    .expect("delete marker copy retries must converge");
+
+                    assert_eq!(
+                        fault_calls.load(Ordering::SeqCst),
+                        crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS - 1
+                    );
+                    let marker_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(marker_version.to_string()),
+                        ..Default::default()
+                    };
+                    let target_marker = store.pools[1]
+                        .get_object_info(&bucket, object, &marker_opts)
+                        .await
+                        .expect("target delete marker must exist");
+                    assert!(target_marker.delete_marker);
+                    assert_decommission_source_absent(&store, &bucket, object, &marker_opts).await;
+
+                    let data_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(data_version.to_string()),
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        read_decommission_target_body(&store, &bucket, object, &data_opts).await,
+                        b"delete marker data"
+                    );
+                    assert_decommission_source_absent(&store, &bucket, object, &data_opts).await;
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_entry_tiered_copy_retries_real_path() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_entry_tiered_copy_retries_real_path".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create tiered retry store dir");
+                    let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-tiered-retry",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-tiered-{}", uuid::Uuid::new_v4());
+                    let object = "tiered.bin";
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create tiered retry bucket");
+                    let mut reader = PutObjReader::from_vec(b"tiered generation".to_vec());
+                    let original = store.pools[0]
+                        .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                        .expect("seed tiered source object");
+                    let tier_name = format!("DECOM{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+                    register_mock_tier(&ctx.tier_config_mgr(), &tier_name).await;
+                    store.pools[0]
+                        .transition_object(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                transition: TransitionOptions {
+                                    status: TRANSITION_PENDING.to_string(),
+                                    tier: tier_name,
+                                    etag: original.etag.clone().expect("tiered source ETag"),
+                                    ..Default::default()
+                                },
+                                version_id: original.version_id.map(|version_id| version_id.to_string()),
+                                mod_time: original.mod_time,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("transition source object to mock tier");
+                    mark_test_pool_decommissioning(&store, 0).await;
+
+                    let fault_calls = Arc::new(AtomicUsize::new(0));
+                    let fault_calls_for_hook = Arc::clone(&fault_calls);
+                    let fault_bucket = bucket.clone();
+                    let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
+                        move |stage, called_bucket, called_object, attempt| {
+                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
+                                && called_bucket == fault_bucket.as_str()
+                                && called_object == object
+                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+                            if injected {
+                                fault_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                            }
+                            injected
+                        },
+                    ));
+
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+                    run_decommission_entry_retry_test(
+                        &store,
+                        CancellationToken::new(),
+                        &bucket,
+                        object,
+                        incarnation,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+                    .expect("tiered copy retries must converge");
+
+                    assert_eq!(
+                        fault_calls.load(Ordering::SeqCst),
+                        crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS - 1
+                    );
+                    let target = store.pools[1]
+                        .get_object_info(&bucket, object, &ObjectOptions::default())
+                        .await
+                        .expect("tiered target metadata must exist");
+                    assert_eq!(target.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+                    assert_decommission_source_absent(&store, &bucket, object, &ObjectOptions::default()).await;
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn decommission retry test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_outer_fence_loss_blocks_target_put_commit() {
@@ -4420,6 +5049,95 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn data_movement_target_remains_readable_before_source_cleanup() {
+        let temp_dir = tempfile::tempdir().expect("create data movement read-window store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "data-movement-read-window", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("dm-read-window-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        let version = uuid::Uuid::new_v4();
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create data movement read-window bucket");
+
+        let mut reader = PutObjReader::from_vec(b"source body".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    mod_time: Some(mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed data movement source");
+        *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+
+        let source_reader = store.pools[0]
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read data movement source");
+        let source_data_dir = source_reader.object_info.data_dir;
+        crate::data_movement::migrate_object(store.clone(), 0, bucket.clone(), source_reader, None, "test_read_window")
+            .await
+            .expect("commit data movement target");
+
+        let target = store.pools[1]
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read committed data movement target");
+        assert_ne!(source_data_dir, target.data_dir, "the target must use its own data directory");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&target.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
+            Some("true")
+        );
+
+        let resolved = store
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the equal-time migration window must remain readable");
+        assert_eq!(resolved.data_dir, target.data_dir);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn data_movement_multipart_conflict_validates_exact_version_target_pool() {
         let temp_dir = tempfile::tempdir().expect("create three-pool multipart data movement store dir");
         let (_ctx, store, _shutdown) =
@@ -4555,6 +5273,1079 @@ mod tests {
             unexpected_version,
             StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)
         ));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-target-read-error", &[4, 4, 4]))
+                .await;
+        let job_id = uuid::Uuid::new_v4();
+        let job =
+            ManualTransitionJobRecord::new(job_id, "manual-target-read-error", &ManualTransitionRunOptions::default(), "owner");
+        let path = manual_transition_job_record_object_name(job_id).expect("manual job path should build");
+        let data = job.encode().expect("manual job should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("manual job fixture should persist in every pool");
+        }
+        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+
+        let failing_target = store.pools[2].get_disks_by_key(&path);
+        let original_disks = {
+            let mut disks = failing_target.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(3) {
+                *disk = None;
+            }
+            original
+        };
+        let error = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, store.pools[0].get_disks_by_key(&path), &path)
+            .await
+            .expect_err("one target read-quorum error must fail closed despite another target success")
+            .to_string();
+        *failing_target.disks.write().await = original_disks;
+
+        assert!(error.contains(&path));
+        assert!(error.contains("pool 2"));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("target read error must retain the source"),
+            data
+        );
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("failed target verification should not create a receipt"),
+            0
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-terminal-receipt", &[4, 4])).await;
+        let tier_name = "DECOMMISSION-RECEIPT";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let entry = Jentry {
+            obj_name: "receipt-recovery-object".to_string(),
+            version_id: "receipt-recovery-version".to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+        };
+        let path = tier_delete_journal_object_name(&entry);
+        let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
+        com::save_config(store.pools[0].clone(), &path, data.clone())
+            .await
+            .expect("source tier journal should persist");
+        com::save_config(store.pools[1].clone(), &path, data.clone())
+            .await
+            .expect("target tier journal should persist");
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active decommission run identity should persist");
+
+        let source_set = store.pools[0].get_disks_by_key(&path);
+        let barrier = SourceCleanupDeleteBarrier::install(RUSTFS_META_BUCKET, &path);
+        let cleanup_store = store.clone();
+        let cleanup_set = source_set.clone();
+        let cleanup_path = path.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_store
+                .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, cleanup_set, &cleanup_path)
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let original_source_disks = {
+            let mut disks = source_set.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(3) {
+                *disk = None;
+            }
+            original
+        };
+        barrier.release();
+        let cleanup_error = cleanup
+            .await
+            .expect("source cleanup task should not panic")
+            .expect_err("injected source delete quorum failure must fail cleanup")
+            .to_string();
+        *source_set.disks.write().await = original_source_disks;
+        drop(barrier);
+
+        assert!(cleanup_error.contains("source durable ILM cleanup failed"));
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("receipt should persist before source cleanup"),
+            1
+        );
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("failed cleanup must retain the source"),
+            data
+        );
+
+        let mut restarted_pool_meta = PoolMeta::default();
+        restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("decommission run identity should reload after restart");
+        *store.pool_meta.write().await = restarted_pool_meta;
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("target recovery should commit terminal proof and delete the target");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        assert!(matches!(
+            com::read_config(store.pools[1].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("target recovery must not delete the decommission source"),
+            data
+        );
+
+        store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, source_set, &path)
+            .await
+            .expect("terminal receipt should authorize cleanup after target deletion");
+        assert!(matches!(
+            com::read_config(store.pools[0].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert!(backend.remove_versions().await.contains(&(entry.obj_name, entry.version_id)));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_final_sweep_blocks_cancel_until_source_cleanup_finishes() {
+        let temp_dir = tempfile::tempdir().expect("create final sweep gate store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-final-sweep-gate", &[4, 4])).await;
+        let job_id = uuid::Uuid::new_v4();
+        let job = ManualTransitionJobRecord::new(job_id, "final-sweep-gate", &ManualTransitionRunOptions::default(), "owner");
+        let path = manual_transition_job_record_object_name(job_id).expect("manual job path should build");
+        let data = job.encode().expect("manual job should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("manual job fixture should persist in both pools");
+        }
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            });
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active decommission run identity should persist");
+
+        let barrier = SourceCleanupDeleteBarrier::install(RUSTFS_META_BUCKET, &path);
+        let final_sweep = tokio::spawn({
+            let store = store.clone();
+            async move { store.check_after_decommission_for_test(0).await }
+        });
+        barrier.wait_until_paused().await;
+
+        let mut cancel = tokio::spawn({
+            let store = store.clone();
+            async move { store.decommission_cancel(0).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cancel).await.is_err(),
+            "cancel must wait for the final sweep source cleanup"
+        );
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let decommission = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission state should remain present");
+            assert!(
+                !decommission.canceled,
+                "cancel must not publish terminal state before the final sweep drains"
+            );
+            assert!(
+                decommission.start_time.is_some(),
+                "cancel must preserve the run identity until the final sweep drains"
+            );
+        }
+
+        barrier.release();
+        final_sweep
+            .await
+            .expect("final sweep task should not panic")
+            .expect("final sweep should finish after the barrier releases");
+        cancel
+            .await
+            .expect("cancel task should not panic")
+            .expect("cancel should complete after the final sweep releases the operation gate");
+        let pool_meta = store.pool_meta.read().await;
+        let decommission = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission state should remain present");
+        assert!(decommission.canceled);
+        assert!(decommission.start_time.is_none());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_recovery_keeps_multiple_active_sources() {
+        let temp_dir = tempfile::tempdir().expect("create multi-source recovery store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "durable-ilm-multi-source-recovery",
+            &[4, 4, 4],
+        ))
+        .await;
+        let tier_name = "DECOMMISSION-MULTI-SOURCE";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let entry = Jentry {
+            obj_name: "multi-source-recovery-object".to_string(),
+            version_id: "multi-source-recovery-version".to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+        };
+        let path = tier_delete_journal_object_name(&entry);
+        let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &path, data.clone())
+                .await
+                .expect("source and target tier journals should persist");
+        }
+
+        let active_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            let start_time = OffsetDateTime::now_utc();
+            for pool_idx in [0, 1] {
+                pool_meta.pools[pool_idx].decommission = Some(PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    ..Default::default()
+                });
+            }
+            pool_meta.clone()
+        };
+        active_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("multiple active decommission runs should persist");
+        let mut restarted_pool_meta = PoolMeta::default();
+        restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("multiple active decommission runs should reload");
+        *store.pool_meta.write().await = restarted_pool_meta;
+
+        let record = validate_durable_ilm_record(&path, &data).expect("tier journal should validate");
+        let source_zero_receipt = store
+            .persist_decommission_durable_ilm_receipt_for_test(0, 1, &path, &record, false)
+            .await
+            .expect("source pool zero receipt should persist on the other active source");
+        let source_one_receipt = store
+            .persist_decommission_durable_ilm_receipt_for_test(1, 0, &path, &record, false)
+            .await
+            .expect("source pool one receipt should persist on the other active source");
+        assert_ne!(
+            source_zero_receipt, source_one_receipt,
+            "active source runs must have distinct receipt paths"
+        );
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("cross-source receipts should not remove active source journals");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        for pool in &store.pools {
+            assert_eq!(
+                com::read_config(pool.clone(), &path)
+                    .await
+                    .expect("cross-source receipts alone must retain every journal copy"),
+                data
+            );
+        }
+
+        store
+            .persist_decommission_durable_ilm_receipt_for_test(0, 2, &path, &record, false)
+            .await
+            .expect("source pool zero receipt should persist on the target");
+        store
+            .persist_decommission_durable_ilm_receipt_for_test(1, 2, &path, &record, false)
+            .await
+            .expect("source pool one receipt should persist on the target");
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("multi-source tier journal recovery should complete");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &path)
+                .await
+                .expect("first active source must remain after target recovery"),
+            data
+        );
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &path)
+                .await
+                .expect("second active source must remain after target recovery"),
+            data
+        );
+        assert!(matches!(
+            com::read_config(store.pools[2].clone(), &path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert!(backend.remove_versions().await.contains(&(entry.obj_name, entry.version_id)));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page() {
+        const RECEIPT_COUNT: usize = 1001;
+
+        let temp_dir = tempfile::tempdir().expect("create paginated receipt store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-receipt-pages", &[4, 4])).await;
+        store.pool_meta.write().await.pools[0].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        });
+
+        futures::stream::iter(0..RECEIPT_COUNT)
+            .map(|index| {
+                let store = store.clone();
+                async move {
+                    let id = format!("{index:064x}");
+                    let source_path = format!("ilm/tier-delete-journal/{id}.json");
+                    let record = ValidatedDurableIlmRecord {
+                        namespace: "tier-delete-journal",
+                        id_kind: "operation_id",
+                        id,
+                        checkpoint: DurableIlmRecordCheckpoint::TierDeleteJournal {
+                            content_sha256: format!("{:064x}", index + RECEIPT_COUNT),
+                            identity_sha256: "f".repeat(64),
+                            committed: false,
+                        },
+                    };
+                    store
+                        .persist_decommission_durable_ilm_receipt_for_test(0, 0, &source_path, &record, true)
+                        .await?;
+                    store
+                        .persist_decommission_durable_ilm_receipt_for_test(0, 1, &source_path, &record, true)
+                        .await?;
+                    Ok::<(), Error>(())
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("more than one receipt page should persist");
+        store
+            .persist_decommission_durable_ilm_manifest_for_test(0)
+            .await
+            .expect("paginated source receipts should produce a manifest");
+
+        let target_receipts = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("paginated target receipts should list");
+        assert_eq!(target_receipts.len(), RECEIPT_COUNT);
+        let (target_pool_idx, second_page_path) = target_receipts
+            .get(1000)
+            .cloned()
+            .expect("the real 1000-item page boundary should expose a second page receipt");
+        let receipt_bytes = com::read_config(store.pools[target_pool_idx].clone(), &second_page_path)
+            .await
+            .expect("second page receipt should be readable");
+
+        com::delete_config(store.pools[target_pool_idx].clone(), &second_page_path)
+            .await
+            .expect("second page receipt should delete");
+        let missing = store
+            .complete_decommission(0)
+            .await
+            .expect_err("a missing second page receipt must block completion")
+            .to_string();
+        assert!(missing.contains(&second_page_path));
+        assert!(
+            !store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source pool should remain in decommission")
+                .complete
+        );
+        assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
+
+        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, receipt_bytes.clone())
+            .await
+            .expect("second page receipt should restore");
+        com::save_config(store.pools[target_pool_idx].clone(), &second_page_path, b"{corrupt".to_vec())
+            .await
+            .expect("second page receipt should corrupt deterministically");
+        let corrupt = store
+            .complete_decommission(0)
+            .await
+            .expect_err("a corrupt second page receipt must block completion")
+            .to_string();
+        assert!(corrupt.contains(&second_page_path));
+        assert!(corrupt.contains("invalid"));
+        assert!(
+            !store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("source pool should remain in decommission")
+                .complete
+        );
+        assert!(com::read_config(store.pools[0].clone(), &second_page_path).await.is_ok());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_migrates_and_verifies_registered_durable_ilm_records() {
+        std::thread::Builder::new()
+            .name("durable-ilm-decommission-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("durable ILM decommission runtime should build");
+                runtime.block_on(decommission_migrates_and_verifies_registered_durable_ilm_records_scenario());
+            })
+            .expect("durable ILM decommission scenario thread should spawn")
+            .join()
+            .expect("durable ILM decommission scenario should not panic");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn decommission_migrates_and_verifies_registered_durable_ilm_records_scenario() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-decommission", &[4, 4])).await;
+
+        let tier_name = "DECOMMISSION-ILM";
+        let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let tier_entry = Jentry {
+            obj_name: "decommissioned-remote-object".to_string(),
+            version_id: "decommissioned-remote-version".to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+        };
+        let tier_path = tier_delete_journal_object_name(&tier_entry);
+        let tier_bytes = encode_tier_delete_journal_entry(&tier_entry).expect("tier journal should encode");
+
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transition transaction should build");
+        let regressed_transaction = transaction.clone();
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("transition transaction should advance before migration");
+        let transaction_path = transition_transaction_record_object_name(transaction.transaction_id)
+            .expect("transition transaction path should build");
+        let transaction_bytes = transaction.encode().expect("transition transaction should encode");
+
+        let manual_job_id = uuid::Uuid::new_v4();
+        let manual_bucket = format!("manual-decommission-{}", manual_job_id.simple());
+        let manual_options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some(tier_name.to_string()),
+            ..Default::default()
+        };
+        let mut manual_job = ManualTransitionJobRecord::new(manual_job_id, &manual_bucket, &manual_options, "old-owner");
+        manual_job.scan_completed = true;
+        manual_job.report.enqueued = 1;
+        manual_job.lease_expires_at_unix_nanos = 0;
+        let manual_scope = ManualTransitionScopeAdmission::from_job(&manual_job);
+        let task_key = manual_transition_worker_result_task_key(&manual_bucket, "logs/a", None);
+        let manual_task = ManualTransitionTaskRecord::new(manual_job_id, &task_key, &manual_bucket, "logs/a", None, tier_name);
+        let manual_result =
+            ManualTransitionWorkerResultRecord::new(manual_job_id, &task_key, ManualTransitionWorkerResult::Completed);
+
+        let manual_job_path = manual_transition_job_record_object_name(manual_job_id).expect("manual job path should build");
+        let manual_scope_path =
+            manual_transition_scope_record_object_name(&manual_scope.scope_key).expect("manual scope path should build");
+        let manual_task_path =
+            manual_transition_task_object_name(manual_job_id, &task_key).expect("manual task path should build");
+        let manual_result_path = manual_transition_worker_result_object_name(manual_job_id, &task_key)
+            .expect("manual worker result path should build");
+        let manual_job_bytes = manual_job.encode().expect("manual job should encode");
+        let manual_scope_bytes = serde_json::to_vec(&manual_scope).expect("manual scope should encode");
+        let manual_task_bytes = manual_task.encode().expect("manual task should encode");
+        let manual_result_bytes = manual_result.encode().expect("manual result should encode");
+
+        let records = vec![
+            (tier_path.clone(), tier_bytes.clone()),
+            (transaction_path.clone(), transaction_bytes.clone()),
+            (manual_job_path.clone(), manual_job_bytes.clone()),
+            (manual_scope_path.clone(), manual_scope_bytes.clone()),
+            (manual_task_path.clone(), manual_task_bytes.clone()),
+            (manual_result_path.clone(), manual_result_bytes.clone()),
+        ];
+        for (path, data) in &records {
+            com::save_config(store.pools[0].clone(), path, data.clone())
+                .await
+                .expect("durable ILM source record should persist");
+        }
+
+        let legacy_queue = [com::CONFIG_PREFIX, BUCKET_META_PREFIX]
+            .into_iter()
+            .map(|prefix| {
+                DecomBucketInfo {
+                    name: RUSTFS_META_BUCKET.to_string(),
+                    prefix: prefix.to_string(),
+                }
+                .to_string()
+            })
+            .collect();
+        let legacy_pool_meta = {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                queued: true,
+                queued_buckets: legacy_queue,
+                ..Default::default()
+            });
+            pool_meta.clone()
+        };
+        legacy_pool_meta
+            .save(store.pools.clone())
+            .await
+            .expect("legacy decommission queue should persist before restart");
+        let mut restarted_pool_meta = PoolMeta::default();
+        restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("legacy decommission queue should reload after restart");
+        *store.pool_meta.write().await = restarted_pool_meta;
+        store
+            .promote_queued_decommission_for_test(0)
+            .await
+            .expect("legacy queued decommission should resume");
+        let expected_ilm_queue = DecomBucketInfo {
+            name: RUSTFS_META_BUCKET.to_string(),
+            prefix: ILM_META_PREFIX.to_string(),
+        }
+        .to_string();
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let decommission = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission state should remain present");
+            assert!(!decommission.queued);
+            assert!(decommission.queued_buckets.contains(&expected_ilm_queue));
+        }
+
+        let ilm_bucket = DecomBucketInfo {
+            name: RUSTFS_META_BUCKET.to_string(),
+            prefix: ILM_META_PREFIX.to_string(),
+        };
+        for _ in 0..2 {
+            store
+                .decommission_pool_for_test(CancellationToken::new(), 0, store.pools[0].clone(), ilm_bucket.clone())
+                .await
+                .expect("durable ILM decommission should be idempotent");
+        }
+        for (path, expected) in &records {
+            assert_eq!(
+                com::read_config(store.pools[0].clone(), path)
+                    .await
+                    .expect("source should remain until the final sweep"),
+                *expected
+            );
+            assert_eq!(
+                com::read_config(store.pools[1].clone(), path)
+                    .await
+                    .expect("target should contain the migrated record"),
+                *expected
+            );
+        }
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("no receipt should exist before the final sweep"),
+            0
+        );
+        let isolated_tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("tier recovery should retain a terminal record until its receipt is committed");
+        assert!(isolated_tier_stats.scanned >= 1);
+        assert_eq!(isolated_tier_stats.deleted, 0);
+        assert!(isolated_tier_stats.failed >= 1);
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &tier_path)
+                .await
+                .expect("receipt isolation must retain the target tier journal"),
+            tier_bytes
+        );
+
+        com::delete_config(store.pools[1].clone(), &manual_job_path)
+            .await
+            .expect("target manual job should delete");
+        let missing = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                0,
+                store.pools[0].get_disks_by_key(&manual_job_path),
+                &manual_job_path,
+            )
+            .await
+            .expect_err("missing target must block source cleanup");
+        let missing = missing.to_string();
+        assert!(missing.contains(&manual_job_path) && missing.contains(&manual_job_id.to_string()));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &manual_job_path)
+                .await
+                .expect("missing target must retain source"),
+            manual_job_bytes
+        );
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("target manual job should restore");
+
+        com::save_config(store.pools[1].clone(), &transaction_path, b"{corrupt".to_vec())
+            .await
+            .expect("target transaction should corrupt deterministically");
+        let corrupt = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                0,
+                store.pools[0].get_disks_by_key(&transaction_path),
+                &transaction_path,
+            )
+            .await
+            .expect_err("corrupt target must block source cleanup");
+        let corrupt = corrupt.to_string();
+        assert!(corrupt.contains(&transaction_path) && corrupt.contains(&transaction.transaction_id.to_string()));
+        assert_eq!(
+            com::read_config(store.pools[0].clone(), &transaction_path)
+                .await
+                .expect("corrupt target must retain source"),
+            transaction_bytes
+        );
+        com::save_config(store.pools[1].clone(), &transaction_path, transaction_bytes.clone())
+            .await
+            .expect("target transaction should restore");
+
+        com::save_config(store.pools[1].clone(), &manual_scope_path, manual_scope_bytes.clone())
+            .await
+            .expect("target scope rewrite should invalidate cached metadata before the quorum check");
+        let target_scope_set = store.pools[1].get_disks_by_key(&manual_scope_path);
+        let original_target_scope_disks = {
+            let mut disks = target_scope_set.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(3) {
+                *disk = None;
+            }
+            original
+        };
+        let quorum_error = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                0,
+                store.pools[0].get_disks_by_key(&manual_scope_path),
+                &manual_scope_path,
+            )
+            .await
+            .expect_err("target below read quorum must block source cleanup");
+        *target_scope_set.disks.write().await = original_target_scope_disks;
+        let quorum_error = quorum_error.to_string();
+        assert!(quorum_error.contains(&manual_scope_path) && quorum_error.contains(&manual_job_id.to_string()));
+        assert!(com::read_config(store.pools[0].clone(), &manual_scope_path).await.is_ok());
+
+        com::save_config(store.pools[1].clone(), &manual_task_path, manual_task_bytes.clone())
+            .await
+            .expect("target task rewrite should invalidate cached metadata before the quorum check");
+        let target_task_set = store.pools[1].get_disks_by_key(&manual_task_path);
+        let original_target_task_disks = {
+            let mut disks = target_task_set.disks.write().await;
+            let original = disks.clone();
+            for disk in disks.iter_mut().take(2) {
+                *disk = None;
+            }
+            original
+        };
+        let receipt_quorum_error = store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                0,
+                store.pools[0].get_disks_by_key(&manual_task_path),
+                &manual_task_path,
+            )
+            .await
+            .expect_err("target read quorum without receipt write quorum must retain the source");
+        *target_task_set.disks.write().await = original_target_task_disks;
+        let receipt_quorum_error = receipt_quorum_error.to_string();
+        assert!(receipt_quorum_error.contains("receipt"));
+        assert!(receipt_quorum_error.contains(&manual_task_path));
+        assert!(receipt_quorum_error.contains(&manual_job_id.to_string()));
+        assert!(com::read_config(store.pools[0].clone(), &manual_task_path).await.is_ok());
+        store
+            .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                0,
+                store.pools[0].get_disks_by_key(&manual_task_path),
+                &manual_task_path,
+            )
+            .await
+            .expect("healthy target should persist the receipt before source cleanup");
+
+        let unknown_path = "ilm/future-durable/jobs/one.json";
+        com::save_config(store.pools[0].clone(), unknown_path, b"{}".to_vec())
+            .await
+            .expect("unknown durable ILM record should persist for the guard test");
+        let unknown_migration = store
+            .decommission_pool_for_test(CancellationToken::new(), 0, store.pools[0].clone(), ilm_bucket)
+            .await
+            .expect_err("unregistered durable ILM namespace must block migration");
+        assert!(unknown_migration.to_string().contains(unknown_path));
+        let unknown_final_sweep = store
+            .check_after_decommission_for_test(0)
+            .await
+            .expect_err("unregistered durable ILM namespace must block completion");
+        assert!(unknown_final_sweep.to_string().contains(unknown_path));
+        com::delete_config(store.pools[0].clone(), unknown_path)
+            .await
+            .expect("unknown guard fixture should be removed before the successful final sweep");
+
+        store
+            .check_after_decommission_for_test(0)
+            .await
+            .expect("production final sweep should validate every target before cleanup");
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("durable ILM receipts should be listable"),
+            records.len(),
+            "every cleaned source record must have a durable validation receipt"
+        );
+        for (path, expected) in &records {
+            assert!(
+                matches!(com::read_config(store.pools[0].clone(), path).await, Err(Error::ConfigNotFound)),
+                "final sweep should remove the validated source `{path}`"
+            );
+            assert_eq!(
+                com::read_config(store.pools[1].clone(), path)
+                    .await
+                    .expect("final sweep must preserve the target"),
+                *expected
+            );
+        }
+
+        let mut crash_restarted_pool_meta = PoolMeta::default();
+        crash_restarted_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("pool metadata should reload after the simulated pre-complete crash");
+        *store.pool_meta.write().await = crash_restarted_pool_meta;
+
+        let (manual_job_receipt_pool, manual_job_receipt_path) = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("durable ILM receipt paths should be listable")
+            .into_iter()
+            .find(|(_, path)| path.contains(&manual_job_path))
+            .expect("manual job should have one target receipt");
+        let manual_job_receipt_bytes = com::read_config(store.pools[manual_job_receipt_pool].clone(), &manual_job_receipt_path)
+            .await
+            .expect("manual job receipt should be readable before deletion");
+        com::delete_config(store.pools[manual_job_receipt_pool].clone(), &manual_job_receipt_path)
+            .await
+            .expect("manual job receipt should delete after source cleanup");
+        com::delete_config(store.pools[1].clone(), &manual_job_path)
+            .await
+            .expect("post-crash target manual job should delete");
+        let missing_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a missing target after source cleanup and restart")
+            .to_string();
+        assert!(missing_after_crash.contains("receipt"));
+        assert!(missing_after_crash.contains(&manual_job_path));
+        assert!(missing_after_crash.contains(&manual_job_id.to_string()));
+        assert!(
+            !store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission state should survive restart")
+                .complete
+        );
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("post-crash target manual job should restore");
+        com::save_config(
+            store.pools[manual_job_receipt_pool].clone(),
+            &manual_job_receipt_path,
+            manual_job_receipt_bytes,
+        )
+        .await
+        .expect("manual job receipt should restore after the missing-receipt check");
+
+        com::save_config(store.pools[1].clone(), &transaction_path, b"{corrupt".to_vec())
+            .await
+            .expect("post-crash target transaction should corrupt deterministically");
+        let corrupt_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a corrupt target after source cleanup and restart")
+            .to_string();
+        assert!(corrupt_after_crash.contains(&transaction_path));
+        assert!(corrupt_after_crash.contains(&transaction.transaction_id.to_string()));
+        com::save_config(store.pools[1].clone(), &transaction_path, transaction_bytes.clone())
+            .await
+            .expect("post-crash target transaction should restore");
+
+        let mut wrong_manual_job = manual_job.clone();
+        wrong_manual_job.job_id = uuid::Uuid::new_v4();
+        com::save_config(
+            store.pools[1].clone(),
+            &manual_job_path,
+            wrong_manual_job.encode().expect("wrong-id job should encode"),
+        )
+        .await
+        .expect("post-crash target manual job should accept the wrong-id fixture");
+        let wrong_id_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a target record with the wrong id")
+            .to_string();
+        assert!(wrong_id_after_crash.contains(&manual_job_path));
+        assert!(wrong_id_after_crash.contains(&manual_job_id.to_string()));
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("post-crash target manual job should restore after the wrong-id check");
+
+        com::save_config(
+            store.pools[1].clone(),
+            &transaction_path,
+            regressed_transaction
+                .encode()
+                .expect("regressed transition transaction should encode"),
+        )
+        .await
+        .expect("post-crash target transaction should accept the regression fixture");
+        let regression_after_crash = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a lower transition transaction revision")
+            .to_string();
+        assert!(regression_after_crash.contains("generation mismatch"));
+        assert!(regression_after_crash.contains(&transaction_path));
+        assert!(regression_after_crash.contains(&transaction.transaction_id.to_string()));
+        com::save_config(store.pools[1].clone(), &transaction_path, transaction_bytes.clone())
+            .await
+            .expect("post-crash target transaction should restore after the regression check");
+
+        let (manual_task_receipt_pool, manual_task_receipt_path) = store
+            .decommission_durable_ilm_receipt_paths_for_test(0)
+            .await
+            .expect("durable ILM receipt paths should be listable")
+            .into_iter()
+            .find(|(_, path)| path.contains(&manual_task_path))
+            .expect("manual task receipt should retain its reversible source path");
+        let manual_task_receipt_bytes =
+            com::read_config(store.pools[manual_task_receipt_pool].clone(), &manual_task_receipt_path)
+                .await
+                .expect("manual task receipt should be readable before corruption");
+        com::save_config(
+            store.pools[manual_task_receipt_pool].clone(),
+            &manual_task_receipt_path,
+            b"{corrupt".to_vec(),
+        )
+        .await
+        .expect("manual task receipt should corrupt deterministically");
+        let corrupt_receipt = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must fail closed on a corrupt receipt")
+            .to_string();
+        assert!(corrupt_receipt.contains(&manual_task_path));
+        assert!(corrupt_receipt.contains(&manual_job_id.to_string()));
+        com::save_config(
+            store.pools[manual_task_receipt_pool].clone(),
+            &manual_task_receipt_path,
+            manual_task_receipt_bytes,
+        )
+        .await
+        .expect("manual task receipt should restore after the corruption check");
+
+        let tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("tier journal recovery should consume the migrated record before completion");
+        assert_eq!((tier_stats.scanned, tier_stats.deleted, tier_stats.failed), (1, 1, 0));
+        assert!(matches!(com::read_config(store.clone(), &tier_path).await, Err(Error::ConfigNotFound)));
+
+        let recovered_transition_version = "recovered-transition-version".to_string();
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::VersionedPresent(
+                recovered_transition_version.clone(),
+            )))
+            .await;
+        let transaction_stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition recovery should advance and consume the migrated transaction before completion");
+        backend.set_transition_candidate_probe_override(None).await;
+        assert_eq!(
+            (
+                transaction_stats.scanned,
+                transaction_stats.recovered,
+                transaction_stats.retained,
+                transaction_stats.failed,
+            ),
+            (1, 1, 0, 0)
+        );
+        assert!(matches!(
+            com::read_config(store.clone(), &transaction_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        com::save_config(
+            store.pools[1].clone(),
+            &transaction_path,
+            regressed_transaction
+                .encode()
+                .expect("post-terminal transition rollback should encode"),
+        )
+        .await
+        .expect("target should accept the post-terminal rollback fixture");
+        let post_terminal_regression = store
+            .complete_decommission(0)
+            .await
+            .expect_err("terminal proof must not mask a lower transition revision")
+            .to_string();
+        assert!(post_terminal_regression.contains("generation mismatch"));
+        assert!(post_terminal_regression.contains(&transaction_path));
+        assert!(post_terminal_regression.contains(&transaction.transaction_id.to_string()));
+        com::delete_config(store.pools[1].clone(), &transaction_path)
+            .await
+            .expect("post-terminal rollback fixture should be removed");
+
+        let manual_stats = recover_manual_transition_jobs_once(store.clone(), 100, None)
+            .await
+            .expect("manual recovery should advance the migrated job and consume its scope before completion");
+        assert_eq!(
+            (manual_stats.scanned, manual_stats.resumed, manual_stats.skipped, manual_stats.failed,),
+            (1, 1, 0, 0)
+        );
+        assert!(matches!(
+            com::read_config(store.clone(), &manual_scope_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        let recovered_manual_job_bytes = com::read_config(store.pools[1].clone(), &manual_job_path)
+            .await
+            .expect("manual recovery should retain the advanced job record");
+        assert_ne!(recovered_manual_job_bytes, manual_job_bytes);
+
+        com::save_config(store.pools[1].clone(), &manual_job_path, manual_job_bytes.clone())
+            .await
+            .expect("target manual job should accept the rollback fixture");
+        let manual_regression = store
+            .complete_decommission(0)
+            .await
+            .expect_err("completion must reject a manual job generation rollback")
+            .to_string();
+        assert!(manual_regression.contains("generation mismatch"));
+        assert!(manual_regression.contains(&manual_job_path));
+        assert!(manual_regression.contains(&manual_job_id.to_string()));
+        com::save_config(store.pools[1].clone(), &manual_job_path, recovered_manual_job_bytes)
+            .await
+            .expect("target manual job should restore its recovered generation");
+
+        store
+            .complete_decommission(0)
+            .await
+            .expect("completion should persist before receipt cleanup");
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("completed decommission state should remain present")
+                .complete
+        );
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("receipt cleanup should be observable"),
+            0
+        );
+        store
+            .cleanup_decommission_durable_ilm_receipts_for_test(0)
+            .await
+            .expect("receipt cleanup should be idempotent");
+        let removed_versions = backend.remove_versions().await;
+        assert!(removed_versions.contains(&(tier_entry.obj_name.clone(), tier_entry.version_id.clone())));
+        assert!(removed_versions.contains(&(transaction.remote_object.clone(), recovered_transition_version)));
     }
 
     #[cfg(feature = "test-util")]

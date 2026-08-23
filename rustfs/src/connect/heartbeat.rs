@@ -19,23 +19,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::{Client, StatusCode, Url, header};
-use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use super::config::HeartbeatConfig;
-use super::credential_store::{CredentialStoreError, DeviceCredential};
+use super::credential_store::CredentialStoreError;
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
-use super::registration::{CredentialValidationError, validate_stored_credential};
+use super::registration::CredentialValidationError;
+use super::telemetry::{TelemetryDelivery, TelemetryError, TelemetryTransport, is_exact_utc_seconds};
 
 const PROTOCOL_VERSION: &str = "v1";
 const AGENT_VERSION: &str = concat!("rustfs-agent/", env!("CARGO_PKG_VERSION"));
 const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -122,133 +118,39 @@ pub(crate) enum Delivery {
 }
 
 pub(crate) struct HeartbeatSender {
-    endpoint: Url,
-    root_store: RootCertStore,
-    roots: Vec<CertificateDer<'static>>,
-    config: HeartbeatConfig,
+    transport: TelemetryTransport,
 }
 
 impl HeartbeatSender {
     pub(crate) fn new(config: HeartbeatConfig) -> Result<Self, HeartbeatError> {
-        let mut endpoint = Url::parse(&config.endpoint).map_err(|_| HeartbeatError::Endpoint)?;
-        if endpoint.scheme() != "https"
-            || endpoint.cannot_be_a_base()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(HeartbeatError::Endpoint);
-        }
-        if !endpoint.path().ends_with('/') {
-            endpoint.set_path(&format!("{}/", endpoint.path()));
-        }
-        let roots = CertificateDer::pem_slice_iter(&config.root_ca_pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| HeartbeatError::RootCertificate)?;
-        if roots.is_empty() {
-            return Err(HeartbeatError::RootCertificate);
-        }
-        let mut root_store = RootCertStore::empty();
-        let (accepted, rejected) = root_store.add_parsable_certificates(roots.clone());
-        if accepted != roots.len() || rejected != 0 {
-            return Err(HeartbeatError::RootCertificate);
-        }
         let schedule = config.schedule;
-        if schedule.cadence.is_zero()
-            || schedule.timeout.is_zero()
-            || schedule.timeout > Duration::from_secs(5)
-            || schedule.initial_backoff.is_zero()
-            || schedule.max_backoff < schedule.initial_backoff
-            || schedule.max_backoff > Duration::from_secs(5 * 60)
-            || schedule.jitter > schedule.cadence
-        {
+        if schedule.cadence.is_zero() || schedule.jitter > schedule.cadence {
             return Err(HeartbeatError::Schedule);
         }
         Ok(Self {
-            endpoint,
-            root_store,
-            roots,
-            config,
+            transport: TelemetryTransport::new(config)?,
         })
     }
 
     pub(crate) async fn send(&self, heartbeat: &PendingHeartbeat) -> Result<Delivery, HeartbeatError> {
-        let (cluster_uid, client) = {
-            let _lock = self.config.credential_store.lock().await?;
-            let credential = self.config.credential_store.load()?.ok_or(HeartbeatError::NotRegistered)?;
-            let identity = self.config.identity_store.load()?.ok_or(HeartbeatError::IdentityMissing)?;
-            validate_stored_credential(&credential, &identity, &self.root_store, &self.roots)?;
-            let now = Utc::now().timestamp();
-            if now < credential.not_before_unix || now >= credential.not_after_unix {
-                return Err(HeartbeatError::CredentialExpired);
+        match self.transport.post("heartbeats", heartbeat).await? {
+            TelemetryDelivery::Accepted { body, .. } => {
+                let accepted: HeartbeatResponse = serde_json::from_slice(&body).map_err(|_| HeartbeatError::Response)?;
+                if accepted.accepted_version != PROTOCOL_VERSION
+                    || accepted.capability_hints.len() > 32
+                    || accepted.capability_hints.iter().any(|hint| hint.len() > 32)
+                    || !is_exact_utc_seconds(&accepted.server_time)
+                {
+                    return Err(HeartbeatError::Response);
+                }
+                Ok(Delivery::Accepted {
+                    server_time: accepted.server_time,
+                })
             }
-            let cluster_uid = cluster_uid(&credential)?.to_owned();
-            let client = self.client(&credential, &identity.to_pkcs8_pem()?)?;
-            (cluster_uid, client)
-        };
-        let url = self.endpoint.join(&format!("clusters/{cluster_uid}/heartbeats"))?;
-        let response = match client.post(url).json(heartbeat).send().await {
-            Ok(response) => response,
-            Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
-                return Ok(Delivery::Retry { retry_after: None });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(Delivery::Retry {
-                retry_after: retry_after(response.headers(), Utc::now(), self.config.schedule.max_backoff),
-            });
+            TelemetryDelivery::Retry { retry_after } => Ok(Delivery::Retry { retry_after }),
+            TelemetryDelivery::AuthenticationStopped { status, reason } => Ok(Delivery::AuthenticationStopped { status, reason }),
+            TelemetryDelivery::Rejected { status, reason } => Ok(Delivery::Rejected { status, reason }),
         }
-        if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
-            return Ok(Delivery::Retry { retry_after: None });
-        }
-        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            return Ok(Delivery::AuthenticationStopped {
-                status: status.as_u16(),
-                reason: response_reason(response).await,
-            });
-        }
-        if status != StatusCode::OK {
-            return Ok(Delivery::Rejected {
-                status: status.as_u16(),
-                reason: response_reason(response).await,
-            });
-        }
-        let accepted: HeartbeatResponse =
-            serde_json::from_slice(&bounded_body(response).await?).map_err(|_| HeartbeatError::Response)?;
-        if accepted.accepted_version != PROTOCOL_VERSION
-            || accepted.capability_hints.len() > 32
-            || accepted.capability_hints.iter().any(|hint| hint.len() > 32)
-            || !is_exact_utc_seconds(&accepted.server_time)
-        {
-            return Err(HeartbeatError::Response);
-        }
-        Ok(Delivery::Accepted {
-            server_time: accepted.server_time,
-        })
-    }
-
-    fn client(&self, credential: &DeviceCredential, key: &Zeroizing<String>) -> Result<Client, HeartbeatError> {
-        let mut pem = Zeroizing::new(Vec::with_capacity(credential.certificate_chain.len() + key.len() + 1));
-        pem.extend_from_slice(credential.certificate_chain.as_bytes());
-        pem.push(b'\n');
-        pem.extend_from_slice(key.as_bytes());
-        let identity = reqwest::Identity::from_pem(&pem).map_err(|_| HeartbeatError::IdentityCertificate)?;
-        let roots = self
-            .roots
-            .iter()
-            .map(|root| reqwest::Certificate::from_der(root.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.config.schedule.timeout)
-            .tls_certs_only(roots)
-            .identity(identity)
-            .build()
-            .map_err(Into::into)
     }
 }
 
@@ -376,73 +278,6 @@ impl HeartbeatStateStore {
         }
         result
     }
-}
-
-fn cluster_uid(credential: &DeviceCredential) -> Result<&str, HeartbeatError> {
-    let mut parts = credential.name.split('/');
-    let valid = parts.next() == Some("organizations");
-    let organization_uid = parts.next();
-    let valid = valid && parts.next() == Some("clusters");
-    let cluster_uid = parts.next();
-    let valid = valid && parts.next() == Some("clusterDevices");
-    let device_uid = parts.next();
-    if !valid
-        || organization_uid.is_none_or(str::is_empty)
-        || cluster_uid.is_none_or(str::is_empty)
-        || device_uid != Some(credential.uid.as_str())
-        || parts.next().is_some()
-    {
-        return Err(HeartbeatError::CredentialName);
-    }
-    cluster_uid.ok_or(HeartbeatError::CredentialName)
-}
-
-fn retry_after(headers: &header::HeaderMap, now: DateTime<Utc>, maximum: Duration) -> Option<Duration> {
-    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
-    let delay = value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
-        DateTime::parse_from_rfc2822(value)
-            .ok()
-            .and_then(|at| (at.with_timezone(&Utc) - now).to_std().ok())
-    })?;
-    Some(delay.min(maximum))
-}
-
-fn is_exact_utc_seconds(value: &str) -> bool {
-    DateTime::parse_from_rfc3339(value).is_ok_and(|time| {
-        time.offset().local_minus_utc() == 0
-            && value.ends_with('Z')
-            && time.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Secs, true) == value
-    })
-}
-
-async fn response_reason(response: reqwest::Response) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        details: Vec<Detail>,
-    }
-    #[derive(Deserialize)]
-    struct Detail {
-        #[serde(default)]
-        reason: String,
-    }
-
-    serde_json::from_slice::<Envelope>(&bounded_body(response).await.ok()?)
-        .ok()?
-        .details
-        .into_iter()
-        .find_map(|detail| (!detail.reason.is_empty()).then_some(detail.reason))
-}
-
-async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, HeartbeatError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(HeartbeatError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 fn parent(path: &Path) -> Result<&Path, HeartbeatError> {
@@ -582,4 +417,26 @@ pub enum HeartbeatError {
     CredentialStore(#[from] CredentialStoreError),
     #[error(transparent)]
     CredentialValidation(#[from] CredentialValidationError),
+}
+
+impl From<TelemetryError> for HeartbeatError {
+    fn from(error: TelemetryError) -> Self {
+        match error {
+            TelemetryError::Endpoint => Self::Endpoint,
+            TelemetryError::RootCertificate => Self::RootCertificate,
+            TelemetryError::Schedule => Self::Schedule,
+            TelemetryError::NotRegistered => Self::NotRegistered,
+            TelemetryError::IdentityMissing => Self::IdentityMissing,
+            TelemetryError::IdentityCertificate => Self::IdentityCertificate,
+            TelemetryError::CredentialName => Self::CredentialName,
+            TelemetryError::CredentialExpired => Self::CredentialExpired,
+            TelemetryError::ResponseTooLarge => Self::ResponseTooLarge,
+            TelemetryError::Url(error) => Self::Url(error),
+            TelemetryError::Transport(error) => Self::Transport(error),
+            TelemetryError::Identity(error) => Self::Identity(error),
+            TelemetryError::IdentityStore(error) => Self::IdentityStore(error),
+            TelemetryError::CredentialStore(error) => Self::CredentialStore(error),
+            TelemetryError::CredentialValidation(error) => Self::CredentialValidation(error),
+        }
+    }
 }

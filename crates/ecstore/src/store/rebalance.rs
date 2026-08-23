@@ -14,10 +14,15 @@
 
 use super::*;
 use crate::config::storageclass;
+use crate::core::pools::merge_pool_status_refresh;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
 pub(in crate::store) mod support;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_POOLS: &str = "pools";
+const EVENT_POOL_META_RELOAD: &str = "pool_meta_reload";
 use support::{
     LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
     rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates, resolve_rebalance_delete_from_all_pools_result,
@@ -684,17 +689,61 @@ impl ECStore {
         )
     }
 
-    pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut meta = PoolMeta::default();
+    /// Peer reload entry: refreshes in-memory pool metadata from the shared
+    /// persisted snapshot. Returns whether newer state was actually merged so
+    /// callers only trigger missing-worker recovery after a real state change;
+    /// delayed snapshots are merged monotonically and never blind-assigned.
+    pub async fn reload_pool_meta(&self) -> Result<bool> {
+        // Serialize the durable reload with local movement transitions. Loading
+        // before acquiring this gate would allow a stale disk snapshot to
+        // overwrite a newer local transition after the writer commits.
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
+        let mut reloaded = PoolMeta::default();
         resolve_store_rebalance_pool_meta_reload_result(
-            meta.load(self.pools[0].clone(), self.pools.clone()).await,
+            reloaded.load(self.pools[0].clone(), self.pools.clone()).await,
             "reload_pool_meta",
         )?;
 
+        // Lock order: release the decommission_cancelers guard before taking
+        // the pool_meta write guard; neither is held without the movement gate.
+        let active_workers = {
+            let cancelers = self.decommission_cancelers.read().await;
+            cancelers
+                .iter()
+                .map(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
+                .collect::<Vec<_>>()
+        };
+
+        let incoming_has_pools = !reloaded.pools.is_empty();
         let mut pool_meta = self.pool_meta.write().await;
-        *pool_meta = meta;
-        // *self.pool_meta.write().expect("operation should succeed") = meta;
-        Ok(())
+        let movement_before = pool_meta.clone();
+        let merged_newer = merge_pool_status_refresh(&mut pool_meta, reloaded, &active_workers);
+        if crate::core::pools::pool_meta_movement_snapshot_changed(&movement_before, &pool_meta) {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+
+        if !merged_newer && !incoming_has_pools {
+            warn!(
+                event = EVENT_POOL_META_RELOAD,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                result = "ignored",
+                reason = "missing_metadata",
+                "Peer pool meta reload ignored because persisted metadata is missing"
+            );
+        } else if !merged_newer {
+            debug!(
+                event = EVENT_POOL_META_RELOAD,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                result = "ignored",
+                reason = "stale_snapshot",
+                "Peer pool meta reload ignored as a stale snapshot"
+            );
+        }
+
+        Ok(merged_newer)
     }
 
     /// Disk information deduplication function
@@ -861,6 +910,7 @@ mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
+    use crate::core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolStatus};
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
@@ -871,6 +921,7 @@ mod tests {
     use rustfs_config::server_config::KVS;
     use rustfs_filemeta::FileInfo;
     use std::sync::Arc;
+    use time::{Duration as TimeDuration, OffsetDateTime};
     use tokio_util::sync::CancellationToken;
 
     async fn setup_multi_pool_test_store(
@@ -1587,10 +1638,6 @@ mod tests {
     fn resolve_latest_object_info_candidates_rejects_equal_time_payload_identity_conflicts() {
         let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
 
-        let mut data_dir = base.clone();
-        data_dir.data_dir = Some(Uuid::from_u128(2));
-        assert_equal_time_identity_conflict(base.clone(), data_dir);
-
         let mut size = base.clone();
         size.size = 1;
         assert_equal_time_identity_conflict(base.clone(), size);
@@ -1618,6 +1665,58 @@ mod tests {
             object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
             transition,
         );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_data_movement_rewrites() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a committed data-movement target must remain readable before source cleanup");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.data_dir = Some(Uuid::from_u128(1));
+
+        let mut right = left.clone();
+        right.data_dir = Some(Uuid::from_u128(2));
+
+        assert_equal_time_identity_conflict(left, right);
     }
 
     #[test]
@@ -2096,5 +2195,283 @@ mod tests {
             err.to_string()
                 .contains("failed to resolve rebalance disk set: pool index 2, set index 7, pool count 3")
         );
+    }
+
+    fn reload_test_pool_status(decommission: Option<PoolDecommissionInfo>, last_update: time::OffsetDateTime) -> PoolStatus {
+        PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update,
+            decommission,
+        }
+    }
+
+    fn reload_test_pool_meta(pool: PoolStatus) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![pool],
+            dont_save: false,
+        }
+    }
+
+    async fn persist_reload_snapshot(store: &ECStore, snapshot: &PoolMeta) {
+        snapshot
+            .save(store.pools.clone())
+            .await
+            .expect("pool meta snapshot should persist to every pool");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_does_not_rollback_newer_local_states() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-stale", &[2]).await;
+
+        let stale_time = OffsetDateTime::now_utc();
+        let newer_time = stale_time + TimeDuration::seconds(30);
+        let progressed_states: [(&str, PoolDecommissionInfo); 4] = [
+            (
+                "queued",
+                PoolDecommissionInfo {
+                    queued: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "canceled",
+                PoolDecommissionInfo {
+                    canceled: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "failed",
+                PoolDecommissionInfo {
+                    failed: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "complete",
+                PoolDecommissionInfo {
+                    complete: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (state_label, local_state) in progressed_states {
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                *pool_meta = reload_test_pool_meta(reload_test_pool_status(Some(local_state.clone()), newer_time));
+            }
+
+            // A delayed peer message carries a snapshot that predates the local progression.
+            let stale_snapshot = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                }),
+                stale_time,
+            ));
+            persist_reload_snapshot(&store, &stale_snapshot).await;
+
+            let merged_newer = store.reload_pool_meta().await.expect("stale reload should succeed");
+            assert!(
+                !merged_newer,
+                "a delayed reload must not report merged newer state for the {state_label} progression"
+            );
+
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("local decommission state should survive a stale reload");
+            assert_eq!(info.queued, local_state.queued, "{state_label} queued flag must not roll back");
+            assert_eq!(info.canceled, local_state.canceled, "{state_label} canceled flag must not roll back");
+            assert_eq!(info.failed, local_state.failed, "{state_label} failed flag must not roll back");
+            assert_eq!(info.complete, local_state.complete, "{state_label} complete flag must not roll back");
+            assert_eq!(
+                pool_meta.pools[0].last_update, newer_time,
+                "{state_label} progress timestamp must be kept"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_merges_newer_state_and_is_idempotent_on_duplicate_delivery() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-duplicate", &[2]).await;
+
+        let older_time = OffsetDateTime::now_utc();
+        let newer_time = older_time + TimeDuration::seconds(30);
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    items_decommissioned: 1,
+                    ..Default::default()
+                }),
+                older_time,
+            ));
+        }
+        let newer_snapshot = reload_test_pool_meta(reload_test_pool_status(
+            Some(PoolDecommissionInfo {
+                complete: true,
+                items_decommissioned: 10,
+                ..Default::default()
+            }),
+            newer_time,
+        ));
+        persist_reload_snapshot(&store, &newer_snapshot).await;
+
+        let merged_newer = store.reload_pool_meta().await.expect("first reload should succeed");
+        assert!(merged_newer, "a strictly newer persisted snapshot must merge");
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0].decommission.as_ref().expect("merged decommission state");
+            assert!(info.complete);
+            assert_eq!(info.items_decommissioned, 10);
+            assert_eq!(pool_meta.pools[0].last_update, newer_time);
+        }
+
+        // Redelivering the same generation must be a no-op.
+        let duplicate_merged = store.reload_pool_meta().await.expect("duplicate reload should succeed");
+        assert!(!duplicate_merged, "a duplicate delivery must not re-apply merged state");
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0].decommission.as_ref().expect("merged decommission state");
+            assert!(info.complete);
+            assert_eq!(info.items_decommissioned, 10);
+            assert_eq!(pool_meta.pools[0].last_update, newer_time);
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_keeps_active_worker_progress_over_newer_snapshot() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-worker", &[2]).await;
+        *store.decommission_cancelers.write().await = vec![Some(crate::core::pools::DecommissionCanceler::new_for_test(
+            CancellationToken::new(),
+        ))];
+
+        let worker_time = OffsetDateTime::now_utc();
+        let newer_time = worker_time + TimeDuration::seconds(30);
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    start_time: Some(worker_time),
+                    items_decommissioned: 10,
+                    bytes_done: 1_024,
+                    ..Default::default()
+                }),
+                worker_time,
+            ));
+        }
+        // Even a strictly newer terminal snapshot must not override a live worker.
+        let newer_terminal_snapshot = reload_test_pool_meta(reload_test_pool_status(
+            Some(PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            }),
+            newer_time,
+        ));
+        persist_reload_snapshot(&store, &newer_terminal_snapshot).await;
+
+        let merged_newer = store
+            .reload_pool_meta()
+            .await
+            .expect("reload under an active worker should succeed");
+        assert!(!merged_newer, "an active local worker must block snapshot replacement");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("worker progress should remain");
+        assert!(!info.complete);
+        assert_eq!(info.items_decommissioned, 10);
+        assert_eq!(info.bytes_done, 1_024);
+        assert_eq!(pool_meta.pools[0].last_update, worker_time);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_fails_closed_when_persisted_metadata_is_missing() {
+        let (temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-missing", &[2]).await;
+
+        let kept_time = OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+                kept_time,
+            ));
+        }
+        // Persist first so the test controls exactly what exists on disk.
+        persist_reload_snapshot(
+            &store,
+            &reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+                kept_time,
+            )),
+        )
+        .await;
+
+        let mut deleted_any = false;
+        for disk_index in 0..2 {
+            let pool_bin_dir = temp_dir
+                .path()
+                .join(format!("pool0-disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_BUCKET)
+                .join(crate::core::pools::POOL_META_NAME);
+            if pool_bin_dir.exists() {
+                tokio::fs::remove_dir_all(&pool_bin_dir)
+                    .await
+                    .expect("persisted pool metadata object dir should be removable");
+                deleted_any = true;
+            }
+        }
+        // The meta-bucket layout may nest objects per pool; fall back to removing
+        // every pool.bin object directory below the temp root.
+        if !deleted_any {
+            panic!("no pool.bin found under {:?}", temp_dir.path());
+        }
+
+        let merged_newer = store
+            .reload_pool_meta()
+            .await
+            .expect("reload with missing metadata should fail closed, not error");
+        assert!(!merged_newer, "missing persisted metadata must not count as merged state");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("missing persisted metadata must not default local state away");
+        assert!(info.complete);
+        assert_eq!(pool_meta.pools[0].last_update, kept_time);
+
+        shutdown.cancel();
     }
 }

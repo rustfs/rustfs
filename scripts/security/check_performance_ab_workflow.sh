@@ -31,7 +31,9 @@ require_present_pattern 'listWorkflowRuns' "the scheduled baseline must come fro
 require_present_pattern 'status:[[:space:]]*"success"' "the scheduled baseline must be a successful run"
 require_present_pattern 'SCHEDULED_BASELINE_SHA' "the resolved scheduled baseline must reach the comparison"
 require_present_pattern "SCHEDULED_BASELINE_SHA:-\\\$candidate_sha" "the first scheduled run must seed from its verified candidate"
-require_present_pattern 'git merge-base --is-ancestor' "the scheduled baseline must stay on candidate history"
+require_present_pattern 'git merge-base --is-ancestor' "every baseline must stay on candidate history"
+require_present_pattern 'update the selected ref before comparing' "stale manual refs must fail before the benchmark"
+require_present_pattern 'setup failed before the rig ran' "an earlier setup failure must not become an empty exit status"
 require_present_pattern 'Cache successful candidate baseline' "a successful candidate must become the next cached baseline"
 if ! sed -n '/^  warp-ab:/,/^  alert-on-failure:/p' "$workflow" | grep -Eq '^    timeout-minutes:[[:space:]]*180([[:space:]]|$)'; then
   echo "invalid performance A/B workflow contract: the cold-cache path must fit both builds, the A/B run, and evidence publication" >&2

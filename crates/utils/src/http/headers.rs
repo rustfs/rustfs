@@ -47,6 +47,8 @@ pub const AMZ_DELETE_MARKER: &str = "x-amz-delete-marker";
 
 // S3 object tagging
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+/// Lowercase wire form of [`AMZ_OBJECT_TAGGING`] for `HeaderMap` insertion.
+pub const AMZ_OBJECT_TAGGING_LOWER: &str = "x-amz-tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 

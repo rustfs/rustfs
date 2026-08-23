@@ -1215,7 +1215,10 @@ pub struct ScannerActivityResponse {
     pub dirty_usage_pending: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackgroundHealStatusRequest {}
+pub struct BackgroundHealStatusRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusResponse {
     #[prost(bool, tag = "1")]

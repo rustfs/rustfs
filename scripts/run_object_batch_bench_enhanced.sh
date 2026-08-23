@@ -459,7 +459,7 @@ write_manifest_entry() {
 
 write_run_manifest() {
   local manifest_file="$OUT_DIR/run_manifest.env"
-  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
+  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv report_operation
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   git_commit="$(git_value unknown rev-parse --short HEAD)"
   git_branch="$(git_value unknown branch --show-current)"
@@ -467,6 +467,10 @@ write_run_manifest() {
   rustc_version="$(rustc --version 2>/dev/null || echo unknown)"
   uname_s="$(uname -a 2>/dev/null || echo unknown)"
   service_metrics_csv="${SERVICE_METRICS_CSV:-}"
+  report_operation="N/A"
+  if [[ "$TOOL" == "warp" ]]; then
+    report_operation="$(warp_report_operation)"
+  fi
 
   cat >"$manifest_file" <<EOF
 started_at_utc=${started_at_utc}
@@ -494,6 +498,7 @@ retry_sleep_secs=${RETRY_SLEEP_SECS}
 cooldown_secs=${COOLDOWN_SECS}
 warp_bin=${WARP_BIN}
 warp_mode=${WARP_MODE}
+warp_report_operation=${report_operation}
 duration=${DURATION}
 s3bench_bin=${S3BENCH_BIN}
 samples=${SAMPLES}
@@ -662,24 +667,23 @@ to_ms() {
   awk -v n="$number" -v f="$factor" 'BEGIN { printf "%.6f\n", n * f }'
 }
 
-extract_first() {
-  local regex="$1"
-  local file="$2"
-  rg -o "$regex" "$file" | head -n1 || true
+warp_report_operation() {
+  case "$WARP_MODE" in
+    get) echo GET ;;
+    put|mixed) echo PUT ;;
+  esac
 }
 
-extract_report_line() {
-  local regex="$1"
+extract_warp_report() {
+  local operation="$1"
   local file="$2"
-  awk -v regex="$regex" '
-    /^Report:/ {
-      in_report = 1
+  awk -v operation="$operation" '
+    /^(Report|Operation):/ {
+      target = "^(Report|Operation):[[:space:]]*" operation "([[:space:].-]|$)"
+      in_report = ($0 ~ target || $0 ~ /^Report:[[:space:]]*$/)
       next
     }
-    in_report && $0 ~ regex {
-      print
-      exit
-    }
+    in_report { print }
   ' "$file"
 }
 
@@ -703,30 +707,35 @@ normalize_duration_metric() {
 extract_metrics() {
   local log_file="$1"
 
-  local average_line reqs_line throughput reqps latency req_p90 req_p99 reqps_num
-  average_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Average:' "$log_file")"
-  reqs_line="$(extract_report_line '^[[:space:]]*[*][[:space:]]+Reqs:' "$log_file")"
+  local report average_line throughput_line request_line throughput reqps latency req_p90 req_p99 reqps_num
+  if [[ "$TOOL" == "warp" ]]; then
+    report="$(extract_warp_report "$(warp_report_operation)" "$log_file")"
+  else
+    report="$(<"$log_file")"
+  fi
+  average_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Average:/ { print; exit }')"
+  throughput_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+Throughput:/ { print; exit }')"
+  request_line="$(printf '%s\n' "$report" | awk '/^[[:space:]]*[*][[:space:]]+(Reqs:[[:space:]]+)?Avg:/ { print; exit }')"
 
   if [[ -n "$average_line" ]]; then
     throughput="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*//; s/,[[:space:]]*.*$//')"
     reqps="$(echo "$average_line" | sed -E 's/^.*Average:[[:space:]]*[^,]+,[[:space:]]*//; s/[[:space:]]*$//')"
+  elif [[ -n "$throughput_line" ]]; then
+    throughput="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$throughput_line" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   else
-    throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
-    reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
+    throughput="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' | head -n1 || true)"
+    reqps="$(printf '%s\n' "$report" | rg -o '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' | head -n1 || true)"
   fi
 
-  if [[ -n "$reqs_line" ]]; then
-    latency="$(echo "$reqs_line" | rg -o 'Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^Avg:[[:space:]]+//')"
-    req_p90="$(echo "$reqs_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
-    req_p99="$(echo "$reqs_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
+  if [[ -n "$request_line" ]]; then
+    latency="$(echo "$request_line" | rg -o 'Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^Avg:[[:space:]]+//')"
+    req_p90="$(echo "$request_line" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^90%:[[:space:]]+//')"
+    req_p99="$(echo "$request_line" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | sed -E 's/^99%:[[:space:]]+//')"
   else
-    latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
-    req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
-    req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
-  fi
-
-  if [[ -z "$latency" ]]; then
-    latency="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(ms|us|µs|s)' "$log_file")"
+    latency="$(printf '%s\n' "$report" | rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//' || true)"
+    req_p90="$(printf '%s\n' "$report" | rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^90%:[[:space:]]+//' || true)"
+    req_p99="$(printf '%s\n' "$report" | rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' | head -n1 | sed -E 's/^99%:[[:space:]]+//' || true)"
   fi
 
   throughput="$(trim "${throughput:-N/A}")"
@@ -1128,6 +1137,8 @@ run_one_attempt() {
       "--concurrent" "$CONCURRENCY"
       "--duration" "$DURATION"
       "--region" "$REGION"
+      "--no-color"
+      "--analyze.v"
     )
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("--insecure")
@@ -1210,6 +1221,12 @@ run_one_attempt() {
     latency_ms="$(to_ms "$latency_human")"
     req_p90_ms="$(to_ms "$req_p90_human")"
     req_p99_ms="$(to_ms "$req_p99_human")"
+  fi
+
+  if [[ "$DRY_RUN" != "true" && "$TOOL" == "warp" && "$status" == "ok" ]] \
+    && rg -q '^[[:space:]]*(Total[[:space:]]+)?Errors:[[:space:]]*[1-9][0-9]*[.]?([[:space:]]|$)' "$log_file"; then
+    status="failed"
+    exit_code=1
   fi
 
   if [[ "$DRY_RUN" != "true" && "$status" == "ok" ]]; then
@@ -1318,10 +1335,21 @@ compare_baseline() {
 
       dr="N/A"; dl="N/A"; dt="N/A"; dp90="N/A"; dp99="N/A"; ne="N/A"; be="N/A"; de="N/A"
       if (br!="N/A" && n_req!="N/A" && br+0!=0) dr=sprintf("%.2f", ((n_req-br)/br)*100)
-      if (bl!="N/A" && n_lat!="N/A" && bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+      if (bl!="N/A" && n_lat!="N/A") {
+        if (bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+        else if (n_lat+0==0) dl="0.00"
+      }
       if (bt!="N/A" && n_thr!="N/A" && bt+0!=0) dt=sprintf("%.2f", ((n_thr-bt)/bt)*100)
-      if (bp90!="N/A" && n_p90!="N/A" && bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
-      if (bp99!="N/A" && n_p99!="N/A" && bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+      # Warp v1 rounds sub-millisecond latency to 0s. Two zero readings are
+      # the same below-resolution bucket; a nonzero candidate remains invalid.
+      if (bp90!="N/A" && n_p90!="N/A") {
+        if (bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
+        else if (n_p90+0==0) dp90="0.00"
+      }
+      if (bp99!="N/A" && n_p99!="N/A") {
+        if (bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+        else if (n_p99+0==0) dp99="0.00"
+      }
       if (n_ok!="N/A" && n_fail!="N/A" && n_ok+n_fail>0) ne=sprintf("%.2f", (n_fail/(n_ok+n_fail))*100)
       if (bok!="N/A" && bfail!="N/A" && bok+bfail>0) be=sprintf("%.2f", (bfail/(bok+bfail))*100)
       if (ne!="N/A" && be!="N/A") de=sprintf("%.2f", ne-be)

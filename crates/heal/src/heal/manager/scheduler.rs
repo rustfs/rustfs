@@ -349,6 +349,8 @@ impl HealManager {
                             let notice_targets = take_mrf_repair_notice_targets(&mrf_repair_notice_targets_clone, &task_id);
                             if successful_completion {
                                 emit_mrf_repaired_events(notice_targets);
+                            } else {
+                                release_mrf_repair_notice_targets(notice_targets);
                             }
                             task_aliases_clone
                                 .lock()
@@ -638,7 +640,19 @@ pub(super) fn running_heal_set_counts(active_heals: &HashMap<String, Arc<HealTas
 }
 
 fn remove_mrf_repair_notice_targets(registry: &Arc<StdMutex<HashMap<String, Vec<MrfRepairNoticeTarget>>>>, task_id: &str) {
-    lock_mrf_repair_notice_targets(registry).remove(task_id);
+    let targets = lock_mrf_repair_notice_targets(registry).remove(task_id);
+    if let Some(targets) = targets {
+        for target in targets {
+            rustfs_common::mrf_channel::release_mrf_identity(
+                target.kind,
+                &target.bucket,
+                &target.object,
+                target.version_id,
+                target.scope,
+                target.lease,
+            );
+        }
+    }
 }
 
 fn take_mrf_repair_notice_targets(
@@ -671,6 +685,27 @@ fn move_mrf_repair_notice_targets(
 fn emit_mrf_repaired_events(targets: Vec<MrfRepairNoticeTarget>) {
     for target in targets {
         rustfs_common::mrf_channel::note_mrf_repaired(&target.bucket, &target.object, target.version_id);
+        rustfs_common::mrf_channel::release_mrf_identity(
+            target.kind,
+            &target.bucket,
+            &target.object,
+            target.version_id,
+            target.scope,
+            target.lease,
+        );
+    }
+}
+
+fn release_mrf_repair_notice_targets(targets: Vec<MrfRepairNoticeTarget>) {
+    for target in targets {
+        rustfs_common::mrf_channel::release_mrf_identity(
+            target.kind,
+            &target.bucket,
+            &target.object,
+            target.version_id,
+            target.scope,
+            target.lease,
+        );
     }
 }
 

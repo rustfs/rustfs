@@ -76,7 +76,8 @@ use metrics::counter;
 use rmp_serde;
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
+    has_internal_suffix, insert_str,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, get_env_usize, sip_hash};
 #[cfg(test)]
@@ -172,6 +173,14 @@ async fn finish_resync_workers(
 
 fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
     err.raw_response().is_some_and(|r| r.status().as_u16() == status)
+}
+
+fn metadata_requires_existing_target(op_type: ReplicationType, object_info: &ObjectInfo) -> bool {
+    op_type == ReplicationType::Metadata
+        && object_info
+            .user_defined
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
 }
 
 const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_identity_drift_total";
@@ -3494,6 +3503,7 @@ async fn resolve_replicate_all_action(
         start_time,
         ssec_audit_required,
     } = ctx;
+    let require_existing_target = metadata_requires_existing_target(roi.op_type, &object_info);
     let replication_action;
     match head_object_for_worker(tgt_client.as_ref(), &tgt_client.bucket, object, roi.version_id.map(|v| v.to_string())).await {
         Ok(oi) => {
@@ -3555,7 +3565,13 @@ async fn resolve_replicate_all_action(
                 // Version-ID format mismatch: retry without versionId and compare ETags.
                 match head_object_fallback(tgt_client, object).await {
                     Ok(Some(oi)) => {
-                        replication_action = if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) {
+                        let etags_match = replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref());
+                        if require_existing_target && !etags_match {
+                            rinfo.error = Some("replica metadata target does not contain matching object data".to_string());
+                            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                            return None;
+                        }
+                        replication_action = if etags_match {
                             if ssec_audit_required
                                 && !settle_ssec_passthrough_evidence(&oi, tgt_client, bucket, object, rinfo).await
                             {
@@ -3568,6 +3584,11 @@ async fn resolve_replicate_all_action(
                         };
                     }
                     Ok(None) => {
+                        if require_existing_target {
+                            rinfo.error = Some("replica metadata target does not contain this object version".to_string());
+                            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                            return None;
+                        }
                         replication_action = ReplicationAction::All;
                     }
                     Err(e2) => {
@@ -3593,7 +3614,12 @@ async fn resolve_replicate_all_action(
                         return None;
                     }
                 }
-            } else if e.as_service_error().is_some_and(|se| se.is_not_found()) {
+            } else if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) {
+                if require_existing_target {
+                    rinfo.error = Some("replica metadata target does not contain this object version".to_string());
+                    rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+                    return None;
+                }
                 replication_action = ReplicationAction::All;
             } else {
                 rinfo.error = Some(e.to_string());
@@ -3868,6 +3894,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 actual_size,
                 object_info.etag.clone().unwrap_or_default(),
                 object_info.mod_time,
+                &put_opts.internal,
             ),
         )
         .await
@@ -3919,6 +3946,113 @@ mod tests {
             replicate_sync: false,
             client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
         })
+    }
+
+    fn spawn_head_status_server(status: u16) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("test HTTP listener should have an address"));
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
+            let mut request = [0_u8; 8192];
+            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+            assert!(bytes_read > 0, "test HTTP request should not be empty");
+            assert!(request[..bytes_read].starts_with(b"HEAD "), "replication comparison must use HEAD");
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test HTTP response should be written");
+        });
+        (endpoint, handle)
+    }
+
+    #[tokio::test]
+    async fn replica_metadata_missing_target_stops_before_full_put() {
+        let (endpoint, server) = spawn_head_status_server(404);
+        let target = test_target_client(endpoint);
+        let roi = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::Metadata,
+            // Normal metadata writes replace REPLICA with per-target PENDING
+            // before constructing the worker request.
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            bucket: roi.bucket.clone(),
+            name: roi.name.clone(),
+            version_id: roi.version_id,
+            etag: Some("source-etag".to_string()),
+            user_defined: Arc::new(HashMap::from([(
+                AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+                ReplicationStatusType::Replica.as_str().to_string(),
+            )])),
+            ..Default::default()
+        };
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(action.is_none(), "missing replica metadata targets must not reach the payload PUT path");
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(
+            rinfo.error.as_deref(),
+            Some("replica metadata target does not contain this object version")
+        );
+        server.join().expect("test HTTP server should finish");
+    }
+
+    #[tokio::test]
+    async fn source_metadata_missing_target_rebuilds_object() {
+        let (endpoint, server) = spawn_head_status_server(404);
+        let target = test_target_client(endpoint);
+        let roi = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            op_type: ReplicationType::Metadata,
+            replication_status: ReplicationStatusType::Pending,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            bucket: roi.bucket.clone(),
+            name: roi.name.clone(),
+            version_id: roi.version_id,
+            etag: Some("source-etag".to_string()),
+            ..Default::default()
+        };
+        let mut rinfo = replicate_all_target_info(&roi, &target);
+
+        let action = resolve_replicate_all_action(
+            ReplicateAllActionContext {
+                roi: &roi,
+                tgt_client: &target,
+                bucket: &roi.bucket,
+                object: &roi.name,
+                start_time: OffsetDateTime::now_utc(),
+                ssec_audit_required: false,
+            },
+            object_info,
+            &mut rinfo,
+        )
+        .await;
+
+        assert!(matches!(action, Some((ReplicationAction::All, _))));
+        assert!(rinfo.error.is_none());
+        server.join().expect("test HTTP server should finish");
     }
 
     async fn register_test_target(target: &Arc<TargetClient>) {
