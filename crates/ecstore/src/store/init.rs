@@ -4263,6 +4263,95 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn data_movement_target_remains_readable_before_source_cleanup() {
+        let temp_dir = tempfile::tempdir().expect("create data movement read-window store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "data-movement-read-window", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("dm-read-window-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        let version = uuid::Uuid::new_v4();
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create data movement read-window bucket");
+
+        let mut reader = PutObjReader::from_vec(b"source body".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    mod_time: Some(mod_time),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed data movement source");
+        *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+
+        let source_reader = store.pools[0]
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read data movement source");
+        let source_data_dir = source_reader.object_info.data_dir;
+        crate::data_movement::migrate_object(store.clone(), 0, bucket.clone(), source_reader, None, "test_read_window")
+            .await
+            .expect("commit data movement target");
+
+        let target = store.pools[1]
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read committed data movement target");
+        assert_ne!(source_data_dir, target.data_dir, "the target must use its own data directory");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&target.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
+            Some("true")
+        );
+
+        let resolved = store
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the equal-time migration window must remain readable");
+        assert_eq!(resolved.data_dir, target.data_dir);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn data_movement_multipart_conflict_validates_exact_version_target_pool() {
         let temp_dir = tempfile::tempdir().expect("create three-pool multipart data movement store dir");
         let (_ctx, store, _shutdown) =

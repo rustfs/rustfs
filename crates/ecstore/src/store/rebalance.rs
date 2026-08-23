@@ -1626,10 +1626,6 @@ mod tests {
     fn resolve_latest_object_info_candidates_rejects_equal_time_payload_identity_conflicts() {
         let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
 
-        let mut data_dir = base.clone();
-        data_dir.data_dir = Some(Uuid::from_u128(2));
-        assert_equal_time_identity_conflict(base.clone(), data_dir);
-
         let mut size = base.clone();
         size.size = 1;
         assert_equal_time_identity_conflict(base.clone(), size);
@@ -1657,6 +1653,58 @@ mod tests {
             object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
             transition,
         );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_data_movement_rewrites() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a committed data-movement target must remain readable before source cleanup");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.data_dir = Some(Uuid::from_u128(1));
+
+        let mut right = left.clone();
+        right.data_dir = Some(Uuid::from_u128(2));
+
+        assert_equal_time_identity_conflict(left, right);
     }
 
     #[test]
