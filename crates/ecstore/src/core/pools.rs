@@ -1838,6 +1838,7 @@ where
     let limit = limit.max(1);
 
     for _ in 0..limit {
+        decommission_cancel_signal_result(rx.is_cancelled())?;
         let Some(bucket) = pending.next() else {
             break;
         };
@@ -1862,6 +1863,7 @@ where
             continue;
         };
 
+        decommission_cancel_signal_result(rx.is_cancelled())?;
         active.push(start_bucket(bucket, rx.clone()));
     }
 
@@ -8555,6 +8557,42 @@ mod pools_tests {
             ]
         );
         assert_eq!(events.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_completion_cancel_prevents_regular_launch() {
+        let rx = CancellationToken::new();
+        let regular_started = Arc::new(AtomicUsize::new(0));
+        let result = run_decommission_phases(
+            rx.clone(),
+            vec![DecomBucketInfo {
+                name: "regular".to_string(),
+                ..Default::default()
+            }],
+            vec![DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+            }],
+            2,
+            {
+                let regular_started = Arc::clone(&regular_started);
+                move |bucket, rx| {
+                    let regular_started = Arc::clone(&regular_started);
+                    Box::pin(async move {
+                        if bucket.name == crate::disk::RUSTFS_META_BUCKET {
+                            rx.cancel();
+                        } else {
+                            regular_started.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::OperationCanceled)));
+        assert_eq!(regular_started.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
