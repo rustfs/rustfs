@@ -218,6 +218,7 @@ where
                     match store.prepare(snapshot).await {
                         Ok(Some(pending)) => pending,
                         Ok(None) => {
+                            backoff = retry_schedule.initial_backoff;
                             let _ = status_tx.send(InventoryStatus::Unchanged { content_hash });
                             if sleep_or_cancel(&task_shutdown, schedule.cadence.saturating_add(jitter(schedule.jitter))).await {
                                 break;

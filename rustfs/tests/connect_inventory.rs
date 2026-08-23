@@ -534,6 +534,77 @@ async fn connect_inventory_retries_an_incomplete_sample_before_delivery() {
 }
 
 #[tokio::test]
+async fn connect_inventory_unchanged_sample_resets_incomplete_backoff() {
+    let pki = TestPki::new();
+    let content_hash = snapshot().content_hash().expect("content hash");
+    let server = server(&pki, vec![Reply::ok(&content_hash)]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shutdown = CancellationToken::new();
+    let config = config(&temp, &pki, &server);
+    let seed = spawn_inventory_runtime(Some(config.clone()), schedule(), &shutdown, || std::future::ready(Ok(snapshot())))
+        .expect("start inventory")
+        .expect("configured inventory");
+    let mut seed_status = seed.status();
+
+    assert!(matches!(
+        wait_for(&mut seed_status, |status| matches!(status, InventoryStatus::Online { .. })).await,
+        InventoryStatus::Online { content_hash: accepted, .. } if accepted == content_hash
+    ));
+    seed.shutdown().await;
+
+    let samples = Arc::new(AtomicUsize::new(0));
+    let sampled = samples.clone();
+    let runtime = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_millis(100),
+            jitter: Duration::ZERO,
+        },
+        &shutdown,
+        move || {
+            let attempt = sampled.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(if matches!(attempt, 0 | 1 | 3) {
+                Err(rustfs::connect::InventoryError::SnapshotIncomplete {
+                    expected: 96,
+                    observed: 12,
+                })
+            } else {
+                Ok(snapshot())
+            })
+        },
+    )
+    .expect("restart inventory")
+    .expect("configured inventory");
+    let mut status = runtime.status();
+
+    assert!(matches!(
+        wait_for(&mut status, |status| {
+            matches!(status, InventoryStatus::BackingOff { delay } if *delay == Duration::from_millis(20))
+        })
+        .await,
+        InventoryStatus::BackingOff { delay } if delay == Duration::from_millis(20)
+    ));
+    assert!(matches!(
+        wait_for(&mut status, |status| {
+            matches!(status, InventoryStatus::BackingOff { delay } if *delay == Duration::from_millis(40))
+        })
+        .await,
+        InventoryStatus::BackingOff { delay } if delay == Duration::from_millis(40)
+    ));
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, InventoryStatus::Unchanged { .. })).await,
+        InventoryStatus::Unchanged { content_hash: unchanged } if unchanged == content_hash
+    ));
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, InventoryStatus::BackingOff { .. })).await,
+        InventoryStatus::BackingOff { delay } if delay == Duration::from_millis(20)
+    ));
+    assert_eq!(samples.load(Ordering::Relaxed), 4);
+    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn connect_inventory_revoked_device_stops_without_retrying() {
     let pki = TestPki::new();
     let server = server(&pki, vec![Reply::error(StatusCode::UNAUTHORIZED, "DEVICE_REVOKED")]).await;
