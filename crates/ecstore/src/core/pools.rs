@@ -71,7 +71,6 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, Replicatio
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::future::Future;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
@@ -107,6 +106,11 @@ const DECOMMISSION_META_PREFIXES: [&str; 3] = [CONFIG_PREFIX, BUCKET_META_PREFIX
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const DECOMMISSION_ENTRY_MAX_ATTEMPTS: usize = 3;
+const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
+const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
 const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
@@ -836,28 +840,29 @@ fn ensure_decommission_generation(meta: &PoolMeta, idx: usize, generation: Offse
     }
 }
 
-async fn run_decommission_side_effect<T, F, Fut>(
+async fn run_decommission_side_effect<T, E, F, Fut>(
     rx: &CancellationToken,
     operation_gate: &Arc<tokio::sync::RwLock<()>>,
     operation: F,
-) -> Result<T>
+) -> std::result::Result<T, E>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: From<Error>,
 {
     let _operation_guard = tokio::select! {
         biased;
-        _ = rx.cancelled() => return Err(Error::OperationCanceled),
+        _ = rx.cancelled() => return Err(Error::OperationCanceled.into()),
         guard = operation_gate.read() => guard,
     };
 
     if rx.is_cancelled() {
-        return Err(Error::OperationCanceled);
+        return Err(Error::OperationCanceled.into());
     }
 
     let result = operation().await;
     if rx.is_cancelled() {
-        return Err(Error::OperationCanceled);
+        return Err(Error::OperationCanceled.into());
     }
     result
 }
@@ -956,7 +961,7 @@ where
     usize::try_from(size).unwrap_or_default()
 }
 
-fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
+fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
@@ -1568,11 +1573,15 @@ fn should_retry_decommission_listing(err: &Error, attempt: usize, max_attempts: 
     !is_err_bucket_not_found(err) && attempt + 1 < max_attempts
 }
 
-async fn wait_decommission_listing_retry(rx: &CancellationToken, delay: std::time::Duration) -> bool {
+async fn wait_decommission_retry_backoff(rx: &CancellationToken, delay: std::time::Duration) -> bool {
     tokio::select! {
         _ = rx.cancelled() => true,
         _ = tokio::time::sleep(delay) => false,
     }
+}
+
+fn decommission_retry_backoff_delay(base: std::time::Duration, attempt: usize) -> std::time::Duration {
+    base.saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -1690,7 +1699,7 @@ where
                     error = ?err,
                     "Decommission listing failed; retrying"
                 );
-                if wait_decommission_listing_retry(&rx, DECOMMISSION_LISTING_RETRY_DELAY).await {
+                if wait_decommission_retry_backoff(&rx, DECOMMISSION_LISTING_RETRY_DELAY).await {
                     debug!(
                         event = EVENT_DECOMMISSION_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1743,7 +1752,7 @@ fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
 
     // A not-found surfacing from inside a data-movement stage is the same
     // condition once the wrapper is unwrapped (backlog#1827 T2).
-    crate::data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
 }
 
 fn is_decommission_target_capacity_error(err: &Error) -> bool {
@@ -1754,7 +1763,7 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
     // A stage failure keeps the error it wrapped, so classify by type rather
     // than by the rendered message (backlog#1827 T2). The substring fallback
     // stays for errors that reached here through some other wrapper.
-    if let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+    if let Some(source) = data_movement::data_movement_stage_source(err) {
         return is_decommission_target_capacity_error(source);
     }
 
@@ -1766,6 +1775,123 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
 
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
     decommissioned.saturating_add(expired) == total_versions
+}
+
+fn should_fail_decommission_pool_after_exhausted_source_changed(exhausted_entries: usize) -> bool {
+    exhausted_entries > DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionEntryAttemptOutcome {
+    Complete,
+    SourceChanged,
+}
+
+#[cfg(test)]
+pub(crate) type DecommissionTestFaultDecision = Arc<dyn Fn(&'static str, &str, &str, usize) -> bool + Send + Sync>;
+
+#[cfg(test)]
+static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFaultDecision>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct DecommissionTestFaultGuard(DecommissionTestFaultDecision);
+
+#[cfg(test)]
+impl DecommissionTestFaultGuard {
+    pub(crate) fn install(decision: DecommissionTestFaultDecision) -> Self {
+        let mut slot = DECOMMISSION_TEST_FAULT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission test fault hook mutex should not poison");
+        assert!(slot.is_none(), "decommission test fault hook must be unique");
+        let stored = Arc::clone(&decision);
+        *slot = Some(decision);
+        Self(stored)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionTestFaultGuard {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_TEST_FAULT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission test fault hook mutex should not poison");
+        if slot.as_ref().is_some_and(|decision| Arc::ptr_eq(decision, &self.0)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn decommission_test_wrap_result<T>(
+    stage: &'static str,
+    bucket: &str,
+    object: &str,
+    attempt: usize,
+    result: Result<T>,
+) -> Result<T> {
+    let decision = DECOMMISSION_TEST_FAULT_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission test fault hook mutex should not poison")
+        .clone();
+    if result.is_ok() && decision.is_some_and(|decision| decision(stage, bucket, object, attempt)) {
+        return Err(Error::other(format!(
+            "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
+        )));
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) type DecommissionCleanupMutationHook = Arc<dyn Fn(&str, &str, usize) -> BoxFuture<'static, ()> + Send + Sync>;
+
+#[cfg(test)]
+static DECOMMISSION_CLEANUP_MUTATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionCleanupMutationHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct DecommissionCleanupMutationGuard(DecommissionCleanupMutationHook);
+
+#[cfg(test)]
+impl DecommissionCleanupMutationGuard {
+    pub(crate) fn install(hook: DecommissionCleanupMutationHook) -> Self {
+        let mut slot = DECOMMISSION_CLEANUP_MUTATION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission cleanup mutation hook mutex should not poison");
+        assert!(slot.is_none(), "decommission cleanup mutation hook must be unique");
+        let stored = Arc::clone(&hook);
+        *slot = Some(hook);
+        Self(stored)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionCleanupMutationGuard {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_CLEANUP_MUTATION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission cleanup mutation hook mutex should not poison");
+        if slot.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.0)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn run_decommission_cleanup_mutation_hook(bucket: &str, object: &str, attempt: usize) {
+    let hook = DECOMMISSION_CLEANUP_MUTATION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission cleanup mutation hook mutex should not poison")
+        .clone();
+    if let Some(hook) = hook {
+        hook(bucket, object, attempt).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3101,7 +3227,7 @@ fn decommission_remote_tiered_opts(
         src_pool_idx,
         data_movement: true,
         include_part_checksums: true,
-        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        http_preconditions: Some(data_movement::data_movement_target_precondition()),
         expected_bucket_incarnation_id,
         ..Default::default()
     }
@@ -3592,7 +3718,6 @@ impl ECStore {
             }
             return Err(err);
         }
-        drop(operation_guard);
 
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
@@ -3601,7 +3726,6 @@ impl ECStore {
         if should_save_pool_meta {
             self.ctx.advance_data_movement_operation_epoch();
         }
-        drop(_movement_guard);
 
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
@@ -3850,7 +3974,7 @@ impl ECStore {
     ) -> Result<()> {
         let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
         if !index_cancelers.is_empty() {
-            std::mem::drop(spawn_decommission_index_cancelers(
+            drop(spawn_decommission_index_cancelers(
                 store,
                 rx,
                 index_cancelers,
@@ -3877,7 +4001,7 @@ impl ECStore {
             return Ok(());
         }
 
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             self.clone(),
             rx,
             index_cancelers,
@@ -3907,7 +4031,7 @@ impl ECStore {
         let index_cancelers = self
             .start_decommission_with_routines(indices, &rx, local_indices.as_slice())
             .await?;
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             store,
             rx,
             index_cancelers,
@@ -3950,6 +4074,7 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         queue: Arc<tokio::sync::Mutex<mpsc::Receiver<QueuedDecommissionEntry>>>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
@@ -4040,6 +4165,7 @@ impl ECStore {
                     object_lock_config.clone(),
                     replication_config.clone(),
                     expected_bucket_incarnation_id,
+                    Arc::clone(&source_changed_exhaustions),
                 )
                 .await;
             drop(entry_budget_permit);
@@ -4077,6 +4203,7 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
     ) -> Result<()> {
@@ -4096,6 +4223,7 @@ impl ECStore {
             let lifecycle_config = lifecycle_config.clone();
             let object_lock_config = object_lock_config.clone();
             let replication_config = replication_config.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             let queue = queue.clone();
             let entry_budget = entry_budget.clone();
             let entry_error = entry_error.clone();
@@ -4111,6 +4239,7 @@ impl ECStore {
                     object_lock_config,
                     replication_config,
                     expected_bucket_incarnation_id,
+                    source_changed_exhaustions,
                     entry_budget,
                     queue,
                     entry_error,
@@ -4252,8 +4381,15 @@ impl ECStore {
         Ok(())
     }
 
-    #[allow(unused_assignments, clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, set, lifecycle_config, object_lock_config, replication_config))]
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(
+        self,
+        set,
+        lifecycle_config,
+        object_lock_config,
+        replication_config,
+        source_changed_exhaustions
+    ))]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -4266,15 +4402,85 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
+        let mut counted_versions = HashSet::new();
+
+        for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
+            match self
+                .decommission_entry_attempt(
+                    rx.clone(),
+                    idx,
+                    generation,
+                    entry.clone(),
+                    bucket.clone(),
+                    Arc::clone(&set),
+                    lifecycle_config.clone(),
+                    object_lock_config.clone(),
+                    replication_config.clone(),
+                    expected_bucket_incarnation_id,
+                    entry_attempt,
+                    source_changed_exhaustions.as_ref(),
+                    &mut counted_versions,
+                )
+                .await?
+            {
+                DecommissionEntryAttemptOutcome::Complete => return Ok(()),
+                DecommissionEntryAttemptOutcome::SourceChanged => {
+                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, entry_attempt);
+                    warn!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "source_changed_retry",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        attempt = entry_attempt,
+                        max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "Decommission source changed during cleanup preflight; retrying entry"
+                    );
+                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                    }
+                }
+            }
+        }
+
+        Err(Error::other(format!(
+            "decommission entry retry loop ended without a terminal result for {bucket}/{}",
+            entry.name
+        )))
+    }
+
+    #[allow(unused_assignments, clippy::too_many_arguments)]
+    async fn decommission_entry_attempt(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        generation: OffsetDateTime,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        object_lock_config: Option<ObjectLockConfiguration>,
+        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        entry_attempt: usize,
+        source_changed_exhaustions: &AtomicUsize,
+        counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
+    ) -> Result<DecommissionEntryAttemptOutcome> {
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "started",
             pool_index = idx,
             bucket = %bucket,
             object = %entry.name,
-            state = "started",
+            attempt = entry_attempt,
+            max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
             "Decommission entry started"
         );
         if entry.is_dir() {
@@ -4288,7 +4494,7 @@ impl ECStore {
                 state = "skipped_directory",
                 "Decommission entry skipped directory"
             );
-            return Ok(());
+            return Ok(DecommissionEntryAttemptOutcome::Complete);
         }
         let durable_ilm_record = if bucket == RUSTFS_META_BUCKET {
             classify_durable_ilm_record(&entry.name)
@@ -4316,6 +4522,7 @@ impl ECStore {
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
             if self.decommission_cancel_requested(idx, &rx).await {
@@ -4367,33 +4574,49 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             if version.deleted {
-                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
-                    self.delete_object(
+                for version_attempt in 1..=DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    let result = run_decommission_side_effect(&rx, &operation_gate, || async {
+                        self.delete_object(
+                            bucket.as_str(),
+                            &version.name,
+                            decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
+                        )
+                        .await
+                    })
+                    .await;
+                    #[cfg(test)]
+                    let result = decommission_test_wrap_result(
+                        "delete_marker_copy",
                         bucket.as_str(),
-                        &version.name,
-                        decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
-                    )
-                    .await
-                })
-                .await
-                {
-                    if is_decommission_copy_cleanup_safe_error(&err) {
-                        warn!(
-                            event = EVENT_DECOMMISSION_ENTRY,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            bucket = %bucket,
-                            object = %version.name,
-                            version_id = ?version_id,
-                            state = "ignored_delete_marker_copy",
-                            error = ?err,
-                            "Decommission delete marker copy ignored"
-                        );
-                        ignore = true;
-                        cleanup_ignored = true;
-                    } else {
-                        if is_decommission_target_capacity_error(&err) {
+                        version.name.as_str(),
+                        version_attempt,
+                        result,
+                    );
+
+                    match result {
+                        Ok(_) => {
+                            failure = false;
+                            error = None;
+                            break;
+                        }
+                        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => {
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "ignored_delete_marker_copy",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                error = ?err,
+                                "Decommission delete marker copy ignored"
+                            );
+                            ignore = true;
+                            cleanup_ignored = true;
+                            break;
+                        }
+                        Err(err) if is_decommission_target_capacity_error(&err) => {
                             return Err(with_decommission_entry_context(
                                 "delete_marker_copy",
                                 bucket.as_str(),
@@ -4401,10 +4624,47 @@ impl ECStore {
                                 err,
                             ));
                         }
+                        Err(err) => {
+                            failure = true;
+                            if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                                error!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "delete_marker_copy_failed",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    error = ?err,
+                                    "Decommission delete marker copy failed"
+                                );
+                                error = Some(err);
+                                break;
+                            }
 
-                        failure = true;
-
-                        error = Some(err)
+                            let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "delete_marker_copy_retry",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                attempt = version_attempt,
+                                max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                retry_delay_ms = retry_delay.as_millis(),
+                                error = ?err,
+                                "Decommission delete marker copy failed; retrying"
+                            );
+                            error = Some(err);
+                            if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                                decommission_cancel_signal_result(rx.is_cancelled())?;
+                            }
+                        }
                     }
                 }
 
@@ -4425,7 +4685,7 @@ impl ECStore {
                     continue;
                 }
 
-                {
+                if counted_versions.insert((version.version_id, version.deleted)) {
                     let mut pool_meta = self.pool_meta.write().await;
                     ensure_decommission_generation(&pool_meta, idx, generation)?;
                     if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, failure) {
@@ -4442,24 +4702,26 @@ impl ECStore {
                     decommissioned += 1;
                 }
 
-                debug!(
-                    event = EVENT_DECOMMISSION_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    bucket = %bucket,
-                    object = %version.name,
-                    version_id = ?version_id,
-                    result = ?error,
-                    state = "delete_marker_copied",
-                    "Decommission delete marker copied"
-                );
+                if !failure {
+                    debug!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "delete_marker_copied",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %version.name,
+                        version_id = ?version_id,
+                        result = ?error,
+                        "Decommission delete marker copied"
+                    );
+                }
                 continue;
             }
 
-            for _i in 0..3 {
+            for version_attempt in 1..=DECOMMISSION_VERSION_COPY_ATTEMPTS {
                 if version.is_remote() {
-                    if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
+                    let result = run_decommission_side_effect(&rx, &operation_gate, || async {
                         self.decommission_tiered_object(
                             bucket.as_str(),
                             &version.name,
@@ -4468,15 +4730,26 @@ impl ECStore {
                         )
                         .await
                     })
-                    .await
-                    {
-                        if is_decommission_copy_cleanup_safe_error(&err) {
+                    .await;
+                    #[cfg(test)]
+                    let result = decommission_test_wrap_result(
+                        "decommission_tiered_object",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        version_attempt,
+                        result,
+                    );
+
+                    match result {
+                        Ok(_) => {
+                            failure = false;
+                            error = None;
+                        }
+                        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => {
                             ignore = true;
                             cleanup_ignored = true;
-                            break;
                         }
-
-                        if is_decommission_target_capacity_error(&err) {
+                        Err(err) if is_decommission_target_capacity_error(&err) => {
                             return Err(with_decommission_entry_context(
                                 "decommission_tiered_object",
                                 bucket.as_str(),
@@ -4484,10 +4757,48 @@ impl ECStore {
                                 err,
                             ));
                         }
-
-                        failure = true;
-                        error!("decommission_pool: decommission_tiered_object err {:?}", &err);
-                        error = Some(err);
+                        Err(err) => {
+                            failure = true;
+                            if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                                error!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "tiered_copy_failed",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    error = ?err,
+                                    "Decommission tiered version copy failed"
+                                );
+                                error = Some(err);
+                            } else {
+                                let retry_delay =
+                                    decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                                warn!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "tiered_copy_retry",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempt = version_attempt,
+                                    max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    retry_delay_ms = retry_delay.as_millis(),
+                                    error = ?err,
+                                    "Decommission tiered version copy failed; retrying"
+                                );
+                                error = Some(err);
+                                if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                                    decommission_cancel_signal_result(rx.is_cancelled())?;
+                                }
+                                continue;
+                            }
+                        }
                     }
                     break;
                 }
@@ -4522,7 +4833,44 @@ impl ECStore {
                         }
 
                         failure = true;
-                        error!("decommission_pool: get_object_reader err {:?}", &err);
+                        if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                            error!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "object_read_failed",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                error = ?err,
+                                "Decommission source object read failed"
+                            );
+                            error = Some(err);
+                            continue;
+                        }
+
+                        let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                        warn!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "object_read_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %version.name,
+                            version_id = ?version_id,
+                            attempt = version_attempt,
+                            max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            error = ?err,
+                            "Decommission source object read failed; retrying"
+                        );
+                        error = Some(err);
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
                         continue;
                     }
                 };
@@ -4539,13 +4887,22 @@ impl ECStore {
                 )
                 .await?;
 
-                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
+                let migrate_result = run_decommission_side_effect(&rx, &operation_gate, || async {
                     self.clone()
                         .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id)
                         .await
                 })
-                .await
-                {
+                .await;
+                #[cfg(test)]
+                let migrate_result = decommission_test_wrap_result(
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                    bucket_name.as_str(),
+                    object_name.as_str(),
+                    version_attempt,
+                    migrate_result,
+                );
+
+                if let Err(err) = migrate_result {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
                         cleanup_ignored = true;
@@ -4562,8 +4919,45 @@ impl ECStore {
                     }
 
                     failure = true;
+                    if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                        error!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "object_migration_failed",
+                            pool_index = idx,
+                            bucket = %bucket_name,
+                            object = %object_name,
+                            version = %version.name,
+                            attempt = version_attempt,
+                            max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                            error = ?err,
+                            "Decommission object migration failed"
+                        );
+                        error = Some(err);
+                        continue;
+                    }
 
-                    error!("decommission_pool: decommission_object err {:?}", &err);
+                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                    warn!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "object_migration_retry",
+                        pool_index = idx,
+                        bucket = %bucket_name,
+                        object = %object_name,
+                        version = %version.name,
+                        attempt = version_attempt,
+                        max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        error = ?err,
+                        "Decommission object migration failed; retrying"
+                    );
+                    error = Some(err);
+                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                    }
                     continue;
                 }
 
@@ -4600,7 +4994,7 @@ impl ECStore {
                 continue;
             }
 
-            {
+            if counted_versions.insert((version.version_id, version.deleted)) {
                 let mut pool_meta = self.pool_meta.write().await;
                 ensure_decommission_generation(&pool_meta, idx, generation)?;
                 if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), failure) {
@@ -4648,6 +5042,9 @@ impl ECStore {
             )
             .await?;
 
+            #[cfg(test)]
+            run_decommission_cleanup_mutation_hook(bucket.as_str(), entry.name.as_str(), entry_attempt).await;
+
             let source_cleanup_mutation_fence = self
                 .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
                 .await?;
@@ -4668,16 +5065,58 @@ impl ECStore {
                     "decommission",
                 )
                 .await
-                .map_err(|err| match err {
-                    data_movement::SourceCleanupError::SourceChanged => Error::other(format!(
-                        "decommission: source cleanup preflight failed for {}/{}: source versions changed after migration started",
-                        bucket, entry.name
-                    )),
-                    data_movement::SourceCleanupError::Storage(err) => err,
-                })
             })
             .await;
-            resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
+            match cleanup_result {
+                Ok(_) => {}
+                Err(data_movement::SourceCleanupError::Storage(err)) => {
+                    resolve_decommission_entry_cleanup_delete_result(
+                        Err::<(), Error>(err),
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                    )?;
+                }
+                Err(data_movement::SourceCleanupError::SourceChanged) if entry_attempt < DECOMMISSION_ENTRY_MAX_ATTEMPTS => {
+                    return Ok(DecommissionEntryAttemptOutcome::SourceChanged);
+                }
+                Err(data_movement::SourceCleanupError::SourceChanged) => {
+                    let exhausted_entries = source_changed_exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_fail_decommission_pool_after_exhausted_source_changed(exhausted_entries) {
+                        return Err(Error::other(format!(
+                            "decommission source cleanup retries exhausted for {}/{} on all {} attempts; exhausted entries exceed pool limit {}",
+                            bucket, entry.name, DECOMMISSION_ENTRY_MAX_ATTEMPTS, DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+                        )));
+                    }
+
+                    {
+                        let mut pool_meta = self.pool_meta.write().await;
+                        ensure_decommission_generation(&pool_meta, idx, generation)?;
+                        count_decommission_item(&mut pool_meta, idx, 0, true).map_err(|err| {
+                            with_decommission_entry_context(
+                                "count_source_changed_exhaustion",
+                                bucket.as_str(),
+                                entry.name.as_str(),
+                                err,
+                            )
+                        })?;
+                    }
+
+                    error!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "source_cleanup_exhausted",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
+                        exhausted_entries,
+                        exhaustion_limit = DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT,
+                        "Decommission source cleanup retries exhausted; source retained and entry marked failed"
+                    );
+                    entry_blocked = true;
+                }
+            }
         } else if durable_ilm_record.is_some() {
             debug!(
                 event = EVENT_DECOMMISSION_ENTRY,
@@ -4771,13 +5210,13 @@ impl ECStore {
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_POOLS,
+            state = if entry_blocked { "blocked" } else { "completed" },
             pool_index = idx,
             bucket = %bucket,
             object = %entry.name,
-            state = "completed",
-            "Decommission entry completed"
+            "Decommission entry finished"
         );
-        Ok(())
+        Ok(DecommissionEntryAttemptOutcome::Complete)
     }
 
     #[cfg(test)]
@@ -4788,17 +5227,43 @@ impl ECStore {
         bucket: String,
         set: Arc<SetDisks>,
     ) -> Result<()> {
-        self.decommission_entry(
+        self.decommission_entry_with_retry_state_for_test(
             CancellationToken::new(),
             idx,
-            OffsetDateTime::now_utc(),
+            entry,
+            bucket,
+            set,
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decommission_entry_with_retry_state_for_test(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
+    ) -> Result<()> {
+        let generation = self.active_decommission_generation(idx).await?;
+        self.decommission_entry(
+            rx,
+            idx,
+            generation,
             entry,
             bucket,
             set,
             None,
             None,
             None,
-            None,
+            expected_bucket_incarnation_id,
+            source_changed_exhaustions,
         )
         .await
     }
@@ -4811,6 +5276,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
         let generation = self.active_decommission_generation(idx).await?;
@@ -4861,6 +5327,7 @@ impl ECStore {
             let object_lock_config = object_lock_config.clone();
             let replication_config = replication_config.clone();
             let entry_budget = entry_budget.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             let entry_error = entry_error.clone();
             let worker = tokio::spawn(async move {
                 store
@@ -4875,6 +5342,7 @@ impl ECStore {
                         object_lock_config,
                         replication_config,
                         expected_bucket_incarnation_id,
+                        source_changed_exhaustions,
                         entry_budget,
                         entry_error,
                     )
@@ -4946,8 +5414,15 @@ impl ECStore {
         pool: Arc<Sets>,
         bucket: DecomBucketInfo,
     ) -> Result<()> {
-        self.decommission_pool(rx, idx, pool, bucket, Arc::new(Semaphore::new(decommission_entry_concurrency_limit())))
-            .await
+        self.decommission_pool(
+            rx,
+            idx,
+            pool,
+            bucket,
+            Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, canceler))]
@@ -5407,6 +5882,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bucket: DecomBucketInfo,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let is_decommissioned = {
             let pool_meta = self.pool_meta.read().await;
@@ -5433,7 +5909,7 @@ impl ECStore {
         warn!("decommission: currently on bucket {}", &bucket.name);
 
         if let Err(err) = self
-            .decommission_pool(rx.clone(), idx, pool, bucket.clone(), entry_budget)
+            .decommission_pool(rx.clone(), idx, pool, bucket.clone(), entry_budget, source_changed_exhaustions)
             .await
         {
             error!("decommission: decommission_pool err {:?}", &err);
@@ -5468,15 +5944,20 @@ impl ECStore {
         idx: usize,
         pool: Arc<Sets>,
         buckets: Vec<DecomBucketInfo>,
-        limit: usize,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let store = Arc::clone(self);
-        run_decommission_buckets_bounded(rx, buckets, limit, move |bucket, rx| {
+        run_decommission_buckets_bounded(rx, buckets, decommission_bucket_concurrency_limit(), move |bucket, rx| {
             let store = Arc::clone(&store);
             let pool = pool.clone();
             let entry_budget = entry_budget.clone();
-            Box::pin(async move { store.decommission_pending_bucket(rx, idx, pool, bucket, entry_budget).await })
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
+            Box::pin(async move {
+                store
+                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
+                    .await
+            })
         })
         .await
     }
@@ -5494,11 +5975,19 @@ impl ECStore {
             let pool_meta = self.pool_meta.read().await;
             pool_meta.pending_buckets(idx)
         };
+        let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
         let bucket_concurrency = decommission_bucket_concurrency_limit();
         if bucket_concurrency <= 1 {
             for bucket in pending {
-                self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                    .await?;
+                self.decommission_pending_bucket(
+                    rx.clone(),
+                    idx,
+                    pool.clone(),
+                    bucket,
+                    entry_budget.clone(),
+                    Arc::clone(&source_changed_exhaustions),
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -5509,14 +5998,21 @@ impl ECStore {
             idx,
             pool.clone(),
             regular_buckets,
-            bucket_concurrency,
             entry_budget.clone(),
+            Arc::clone(&source_changed_exhaustions),
         )
         .await?;
 
         for bucket in meta_buckets {
-            self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                .await?;
+            self.decommission_pending_bucket(
+                rx.clone(),
+                idx,
+                pool.clone(),
+                bucket,
+                entry_budget.clone(),
+                Arc::clone(&source_changed_exhaustions),
+            )
+            .await?;
         }
 
         Ok(())
@@ -6982,13 +7478,7 @@ mod tests {
     #[test]
     fn decommission_classifiers_see_through_a_stage_wrapper() {
         let wrap = |inner: Error| {
-            crate::data_movement::data_movement_stage_error_for_test(
-                "decommission_object",
-                "put_object",
-                "bucket-a",
-                "object-a",
-                inner,
-            )
+            data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "bucket-a", "object-a", inner)
         };
 
         // Capacity: the target pool filling up must still stop the loop.
@@ -7120,7 +7610,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            metadata: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
         };
 
@@ -7927,15 +8417,16 @@ mod pools_tests {
     use super::{
         DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP,
         DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP, DECOMMISSION_ENTRY_QUEUE_HARD_CAP, DECOMMISSION_META_PREFIXES,
-        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionCanceler,
-        DecommissionDurableIlmReceipt, DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState,
-        ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, QueuedDecommissionEntry,
-        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
-        bind_missing_decommission_cancelers, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
-        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
-        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
-        decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
-        decommission_meta_bucket_options, decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
+        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
+        DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT, DecomBucketInfo, DecommissionCanceler, DecommissionDurableIlmReceipt,
+        DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState, ListCallback,
+        PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, QueuedDecommissionEntry, apply_decommission_status_space_info,
+        await_decommission_worker, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        cancel_decommission_canceler, clamp_decommission_entry_concurrency, classify_decommission_terminal_state,
+        count_decommission_item, decommission_cancel_signal_result, decommission_durable_ilm_receipt_path,
+        decommission_durable_ilm_receipt_run_prefix, decommission_durable_ilm_receipt_run_token,
+        decommission_entry_queue_capacity, decommission_item_size, decommission_meta_bucket_options,
+        decommission_retry_backoff_delay, decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_generation,
         ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
@@ -7958,13 +8449,13 @@ mod pools_tests {
         resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
         run_decommission_buckets_bounded, run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain,
         run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
-        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
-        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
-        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
-        validate_start_decommission_request, wait_decommission_listing_retry, wait_decommission_worker_drain,
-        with_decommission_entry_context,
+        should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed,
+        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
+        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
+        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
+        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_retry_backoff,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -9511,11 +10002,30 @@ mod pools_tests {
     }
 
     #[tokio::test]
-    async fn test_wait_decommission_listing_retry_reports_canceled_without_sleeping() {
+    async fn test_wait_decommission_retry_backoff_reports_canceled_without_sleeping() {
         let token = CancellationToken::new();
         token.cancel();
 
-        assert!(wait_decommission_listing_retry(&token, StdDuration::from_secs(30)).await);
+        assert!(wait_decommission_retry_backoff(&token, StdDuration::from_secs(30)).await);
+    }
+
+    #[test]
+    fn test_decommission_retry_backoff_delay_grows_linearly() {
+        let base = StdDuration::from_millis(100);
+
+        assert_eq!(decommission_retry_backoff_delay(base, 1), base);
+        assert_eq!(decommission_retry_backoff_delay(base, 3), StdDuration::from_millis(300));
+        assert_eq!(decommission_retry_backoff_delay(base, usize::MAX), base.saturating_mul(u32::MAX));
+    }
+
+    #[test]
+    fn test_source_changed_exhaustion_fails_only_after_pool_limit() {
+        assert!(!should_fail_decommission_pool_after_exhausted_source_changed(
+            DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+        ));
+        assert!(should_fail_decommission_pool_after_exhausted_source_changed(
+            DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT + 1
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -11359,8 +11869,6 @@ mod pools_tests {
     async fn test_decommission_supervisor_observes_worker_panic() {
         let worker = tokio::spawn(async move {
             panic!("injected decommission worker panic");
-            #[allow(unreachable_code)]
-            Ok(())
         });
 
         let err = await_decommission_worker(4, worker)

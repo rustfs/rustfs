@@ -58,7 +58,8 @@ use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerConfigObjectDelete as _, ScannerDiskExt as _,
     ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError,
-    enqueue_runtime_free_version, get_lifecycle_config, get_object_lock_config, get_replication_config, runtime_tier_names,
+    begin_tier_registry_cycle, complete_tier_registry_cycle, enqueue_runtime_free_version, get_lifecycle_config,
+    get_object_lock_config, get_replication_config, runtime_tier_names, runtime_tier_registry_for_cycle,
     scanner_publication_admission_for_epoch, scanner_publication_epoch, storageclass,
 };
 
@@ -144,6 +145,7 @@ pub struct ScannerBucketScanPlan {
     all_buckets: Arc<Vec<BucketInfo>>,
     digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
+    tier_registry_generation: u64,
     /// Epoch captured once for the whole scanner cycle.  `None` is retained
     /// for unfenced test implementations; production plans always carry the
     /// admission token captured before bucket enumeration.
@@ -357,12 +359,20 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
         name: cache.info.name.clone(),
         parent: DATA_USAGE_ROOT.to_string(),
         entry,
+        tier_registry_generation: cache.info.tier_registry_generation,
     })
 }
 
-fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) {
+fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) -> bool {
+    if cache.info.tier_registry_generation != result.tier_registry_generation {
+        // A result from another registry generation must never be folded into
+        // this cycle. Leaving it unapplied makes the cycle incomplete and
+        // forces the caller to re-account it under one frozen registry.
+        return false;
+    }
     cache.replace(&result.name, &result.parent, result.entry);
     cache.info.last_update = Some(update_time);
+    true
 }
 
 fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
@@ -514,6 +524,9 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     ) -> Result<ScannerDiskScanOutcome>;
 
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
+
+    /// Read one object using a registry snapshot captured at scan start.
+    async fn get_size_with_tier_names(&self, item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary>;
 }
 
 #[derive(Debug)]
@@ -676,7 +689,10 @@ use cache::*;
 use dirty_usage::*;
 use guards::*;
 
-pub(crate) use cache::{DataUsageCacheScanState, acquire_scanner_cache_locks, current_cache_root_or_prepare};
+pub(crate) use cache::{
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, acquire_scanner_cache_locks,
+    current_cache_root_or_prepare_with_generation,
+};
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageState, acknowledge_dirty_usage_generation, clear_dirty_usage_bucket,
     record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_state,

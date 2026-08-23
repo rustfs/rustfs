@@ -19,13 +19,15 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
     PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-    sign_ns_scanner_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+    sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, verify_put_file_auth_trailer,
+    verify_rpc_signature,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
-    PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, WALK_DIR_BODY_SHA256_QUERY,
+    NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY,
+    WALK_DIR_BODY_SHA256_QUERY,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::tonic_rpc_auth_failure_reason;
@@ -290,6 +292,8 @@ struct NsScannerQuery {
 struct NsScannerCapabilityQuery {
     ns_scanner_protocol: Option<u16>,
     ns_scanner_challenge: Option<uuid::Uuid>,
+    #[serde(rename = "ns_scanner_tier_registry_generation")]
+    ns_scanner_tier_registry_generation: Option<bool>,
 }
 
 fn verify_ns_scanner_body_digest(query: &NsScannerQuery, body: &[u8]) -> bool {
@@ -410,7 +414,9 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
         (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
             Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
-                Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(challenge),
+                Some(challenge) if !challenge.is_nil() => {
+                    ns_scanner_capability_response(challenge, query.ns_scanner_tier_registry_generation == Some(true))
+                }
                 Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
             },
             Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
@@ -466,31 +472,34 @@ fn record_internode_rpc_error(operation: Option<&'static str>) {
     }
 }
 
-fn ns_scanner_capability_response(challenge: uuid::Uuid) -> Response<Body> {
+fn ns_scanner_capability_response(challenge: uuid::Uuid, include_tier_registry_generation: bool) -> Response<Body> {
     let server_epoch = *NS_SCANNER_SERVER_EPOCH;
-    let proof = match sign_ns_scanner_capability(challenge, server_epoch) {
-        Ok(proof) => proof,
-        Err(err) => {
-            error!(
-                event = EVENT_RPC_REQUEST_FAILED,
-                component = LOG_COMPONENT_INTERNODE_RPC,
-                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-                operation = INTERNODE_OPERATION_NS_SCANNER,
-                result = "failed",
-                status_code = StatusCode::UPGRADE_REQUIRED.as_u16(),
-                rpc_path = NS_SCANNER_PATH,
-                method = %Method::GET,
-                reason = "capability_authentication_unavailable",
-                error = %err,
-                "internode rpc request failed"
-            );
-            return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
-        }
-    };
+    let proof =
+        match sign_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, include_tier_registry_generation)
+        {
+            Ok(proof) => proof,
+            Err(err) => {
+                error!(
+                    event = EVENT_RPC_REQUEST_FAILED,
+                    component = LOG_COMPONENT_INTERNODE_RPC,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
+                    operation = INTERNODE_OPERATION_NS_SCANNER,
+                    result = "failed",
+                    status_code = StatusCode::UPGRADE_REQUIRED.as_u16(),
+                    rpc_path = NS_SCANNER_PATH,
+                    method = %Method::GET,
+                    reason = "capability_authentication_unavailable",
+                    error = %err,
+                    "internode rpc request failed"
+                );
+                return response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner RPC authentication is unavailable");
+            }
+        };
     let body = match rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
         version: NS_SCANNER_PROTOCOL_VERSION,
         server_epoch,
         proof,
+        supports_tier_registry_generation: include_tier_registry_generation.then_some(true),
     }) {
         Ok(body) => body,
         Err(err) => {
@@ -1676,12 +1685,13 @@ mod tests {
         LOG_SUBSYSTEM_NAMESPACE_SCANNER, LOG_SUBSYSTEM_ROUTING, NS_SCANNER_BODY_SHA256_QUERY,
         NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PATH,
         NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
-        NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH,
-        PUT_FILE_STREAM_PATH, PutFileQuery, READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery,
-        append_walk_dir_completion, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
-        ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
-        put_file_capability_response, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
-        read_file_body_stream, read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
+        NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse,
+        NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH, PUT_FILE_STREAM_PATH, PutFileQuery,
+        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
+        internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
+        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_capability_response,
+        put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock, read_file_body_stream,
+        read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
         supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
         verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
         write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
@@ -2114,6 +2124,51 @@ mod tests {
         );
         assert!(serde_urlencoded::from_str::<NsScannerQuery>(&query).is_err());
         assert!(serde_urlencoded::from_str::<super::NsScannerCapabilityQuery>("ns_scanner_protocol=1&unexpected=true").is_err());
+        let marked =
+            format!("ns_scanner_protocol=3&ns_scanner_challenge={request_id}&{NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY}=true");
+        assert_eq!(
+            serde_urlencoded::from_str::<super::NsScannerCapabilityQuery>(&marked)
+                .expect("generation marker should be accepted")
+                .ns_scanner_tier_registry_generation,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn namespace_scanner_capability_response_support_is_optional_for_old_peers() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyCapabilityResponse {
+            version: u16,
+            server_epoch: uuid::Uuid,
+            proof: Vec<u8>,
+        }
+
+        let old = rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
+            version: super::NS_SCANNER_PROTOCOL_VERSION,
+            server_epoch: uuid::Uuid::new_v4(),
+            proof: vec![1, 2, 3],
+            supports_tier_registry_generation: None,
+        })
+        .expect("old response shape should encode");
+        let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&old).expect("old response should decode");
+        assert_eq!(decoded.supports_tier_registry_generation, None);
+        let legacy_decoded: LegacyCapabilityResponse =
+            rmp_serde::from_slice(&old).expect("legacy reader should decode old shape");
+        assert_eq!(legacy_decoded.version, super::NS_SCANNER_PROTOCOL_VERSION);
+        assert!(!legacy_decoded.server_epoch.is_nil());
+        assert_eq!(legacy_decoded.proof, vec![1, 2, 3]);
+
+        let current = rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
+            version: super::NS_SCANNER_PROTOCOL_VERSION,
+            server_epoch: uuid::Uuid::new_v4(),
+            proof: vec![1, 2, 3],
+            supports_tier_registry_generation: Some(true),
+        })
+        .expect("new response shape should encode");
+        let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&current).expect("new response should decode");
+        assert_eq!(decoded.supports_tier_registry_generation, Some(true));
+        assert!(rmp_serde::from_slice::<LegacyCapabilityResponse>(&current).is_err());
     }
 
     #[test]
