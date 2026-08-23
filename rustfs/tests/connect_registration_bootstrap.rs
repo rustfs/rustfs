@@ -158,6 +158,15 @@ impl Drop for TestServer {
     }
 }
 
+fn assert_reused_pending_requests(server: &TestServer) {
+    let requests = server.seen.lock().expect("seen lock");
+    assert_eq!(requests.len(), 4);
+    for request in &requests[1..] {
+        assert_eq!(request["requestId"], requests[0]["requestId"]);
+        assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
+    }
+}
+
 async fn server(state_directory: &std::path::Path, replies: Vec<Reply>) -> TestServer {
     let pki = Arc::new(TestPki::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
@@ -399,14 +408,7 @@ async fn response_loss_reuses_the_pending_request_and_existing_credential_is_ide
         .await
         .expect("retry registration");
     assert_eq!(registered.device_uid, DEVICE_UID);
-    {
-        let requests = flaky_server.seen.lock().expect("seen lock");
-        assert_eq!(requests.len(), 4);
-        for request in &requests[1..] {
-            assert_eq!(request["requestId"], requests[0]["requestId"]);
-            assert_eq!(request["certificateRequest"], requests[0]["certificateRequest"]);
-        }
-    }
+    assert_reused_pending_requests(&flaky_server);
 
     let idle = server(&state, vec![]).await;
     let idempotent = register_from_protected_input(&idle.endpoint, &root, &state, Some(&token))
