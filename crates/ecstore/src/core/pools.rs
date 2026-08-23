@@ -7965,8 +7965,7 @@ mod pools_tests {
         DurableIlmRecordCheckpoint,
         bucket_lifecycle_ops::{ManualTransitionQueueSnapshot, ManualTransitionRunOptions},
         manual_transition_job::{ManualTransitionJobRecord, manual_transition_job_record_object_name},
-        validate_durable_ilm_record,
-        run_decommission_phases,
+        run_decommission_phases, validate_durable_ilm_record,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -8502,6 +8501,129 @@ mod pools_tests {
                 "regular:regular-fails".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_barrier_holds_with_regular_concurrency() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        run_decommission_phases(
+            CancellationToken::new(),
+            vec![
+                DecomBucketInfo {
+                    name: "regular-a".to_string(),
+                    ..Default::default()
+                },
+                DecomBucketInfo {
+                    name: "regular-b".to_string(),
+                    ..Default::default()
+                },
+            ],
+            vec![
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+                },
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
+                },
+            ],
+            2,
+            {
+                let events = Arc::clone(&events);
+                move |bucket, _rx| {
+                    let events = Arc::clone(&events);
+                    Box::pin(async move {
+                        events
+                            .lock()
+                            .expect("phase event lock should not be poisoned")
+                            .push(bucket.name);
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await
+        .expect("metadata barrier should complete before regular workers");
+
+        let events = events.lock().expect("phase event lock should not be poisoned");
+        assert_eq!(
+            &events[..2],
+            &[
+                crate::disk::RUSTFS_META_BUCKET.to_string(),
+                crate::disk::RUSTFS_META_BUCKET.to_string()
+            ]
+        );
+        assert_eq!(events.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_decommission_phase_gate_honors_cancellation_before_metadata() {
+        let rx = CancellationToken::new();
+        rx.cancel();
+        let started = Arc::new(AtomicUsize::new(0));
+        let err = run_decommission_phases(
+            rx,
+            vec![DecomBucketInfo {
+                name: "regular".to_string(),
+                ..Default::default()
+            }],
+            vec![DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+            }],
+            2,
+            {
+                let started = Arc::clone(&started);
+                move |_bucket, _rx| {
+                    let started = Arc::clone(&started);
+                    Box::pin(async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("canceled phase gate should stop before metadata");
+
+        assert!(matches!(err, Error::OperationCanceled));
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_failure_blocks_regular_phase() {
+        let regular_started = Arc::new(AtomicUsize::new(0));
+        let err = run_decommission_phases(
+            CancellationToken::new(),
+            vec![DecomBucketInfo {
+                name: "regular".to_string(),
+                ..Default::default()
+            }],
+            vec![DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+            }],
+            2,
+            {
+                let regular_started = Arc::clone(&regular_started);
+                move |bucket, _rx| {
+                    let regular_started = Arc::clone(&regular_started);
+                    Box::pin(async move {
+                        if bucket.name != crate::disk::RUSTFS_META_BUCKET {
+                            regular_started.fetch_add(1, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        Err(Error::SlowDown)
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("metadata failure must remain fatal");
+
+        assert!(matches!(err, Error::SlowDown));
+        assert_eq!(regular_started.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
