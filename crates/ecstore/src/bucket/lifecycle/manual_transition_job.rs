@@ -199,7 +199,7 @@ pub struct ManualTransitionJobRecord {
     pub updated_at_unix_nanos: i128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_nanos: Option<i128>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub cursor_revision: Option<u64>,
     pub report: ManualTransitionRunReport,
     pub queue_snapshot: ManualTransitionQueueSnapshot,
@@ -230,7 +230,7 @@ impl ManualTransitionJobRecord {
             created_at_unix_nanos: now,
             updated_at_unix_nanos: now,
             completed_at_unix_nanos: None,
-            cursor_revision: Some(0),
+            cursor_revision: None,
             report: ManualTransitionRunReport {
                 bucket: bucket.to_string(),
                 prefix: options.prefix.clone(),
@@ -451,10 +451,8 @@ impl ManualTransitionJobRecord {
     }
 
     fn merge_scan_report(&mut self, report: &ManualTransitionRunReport) {
-        if self.report.continuation_token != report.continuation_token {
-            self.cursor_revision = Some(self.cursor_revision.unwrap_or(0).saturating_add(1));
-        }
         self.report.merge_scan_report_preserving_worker(report);
+        self.cursor_revision = manual_transition_cursor_revision(&self.report);
     }
 
     pub fn mark_unknown_if_unowned(&mut self) {
@@ -561,6 +559,7 @@ impl ManualTransitionJobRecord {
         if job.state == ManualTransitionJobState::Cancelled && job.cancel_requested {
             job.report.cancelled = true;
         }
+        job.cursor_revision = manual_transition_cursor_revision(&job.report);
         job.validate()?;
         Ok(job)
     }
@@ -1995,6 +1994,11 @@ fn manual_transition_job_store_error(err: ManualTransitionJobError) -> Error {
     Error::other(err)
 }
 
+fn manual_transition_cursor_revision(report: &ManualTransitionRunReport) -> Option<u64> {
+    report.continuation_token.as_ref()?;
+    (report.scanned > 0).then_some(report.scanned)
+}
+
 pub fn manual_transition_scope_admission_lease_expired(admission: &ManualTransitionScopeAdmission) -> bool {
     OffsetDateTime::now_utc().unix_timestamp_nanos() > admission.lease_expires_at_unix_nanos
 }
@@ -2232,6 +2236,76 @@ mod tests {
                 .get(&ManualTransitionWorkerFailureReason::NotFound),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn manual_transition_job_scan_progress_accumulates_resumed_checkpoint_counters() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let first_token =
+            encode_manual_transition_continuation_token(Some("logs/page-a".to_string()), Some("version-a".to_string()));
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                lifecycle_config_found: true,
+                scanned: 1000,
+                eligible: 800,
+                enqueued: 50,
+                dry_run_eligible: 10,
+                skipped_not_transition: 2,
+                skipped_tier: 3,
+                skipped_delete_marker: 4,
+                skipped_directory: 5,
+                skipped_replication: 6,
+                skipped_already_transitioned: 7,
+                skipped_already_in_flight: 8,
+                skipped_queue_full: 9,
+                skipped_queue_closed: 10,
+                skipped_queue_timeout: 11,
+                tier_failure: 12,
+                truncated_by_duration: true,
+                continuation_token: first_token,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        let next_token =
+            encode_manual_transition_continuation_token(Some("logs/page-b".to_string()), Some("version-b".to_string()));
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                scanned: 3,
+                eligible: 2,
+                enqueued: 1,
+                dry_run_eligible: 1,
+                skipped_not_transition: 1,
+                tier_failure: 1,
+                continuation_token: next_token.clone(),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert_eq!(record.report.scanned, 1003);
+        assert_eq!(record.report.eligible, 802);
+        assert_eq!(record.report.enqueued, 51);
+        assert_eq!(record.report.dry_run_eligible, 11);
+        assert_eq!(record.report.skipped_not_transition, 3);
+        assert_eq!(record.report.skipped_tier, 3);
+        assert_eq!(record.report.skipped_delete_marker, 4);
+        assert_eq!(record.report.skipped_directory, 5);
+        assert_eq!(record.report.skipped_replication, 6);
+        assert_eq!(record.report.skipped_already_transitioned, 7);
+        assert_eq!(record.report.skipped_already_in_flight, 8);
+        assert_eq!(record.report.skipped_queue_full, 9);
+        assert_eq!(record.report.skipped_queue_closed, 10);
+        assert_eq!(record.report.skipped_queue_timeout, 11);
+        assert_eq!(record.report.tier_failure, 13);
+        assert!(record.report.lifecycle_config_found);
+        assert!(record.report.truncated_by_duration);
+        assert_eq!(record.report.continuation_token, next_token);
+        assert_eq!(record.cursor_revision, Some(1003));
     }
 
     #[test]
@@ -2602,9 +2676,20 @@ mod tests {
     }
 
     #[test]
-    fn manual_transition_job_record_decodes_legacy_cursor_without_revision() {
+    fn manual_transition_job_record_derives_revision_from_legacy_cursor() {
         let options = ManualTransitionRunOptions::default();
-        let record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-a".to_string()), Some("version-a".to_string()));
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                scanned: 9,
+                continuation_token,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
         let encoded = record.encode().expect("job record should encode");
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).expect("encoded job should be json");
         value["job"]
@@ -2617,7 +2702,69 @@ mod tests {
 
         let decoded = ManualTransitionJobRecord::decode(record.job_id, &legacy).expect("legacy job should decode");
 
-        assert_eq!(decoded.cursor_revision, None);
+        assert_eq!(decoded.cursor_revision, Some(9));
+    }
+
+    #[test]
+    fn manual_transition_job_record_omits_cursor_revision_for_old_readers() {
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyPersistedManualTransitionJobRecord {
+            schema: String,
+            content_sha256: String,
+            job: LegacyManualTransitionJobRecord,
+        }
+
+        #[allow(dead_code)]
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyManualTransitionJobRecord {
+            job_id: Uuid,
+            scope_key: String,
+            bucket: String,
+            prefix: String,
+            tier: Option<String>,
+            dry_run: bool,
+            max_objects: Option<u64>,
+            max_duration: Option<std::time::Duration>,
+            owner_id: String,
+            lease_id: Uuid,
+            lease_expires_at_unix_nanos: i128,
+            state: ManualTransitionJobState,
+            scan_completed: bool,
+            cancel_requested: bool,
+            created_at_unix_nanos: i128,
+            updated_at_unix_nanos: i128,
+            completed_at_unix_nanos: Option<i128>,
+            report: ManualTransitionRunReport,
+            queue_snapshot: ManualTransitionQueueSnapshot,
+            error: Option<String>,
+        }
+
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-a".to_string()), Some("version-a".to_string()));
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                scanned: 7,
+                continuation_token: continuation_token.clone(),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        assert_eq!(record.cursor_revision, Some(7));
+
+        let encoded = record.encode().expect("job record should encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("encoded job should be json");
+        assert!(value["job"].get("cursor_revision").is_none());
+        let legacy: LegacyPersistedManualTransitionJobRecord =
+            serde_json::from_slice(&encoded).expect("old reader should accept new job record");
+
+        assert_eq!(legacy.job.job_id, record.job_id);
+        assert_eq!(legacy.job.report.continuation_token, continuation_token);
     }
 
     #[test]
