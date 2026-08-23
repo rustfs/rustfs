@@ -3499,6 +3499,26 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) tail_drain: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Options shared by the normal and early-ack rename fanouts. Keeping the
+/// quorum and optional scanner lease map together avoids widening either
+/// fanout helper's argument list while preserving the fence semantics.
+pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
+    write_quorum: usize,
+    scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+}
+
+impl<'a> RenameDataFenceOptions<'a> {
+    pub(in crate::set_disk) fn new(
+        write_quorum: usize,
+        scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+    ) -> Self {
+        Self {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        }
+    }
+}
+
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
@@ -3721,7 +3741,7 @@ impl SetDisks {
             .collect()
     }
 
-    #[tracing::instrument(level = "debug", skip(disks, file_infos, scanner_publication_lease_tokens))]
+    #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
     async fn rename_data_owned_early_ack_with_fence(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -3729,9 +3749,12 @@ impl SetDisks {
         file_infos: Vec<FileInfo>,
         dst_bucket: &str,
         dst_object: &str,
-        write_quorum: usize,
-        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+        fence_options: RenameDataFenceOptions<'_>,
     ) -> disk::error::Result<RenameDataCommit> {
+        let RenameDataFenceOptions {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        } = fence_options;
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -4013,11 +4036,19 @@ impl SetDisks {
         dst_object: &str,
         write_quorum: usize,
     ) -> disk::error::Result<RenameDataCommit> {
-        Self::rename_data_owned_with_fence(disks, src_bucket, src_object, file_infos, dst_bucket, dst_object, write_quorum, None)
-            .await
+        Self::rename_data_owned_with_fence(
+            disks,
+            src_bucket,
+            src_object,
+            file_infos,
+            dst_bucket,
+            dst_object,
+            RenameDataFenceOptions::new(write_quorum, None),
+        )
+        .await
     }
 
-    #[tracing::instrument(level = "debug", skip(disks, file_infos, scanner_publication_lease_tokens))]
+    #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
     pub(in crate::set_disk) async fn rename_data_owned_with_fence(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
@@ -4025,8 +4056,7 @@ impl SetDisks {
         file_infos: Vec<FileInfo>,
         dst_bucket: &str,
         dst_object: &str,
-        write_quorum: usize,
-        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+        fence_options: RenameDataFenceOptions<'_>,
     ) -> disk::error::Result<RenameDataCommit> {
         if put_rename_early_ack_enabled() {
             return Self::rename_data_owned_early_ack_with_fence(
@@ -4036,11 +4066,14 @@ impl SetDisks {
                 file_infos,
                 dst_bucket,
                 dst_object,
-                write_quorum,
-                scanner_publication_lease_tokens,
+                fence_options,
             )
             .await;
         }
+        let RenameDataFenceOptions {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        } = fence_options;
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -5496,6 +5529,7 @@ impl SetDisks {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
         self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None).await
     }

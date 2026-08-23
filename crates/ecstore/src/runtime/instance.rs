@@ -330,14 +330,14 @@ impl InstanceContext {
     pub(crate) async fn scanner_publication_lease_generation(&self, token: Uuid) -> Option<u64> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let Some(entry) = leases.get(&token) else {
-            return None;
-        };
-        if entry.expires_at <= now {
+        let (expires_at, movement_generation) = leases
+            .get(&token)
+            .map(|entry| (entry.expires_at, entry.movement_generation))?;
+        if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some(entry.movement_generation)
+        Some(movement_generation)
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {

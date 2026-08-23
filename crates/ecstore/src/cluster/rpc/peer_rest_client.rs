@@ -1807,11 +1807,7 @@ impl PeerRestClient {
         let result = self
             .scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_PROTOCOL_VERSION)
             .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|err| scanner_activity_protocol_unsupported(err))
-        {
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
             // A v6 peer cannot parse the v7 marker.  Its authenticated
             // response is still decoded as untrusted terminal state, so the
             // scanner will defer publication until every peer is v7.
@@ -1826,11 +1822,7 @@ impl PeerRestClient {
         let result = self
             .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
             .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|err| scanner_activity_protocol_unsupported(err))
-        {
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
             self.scanner_activity_request_with_protocol(instance_id, generation, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
                 .await
         } else {

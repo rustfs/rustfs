@@ -2940,8 +2940,10 @@ impl SetDisks {
                     parts_metadatas,
                     &commit_bucket,
                     &commit_object,
-                    write_quorum,
-                    commit_scanner_publication_lease_tokens.as_ref(),
+                    crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
+                        write_quorum,
+                        commit_scanner_publication_lease_tokens.as_ref(),
+                    ),
                 )
                 .await;
                 if quota_mutation_fence {
