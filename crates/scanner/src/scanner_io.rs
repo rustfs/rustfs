@@ -18,7 +18,8 @@ use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
-    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, ScannerError, SizeSummary,
+    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageSnapshotSetState, DataUsageScanPlanDigest,
+    ScannerError, SizeSummary,
     TierStats,
 };
 use futures::future::join_all;
@@ -274,6 +275,17 @@ async fn publish_usage_snapshot(
     let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
         return Ok(false);
     };
+    send_data_usage_update(updates, data_usage_info).await?;
+    Ok(true)
+}
+
+async fn publish_observational_snapshot(
+    updates: &mpsc::Sender<DataUsageInfo>,
+    mut data_usage_info: DataUsageInfo,
+) -> Result<bool> {
+    data_usage_info.usage_snapshot_complete = false;
+    data_usage_info.usage_snapshot_partial = true;
+    data_usage_info.usage_snapshot_converged = Some(false);
     send_data_usage_update(updates, data_usage_info).await?;
     Ok(true)
 }

@@ -73,6 +73,9 @@ struct CachedBucketUsage {
     // mutation. A strictly later generation is required before the mutation
     // evidence can be discarded.
     pending_scanner_position: Option<(u64, u64)>,
+    // Deletes are visible to admin immediately, but quota admission keeps
+    // them pending until a complete scanner generation reconciles the set.
+    pending_negative_delta: u64,
 }
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
@@ -948,7 +951,9 @@ async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUs
     };
 
     match parse_usage_snapshot(&data) {
-        Ok(info) if info.usage_snapshot_converged == Some(false) && info.is_complete_bucket_usage_snapshot() => Some(info),
+        Ok(info)
+            if info.usage_snapshot_converged == Some(false)
+                && (info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot()) => Some(info),
         Ok(_) => {
             error!(
                 event = "data_usage_snapshot_load_failed",
@@ -993,7 +998,7 @@ async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataU
 }
 
 fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
-    if !data_usage_info.is_complete_bucket_usage_snapshot() {
+    if !data_usage_info.is_complete_bucket_usage_snapshot() && !data_usage_info.usage_snapshot_partial {
         data_usage_info.usage_snapshot_complete = false;
         data_usage_info.buckets_usage.clear();
         data_usage_info.bucket_sizes.clear();
@@ -1643,6 +1648,7 @@ fn cached_bucket_usage_from_backend(usage: BucketUsageInfo, updated_at: SystemTi
         dirty: false,
         stale_snapshot_pending: false,
         pending_scanner_position: None,
+        pending_negative_delta: 0,
     }
 }
 
@@ -1656,6 +1662,7 @@ fn cached_bucket_usage_now(usage: BucketUsageInfo) -> CachedBucketUsage {
         dirty: false,
         stale_snapshot_pending: false,
         pending_scanner_position: None,
+        pending_negative_delta: 0,
     }
 }
 
@@ -1808,6 +1815,7 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
         .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
 
     entry.usage.size = entry.usage.size.saturating_sub(deleted_size);
+    entry.pending_negative_delta = entry.pending_negative_delta.saturating_add(deleted_size);
     if removed_current_object {
         entry.usage.objects_count = entry.usage.objects_count.saturating_sub(1);
         entry.usage.versions_count = entry.usage.versions_count.saturating_sub(1);
@@ -1863,7 +1871,7 @@ pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
     cache
         .get(bucket)
         .filter(|cached| cached.authoritative)
-        .map(|cached| cached.usage.size)
+        .map(|cached| cached.usage.size.saturating_add(cached.pending_negative_delta))
 }
 
 async fn update_usage_cache_if_needed() {
@@ -2941,6 +2949,45 @@ mod tests {
         namespace_changed.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2));
         let (selected, _) = select_admin_data_usage_snapshot(namespace_changed, true, Some(observed));
         assert_eq!(selected.usage_snapshot_converged, Some(true));
+    }
+
+    #[test]
+    fn persisted_authoritative_stalls_but_memory_overlay_remains_visible() {
+        let authoritative = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(10),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let mut partial = authoritative.clone();
+        partial.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        partial.scanner_cycle = Some(11);
+        partial.usage_snapshot_complete = false;
+        partial.usage_snapshot_partial = true;
+        partial.usage_snapshot_converged = Some(false);
+        partial.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
+        partial.usage_snapshot_set_states = vec![rustfs_data_usage::DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(10),
+            scanner_epoch: Some(4),
+            scan_plan_digest: Some([1; 32]),
+            complete: false,
+            tombstone: false,
+        }];
+        partial.buckets_usage.insert(
+            "bucket".to_string(),
+            BucketUsageInfo {
+                size: 100,
+                ..Default::default()
+            },
+        );
+        partial.buckets_count = 1;
+
+        let (selected, _) = select_admin_data_usage_snapshot(authoritative, true, Some(partial));
+        assert!(selected.usage_snapshot_partial);
+        assert_eq!(selected.buckets_usage.get("bucket").map(|usage| usage.size), Some(100));
     }
 
     #[tokio::test]
@@ -4663,6 +4710,47 @@ mod tests {
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((1, 20))
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn partial_usage_is_observational_not_authoritative_for_quota() {
+        clear_usage_memory_cache_for_test().await;
+
+        let mut partial = data_usage_info_for_test("bucket-a", 10, 100, SystemTime::now());
+        partial.usage_snapshot_complete = false;
+        partial.usage_snapshot_partial = true;
+        replace_bucket_usage_memory_from_info(&partial).await;
+
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_quota_uses_complete_baseline_plus_positive_deltas() {
+        clear_usage_memory_cache_for_test().await;
+
+        let baseline = data_usage_info_for_test("bucket-a", 1, 100, SystemTime::now());
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_write_memory("bucket-a", None, 25).await;
+
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(125));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn negative_delta_waits_for_set_reconciliation() {
+        clear_usage_memory_cache_for_test().await;
+
+        let baseline = data_usage_info_for_test("bucket-a", 1, 100, SystemTime::now());
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_delete_memory("bucket-a", 25, true).await;
+
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(100));
+
+        let reconciled = data_usage_info_for_test("bucket-a", 0, 75, SystemTime::now() + Duration::from_secs(1));
+        replace_bucket_usage_memory_from_info(&reconciled).await;
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(75));
     }
 
     #[tokio::test]
