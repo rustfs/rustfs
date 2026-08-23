@@ -15,6 +15,42 @@
 use super::*;
 use std::sync::Arc;
 
+#[derive(Debug)]
+struct CachePublicationAdmissionUnavailable;
+
+impl std::fmt::Display for CachePublicationAdmissionUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("scanner cache publication admission is unavailable")
+    }
+}
+
+impl std::error::Error for CachePublicationAdmissionUnavailable {}
+
+fn cache_publication_admission_unavailable() -> Error {
+    Error::Io(std::io::Error::other(CachePublicationAdmissionUnavailable))
+}
+
+fn cache_publication_epoch_changed() -> Error {
+    Error::other(SCANNER_PUBLICATION_EPOCH_CHANGED)
+}
+
+fn is_cache_publication_admission_unavailable(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Io(io_error)
+            if io_error
+                .get_ref()
+                .is_some_and(|source| source.downcast_ref::<CachePublicationAdmissionUnavailable>().is_some())
+    )
+}
+
+fn is_cache_publication_epoch_changed(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Io(io_error) if io_error.to_string() == SCANNER_PUBLICATION_EPOCH_CHANGED
+    )
+}
+
 pub(super) enum DataUsageCacheLoadAttempt {
     Loaded {
         cache: Box<DataUsageCache>,
@@ -368,6 +404,12 @@ impl DataUsageCache {
     fn should_retry_save_error(err: &StorageError) -> bool {
         // Usage-cache files are best-effort scanner checkpoints. Retrying namespace
         // lock failures immediately only adds more lock traffic to the same hot object.
+        if is_cache_publication_admission_unavailable(err) {
+            return false;
+        }
+        if is_cache_publication_epoch_changed(err) {
+            return false;
+        }
         !matches!(
             err,
             StorageError::Lock(_)
@@ -423,13 +465,14 @@ impl DataUsageCache {
         Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
     }
 
-    async fn save_path_with_retry<S: ScannerObjectIO>(
+    async fn save_path_with_retry<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         store: Arc<S>,
         path: &str,
         buf: &[u8],
         timeout_duration: Duration,
         max_retries: u32,
         revision: Option<DataUsageCacheRevision>,
+        expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
@@ -441,6 +484,17 @@ impl DataUsageCache {
             let buf_clone = buf.to_vec();
             let revision = revision.clone();
             async move {
+                let publication_admission = match expected_epoch {
+                    Some(expected_epoch) => scanner_publication_admission_for_epoch(store_clone.clone(), expected_epoch).await,
+                    None => store_clone.scanner_data_usage_publication_admission().await,
+                };
+                let Some(_publication_admission) = publication_admission else {
+                    return Err(if expected_epoch.is_some() {
+                        cache_publication_epoch_changed()
+                    } else {
+                        cache_publication_admission_unavailable()
+                    });
+                };
                 if let Some(revision) = revision {
                     save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
                 } else {
@@ -453,6 +507,14 @@ impl DataUsageCache {
         let Err(save_err) = save_result else {
             return Ok(());
         };
+
+        // An epoch-specific admission failure is authoritative: reconciling
+        // identical bytes cannot prove that this snapshot belongs to the
+        // captured movement epoch. Do not turn that fence failure into a
+        // successful stale publication.
+        if is_cache_publication_epoch_changed(&save_err) {
+            return Err(save_err);
+        }
 
         for attempt in 0..=max_retries {
             let reconcile = timeout(timeout_duration, async {
@@ -486,24 +548,36 @@ impl DataUsageCache {
         Err(save_err)
     }
 
-    pub async fn save<S: ScannerObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
-        self.save_inner(store, name, None).await
+    pub async fn save<S: ScannerObjectIO + ScannerConfigObjectDelete>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+        self.save_inner(store, name, None, None).await
     }
 
-    pub(crate) async fn save_with_revisions<S: ScannerObjectIO>(
+    #[cfg(test)]
+    pub(crate) async fn save_with_revisions<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
         revisions: &DataUsageCacheRevisions,
     ) -> StorageResult<()> {
-        self.save_inner(store, name, Some(revisions)).await
+        self.save_inner(store, name, Some(revisions), None).await
     }
 
-    async fn save_inner<S: ScannerObjectIO>(
+    pub(crate) async fn save_with_revisions_for_epoch<S: ScannerObjectIO + ScannerConfigObjectDelete>(
+        &self,
+        store: Arc<S>,
+        name: &str,
+        revisions: &DataUsageCacheRevisions,
+        expected_epoch: u64,
+    ) -> StorageResult<()> {
+        self.save_inner(store, name, Some(revisions), Some(expected_epoch)).await
+    }
+
+    async fn save_inner<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
         revisions: Option<&DataUsageCacheRevisions>,
+        expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
@@ -517,6 +591,7 @@ impl DataUsageCache {
             timeout_duration,
             DATA_USAGE_CACHE_SAVE_RETRIES,
             revisions.map(|revisions| revisions.main.clone()),
+            expected_epoch,
         )
         .await?;
 
@@ -534,6 +609,7 @@ impl DataUsageCache {
             backup_timeout_duration,
             DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES,
             backup_revision,
+            expected_epoch,
         )
         .await
         {
@@ -548,6 +624,9 @@ impl DataUsageCache {
                 error = %e,
                 "Scanner cache backup save failed"
             );
+            if is_cache_publication_admission_unavailable(&e) || is_cache_publication_epoch_changed(&e) {
+                return Err(e);
+            }
         }
         Ok(())
     }

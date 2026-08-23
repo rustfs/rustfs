@@ -59,9 +59,73 @@ const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
-    ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
+    OperatorRuleContract, ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
+
+#[cfg(test)]
+static SITE_REPLICATION_GATE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+const SITE_REPLICATION_GATE_FORCE_DISABLED: u8 = 1;
+#[cfg(test)]
+const SITE_REPLICATION_GATE_FORCE_ENABLED: u8 = 2;
+
+async fn site_replication_gate_enabled() -> S3Result<bool> {
+    #[cfg(test)]
+    match SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+        SITE_REPLICATION_GATE_FORCE_DISABLED => return Ok(false),
+        SITE_REPLICATION_GATE_FORCE_ENABLED => return Ok(true),
+        _ => {}
+    }
+    crate::admin::handlers::site_replication::site_replication_enabled().await
+}
+
+/// Remote site-replication peer deployment ids and the operator-rule contract
+/// the peers support, handed to the bucket usecase so an S3 replication-config
+/// edit keeps exactly the reconciler-owned rules and merges the way every
+/// peer will (issue #1948). Read here, in the interface layer, because the
+/// usecase must not import the admin handlers (layer guard); a state-read
+/// failure propagates so the edit fails closed.
+async fn site_replication_edit_context() -> S3Result<(std::collections::HashSet<String>, OperatorRuleContract)> {
+    // While the gate override is in effect the test exercises the deny/allow
+    // branch, not the peer set; there is no persisted state to read.
+    #[cfg(test)]
+    if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return Ok((std::collections::HashSet::new(), OperatorRuleContract::Derived));
+    }
+    crate::admin::handlers::site_replication::site_replication_edit_context().await
+}
+
+/// MinIO `ErrReplicationDenyEditError`.
+fn replication_deny_edit_error() -> S3Error {
+    let mut err = S3Error::with_message(
+        S3ErrorCode::Custom("XMinioReplicationDenyEdit".into()),
+        "Sub-User is not allowed to edit Replication configuration",
+    );
+    err.set_status_code(StatusCode::BAD_REQUEST);
+    err
+}
+
+/// Site-replication gate for S3 replication-config edits (issue #1948).
+///
+/// On a site-replication deployment the bucket's replication config carries
+/// the operator-managed `site-repl-*` rules that keep every peer in sync, and
+/// a successful edit is broadcast to all peers — so a user holding only
+/// bucket-scoped `s3:PutReplicationConfiguration` could rewrite or erase
+/// replication net-wide. MinIO parity (`ErrReplicationDenyEditError`): only
+/// owner credentials (root or root-parented) may edit. Runs after the policy
+/// authorization in the access layer and only on the external S3 path — the
+/// reconciler and peer bucket-meta ingestion never route through these
+/// handlers.
+async fn deny_replication_config_edit_for_non_owner<T>(req: &S3Request<T>) -> S3Result<()> {
+    if crate::storage::access::req_info_ref(req)?.is_owner {
+        return Ok(());
+    }
+    if site_replication_gate_enabled().await? {
+        return Err(replication_deny_edit_error());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -500,8 +564,10 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        deny_replication_config_edit_for_non_owner(&req).await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_replication(req).await
+        usecase.execute_delete_bucket_replication(req, site_peers, contract).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1353,8 +1419,10 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        deny_replication_config_edit_for_non_owner(&req).await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_replication(req).await
+        usecase.execute_put_bucket_replication(req, site_peers, contract).await
     }
 
     async fn put_bucket_request_payment(
@@ -1917,5 +1985,105 @@ impl S3 for FS {
         record_s3_op(S3Operation::UploadPartCopy);
         let usecase = s3_api::multipart_usecase_for(self);
         Box::pin(usecase.execute_upload_part_copy(req)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FS, SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
+    };
+    use crate::storage::access::ReqInfo;
+    use http::Method;
+    use http::StatusCode;
+    use s3s::dto::{DeleteBucketReplicationInput, PutBucketReplicationInput, ReplicationConfiguration};
+    use s3s::{S3, S3Error, S3ErrorCode, S3Request};
+    use std::sync::atomic::Ordering;
+
+    fn replication_config_edit_request<T>(input: T, is_owner: bool) -> S3Request<T> {
+        let mut req = S3Request {
+            input,
+            method: Method::PUT,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        req.extensions.insert(ReqInfo {
+            is_owner,
+            ..Default::default()
+        });
+        req
+    }
+
+    fn put_bucket_replication_input() -> PutBucketReplicationInput {
+        PutBucketReplicationInput {
+            bucket: "test-bucket".to_string(),
+            checksum_algorithm: None,
+            content_md5: None,
+            expected_bucket_owner: None,
+            replication_configuration: ReplicationConfiguration {
+                role: String::new(),
+                rules: Vec::new(),
+            },
+            token: None,
+        }
+    }
+
+    fn delete_bucket_replication_input() -> DeleteBucketReplicationInput {
+        DeleteBucketReplicationInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+        }
+    }
+
+    fn assert_replication_deny_edit(err: &S3Error) {
+        match err.code() {
+            S3ErrorCode::Custom(code) => assert_eq!(code, "XMinioReplicationDenyEdit"),
+            other => panic!("expected XMinioReplicationDenyEdit, got {other:?}"),
+        }
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    /// Single test on purpose: the branches share the process-wide gate
+    /// override, and parallel tests would race it.
+    #[tokio::test]
+    async fn replication_config_edit_gate_denies_only_non_owner_under_site_replication() {
+        let fs = FS::new();
+        SITE_REPLICATION_GATE_TEST_OVERRIDE.store(SITE_REPLICATION_GATE_FORCE_ENABLED, Ordering::SeqCst);
+
+        // Non-owner PUT/DELETE through the real S3 handlers: denied by the
+        // gate before the usecase (and thus the store) is ever touched.
+        let err = fs
+            .put_bucket_replication(replication_config_edit_request(put_bucket_replication_input(), false))
+            .await
+            .expect_err("non-owner PutBucketReplication must be denied while site replication is enabled");
+        assert_replication_deny_edit(&err);
+        let err = fs
+            .delete_bucket_replication(replication_config_edit_request(delete_bucket_replication_input(), false))
+            .await
+            .expect_err("non-owner DeleteBucketReplication must be denied while site replication is enabled");
+        assert_replication_deny_edit(&err);
+
+        // Owner passes the gate (the usecase's empty-rules structure error
+        // proves the request reached the usecase instead of the deny path).
+        let err = fs
+            .put_bucket_replication(replication_config_edit_request(put_bucket_replication_input(), true))
+            .await
+            .expect_err("owner request should pass the gate and fail later on config validation");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        // Without site replication the policy check alone still governs the edit.
+        SITE_REPLICATION_GATE_TEST_OVERRIDE.store(SITE_REPLICATION_GATE_FORCE_DISABLED, Ordering::SeqCst);
+        let err = fs
+            .put_bucket_replication(replication_config_edit_request(put_bucket_replication_input(), false))
+            .await
+            .expect_err("non-owner request should pass the gate and fail later on config validation");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        SITE_REPLICATION_GATE_TEST_OVERRIDE.store(0, Ordering::SeqCst);
     }
 }
