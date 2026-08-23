@@ -265,6 +265,13 @@ fn prepare_inputs(temp: &tempfile::TempDir, root_pem: &str) -> (std::path::PathB
     (root, token)
 }
 
+fn secure_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(".connect-registration-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .expect("temporary directory inside the protected checkout")
+}
+
 fn run_binary(endpoint: String, root: std::path::PathBuf, state: std::path::PathBuf, token: Vec<u8>) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustfs"))
         .args(["connect", "register", "--endpoint"])
@@ -289,7 +296,7 @@ fn run_binary(endpoint: String, root: std::path::PathBuf, state: std::path::Path
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_command_registers_once_and_emits_only_stable_identifiers() {
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = secure_tempdir();
     let state = temp.path().join("state");
     let server = server(&state, vec![Reply::Register]).await;
     let (root, _) = prepare_inputs(&temp, &server.root_pem);
@@ -324,9 +331,33 @@ async fn production_command_registers_once_and_emits_only_stable_identifiers() {
     assert_owner_only_files(&state);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_command_never_echoes_a_remote_reason() {
+    let temp = secure_tempdir();
+    let state = temp.path().join("state");
+    let server = server(&state, vec![Reply::Reject(StatusCode::BAD_REQUEST, TOKEN_SECRET)]).await;
+    let (root, _) = prepare_inputs(&temp, &server.root_pem);
+    let token = token_document(OffsetDateTime::now_utc().unix_timestamp() + 3600);
+    let output = tokio::task::spawn_blocking({
+        let endpoint = server.endpoint.clone();
+        let state = state.clone();
+        move || run_binary(endpoint, root, state, token)
+    })
+    .await
+    .expect("registration process task");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "[FATAL] Server runtime failed: Connect registration exchange failed\n"
+    );
+    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+}
+
 #[tokio::test]
 async fn response_loss_reuses_the_pending_request_and_existing_credential_is_idempotent() {
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = secure_tempdir();
     let state = temp.path().join("state");
     let server = server(
         &state,
@@ -372,7 +403,7 @@ async fn response_loss_reuses_the_pending_request_and_existing_credential_is_ide
 
 #[tokio::test]
 async fn concurrent_bootstraps_share_one_identity_and_one_exchange() {
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = secure_tempdir();
     let state = temp.path().join("state");
     let server = server(&state, vec![Reply::RegisterAfter(Duration::from_millis(150))]).await;
     let (root, token) = prepare_inputs(&temp, &server.root_pem);
@@ -388,7 +419,7 @@ async fn concurrent_bootstraps_share_one_identity_and_one_exchange() {
 
 #[tokio::test]
 async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized() {
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = secure_tempdir();
     let server = server(temp.path(), vec![Reply::Reject(StatusCode::BAD_REQUEST, "REGISTRATION_TOKEN_EXPIRED")]).await;
     let (root, token) = prepare_inputs(&temp, &server.root_pem);
 
@@ -396,7 +427,7 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
     let error = register_from_protected_input("http://localhost/agent/", &root, &http_state, Some(&token))
         .await
         .expect_err("HTTP endpoint must fail");
-    assert!(matches!(error, RegistrationBootstrapError::Client(_)));
+    assert!(matches!(error, RegistrationBootstrapError::Configuration));
     assert!(!http_state.exists());
 
     let malformed = temp.path().join("malformed-token.json");
@@ -414,9 +445,8 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
     let error = register_from_protected_input(&server.endpoint, &root, &rejected_state, Some(&expired))
         .await
         .expect_err("expired token must be refused by Connect");
-    let display = error.to_string();
-    assert!(display.contains("REGISTRATION_TOKEN_EXPIRED"));
-    assert!(!display.contains(TOKEN_SECRET));
+    assert!(matches!(&error, RegistrationBootstrapError::Exchange));
+    assert_eq!(error.to_string(), "Connect registration exchange failed");
     assert!(!rejected_state.join("credential/device.crt.json").exists());
     assert!(!rejected_state.join("credential/registration.pending.json").exists());
 
@@ -427,7 +457,7 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
     let error = register_from_protected_input(&server.endpoint, &wrong_root, &wrong_ca_state, Some(&token))
         .await
         .expect_err("wrong CA must fail TLS");
-    assert!(!error.to_string().contains(TOKEN_SECRET));
+    assert!(matches!(error, RegistrationBootstrapError::Exchange));
     assert!(!wrong_ca_state.join("credential/device.crt.json").exists());
 }
 
@@ -437,7 +467,7 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     let pki = TestPki::new();
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = secure_tempdir();
     let (root, token) = prepare_inputs(&temp, &pki.root_pem);
     let endpoint = "https://localhost:1/agent/";
 
@@ -450,24 +480,54 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token mode");
     let token_link = temp.path().join("token-link");
     symlink(&token, &token_link).expect("token symlink");
-    register_from_protected_input(endpoint, &root, &temp.path().join("token-link-state"), Some(&token_link))
+    let error = register_from_protected_input(endpoint, &root, &temp.path().join("token-link-state"), Some(&token_link))
         .await
         .expect_err("token symlink must fail");
+    assert!(matches!(error, RegistrationBootstrapError::TokenFileSecurity));
 
     let root_link = temp.path().join("root-link");
     symlink(&root, &root_link).expect("root symlink");
-    register_from_protected_input(endpoint, &root_link, &temp.path().join("root-link-state"), Some(&token))
+    let error = register_from_protected_input(endpoint, &root_link, &temp.path().join("root-link-state"), Some(&token))
         .await
         .expect_err("CA symlink must fail");
+    assert!(matches!(error, RegistrationBootstrapError::RootCaFileSecurity));
 
-    let state_target = temp.path().join("state-target");
-    fs::create_dir(&state_target).expect("state target");
-    let state_link = temp.path().join("state-link");
-    symlink(&state_target, &state_link).expect("state symlink");
-    let error = register_from_protected_input(endpoint, &root, &state_link, Some(&token))
+    let shared_state = temp.path().join("shared-state");
+    fs::create_dir(&shared_state).expect("shared state directory");
+    fs::set_permissions(&shared_state, fs::Permissions::from_mode(0o770)).expect("make state group-writable");
+    let error = register_from_protected_input(endpoint, &root, &shared_state, Some(&token))
         .await
-        .expect_err("state symlink must fail");
+        .expect_err("shared-writable state must fail");
     assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+
+    let shared_ancestor = temp.path().join("shared-ancestor");
+    fs::create_dir(&shared_ancestor).expect("shared ancestor directory");
+    fs::set_permissions(&shared_ancestor, fs::Permissions::from_mode(0o770)).expect("make ancestor group-writable");
+    let error = register_from_protected_input(endpoint, &root, &shared_ancestor.join("state"), Some(&token))
+        .await
+        .expect_err("shared-writable state ancestor must fail");
+    assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+
+    let ancestor_target = temp.path().join("ancestor-target");
+    fs::create_dir(&ancestor_target).expect("ancestor target");
+    let ancestor_link = temp.path().join("ancestor-link");
+    symlink(&ancestor_target, &ancestor_link).expect("ancestor symlink");
+    let error = register_from_protected_input(endpoint, &root, &ancestor_link.join("state"), Some(&token))
+        .await
+        .expect_err("state ancestor symlink must fail");
+    assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+
+    for nested in ["identity", "credential"] {
+        let state = temp.path().join(format!("nested-{nested}"));
+        fs::create_dir(&state).expect("state directory");
+        let target = temp.path().join(format!("{nested}-target"));
+        fs::create_dir(&target).expect("nested target");
+        symlink(&target, state.join(nested)).expect("nested store symlink");
+        let error = register_from_protected_input(endpoint, &root, &state, Some(&token))
+            .await
+            .expect_err("nested store symlink must fail");
+        assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+    }
 }
 
 fn assert_no_staging_files(root: &std::path::Path) {
@@ -500,11 +560,15 @@ fn assert_owner_only_files(state: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
     for path in [
+        state.to_path_buf(),
+        state.join("identity"),
+        state.join("credential"),
         state.join("identity/device.key"),
         state.join("credential/device.crt.json"),
         state.join("credential/.state.lock"),
     ] {
         let mode = fs::metadata(&path).expect("stored file metadata").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "unexpected mode for {}", path.display());
+        let expected = if path.is_dir() { 0o700 } else { 0o600 };
+        assert_eq!(mode, expected, "unexpected mode for {}", path.display());
     }
 }

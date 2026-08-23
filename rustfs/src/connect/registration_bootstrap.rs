@@ -17,7 +17,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{ClientError, ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken, TokenError};
+use super::{ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken, TokenError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -37,12 +37,12 @@ pub enum RegistrationBootstrapError {
     StateDirectorySecurity,
     #[error("failed to read protected Connect registration input")]
     Input(#[source] io::Error),
-    #[error("Connect returned a device outside the registration token's cluster scope")]
-    CredentialScope,
+    #[error("Connect registration configuration is invalid")]
+    Configuration,
+    #[error("Connect registration exchange failed")]
+    Exchange,
     #[error(transparent)]
     Token(#[from] TokenError),
-    #[error(transparent)]
-    Client(#[from] ClientError),
 }
 
 pub async fn register_from_protected_input(
@@ -56,13 +56,14 @@ pub async fn register_from_protected_input(
         endpoint,
         root_ca_pem: &root_ca_pem,
         timeout: REQUEST_TIMEOUT,
-    })?;
+    })
+    .map_err(|_| RegistrationBootstrapError::Configuration)?;
 
     let token = match token_file {
         Some(path) => RegistrationToken::from_reader(open_regular_file(path, true)?),
         None => RegistrationToken::from_reader(io::stdin().lock()),
     }?;
-    prepare_state_directory(state_directory)?;
+    let state_directory = prepare_state_directory(state_directory)?;
     let cluster_name = format!("organizations/{}/clusters/{}", token.organization_uid, token.cluster_uid);
     let credential = client
         .register(
@@ -70,9 +71,10 @@ pub async fn register_from_protected_input(
             &CredentialStore::new(state_directory.join("credential")),
             &token,
         )
-        .await?;
+        .await
+        .map_err(|_| RegistrationBootstrapError::Exchange)?;
     if credential.name != format!("{cluster_name}/clusterDevices/{}", credential.uid) {
-        return Err(RegistrationBootstrapError::CredentialScope);
+        return Err(RegistrationBootstrapError::Exchange);
     }
 
     Ok(RegistrationBootstrapResult {
@@ -81,24 +83,76 @@ pub async fn register_from_protected_input(
     })
 }
 
-fn prepare_state_directory(path: &Path) -> Result<(), RegistrationBootstrapError> {
+fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrapError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(RegistrationBootstrapError::Input)?.join(path)
+    };
+
+    let mut directories = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    directories.reverse();
+    for directory in &directories {
+        ensure_directory(directory, directory == &path)?;
+    }
+    for directory in [path.join("identity"), path.join("credential")] {
+        ensure_directory(&directory, true)?;
+    }
+    for directory in directories {
+        validate_directory(&directory, directory == path)?;
+    }
+    for directory in [path.join("identity"), path.join("credential")] {
+        validate_directory(&directory, true)?;
+    }
+
+    Ok(path)
+}
+
+fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(RegistrationBootstrapError::StateDirectorySecurity)
-        }
-        Ok(_) => Ok(()),
+        Ok(_) => validate_directory(path, require_process_owner),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt as _;
                 builder.mode(0o700);
             }
-            builder.create(path).map_err(RegistrationBootstrapError::Input)
+            match builder.create(path) {
+                Ok(()) => validate_directory(path, true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => validate_directory(path, require_process_owner),
+                Err(error) => Err(RegistrationBootstrapError::Input(error)),
+            }
         }
         Err(error) => Err(RegistrationBootstrapError::Input(error)),
     }
+}
+
+fn validate_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
+    let metadata = fs::symlink_metadata(path).map_err(RegistrationBootstrapError::Input)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RegistrationBootstrapError::StateDirectorySecurity);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let process_uid = process_uid();
+        let owner_is_trusted = metadata.uid() == process_uid || (!require_process_owner && metadata.uid() == 0);
+        let mode = metadata.permissions().mode() & 0o777;
+        if !owner_is_trusted || mode & 0o022 != 0 {
+            return Err(RegistrationBootstrapError::StateDirectorySecurity);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_process_owner;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_uid() -> u32 {
+    // SAFETY: geteuid has no pointer arguments or caller preconditions.
+    unsafe { libc::geteuid() }
 }
 
 fn read_regular_file(path: &Path, owner_only: bool) -> Result<Vec<u8>, RegistrationBootstrapError> {
@@ -116,6 +170,10 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
             RegistrationBootstrapError::RootCaFileSecurity
         }
     };
+    #[cfg(not(unix))]
+    if owner_only {
+        return Err(RegistrationBootstrapError::TokenFileSecurity);
+    }
     let initial = fs::symlink_metadata(path).map_err(RegistrationBootstrapError::Input)?;
     if initial.file_type().is_symlink() || !initial.is_file() {
         return Err(insecure());
@@ -135,10 +193,10 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
     }
     #[cfg(unix)]
     if owner_only {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let mode = metadata.permissions().mode() & 0o777;
-        if mode & 0o400 == 0 || mode & 0o177 != 0 {
+        if metadata.uid() != process_uid() || mode & 0o400 == 0 || mode & 0o177 != 0 {
             return Err(RegistrationBootstrapError::TokenFileSecurity);
         }
     }
