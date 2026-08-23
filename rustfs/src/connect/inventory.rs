@@ -363,7 +363,39 @@ pub(crate) struct InventoryStateStore {
     #[cfg(unix)]
     directory: Arc<fs::File>,
     #[cfg(unix)]
-    state_root: Arc<fs::File>,
+    state_root: Arc<StateRootAnchor>,
+}
+
+#[cfg(unix)]
+struct StateRootAnchor {
+    root: fs::File,
+    components: Vec<(std::ffi::OsString, fs::File)>,
+}
+
+#[cfg(unix)]
+impl StateRootAnchor {
+    fn state_root(&self) -> Result<&fs::File, InventoryError> {
+        self.components
+            .last()
+            .map(|(_, directory)| directory)
+            .ok_or(InventoryError::StatePath)
+    }
+
+    fn validate(&self) -> Result<(), InventoryError> {
+        validate_directory(&self.root, false)?;
+        let mut current = None;
+        for (index, (component, expected)) in self.components.iter().enumerate() {
+            let parent = current.as_ref().unwrap_or(&self.root);
+            let resolved = open_directory_component_at(parent, component)?;
+            let dedicated = index + 1 == self.components.len();
+            validate_directory(&resolved, dedicated)?;
+            if file_identity(expected)? != file_identity(&resolved)? {
+                return Err(InventoryError::PersistenceSecurity);
+            }
+            current = Some(resolved);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -493,9 +525,10 @@ impl InventoryStateStore {
 
     #[cfg(unix)]
     fn validate_anchor(&self) -> Result<(), InventoryError> {
-        validate_directory(&self.state_root, true)?;
+        self.state_root.validate()?;
+        let state_root = self.state_root.state_root()?;
         validate_directory(&self.directory, true)?;
-        let current = open_directory_at(&self.state_root, "inventory")?;
+        let current = open_directory_at(state_root, "inventory")?;
         validate_directory(&current, true)?;
         if file_identity(&self.directory)? != file_identity(&current)? {
             return Err(InventoryError::PersistenceSecurity);
@@ -750,8 +783,8 @@ fn read_bounded(file: &mut fs::File) -> Result<Vec<u8>, InventoryError> {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn open_inventory_directory(path: &Path) -> Result<(fs::File, fs::File), InventoryError> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+fn open_inventory_directory(path: &Path) -> Result<(StateRootAnchor, fs::File), InventoryError> {
+    use std::os::fd::AsRawFd as _;
     use std::path::Component;
 
     let absolute = if path.is_absolute() {
@@ -759,39 +792,37 @@ fn open_inventory_directory(path: &Path) -> Result<(fs::File, fs::File), Invento
     } else {
         std::env::current_dir().map_err(|_| InventoryError::StateIo)?.join(path)
     };
-    let mut directory = fs::File::open("/").map_err(|_| InventoryError::StateIo)?;
-    validate_directory(&directory, false)?;
+    let root = fs::File::open("/").map_err(|_| InventoryError::StateIo)?;
+    validate_directory(&root, false)?;
     let components = absolute.components().collect::<Vec<_>>();
     let names = components
         .iter()
         .filter_map(|component| match component {
-            Component::Normal(name) => Some(*name),
+            Component::Normal(name) => Some(name.to_os_string()),
             Component::RootDir => None,
-            _ => Some(std::ffi::OsStr::new("")),
+            _ => Some(std::ffi::OsString::new()),
         })
         .collect::<Vec<_>>();
     if names.iter().any(|name| name.is_empty()) || names.is_empty() {
         return Err(InventoryError::StatePath);
     }
-    for (index, name) in names.iter().enumerate() {
-        use std::os::unix::ffi::OsStrExt as _;
-        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| InventoryError::StatePath)?;
-        // SAFETY: the parent descriptor and C string are valid for this call; ownership of a successful descriptor is transferred.
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-            )
-        };
-        if fd < 0 {
-            return Err(InventoryError::PersistenceSecurity);
-        }
-        // SAFETY: openat returned a new owned descriptor.
-        directory = unsafe { fs::File::from_raw_fd(fd) };
-        validate_directory(&directory, index + 1 == names.len())?;
+    let component_count = names.len();
+    let mut state_root = StateRootAnchor {
+        root,
+        components: Vec::with_capacity(component_count),
+    };
+    for (index, name) in names.into_iter().enumerate() {
+        let parent = state_root
+            .components
+            .last()
+            .map(|(_, directory)| directory)
+            .unwrap_or(&state_root.root);
+        let directory = open_directory_component_at(parent, &name)?;
+        validate_directory(&directory, index + 1 == component_count)?;
+        state_root.components.push((name, directory));
     }
 
+    let directory = state_root.state_root()?;
     let inventory = c_name("inventory")?;
     // SAFETY: descriptor and C string are valid; mode is applied only if the directory is created.
     if unsafe { libc::mkdirat(directory.as_raw_fd(), inventory.as_ptr(), 0o700) } != 0 {
@@ -800,10 +831,10 @@ fn open_inventory_directory(path: &Path) -> Result<(fs::File, fs::File), Invento
             return Err(InventoryError::StateIo);
         }
     }
-    let child = open_directory_at(&directory, "inventory")?;
+    let child = open_directory_at(directory, "inventory")?;
     validate_directory(&child, true)?;
-    sync_inventory_anchor(&child, &directory)?;
-    Ok((directory, child))
+    sync_inventory_anchor(&child, directory)?;
+    Ok((state_root, child))
 }
 
 #[cfg(unix)]
@@ -824,10 +855,16 @@ fn sync_inventory_anchor_with(mut sync: impl FnMut(bool) -> io::Result<()>) -> R
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn open_directory_at(parent: &fs::File, name: &str) -> Result<fs::File, InventoryError> {
+    open_directory_component_at(parent, std::ffi::OsStr::new(name))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_directory_component_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<fs::File, InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    let name = c_name(name)?;
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| InventoryError::StatePath)?;
     // SAFETY: the parent descriptor and C string are valid; ownership of a successful descriptor is transferred.
     let fd = unsafe {
         libc::openat(
@@ -867,7 +904,7 @@ fn unix_directory_is_trusted(owner: u32, mode: u32, process: u32, dedicated: boo
 fn open_file_at(directory: &fs::File, name: &str, create: bool, write: bool) -> Result<fs::File, InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     let name = c_name(name)?;
-    let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     flags |= if write { libc::O_RDWR } else { libc::O_RDONLY };
     if create {
         flags |= libc::O_CREAT;
@@ -1061,6 +1098,16 @@ mod tests {
         tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory")
     }
 
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: the path is a valid C string and mkfifo does not retain it.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), FILE_MODE as libc::mode_t) }, 0, "create FIFO");
+    }
+
     fn snapshot() -> InventorySnapshot {
         InventorySnapshot::new("1.2.3", None, 2, 4, 1_000, 400, [InventoryFlag::DriveOffline]).expect("snapshot")
     }
@@ -1209,6 +1256,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn fifo_children_are_rejected_without_blocking_readers_or_writers() {
+        let latest_temp = safe_tempdir();
+        let latest_store = InventoryStateStore::from_state_root(latest_temp.path()).expect("latest store");
+        let latest = latest_temp.path().join("inventory/latest.json");
+        make_fifo(&latest);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T01:02:03Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        assert!(matches!(latest_store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
+        assert!(matches!(
+            latest_store.publish_latest_sync(
+                snapshot(),
+                "2026-08-23T01:02:03Z".to_owned(),
+                &tokio_util::sync::CancellationToken::new()
+            ),
+            Err(InventoryError::PersistenceSecurity)
+        ));
+
+        let state_temp = safe_tempdir();
+        let state_store = InventoryStateStore::from_state_root(state_temp.path()).expect("state store");
+        let state = state_temp.path().join("inventory/state.json");
+        make_fifo(&state);
+        assert!(matches!(state_store.read(), Err(InventoryError::PersistenceSecurity)));
+        assert!(matches!(
+            state_store.write(&InventoryState::default()),
+            Err(InventoryError::PersistenceSecurity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reader_rejects_insecure_file_modes_and_hardlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
@@ -1332,6 +1410,45 @@ mod tests {
             Err(InventoryError::PersistenceSecurity)
         ));
         assert!(!temp.path().join("inventory/latest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_root_and_ancestor_exchanges_are_rejected_by_the_path_anchor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for exchange_ancestor in [false, true] {
+            let temp = safe_tempdir();
+            let ancestor = temp.path().join("anchor");
+            let state_root = ancestor.join("state");
+            fs::create_dir_all(&state_root).expect("state root");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).expect("ancestor mode");
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("state mode");
+            let store = InventoryStateStore::from_state_root(&state_root).expect("store");
+            store
+                .publish_latest_sync(snapshot(), "2026-08-23T01:02:03Z".to_owned(), &tokio_util::sync::CancellationToken::new())
+                .expect("publish");
+
+            let exchanged = if exchange_ancestor { &ancestor } else { &state_root };
+            fs::rename(exchanged, temp.path().join("original")).expect("exchange original directory");
+            fs::create_dir_all(&state_root).expect("replacement state root");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).expect("replacement ancestor mode");
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("replacement state mode");
+
+            let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T01:02:03Z")
+                .expect("time")
+                .with_timezone(&chrono::Utc);
+            assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
+            assert!(matches!(
+                store.publish_latest_sync(
+                    snapshot(),
+                    "2026-08-23T02:02:03Z".to_owned(),
+                    &tokio_util::sync::CancellationToken::new()
+                ),
+                Err(InventoryError::PersistenceSecurity)
+            ));
+            assert!(!state_root.join("inventory/latest.json").exists());
+        }
     }
 
     #[cfg(unix)]
