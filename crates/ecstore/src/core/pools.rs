@@ -3388,6 +3388,7 @@ impl ECStore {
         is_decommission_cancel_requested(rx.is_cancelled(), pool_meta.pools.get(idx))
     }
 
+    #[cfg(test)]
     async fn cancel_decommission_routines_and_wait(&self, indices: &[usize]) {
         self.cancel_decommission_routines(indices).await;
         let movement_gate = self.ctx.data_movement_operation_gate();
@@ -3401,11 +3402,6 @@ impl ECStore {
                 take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), *idx);
             }
         }
-    }
-
-    async fn wait_for_decommission_side_effects(&self) {
-        let operation_gate = self.ctx.data_movement_operation_gate();
-        let _operation_guard = operation_gate.write().await;
     }
 
     async fn reserve_decommission_routines(

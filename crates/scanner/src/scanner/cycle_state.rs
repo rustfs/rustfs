@@ -13,7 +13,6 @@
 // limitations under the License.
 /// Scanner cycle-state codec, persisted usage floors, and cycle-state persistence.
 use super::*;
-use crate::ScannerConfigObjectDelete as _;
 use crate::ScannerGetObjectReader;
 use crate::data_usage_define::DATA_USAGE_BLOOM_RECOVERY_PATH;
 use crate::storage_api::owner::ObjectIO as _;
@@ -626,6 +625,16 @@ pub(crate) async fn load_scanner_cycle_state_for_startup(
             return ScannerCycleStateStartup::Transient(ScannerError::Other(format!(
                 "failed to read scanner cycle recovery marker: {err}"
             )));
+        }
+        Err(CycleRecoveryMarkerReadError::PublicationBlocked) => {
+            set_scanner_cycle_recovery_status(recovery_status(
+                "transient",
+                Some("cycle recovery marker publication is blocked by data movement"),
+                true,
+            ));
+            return ScannerCycleStateStartup::Transient(ScannerError::Other(
+                "cycle recovery marker publication is blocked by data movement".to_string(),
+            ));
         }
         Err(CycleRecoveryMarkerReadError::Invalid(reason)) => {
             set_scanner_cycle_recovery_status(recovery_status("recovery-required", Some(reason), false));

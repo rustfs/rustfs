@@ -13,7 +13,6 @@
 // limitations under the License.
 /// Leader-lock claiming, usage-epoch fencing, and lock-loss handling.
 use super::*;
-use crate::ScannerConfigObjectDelete as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerLeadershipClaimReconcile {
@@ -103,14 +102,6 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
     // snapshot. Leadership fencing may proceed without creating a plausible
     // default; the first authoritative scanner publication will create it.
     Ok(None)
-}
-
-pub(super) async fn fence_scanner_usage_epoch(
-    ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    claimed_epoch: u64,
-) -> Result<(), ScannerError> {
-    fence_scanner_usage_epoch_with_expected_epoch(ctx, storeapi, claimed_epoch, None).await
 }
 
 pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(

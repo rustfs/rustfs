@@ -455,13 +455,6 @@ impl ObservedDataUsageSnapshotCleanup for ECStore {
     }
 }
 
-async fn cleanup_observed_data_usage_after_authoritative_save<S>(store: &S, authoritative: &DataUsageInfo)
-where
-    S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
-{
-    cleanup_observed_data_usage_after_authoritative_save_with_publication(store, authoritative, None).await;
-}
-
 async fn cleanup_observed_data_usage_after_authoritative_save_with_publication<S>(
     store: &S,
     authoritative: &DataUsageInfo,
@@ -519,6 +512,14 @@ async fn cleanup_observed_data_usage_after_authoritative_save_with_publication<S
         }
     }
     drop(publication_guard);
+}
+
+#[cfg(test)]
+async fn cleanup_observed_data_usage_after_authoritative_save<S>(store: &S, authoritative: &DataUsageInfo)
+where
+    S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
+{
+    cleanup_observed_data_usage_after_authoritative_save_with_publication(store, authoritative, None).await;
 }
 
 fn set_buckets_count_from_usage(data_usage_info: &mut DataUsageInfo) {
@@ -582,6 +583,7 @@ pub(crate) async fn prepare_bucket_usage_for_namespace_change(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn remove_bucket_usage_from_backend_with_guard<S>(
     store: &S,
     bucket: &str,
@@ -675,6 +677,7 @@ fn ensure_bucket_namespace_guard(
     Ok(())
 }
 
+#[cfg(test)]
 async fn remove_bucket_usage_from_backend_with_store_and_guard<S>(
     store: &S,
     bucket: &str,
@@ -800,6 +803,7 @@ where
     Ok(DataUsageInfo::default())
 }
 
+#[cfg(test)]
 async fn remove_bucket_usage_from_object_with_retries<S>(
     store: &S,
     object: &str,

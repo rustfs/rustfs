@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::*;
-use crate::ScannerConfigObjectDelete as _;
 use std::sync::Arc;
 
 #[derive(Debug)]

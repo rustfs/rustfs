@@ -13,7 +13,6 @@
 // limitations under the License.
 /// The background-heal info object persisted between scanner cycles.
 use super::*;
-use crate::ScannerConfigObjectDelete as _;
 
 /// Background healing information
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

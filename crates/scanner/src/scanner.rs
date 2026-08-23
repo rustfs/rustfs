@@ -18,6 +18,10 @@ use std::future::Future;
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use self::heal_info::{
+    BackgroundHealInfoReadStatus, classify_background_heal_read_error, decode_background_heal_info,
+    read_background_heal_info_with_epoch, save_background_heal_info_for_epoch,
+};
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
     DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
@@ -68,12 +72,11 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, delete_config_with_publication_admission,
-    delete_config_with_publication_admission_for_epoch, get_lifecycle_config, get_replication_config,
-    invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
+    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
     replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
-    save_config_with_publication_admission, save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd,
-    scanner_publication_admission_for_epoch, scanner_publication_epoch, scanner_publication_epoch_changed,
+    save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd, scanner_publication_admission_for_epoch,
+    scanner_publication_epoch, scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";

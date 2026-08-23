@@ -114,7 +114,7 @@ pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_basel
 pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe<F, Fut>(
     ctx: CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    receiver: mpsc::Receiver<DataUsageInfo>,
     leader_epoch: Option<u64>,
     initial_baseline: Option<DataUsagePersistBaseline>,
     route_probe: F,
@@ -631,13 +631,6 @@ where
     }
 
     outcome
-}
-
-pub(super) async fn cleanup_observed_data_usage_snapshot(
-    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    authoritative: &DataUsageInfo,
-) -> bool {
-    cleanup_observed_data_usage_snapshot_for_epoch(storeapi, authoritative, None).await
 }
 
 pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(

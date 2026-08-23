@@ -511,24 +511,6 @@ where
     .await
 }
 
-/// Save one scanner-owned metadata object only while storage-owned movement
-/// admission is held. Callers should perform reads and encoding before calling
-/// this helper so the fence covers only the final conditional write.
-pub(crate) async fn save_config_with_publication_admission<S>(
-    api: Arc<S>,
-    file: &str,
-    data: Vec<u8>,
-    preconditions: HTTPPreconditions,
-) -> EcstoreResult<ScannerObjectInfo>
-where
-    S: ScannerObjectIO + ScannerConfigObjectDelete,
-{
-    let Some(_admission) = api.scanner_data_usage_publication_admission().await else {
-        return Err(EcstoreError::other("scanner publication admission is unavailable"));
-    };
-    save_config_with_preconditions(api, file, data, preconditions).await
-}
-
 pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
     api: Arc<S>,
     file: &str,
@@ -552,21 +534,6 @@ pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
         error,
         EcstoreError::Io(io_error) if io_error.to_string() == SCANNER_PUBLICATION_EPOCH_CHANGED
     )
-}
-
-pub(crate) async fn delete_config_with_publication_admission<S>(
-    api: Arc<S>,
-    bucket: &str,
-    object: &str,
-    opts: ScannerObjectOptions,
-) -> EcstoreResult<ScannerObjectInfo>
-where
-    S: ScannerObjectIO + ScannerConfigObjectDelete,
-{
-    let Some(_admission) = api.scanner_data_usage_publication_admission().await else {
-        return Err(EcstoreError::other("scanner publication admission is unavailable"));
-    };
-    api.delete_config_object(bucket, object, opts).await
 }
 
 pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
