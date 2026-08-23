@@ -76,6 +76,15 @@ cat >"$FAKE_WARP" <<'EOF'
 set -euo pipefail
 [[ " $* " == *" --analyze.v "* ]]
 [[ " $* " == *" --no-color "* ]]
+if [[ "${FAKE_WARP_ZERO_LATENCY:-0}" == "1" ]]; then
+  cat <<'LOG'
+Operation: GET. Concurrency: 8. Ran: 7s
+Requests considered: 1000:
+ * Average: 160.00 MiB/s, 40960.00 obj/s
+ * Avg: 0s, 50%: 0s, 90%: 0s, 99%: 0s, Fastest: 0s, Slowest: 1ms, StdDev: 0s
+LOG
+  exit 0
+fi
 cat <<'LOG'
  -       PUT Average: 161 Obj/s, 5.0MiB/s; Current 161 Obj/s, 5.0MiB/s.
 Operation: GET. Concurrency: 64. Ran: 7s
@@ -163,5 +172,29 @@ awk -F',' '
   }
   END { exit found ? 0 : 1 }
 ' "${TMP_DIR}/fake-warp-candidate/baseline_compare.csv"
+
+for leg in baseline candidate; do
+  zero_args=(
+    --tool warp
+    --endpoint http://127.0.0.1:9000
+    --access-key test-access
+    --secret-key test-secret
+    --sizes 4KiB
+    --rounds 1
+    --retry-per-round 1
+    --cooldown-secs 0
+    --duration 1s
+    --out-dir "${TMP_DIR}/fake-warp-zero-${leg}"
+    --warp-bin "$FAKE_WARP"
+  )
+  if [[ "$leg" == "candidate" ]]; then
+    zero_args+=(--baseline-csv "${TMP_DIR}/fake-warp-zero-baseline/median_summary.csv")
+  fi
+  FAKE_WARP_ZERO_LATENCY=1 "$RUNNER" "${zero_args[@]}" >/dev/null 2>&1
+done
+
+"${SCRIPT_DIR}/hotpath_warp_ab_gate.sh" \
+  --compare-csv "${TMP_DIR}/fake-warp-zero-candidate/baseline_compare.csv" \
+  --require-tail-error >/dev/null
 
 echo "object batch benchmark enhanced tests passed"

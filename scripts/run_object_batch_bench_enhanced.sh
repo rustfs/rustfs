@@ -1322,10 +1322,21 @@ compare_baseline() {
 
       dr="N/A"; dl="N/A"; dt="N/A"; dp90="N/A"; dp99="N/A"; ne="N/A"; be="N/A"; de="N/A"
       if (br!="N/A" && n_req!="N/A" && br+0!=0) dr=sprintf("%.2f", ((n_req-br)/br)*100)
-      if (bl!="N/A" && n_lat!="N/A" && bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+      if (bl!="N/A" && n_lat!="N/A") {
+        if (bl+0!=0) dl=sprintf("%.2f", ((n_lat-bl)/bl)*100)
+        else if (n_lat+0==0) dl="0.00"
+      }
       if (bt!="N/A" && n_thr!="N/A" && bt+0!=0) dt=sprintf("%.2f", ((n_thr-bt)/bt)*100)
-      if (bp90!="N/A" && n_p90!="N/A" && bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
-      if (bp99!="N/A" && n_p99!="N/A" && bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+      # Warp v1 rounds sub-millisecond latency to 0s. Two zero readings are
+      # the same below-resolution bucket; a nonzero candidate remains invalid.
+      if (bp90!="N/A" && n_p90!="N/A") {
+        if (bp90+0!=0) dp90=sprintf("%.2f", ((n_p90-bp90)/bp90)*100)
+        else if (n_p90+0==0) dp90="0.00"
+      }
+      if (bp99!="N/A" && n_p99!="N/A") {
+        if (bp99+0!=0) dp99=sprintf("%.2f", ((n_p99-bp99)/bp99)*100)
+        else if (n_p99+0==0) dp99="0.00"
+      }
       if (n_ok!="N/A" && n_fail!="N/A" && n_ok+n_fail>0) ne=sprintf("%.2f", (n_fail/(n_ok+n_fail))*100)
       if (bok!="N/A" && bfail!="N/A" && bok+bfail>0) be=sprintf("%.2f", (bfail/(bok+bfail))*100)
       if (ne!="N/A" && be!="N/A") de=sprintf("%.2f", ne-be)
