@@ -1412,8 +1412,11 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
 
     // Reservation won: this sighting owns the repair records for the object,
     // including the durable journal intent when the caller asked for one.
-    if let Some((kind, version_uuid)) = mrf_intent {
-        rustfs_common::mrf_channel::try_send_mrf_intent(kind, bucket, object, version_uuid);
+    if let Some((kind, version_uuid)) = mrf_intent
+        && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(pool_index), u32::try_from(set_index))
+    {
+        let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+        let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
     }
 
     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(

@@ -50,11 +50,12 @@ pub(super) enum CorruptMetadataRecording {
     ImmediateAndLedger,
 }
 
-pub(super) fn corrupt_metadata_recording(mrf_accepted: bool) -> CorruptMetadataRecording {
-    if mrf_accepted {
-        CorruptMetadataRecording::LedgerOnly
-    } else {
-        CorruptMetadataRecording::ImmediateAndLedger
+pub(super) fn corrupt_metadata_recording(result: rustfs_common::mrf_channel::MrfIngressResult) -> CorruptMetadataRecording {
+    match result {
+        rustfs_common::mrf_channel::MrfIngressResult::Enqueued | rustfs_common::mrf_channel::MrfIngressResult::Coalesced => {
+            CorruptMetadataRecording::LedgerOnly
+        }
+        rustfs_common::mrf_channel::MrfIngressResult::Dropped(_) => CorruptMetadataRecording::ImmediateAndLedger,
     }
 }
 

@@ -1375,13 +1375,14 @@ impl FolderScanner {
                             // Single-flight (backlog#1894 axis A) — the
                             // recording mode and its guarantees are pinned by
                             // corrupt_metadata_recording below.
-                            let mrf_accepted = rustfs_common::mrf_channel::try_send_mrf_intent(
+                            let mrf_result = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
                                 rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
                                 &item.bucket,
                                 &object,
                                 None,
+                                None,
                             );
-                            match corrupt_metadata_recording(mrf_accepted) {
+                            match corrupt_metadata_recording(mrf_result) {
                                 CorruptMetadataRecording::LedgerOnly => {
                                     // Recorded as Full (retry-later): admission
                                     // for this target happens in the MRF
