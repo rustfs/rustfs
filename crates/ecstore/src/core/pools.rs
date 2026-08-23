@@ -99,10 +99,15 @@ const DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD: usize = 1000;
 const DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF: Duration = Duration::seconds(1);
 const DECOMMISSION_BUCKET_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY";
 const DECOMMISSION_BUCKET_CONCURRENCY_DEFAULT_CAP: usize = 4;
+const DECOMMISSION_ENTRY_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY";
+const DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP: usize = 8;
+const DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP: usize = 64;
+const DECOMMISSION_ENTRY_WORKERS_PER_SET: usize = 2;
 const DECOMMISSION_META_PREFIXES: [&str; 3] = [CONFIG_PREFIX, BUCKET_META_PREFIX, ILM_META_PREFIX];
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
 const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
 const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v2";
@@ -3595,24 +3600,47 @@ impl ECStore {
         Ok(())
     }
 
-    async fn promote_queued_decommission(&self, idx: usize) -> Result<()> {
-        let (changed, previous_pool_meta) = {
+    async fn promote_queued_decommission(&self, idx: usize, owner: &DecommissionCanceler) -> Result<OffsetDateTime> {
+        let (changed, generation, save_error) = {
+            let _start_guard = self.start_gate.lock().await;
             let mut pool_meta = self.pool_meta.write().await;
-            let previous_pool_meta = pool_meta.clone();
+            if pool_meta.pools.get(idx).is_none() {
+                return Err(Error::other("failed to start decommission: target pool was not found"));
+            }
             let reconciled = reconcile_decommission_meta_buckets(&mut pool_meta, idx);
             let promoted = pool_meta.promote_queued_decommission(idx);
-            (reconciled || promoted, previous_pool_meta)
+            let changed = reconciled || promoted;
+            drop(pool_meta);
+
+            let save_error = if changed {
+                self.save_current_pool_meta().await.err()
+            } else {
+                None
+            };
+            let generation = self.active_decommission_generation(idx).await?;
+            (changed, generation, save_error)
         };
 
-        if changed {
-            if let Err(err) = self.save_current_pool_meta().await {
-                let mut pool_meta = self.pool_meta.write().await;
-                rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
+        if let Some(err) = save_error {
+            resolve_decommission_terminal_mark_after_error_result(
+                self.decommission_failed_for_operation(idx, owner).await,
+                idx,
+                &err,
+            )?;
+            return Err(err);
+        }
+
+        if changed && let Some(notification_sys) = runtime_sources::notification_sys() {
+            let stage = format!("promote_queued_decommission for pool {idx}");
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            {
+                resolve_decommission_terminal_mark_after_error_result(
+                    self.decommission_failed_for_operation(idx, owner).await,
+                    idx,
+                    &err,
+                )?;
                 return Err(err);
-            }
-            if let Some(notification_sys) = runtime_sources::notification_sys() {
-                let stage = format!("promote_queued_decommission for pool {idx}");
-                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
             }
         }
 
@@ -3621,7 +3649,8 @@ impl ECStore {
 
     #[cfg(test)]
     pub(crate) async fn promote_queued_decommission_for_test(&self, idx: usize) -> Result<()> {
-        self.promote_queued_decommission(idx).await
+        let owner = DecommissionCanceler::new(CancellationToken::new());
+        self.promote_queued_decommission(idx, &owner).await.map(|_| ())
     }
 
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
@@ -5006,8 +5035,12 @@ impl ECStore {
                     state = "marking_completed",
                     "Decommission marking completed state"
                 );
-                if let Err(err) = self.complete_decommission(idx).await {
-                    resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
+                if let Err(err) = self.complete_decommission_for_operation(idx, canceler).await {
+                    resolve_decommission_terminal_mark_result(
+                        self.decommission_failed_for_operation(idx, canceler).await,
+                        "failed",
+                        &cmd_line,
+                    )?;
                     return Err(Error::other(format!("failed to finalize decommission for pool {cmd_line}: {err}")));
                 }
             }
@@ -5142,20 +5175,48 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn complete_decommission(&self, idx: usize) -> Result<()> {
+        self.complete_decommission_with_owner(idx, None).await
+    }
+
+    async fn complete_decommission_for_operation(&self, idx: usize, owner: &DecommissionCanceler) -> Result<()> {
+        self.complete_decommission_with_owner(idx, Some(owner)).await
+    }
+
+    async fn complete_decommission_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
         ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
+        if let Some(owner) = owner {
+            let cancelers = self.decommission_cancelers.read().await;
+            if !decommission_canceler_is_owned_by(cancelers.as_slice(), idx, owner) {
+                owner.release();
+                return Ok(());
+            }
+        }
         self.verify_decommission_durable_ilm_receipts(idx).await?;
+        let _start_guard = self.start_gate.lock().await;
 
-        let (should_reload_pool_meta, completed, previous_pool_meta) = {
+        let (should_reload_pool_meta, completed, previous_pool_meta, terminal_canceler) = {
+            let cancelers = self.decommission_cancelers.read().await;
             let mut pool_meta = self.pool_meta.write().await;
             let previous_pool_meta = pool_meta.clone();
-            let changed = pool_meta.decommission_complete(idx);
+            let Some(changed) =
+                update_decommission_for_operation(cancelers.as_slice(), &mut pool_meta, idx, owner, |pool_meta| {
+                    pool_meta.decommission_complete(idx)
+                })
+            else {
+                return Ok(());
+            };
             let completed = pool_meta
                 .pools
                 .get(idx)
                 .and_then(|pool| pool.decommission.as_ref())
                 .is_some_and(|decommission| decommission.complete);
-            (changed, completed, changed.then_some(previous_pool_meta))
+            let terminal_canceler = if let Some(owner) = owner {
+                Some(owner.clone())
+            } else {
+                cancelers.get(idx).and_then(Option::as_ref).cloned()
+            };
+            (changed, completed, changed.then_some(previous_pool_meta), terminal_canceler)
         };
 
         if should_reload_pool_meta && let Err(err) = self.save_current_pool_meta().await {
@@ -7729,25 +7790,30 @@ mod pools_tests {
     use super::resolve_decommission_listing_error;
     use super::resolve_decommission_partial_listing_entry;
     use super::{
-        DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_META_PREFIXES, DECOMMISSION_PROGRESS_SAVE_INTERVAL,
-        DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionDurableIlmReceipt, DecommissionStartPoolState,
-        DecommissionTerminalState, ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
-        apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
-        cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
-        decommission_durable_ilm_receipt_run_token, decommission_item_size, decommission_meta_bucket_options,
-        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
-        ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
-        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
-        ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
-        ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_start_target_capacity,
-        ensure_decommission_terminal_operation_supported, ensure_local_decommission_pool_leaders,
-        ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices, get_by_index,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
-        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
-        merge_decommission_durable_ilm_receipts, merge_pool_status_refresh, missing_decommission_worker_prefix,
-        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, reconcile_decommission_meta_buckets,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP,
+        DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP, DECOMMISSION_ENTRY_QUEUE_HARD_CAP, DECOMMISSION_META_PREFIXES,
+        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionCanceler,
+        DecommissionDurableIlmReceipt, DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState,
+        ListCallback, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, QueuedDecommissionEntry,
+        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
+        bind_missing_decommission_cancelers, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
+        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
+        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
+        decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
+        decommission_meta_bucket_options, decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
+        default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
+        ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_generation,
+        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
+        ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
+        ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
+        get_by_index, guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_requested, load_decommission_entry_versions, local_decommission_queue_prefix,
+        mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts, merge_pool_status_refresh,
+        missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
+        reconcile_decommission_meta_buckets, require_decommission_store, reserve_decommission_start_cancelers,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
         resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
@@ -7755,14 +7821,15 @@ mod pools_tests {
         resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result,
         resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
         resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
-        run_decommission_buckets_bounded, run_decommission_listing_with_retry, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
-        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
-        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
-        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_listing_retry,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        run_decommission_buckets_bounded, run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain,
+        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
+        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
+        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
+        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
+        validate_start_decommission_request, wait_decommission_listing_retry, wait_decommission_worker_drain,
+        with_decommission_entry_context,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,

@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::bucket::lifecycle::bucket_lifecycle_ops::encode_manual_transition_continuation_token;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
 };

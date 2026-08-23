@@ -3803,7 +3803,10 @@ struct ManualTransitionContinuationToken {
     version_marker: Option<String>,
 }
 
-fn encode_manual_transition_continuation_token(marker: Option<String>, version_marker: Option<String>) -> Option<String> {
+pub(super) fn encode_manual_transition_continuation_token(
+    marker: Option<String>,
+    version_marker: Option<String>,
+) -> Option<String> {
     if marker.is_none() && version_marker.is_none() {
         return None;
     }
