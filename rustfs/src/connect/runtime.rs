@@ -199,6 +199,15 @@ where
                 Ok(None) => {
                     let snapshot = match cancellable(&task_shutdown, sample()).await {
                         Some(Ok(snapshot)) => snapshot,
+                        Some(Err(InventoryError::SnapshotIncomplete { .. })) => {
+                            let delay = backoff;
+                            backoff = backoff.saturating_mul(2).min(retry_schedule.max_backoff);
+                            let _ = status_tx.send(InventoryStatus::BackingOff { delay });
+                            if sleep_or_cancel(&task_shutdown, delay).await {
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Err(error)) => return failed_inventory(&status_tx, error),
                         None => break,
                     };

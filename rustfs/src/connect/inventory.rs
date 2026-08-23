@@ -550,6 +550,8 @@ pub enum InventoryError {
     DriveCount,
     #[error("the RustFS inventory capacity is outside protocol bounds")]
     Capacity,
+    #[error("the RustFS inventory snapshot is incomplete: observed {observed} of {expected} configured drives")]
+    SnapshotIncomplete { expected: usize, observed: usize },
     #[error("the Connect inventory schedule is invalid")]
     Schedule,
     #[error("the Connect inventory sequence is exhausted")]

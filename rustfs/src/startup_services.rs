@@ -17,7 +17,7 @@ use crate::storage_api::startup::services::{ECStore, EndpointServerPools, Server
 use crate::{
     config::Config,
     connect::{
-        CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, InventoryFlag, InventoryRuntime, InventorySchedule,
+        CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime, InventorySchedule,
         InventorySnapshot, spawn_heartbeat_runtime, spawn_inventory_runtime,
     },
     init::{init_buffer_profile_system, init_kms_system},
@@ -80,6 +80,9 @@ pub(crate) async fn init_startup_runtime_services(
     let optional_runtimes = init_optional_runtime_services().await?;
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
     let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
+    let inventory_drives = heartbeat_config
+        .as_ref()
+        .map(|_| endpoint_pools.as_ref().iter().map(|pool| pool.endpoints.as_ref().len()).sum());
 
     init_buffer_profile_system(config);
     init_deadlock_detector_runtime();
@@ -100,7 +103,7 @@ pub(crate) async fn init_startup_runtime_services(
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
     init_observability_runtime(store.clone(), ctx.clone()).await;
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
-    let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, store, &ctx)?;
+    let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
     let heartbeat = heartbeat.map(|heartbeat| heartbeat.with_inventory(inventory));
 
     Ok(StartupServiceRuntime {
@@ -129,6 +132,7 @@ fn start_heartbeat_runtime(
 fn start_inventory_runtime(
     config: Option<HeartbeatConfig>,
     node_count: Option<usize>,
+    expected_drive_count: Option<usize>,
     store: Arc<ECStore>,
     shutdown: &CancellationToken,
 ) -> Result<Option<InventoryRuntime>> {
@@ -136,21 +140,57 @@ fn start_inventory_runtime(
         return Ok(None);
     };
     let node_count = node_count.unwrap_or_default();
+    let expected_drive_count = expected_drive_count.unwrap_or_default();
     spawn_inventory_runtime(Some(config), InventorySchedule::default(), shutdown, move || {
         let store = store.clone();
         async move {
             let info = StorageAdminApi::storage_info(store.as_ref()).await;
-            let total = crate::app::storage_api::capacity::get_total_usable_capacity(&info.disks, &info) as u64;
-            let free = crate::app::storage_api::capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
-            let mut flags = Vec::with_capacity(3);
-            if info.disks.iter().any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE) {
-                flags.extend([InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]);
-            }
-            if info.disks.iter().any(|disk| disk.healing) {
-                flags.push(InventoryFlag::ClusterHealing);
-            }
-            InventorySnapshot::current(node_count, info.disks.len(), total, free, flags)
+            inventory_snapshot(node_count, expected_drive_count, info)
         }
     })
     .map_err(std::io::Error::other)
+}
+
+fn inventory_snapshot(
+    node_count: usize,
+    expected_drive_count: usize,
+    info: rustfs_madmin::StorageInfo,
+) -> std::result::Result<InventorySnapshot, InventoryError> {
+    if info.disks.len() != expected_drive_count {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: expected_drive_count,
+            observed: info.disks.len(),
+        });
+    }
+    let total = crate::app::storage_api::capacity::get_total_usable_capacity(&info.disks, &info) as u64;
+    let free = crate::app::storage_api::capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
+    let mut flags = Vec::with_capacity(3);
+    if info.disks.iter().any(|disk| disk.state == rustfs_madmin::ITEM_OFFLINE) {
+        flags.extend([InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]);
+    }
+    if info.disks.iter().any(|disk| disk.healing) {
+        flags.push(InventoryFlag::ClusterHealing);
+    }
+    InventorySnapshot::current(node_count, info.disks.len(), total, free, flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_rejects_a_partial_startup_storage_snapshot() {
+        let info = rustfs_madmin::StorageInfo {
+            disks: vec![rustfs_madmin::Disk::default()],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            inventory_snapshot(2, 2, info),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+    }
 }

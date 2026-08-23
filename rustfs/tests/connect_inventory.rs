@@ -501,6 +501,39 @@ async fn connect_inventory_disconnect_retries_without_resampling() {
 }
 
 #[tokio::test]
+async fn connect_inventory_retries_an_incomplete_sample_before_delivery() {
+    let pki = TestPki::new();
+    let content_hash = snapshot().content_hash().expect("content hash");
+    let server = server(&pki, vec![Reply::ok(&content_hash)]).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let shutdown = CancellationToken::new();
+    let samples = Arc::new(AtomicUsize::new(0));
+    let sampled = samples.clone();
+    let runtime = spawn_inventory_runtime(Some(config(&temp, &pki, &server)), schedule(), &shutdown, move || {
+        let attempt = sampled.fetch_add(1, Ordering::Relaxed);
+        std::future::ready(if attempt == 0 {
+            Err(rustfs::connect::InventoryError::SnapshotIncomplete {
+                expected: 96,
+                observed: 12,
+            })
+        } else {
+            Ok(snapshot())
+        })
+    })
+    .expect("start inventory")
+    .expect("configured inventory");
+    let mut status = runtime.status();
+
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, InventoryStatus::Online { .. })).await,
+        InventoryStatus::Online { content_hash: accepted, .. } if accepted == content_hash
+    ));
+    assert_eq!(samples.load(Ordering::Relaxed), 2);
+    assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn connect_inventory_revoked_device_stops_without_retrying() {
     let pki = TestPki::new();
     let server = server(&pki, vec![Reply::error(StatusCode::UNAUTHORIZED, "DEVICE_REVOKED")]).await;
