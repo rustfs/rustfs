@@ -184,7 +184,7 @@ async fn test_delete_group_requires_empty_membership() -> Result<(), Box<dyn std
         "a deleted group must return NoSuchResource, body: {get_body}"
     );
     assert!(
-        get_body.contains("<Message>group 'testgroup' does not exist</Message>"),
+        get_body.contains("<Message>group &apos;testgroup&apos; does not exist</Message>"),
         "a deleted group returned an unexpected message: {get_body}"
     );
     info!("Confirmed testgroup no longer exists");
@@ -212,7 +212,7 @@ async fn test_user_with_only_group_gets_group_policies() -> Result<(), Box<dyn s
         "Statement": [{
             "Effect": "Allow",
             "Action": ["s3:ListAllMyBuckets"],
-            "Resource": ["*"]
+            "Resource": ["arn:aws:s3:::*"]
         }]
     });
     admin_ok(
