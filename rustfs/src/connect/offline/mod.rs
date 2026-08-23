@@ -28,8 +28,14 @@
 //! frozen by `protocol/agent/v1/fixtures/offline-enrollment/` and by
 //! `docs/adr/0009-offline-signing.md` on the Connect side.
 
+pub mod collectors;
 pub mod enrollment;
 pub mod key_store;
+pub mod manifest_entry;
+pub mod redaction;
 
+pub use collectors::{CollectorError, OfflineCollector, collect_offline_diagnostics};
 pub use enrollment::{EnrollmentError, OfflineEnrollment, VerifiedChallenge};
 pub use key_store::OfflineKeyStore;
+pub use manifest_entry::ManifestEntry;
+pub use redaction::{RedactionError, RedactionResult, RedactionSource, redact_json};

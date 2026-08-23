@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(windows)]
+use crate::disk::ConditionalFileUpdate;
 use crate::disk::error::DiskError;
 use crate::disk::error::Result;
 use crate::disk::error_conv::to_file_error;
@@ -3456,6 +3458,89 @@ fn read_windows_relative_file(file_path: &Path, parent_guard: &ExistingBaseDirec
         .map_err(|err| io::Error::other(format!("failed to reserve destination metadata buffer: {err}")))?;
     std::io::Read::read_to_end(file.as_file_mut(), &mut data)?;
     Ok(Some(data))
+}
+
+#[cfg(windows)]
+pub(crate) fn compare_and_update_control_file(
+    file_path: &Path,
+    expected: Option<&[u8]>,
+    replacement: Option<&[u8]>,
+    sync_metadata: bool,
+    publication_root: &PublicationRoot,
+) -> io::Result<ConditionalFileUpdate> {
+    use windows_sys::{
+        Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+        Win32::Storage::FileSystem::{
+            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, SYNCHRONIZE,
+        },
+    };
+
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "conditional file has no parent"))?;
+    let parent_guard = lock_windows_directory_tree(parent, Some(parent), publication_root)?;
+    let lock = open_windows_relative(
+        parent_guard.last_handle()?,
+        std::ffi::OsStr::new(".rustfs-cas.lock"),
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_ATTRIBUTE_NORMAL,
+        true,
+    )?;
+    validate_windows_owned_file(&lock)?;
+    match lock.as_file().try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Err(std::fs::TryLockError::Error(err)) => return Err(err),
+    }
+
+    let current = read_windows_relative_file(file_path, &parent_guard)?;
+    let matches = match (&current, expected) {
+        (None, None) => true,
+        (Some(current), Some(expected)) => current.as_slice() == expected,
+        _ => false,
+    };
+    if !matches {
+        return Ok(match current {
+            None => ConditionalFileUpdate::Missing,
+            Some(_) => ConditionalFileUpdate::Mismatch,
+        });
+    }
+
+    match replacement {
+        Some(replacement) => RenameDestinationPathGuard {
+            directory: parent.to_path_buf(),
+            _directory_guard: parent_guard,
+        }
+        .write_file_for_path_access(file_path, replacement, sync_metadata, sync_metadata)?,
+        None => {
+            let file_name = file_path
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "conditional file must have a name"))?;
+            let file = open_windows_relative(
+                parent_guard.last_handle()?,
+                file_name,
+                DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                0,
+                true,
+            )?;
+            validate_windows_owned_file(&file)?;
+            set_windows_file_delete_on_close(&file, true)?;
+            drop(file);
+            if sync_metadata {
+                fsync_dir_std(parent)?;
+            }
+        }
+    }
+
+    Ok(ConditionalFileUpdate::Updated)
 }
 
 #[cfg(windows)]

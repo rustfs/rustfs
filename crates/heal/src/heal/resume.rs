@@ -28,10 +28,12 @@ use super::{
 };
 
 mod checkpoint;
+mod gc;
 mod replacement;
 mod utils;
 
-pub use checkpoint::{CheckpointManager, ResumeCheckpoint};
+pub use checkpoint::{CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ResumeCheckpoint};
+pub(crate) use gc::ResumeGc;
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
@@ -51,6 +53,7 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const REPLACEMENT_INTENT_FILE: &str = "ahm_replacement_intent.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 pub(super) const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
+pub(super) const RESUME_CHECKPOINT_BLOCKED_FILE: &str = "ahm_checkpoint.blocked";
 const REPLACEMENT_COMPLETION_PROOF_FILE: &str = "ahm_replacement_completion_proof.json";
 const REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 const REPLACEMENT_INTENT_SEAL_FILE: &str = "ahm_replacement_intent_seal";
@@ -340,6 +343,12 @@ pub struct ResumeState {
     pub failed_objects: u64,
     /// skipped objects
     pub skipped_objects: u64,
+    /// Terminal versions skipped because they were newer than the heal start.
+    #[serde(default)]
+    pub skipped_new_versions: u64,
+    /// Terminal versions handed to lifecycle expiry.
+    #[serde(default)]
+    pub skipped_ilm_expired: u64,
     /// current bucket
     pub current_bucket: Option<String>,
     /// current object
@@ -354,6 +363,24 @@ pub struct ResumeState {
     pub retry_count: u32,
     /// max retries
     pub max_retries: u32,
+    /// Bytes accounted by the object ledger; additive for old snapshots.
+    #[serde(default)]
+    pub processed_bytes: u64,
+    /// Total bytes from a complete usage snapshot, when available.
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Generation of the usage snapshot used for the baseline.
+    #[serde(default)]
+    pub baseline_generation: Option<u64>,
+    /// Whether the usage baseline is known. Missing in old snapshots means
+    /// indeterminate rather than a measured zero baseline.
+    #[serde(default)]
+    pub baseline_known: bool,
+    /// Persistent telemetry fence for counter/byte overflow or corruption.
+    /// It must survive a restart so a saturated snapshot is never presented as
+    /// a measured percentage on the next resume.
+    #[serde(default)]
+    pub counter_unknown: bool,
 }
 
 impl ResumeState {
@@ -377,6 +404,8 @@ impl ResumeState {
             successful_objects: 0,
             failed_objects: 0,
             skipped_objects: 0,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
             current_bucket: None,
             current_object: None,
             completed_buckets: Vec::new(),
@@ -384,6 +413,11 @@ impl ResumeState {
             error_message: None,
             retry_count: 0,
             max_retries: 3,
+            processed_bytes: 0,
+            total_bytes: 0,
+            baseline_generation: None,
+            baseline_known: false,
+            counter_unknown: false,
         }
     }
 
@@ -412,6 +446,39 @@ impl ResumeState {
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
+    pub fn update_progress_with_bytes(
+        &mut self,
+        processed: u64,
+        successful: u64,
+        failed: u64,
+        skipped: u64,
+        processed_bytes: u64,
+    ) {
+        self.update_progress(processed, successful, failed, skipped);
+        self.processed_bytes = processed_bytes;
+    }
+
+    pub fn set_skipped_version_counts(&mut self, new_versions: u64, ilm_expired: u64) {
+        self.skipped_new_versions = new_versions;
+        self.skipped_ilm_expired = ilm_expired;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn set_progress_baseline(&mut self, total_objects: u64, total_bytes: u64, generation: Option<u64>) {
+        self.total_objects = total_objects;
+        self.total_bytes = total_bytes;
+        self.baseline_generation = generation;
+        // This method is called only after a complete usage snapshot has been
+        // validated.  A complete but empty snapshot is still a known baseline.
+        self.baseline_known = true;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn mark_counter_unknown(&mut self) {
+        self.counter_unknown = true;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
     pub fn set_current_item(&mut self, bucket: Option<String>, object: Option<String>) {
         self.current_bucket = bucket;
         self.current_object = object;
@@ -437,6 +504,7 @@ impl ResumeState {
         if let Some(pos) = self.pending_buckets.iter().position(|b| b == bucket) {
             self.pending_buckets.remove(pos);
         }
+        self.resume_cursor = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -454,6 +522,10 @@ impl ResumeState {
         self.successful_objects = 0;
         self.failed_objects = 0;
         self.skipped_objects = 0;
+        self.skipped_new_versions = 0;
+        self.skipped_ilm_expired = 0;
+        self.processed_bytes = 0;
+        self.counter_unknown = false;
         self.completed = false;
         // A retry re-scans every bucket from the beginning, so the version
         // cursor must be cleared too — otherwise the retry would resume mid-scan.
@@ -476,14 +548,28 @@ impl ResumeState {
     }
 
     pub fn get_progress_percentage(&self) -> f64 {
+        if self.completed {
+            return 100.0;
+        }
+        if self.counter_unknown {
+            return 0.0;
+        }
+        if !self.baseline_known {
+            return 0.0;
+        }
+        if self.total_bytes > 0 {
+            return ((self.processed_bytes as f64 / self.total_bytes as f64) * 100.0).min(99.999);
+        }
         if self.total_objects == 0 {
             return 0.0;
         }
-        (self.processed_objects as f64 / self.total_objects as f64) * 100.0
+        ((self.processed_objects as f64 / self.total_objects as f64) * 100.0).min(99.999)
     }
 
     pub fn get_success_rate(&self) -> f64 {
-        let total = self.successful_objects + self.failed_objects;
+        let Some(total) = self.successful_objects.checked_add(self.failed_objects) else {
+            return 0.0;
+        };
         if total == 0 {
             return 0.0;
         }
@@ -754,6 +840,14 @@ impl ResumeManager {
             state.successful_objects = 0;
             state.failed_objects = 0;
             state.skipped_objects = 0;
+            state.skipped_new_versions = 0;
+            state.skipped_ilm_expired = 0;
+            state.processed_bytes = 0;
+            state.total_objects = 0;
+            state.total_bytes = 0;
+            state.baseline_generation = None;
+            state.baseline_known = false;
+            state.counter_unknown = false;
             state.completed = false;
             state.completed_buckets.clear();
             state.schema_version = CURRENT_RESUME_SCHEMA;
@@ -838,6 +932,41 @@ impl ResumeManager {
         self.save_state_throttled().await
     }
 
+    pub async fn update_progress_with_bytes(
+        &self,
+        processed: u64,
+        successful: u64,
+        failed: u64,
+        skipped: u64,
+        processed_bytes: u64,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.update_progress_with_bytes(processed, successful, failed, skipped, processed_bytes);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
+    pub async fn set_progress_baseline(&self, total_objects: u64, total_bytes: u64, generation: Option<u64>) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_progress_baseline(total_objects, total_bytes, generation);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
+    pub async fn mark_counter_unknown(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.mark_counter_unknown();
+        drop(state);
+        self.save_state().await
+    }
+
+    pub async fn set_skipped_version_counts(&self, new_versions: u64, ilm_expired: u64) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_skipped_version_counts(new_versions, ilm_expired);
+        drop(state);
+        self.save_state_throttled().await
+    }
+
     /// Set current item. Called once per healed object, so persistence is
     /// throttled: the in-memory state always updates, but the snapshot is only
     /// written every `PERSIST_EVERY_MUTATIONS` calls or `PERSIST_INTERVAL`.
@@ -882,7 +1011,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.complete_bucket(bucket);
         drop(state);
-        self.save_state_throttled().await
+        self.save_state().await
     }
 
     /// mark task completed

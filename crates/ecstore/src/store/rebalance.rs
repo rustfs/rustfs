@@ -694,6 +694,11 @@ impl ECStore {
     /// callers only trigger missing-worker recovery after a real state change;
     /// delayed snapshots are merged monotonically and never blind-assigned.
     pub async fn reload_pool_meta(&self) -> Result<bool> {
+        // Serialize the durable reload with local movement transitions. Loading
+        // before acquiring this gate would allow a stale disk snapshot to
+        // overwrite a newer local transition after the writer commits.
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let mut reloaded = PoolMeta::default();
         resolve_store_rebalance_pool_meta_reload_result(
             reloaded.load(self.pools[0].clone(), self.pools.clone()).await,
@@ -701,15 +706,22 @@ impl ECStore {
         )?;
 
         // Lock order: release the decommission_cancelers guard before taking
-        // the pool_meta write guard; neither is held across the disk read.
+        // the pool_meta write guard; neither is held without the movement gate.
         let active_workers = {
             let cancelers = self.decommission_cancelers.read().await;
-            cancelers.iter().map(Option::is_some).collect::<Vec<_>>()
+            cancelers
+                .iter()
+                .map(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
+                .collect::<Vec<_>>()
         };
 
         let incoming_has_pools = !reloaded.pools.is_empty();
         let mut pool_meta = self.pool_meta.write().await;
+        let movement_before = pool_meta.clone();
         let merged_newer = merge_pool_status_refresh(&mut pool_meta, reloaded, &active_workers);
+        if crate::core::pools::pool_meta_movement_snapshot_changed(&movement_before, &pool_meta) {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
 
         if !merged_newer && !incoming_has_pools {
             warn!(
@@ -1626,10 +1638,6 @@ mod tests {
     fn resolve_latest_object_info_candidates_rejects_equal_time_payload_identity_conflicts() {
         let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
 
-        let mut data_dir = base.clone();
-        data_dir.data_dir = Some(Uuid::from_u128(2));
-        assert_equal_time_identity_conflict(base.clone(), data_dir);
-
         let mut size = base.clone();
         size.size = 1;
         assert_equal_time_identity_conflict(base.clone(), size);
@@ -1657,6 +1665,58 @@ mod tests {
             object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
             transition,
         );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_data_movement_rewrites() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a committed data-movement target must remain readable before source cleanup");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.data_dir = Some(Uuid::from_u128(1));
+
+        let mut right = left.clone();
+        right.data_dir = Some(Uuid::from_u128(2));
+
+        assert_equal_time_identity_conflict(left, right);
     }
 
     #[test]
@@ -2301,7 +2361,9 @@ mod tests {
     #[serial_test::serial]
     async fn peer_pool_meta_reload_keeps_active_worker_progress_over_newer_snapshot() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-worker", &[2]).await;
-        *store.decommission_cancelers.write().await = vec![Some(CancellationToken::new())];
+        *store.decommission_cancelers.write().await = vec![Some(crate::core::pools::DecommissionCanceler::new_for_test(
+            CancellationToken::new(),
+        ))];
 
         let worker_time = OffsetDateTime::now_utc();
         let newer_time = worker_time + TimeDuration::seconds(30);

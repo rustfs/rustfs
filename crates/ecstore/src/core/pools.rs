@@ -16,19 +16,23 @@ use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
-        LifecycleExpiryConfigs,
+        DurableIlmRecordCheckpoint, ILM_META_PREFIX, LifecycleExpiryConfigs, ValidatedDurableIlmRecord,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
             lifecycle_delete_all_versions_blocked_by_replication,
         },
-        get_expiry_configs,
+        classify_durable_ilm_record, get_expiry_configs,
         lifecycle::IlmAction,
+        validate_durable_ilm_record,
     },
     metadata_sys,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
-use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
+use crate::config::com::{
+    CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
+    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config, save_config_with_opts,
+};
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
@@ -48,24 +52,29 @@ use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
+    list::ListOperations as _,
     namespace::NamespaceLocking as _,
-    object::{EcstoreObjectIO, ObjectIO as _, ObjectOperations as _},
+    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{
+    StreamExt,
+    future::{BoxFuture, join_all},
+    stream::FuturesUnordered,
+};
 use http::HeaderMap;
 #[cfg(test)]
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::future::Future;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
@@ -97,10 +106,23 @@ const DECOMMISSION_ENTRY_CONCURRENCY_ENV: &str = "RUSTFS_DECOMMISSION_ENTRY_CONC
 const DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP: usize = 8;
 const DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP: usize = 64;
 const DECOMMISSION_ENTRY_WORKERS_PER_SET: usize = 2;
+const DECOMMISSION_META_PREFIXES: [&str; 3] = [CONFIG_PREFIX, BUCKET_META_PREFIX, ILM_META_PREFIX];
 const DECOMMISSION_TARGET_CAPACITY_OVERHEAD_PERCENT: usize = 30;
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const DECOMMISSION_ENTRY_MAX_ATTEMPTS: usize = 3;
+const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
+const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT: &str = "decommission/ilm-receipts";
+const DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT: &str = "decommission/ilm-manifests";
+const DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA: &str = "v2";
+const DECOMMISSION_DURABLE_ILM_MANIFEST_SCHEMA: &str = "v1";
+const DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE: usize = 16 * 1024;
+const DECOMMISSION_DURABLE_ILM_MANIFEST_MAX_SIZE: usize = 4 * 1024;
+const DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS: usize = 3;
 /// Background decommission walks must tolerate slow object migrations; the
 /// stall timeout is the drive-health bound, not the total listing duration.
 const DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -121,7 +143,7 @@ struct DecommissionOperation {
 }
 
 impl DecommissionCanceler {
-    fn new(token: CancellationToken) -> Self {
+    pub(crate) fn new(token: CancellationToken) -> Self {
         Self {
             operation: Arc::new(DecommissionOperation {
                 token,
@@ -130,11 +152,16 @@ impl DecommissionCanceler {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(token: CancellationToken) -> Self {
+        Self::new(token)
+    }
+
     fn token(&self) -> &CancellationToken {
         &self.operation.token
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.operation.active.load(Ordering::Acquire)
     }
 
@@ -377,6 +404,19 @@ fn is_decommission_meta_bucket(bucket: &DecomBucketInfo) -> bool {
     bucket.name == RUSTFS_META_BUCKET
 }
 
+fn decommission_meta_buckets() -> [DecomBucketInfo; DECOMMISSION_META_PREFIXES.len()] {
+    DECOMMISSION_META_PREFIXES.map(|prefix| DecomBucketInfo {
+        name: RUSTFS_META_BUCKET.to_owned(),
+        prefix: prefix.to_owned(),
+    })
+}
+
+fn reconcile_decommission_meta_buckets(meta: &mut PoolMeta, idx: usize) -> bool {
+    let before = meta.pending_buckets(idx).len();
+    meta.queue_buckets(idx, decommission_meta_buckets().into());
+    meta.pending_buckets(idx).len() != before
+}
+
 fn split_decommission_buckets(buckets: Vec<DecomBucketInfo>) -> (Vec<DecomBucketInfo>, Vec<DecomBucketInfo>) {
     let mut regular = Vec::with_capacity(buckets.len());
     let mut meta = Vec::new();
@@ -462,18 +502,15 @@ pub(crate) fn local_decommission_queue_prefix(endpoints: &EndpointServerPools, i
     Ok(local)
 }
 
-fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
+fn resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
     let mut indices = Vec::new();
     for (idx, pool) in meta.pools.iter().enumerate() {
         if let Some(decommission) = &pool.decommission {
             if !decommission.has_decommission_state() {
                 continue;
             }
-            if decommission.complete {
+            if decommission.complete || decommission.failed || decommission.canceled {
                 continue;
-            }
-            if decommission.failed || decommission.canceled {
-                break;
             }
             indices.push(idx);
         }
@@ -567,6 +604,7 @@ fn spawn_decommission_index_cancelers(
                     error = %err,
                     "Decommission routine failed"
                 );
+                store.quiesce_decommission_worker_after_join_error(&canceler).await;
                 store.retry_decommission_failed_for_operation(idx, &canceler).await;
                 stop_queue = true;
                 continue;
@@ -804,28 +842,29 @@ fn ensure_decommission_generation(meta: &PoolMeta, idx: usize, generation: Offse
     }
 }
 
-async fn run_decommission_side_effect<T, F, Fut>(
+async fn run_decommission_side_effect<T, E, F, Fut>(
     rx: &CancellationToken,
     operation_gate: &Arc<tokio::sync::RwLock<()>>,
     operation: F,
-) -> Result<T>
+) -> std::result::Result<T, E>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: From<Error>,
 {
     let _operation_guard = tokio::select! {
         biased;
-        _ = rx.cancelled() => return Err(Error::OperationCanceled),
+        _ = rx.cancelled() => return Err(Error::OperationCanceled.into()),
         guard = operation_gate.read() => guard,
     };
 
     if rx.is_cancelled() {
-        return Err(Error::OperationCanceled);
+        return Err(Error::OperationCanceled.into());
     }
 
     let result = operation().await;
     if rx.is_cancelled() {
-        return Err(Error::OperationCanceled);
+        return Err(Error::OperationCanceled.into());
     }
     result
 }
@@ -924,7 +963,7 @@ where
     usize::try_from(size).unwrap_or_default()
 }
 
-fn with_decommission_entry_context<E: std::fmt::Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
+fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
@@ -1022,6 +1061,362 @@ fn resolve_decommission_partial_listing_entry(
     ))
 }
 
+fn validate_decommission_durable_ilm_copy(
+    path: &str,
+    source_record: &ValidatedDurableIlmRecord,
+    target: &[u8],
+) -> Result<ValidatedDurableIlmRecord> {
+    let target_record = validate_durable_ilm_record(path, target).map_err(|err| {
+        Error::other(format!(
+            "target durable ILM record is invalid at path `{path}` {}: {err}",
+            source_record.context()
+        ))
+    })?;
+    source_record
+        .checkpoint
+        .validate_successor(&target_record.checkpoint)
+        .map_err(|err| {
+            Error::other(format!(
+                "target durable ILM record generation mismatch at path `{path}` {}: {err}",
+                source_record.context()
+            ))
+        })?;
+    Ok(target_record)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecommissionDurableIlmReceipt {
+    source_path: String,
+    namespace: String,
+    id_kind: String,
+    id: String,
+    checkpoint: DurableIlmRecordCheckpoint,
+    terminal_checkpoint: Option<DurableIlmRecordCheckpoint>,
+}
+
+impl DecommissionDurableIlmReceipt {
+    fn new(path: &str, record: &ValidatedDurableIlmRecord) -> Self {
+        Self {
+            source_path: path.to_string(),
+            namespace: record.namespace.to_string(),
+            id_kind: record.id_kind.to_string(),
+            id: record.id.clone(),
+            checkpoint: record.checkpoint.clone(),
+            terminal_checkpoint: None,
+        }
+    }
+
+    fn context(&self) -> String {
+        format!("namespace `{}` {} `{}`", self.namespace, self.id_kind, self.id)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let namespace = classify_durable_ilm_record(&self.source_path)?
+            .ok_or_else(|| Error::other(format!("receipt source path `{}` is not a durable ILM record", self.source_path)))?;
+        if namespace.name != self.namespace {
+            return Err(Error::other(format!(
+                "receipt namespace `{}` does not match source path `{}`",
+                self.namespace, self.source_path
+            )));
+        }
+        if self.id_kind.is_empty() || self.id.is_empty() {
+            return Err(Error::other(format!(
+                "receipt identity is missing for source path `{}`",
+                self.source_path
+            )));
+        }
+        if !is_sha256_checksum(self.checkpoint.content_sha256()) {
+            return Err(Error::other(format!(
+                "receipt target checksum is invalid for source path `{}` {}",
+                self.source_path,
+                self.context()
+            )));
+        }
+        if let Some(terminal_checkpoint) = &self.terminal_checkpoint {
+            self.checkpoint.validate_successor(terminal_checkpoint).map_err(|err| {
+                Error::other(format!(
+                    "receipt terminal checkpoint is invalid for source path `{}` {}: {err}",
+                    self.source_path,
+                    self.context()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut receipt = self.clone();
+        receipt.checkpoint = receipt.checkpoint.compacted()?;
+        receipt.terminal_checkpoint = receipt
+            .terminal_checkpoint
+            .as_ref()
+            .map(DurableIlmRecordCheckpoint::compacted)
+            .transpose()?;
+        receipt.validate()?;
+        let receipt_bytes = serde_json::to_vec(&receipt)?;
+        let persisted = PersistedDecommissionDurableIlmReceipt {
+            schema: DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA.to_string(),
+            content_sha256: hex_sha256(&receipt_bytes, ToOwned::to_owned),
+            receipt,
+        };
+        let encoded = serde_json::to_vec(&persisted)?;
+        if encoded.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE {
+            return Err(Error::other(format!(
+                "durable ILM receipt exceeds maximum size for source path `{}` {}",
+                self.source_path,
+                self.context()
+            )));
+        }
+        Ok(encoded)
+    }
+
+    fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE {
+            return Err(Error::other("durable ILM receipt exceeds maximum size"));
+        }
+        let persisted: PersistedDecommissionDurableIlmReceipt = serde_json::from_slice(data)?;
+        if persisted.schema != DECOMMISSION_DURABLE_ILM_RECEIPT_SCHEMA {
+            return Err(Error::other(format!("unsupported durable ILM receipt schema `{}`", persisted.schema)));
+        }
+        if !is_sha256_checksum(&persisted.content_sha256) {
+            return Err(Error::other("durable ILM receipt checksum is invalid"));
+        }
+        let receipt_bytes = serde_json::to_vec(&persisted.receipt)?;
+        let actual_checksum = hex_sha256(&receipt_bytes, ToOwned::to_owned);
+        if persisted.content_sha256 != actual_checksum {
+            return Err(Error::other("durable ILM receipt checksum mismatch"));
+        }
+        persisted.receipt.validate()?;
+        Ok(persisted.receipt)
+    }
+}
+
+fn merge_decommission_durable_ilm_receipts(
+    existing: &DecommissionDurableIlmReceipt,
+    incoming: &DecommissionDurableIlmReceipt,
+) -> Result<DecommissionDurableIlmReceipt> {
+    if existing.source_path != incoming.source_path
+        || existing.namespace != incoming.namespace
+        || existing.id_kind != incoming.id_kind
+        || existing.id != incoming.id
+    {
+        return Err(Error::other(format!(
+            "durable ILM receipt identity conflict for source path `{}` {}; incoming {}",
+            existing.source_path,
+            existing.context(),
+            incoming.context()
+        )));
+    }
+
+    let checkpoint =
+        if existing.checkpoint == incoming.checkpoint || incoming.checkpoint.validate_successor(&existing.checkpoint).is_ok() {
+            existing.checkpoint.clone()
+        } else {
+            existing.checkpoint.validate_successor(&incoming.checkpoint).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM receipt checkpoint conflict for source path `{}` {}: {err}",
+                    existing.source_path,
+                    existing.context()
+                ))
+            })?;
+            incoming.checkpoint.clone()
+        };
+    let terminal_checkpoint = match (&existing.terminal_checkpoint, &incoming.terminal_checkpoint) {
+        (Some(existing_terminal), Some(incoming_terminal)) if existing_terminal == incoming_terminal => {
+            Some(existing_terminal.clone())
+        }
+        (Some(existing_terminal), Some(incoming_terminal)) if incoming_terminal.validate_successor(existing_terminal).is_ok() => {
+            Some(existing_terminal.clone())
+        }
+        (Some(existing_terminal), Some(incoming_terminal)) => {
+            existing_terminal.validate_successor(incoming_terminal).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM receipt terminal checkpoint conflict for source path `{}` {}: {err}",
+                    existing.source_path,
+                    existing.context()
+                ))
+            })?;
+            Some(incoming_terminal.clone())
+        }
+        (Some(existing_terminal), None) => Some(existing_terminal.clone()),
+        (None, Some(incoming_terminal)) => Some(incoming_terminal.clone()),
+        (None, None) => None,
+    };
+    let merged = DecommissionDurableIlmReceipt {
+        source_path: existing.source_path.clone(),
+        namespace: existing.namespace.clone(),
+        id_kind: existing.id_kind.clone(),
+        id: existing.id.clone(),
+        checkpoint,
+        terminal_checkpoint,
+    };
+    merged.validate()?;
+    Ok(merged)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedDecommissionDurableIlmReceipt {
+    schema: String,
+    content_sha256: String,
+    receipt: DecommissionDurableIlmReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecommissionDurableIlmManifest {
+    schema: String,
+    run_token: String,
+    receipt_count: u64,
+    receipt_paths_sha256: String,
+}
+
+impl DecommissionDurableIlmManifest {
+    fn new(run_token: &str, receipt_paths: &[String]) -> Result<Self> {
+        let manifest = Self {
+            schema: DECOMMISSION_DURABLE_ILM_MANIFEST_SCHEMA.to_string(),
+            run_token: run_token.to_string(),
+            receipt_count: u64::try_from(receipt_paths.len())
+                .map_err(|_| Error::other("durable ILM expected manifest receipt count exceeds u64"))?,
+            receipt_paths_sha256: decommission_durable_ilm_manifest_paths_sha256(receipt_paths)?,
+        };
+        manifest.validate(run_token, receipt_paths)?;
+        Ok(manifest)
+    }
+
+    fn validate(&self, run_token: &str, receipt_paths: &[String]) -> Result<()> {
+        if self.schema != DECOMMISSION_DURABLE_ILM_MANIFEST_SCHEMA {
+            return Err(Error::other(format!(
+                "unsupported durable ILM expected manifest schema `{}`",
+                self.schema
+            )));
+        }
+        if self.run_token != run_token || !is_sha256_checksum(&self.run_token) {
+            return Err(Error::other("durable ILM expected manifest run token is invalid"));
+        }
+        let receipt_count = u64::try_from(receipt_paths.len())
+            .map_err(|_| Error::other("durable ILM expected manifest receipt count exceeds u64"))?;
+        if self.receipt_count != receipt_count {
+            return Err(Error::other(format!(
+                "durable ILM expected manifest receipt count mismatch: expected {}, found {receipt_count}",
+                self.receipt_count
+            )));
+        }
+        if !is_sha256_checksum(&self.receipt_paths_sha256)
+            || self.receipt_paths_sha256 != decommission_durable_ilm_manifest_paths_sha256(receipt_paths)?
+        {
+            return Err(Error::other("durable ILM expected manifest receipt paths checksum mismatch"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > DECOMMISSION_DURABLE_ILM_MANIFEST_MAX_SIZE {
+            return Err(Error::other("durable ILM expected manifest exceeds maximum size"));
+        }
+        Ok(encoded)
+    }
+
+    fn decode(data: &[u8], run_token: &str, receipt_paths: &[String]) -> Result<Self> {
+        if data.len() > DECOMMISSION_DURABLE_ILM_MANIFEST_MAX_SIZE {
+            return Err(Error::other("durable ILM expected manifest exceeds maximum size"));
+        }
+        let manifest: Self = serde_json::from_slice(data)?;
+        manifest.validate(run_token, receipt_paths)?;
+        Ok(manifest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecommissionDurableIlmReceiptLocator {
+    run_token: String,
+    source_path: String,
+    id_kind: String,
+    id: String,
+}
+
+impl DecommissionDurableIlmReceiptLocator {
+    fn context(&self) -> String {
+        format!("source path `{}` {} `{}`", self.source_path, self.id_kind, self.id)
+    }
+}
+
+fn decommission_durable_ilm_receipt_run_token(cmd_line: &str, start_time: OffsetDateTime) -> String {
+    let identity = format!("{cmd_line}\0{}", start_time.unix_timestamp_nanos());
+    hex_sha256(identity.as_bytes(), ToOwned::to_owned)
+}
+
+fn decommission_durable_ilm_receipt_run_prefix(run_token: &str) -> String {
+    format!("{DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT}/{run_token}/")
+}
+
+fn decommission_durable_ilm_receipt_path(run_token: &str, source_path: &str, id_kind: &str, id: &str) -> String {
+    format!(
+        "{}{}/{}/{}.json",
+        decommission_durable_ilm_receipt_run_prefix(run_token),
+        source_path,
+        id_kind,
+        id
+    )
+}
+
+fn decommission_durable_ilm_manifest_path(run_token: &str) -> String {
+    format!("{DECOMMISSION_DURABLE_ILM_MANIFEST_ROOT}/{run_token}.json")
+}
+
+fn decommission_durable_ilm_manifest_paths_sha256(receipt_paths: &[String]) -> Result<String> {
+    let mut sorted_paths = receipt_paths.iter().map(String::as_str).collect::<Vec<_>>();
+    sorted_paths.sort_unstable();
+    let encoded = serde_json::to_vec(&sorted_paths)?;
+    Ok(hex_sha256(&encoded, ToOwned::to_owned))
+}
+
+fn parse_decommission_durable_ilm_receipt_path(path: &str) -> Result<DecommissionDurableIlmReceiptLocator> {
+    let prefix = format!("{DECOMMISSION_DURABLE_ILM_RECEIPT_ROOT}/");
+    let suffix = path
+        .strip_prefix(&prefix)
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` has the wrong root")))?;
+    let (run_token, record_path) = suffix
+        .split_once('/')
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` is missing its record path")))?;
+    let mut parts = record_path.rsplitn(3, '/');
+    let id = parts
+        .next()
+        .and_then(|file| file.strip_suffix(".json"))
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` is missing its record id")))?;
+    let id_kind = parts
+        .next()
+        .filter(|id_kind| matches!(*id_kind, "operation_id" | "transaction_id" | "job_id"))
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` has an invalid id kind")))?;
+    let source_path = parts
+        .next()
+        .filter(|source_path| !source_path.is_empty())
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` is missing its source path")))?;
+    if !is_sha256_checksum(run_token) {
+        return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid run token")));
+    }
+    match id_kind {
+        "operation_id" if !is_sha256_checksum(id) => {
+            return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid operation id")));
+        }
+        "transaction_id" | "job_id" if uuid::Uuid::parse_str(id).is_err() => {
+            return Err(Error::other(format!("durable ILM receipt path `{path}` has an invalid UUID")));
+        }
+        _ => {}
+    }
+    classify_durable_ilm_record(source_path)?
+        .ok_or_else(|| Error::other(format!("durable ILM receipt path `{path}` does not identify a durable ILM source path")))?;
+    Ok(DecommissionDurableIlmReceiptLocator {
+        run_token: run_token.to_string(),
+        source_path: source_path.to_string(),
+        id_kind: id_kind.to_string(),
+        id: id.to_string(),
+    })
+}
+
 fn resolve_decommission_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("decommission pool meta reload failed during {stage}: {err}")))
 }
@@ -1054,6 +1449,30 @@ fn should_replace_pool_status_for_status_refresh(
     };
 
     !has_active_worker && persisted.last_update > current.last_update
+}
+
+fn pool_decommission_movement_snapshot(
+    info: Option<&PoolDecommissionInfo>,
+) -> (bool, bool, bool, bool, bool, Option<OffsetDateTime>) {
+    info.map(|info| {
+        (
+            info.has_decommission_state(),
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.queued,
+            info.start_time,
+        )
+    })
+    .unwrap_or_default()
+}
+
+pub(crate) fn pool_meta_movement_snapshot_changed(before: &PoolMeta, after: &PoolMeta) -> bool {
+    before.pools.len() != after.pools.len()
+        || before.pools.iter().zip(after.pools.iter()).any(|(before, after)| {
+            pool_decommission_movement_snapshot(before.decommission.as_ref())
+                != pool_decommission_movement_snapshot(after.decommission.as_ref())
+        })
 }
 
 /// Merges a persisted pool metadata snapshot into `current` monotonically:
@@ -1129,6 +1548,48 @@ fn rollback_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta:
     *pool_meta = previous_pool_meta;
 }
 
+#[derive(Debug)]
+struct DecommissionCancelCommit {
+    previous_start_time: Option<OffsetDateTime>,
+    previous_queued: bool,
+    previous_last_update: OffsetDateTime,
+    canceled_pool: PoolStatus,
+}
+
+fn commit_decommission_cancel(pool_meta: &mut PoolMeta, idx: usize, commit: DecommissionCancelCommit) -> Result<()> {
+    let pool_count = pool_meta.pools.len();
+    let Some(current) = pool_meta.pools.get(idx) else {
+        return Err(invalid_decommission_pool_index_error(pool_count, idx));
+    };
+    // A peer reload can install the saved cancel while runtime-only fields are reconstructed.
+    let cancel_already_published = commit
+        .canceled_pool
+        .decommission
+        .as_ref()
+        .is_some_and(|info| info.canceled && !info.complete && !info.failed && info.start_time.is_none())
+        && PersistedPoolStatus::from(current) == PersistedPoolStatus::from(&commit.canceled_pool);
+    if cancel_already_published {
+        return Ok(());
+    }
+
+    let matches_generation = current.id == commit.canceled_pool.id
+        && current.cmd_line == commit.canceled_pool.cmd_line
+        && current.decommission.as_ref().is_some_and(|info| {
+            info.start_time == commit.previous_start_time
+                && info.queued == commit.previous_queued
+                && is_decommission_active(info.complete, info.failed, info.canceled)
+                && (commit.previous_start_time.is_some() || current.last_update == commit.previous_last_update)
+        });
+    if !matches_generation {
+        return Err(Error::other(format!(
+            "failed to publish decommission cancel for pool {idx}: operation generation changed"
+        )));
+    }
+
+    pool_meta.pools[idx] = commit.canceled_pool;
+    Ok(())
+}
+
 fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: PoolMeta) {
     rollback_decommission_pool_meta(pool_meta, previous_pool_meta);
 }
@@ -1156,11 +1617,15 @@ fn should_retry_decommission_listing(err: &Error, attempt: usize, max_attempts: 
     !is_err_bucket_not_found(err) && attempt + 1 < max_attempts
 }
 
-async fn wait_decommission_listing_retry(rx: &CancellationToken, delay: std::time::Duration) -> bool {
+async fn wait_decommission_retry_backoff(rx: &CancellationToken, delay: std::time::Duration) -> bool {
     tokio::select! {
         _ = rx.cancelled() => true,
         _ = tokio::time::sleep(delay) => false,
     }
+}
+
+fn decommission_retry_backoff_delay(base: std::time::Duration, attempt: usize) -> std::time::Duration {
+    base.saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -1278,7 +1743,7 @@ where
                     error = ?err,
                     "Decommission listing failed; retrying"
                 );
-                if wait_decommission_listing_retry(&rx, DECOMMISSION_LISTING_RETRY_DELAY).await {
+                if wait_decommission_retry_backoff(&rx, DECOMMISSION_LISTING_RETRY_DELAY).await {
                     debug!(
                         event = EVENT_DECOMMISSION_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1331,7 +1796,7 @@ fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
 
     // A not-found surfacing from inside a data-movement stage is the same
     // condition once the wrapper is unwrapped (backlog#1827 T2).
-    crate::data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_copy_cleanup_safe_error)
 }
 
 fn is_decommission_target_capacity_error(err: &Error) -> bool {
@@ -1342,7 +1807,7 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
     // A stage failure keeps the error it wrapped, so classify by type rather
     // than by the rendered message (backlog#1827 T2). The substring fallback
     // stays for errors that reached here through some other wrapper.
-    if let Some(source) = crate::data_movement::data_movement_stage_source(err) {
+    if let Some(source) = data_movement::data_movement_stage_source(err) {
         return is_decommission_target_capacity_error(source);
     }
 
@@ -1354,6 +1819,123 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
 
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
     decommissioned.saturating_add(expired) == total_versions
+}
+
+fn should_fail_decommission_pool_after_exhausted_source_changed(exhausted_entries: usize) -> bool {
+    exhausted_entries > DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionEntryAttemptOutcome {
+    Complete,
+    SourceChanged,
+}
+
+#[cfg(test)]
+pub(crate) type DecommissionTestFaultDecision = Arc<dyn Fn(&'static str, &str, &str, usize) -> bool + Send + Sync>;
+
+#[cfg(test)]
+static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFaultDecision>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct DecommissionTestFaultGuard(DecommissionTestFaultDecision);
+
+#[cfg(test)]
+impl DecommissionTestFaultGuard {
+    pub(crate) fn install(decision: DecommissionTestFaultDecision) -> Self {
+        let mut slot = DECOMMISSION_TEST_FAULT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission test fault hook mutex should not poison");
+        assert!(slot.is_none(), "decommission test fault hook must be unique");
+        let stored = Arc::clone(&decision);
+        *slot = Some(decision);
+        Self(stored)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionTestFaultGuard {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_TEST_FAULT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission test fault hook mutex should not poison");
+        if slot.as_ref().is_some_and(|decision| Arc::ptr_eq(decision, &self.0)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn decommission_test_wrap_result<T>(
+    stage: &'static str,
+    bucket: &str,
+    object: &str,
+    attempt: usize,
+    result: Result<T>,
+) -> Result<T> {
+    let decision = DECOMMISSION_TEST_FAULT_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission test fault hook mutex should not poison")
+        .clone();
+    if result.is_ok() && decision.is_some_and(|decision| decision(stage, bucket, object, attempt)) {
+        return Err(Error::other(format!(
+            "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
+        )));
+    }
+    result
+}
+
+#[cfg(test)]
+pub(crate) type DecommissionCleanupMutationHook = Arc<dyn Fn(&str, &str, usize) -> BoxFuture<'static, ()> + Send + Sync>;
+
+#[cfg(test)]
+static DECOMMISSION_CLEANUP_MUTATION_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionCleanupMutationHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct DecommissionCleanupMutationGuard(DecommissionCleanupMutationHook);
+
+#[cfg(test)]
+impl DecommissionCleanupMutationGuard {
+    pub(crate) fn install(hook: DecommissionCleanupMutationHook) -> Self {
+        let mut slot = DECOMMISSION_CLEANUP_MUTATION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission cleanup mutation hook mutex should not poison");
+        assert!(slot.is_none(), "decommission cleanup mutation hook must be unique");
+        let stored = Arc::clone(&hook);
+        *slot = Some(hook);
+        Self(stored)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionCleanupMutationGuard {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_CLEANUP_MUTATION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission cleanup mutation hook mutex should not poison");
+        if slot.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.0)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn run_decommission_cleanup_mutation_hook(bucket: &str, object: &str, attempt: usize) {
+    let hook = DECOMMISSION_CLEANUP_MUTATION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission cleanup mutation hook mutex should not poison")
+        .clone();
+    if let Some(hook) = hook {
+        hook(bucket, object, attempt).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1464,6 +2046,36 @@ where
     Ok(())
 }
 
+async fn run_decommission_phases<F>(
+    rx: CancellationToken,
+    regular_buckets: Vec<DecomBucketInfo>,
+    meta_buckets: Vec<DecomBucketInfo>,
+    bucket_concurrency: usize,
+    mut start_bucket: F,
+) -> Result<()>
+where
+    F: FnMut(DecomBucketInfo, CancellationToken) -> BoxFuture<'static, Result<()>>,
+{
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    for bucket in meta_buckets {
+        decommission_cancel_signal_result(rx.is_cancelled())?;
+        start_bucket(bucket, rx.clone()).await?;
+    }
+
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    if bucket_concurrency <= 1 {
+        for bucket in regular_buckets {
+            decommission_cancel_signal_result(rx.is_cancelled())?;
+            start_bucket(bucket, rx.clone()).await?;
+        }
+        return Ok(());
+    }
+
+    run_decommission_buckets_bounded(rx, regular_buckets, bucket_concurrency, start_bucket).await
+}
+
 #[cfg(test)]
 async fn wait_decommission_worker_drain(workers: &Semaphore, limit: usize) -> Result<()> {
     let permits = u32::try_from(limit)
@@ -1572,6 +2184,218 @@ pub struct PoolMeta {
     pub dont_save: bool,
 }
 
+#[derive(Debug)]
+enum PoolMetaReplica {
+    Missing,
+    Valid {
+        raw: Vec<u8>,
+        canonical: Vec<u8>,
+        meta: PoolMeta,
+    },
+    Corrupt(String),
+    Incompatible(String),
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMetaReplicaState {
+    pub(crate) needs_repair: bool,
+    pub(crate) repair_write_safe: bool,
+}
+
+impl PoolMetaReplicaState {
+    pub(crate) fn ensure_write_safe(self, operation: &str) -> Result<()> {
+        if self.repair_write_safe {
+            return Ok(());
+        }
+        Err(Error::other(format!(
+            "{operation}: pool metadata update cannot overwrite an unreadable replica"
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct PoolMetaSelection {
+    meta: PoolMeta,
+    replica_state: PoolMetaReplicaState,
+}
+
+fn classify_pool_meta_tuple_decode_error(kind: &str, err: rmp_serde::decode::Error) -> PoolMetaReplica {
+    let truncated = matches!(
+        &err,
+        rmp_serde::decode::Error::InvalidMarkerRead(source)
+            | rmp_serde::decode::Error::InvalidDataRead(source)
+            if source.kind() == std::io::ErrorKind::UnexpectedEof
+    );
+    if truncated {
+        PoolMetaReplica::Corrupt(format!("{kind} tuple payload is truncated: {err}"))
+    } else {
+        PoolMetaReplica::Incompatible(format!("{kind} tuple payload is not decodable: {err}"))
+    }
+}
+
+fn decode_pool_meta_replica(data: Vec<u8>) -> PoolMetaReplica {
+    if data.len() <= 4 {
+        return PoolMetaReplica::Corrupt("metadata payload is empty or truncated".to_string());
+    }
+
+    let format = LittleEndian::read_u16(&data[0..2]);
+    if format != POOL_META_FORMAT {
+        return PoolMetaReplica::Incompatible(format!("unsupported format {format}"));
+    }
+    let version = LittleEndian::read_u16(&data[2..4]);
+    if version != POOL_META_VERSION {
+        return PoolMetaReplica::Incompatible(format!("unsupported version {version}"));
+    }
+
+    let payload = &data[4..];
+    let meta = match rmp::decode::read_array_len(&mut &payload[..]) {
+        Ok(2) => match rmp_serde::from_slice::<PersistedPoolMeta>(payload) {
+            Ok(meta) => match PoolMeta::try_from(meta) {
+                Ok(meta) => meta,
+                Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+            },
+            Err(err) => return classify_pool_meta_tuple_decode_error("current", err),
+        },
+        // V1's third tuple field is the legacy `dont_save` flag. A same-version
+        // boolean extension is byte-identical, so schema extensions must bump
+        // POOL_META_VERSION instead of reusing this shape.
+        Ok(3) => match rmp_serde::from_slice::<LegacyPoolMeta>(payload) {
+            Ok(meta) => match PoolMeta::try_from(meta) {
+                Ok(meta) => meta,
+                Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+            },
+            Err(err) => return classify_pool_meta_tuple_decode_error("legacy", err),
+        },
+        Ok(field_count) if field_count < 2 => {
+            return PoolMetaReplica::Corrupt(format!("pool metadata tuple has only {field_count} fields"));
+        }
+        Ok(field_count) => {
+            return PoolMetaReplica::Incompatible(format!("pool metadata tuple has unsupported field count {field_count}"));
+        }
+        Err(_) => {
+            let mut meta = PoolMeta::default();
+            if let Err(err) = meta.load_from_config_data(data.clone()) {
+                let reason = err.to_string();
+                if reason.contains("unknown field") {
+                    return PoolMetaReplica::Incompatible(format!("current-version payload uses unsupported fields: {reason}"));
+                }
+                return PoolMetaReplica::Corrupt(reason);
+            }
+            meta
+        }
+    };
+
+    match meta.encode_config_data() {
+        Ok(canonical) => PoolMetaReplica::Valid {
+            raw: data,
+            canonical,
+            meta,
+        },
+        Err(err) => PoolMetaReplica::Corrupt(err.to_string()),
+    }
+}
+
+async fn read_pool_meta_replica<S>(pool: Arc<S>, no_lock: bool) -> PoolMetaReplica
+where
+    S: EcstoreObjectIO,
+{
+    let result = if no_lock {
+        read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME)
+            .await
+            .map(|(data, _)| data)
+    } else {
+        read_config_preserve_empty(pool, POOL_META_NAME).await
+    };
+    match result {
+        Ok(data) => decode_pool_meta_replica(data),
+        Err(Error::ConfigNotFound) => PoolMetaReplica::Missing,
+        Err(err) => PoolMetaReplica::Unreadable(err.to_string()),
+    }
+}
+
+fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSelection> {
+    if replicas.is_empty() {
+        return Err(Error::other("pool metadata recovery required: no storage pools available"));
+    }
+
+    // V1 has no durable generation. Semantically equivalent legacy/current
+    // encodings can be normalized, but different canonical snapshots require
+    // an operator-selected recovery source instead of an inferred winner.
+    let mut selected: Option<(usize, Vec<u8>, Vec<u8>, PoolMeta)> = None;
+    let mut needs_repair = false;
+    let mut repair_write_safe = true;
+    let mut missing = 0usize;
+    let mut unusable = Vec::new();
+
+    for (idx, replica) in replicas.into_iter().enumerate() {
+        match replica {
+            PoolMetaReplica::Missing => {
+                missing += 1;
+                needs_repair = true;
+            }
+            PoolMetaReplica::Corrupt(reason) => {
+                needs_repair = true;
+                unusable.push(format!("pool {idx} is corrupt: {reason}"));
+            }
+            PoolMetaReplica::Unreadable(reason) => {
+                needs_repair = true;
+                repair_write_safe = false;
+                unusable.push(format!("pool {idx} is unreadable: {reason}"));
+            }
+            PoolMetaReplica::Incompatible(reason) => {
+                return Err(Error::other(format!(
+                    "pool metadata recovery required: pool {idx} is incompatible ({reason}); upgrade or restore a compatible replica without overwriting it"
+                )));
+            }
+            PoolMetaReplica::Valid { raw, canonical, meta } => {
+                if let Some((selected_idx, selected_raw, selected_canonical, _)) = selected.as_ref() {
+                    if selected_canonical != &canonical {
+                        return Err(Error::other(format!(
+                            "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
+                        )));
+                    }
+                    needs_repair |= selected_raw != &raw;
+                } else {
+                    selected = Some((idx, raw, canonical, meta));
+                }
+            }
+        }
+    }
+
+    if let Some((_, _, _, meta)) = selected {
+        return Ok(PoolMetaSelection {
+            meta,
+            replica_state: PoolMetaReplicaState {
+                needs_repair,
+                repair_write_safe,
+            },
+        });
+    }
+    if missing > 0 && unusable.is_empty() {
+        return Ok(PoolMetaSelection {
+            meta: PoolMeta::default(),
+            replica_state: PoolMetaReplicaState {
+                needs_repair: false,
+                repair_write_safe: true,
+            },
+        });
+    }
+
+    Err(Error::other(format!(
+        "pool metadata recovery required: no valid replica is available ({})",
+        unusable.join("; ")
+    )))
+}
+
+async fn load_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Result<PoolMetaSelection>
+where
+    S: EcstoreObjectIO,
+{
+    let replicas = join_all(pools.into_iter().map(|pool| read_pool_meta_replica(pool, no_lock))).await;
+    select_pool_meta_replica(replicas)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPoolMeta {
@@ -1579,7 +2403,7 @@ struct PersistedPoolMeta {
     pub pools: Vec<PersistedPoolStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPoolStatus {
     #[serde(rename = "id")]
@@ -1592,7 +2416,7 @@ struct PersistedPoolStatus {
     pub decommission: Option<PersistedPoolDecommissionInfo>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPoolDecommissionInfo {
     #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
@@ -2014,41 +2838,21 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn load(&mut self, pool: Arc<Sets>, _pools: Vec<Arc<Sets>>) -> Result<()> {
-        let data = match read_config(pool, POOL_META_NAME).await {
-            Ok(data) => data,
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-        };
-        self.load_from_config_data(data)
+    pub async fn load(&mut self, _pool: Arc<Sets>, pools: Vec<Arc<Sets>>) -> Result<()> {
+        let selection = load_pool_meta_replicas(pools, false).await?;
+        *self = selection.meta;
+        Ok(())
     }
 
-    /// Startup loads pool metadata before the full namespace-lock RPC surface is ready.
-    pub(crate) async fn load_for_startup<S>(&mut self, pool: Arc<S>) -> Result<()>
+    /// Loads every pool metadata replica while the caller owns the metadata fence
+    /// or before the namespace-lock RPC surface is ready during startup.
+    pub(crate) async fn load_no_lock_from_replicas<S>(&mut self, pools: Vec<Arc<S>>) -> Result<PoolMetaReplicaState>
     where
         S: EcstoreObjectIO,
     {
-        self.load_no_lock(pool).await
-    }
-
-    pub(crate) async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
-    where
-        S: EcstoreObjectIO,
-    {
-        let data = match read_config_no_lock(pool, POOL_META_NAME).await {
-            Ok(data) => data,
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-        };
-        self.load_from_config_data(data)
+        let selection = load_pool_meta_replicas(pools, true).await?;
+        *self = selection.meta;
+        Ok(selection.replica_state)
     }
 
     fn encode_config_data(&self) -> Result<Vec<u8>> {
@@ -2415,24 +3219,10 @@ impl PoolMeta {
     }
 
     pub fn return_resumable_pools(&self) -> Vec<PoolStatus> {
-        let mut new_pools = Vec::new();
-        for pool in &self.pools {
-            if let Some(decommission) = &pool.decommission {
-                if !decommission.has_decommission_state() {
-                    continue;
-                }
-                if decommission.complete || decommission.failed || decommission.canceled {
-                    // Recovery is not required when:
-                    // - Decommissioning completed
-                    // - Decommissioning failed and must be explicitly restarted or cleared
-                    // - Decommissioning was cancelled
-                    continue;
-                }
-                // All other scenarios require recovery
-                new_pools.push(pool.clone());
-            }
-        }
-        new_pools
+        resumable_decommission_queue_indices(self)
+            .into_iter()
+            .map(|idx| self.pools[idx].clone())
+            .collect()
     }
 }
 
@@ -2689,7 +3479,7 @@ fn decommission_remote_tiered_opts(
         src_pool_idx,
         data_movement: true,
         include_part_checksums: true,
-        http_preconditions: Some(crate::data_movement::data_movement_target_precondition()),
+        http_preconditions: Some(data_movement::data_movement_target_precondition()),
         expected_bucket_incarnation_id,
         ..Default::default()
     }
@@ -2922,7 +3712,8 @@ impl ECStore {
             pool_meta.clone()
         };
         let mut latest_pool_meta = PoolMeta::default();
-        latest_pool_meta.load_no_lock(rebalance_pool).await?;
+        let replica_state = latest_pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
+        replica_state.ensure_write_safe("decommission start failed")?;
         if latest_pool_meta.pools.is_empty() {
             latest_pool_meta = current_pool_meta;
         }
@@ -2970,6 +3761,8 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("refresh_pool_status_meta: no pools available"))?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let mut persisted = PoolMeta::default();
         persisted.load(pool, self.pools.clone()).await?;
 
@@ -2982,7 +3775,9 @@ impl ECStore {
         };
 
         let mut pool_meta = self.pool_meta.write().await;
-        merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers);
+        if merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers) {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
         Ok(())
     }
 
@@ -3013,12 +3808,172 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn decommission_cancel(&self, idx: usize) -> Result<()> {
+    pub async fn decommission_cancel(self: &Arc<Self>, idx: usize) -> Result<()> {
         self.decommission_cancel_with_owner(idx, None).await
     }
 
-    async fn decommission_cancel_for_operation(&self, idx: usize, owner: &DecommissionCanceler) -> Result<()> {
+    async fn decommission_cancel_for_operation(self: &Arc<Self>, idx: usize, owner: &DecommissionCanceler) -> Result<()> {
         self.decommission_cancel_with_owner(idx, Some(owner)).await
+    }
+
+    async fn decommission_cancel_with_owner_and_save<Save, SaveFuture>(
+        self: &Arc<Self>,
+        idx: usize,
+        owner: Option<&DecommissionCanceler>,
+        save_pool_meta: Save,
+    ) -> Result<()>
+    where
+        Save: FnOnce(PoolMeta) -> SaveFuture + Send + 'static,
+        SaveFuture: Future<Output = Result<()>> + Send + 'static,
+    {
+        let store = self.clone();
+        let owner = owner.cloned();
+        // Dropping the RPC waiter detaches this task; the transaction retains
+        // the store and exact owner until persistence is resolved.
+        tokio::spawn(async move { store.decommission_cancel_transaction(idx, owner, save_pool_meta).await })
+            .await
+            .map_err(|err| Error::other(format!("decommission cancel transaction task join error: {err}")))?
+    }
+
+    async fn decommission_cancel_transaction<Save, SaveFuture>(
+        &self,
+        idx: usize,
+        owner: Option<DecommissionCanceler>,
+        save_pool_meta: Save,
+    ) -> Result<()>
+    where
+        Save: FnOnce(PoolMeta) -> SaveFuture,
+        SaveFuture: Future<Output = Result<()>>,
+    {
+        let owner = owner.as_ref();
+        ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
+        let _start_guard = self.start_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
+
+        // Lock order: start gate, save gate, decommission_cancelers, then
+        // pool_meta. The state guards stay held across persistence so the
+        // active generation cannot change before the cancel is published.
+        let mut cancelers = self.decommission_cancelers.write().await;
+        let mut pool_meta = self.pool_meta.write().await;
+        let (pending, should_reload_pool_meta, already_canceled, terminal_canceler) = {
+            let mut already_canceled = false;
+            let (pool_present, decommission_present, terminal) = if let Some(pool) = pool_meta.pools.get(idx) {
+                if let Some(info) = pool.decommission.as_ref() {
+                    already_canceled = info.canceled;
+                    (
+                        true,
+                        info.has_decommission_state(),
+                        should_reject_decommission_cancel_as_terminal(info.complete, info.failed),
+                    )
+                } else {
+                    (true, false, false)
+                }
+            } else {
+                (false, false, false)
+            };
+
+            ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
+            let previous_pool = pool_meta
+                .pools
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), idx))?;
+            let previous_decommission = previous_pool
+                .decommission
+                .as_ref()
+                .ok_or_else(|| decommission_metadata_not_initialized_error("cancel decommission"))?;
+            let mut snapshot = pool_meta.clone();
+            let Some(changed) = update_decommission_for_operation(cancelers.as_slice(), &mut snapshot, idx, owner, |pool_meta| {
+                pool_meta.decommission_cancel(idx)
+            }) else {
+                return Ok(());
+            };
+            let pending = if changed {
+                let canceled_pool = snapshot
+                    .pools
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), idx))?;
+                Some((
+                    snapshot,
+                    DecommissionCancelCommit {
+                        previous_start_time: previous_decommission.start_time,
+                        previous_queued: previous_decommission.queued,
+                        previous_last_update: previous_pool.last_update,
+                        canceled_pool,
+                    },
+                ))
+            } else {
+                None
+            };
+            let terminal_canceler = if let Some(owner) = owner {
+                Some(owner.clone())
+            } else {
+                cancelers.get(idx).and_then(Option::as_ref).cloned()
+            };
+            (
+                pending,
+                should_retry_decommission_cancel_reload(changed, already_canceled),
+                already_canceled,
+                terminal_canceler,
+            )
+        };
+        let active_worker = terminal_canceler.as_ref().is_some_and(DecommissionCanceler::is_active);
+        if !active_worker && !already_canceled {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "cancel_skipped",
+                reason = "no_active_canceler",
+                "Decommission cancel skipped"
+            );
+        }
+
+        let changed = pending.is_some();
+        let commit_result = if let Some((snapshot, commit)) = pending {
+            save_pool_meta(snapshot).await?;
+            commit_decommission_cancel(&mut pool_meta, idx, commit)
+        } else {
+            Ok(())
+        };
+
+        if let Some(canceler) = terminal_canceler.as_ref() {
+            take_and_cancel_decommission_canceler_for_operation(cancelers.as_mut_slice(), idx, canceler);
+        }
+        commit_result?;
+        drop(pool_meta);
+        drop(cancelers);
+        drop(save_guard);
+
+        if changed {
+            // Persistence must commit before the cancellation signal. Wait for
+            // in-flight movement only after signaling so readers can release
+            // the shared gate without deadlocking the terminal transition.
+            let movement_gate = self.ctx.data_movement_operation_gate();
+            let _movement_guard = movement_gate.write().await;
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+
+        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
+            let stage = format!("decommission_cancel for pool {idx}");
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "terminal_reload_failed",
+                    error = %err,
+                    "Decommission cancel saved locally but pool meta reload failed"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn release_decommission_canceler_slot(&self, idx: usize, owner: &DecommissionCanceler) {
@@ -3048,7 +4003,11 @@ impl ECStore {
         retryable
     }
 
-    async fn retry_decommission_cancel_for_operation(&self, idx: usize, owner: &DecommissionCanceler) {
+    async fn retry_decommission_cancel_for_operation(self: &Arc<Self>, idx: usize, owner: &DecommissionCanceler) {
+        if !self.decommission_terminal_retryable_for_operation(idx, owner).await {
+            return;
+        }
+
         let mut attempt = 0usize;
         loop {
             let Err(err) = self.decommission_cancel_for_operation(idx, owner).await else {
@@ -3098,87 +4057,10 @@ impl ECStore {
         }
     }
 
-    async fn decommission_cancel_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
-        ensure_decommission_terminal_operation_supported(self.single_pool(), "cancel decommission")?;
-        let _start_guard = self.start_gate.lock().await;
-
-        // Lock order: decommission_cancelers before pool_meta. Holding both makes
-        // owner validation and the terminal transition one atomic operation.
-        let (should_save_pool_meta, should_reload_pool_meta, already_canceled, previous_pool_meta, terminal_canceler) = {
-            let cancelers = self.decommission_cancelers.read().await;
-            let mut lock = self.pool_meta.write().await;
-            let mut already_canceled = false;
-            let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
-                if let Some(info) = pool.decommission.as_ref() {
-                    already_canceled = info.canceled;
-                    (
-                        true,
-                        info.has_decommission_state(),
-                        should_reject_decommission_cancel_as_terminal(info.complete, info.failed),
-                    )
-                } else {
-                    (true, false, false)
-                }
-            } else {
-                (false, false, false)
-            };
-
-            ensure_decommission_cancel_allowed(pool_present, decommission_present, terminal)?;
-            let previous_pool_meta = lock.clone();
-            let Some(changed) = update_decommission_for_operation(cancelers.as_slice(), &mut lock, idx, owner, |pool_meta| {
-                pool_meta.decommission_cancel(idx)
-            }) else {
-                return Ok(());
-            };
-            let terminal_canceler = if let Some(owner) = owner {
-                Some(owner.clone())
-            } else {
-                cancelers.get(idx).and_then(Option::as_ref).cloned()
-            };
-            if let Some(canceler) = terminal_canceler.as_ref() {
-                canceler.cancel();
-            }
-            (
-                changed,
-                should_retry_decommission_cancel_reload(changed, already_canceled),
-                already_canceled,
-                changed.then_some(previous_pool_meta),
-                terminal_canceler,
-            )
-        };
-        let canceled_worker = terminal_canceler.as_ref().is_some_and(DecommissionCanceler::is_active);
-        if !canceled_worker && !already_canceled {
-            warn!(
-                event = EVENT_DECOMMISSION_STATE,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_POOLS,
-                pool_index = idx,
-                state = "cancel_skipped",
-                reason = "no_active_canceler",
-                "Decommission cancel skipped"
-            );
-        }
-
-        self.wait_for_decommission_side_effects().await;
-
-        if should_save_pool_meta && let Err(err) = self.save_current_pool_meta().await {
-            if let Some(previous_pool_meta) = previous_pool_meta {
-                let mut pool_meta = self.pool_meta.write().await;
-                rollback_decommission_pool_meta(&mut pool_meta, previous_pool_meta);
-            }
-            return Err(err);
-        }
-
-        if let Some(canceler) = terminal_canceler.as_ref() {
-            self.release_decommission_canceler_slot(idx, canceler).await;
-        }
-
-        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
-            let stage = format!("decommission_cancel for pool {idx}");
-            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
-        }
-
-        Ok(())
+    async fn decommission_cancel_with_owner(self: &Arc<Self>, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
+        let pools = self.pools.clone();
+        self.decommission_cancel_with_owner_and_save(idx, owner, move |snapshot| async move { snapshot.save(pools).await })
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3200,7 +4082,11 @@ impl ECStore {
                 .unwrap_or((false, false, false, false));
             ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled)?;
         }
-        self.cancel_decommission_routines_and_wait(&[idx]).await;
+        // Cancel workers before waiting for the movement writer so active
+        // object operations can observe the signal and release read guards.
+        self.cancel_decommission_routines(&[idx]).await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
             let mut pool_meta = self.pool_meta.write().await;
@@ -3217,9 +4103,26 @@ impl ECStore {
             return Err(err);
         }
 
+        if should_reload_pool_meta {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        drop(_movement_guard);
+
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("clear_decommission for pool {idx}");
-            resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
+            if let Err(err) =
+                resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
+            {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "terminal_reload_failed",
+                    error = %err,
+                    "Decommission clear saved locally but pool meta reload failed"
+                );
+            }
         }
 
         Ok(())
@@ -3227,23 +4130,26 @@ impl ECStore {
 
     async fn promote_queued_decommission(&self, idx: usize, owner: &DecommissionCanceler) -> Result<OffsetDateTime> {
         // Serialize promotion and generation capture with clear/restart transitions.
-        let (promoted, generation, save_error) = {
+        let (changed, generation, save_error) = {
             let _start_guard = self.start_gate.lock().await;
+            let movement_gate = self.ctx.data_movement_operation_gate();
+            let _movement_guard = movement_gate.write().await;
             let mut pool_meta = self.pool_meta.write().await;
             if pool_meta.pools.get(idx).is_none() {
                 return Err(Error::other("failed to start decommission: target pool was not found"));
             }
+            let reconciled = reconcile_decommission_meta_buckets(&mut pool_meta, idx);
             let promoted = pool_meta.promote_queued_decommission(idx);
+            let changed = reconciled || promoted;
             drop(pool_meta);
 
-            let save_error = if promoted {
+            let save_error = if changed {
                 self.save_current_pool_meta().await.err()
             } else {
                 None
             };
-
             let generation = self.active_decommission_generation(idx).await?;
-            (promoted, generation, save_error)
+            (changed, generation, save_error)
         };
 
         if let Some(err) = save_error {
@@ -3255,7 +4161,10 @@ impl ECStore {
             return Err(err);
         }
 
-        if promoted && let Some(notification_sys) = runtime_sources::notification_sys() {
+        if changed {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        if changed && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("promote_queued_decommission for pool {idx}");
             if let Err(err) =
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())
@@ -3272,7 +4181,15 @@ impl ECStore {
         Ok(generation)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn promote_queued_decommission_for_test(&self, idx: usize) -> Result<()> {
+        let owner = DecommissionCanceler::new(CancellationToken::new());
+        self.promote_queued_decommission(idx, &owner).await.map(|_| ())
+    }
+
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let changed = {
             let mut pool_meta = self.pool_meta.write().await;
             pool_meta.record_decommission_terminal_reload_failure(idx, stage, err.to_string())?
@@ -3313,19 +4230,26 @@ impl ECStore {
         is_decommission_cancel_requested(rx.is_cancelled(), pool_meta.pools.get(idx))
     }
 
+    #[cfg(test)]
     async fn cancel_decommission_routines_and_wait(&self, indices: &[usize]) {
+        self.cancel_decommission_routines(indices).await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
+    }
+
+    async fn cancel_decommission_routines(&self, indices: &[usize]) {
         {
             let mut cancelers = self.decommission_cancelers.write().await;
             for idx in indices {
                 take_and_cancel_decommission_canceler(cancelers.as_mut_slice(), *idx);
             }
         }
-        self.wait_for_decommission_side_effects().await;
     }
 
-    async fn wait_for_decommission_side_effects(&self) {
-        let operation_gate = self.ctx.decommission_operation_gate();
-        let _operation_guard = operation_gate.write().await;
+    async fn quiesce_decommission_worker_after_join_error(&self, canceler: &DecommissionCanceler) {
+        canceler.cancel();
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
     }
 
     async fn reserve_decommission_routines(
@@ -3341,7 +4265,7 @@ impl ECStore {
         let _start_guard = self.start_gate.lock().await;
         let indices = {
             let pool_meta = self.pool_meta.read().await;
-            first_resumable_decommission_queue_indices(&pool_meta)
+            resumable_decommission_queue_indices(&pool_meta)
                 .into_iter()
                 .filter(|idx| indices.contains(idx))
                 .collect::<Vec<_>>()
@@ -3364,6 +4288,19 @@ impl ECStore {
         Ok(index_cancelers)
     }
 
+    async fn reserve_missing_local_decommission_routines(
+        &self,
+        rx: &CancellationToken,
+        endpoints: &EndpointServerPools,
+    ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
+        let indices = {
+            let pool_meta = self.pool_meta.read().await;
+            resumable_decommission_queue_indices(&pool_meta)
+        };
+        let indices = local_decommission_queue_prefix(endpoints, &indices)?;
+        self.reserve_decommission_routines(rx, indices.as_slice()).await
+    }
+
     pub(crate) async fn spawn_decommission_routines(
         &self,
         store: Arc<ECStore>,
@@ -3372,7 +4309,7 @@ impl ECStore {
     ) -> Result<()> {
         let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
         if !index_cancelers.is_empty() {
-            std::mem::drop(spawn_decommission_index_cancelers(
+            drop(spawn_decommission_index_cancelers(
                 store,
                 rx,
                 index_cancelers,
@@ -3384,22 +4321,14 @@ impl ECStore {
     }
 
     pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
-        let indices = {
-            let pool_meta = self.pool_meta.read().await;
-            first_resumable_decommission_queue_indices(&pool_meta)
-        };
-        let indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
-        if indices.is_empty() {
-            return Ok(());
-        }
-
         let rx = CancellationToken::new();
-        let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
+        let endpoints = self.endpoints();
+        let index_cancelers = self.reserve_missing_local_decommission_routines(&rx, &endpoints).await?;
         if index_cancelers.is_empty() {
             return Ok(());
         }
 
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             self.clone(),
             rx,
             index_cancelers,
@@ -3429,7 +4358,7 @@ impl ECStore {
         let index_cancelers = self
             .start_decommission_with_routines(indices, &rx, local_indices.as_slice())
             .await?;
-        std::mem::drop(spawn_decommission_index_cancelers(
+        drop(spawn_decommission_index_cancelers(
             store,
             rx,
             index_cancelers,
@@ -3472,6 +4401,7 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         queue: Arc<tokio::sync::Mutex<mpsc::Receiver<QueuedDecommissionEntry>>>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
@@ -3562,6 +4492,7 @@ impl ECStore {
                     object_lock_config.clone(),
                     replication_config.clone(),
                     expected_bucket_incarnation_id,
+                    Arc::clone(&source_changed_exhaustions),
                 )
                 .await;
             drop(entry_budget_permit);
@@ -3599,6 +4530,7 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
         entry_budget: Arc<Semaphore>,
         entry_error: Arc<tokio::sync::Mutex<Option<Error>>>,
     ) -> Result<()> {
@@ -3618,6 +4550,7 @@ impl ECStore {
             let lifecycle_config = lifecycle_config.clone();
             let object_lock_config = object_lock_config.clone();
             let replication_config = replication_config.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             let queue = queue.clone();
             let entry_budget = entry_budget.clone();
             let entry_error = entry_error.clone();
@@ -3633,6 +4566,7 @@ impl ECStore {
                     object_lock_config,
                     replication_config,
                     expected_bucket_incarnation_id,
+                    source_changed_exhaustions,
                     entry_budget,
                     queue,
                     entry_error,
@@ -3774,8 +4708,15 @@ impl ECStore {
         Ok(())
     }
 
-    #[allow(unused_assignments, clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, set, lifecycle_config, object_lock_config, replication_config))]
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(
+        self,
+        set,
+        lifecycle_config,
+        object_lock_config,
+        replication_config,
+        source_changed_exhaustions
+    ))]
     async fn decommission_entry(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -3788,15 +4729,85 @@ impl ECStore {
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
+        let mut counted_versions = HashSet::new();
+
+        for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
+            match self
+                .decommission_entry_attempt(
+                    rx.clone(),
+                    idx,
+                    generation,
+                    entry.clone(),
+                    bucket.clone(),
+                    Arc::clone(&set),
+                    lifecycle_config.clone(),
+                    object_lock_config.clone(),
+                    replication_config.clone(),
+                    expected_bucket_incarnation_id,
+                    entry_attempt,
+                    source_changed_exhaustions.as_ref(),
+                    &mut counted_versions,
+                )
+                .await?
+            {
+                DecommissionEntryAttemptOutcome::Complete => return Ok(()),
+                DecommissionEntryAttemptOutcome::SourceChanged => {
+                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, entry_attempt);
+                    warn!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "source_changed_retry",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        attempt = entry_attempt,
+                        max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "Decommission source changed during cleanup preflight; retrying entry"
+                    );
+                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                    }
+                }
+            }
+        }
+
+        Err(Error::other(format!(
+            "decommission entry retry loop ended without a terminal result for {bucket}/{}",
+            entry.name
+        )))
+    }
+
+    #[allow(unused_assignments, clippy::too_many_arguments)]
+    async fn decommission_entry_attempt(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        generation: OffsetDateTime,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        object_lock_config: Option<ObjectLockConfiguration>,
+        replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        entry_attempt: usize,
+        source_changed_exhaustions: &AtomicUsize,
+        counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
+    ) -> Result<DecommissionEntryAttemptOutcome> {
         debug!(
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "started",
             pool_index = idx,
             bucket = %bucket,
             object = %entry.name,
-            state = "started",
+            attempt = entry_attempt,
+            max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
             "Decommission entry started"
         );
         if entry.is_dir() {
@@ -3810,14 +4821,20 @@ impl ECStore {
                 state = "skipped_directory",
                 "Decommission entry skipped directory"
             );
-            return Ok(());
+            return Ok(DecommissionEntryAttemptOutcome::Complete);
         }
+        let durable_ilm_record = if bucket == RUSTFS_META_BUCKET {
+            classify_durable_ilm_record(&entry.name)
+                .map_err(|err| with_decommission_entry_context("durable_ilm_namespace", &bucket, &entry.name, err))?
+        } else {
+            None
+        };
         if self.decommission_cancel_requested(idx, &rx).await {
             rx.cancel();
         }
         decommission_cancel_signal_result(rx.is_cancelled())?;
         self.ensure_decommission_generation_current(idx, generation).await?;
-        let operation_gate = self.ctx.decommission_operation_gate();
+        let operation_gate = self.ctx.data_movement_operation_gate();
 
         let bucket_incarnation_fence = match expected_bucket_incarnation_id {
             Some(expected) => Some(self.acquire_bucket_incarnation_fence(&bucket, expected).await?),
@@ -3832,6 +4849,7 @@ impl ECStore {
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
             if self.decommission_cancel_requested(idx, &rx).await {
@@ -3883,33 +4901,49 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             if version.deleted {
-                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
-                    self.delete_object(
+                for version_attempt in 1..=DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                    let result = run_decommission_side_effect(&rx, &operation_gate, || async {
+                        self.delete_object(
+                            bucket.as_str(),
+                            &version.name,
+                            decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
+                        )
+                        .await
+                    })
+                    .await;
+                    #[cfg(test)]
+                    let result = decommission_test_wrap_result(
+                        "delete_marker_copy",
                         bucket.as_str(),
-                        &version.name,
-                        decommission_delete_marker_opts(version, version_id.clone(), idx, expected_bucket_incarnation_id),
-                    )
-                    .await
-                })
-                .await
-                {
-                    if is_decommission_copy_cleanup_safe_error(&err) {
-                        warn!(
-                            event = EVENT_DECOMMISSION_ENTRY,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_POOLS,
-                            pool_index = idx,
-                            bucket = %bucket,
-                            object = %version.name,
-                            version_id = ?version_id,
-                            state = "ignored_delete_marker_copy",
-                            error = ?err,
-                            "Decommission delete marker copy ignored"
-                        );
-                        ignore = true;
-                        cleanup_ignored = true;
-                    } else {
-                        if is_decommission_target_capacity_error(&err) {
+                        version.name.as_str(),
+                        version_attempt,
+                        result,
+                    );
+
+                    match result {
+                        Ok(_) => {
+                            failure = false;
+                            error = None;
+                            break;
+                        }
+                        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => {
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "ignored_delete_marker_copy",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                error = ?err,
+                                "Decommission delete marker copy ignored"
+                            );
+                            ignore = true;
+                            cleanup_ignored = true;
+                            break;
+                        }
+                        Err(err) if is_decommission_target_capacity_error(&err) => {
                             return Err(with_decommission_entry_context(
                                 "delete_marker_copy",
                                 bucket.as_str(),
@@ -3917,10 +4951,47 @@ impl ECStore {
                                 err,
                             ));
                         }
+                        Err(err) => {
+                            failure = true;
+                            if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                                error!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "delete_marker_copy_failed",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    error = ?err,
+                                    "Decommission delete marker copy failed"
+                                );
+                                error = Some(err);
+                                break;
+                            }
 
-                        failure = true;
-
-                        error = Some(err)
+                            let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "delete_marker_copy_retry",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                attempt = version_attempt,
+                                max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                retry_delay_ms = retry_delay.as_millis(),
+                                error = ?err,
+                                "Decommission delete marker copy failed; retrying"
+                            );
+                            error = Some(err);
+                            if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                                decommission_cancel_signal_result(rx.is_cancelled())?;
+                            }
+                        }
                     }
                 }
 
@@ -3941,7 +5012,7 @@ impl ECStore {
                     continue;
                 }
 
-                {
+                if counted_versions.insert((version.version_id, version.deleted)) {
                     let mut pool_meta = self.pool_meta.write().await;
                     ensure_decommission_generation(&pool_meta, idx, generation)?;
                     if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, failure) {
@@ -3958,24 +5029,26 @@ impl ECStore {
                     decommissioned += 1;
                 }
 
-                debug!(
-                    event = EVENT_DECOMMISSION_ENTRY,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = idx,
-                    bucket = %bucket,
-                    object = %version.name,
-                    version_id = ?version_id,
-                    result = ?error,
-                    state = "delete_marker_copied",
-                    "Decommission delete marker copied"
-                );
+                if !failure {
+                    debug!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "delete_marker_copied",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %version.name,
+                        version_id = ?version_id,
+                        result = ?error,
+                        "Decommission delete marker copied"
+                    );
+                }
                 continue;
             }
 
-            for _i in 0..3 {
+            for version_attempt in 1..=DECOMMISSION_VERSION_COPY_ATTEMPTS {
                 if version.is_remote() {
-                    if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
+                    let result = run_decommission_side_effect(&rx, &operation_gate, || async {
                         self.decommission_tiered_object(
                             bucket.as_str(),
                             &version.name,
@@ -3984,15 +5057,26 @@ impl ECStore {
                         )
                         .await
                     })
-                    .await
-                    {
-                        if is_decommission_copy_cleanup_safe_error(&err) {
+                    .await;
+                    #[cfg(test)]
+                    let result = decommission_test_wrap_result(
+                        "decommission_tiered_object",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        version_attempt,
+                        result,
+                    );
+
+                    match result {
+                        Ok(_) => {
+                            failure = false;
+                            error = None;
+                        }
+                        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => {
                             ignore = true;
                             cleanup_ignored = true;
-                            break;
                         }
-
-                        if is_decommission_target_capacity_error(&err) {
+                        Err(err) if is_decommission_target_capacity_error(&err) => {
                             return Err(with_decommission_entry_context(
                                 "decommission_tiered_object",
                                 bucket.as_str(),
@@ -4000,10 +5084,48 @@ impl ECStore {
                                 err,
                             ));
                         }
-
-                        failure = true;
-                        error!("decommission_pool: decommission_tiered_object err {:?}", &err);
-                        error = Some(err);
+                        Err(err) => {
+                            failure = true;
+                            if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                                error!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "tiered_copy_failed",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    error = ?err,
+                                    "Decommission tiered version copy failed"
+                                );
+                                error = Some(err);
+                            } else {
+                                let retry_delay =
+                                    decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                                warn!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    state = "tiered_copy_retry",
+                                    pool_index = idx,
+                                    bucket = %bucket,
+                                    object = %version.name,
+                                    version_id = ?version_id,
+                                    attempt = version_attempt,
+                                    max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                    retry_delay_ms = retry_delay.as_millis(),
+                                    error = ?err,
+                                    "Decommission tiered version copy failed; retrying"
+                                );
+                                error = Some(err);
+                                if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                                    decommission_cancel_signal_result(rx.is_cancelled())?;
+                                }
+                                continue;
+                            }
+                        }
                     }
                     break;
                 }
@@ -4038,7 +5160,44 @@ impl ECStore {
                         }
 
                         failure = true;
-                        error!("decommission_pool: get_object_reader err {:?}", &err);
+                        if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                            error!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "object_read_failed",
+                                pool_index = idx,
+                                bucket = %bucket,
+                                object = %version.name,
+                                version_id = ?version_id,
+                                attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                                error = ?err,
+                                "Decommission source object read failed"
+                            );
+                            error = Some(err);
+                            continue;
+                        }
+
+                        let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                        warn!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "object_read_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %version.name,
+                            version_id = ?version_id,
+                            attempt = version_attempt,
+                            max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            error = ?err,
+                            "Decommission source object read failed; retrying"
+                        );
+                        error = Some(err);
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
                         continue;
                     }
                 };
@@ -4055,13 +5214,22 @@ impl ECStore {
                 )
                 .await?;
 
-                if let Err(err) = run_decommission_side_effect(&rx, &operation_gate, || async {
+                let migrate_result = run_decommission_side_effect(&rx, &operation_gate, || async {
                     self.clone()
                         .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id)
                         .await
                 })
-                .await
-                {
+                .await;
+                #[cfg(test)]
+                let migrate_result = decommission_test_wrap_result(
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                    bucket_name.as_str(),
+                    object_name.as_str(),
+                    version_attempt,
+                    migrate_result,
+                );
+
+                if let Err(err) = migrate_result {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
                         cleanup_ignored = true;
@@ -4078,8 +5246,45 @@ impl ECStore {
                     }
 
                     failure = true;
+                    if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
+                        error!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "object_migration_failed",
+                            pool_index = idx,
+                            bucket = %bucket_name,
+                            object = %object_name,
+                            version = %version.name,
+                            attempt = version_attempt,
+                            max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                            error = ?err,
+                            "Decommission object migration failed"
+                        );
+                        error = Some(err);
+                        continue;
+                    }
 
-                    error!("decommission_pool: decommission_object err {:?}", &err);
+                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_COPY_RETRY_DELAY, version_attempt);
+                    warn!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "object_migration_retry",
+                        pool_index = idx,
+                        bucket = %bucket_name,
+                        object = %object_name,
+                        version = %version.name,
+                        attempt = version_attempt,
+                        max_attempts = DECOMMISSION_VERSION_COPY_ATTEMPTS,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        error = ?err,
+                        "Decommission object migration failed; retrying"
+                    );
+                    error = Some(err);
+                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                        decommission_cancel_signal_result(rx.is_cancelled())?;
+                    }
                     continue;
                 }
 
@@ -4116,7 +5321,7 @@ impl ECStore {
                 continue;
             }
 
-            {
+            if counted_versions.insert((version.version_id, version.deleted)) {
                 let mut pool_meta = self.pool_meta.write().await;
                 ensure_decommission_generation(&pool_meta, idx, generation)?;
                 if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), failure) {
@@ -4138,7 +5343,8 @@ impl ECStore {
             }
         }
 
-        if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) {
+        if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) && durable_ilm_record.is_none()
+        {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(Error::other("decommission bucket incarnation fence was lost before source cleanup"));
             }
@@ -4163,6 +5369,9 @@ impl ECStore {
             )
             .await?;
 
+            #[cfg(test)]
+            run_decommission_cleanup_mutation_hook(bucket.as_str(), entry.name.as_str(), entry_attempt).await;
+
             let source_cleanup_mutation_fence = self
                 .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
                 .await?;
@@ -4183,16 +5392,69 @@ impl ECStore {
                     "decommission",
                 )
                 .await
-                .map_err(|err| match err {
-                    data_movement::SourceCleanupError::SourceChanged => Error::other(format!(
-                        "decommission: source cleanup preflight failed for {}/{}: source versions changed after migration started",
-                        bucket, entry.name
-                    )),
-                    data_movement::SourceCleanupError::Storage(err) => err,
-                })
             })
             .await;
-            resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
+            match cleanup_result {
+                Ok(_) => {}
+                Err(data_movement::SourceCleanupError::Storage(err)) => {
+                    resolve_decommission_entry_cleanup_delete_result(
+                        Err::<(), Error>(err),
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                    )?;
+                }
+                Err(data_movement::SourceCleanupError::SourceChanged) if entry_attempt < DECOMMISSION_ENTRY_MAX_ATTEMPTS => {
+                    return Ok(DecommissionEntryAttemptOutcome::SourceChanged);
+                }
+                Err(data_movement::SourceCleanupError::SourceChanged) => {
+                    let exhausted_entries = source_changed_exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_fail_decommission_pool_after_exhausted_source_changed(exhausted_entries) {
+                        return Err(Error::other(format!(
+                            "decommission source cleanup retries exhausted for {}/{} on all {} attempts; exhausted entries exceed pool limit {}",
+                            bucket, entry.name, DECOMMISSION_ENTRY_MAX_ATTEMPTS, DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+                        )));
+                    }
+
+                    {
+                        let mut pool_meta = self.pool_meta.write().await;
+                        ensure_decommission_generation(&pool_meta, idx, generation)?;
+                        count_decommission_item(&mut pool_meta, idx, 0, true).map_err(|err| {
+                            with_decommission_entry_context(
+                                "count_source_changed_exhaustion",
+                                bucket.as_str(),
+                                entry.name.as_str(),
+                                err,
+                            )
+                        })?;
+                    }
+
+                    error!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        state = "source_cleanup_exhausted",
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %entry.name,
+                        attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
+                        exhausted_entries,
+                        exhaustion_limit = DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT,
+                        "Decommission source cleanup retries exhausted; source retained and entry marked failed"
+                    );
+                    entry_blocked = true;
+                }
+            }
+        } else if durable_ilm_record.is_some() {
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                state = "retained_for_final_verification",
+                "Decommission durable ILM source retained for final verification"
+            );
         } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(
                 event = EVENT_DECOMMISSION_ENTRY,
@@ -4275,13 +5537,13 @@ impl ECStore {
             event = EVENT_DECOMMISSION_ENTRY,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_POOLS,
+            state = if entry_blocked { "blocked" } else { "completed" },
             pool_index = idx,
             bucket = %bucket,
             object = %entry.name,
-            state = "completed",
-            "Decommission entry completed"
+            "Decommission entry finished"
         );
-        Ok(())
+        Ok(DecommissionEntryAttemptOutcome::Complete)
     }
 
     #[cfg(test)]
@@ -4292,17 +5554,43 @@ impl ECStore {
         bucket: String,
         set: Arc<SetDisks>,
     ) -> Result<()> {
-        self.decommission_entry(
+        self.decommission_entry_with_retry_state_for_test(
             CancellationToken::new(),
             idx,
-            OffsetDateTime::now_utc(),
+            entry,
+            bucket,
+            set,
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decommission_entry_with_retry_state_for_test(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        expected_bucket_incarnation_id: Option<uuid::Uuid>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
+    ) -> Result<()> {
+        let generation = self.active_decommission_generation(idx).await?;
+        self.decommission_entry(
+            rx,
+            idx,
+            generation,
             entry,
             bucket,
             set,
             None,
             None,
             None,
-            None,
+            expected_bucket_incarnation_id,
+            source_changed_exhaustions,
         )
         .await
     }
@@ -4315,6 +5603,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bi: DecomBucketInfo,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
         let generation = self.active_decommission_generation(idx).await?;
@@ -4365,6 +5654,7 @@ impl ECStore {
             let object_lock_config = object_lock_config.clone();
             let replication_config = replication_config.clone();
             let entry_budget = entry_budget.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
             let entry_error = entry_error.clone();
             let worker = tokio::spawn(async move {
                 store
@@ -4379,6 +5669,7 @@ impl ECStore {
                         object_lock_config,
                         replication_config,
                         expected_bucket_incarnation_id,
+                        source_changed_exhaustions,
                         entry_budget,
                         entry_error,
                     )
@@ -4440,6 +5731,25 @@ impl ECStore {
         );
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_pool_for_test(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+        idx: usize,
+        pool: Arc<Sets>,
+        bucket: DecomBucketInfo,
+    ) -> Result<()> {
+        self.decommission_pool(
+            rx,
+            idx,
+            pool,
+            bucket,
+            Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, canceler))]
@@ -4602,7 +5912,10 @@ impl ECStore {
                     state = "verifying_completion",
                     "Decommission completion verification started"
                 );
-                if let Err(err) = self.check_after_decommission(idx).await {
+                if let Err(err) = self.check_after_decommission(idx, &rx, generation).await {
+                    if is_err_operation_canceled(&err) {
+                        return Err(err);
+                    }
                     resolve_decommission_terminal_mark_result(
                         self.decommission_failed_for_operation(idx, canceler).await,
                         "failed",
@@ -4612,13 +5925,6 @@ impl ECStore {
                         "failed to finalize decommission for pool {cmd_line}: post-check failed: {err}"
                     )));
                 }
-
-                if self.decommission_cancel_requested(idx, &rx).await {
-                    rx.cancel();
-                }
-                decommission_cancel_signal_result(rx.is_cancelled())?;
-                self.ensure_decommission_generation_current(idx, generation).await?;
-
                 info!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -4628,11 +5934,14 @@ impl ECStore {
                     state = "marking_completed",
                     "Decommission marking completed state"
                 );
-                resolve_decommission_terminal_mark_result(
-                    self.complete_decommission_for_operation(idx, canceler).await,
-                    "completed",
-                    &cmd_line,
-                )?;
+                if let Err(err) = self.complete_decommission_for_operation(idx, canceler).await {
+                    resolve_decommission_terminal_mark_result(
+                        self.decommission_failed_for_operation(idx, canceler).await,
+                        "failed",
+                        &cmd_line,
+                    )?;
+                    return Err(Error::other(format!("failed to finalize decommission for pool {cmd_line}: {err}")));
+                }
             }
             DecommissionFinalState::Failed => {
                 warn!(
@@ -4689,9 +5998,12 @@ impl ECStore {
     {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "mark decommission failed")?;
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
-        // Lock order: decommission_cancelers before pool_meta. Holding both makes
-        // owner validation and the terminal transition one atomic operation.
+        // Lock order: movement gate, then decommission_cancelers, then pool_meta.
+        // Holding both state locks makes owner validation and the terminal
+        // transition one atomic operation.
         let (should_reload_pool_meta, previous_pool_meta, terminal_canceler) = {
             let cancelers = self.decommission_cancelers.read().await;
             let mut pool_meta = self.pool_meta.write().await;
@@ -4727,6 +6039,12 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
+
+        if should_reload_pool_meta {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        drop(_movement_guard);
+
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_failed for pool {idx}");
             if let Some(err) = observe_decommission_terminal_reload_result(
@@ -4774,11 +6092,23 @@ impl ECStore {
 
     async fn complete_decommission_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "complete decommission")?;
+        ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
+        if let Some(owner) = owner {
+            let cancelers = self.decommission_cancelers.read().await;
+            if !decommission_canceler_is_owned_by(cancelers.as_slice(), idx, owner) {
+                owner.release();
+                return Ok(());
+            }
+        }
+        self.verify_decommission_durable_ilm_receipts(idx).await?;
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
-        // Lock order: decommission_cancelers before pool_meta. Holding both makes
-        // owner validation and the terminal transition one atomic operation.
-        let (should_reload_pool_meta, previous_pool_meta, terminal_canceler) = {
+        // Lock order: movement gate, then decommission_cancelers, then pool_meta.
+        // Holding both state locks makes owner validation and the terminal
+        // transition one atomic operation.
+        let (should_reload_pool_meta, completed, previous_pool_meta, terminal_canceler) = {
             let cancelers = self.decommission_cancelers.read().await;
             let mut pool_meta = self.pool_meta.write().await;
             let previous_pool_meta = pool_meta.clone();
@@ -4789,12 +6119,17 @@ impl ECStore {
             else {
                 return Ok(());
             };
+            let completed = pool_meta
+                .pools
+                .get(idx)
+                .and_then(|pool| pool.decommission.as_ref())
+                .is_some_and(|decommission| decommission.complete);
             let terminal_canceler = if let Some(owner) = owner {
                 Some(owner.clone())
             } else {
                 cancelers.get(idx).and_then(Option::as_ref).cloned()
             };
-            (changed, changed.then_some(previous_pool_meta), terminal_canceler)
+            (changed, completed, changed.then_some(previous_pool_meta), terminal_canceler)
         };
 
         if should_reload_pool_meta && let Err(err) = self.save_current_pool_meta().await {
@@ -4813,6 +6148,12 @@ impl ECStore {
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
+
+        if should_reload_pool_meta {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        drop(_movement_guard);
+
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("complete_decommission for pool {idx}");
             if let Some(err) = observe_decommission_terminal_reload_result(
@@ -4846,6 +6187,18 @@ impl ECStore {
             }
         }
 
+        if completed && let Err(err) = self.cleanup_decommission_durable_ilm_receipts(idx).await {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "receipt_cleanup_failed",
+                error = %err,
+                "Decommission durable ILM receipt cleanup failed"
+            );
+        }
+
         Ok(())
     }
 
@@ -4856,6 +6209,7 @@ impl ECStore {
         pool: Arc<Sets>,
         bucket: DecomBucketInfo,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let is_decommissioned = {
             let pool_meta = self.pool_meta.read().await;
@@ -4882,7 +6236,7 @@ impl ECStore {
         warn!("decommission: currently on bucket {}", &bucket.name);
 
         if let Err(err) = self
-            .decommission_pool(rx.clone(), idx, pool, bucket.clone(), entry_budget)
+            .decommission_pool(rx.clone(), idx, pool, bucket.clone(), entry_budget, source_changed_exhaustions)
             .await
         {
             error!("decommission: decommission_pool err {:?}", &err);
@@ -4917,15 +6271,20 @@ impl ECStore {
         idx: usize,
         pool: Arc<Sets>,
         buckets: Vec<DecomBucketInfo>,
-        limit: usize,
         entry_budget: Arc<Semaphore>,
+        source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
         let store = Arc::clone(self);
-        run_decommission_buckets_bounded(rx, buckets, limit, move |bucket, rx| {
+        run_decommission_buckets_bounded(rx, buckets, decommission_bucket_concurrency_limit(), move |bucket, rx| {
             let store = Arc::clone(&store);
             let pool = pool.clone();
             let entry_budget = entry_budget.clone();
-            Box::pin(async move { store.decommission_pending_bucket(rx, idx, pool, bucket, entry_budget).await })
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
+            Box::pin(async move {
+                store
+                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
+                    .await
+            })
         })
         .await
     }
@@ -4943,32 +6302,22 @@ impl ECStore {
             let pool_meta = self.pool_meta.read().await;
             pool_meta.pending_buckets(idx)
         };
+        let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
         let bucket_concurrency = decommission_bucket_concurrency_limit();
-        if bucket_concurrency <= 1 {
-            for bucket in pending {
-                self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                    .await?;
-            }
-            return Ok(());
-        }
-
         let (regular_buckets, meta_buckets) = split_decommission_buckets(pending);
-        self.decommission_buckets_concurrently(
-            rx.clone(),
-            idx,
-            pool.clone(),
-            regular_buckets,
-            bucket_concurrency,
-            entry_budget.clone(),
-        )
-        .await?;
-
-        for bucket in meta_buckets {
-            self.decommission_pending_bucket(rx.clone(), idx, pool.clone(), bucket, entry_budget.clone())
-                .await?;
-        }
-
-        Ok(())
+        let store = Arc::clone(self);
+        run_decommission_phases(rx.clone(), regular_buckets, meta_buckets, bucket_concurrency, move |bucket, rx| {
+            let store = Arc::clone(&store);
+            let pool = pool.clone();
+            let entry_budget = entry_budget.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
+            Box::pin(async move {
+                store
+                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
+                    .await
+            })
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -5007,17 +6356,16 @@ impl ECStore {
 
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
+        let mut healed_buckets = HashSet::with_capacity(decom_buckets.len());
         for bk in decom_buckets.iter() {
-            resolve_decommission_preflight_heal_result(&bk.name, self.heal_bucket(&bk.name, &HealOpts::default()).await)?;
+            if healed_buckets.insert(bk.name.as_str()) {
+                resolve_decommission_preflight_heal_result(&bk.name, self.heal_bucket(&bk.name, &HealOpts::default()).await)?;
+            }
         }
 
-        let meta_buckets = [
-            path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(CONFIG_PREFIX)]),
-            path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
-        ];
-
         let meta_bucket_opts = decommission_meta_bucket_options();
-        for bk in meta_buckets.iter() {
+        for prefix in DECOMMISSION_META_PREFIXES {
+            let bk = path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(prefix)]);
             if let Err(err) = self
                 .make_bucket(bk.to_string_lossy().to_string().as_str(), &meta_bucket_opts)
                 .await
@@ -5032,11 +6380,16 @@ impl ECStore {
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
         let all_space_infos = self.get_decommission_all_pool_space_infos().await?;
-        self.cancel_decommission_routines_and_wait(&indices).await;
+        // Signal cancellation before waiting for the movement writer so active
+        // object operations can observe the signal and release read guards.
+        self.cancel_decommission_routines(&indices).await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         let index_cancelers = if let Some((rx, local_indices)) = reservation {
-            // Lock order matches terminal transitions: decommission_cancelers
-            // before pool_meta while start_gate excludes another start.
+            // Lock order matches terminal transitions: movement gate, then
+            // decommission_cancelers, then pool_meta while start_gate excludes
+            // another start.
             let mut cancelers = self.decommission_cancelers.write().await;
             let pool_meta = self.pool_meta.read().await;
             ensure_decommission_start_target_capacity(&pool_meta, &indices, &all_space_infos)?;
@@ -5058,6 +6411,10 @@ impl ECStore {
         let previous_pool_meta = self
             .save_current_pool_meta_for_decommission_start(&indices, space_infos, decom_buckets)
             .await?;
+        self.ctx.advance_data_movement_operation_epoch();
+        // The local durable transition is now fenced. Release the writer
+        // before any peer RPC; remote reload must not block scanner admission.
+        drop(_movement_guard);
 
         if let Some(notification_sys) = runtime_sources::notification_sys()
             && let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await)
@@ -5072,11 +6429,20 @@ impl ECStore {
                 "Decommission start failed after pool metadata save"
             );
 
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
-            }
-            if let Err(rollback_save_err) = self.save_current_pool_meta().await {
+            let rollback_result = {
+                let movement_guard = movement_gate.write().await;
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
+                }
+                let rollback_result = self.save_current_pool_meta().await;
+                if rollback_result.is_ok() {
+                    self.ctx.advance_data_movement_operation_epoch();
+                }
+                drop(movement_guard);
+                rollback_result
+            };
+            if let Err(rollback_save_err) = rollback_result {
                 error!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -5136,21 +6502,960 @@ impl ECStore {
             })
             .collect();
 
-        ret.push(DecomBucketInfo {
-            name: RUSTFS_META_BUCKET.to_owned(),
-            prefix: CONFIG_PREFIX.to_owned(),
-        });
-        ret.push(DecomBucketInfo {
-            name: RUSTFS_META_BUCKET.to_owned(),
-            prefix: BUCKET_META_PREFIX.to_owned(),
-        });
+        ret.extend(decommission_meta_buckets());
 
         Ok(ret)
     }
 
-    async fn check_after_decommission(self: &Arc<Self>, idx: usize) -> Result<()> {
+    async fn durable_ilm_receipt_run_token(&self, source_pool_idx: usize) -> Result<String> {
+        let pool_meta = self.pool_meta.read().await;
+        let pool = pool_meta
+            .pools
+            .get(source_pool_idx)
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), source_pool_idx))?;
+        let start_time = pool
+            .decommission
+            .as_ref()
+            .and_then(|info| info.start_time)
+            .ok_or_else(|| Error::other(format!("decommission run identity is missing for pool {source_pool_idx}")))?;
+        Ok(decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time))
+    }
+
+    async fn load_decommissioned_durable_ilm_target(
+        &self,
+        source_pool_idx: usize,
+        path: &str,
+        max_record_size: usize,
+        record_context: &str,
+    ) -> Result<Option<(usize, Vec<u8>)>> {
+        let mut target = None::<(usize, Vec<u8>)>;
+        let mut first_read_error = None;
+        for (target_pool_idx, pool) in self.pools.iter().enumerate() {
+            if target_pool_idx == source_pool_idx {
+                continue;
+            }
+            match read_config_limited_preserve_empty(pool.clone(), path, max_record_size).await {
+                Ok(data) => {
+                    if let Some((existing_pool_idx, existing)) = target.as_ref()
+                        && existing != &data
+                    {
+                        return Err(Error::other(format!(
+                            "divergent target durable ILM records at path `{path}` {record_context} in pools {existing_pool_idx} and {target_pool_idx}"
+                        )));
+                    }
+                    target = Some((target_pool_idx, data));
+                }
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    first_read_error.get_or_insert_with(|| {
+                        Error::other(format!(
+                            "failed to read target durable ILM record at path `{path}` {record_context} from pool {target_pool_idx}: {err}"
+                        ))
+                    });
+                }
+            }
+        }
+
+        if let Some(err) = first_read_error {
+            return Err(err);
+        }
+        Ok(target)
+    }
+
+    async fn list_decommission_durable_ilm_receipt_paths_in_pool(&self, pool_idx: usize, prefix: &str) -> Result<Vec<String>> {
+        let pool = self
+            .pools
+            .get(pool_idx)
+            .ok_or_else(|| invalid_decommission_pool_index_error(self.pools.len(), pool_idx))?;
+        let mut receipts = Vec::new();
+        let mut continuation = None;
+        loop {
+            let page = pool
+                .clone()
+                .list_objects_v2(RUSTFS_META_BUCKET, prefix, continuation, None, 1000, false, None, false)
+                .await
+                .map_err(|err| {
+                    Error::other(format!(
+                        "failed to list durable ILM decommission receipts under `{prefix}` in pool {pool_idx}: {err}"
+                    ))
+                })?;
+            receipts.extend(page.objects.into_iter().map(|object| object.name));
+            if !page.is_truncated {
+                break;
+            }
+            continuation = Some(page.next_continuation_token.ok_or_else(|| {
+                Error::other(format!(
+                    "durable ILM decommission receipt listing under `{prefix}` in pool {pool_idx} was truncated without a continuation token"
+                ))
+            })?);
+        }
+        Ok(receipts)
+    }
+
+    async fn list_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<Vec<(usize, String)>> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let prefix = decommission_durable_ilm_receipt_run_prefix(&run_token);
+        let mut receipts = Vec::new();
+        for pool_idx in 0..self.pools.len() {
+            if pool_idx == source_pool_idx {
+                continue;
+            }
+            for receipt_path in self
+                .list_decommission_durable_ilm_receipt_paths_in_pool(pool_idx, &prefix)
+                .await?
+            {
+                let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+                if locator.run_token != run_token {
+                    return Err(Error::other(format!(
+                        "durable ILM receipt path `{receipt_path}` has an unexpected run token"
+                    )));
+                }
+                receipts.push((pool_idx, receipt_path));
+            }
+        }
+        Ok(receipts)
+    }
+
+    async fn list_decommission_durable_ilm_manifest_receipts(&self, source_pool_idx: usize) -> Result<Vec<String>> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let prefix = decommission_durable_ilm_receipt_run_prefix(&run_token);
+        let receipt_paths = self
+            .list_decommission_durable_ilm_receipt_paths_in_pool(source_pool_idx, &prefix)
+            .await?;
+        for receipt_path in &receipt_paths {
+            let locator = parse_decommission_durable_ilm_receipt_path(receipt_path)?;
+            if locator.run_token != run_token {
+                return Err(Error::other(format!(
+                    "durable ILM expected manifest receipt path `{receipt_path}` has an unexpected run token"
+                )));
+            }
+        }
+        Ok(receipt_paths)
+    }
+
+    async fn persist_decommission_durable_ilm_manifest(&self, source_pool_idx: usize) -> Result<()> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let receipt_paths = self.list_decommission_durable_ilm_manifest_receipts(source_pool_idx).await?;
+        for receipt_path in &receipt_paths {
+            self.read_decommission_durable_ilm_receipt(source_pool_idx, receipt_path)
+                .await?;
+        }
+        let manifest = DecommissionDurableIlmManifest::new(&run_token, &receipt_paths)?;
+        let manifest_path = decommission_durable_ilm_manifest_path(&run_token);
+        let encoded = manifest.encode()?;
+        let mut attempt = 1;
+        loop {
+            match read_config_limited_preserve_empty(
+                self.pools[source_pool_idx].clone(),
+                &manifest_path,
+                DECOMMISSION_DURABLE_ILM_MANIFEST_MAX_SIZE,
+            )
+            .await
+            {
+                Ok(existing) => {
+                    DecommissionDurableIlmManifest::decode(&existing, &run_token, &receipt_paths).map_err(|err| {
+                        Error::other(format!(
+                            "durable ILM expected manifest `{manifest_path}` in source pool {source_pool_idx} is invalid: {err}"
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read durable ILM expected manifest `{manifest_path}` from source pool {source_pool_idx}: {err}"
+                    )));
+                }
+            }
+            match save_config_with_opts(
+                self.pools[source_pool_idx].clone(),
+                &manifest_path,
+                encoded.clone(),
+                &ObjectOptions {
+                    max_parity: true,
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(Error::PreconditionFailed) if attempt < DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS => {
+                    attempt += 1;
+                }
+                Err(Error::PreconditionFailed) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM expected manifest `{manifest_path}` after concurrent updates"
+                    )));
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM expected manifest `{manifest_path}` in source pool {source_pool_idx}: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn load_decommission_durable_ilm_manifest(
+        &self,
+        source_pool_idx: usize,
+    ) -> Result<HashMap<String, DecommissionDurableIlmReceipt>> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let receipt_paths = self.list_decommission_durable_ilm_manifest_receipts(source_pool_idx).await?;
+        let manifest_path = decommission_durable_ilm_manifest_path(&run_token);
+        let data = read_config_limited_preserve_empty(
+            self.pools[source_pool_idx].clone(),
+            &manifest_path,
+            DECOMMISSION_DURABLE_ILM_MANIFEST_MAX_SIZE,
+        )
+        .await
+        .map_err(|err| {
+            Error::other(format!(
+                "failed to read durable ILM expected manifest `{manifest_path}` from source pool {source_pool_idx}: {err}"
+            ))
+        })?;
+        DecommissionDurableIlmManifest::decode(&data, &run_token, &receipt_paths).map_err(|err| {
+            Error::other(format!(
+                "durable ILM expected manifest `{manifest_path}` in source pool {source_pool_idx} is invalid: {err}"
+            ))
+        })?;
+
+        let mut receipts = HashMap::with_capacity(receipt_paths.len());
+        for receipt_path in receipt_paths {
+            let receipt = self
+                .read_decommission_durable_ilm_receipt(source_pool_idx, &receipt_path)
+                .await?;
+            if receipts.insert(receipt_path.clone(), receipt).is_some() {
+                return Err(Error::other(format!(
+                    "durable ILM expected manifest contains duplicate receipt path `{receipt_path}`"
+                )));
+            }
+        }
+        Ok(receipts)
+    }
+
+    async fn persist_decommission_durable_ilm_receipt(
+        &self,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        receipt: &DecommissionDurableIlmReceipt,
+    ) -> Result<()> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let receipt_path = decommission_durable_ilm_receipt_path(&run_token, &receipt.source_path, &receipt.id_kind, &receipt.id);
+        let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+        let mut attempt = 1;
+        loop {
+            let (merged, http_preconditions) = match read_config_limited_preserve_empty_with_metadata(
+                self.pools[target_pool_idx].clone(),
+                &receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
+            .await
+            {
+                Ok((existing_data, metadata)) => {
+                    let existing = DecommissionDurableIlmReceipt::decode(&existing_data).map_err(|err| {
+                        Error::other(format!(
+                            "durable ILM decommission receipt `{receipt_path}` in pool {target_pool_idx} for {} is invalid: {err}",
+                            locator.context()
+                        ))
+                    })?;
+                    Self::validate_decommission_durable_ilm_receipt_locator(&receipt_path, &locator, &existing)?;
+                    let merged = merge_decommission_durable_ilm_receipts(&existing, receipt)?;
+                    if merged == existing {
+                        return Ok(());
+                    }
+                    let etag = metadata.etag.filter(|etag| !etag.trim().is_empty()).ok_or_else(|| {
+                        Error::other(format!(
+                            "durable ILM decommission receipt `{receipt_path}` in pool {target_pool_idx} is missing an ETag"
+                        ))
+                    })?;
+                    (
+                        merged,
+                        HTTPPreconditions {
+                            if_match: Some(etag),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) =>
+                {
+                    (
+                        receipt.clone(),
+                        HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read durable ILM decommission receipt `{receipt_path}` from pool {target_pool_idx} for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            };
+            let encoded = merged.encode().map_err(|err| {
+                Error::other(format!(
+                    "failed to encode durable ILM decommission receipt `{receipt_path}` for source path `{}` {}: {err}",
+                    receipt.source_path,
+                    receipt.context()
+                ))
+            })?;
+            match save_config_with_opts(
+                self.pools[target_pool_idx].clone(),
+                &receipt_path,
+                encoded,
+                &ObjectOptions {
+                    max_parity: true,
+                    http_preconditions: Some(http_preconditions),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(Error::PreconditionFailed) if attempt < DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS => {
+                    attempt += 1;
+                }
+                Err(Error::PreconditionFailed) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM decommission receipt `{receipt_path}` for {} after concurrent updates",
+                        locator.context()
+                    )));
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to persist durable ILM decommission receipt `{receipt_path}` for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            }
+        }
+    }
+
+    fn validate_decommission_durable_ilm_receipt_locator(
+        receipt_path: &str,
+        locator: &DecommissionDurableIlmReceiptLocator,
+        receipt: &DecommissionDurableIlmReceipt,
+    ) -> Result<()> {
+        if locator.source_path != receipt.source_path || locator.id_kind != receipt.id_kind || locator.id != receipt.id {
+            return Err(Error::other(format!(
+                "durable ILM decommission receipt path `{receipt_path}` identity {} does not match receipt {}",
+                locator.context(),
+                receipt.context()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_decommission_durable_ilm_receipt(
+        &self,
+        receipt_pool_idx: usize,
+        receipt_path: &str,
+    ) -> Result<DecommissionDurableIlmReceipt> {
+        let locator = parse_decommission_durable_ilm_receipt_path(receipt_path)?;
+        let data = read_config_limited_preserve_empty(
+            self.pools[receipt_pool_idx].clone(),
+            receipt_path,
+            DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+        )
+        .await
+        .map_err(|err| {
+            Error::other(format!(
+                "failed to read durable ILM decommission receipt `{receipt_path}` from pool {receipt_pool_idx} for {}: {err}",
+                locator.context()
+            ))
+        })?;
+        let receipt = DecommissionDurableIlmReceipt::decode(&data).map_err(|err| {
+            Error::other(format!(
+                "durable ILM decommission receipt `{receipt_path}` in pool {receipt_pool_idx} for {} is invalid: {err}",
+                locator.context()
+            ))
+        })?;
+        Self::validate_decommission_durable_ilm_receipt_locator(receipt_path, &locator, &receipt)?;
+        Ok(receipt)
+    }
+
+    async fn load_decommission_durable_ilm_terminal_receipt(
+        &self,
+        source_pool_idx: usize,
+        path: &str,
+        source_record: &ValidatedDurableIlmRecord,
+    ) -> Result<Option<DecommissionDurableIlmReceipt>> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, source_record.id_kind, &source_record.id);
+        let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+        let mut proof = None::<DecommissionDurableIlmReceipt>;
+        for pool_idx in 0..self.pools.len() {
+            if pool_idx == source_pool_idx {
+                continue;
+            }
+            let data = match read_config_limited_preserve_empty(
+                self.pools[pool_idx].clone(),
+                &receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
+            .await
+            {
+                Ok(data) => data,
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) =>
+                {
+                    continue;
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read terminal durable ILM decommission receipt `{receipt_path}` from pool {pool_idx} for {}: {err}",
+                        source_record.context()
+                    )));
+                }
+            };
+            let receipt = DecommissionDurableIlmReceipt::decode(&data).map_err(|err| {
+                Error::other(format!(
+                    "terminal durable ILM decommission receipt `{receipt_path}` in pool {pool_idx} for {} is invalid: {err}",
+                    source_record.context()
+                ))
+            })?;
+            Self::validate_decommission_durable_ilm_receipt_locator(&receipt_path, &locator, &receipt)?;
+            if receipt.namespace != source_record.namespace
+                || receipt.id_kind != source_record.id_kind
+                || receipt.id != source_record.id
+            {
+                return Err(Error::other(format!(
+                    "terminal durable ILM decommission receipt identity mismatch at path `{path}` {}; receipt {}",
+                    source_record.context(),
+                    receipt.context()
+                )));
+            }
+            source_record
+                .checkpoint
+                .validate_successor(&receipt.checkpoint)
+                .map_err(|err| {
+                    Error::other(format!(
+                        "terminal durable ILM decommission receipt does not cover source at path `{path}` {}: {err}",
+                        source_record.context()
+                    ))
+                })?;
+            if receipt.terminal_checkpoint.is_some() {
+                proof = Some(match proof {
+                    Some(existing) => merge_decommission_durable_ilm_receipts(&existing, &receipt)?,
+                    None => receipt,
+                });
+            }
+        }
+        Ok(proof)
+    }
+
+    async fn verify_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
+        let expected_receipts = self.load_decommission_durable_ilm_manifest(source_pool_idx).await?;
+        let receipt_paths = self.list_decommission_durable_ilm_receipts(source_pool_idx).await?;
+        let present_receipt_paths = receipt_paths
+            .iter()
+            .map(|(_, receipt_path)| receipt_path.as_str())
+            .collect::<HashSet<_>>();
+        for (expected_path, expected) in &expected_receipts {
+            if !present_receipt_paths.contains(expected_path.as_str()) {
+                return Err(Error::other(format!(
+                    "durable ILM decommission receipt is missing at `{expected_path}` for source path `{}` {}",
+                    expected.source_path,
+                    expected.context()
+                )));
+            }
+        }
+
+        for (receipt_pool_idx, receipt_path) in receipt_paths {
+            let expected = expected_receipts.get(&receipt_path).ok_or_else(|| {
+                Error::other(format!(
+                    "durable ILM decommission receipt `{receipt_path}` in pool {receipt_pool_idx} is absent from the expected manifest"
+                ))
+            })?;
+            let receipt = self
+                .read_decommission_durable_ilm_receipt(receipt_pool_idx, &receipt_path)
+                .await?;
+            if receipt.source_path != expected.source_path
+                || receipt.namespace != expected.namespace
+                || receipt.id_kind != expected.id_kind
+                || receipt.id != expected.id
+            {
+                return Err(Error::other(format!(
+                    "durable ILM decommission receipt identity mismatch at `{receipt_path}` for source path `{}` {}; decoded {}",
+                    expected.source_path,
+                    expected.context(),
+                    receipt.context()
+                )));
+            }
+            expected.checkpoint.validate_successor(&receipt.checkpoint).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM decommission receipt generation mismatch at `{receipt_path}` for source path `{}` {}: {err}",
+                    expected.source_path,
+                    expected.context()
+                ))
+            })?;
+            match (&expected.terminal_checkpoint, &receipt.terminal_checkpoint) {
+                (Some(expected_terminal), Some(receipt_terminal)) => {
+                    expected_terminal.validate_successor(receipt_terminal).map_err(|err| {
+                        Error::other(format!(
+                            "durable ILM decommission terminal receipt generation mismatch at `{receipt_path}` for source path `{}` {}: {err}",
+                            expected.source_path,
+                            expected.context()
+                        ))
+                    })?;
+                }
+                (Some(_), None) => {
+                    return Err(Error::other(format!(
+                        "durable ILM decommission terminal receipt is missing at `{receipt_path}` for source path `{}` {}",
+                        expected.source_path,
+                        expected.context()
+                    )));
+                }
+                (None, _) => {}
+            }
+            let namespace = classify_durable_ilm_record(&receipt.source_path)?
+                .ok_or_else(|| Error::other(format!("path `{}` is not a durable ILM record", receipt.source_path)))?;
+            let target = self
+                .load_decommissioned_durable_ilm_target(
+                    source_pool_idx,
+                    &receipt.source_path,
+                    namespace.max_record_size,
+                    &receipt.context(),
+                )
+                .await?;
+            if let Some((_, target)) = target {
+                let target_record = validate_durable_ilm_record(&receipt.source_path, &target).map_err(|err| {
+                    Error::other(format!(
+                        "target durable ILM record is invalid at path `{}` {}: {err}",
+                        receipt.source_path,
+                        receipt.context()
+                    ))
+                })?;
+                let identity_matches = target_record.namespace == receipt.namespace
+                    && target_record.id_kind == receipt.id_kind
+                    && target_record.id == receipt.id;
+                let reused_manual_scope = receipt.terminal_checkpoint.is_some()
+                    && matches!(
+                        (&receipt.checkpoint, &target_record.checkpoint),
+                        (
+                            DurableIlmRecordCheckpoint::ManualTransitionScope { .. },
+                            DurableIlmRecordCheckpoint::ManualTransitionScope { .. }
+                        )
+                    );
+                if !identity_matches && !reused_manual_scope {
+                    return Err(Error::other(format!(
+                        "target durable ILM record identity mismatch at path `{}` {}; decoded {}",
+                        receipt.source_path,
+                        receipt.context(),
+                        target_record.context()
+                    )));
+                }
+                if identity_matches {
+                    receipt
+                        .terminal_checkpoint
+                        .as_ref()
+                        .unwrap_or(&receipt.checkpoint)
+                        .validate_successor(&target_record.checkpoint)
+                        .map_err(|err| {
+                            Error::other(format!(
+                                "target durable ILM record generation mismatch at path `{}` {}: {err}",
+                                receipt.source_path,
+                                receipt.context()
+                            ))
+                        })?;
+                }
+            } else if receipt.terminal_checkpoint.is_none() {
+                return Err(Error::other(format!(
+                    "target durable ILM record is missing at path `{}` {} without a recovery terminal checkpoint",
+                    receipt.source_path,
+                    receipt.context()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn advance_durable_ilm_decommission_receipt(
+        &self,
+        pool_idx: usize,
+        receipt_path: &str,
+        record: &ValidatedDurableIlmRecord,
+        terminal: bool,
+    ) -> Result<bool> {
+        let stage = if terminal { "terminal" } else { "progress" };
+        let locator = parse_decommission_durable_ilm_receipt_path(receipt_path)?;
+        let mut attempt = 1;
+        loop {
+            let (receipt_data, metadata) = match read_config_limited_preserve_empty_with_metadata(
+                self.pools[pool_idx].clone(),
+                receipt_path,
+                DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(err)
+                    if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                        || is_err_object_not_found(&err)
+                        || is_err_version_not_found(&err) =>
+                {
+                    return Ok(false);
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to read durable ILM decommission receipt `{receipt_path}` from pool {pool_idx} for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            };
+            let mut receipt = DecommissionDurableIlmReceipt::decode(&receipt_data).map_err(|err| {
+                Error::other(format!(
+                    "durable ILM decommission receipt `{receipt_path}` in pool {pool_idx} for {} is invalid: {err}",
+                    locator.context()
+                ))
+            })?;
+            Self::validate_decommission_durable_ilm_receipt_locator(receipt_path, &locator, &receipt)?;
+            receipt.checkpoint.validate_successor(&record.checkpoint).map_err(|err| {
+                Error::other(format!(
+                    "{stage} durable ILM record generation mismatch at path `{}` {}: {err}",
+                    receipt.source_path,
+                    receipt.context()
+                ))
+            })?;
+
+            if terminal {
+                if let Some(existing) = &receipt.terminal_checkpoint {
+                    if existing == &record.checkpoint || record.checkpoint.validate_successor(existing).is_ok() {
+                        return Ok(true);
+                    }
+                    existing.validate_successor(&record.checkpoint).map_err(|err| {
+                        Error::other(format!(
+                            "terminal durable ILM record checkpoint conflicts at path `{}` {}: {err}",
+                            receipt.source_path,
+                            receipt.context()
+                        ))
+                    })?;
+                }
+                receipt.terminal_checkpoint = Some(record.checkpoint.clone());
+            } else {
+                if let Some(existing) = &receipt.terminal_checkpoint {
+                    if existing == &record.checkpoint {
+                        return Ok(true);
+                    }
+                    existing.validate_successor(&record.checkpoint).map_err(|err| {
+                        Error::other(format!(
+                            "progress durable ILM record conflicts with terminal checkpoint at path `{}` {}: {err}",
+                            receipt.source_path,
+                            receipt.context()
+                        ))
+                    })?;
+                    receipt.terminal_checkpoint = None;
+                }
+                if receipt.checkpoint == record.checkpoint {
+                    return Ok(true);
+                }
+                receipt.checkpoint = record.checkpoint.clone();
+            }
+
+            let etag = metadata.etag.filter(|etag| !etag.trim().is_empty()).ok_or_else(|| {
+                Error::other(format!(
+                    "durable ILM decommission receipt `{receipt_path}` in pool {pool_idx} is missing an ETag"
+                ))
+            })?;
+            let encoded = receipt.encode()?;
+            match save_config_with_opts(
+                self.pools[pool_idx].clone(),
+                receipt_path,
+                encoded,
+                &ObjectOptions {
+                    max_parity: true,
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some(etag),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(()) => return Ok(true),
+                Err(Error::PreconditionFailed) if attempt < DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS => {
+                    attempt += 1;
+                    continue;
+                }
+                Err(Error::PreconditionFailed) => {
+                    return Err(Error::other(format!(
+                        "failed to persist {stage} durable ILM decommission receipt `{receipt_path}` for {} after concurrent updates",
+                        locator.context()
+                    )));
+                }
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to persist {stage} durable ILM decommission receipt `{receipt_path}` for {}: {err}",
+                        locator.context()
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn advance_durable_ilm_decommission_receipts(
+        &self,
+        path: &str,
+        data: &[u8],
+        terminal: bool,
+    ) -> Result<Option<Vec<usize>>> {
+        let active_runs = {
+            let pool_meta = self.pool_meta.read().await;
+            pool_meta
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(pool_idx, pool)| {
+                    pool.decommission
+                        .as_ref()
+                        .filter(|info| info.has_decommission_state() && !info.complete)
+                        .and_then(|info| info.start_time)
+                        .map(|start_time| (pool_idx, decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time)))
+                })
+                .collect::<Vec<_>>()
+        };
+        if active_runs.is_empty() {
+            return Ok(None);
+        }
+
+        let stage = if terminal { "terminal" } else { "progress" };
+        let record = validate_durable_ilm_record(path, data)
+            .map_err(|err| Error::other(format!("{stage} durable ILM record is invalid at path `{path}`: {err}")))?;
+        let active_source_pool_indices = active_runs.iter().map(|(pool_idx, _)| *pool_idx).collect::<Vec<_>>();
+        let mut terminal_target_pool_indices = Vec::new();
+        for (source_pool_idx, run_token) in active_runs {
+            let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, record.id_kind, &record.id);
+            let mut receipt_found = false;
+            for pool_idx in 0..self.pools.len() {
+                if pool_idx != source_pool_idx {
+                    let found = self
+                        .advance_durable_ilm_decommission_receipt(pool_idx, &receipt_path, &record, terminal)
+                        .await?;
+                    receipt_found |= found;
+                    if terminal
+                        && found
+                        && !active_source_pool_indices.contains(&pool_idx)
+                        && !terminal_target_pool_indices.contains(&pool_idx)
+                    {
+                        terminal_target_pool_indices.push(pool_idx);
+                    }
+                }
+            }
+            if terminal && !receipt_found {
+                return Err(Error::other(format!(
+                    "terminal durable ILM record at path `{path}` {} is retained until its decommission receipt is committed",
+                    record.context()
+                )));
+            }
+        }
+        Ok(Some(terminal_target_pool_indices))
+    }
+
+    pub(crate) async fn record_durable_ilm_decommission_progress(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.advance_durable_ilm_decommission_receipts(path, data, false)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn record_durable_ilm_decommission_terminal(&self, path: &str, data: &[u8]) -> Result<()> {
+        self.record_durable_ilm_decommission_terminal_target_pools(path, data)
+            .await
+            .map(|_| ())
+    }
+
+    /// Record terminal proof and return its non-source receipt pools for targeted cleanup.
+    pub(crate) async fn record_durable_ilm_decommission_terminal_target_pools(
+        &self,
+        path: &str,
+        data: &[u8],
+    ) -> Result<Option<Vec<usize>>> {
+        self.advance_durable_ilm_decommission_receipts(path, data, true).await
+    }
+
+    async fn cleanup_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
+        for (pool_idx, receipt_path) in self.list_decommission_durable_ilm_receipts(source_pool_idx).await? {
+            match delete_config(self.pools[pool_idx].clone(), &receipt_path).await {
+                Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to clean durable ILM decommission receipt `{receipt_path}` from pool {pool_idx}: {err}"
+                    )));
+                }
+            }
+        }
+        for receipt_path in self.list_decommission_durable_ilm_manifest_receipts(source_pool_idx).await? {
+            match delete_config(self.pools[source_pool_idx].clone(), &receipt_path).await {
+                Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => {
+                    return Err(Error::other(format!(
+                        "failed to clean durable ILM expected manifest receipt `{receipt_path}` from source pool {source_pool_idx}: {err}"
+                    )));
+                }
+            }
+        }
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        let manifest_path = decommission_durable_ilm_manifest_path(&run_token);
+        match delete_config(self.pools[source_pool_idx].clone(), &manifest_path).await {
+            Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound) => {}
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+            Err(err) => {
+                return Err(Error::other(format!(
+                    "failed to clean durable ILM expected manifest `{manifest_path}` from source pool {source_pool_idx}: {err}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_and_cleanup_decommissioned_durable_ilm_record(
+        &self,
+        source_pool_idx: usize,
+        source_set: Arc<SetDisks>,
+        path: &str,
+    ) -> Result<()> {
+        let namespace = classify_durable_ilm_record(path)?
+            .ok_or_else(|| Error::other(format!("path `{path}` is not a durable ILM record")))?;
+        let source_versions = source_set
+            .load_file_info_versions_exact(RUSTFS_META_BUCKET, path)
+            .await
+            .map_err(|err| Error::other(format!("failed to load source durable ILM versions at path `{path}`: {err}")))?
+            .ok_or_else(|| Error::other(format!("source durable ILM record is missing at path `{path}`")))?;
+        let source = read_config_limited_preserve_empty(source_set.clone(), path, namespace.max_record_size)
+            .await
+            .map_err(|err| Error::other(format!("failed to read source durable ILM record at path `{path}`: {err}")))?;
+        let source_record = validate_durable_ilm_record(path, &source)
+            .map_err(|err| Error::other(format!("source durable ILM record is invalid at path `{path}`: {err}")))?;
+        let target = self
+            .load_decommissioned_durable_ilm_target(source_pool_idx, path, namespace.max_record_size, &source_record.context())
+            .await?;
+        let manifest_receipt = if let Some((target_pool_idx, target)) = target {
+            let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
+            let receipt = DecommissionDurableIlmReceipt::new(path, &target_record);
+            self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+                .await?;
+            receipt
+        } else {
+            self.load_decommission_durable_ilm_terminal_receipt(source_pool_idx, path, &source_record)
+                .await?
+                .ok_or_else(|| {
+                    Error::other(format!(
+                        "target durable ILM record is missing at path `{path}` {} without a matching terminal receipt",
+                        source_record.context()
+                    ))
+                })?
+        };
+        self.persist_decommission_durable_ilm_receipt(source_pool_idx, source_pool_idx, &manifest_receipt)
+            .await?;
+
+        let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
+            source_set,
+            RUSTFS_META_BUCKET,
+            path,
+            &source_versions,
+            &[],
+            data_movement::SourceCleanupBucketFence::default(),
+            "decommission durable ILM final sweep",
+        )
+        .await
+        .map_err(|err| {
+            Error::other(format!(
+                "source durable ILM cleanup failed at path `{path}` {}: {err}",
+                source_record.context()
+            ))
+        });
+        resolve_decommission_entry_cleanup_delete_result(cleanup_result, RUSTFS_META_BUCKET, path)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+        &self,
+        source_pool_idx: usize,
+        source_set: Arc<SetDisks>,
+        path: &str,
+    ) -> Result<()> {
+        self.verify_and_cleanup_decommissioned_durable_ilm_record(source_pool_idx, source_set, path)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_durable_ilm_receipt_count_for_test(&self, source_pool_idx: usize) -> Result<usize> {
+        Ok(self.list_decommission_durable_ilm_receipts(source_pool_idx).await?.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_durable_ilm_receipt_paths_for_test(
+        &self,
+        source_pool_idx: usize,
+    ) -> Result<Vec<(usize, String)>> {
+        self.list_decommission_durable_ilm_receipts(source_pool_idx).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_decommission_durable_ilm_receipt_for_test(
+        &self,
+        source_pool_idx: usize,
+        target_pool_idx: usize,
+        source_path: &str,
+        record: &ValidatedDurableIlmRecord,
+        terminal: bool,
+    ) -> Result<String> {
+        let mut receipt = DecommissionDurableIlmReceipt::new(source_path, record);
+        if terminal {
+            receipt.terminal_checkpoint = Some(record.checkpoint.clone());
+        }
+        self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+            .await?;
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        Ok(decommission_durable_ilm_receipt_path(&run_token, source_path, record.id_kind, &record.id))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persist_decommission_durable_ilm_manifest_for_test(&self, source_pool_idx: usize) -> Result<()> {
+        self.persist_decommission_durable_ilm_manifest(source_pool_idx).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cleanup_decommission_durable_ilm_receipts_for_test(&self, source_pool_idx: usize) -> Result<()> {
+        self.cleanup_decommission_durable_ilm_receipts(source_pool_idx).await
+    }
+
+    async fn check_after_decommission(
+        self: &Arc<Self>,
+        idx: usize,
+        rx: &CancellationToken,
+        generation: OffsetDateTime,
+    ) -> Result<()> {
+        self.ensure_decommission_generation_current(idx, generation).await?;
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        run_decommission_side_effect(rx, &operation_gate, || self.check_after_decommission_unfenced(idx)).await
+    }
+
+    async fn check_after_decommission_unfenced(self: &Arc<Self>, idx: usize) -> Result<()> {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
+
+        self.ensure_decommission_multipart_uploads_drained(idx, &pool, &buckets)
+            .await?;
 
         for (set_index, set) in pool.disk_set.iter().enumerate() {
             for bucket_info in &buckets {
@@ -5164,22 +7469,27 @@ impl ECStore {
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
                 let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+                let first_remaining_path = Arc::new(tokio::sync::Mutex::new(None::<String>));
                 let callback_rx = CancellationToken::new();
                 let versions_found_cb = versions_found.clone();
                 let entry_error_cb = entry_error.clone();
+                let first_remaining_path_cb = first_remaining_path.clone();
                 let bucket_name = bucket_info.name.clone();
                 let lifecycle_config_cb = lifecycle_config.clone();
                 let object_lock_config_cb = object_lock_config.clone();
                 let store = Arc::clone(self);
+                let source_set = set.clone();
                 let callback_rx_cb = callback_rx.clone();
 
                 let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
                     let versions_found = versions_found_cb.clone();
                     let entry_error = entry_error_cb.clone();
+                    let first_remaining_path = first_remaining_path_cb.clone();
                     let bucket_name = bucket_name.clone();
                     let lifecycle_config = lifecycle_config_cb.clone();
                     let object_lock_config = object_lock_config_cb.clone();
                     let store = Arc::clone(&store);
+                    let source_set = source_set.clone();
                     let callback_rx = callback_rx_cb.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
@@ -5191,6 +7501,41 @@ impl ECStore {
                         }
 
                         if bucket_name == RUSTFS_META_BUCKET && entry.name.contains(DATA_USAGE_CACHE_NAME) {
+                            return;
+                        }
+
+                        let durable_ilm_record = if bucket_name == RUSTFS_META_BUCKET {
+                            match classify_durable_ilm_record(&entry.name) {
+                                Ok(record) => record,
+                                Err(err) => {
+                                    let mut first_err = entry_error.lock().await;
+                                    if first_err.is_none() {
+                                        *first_err = Some(with_decommission_entry_context(
+                                            "check_after_decommission.durable_ilm_namespace",
+                                            &bucket_name,
+                                            &entry.name,
+                                            err,
+                                        ));
+                                        callback_rx.cancel();
+                                    }
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        if durable_ilm_record.is_some() {
+                            if let Err(err) = store
+                                .verify_and_cleanup_decommissioned_durable_ilm_record(idx, source_set, &entry.name)
+                                .await
+                            {
+                                let mut first_err = entry_error.lock().await;
+                                if first_err.is_none() {
+                                    *first_err = Some(err);
+                                    callback_rx.cancel();
+                                }
+                            }
                             return;
                         }
 
@@ -5242,6 +7587,13 @@ impl ECStore {
                             remaining += 1;
                         }
 
+                        if remaining > 0 {
+                            let mut first_path = first_remaining_path.lock().await;
+                            if first_path.is_none() {
+                                *first_path = Some(format!("{bucket_name}/{}", entry.name));
+                            }
+                        }
+
                         versions_found.fetch_add(remaining, Ordering::Relaxed);
                     })
                 });
@@ -5254,15 +7606,72 @@ impl ECStore {
 
                 let versions_found = versions_found.load(Ordering::Relaxed);
                 if versions_found > 0 {
+                    let first_remaining_path = first_remaining_path
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| format!("{}/<unknown>", bucket_info.name));
                     return Err(Error::other(format!(
-                        "at least {versions_found} object(s)/version(s) were found in bucket `{}` after decommissioning",
-                        bucket_info.name
+                        "at least {versions_found} object(s)/version(s) were found in bucket `{}` after decommissioning; first remaining path `{first_remaining_path}`",
+                        bucket_info.name,
+                    )));
+                }
+            }
+        }
+
+        self.persist_decommission_durable_ilm_manifest(idx).await?;
+        self.verify_decommission_durable_ilm_receipts(idx).await?;
+
+        Ok(())
+    }
+
+    async fn ensure_decommission_multipart_uploads_drained(
+        &self,
+        idx: usize,
+        pool: &Sets,
+        buckets: &[DecomBucketInfo],
+    ) -> Result<()> {
+        let mut bucket_names = buckets
+            .iter()
+            .filter(|bucket| bucket.name != RUSTFS_META_BUCKET)
+            .map(|bucket| bucket.name.as_str())
+            .collect::<Vec<_>>();
+        bucket_names.sort_unstable();
+        bucket_names.dedup();
+
+        // Take one bucket fence at a time so cross-bucket COPY cannot form an
+        // ABBA cycle. Suspension prevents new source uploads after each fence.
+        for bucket in bucket_names {
+            let lifecycle_guard = self.acquire_bucket_lifecycle_write_lock(bucket).await?;
+            if lifecycle_guard.is_lock_lost() {
+                return Err(Error::other(format!(
+                    "decommission multipart drain lost the bucket lifecycle fence for `{bucket}`"
+                )));
+            }
+            for set in &pool.disk_set {
+                if let Some(upload_path) = set.first_multipart_upload_path_for_decommission(bucket).await? {
+                    return Err(Error::other(format!(
+                        "pool {idx} still contains multipart upload `{upload_path}` for bucket `{bucket}`; resolve it before retrying decommission"
                     )));
                 }
             }
         }
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ensure_decommission_multipart_uploads_drained_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
+        let buckets = self.get_buckets_to_decommission().await?;
+        let pool = self.pools[idx].clone();
+        self.ensure_decommission_multipart_uploads_drained(idx, pool.as_ref(), &buckets)
+            .await
+    }
+    #[cfg(test)]
+    pub(crate) async fn check_after_decommission_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
+        let generation = self.active_decommission_generation(idx).await?;
+        self.check_after_decommission(idx, &CancellationToken::new(), generation)
+            .await
     }
 
     #[tracing::instrument(skip(self, rd))]
@@ -5302,6 +7711,167 @@ mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
     use serde::Serialize;
+
+    fn pool_meta_replica_test_meta(cmd_line: &str) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: cmd_line.to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            dont_save: false,
+        }
+    }
+
+    fn pool_meta_replica_test_data(cmd_line: &str) -> Vec<u8> {
+        pool_meta_replica_test_meta(cmd_line)
+            .encode_config_data()
+            .expect("pool metadata should encode")
+    }
+
+    fn pool_meta_legacy_replica_test_data(cmd_line: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
+            .expect("pool metadata format should encode");
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)
+            .expect("pool metadata version should encode");
+        pool_meta_replica_test_meta(cmd_line)
+            .serialize(&mut Serializer::new(&mut data))
+            .expect("legacy pool metadata should encode");
+        data
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_falls_back_from_corrupt_first_copy() {
+        let selection = select_pool_meta_replica(vec![
+            PoolMetaReplica::Corrupt("truncated".to_string()),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+        ])
+        .expect("a validated backup replica should be selected");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools.len(), 1);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-0");
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_incompatible_copy() {
+        let valid = pool_meta_replica_test_data("pool-0");
+        let mut incompatible = valid.clone();
+        LittleEndian::write_u16(&mut incompatible[2..4], POOL_META_VERSION + 1);
+
+        let err = select_pool_meta_replica(vec![decode_pool_meta_replica(valid), decode_pool_meta_replica(incompatible)])
+            .expect_err("an incompatible replica must block fallback and repair writes");
+
+        assert!(err.to_string().contains("pool 1 is incompatible"));
+        assert!(err.to_string().contains("without overwriting it"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_partial_write_divergence() {
+        let err = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-old")),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-new")),
+        ])
+        .expect_err("different valid snapshots have no safe ordering without a generation protocol");
+
+        assert!(err.to_string().contains("valid replicas in pools 0 and 1 diverge"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_normalizes_equivalent_legacy_copy() {
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_legacy_replica_test_data("pool-0")),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+        ])
+        .expect("equivalent legacy and current encodings should be compatible");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-0");
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_distinguishes_absent_from_unrecoverable() {
+        assert!(matches!(decode_pool_meta_replica(Vec::new()), PoolMetaReplica::Corrupt(_)));
+
+        let empty = select_pool_meta_replica(vec![PoolMetaReplica::Missing, PoolMetaReplica::Missing])
+            .expect("all missing replicas should preserve new-deployment behavior");
+        assert!(empty.meta.pools.is_empty());
+        assert!(!empty.replica_state.needs_repair);
+        assert!(empty.replica_state.repair_write_safe);
+
+        let err = select_pool_meta_replica(vec![
+            PoolMetaReplica::Missing,
+            PoolMetaReplica::Unreadable("read quorum unavailable".to_string()),
+        ])
+        .expect_err("an unreadable replica must not be treated as a new deployment");
+        assert!(err.to_string().contains("no valid replica is available"));
+        assert!(err.to_string().contains("pool 1 is unreadable"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_blocks_repair_for_unreadable_copy() {
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+            PoolMetaReplica::Unreadable("read quorum unavailable".to_string()),
+        ])
+        .expect("a validated replica should remain usable while another copy is unreadable");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(!selection.replica_state.repair_write_safe);
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_same_version_tuple_extension() {
+        #[derive(Serialize)]
+        struct FuturePersistedPoolMeta {
+            version: u16,
+            pools: Vec<PersistedPoolStatus>,
+            generation: u64,
+        }
+
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
+            .expect("pool metadata format should encode");
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)
+            .expect("pool metadata version should encode");
+        FuturePersistedPoolMeta {
+            version: POOL_META_VERSION,
+            pools: Vec::new(),
+            generation: 2,
+        }
+        .serialize(&mut Serializer::new(&mut data))
+        .expect("extended tuple pool metadata should encode");
+
+        let err = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+            decode_pool_meta_replica(data),
+        ])
+        .expect_err("same-version tuple extensions must block fallback repair writes");
+
+        assert!(err.to_string().contains("pool 1 is incompatible"));
+        assert!(err.to_string().contains("legacy tuple payload is not decodable"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_falls_back_from_truncated_current_tuple() {
+        let mut truncated = pool_meta_replica_test_data("pool-truncated");
+        truncated.pop();
+
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(truncated),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-valid")),
+        ])
+        .expect("a truncated tuple should not block a validated backup replica");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-valid");
+    }
 
     #[test]
     fn ensure_pool_not_left_in_cmdline_after_decommission_allows_active_pool() {
@@ -5416,13 +7986,7 @@ mod tests {
     #[test]
     fn decommission_classifiers_see_through_a_stage_wrapper() {
         let wrap = |inner: Error| {
-            crate::data_movement::data_movement_stage_error_for_test(
-                "decommission_object",
-                "put_object",
-                "bucket-a",
-                "object-a",
-                inner,
-            )
+            data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "bucket-a", "object-a", inner)
         };
 
         // Capacity: the target pool filling up must still stop the loop.
@@ -5554,7 +8118,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            metadata: std::collections::HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
         };
 
@@ -6357,43 +8921,52 @@ mod pools_tests {
     use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
     use super::record_decommission_entry_error;
     use super::resolve_decommission_listing_error;
+    use super::resolve_decommission_partial_listing_entry;
     use super::{
-        DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP, DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP, DECOMMISSION_ENTRY_QUEUE_HARD_CAP,
-        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo, DecommissionCanceler,
+        DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE, DECOMMISSION_ENTRY_CONCURRENCY_DEFAULT_CAP,
+        DECOMMISSION_ENTRY_CONCURRENCY_HARD_CAP, DECOMMISSION_ENTRY_QUEUE_HARD_CAP, DECOMMISSION_META_PREFIXES,
+        DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
+        DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT, DecomBucketInfo, DecommissionCanceler, DecommissionDurableIlmReceipt,
         DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState, ListCallback,
         PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus, QueuedDecommissionEntry, apply_decommission_status_space_info,
         await_decommission_worker, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, clamp_decommission_entry_concurrency, classify_decommission_terminal_state,
-        count_decommission_item, decommission_cancel_signal_result, decommission_entry_queue_capacity, decommission_item_size,
-        decommission_meta_bucket_options, decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
+        count_decommission_item, decommission_cancel_signal_result, decommission_durable_ilm_receipt_path,
+        decommission_durable_ilm_receipt_run_prefix, decommission_durable_ilm_receipt_run_token,
+        decommission_entry_queue_capacity, decommission_item_size, decommission_meta_bucket_options,
+        decommission_retry_backoff_delay, decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_generation,
         ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
         ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
-        get_by_index, guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index,
+        guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active,
         is_decommission_cancel_requested, load_decommission_entry_versions, local_decommission_queue_prefix,
-        mark_decommission_bucket_done, merge_pool_status_refresh, missing_decommission_worker_prefix,
-        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, require_decommission_store,
-        reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_partial_listing_entry, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
-        run_decommission_listing_with_retry_and_drain, run_decommission_side_effect, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
-        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
-        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
-        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
-        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_listing_retry,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts, merge_pool_status_refresh,
+        missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
+        reconcile_decommission_meta_buckets, require_decommission_store, reserve_decommission_start_cancelers,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
+        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_phases,
+        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload, should_retry_decommission_listing,
+        should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        track_decommission_current_object_stage, update_decommission_for_operation, validate_start_decommission_request,
+        wait_decommission_retry_backoff, wait_decommission_worker_drain, with_decommission_entry_context
+    };
+    use crate::bucket::lifecycle::{
+        DurableIlmRecordCheckpoint,
+        bucket_lifecycle_ops::{ManualTransitionQueueSnapshot, ManualTransitionRunOptions},
+        manual_transition_job::{ManualTransitionJobRecord, manual_transition_job_record_object_name},
+        validate_durable_ilm_record,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -6406,7 +8979,7 @@ mod pools_tests {
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_rio::Index;
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration as StdDuration;
@@ -6460,6 +9033,93 @@ mod pools_tests {
             last_update: OffsetDateTime::now_utc(),
             decommission,
         }
+    }
+
+    #[test]
+    fn decommission_receipt_run_token_changes_with_persisted_start_time() {
+        let first = OffsetDateTime::from_unix_timestamp(1_000).expect("first run timestamp should be valid");
+        let second = OffsetDateTime::from_unix_timestamp(2_000).expect("second run timestamp should be valid");
+        let first_token = decommission_durable_ilm_receipt_run_token("pool-0", first);
+        let second_token = decommission_durable_ilm_receipt_run_token("pool-0", second);
+
+        assert_ne!(first_token, second_token);
+        assert_eq!(first_token, decommission_durable_ilm_receipt_run_token("pool-0", first));
+        let operation_id = "a".repeat(64);
+        let old_receipt = decommission_durable_ilm_receipt_path(
+            &first_token,
+            &format!("ilm/tier-delete-journal/{operation_id}.json"),
+            "operation_id",
+            &operation_id,
+        );
+        assert!(!old_receipt.starts_with(&decommission_durable_ilm_receipt_run_prefix(&second_token)));
+    }
+
+    #[test]
+    fn decommission_receipt_merge_preserves_terminal_proof() {
+        let operation_id = "a".repeat(64);
+        let source_path = format!("ilm/tier-delete-journal/{operation_id}.json");
+        let checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: "b".repeat(64),
+            identity_sha256: "c".repeat(64),
+            committed: false,
+        };
+        let terminal_checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: "d".repeat(64),
+            identity_sha256: "c".repeat(64),
+            committed: true,
+        };
+        let incoming = DecommissionDurableIlmReceipt {
+            source_path,
+            namespace: "tier-delete-journal".to_string(),
+            id_kind: "operation_id".to_string(),
+            id: operation_id,
+            checkpoint: checkpoint.clone(),
+            terminal_checkpoint: None,
+        };
+        let existing = DecommissionDurableIlmReceipt {
+            terminal_checkpoint: Some(terminal_checkpoint.clone()),
+            ..incoming.clone()
+        };
+
+        let merged = merge_decommission_durable_ilm_receipts(&existing, &incoming)
+            .expect("retry receipt must merge with a terminal receipt");
+
+        assert_eq!(merged.checkpoint, checkpoint);
+        assert_eq!(merged.terminal_checkpoint, Some(terminal_checkpoint));
+    }
+
+    #[test]
+    fn decommission_manual_job_receipt_compacts_large_progress() {
+        let prefix = "p".repeat(12 * 1024);
+        let options = ManualTransitionRunOptions {
+            prefix,
+            ..Default::default()
+        };
+        let mut job = ManualTransitionJobRecord::new(uuid::Uuid::new_v4(), "bounded-receipt-bucket", &options, "owner");
+        let token_bytes = serde_json::to_vec(&serde_json::json!({
+            "marker": "m".repeat(12 * 1024),
+            "version_marker": "opaque-version"
+        }))
+        .expect("large continuation token should encode");
+        let mut report = job.report.clone();
+        report.scanned = 1;
+        report.continuation_token = Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&token_bytes));
+        job.update_running_progress(report, ManualTransitionQueueSnapshot::default());
+        let path = manual_transition_job_record_object_name(job.job_id).expect("manual job path should build");
+        let job_bytes = job.encode().expect("large manual job should remain within its record limit");
+        assert!(job_bytes.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
+        let record = validate_durable_ilm_record(&path, &job_bytes).expect("large manual job should validate");
+        let expected_checkpoint = record.checkpoint.clone();
+        let mut receipt = DecommissionDurableIlmReceipt::new(&path, &record);
+        receipt.terminal_checkpoint = Some(record.checkpoint);
+
+        let encoded = receipt.encode().expect("bounded progress proof should fit the receipt limit");
+        let decoded = DecommissionDurableIlmReceipt::decode(&encoded).expect("bounded receipt should round trip");
+
+        assert!(encoded.len() <= DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
+        assert_eq!(decoded.source_path, path);
+        assert_eq!(decoded.checkpoint, expected_checkpoint);
+        assert_eq!(decoded.terminal_checkpoint, Some(expected_checkpoint));
     }
 
     #[test]
@@ -6534,7 +9194,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[false]);
+        assert!(merge_pool_status_refresh(&mut current, persisted, &[false]));
 
         let info = current.pools[0]
             .decommission
@@ -6578,7 +9238,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[true]);
+        assert!(!merge_pool_status_refresh(&mut current, persisted, &[true]));
 
         let info = current.pools[0]
             .decommission
@@ -6619,7 +9279,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[true]);
+        assert!(!merge_pool_status_refresh(&mut current, persisted, &[true]));
 
         let info = current.pools[0]
             .decommission
@@ -6736,6 +9396,10 @@ mod pools_tests {
                 name: crate::disk::RUSTFS_META_BUCKET.to_string(),
                 prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
             },
+            DecomBucketInfo {
+                name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                prefix: crate::bucket::lifecycle::ILM_META_PREFIX.to_string(),
+            },
         ]);
 
         assert_eq!(
@@ -6744,7 +9408,99 @@ mod pools_tests {
         );
         assert_eq!(
             meta.iter().map(|bucket| bucket.prefix.as_str()).collect::<Vec<_>>(),
-            vec![crate::config::com::CONFIG_PREFIX, crate::disk::BUCKET_META_PREFIX,]
+            vec![
+                crate::config::com::CONFIG_PREFIX,
+                crate::disk::BUCKET_META_PREFIX,
+                crate::bucket::lifecycle::ILM_META_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resume_reconciles_missing_decommission_meta_prefixes() {
+        let mut meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    queued_buckets: vec![
+                        format!("{}/{}", crate::disk::RUSTFS_META_BUCKET, crate::config::com::CONFIG_PREFIX),
+                        format!("{}/{}", crate::disk::RUSTFS_META_BUCKET, crate::disk::BUCKET_META_PREFIX),
+                    ],
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+
+        assert!(reconcile_decommission_meta_buckets(&mut meta, 0));
+        assert_eq!(
+            meta.pending_buckets(0)
+                .iter()
+                .filter(|bucket| bucket.name == crate::disk::RUSTFS_META_BUCKET)
+                .map(|bucket| bucket.prefix.as_str())
+                .collect::<Vec<_>>(),
+            DECOMMISSION_META_PREFIXES
+        );
+        assert!(!reconcile_decommission_meta_buckets(&mut meta, 0));
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_phase_precedes_regular_failure() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let err = run_decommission_phases(
+            CancellationToken::new(),
+            vec![
+                DecomBucketInfo {
+                    name: "regular-fails".to_string(),
+                    ..Default::default()
+                },
+                DecomBucketInfo {
+                    name: "regular-not-started".to_string(),
+                    ..Default::default()
+                },
+            ],
+            vec![
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+                },
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
+                },
+            ],
+            1,
+            {
+                let events = Arc::clone(&events);
+                move |bucket, _rx| {
+                    let events = Arc::clone(&events);
+                    Box::pin(async move {
+                        let event = if bucket.name == crate::disk::RUSTFS_META_BUCKET {
+                            format!("meta:{}", bucket.prefix)
+                        } else {
+                            format!("regular:{}", bucket.name)
+                        };
+                        events.lock().expect("phase event lock should not be poisoned").push(event);
+                        if bucket.name == "regular-fails" {
+                            Err(Error::SlowDown)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("regular failure should remain fatal after metadata completes");
+
+        assert!(matches!(err, Error::SlowDown));
+        assert_eq!(
+            *events.lock().expect("phase event lock should not be poisoned"),
+            vec![
+                format!("meta:{}", crate::config::com::CONFIG_PREFIX),
+                format!("meta:{}", crate::disk::BUCKET_META_PREFIX),
+                "regular:regular-fails".to_string(),
+            ]
         );
     }
 
@@ -7012,7 +9768,7 @@ mod pools_tests {
     #[tokio::test]
     async fn test_decommission_transition_waits_without_registered_canceler() {
         let store = decommission_worker_test_store(PoolMeta::default(), vec![None]);
-        let operation_gate = store.ctx.decommission_operation_gate();
+        let operation_gate = store.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read().await;
         let transition = tokio::spawn({
             let store = store.clone();
@@ -7030,6 +9786,33 @@ mod pools_tests {
             .await
             .expect("transition should finish after the side effect")
             .expect("transition task should not panic");
+    }
+
+    #[tokio::test]
+    async fn test_join_error_quiesces_side_effects_before_failure_transition() {
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let store = decommission_worker_test_store(PoolMeta::default(), vec![Some(canceler.clone())]);
+        let operation_gate = store.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read().await;
+        let transition = tokio::spawn({
+            let store = store.clone();
+            let canceler = canceler.clone();
+            async move { store.quiesce_decommission_worker_after_join_error(&canceler).await }
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), canceler.token().cancelled())
+            .await
+            .expect("join error handling should cancel the detached worker");
+        assert!(
+            !transition.is_finished(),
+            "failure transition must wait for the detached worker's in-flight side effect"
+        );
+
+        drop(operation_guard);
+        tokio::time::timeout(StdDuration::from_secs(1), transition)
+            .await
+            .expect("failure transition should finish after the side effect")
+            .expect("failure transition task should not panic");
     }
 
     #[tokio::test(start_paused = true)]
@@ -7811,11 +10594,30 @@ mod pools_tests {
     }
 
     #[tokio::test]
-    async fn test_wait_decommission_listing_retry_reports_canceled_without_sleeping() {
+    async fn test_wait_decommission_retry_backoff_reports_canceled_without_sleeping() {
         let token = CancellationToken::new();
         token.cancel();
 
-        assert!(wait_decommission_listing_retry(&token, StdDuration::from_secs(30)).await);
+        assert!(wait_decommission_retry_backoff(&token, StdDuration::from_secs(30)).await);
+    }
+
+    #[test]
+    fn test_decommission_retry_backoff_delay_grows_linearly() {
+        let base = StdDuration::from_millis(100);
+
+        assert_eq!(decommission_retry_backoff_delay(base, 1), base);
+        assert_eq!(decommission_retry_backoff_delay(base, 3), StdDuration::from_millis(300));
+        assert_eq!(decommission_retry_backoff_delay(base, usize::MAX), base.saturating_mul(u32::MAX));
+    }
+
+    #[test]
+    fn test_source_changed_exhaustion_fails_only_after_pool_limit() {
+        assert!(!should_fail_decommission_pool_after_exhausted_source_changed(
+            DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT
+        ));
+        assert!(should_fail_decommission_pool_after_exhausted_source_changed(
+            DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT + 1
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -9445,7 +12247,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state() {
+    fn test_resumable_decommission_queue_indices_skip_terminal_predecessors() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9481,11 +12283,11 @@ mod pools_tests {
             ..Default::default()
         };
 
-        assert!(first_resumable_decommission_queue_indices(&meta).is_empty());
+        assert_eq!(resumable_decommission_queue_indices(&meta), vec![3]);
     }
 
     #[test]
-    fn test_first_resumable_decommission_queue_indices_allows_after_completed_prefix() {
+    fn test_resumable_decommission_queue_indices_preserve_active_predecessor_order() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9498,7 +12300,7 @@ mod pools_tests {
                 decommission_test_pool_status(
                     1,
                     Some(PoolDecommissionInfo {
-                        queued: true,
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
                         ..Default::default()
                     }),
                 ),
@@ -9513,11 +12315,11 @@ mod pools_tests {
             ..Default::default()
         };
 
-        assert_eq!(first_resumable_decommission_queue_indices(&meta), vec![1, 2]);
+        assert_eq!(resumable_decommission_queue_indices(&meta), vec![1, 2]);
     }
 
-    #[test]
-    fn test_return_resumable_pools_skips_failed_decommission() {
+    #[tokio::test]
+    async fn test_runtime_recovery_reserves_the_startup_resumable_queue() {
         let meta = PoolMeta {
             pools: vec![
                 decommission_test_pool_status(
@@ -9530,6 +12332,20 @@ mod pools_tests {
                 decommission_test_pool_status(
                     1,
                     Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    3,
+                    Some(PoolDecommissionInfo {
                         queued: true,
                         ..Default::default()
                     }),
@@ -9537,11 +12353,79 @@ mod pools_tests {
             ],
             ..Default::default()
         };
+        let startup_ids = meta
+            .return_resumable_pools()
+            .into_iter()
+            .map(|pool| pool.id)
+            .collect::<Vec<_>>();
+        let store = decommission_worker_test_store(meta, vec![None, None, None, None]);
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, true),
+            decommission_test_pool_endpoint(2, true),
+            decommission_test_pool_endpoint(3, true),
+        ]);
+        let reserved = store
+            .reserve_missing_local_decommission_routines(&CancellationToken::new(), &endpoints)
+            .await
+            .expect("runtime recovery reservation should succeed");
+        let runtime_indices = reserved.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
 
-        let resumable = meta.return_resumable_pools();
+        assert_eq!(runtime_indices, vec![2, 3]);
+        assert_eq!(startup_ids, vec![2, 3]);
+    }
 
-        assert_eq!(resumable.len(), 1);
-        assert_eq!(resumable[0].id, 1);
+    #[tokio::test]
+    async fn test_runtime_recovery_does_not_reserve_behind_active_predecessor() {
+        let meta = PoolMeta {
+            pools: vec![
+                decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    1,
+                    Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    2,
+                    Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                ),
+                decommission_test_pool_status(
+                    3,
+                    Some(PoolDecommissionInfo {
+                        queued: true,
+                        ..Default::default()
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+        let active = DecommissionCanceler::new(CancellationToken::new());
+        let store = decommission_worker_test_store(meta, vec![None, None, Some(active.clone()), None]);
+        let endpoints = EndpointServerPools::from(vec![
+            decommission_test_pool_endpoint(0, true),
+            decommission_test_pool_endpoint(1, true),
+            decommission_test_pool_endpoint(2, true),
+            decommission_test_pool_endpoint(3, true),
+        ]);
+
+        let reserved = store
+            .reserve_missing_local_decommission_routines(&CancellationToken::new(), &endpoints)
+            .await
+            .expect("runtime recovery reservation should succeed");
+
+        assert!(reserved.is_empty());
+        assert!(active.is_active());
     }
 
     #[test]
@@ -9659,8 +12543,6 @@ mod pools_tests {
     async fn test_decommission_supervisor_observes_worker_panic() {
         let worker = tokio::spawn(async move {
             panic!("injected decommission worker panic");
-            #[allow(unreachable_code)]
-            Ok(())
         });
 
         let err = await_decommission_worker(4, worker)
@@ -9701,6 +12583,517 @@ mod pools_tests {
         assert!(!queued.is_active());
         assert!(queued.is_cancelled());
         assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+    }
+
+    #[tokio::test]
+    async fn test_decommission_cancel_save_failure_preserves_generation_and_token_until_retry() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+
+        let err = store
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), |_| async { Err(Error::Timeout) })
+            .await
+            .expect_err("injected pool metadata timeout should fail cancel");
+        assert!(matches!(err, Error::Timeout));
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("failed cancel must retain decommission metadata");
+            assert_eq!(info.start_time, Some(generation));
+            assert!(!info.canceled);
+            assert!(!info.complete);
+            assert!(!info.failed);
+            assert!(ensure_decommission_generation(&pool_meta, 0, generation).is_ok());
+        }
+        {
+            let cancelers = store.decommission_cancelers.read().await;
+            let current = cancelers[0].as_ref().expect("failed cancel must retain the worker owner");
+            assert!(current.owns_same_operation(&canceler));
+            assert!(current.is_active());
+        }
+        assert!(!canceler.is_cancelled());
+        assert!(store.decommission_terminal_retryable_for_operation(0, &canceler).await);
+
+        let persisted = Arc::new(std::sync::Mutex::new(None));
+        let persisted_for_save = persisted.clone();
+        store
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                let data = snapshot.encode_config_data()?;
+                *persisted_for_save
+                    .lock()
+                    .expect("persisted snapshot lock should not be poisoned") = Some(data);
+                Ok(())
+            })
+            .await
+            .expect("cancel retry should commit");
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("committed cancel metadata should remain present");
+            assert!(info.canceled);
+            assert!(!info.complete);
+            assert!(!info.failed);
+            assert!(info.start_time.is_none());
+        }
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert!(!canceler.is_active());
+        assert!(canceler.is_cancelled());
+
+        let repeated_save_called = Arc::new(AtomicBool::new(false));
+        let repeated_save_called_by_closure = repeated_save_called.clone();
+        store
+            .decommission_cancel_with_owner_and_save(0, None, move |_| async move {
+                repeated_save_called_by_closure.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("repeated cancel should be idempotent");
+        assert!(!repeated_save_called.load(Ordering::SeqCst));
+
+        let persisted = persisted
+            .lock()
+            .expect("persisted snapshot lock should not be poisoned")
+            .take()
+            .expect("successful retry should capture persisted bytes");
+        let mut restarted = PoolMeta::default();
+        restarted
+            .load_from_config_data(persisted)
+            .expect("a restarted process should decode the committed cancel");
+        assert!(
+            restarted.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.canceled && info.start_time.is_none())
+        );
+        assert!(resumable_decommission_queue_indices(&restarted).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decommission_cancel_serializes_reload_until_local_commit() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    stage: "migrate_object".to_string(),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+        let (persisted_tx, persisted_rx) = tokio::sync::oneshot::channel();
+        let save_release = Arc::new(tokio::sync::Notify::new());
+
+        let cancel = tokio::spawn({
+            let store = store.clone();
+            let canceler = canceler.clone();
+            let save_release = save_release.clone();
+            async move {
+                store
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                        persisted_tx
+                            .send(snapshot.encode_config_data()?)
+                            .map_err(|_| Error::other("failed to expose saved cancel snapshot"))?;
+                        save_release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        let persisted = persisted_rx.await.expect("save should expose the canceled snapshot");
+        let reload_started = Arc::new(tokio::sync::Notify::new());
+        let reload = tokio::spawn({
+            let store = store.clone();
+            let reload_started = reload_started.clone();
+            async move {
+                let mut reloaded = PoolMeta::default();
+                reloaded.load_from_config_data(persisted)?;
+                reload_started.notify_one();
+                *store.pool_meta.write().await = reloaded;
+                Ok::<(), Error>(())
+            }
+        });
+        reload_started.notified().await;
+        assert!(!reload.is_finished(), "peer reload must wait for cancel publication");
+
+        save_release.notify_one();
+        cancel
+            .await
+            .expect("cancel task should not panic")
+            .expect("cancel should commit before releasing the reload");
+        reload
+            .await
+            .expect("reload task should not panic")
+            .expect("reload should install the saved cancel after publication");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("reloaded cancel metadata should remain present");
+        assert!(info.canceled);
+        assert!(!info.complete);
+        assert!(!info.failed);
+        assert!(info.start_time.is_none());
+        assert!(info.stage.is_empty(), "the persisted snapshot should have been decoded before commit");
+        drop(pool_meta);
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert!(!canceler.is_active());
+        assert!(canceler.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_decommission_cancel_transaction_survives_caller_abort_after_durable_save() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+        let persisted = Arc::new(std::sync::Mutex::new(None));
+        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+        let save_release = Arc::new(tokio::sync::Notify::new());
+        let cancel = tokio::spawn({
+            let store = store.clone();
+            let canceler = canceler.clone();
+            let persisted = persisted.clone();
+            let save_release = save_release.clone();
+            async move {
+                store
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                        assert!(
+                            snapshot.pools[0]
+                                .decommission
+                                .as_ref()
+                                .is_some_and(|info| info.canceled && info.start_time.is_none())
+                        );
+                        *persisted.lock().expect("persisted cancel lock should not be poisoned") =
+                            Some(snapshot.encode_config_data()?);
+                        durable_tx
+                            .send(())
+                            .map_err(|_| Error::other("failed to report durable cancel snapshot"))?;
+                        save_release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        durable_rx.await.expect("save hook should report the durable cancel snapshot");
+        cancel.abort();
+        let join_err = cancel.await.expect_err("caller cancel future should be aborted");
+        assert!(join_err.is_cancelled());
+        assert!(
+            store.pool_meta.try_read().is_err(),
+            "the detached transaction must retain its state guard"
+        );
+        assert!(
+            store.decommission_cancelers.try_read().is_err(),
+            "the detached transaction must retain its owner guard"
+        );
+
+        save_release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(1), canceler.token().cancelled())
+            .await
+            .expect("detached cancel transaction should terminate the old token");
+
+        let persisted = persisted
+            .lock()
+            .expect("persisted cancel lock should not be poisoned")
+            .take()
+            .expect("save should capture the durable cancel snapshot");
+        let mut durable = PoolMeta::default();
+        durable
+            .load_from_config_data(persisted)
+            .expect("durable cancel snapshot should decode");
+        assert!(
+            durable.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.canceled && info.start_time.is_none())
+        );
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert!(!canceler.is_active());
+        assert!(canceler.is_cancelled());
+
+        let side_effect_ran = Arc::new(AtomicBool::new(false));
+        let operation_gate = store.ctx.data_movement_operation_gate();
+        let result = run_decommission_side_effect(canceler.token(), &operation_gate, {
+            let side_effect_ran = side_effect_ran.clone();
+            move || async move {
+                side_effect_ran.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::OperationCanceled)));
+        assert!(!side_effect_ran.load(Ordering::SeqCst));
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.canceled && !info.failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decommission_cancel_persists_before_signaling_and_quiesces_before_return() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+        let operation_gate = store.ctx.data_movement_operation_gate();
+        let side_effect = operation_gate.read().await;
+        let save_started = Arc::new(tokio::sync::Notify::new());
+        let save_release = Arc::new(tokio::sync::Notify::new());
+        let save_entered = Arc::new(AtomicBool::new(false));
+
+        let mut cancel = tokio::spawn({
+            let store = store.clone();
+            let canceler = canceler.clone();
+            let save_started = save_started.clone();
+            let save_release = save_release.clone();
+            let save_entered = save_entered.clone();
+            async move {
+                store
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_| async move {
+                        save_entered.store(true, Ordering::SeqCst);
+                        save_started.notify_one();
+                        save_release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), save_started.notified())
+            .await
+            .expect("cancel should persist while the side effect is still in flight");
+        assert!(save_entered.load(Ordering::SeqCst));
+        assert!(!cancel.is_finished(), "cancel must wait for the injected save");
+        assert!(
+            store.pool_meta_save_gate.try_lock().is_err(),
+            "the cancel save must exclude stale full-document saves until publication"
+        );
+        assert!(
+            store.pool_meta.try_read().is_err(),
+            "the active generation must stay write-locked through persistence"
+        );
+        assert!(!canceler.is_cancelled(), "the token must remain live until persistence commits");
+
+        let mut fail = tokio::spawn({
+            let store = store.clone();
+            async move { store.decommission_failed(0).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!fail.is_finished(), "fail must serialize behind the pending cancel");
+
+        save_release.notify_one();
+        tokio::time::timeout(StdDuration::from_secs(1), canceler.token().cancelled())
+            .await
+            .expect("the durable cancel must signal the active worker");
+        assert!(!cancel.is_finished(), "cancel must wait for in-flight movement after the durable signal");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the durable cancel must be published before quiescence");
+            assert!(info.canceled);
+            assert!(!info.complete);
+            assert!(!info.failed);
+            assert!(info.start_time.is_none());
+        }
+
+        drop(side_effect);
+        tokio::time::timeout(StdDuration::from_secs(1), &mut cancel)
+            .await
+            .expect("cancel should finish after in-flight movement quiesces")
+            .expect("cancel task should not panic")
+            .expect("cancel should commit");
+        tokio::time::timeout(StdDuration::from_secs(1), &mut fail)
+            .await
+            .expect("fail should finish after cancel commits")
+            .expect("fail task should not panic")
+            .expect("stale fail should be a no-op");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("cancel metadata should remain present");
+        assert!(info.canceled);
+        assert!(!info.complete);
+        assert!(!info.failed);
+        assert!(info.start_time.is_none());
+        drop(pool_meta);
+        assert!(canceler.is_cancelled());
+        assert!(!canceler.is_active());
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+    }
+
+    #[test]
+    fn test_decommission_cancel_commit_rejects_a_replaced_generation() {
+        let old_generation = OffsetDateTime::UNIX_EPOCH;
+        let new_generation = old_generation + Duration::seconds(1);
+        let mut canceled = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(old_generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let previous_last_update = canceled.pools[0].last_update;
+        assert!(canceled.decommission_cancel(0));
+        let canceled_pool = canceled.pools.remove(0);
+        let commit = super::DecommissionCancelCommit {
+            previous_start_time: Some(old_generation),
+            previous_queued: false,
+            previous_last_update,
+            canceled_pool,
+        };
+        let mut current = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(new_generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+
+        let err = super::commit_decommission_cancel(&mut current, 0, commit)
+            .expect_err("an old cancel must not publish over a replacement generation");
+        assert!(err.to_string().contains("operation generation changed"));
+        let info = current.pools[0]
+            .decommission
+            .as_ref()
+            .expect("replacement generation should remain present");
+        assert_eq!(info.start_time, Some(new_generation));
+        assert!(!info.canceled);
+    }
+
+    #[tokio::test]
+    async fn test_decommission_cancel_rejects_stale_retry_after_queued_replacement() {
+        let old_generation = OffsetDateTime::UNIX_EPOCH;
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        let pool_meta = PoolMeta {
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    start_time: Some(old_generation),
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
+        let queued_replacement = Arc::new(std::sync::Mutex::new(None));
+        let queued_replacement_for_save = queued_replacement.clone();
+
+        store
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                let saved_cancel = snapshot.pools[0]
+                    .decommission
+                    .as_ref()
+                    .expect("saved snapshot should contain decommission metadata");
+                assert!(saved_cancel.canceled);
+                assert!(saved_cancel.start_time.is_none());
+                let mut queued_replacement = snapshot.clone();
+                let replacement = queued_replacement
+                    .pools
+                    .get_mut(0)
+                    .expect("cancel snapshot should contain the pool");
+                replacement.last_update += Duration::seconds(1);
+                let info = replacement
+                    .decommission
+                    .as_mut()
+                    .expect("cancel snapshot should contain decommission metadata");
+                info.canceled = false;
+                info.queued = true;
+                *queued_replacement_for_save
+                    .lock()
+                    .expect("queued replacement lock should not be poisoned") = Some(queued_replacement);
+                Ok(())
+            })
+            .await
+            .expect("cancel should commit before a queued replacement is installed");
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert!(!canceler.is_active());
+        assert!(canceler.is_cancelled());
+
+        let queued_replacement = queued_replacement
+            .lock()
+            .expect("queued replacement lock should not be poisoned")
+            .take()
+            .expect("save should prepare the queued replacement");
+        *store.pool_meta.write().await = queued_replacement;
+
+        let replacement_revision = {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("queued replacement should remain present");
+            assert!(info.queued);
+            assert!(!info.canceled);
+            assert!(info.start_time.is_none());
+            pool_meta.pools[0].last_update
+        };
+
+        store.retry_decommission_cancel_for_operation(0, &canceler).await;
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("stale retry must preserve the queued replacement");
+        assert_eq!(pool_meta.pools[0].last_update, replacement_revision);
+        assert!(info.queued);
+        assert!(!info.canceled);
+        assert!(info.start_time.is_none());
     }
 
     #[tokio::test]
@@ -9759,6 +13152,7 @@ mod pools_tests {
         assert!(store.decommission_cancelers.read().await[0].is_none());
         assert!(!canceler.is_active());
         assert!(canceler.is_cancelled());
+        assert_eq!(store.ctx.data_movement_operation_epoch(), 1);
     }
 
     #[test]

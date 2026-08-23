@@ -61,6 +61,8 @@ pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "batch
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "batch_read_version_response_msgpack_encode";
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP: &str = "batch_read_version_rpc_roundtrip";
 pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE: &str = "batch_read_version_response_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT: &str = "batch_read_version_coalescer_wait";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP: &str = "batch_read_version_response_map";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -1431,6 +1433,8 @@ mod tests {
         );
         assert_eq!(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, "read_version_rpc_roundtrip");
         assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, "read_version_response_decode");
+        assert_eq!(INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT, "batch_read_version_coalescer_wait");
+        assert_eq!(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP, "batch_read_version_response_map");
         assert_eq!(
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"

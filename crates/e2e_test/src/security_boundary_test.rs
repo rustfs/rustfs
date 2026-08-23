@@ -21,12 +21,11 @@
 //! - SSRF prevention (internal/private endpoints rejected for tiering)
 //! - Race condition handling (concurrent writes converge without corruption)
 
-use crate::common::{RustFSTestEnvironment, awscurl_available, awscurl_put, init_logging};
+use crate::common::{RustFSTestEnvironment, awscurl_put, init_logging, require_awscurl};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Tag, Tagging};
 use std::error::Error;
-use tracing::info;
 
 /// Oversized tagging payloads must be rejected by the per-object tag limit.
 ///
@@ -225,16 +224,12 @@ async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send 
 /// outcome — the internal endpoint is not accepted — is asserted here.
 ///
 /// The admin API is exercised via signed `awscurl` requests, matching the
-/// pattern used by the other admin-API E2E tests in this crate; the test is
-/// skipped when `awscurl` is not installed.
+/// pattern used by the other admin-API E2E tests in this crate. The full E2E
+/// lane installs and verifies the pinned `awscurl` prerequisite.
 #[tokio::test]
 async fn test_tiering_url_validation() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
-    if !awscurl_available() {
-        info!("Skipping tiering URL validation test because awscurl is not available");
-        return Ok(());
-    }
-
+    require_awscurl()?;
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server(vec![]).await?;
 

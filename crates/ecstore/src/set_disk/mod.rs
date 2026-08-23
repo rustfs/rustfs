@@ -47,6 +47,7 @@ use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_config, check_object_lock_for_deletion_with_state, check_retention_for_modification,
+    replication_write_may_pass_worm_gate,
 };
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
@@ -3614,6 +3615,26 @@ impl SetDisks {
         &self.ctx
     }
 
+    /// Admit one short scanner cache publication under this set's instance
+    /// movement fence. The caller must hold the returned guard through its
+    /// final conditional cache write; no scan-round work belongs under it.
+    pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.scanner_publication_state_allowed() {
+            let epoch = self.ctx.data_movement_operation_epoch();
+            return Some((operation_guard, epoch));
+        }
+
+        // The owner deliberately marks the cached state UNKNOWN after every
+        // movement epoch advance. Do not strand remote scanner writers in that
+        // state: release this guard before asking the storage owner to refresh
+        // its durable movement snapshot, since the owner uses the same gate.
+        drop(operation_guard);
+        let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
+        owner.scanner_data_usage_publication_admission_guard().await
+    }
+
     /// Whether both sets' namespace-lock implementations cover the same object key.
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
@@ -4736,7 +4757,15 @@ impl SetDisks {
                 achieved: 0,
             });
         }
-        let parts_metadata = vec![fi.clone(); disks.len()];
+        // Rebuilt tiered metadata starts with index zero, but shuffling validates
+        // each source slot before assigning the shuffled index below.
+        let parts_metadata: Vec<FileInfo> = (0..disks.len())
+            .map(|disk_index| {
+                let mut part = fi.clone();
+                part.erasure.index = fi.erasure.distribution[disk_index];
+                part
+            })
+            .collect();
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mut errs = Vec::with_capacity(shuffle_disks.len());

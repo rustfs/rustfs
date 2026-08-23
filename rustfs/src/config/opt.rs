@@ -18,7 +18,7 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{Cli, CommandResult, Commands, ConnectCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
 use crate::apply_external_env_compat;
 use CommandResult::Server;
 use clap::Parser;
@@ -98,9 +98,11 @@ impl Opt {
         let cli = Cli::parse_from(args);
         match cli.command {
             Some(Commands::Server(opts)) => Self::from_server_opts(*opts),
-            Some(Commands::Info(_)) | Some(Commands::Tls(_)) | Some(Commands::Diagnose(_)) | Some(Commands::Inspect(_)) => {
-                Self::from_server_opts(default_server_opts())
-            }
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Self::from_server_opts(default_server_opts()),
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())
@@ -135,6 +137,9 @@ impl Opt {
             Some(Commands::Tls(opts)) => Ok(CommandResult::Tls(opts)),
             Some(Commands::Diagnose(opts)) => Ok(CommandResult::Diagnose(opts)),
             Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
+            Some(Commands::Connect(opts)) => match opts.command {
+                ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
+            },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
                 // Default to server with empty volumes (will be filled from env)
@@ -163,9 +168,11 @@ impl Opt {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
             Some(Commands::Server(opts)) => Ok(Self::from_server_opts(*opts)),
-            Some(Commands::Info(_)) | Some(Commands::Tls(_)) | Some(Commands::Diagnose(_)) | Some(Commands::Inspect(_)) => {
-                Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp))
-            }
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
             None => {
                 // Default to server with empty volumes
                 Ok(Self::from_server_opts(default_server_opts()))

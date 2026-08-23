@@ -1,0 +1,20 @@
+# Report-only calibration baseline from https://github.com/rustfs/rustfs/actions/runs/29394996173.
+# Update counts only with a linked coverage run and a reviewed explanation.
+phase = "report-only"
+allowed_drop_percentage_points = 1.0
+
+[crates."crates/iam"]
+covered = 5149
+count = 8131
+
+[crates."crates/kms"]
+covered = 2950
+count = 4200
+
+[crates."crates/policy"]
+covered = 4636
+count = 5464
+
+[crates."crates/crypto"]
+covered = 469
+count = 494
