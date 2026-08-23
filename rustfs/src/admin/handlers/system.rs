@@ -70,6 +70,12 @@ const SITE_REPLICATION_EDIT_ROUTE: &str = "/rustfs/admin/v3/site-replication/edi
 const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/resync/op";
 const SITE_REPLICATION_REPAIR_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair";
 const SITE_REPLICATION_REPAIR_STATUS_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair/status";
+const IAM_POLICY_ATTACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/attach";
+const IAM_POLICY_DETACH_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy/detach";
+const IAM_POLICY_ENTITIES_ROUTE: &str = "/rustfs/admin/v3/idp/builtin/policy-entities";
+const IAM_ACCESS_KEYS_BULK_ROUTE: &str = "/rustfs/admin/v3/list-access-keys-bulk";
+const IAM_ACCESS_KEYS_BULK_LDAP_ROUTE: &str = "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk";
+const IAM_ACCESS_KEYS_BULK_OPENID_ROUTE: &str = "/rustfs/admin/v3/idp/openid/list-access-keys-bulk";
 
 macro_rules! log_system_request_rejected {
     ($operation:expr, $reason:expr) => {
@@ -661,9 +667,24 @@ pub struct RuntimeCapabilitiesSummary {
     pub manual_transition_jobs: CapabilityStatus,
 }
 
+/// One named admin capability advertised to management clients
+/// (rustfs/backlog#1900). `name` is a cross-repo wire contract: the rc
+/// client gates commands on these exact strings (see rustfs/cli
+/// `IAM_POLICY_DETACH_CAPABILITY` etc.), so entries may be added but
+/// existing names must never be renamed or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdvertisedAdminCapability {
+    pub name: &'static str,
+    pub status: CapabilityStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    /// Additive field: absent in responses from older servers, so clients
+    /// must treat a missing list as "no dynamic advertisement" and fall
+    /// back to their pinned per-version contract.
+    pub advertised: Vec<AdvertisedAdminCapability>,
     pub replication: ReplicationCapabilities,
     pub manual_transition_jobs: ManualTransitionJobCapabilities,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
@@ -986,6 +1007,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        advertised: advertised_admin_capabilities(),
         replication: ReplicationCapabilities::current(),
         manual_transition_jobs: ManualTransitionJobCapabilities::current(),
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
@@ -1075,6 +1097,23 @@ fn build_runtime_capabilities_summary(
 
 fn admin_route_capability(method: HttpMethod, path: &str) -> CapabilityStatus {
     admin_route_capability_from_inventory(method, path, ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES)
+}
+
+fn advertised_admin_capabilities() -> Vec<AdvertisedAdminCapability> {
+    [
+        ("admin.iam.policy-attach", HttpMethod::Post, IAM_POLICY_ATTACH_ROUTE),
+        ("admin.iam.policy-detach", HttpMethod::Post, IAM_POLICY_DETACH_ROUTE),
+        ("admin.iam.policy-entities", HttpMethod::Get, IAM_POLICY_ENTITIES_ROUTE),
+        ("admin.iam.access-keys-bulk", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_ROUTE),
+        ("admin.iam.access-keys-bulk.ldap", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_LDAP_ROUTE),
+        ("admin.iam.access-keys-bulk.openid", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_OPENID_ROUTE),
+    ]
+    .into_iter()
+    .map(|(name, method, route)| AdvertisedAdminCapability {
+        name,
+        status: admin_route_capability(method, route),
+    })
+    .collect()
 }
 
 fn admin_route_capability_from_inventory(
@@ -1237,6 +1276,48 @@ mod tests {
                 Action::S3Action(S3Action::ListBucketAction),
             ]
         );
+    }
+
+    /// Wire-contract pin (rustfs/backlog#1900): the rc client keys its
+    /// command gates on these exact capability names, and parses each
+    /// entry as `{name, status: {state, reason?}}`. Renaming or dropping
+    /// a name silently disables the corresponding rc command.
+    #[tokio::test]
+    async fn runtime_capabilities_response_advertises_iam_capabilities() {
+        let response = build_runtime_capabilities_response()
+            .await
+            .expect("runtime capabilities response should build");
+
+        let expected_supported = [
+            "admin.iam.policy-attach",
+            "admin.iam.policy-detach",
+            "admin.iam.policy-entities",
+            "admin.iam.access-keys-bulk",
+            "admin.iam.access-keys-bulk.ldap",
+            "admin.iam.access-keys-bulk.openid",
+        ];
+        for name in expected_supported {
+            let entry = response
+                .advertised
+                .iter()
+                .find(|capability| capability.name == name)
+                .unwrap_or_else(|| panic!("{name} must be advertised"));
+            assert_eq!(entry.status.state, CapabilityState::Supported, "{name} must be supported");
+        }
+
+        let mut names: Vec<&str> = response.advertised.iter().map(|capability| capability.name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "advertised capability names must be unique");
+
+        let serialized = serde_json::to_value(&response).expect("response should serialize");
+        let advertised = serialized["advertised"].as_array().expect("advertised must be an array");
+        let detach = advertised
+            .iter()
+            .find(|entry| entry["name"] == "admin.iam.policy-detach")
+            .expect("serialized detach entry must exist");
+        assert_eq!(detach["status"]["state"], "supported");
     }
 
     #[tokio::test]

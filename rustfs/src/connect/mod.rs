@@ -33,6 +33,7 @@ pub mod identity;
 pub mod identity_store;
 pub mod offline;
 pub mod registration;
+pub mod registration_bootstrap;
 pub mod runtime;
 
 pub use client::{ClientError, ConnectClient, ConnectConfig};
@@ -43,4 +44,5 @@ pub use identity::{DeviceIdentity, IdentityError, RegistrationProof, Registratio
 pub use identity_store::{IdentityStore, StoreError};
 pub use offline::{EnrollmentError, OfflineEnrollment, OfflineKeyStore, VerifiedChallenge};
 pub use registration::{RegistrationToken, TokenError};
+pub use registration_bootstrap::{RegistrationBootstrapError, RegistrationBootstrapResult, register_from_protected_input};
 pub use runtime::{HeartbeatRuntime, spawn_heartbeat_runtime};
