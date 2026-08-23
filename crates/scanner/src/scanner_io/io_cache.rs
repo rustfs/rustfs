@@ -112,9 +112,7 @@ impl ScannerIOCache for SetDisks {
                 incomplete_scope.info.lkg_leader_epoch = Some(lkg.info.leader_epoch);
                 incomplete_scope.info.lkg_scan_plan_digest = lkg.info.scan_plan_digest;
             }
-            let _ = updates
-                .send(incomplete_scope)
-                .await;
+            let _ = updates.send(incomplete_scope).await;
             return Ok(());
         }
         // Preserve the original set topology across capability filtering. During
@@ -214,9 +212,7 @@ impl ScannerIOCache for SetDisks {
                 incomplete_scope.info.lkg_leader_epoch = Some(lkg.info.leader_epoch);
                 incomplete_scope.info.lkg_scan_plan_digest = lkg.info.scan_plan_digest;
             }
-            let _ = updates
-                .send(incomplete_scope)
-                .await;
+            let _ = updates.send(incomplete_scope).await;
             return Ok(());
         }
         let set_disk_inventory = Arc::new(scanner_set_disk_inventory(self.as_ref()).await);

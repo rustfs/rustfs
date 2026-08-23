@@ -18,9 +18,8 @@ use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
-    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageSnapshotSetState, DataUsageScanPlanDigest,
-    ScannerError, SizeSummary,
-    TierStats,
+    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
+    ScannerError, SizeSummary, TierStats,
 };
 use futures::future::join_all;
 use metrics::counter;

@@ -386,16 +386,19 @@ impl ScannerIOCycle for ECStore {
             budget_elapsed,
             ctx.is_cancelled(),
         );
-        let observational_usage = completed_usage.is_none().then(|| {
-            observational_data_usage_info(
-                &results,
-                &expected_sources,
-                &all_buckets,
-                scan_plan_digest,
-                want_cycle,
-                leader_epoch,
-            )
-        }).flatten();
+        let observational_usage = completed_usage
+            .is_none()
+            .then(|| {
+                observational_data_usage_info(
+                    &results,
+                    &expected_sources,
+                    &all_buckets,
+                    scan_plan_digest,
+                    want_cycle,
+                    leader_epoch,
+                )
+            })
+            .flatten();
         let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
         let cycle_status = classify_nsscanner_cycle(
             structurally_complete_snapshot,

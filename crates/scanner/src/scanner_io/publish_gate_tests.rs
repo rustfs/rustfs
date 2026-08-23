@@ -129,16 +129,11 @@ fn partial_usage_is_observational_not_authoritative_for_quota() {
     let stalled = lkg_root_cache("bucket", 1, stalled_source);
     let expected = HashSet::from([current_source, stalled_source]);
 
-    assert!(completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, true, false, false).is_none());
-    let (observed, _) = observational_data_usage_info(
-        &[current, stalled],
-        &expected,
-        &all_buckets,
-        TEST_PLAN_DIGEST,
-        8,
-        3,
-    )
-    .expect("a completed set should produce an observational view");
+    assert!(
+        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, true, false, false).is_none()
+    );
+    let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, TEST_PLAN_DIGEST, 8, 3)
+        .expect("a completed set should produce an observational view");
     assert!(observed.usage_snapshot_partial);
     assert!(!observed.usage_snapshot_complete);
     assert_eq!(observed.usage_snapshot_converged, Some(false));

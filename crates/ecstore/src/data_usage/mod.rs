@@ -960,7 +960,10 @@ async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUs
     match parse_usage_snapshot(&data) {
         Ok(info)
             if info.usage_snapshot_converged == Some(false)
-                && (info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot()) => Some(info),
+                && (info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot()) =>
+        {
+            Some(info)
+        }
         Ok(_) => {
             error!(
                 event = "data_usage_snapshot_load_failed",
@@ -4749,12 +4752,7 @@ mod tests {
     async fn negative_delta_waits_for_set_reconciliation() {
         clear_usage_memory_cache_for_test().await;
 
-        let baseline = data_usage_info_for_test(
-            "bucket-a",
-            1,
-            100,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
-        );
+        let baseline = data_usage_info_for_test("bucket-a", 1, 100, SystemTime::UNIX_EPOCH + Duration::from_secs(100));
         replace_bucket_usage_memory_from_info(&baseline).await;
         record_bucket_object_delete_memory("bucket-a", 25, true).await;
 

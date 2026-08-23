@@ -353,7 +353,10 @@ pub(super) fn observational_data_usage_info(
             objects_total_size: u64::try_from(total.size).ok()?,
             tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
             buckets_count: u64::try_from(buckets_usage.len()).ok()?,
-            bucket_sizes: buckets_usage.iter().map(|(bucket, usage)| (bucket.clone(), usage.size)).collect(),
+            bucket_sizes: buckets_usage
+                .iter()
+                .map(|(bucket, usage)| (bucket.clone(), usage.size))
+                .collect(),
             buckets_usage,
             usage_snapshot_complete: false,
             usage_snapshot_partial: true,
