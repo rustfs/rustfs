@@ -28,10 +28,12 @@ use super::{
 };
 
 mod checkpoint;
+mod gc;
 mod replacement;
 mod utils;
 
 pub use checkpoint::{CheckpointManager, ResumeCheckpoint};
+pub(crate) use gc::ResumeGc;
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{

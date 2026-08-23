@@ -14,7 +14,7 @@
 
 use crate::heal::{
     progress::{HealProgress, HealStatistics},
-    resume::{ReplacementPhase, ResumeManager, ResumeState, ResumeUtils},
+    resume::{ReplacementPhase, ResumeGc, ResumeManager, ResumeState, ResumeUtils},
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
@@ -53,9 +53,11 @@ const EVENT_HEAL_MAINLINE_THROTTLE: &str = "heal_mainline_throttle";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
+const EVENT_HEAL_RESUME_GC: &str = "heal_resume_gc";
 const LEGACY_ROOT_HEAL_PATH: &str = ".";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+const RESUME_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // Admission/scheduler outcomes for per-object requests (Object/Metadata/
 // ECDecode) log via demote_to_debug_when! — MRF, autoheal, and scanner
@@ -1165,6 +1167,49 @@ impl HealManager {
         Ok(())
     }
 
+    /// Start the bounded resume-state inspector.  Destructive GC remains
+    /// disabled until the durable owner/CAS contract from backlog#1927 is
+    /// available; this task therefore cannot remove an active or stale file.
+    async fn start_resume_gc(&self) {
+        let cancel = self.cancel_token.clone();
+        tokio::spawn(async move {
+            let mut gc_by_disk = HashMap::<String, ResumeGc>::new();
+            let mut ticker = interval(RESUME_GC_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let disks = {
+                            let local_disk_map = local_disk_map_read().await;
+                            local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
+                        };
+                        for disk in disks {
+                            let disk_key = disk.endpoint().to_string();
+                            let gc = gc_by_disk.entry(disk_key).or_default();
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                result = gc.inspect_disk(&disk) => {
+                                    if let Err(error) = result {
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_RESUME_GC,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            state = "inspect_failed",
+                                            endpoint = %disk.endpoint(),
+                                            error = %error,
+                                            "Heal resume GC inspection failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         Self::new_with_workload_provider(storage, config, None)
@@ -1229,6 +1274,9 @@ impl HealManager {
         // Recover durable replacement intents before the scanner can admit a
         // competing task for the same set.
         self.process_unclean_shutdown().await;
+
+        // Inspect resume artifacts in a bounded, fail-closed background task.
+        self.start_resume_gc().await;
 
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
