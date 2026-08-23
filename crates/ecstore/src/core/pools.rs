@@ -30,8 +30,8 @@ use crate::bucket::{
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{
-    CONFIG_PREFIX, delete_config, read_config, read_config_limited_preserve_empty,
-    read_config_limited_preserve_empty_with_metadata, read_config_no_lock, save_config, save_config_with_opts,
+    CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
+    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config, save_config_with_opts,
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
@@ -58,7 +58,11 @@ use crate::storage_api_contracts::{
 };
 use crate::{core::sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{
+    StreamExt,
+    future::{BoxFuture, join_all},
+    stream::FuturesUnordered,
+};
 use http::HeaderMap;
 #[cfg(test)]
 use rmp_serde::Deserializer;
@@ -1984,6 +1988,218 @@ pub struct PoolMeta {
     pub dont_save: bool,
 }
 
+#[derive(Debug)]
+enum PoolMetaReplica {
+    Missing,
+    Valid {
+        raw: Vec<u8>,
+        canonical: Vec<u8>,
+        meta: PoolMeta,
+    },
+    Corrupt(String),
+    Incompatible(String),
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMetaReplicaState {
+    pub(crate) needs_repair: bool,
+    pub(crate) repair_write_safe: bool,
+}
+
+impl PoolMetaReplicaState {
+    pub(crate) fn ensure_write_safe(self, operation: &str) -> Result<()> {
+        if self.repair_write_safe {
+            return Ok(());
+        }
+        Err(Error::other(format!(
+            "{operation}: pool metadata update cannot overwrite an unreadable replica"
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct PoolMetaSelection {
+    meta: PoolMeta,
+    replica_state: PoolMetaReplicaState,
+}
+
+fn classify_pool_meta_tuple_decode_error(kind: &str, err: rmp_serde::decode::Error) -> PoolMetaReplica {
+    let truncated = matches!(
+        &err,
+        rmp_serde::decode::Error::InvalidMarkerRead(source)
+            | rmp_serde::decode::Error::InvalidDataRead(source)
+            if source.kind() == std::io::ErrorKind::UnexpectedEof
+    );
+    if truncated {
+        PoolMetaReplica::Corrupt(format!("{kind} tuple payload is truncated: {err}"))
+    } else {
+        PoolMetaReplica::Incompatible(format!("{kind} tuple payload is not decodable: {err}"))
+    }
+}
+
+fn decode_pool_meta_replica(data: Vec<u8>) -> PoolMetaReplica {
+    if data.len() <= 4 {
+        return PoolMetaReplica::Corrupt("metadata payload is empty or truncated".to_string());
+    }
+
+    let format = LittleEndian::read_u16(&data[0..2]);
+    if format != POOL_META_FORMAT {
+        return PoolMetaReplica::Incompatible(format!("unsupported format {format}"));
+    }
+    let version = LittleEndian::read_u16(&data[2..4]);
+    if version != POOL_META_VERSION {
+        return PoolMetaReplica::Incompatible(format!("unsupported version {version}"));
+    }
+
+    let payload = &data[4..];
+    let meta = match rmp::decode::read_array_len(&mut &payload[..]) {
+        Ok(2) => match rmp_serde::from_slice::<PersistedPoolMeta>(payload) {
+            Ok(meta) => match PoolMeta::try_from(meta) {
+                Ok(meta) => meta,
+                Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+            },
+            Err(err) => return classify_pool_meta_tuple_decode_error("current", err),
+        },
+        // V1's third tuple field is the legacy `dont_save` flag. A same-version
+        // boolean extension is byte-identical, so schema extensions must bump
+        // POOL_META_VERSION instead of reusing this shape.
+        Ok(3) => match rmp_serde::from_slice::<LegacyPoolMeta>(payload) {
+            Ok(meta) => match PoolMeta::try_from(meta) {
+                Ok(meta) => meta,
+                Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+            },
+            Err(err) => return classify_pool_meta_tuple_decode_error("legacy", err),
+        },
+        Ok(field_count) if field_count < 2 => {
+            return PoolMetaReplica::Corrupt(format!("pool metadata tuple has only {field_count} fields"));
+        }
+        Ok(field_count) => {
+            return PoolMetaReplica::Incompatible(format!("pool metadata tuple has unsupported field count {field_count}"));
+        }
+        Err(_) => {
+            let mut meta = PoolMeta::default();
+            if let Err(err) = meta.load_from_config_data(data.clone()) {
+                let reason = err.to_string();
+                if reason.contains("unknown field") {
+                    return PoolMetaReplica::Incompatible(format!("current-version payload uses unsupported fields: {reason}"));
+                }
+                return PoolMetaReplica::Corrupt(reason);
+            }
+            meta
+        }
+    };
+
+    match meta.encode_config_data() {
+        Ok(canonical) => PoolMetaReplica::Valid {
+            raw: data,
+            canonical,
+            meta,
+        },
+        Err(err) => PoolMetaReplica::Corrupt(err.to_string()),
+    }
+}
+
+async fn read_pool_meta_replica<S>(pool: Arc<S>, no_lock: bool) -> PoolMetaReplica
+where
+    S: EcstoreObjectIO,
+{
+    let result = if no_lock {
+        read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME)
+            .await
+            .map(|(data, _)| data)
+    } else {
+        read_config_preserve_empty(pool, POOL_META_NAME).await
+    };
+    match result {
+        Ok(data) => decode_pool_meta_replica(data),
+        Err(Error::ConfigNotFound) => PoolMetaReplica::Missing,
+        Err(err) => PoolMetaReplica::Unreadable(err.to_string()),
+    }
+}
+
+fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSelection> {
+    if replicas.is_empty() {
+        return Err(Error::other("pool metadata recovery required: no storage pools available"));
+    }
+
+    // V1 has no durable generation. Semantically equivalent legacy/current
+    // encodings can be normalized, but different canonical snapshots require
+    // an operator-selected recovery source instead of an inferred winner.
+    let mut selected: Option<(usize, Vec<u8>, Vec<u8>, PoolMeta)> = None;
+    let mut needs_repair = false;
+    let mut repair_write_safe = true;
+    let mut missing = 0usize;
+    let mut unusable = Vec::new();
+
+    for (idx, replica) in replicas.into_iter().enumerate() {
+        match replica {
+            PoolMetaReplica::Missing => {
+                missing += 1;
+                needs_repair = true;
+            }
+            PoolMetaReplica::Corrupt(reason) => {
+                needs_repair = true;
+                unusable.push(format!("pool {idx} is corrupt: {reason}"));
+            }
+            PoolMetaReplica::Unreadable(reason) => {
+                needs_repair = true;
+                repair_write_safe = false;
+                unusable.push(format!("pool {idx} is unreadable: {reason}"));
+            }
+            PoolMetaReplica::Incompatible(reason) => {
+                return Err(Error::other(format!(
+                    "pool metadata recovery required: pool {idx} is incompatible ({reason}); upgrade or restore a compatible replica without overwriting it"
+                )));
+            }
+            PoolMetaReplica::Valid { raw, canonical, meta } => {
+                if let Some((selected_idx, selected_raw, selected_canonical, _)) = selected.as_ref() {
+                    if selected_canonical != &canonical {
+                        return Err(Error::other(format!(
+                            "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
+                        )));
+                    }
+                    needs_repair |= selected_raw != &raw;
+                } else {
+                    selected = Some((idx, raw, canonical, meta));
+                }
+            }
+        }
+    }
+
+    if let Some((_, _, _, meta)) = selected {
+        return Ok(PoolMetaSelection {
+            meta,
+            replica_state: PoolMetaReplicaState {
+                needs_repair,
+                repair_write_safe,
+            },
+        });
+    }
+    if missing > 0 && unusable.is_empty() {
+        return Ok(PoolMetaSelection {
+            meta: PoolMeta::default(),
+            replica_state: PoolMetaReplicaState {
+                needs_repair: false,
+                repair_write_safe: true,
+            },
+        });
+    }
+
+    Err(Error::other(format!(
+        "pool metadata recovery required: no valid replica is available ({})",
+        unusable.join("; ")
+    )))
+}
+
+async fn load_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Result<PoolMetaSelection>
+where
+    S: EcstoreObjectIO,
+{
+    let replicas = join_all(pools.into_iter().map(|pool| read_pool_meta_replica(pool, no_lock))).await;
+    select_pool_meta_replica(replicas)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPoolMeta {
@@ -2426,41 +2642,21 @@ impl PoolMeta {
         Ok(())
     }
 
-    pub async fn load(&mut self, pool: Arc<Sets>, _pools: Vec<Arc<Sets>>) -> Result<()> {
-        let data = match read_config(pool, POOL_META_NAME).await {
-            Ok(data) => data,
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-        };
-        self.load_from_config_data(data)
+    pub async fn load(&mut self, _pool: Arc<Sets>, pools: Vec<Arc<Sets>>) -> Result<()> {
+        let selection = load_pool_meta_replicas(pools, false).await?;
+        *self = selection.meta;
+        Ok(())
     }
 
-    /// Startup loads pool metadata before the full namespace-lock RPC surface is ready.
-    pub(crate) async fn load_for_startup<S>(&mut self, pool: Arc<S>) -> Result<()>
+    /// Loads every pool metadata replica while the caller owns the metadata fence
+    /// or before the namespace-lock RPC surface is ready during startup.
+    pub(crate) async fn load_no_lock_from_replicas<S>(&mut self, pools: Vec<Arc<S>>) -> Result<PoolMetaReplicaState>
     where
         S: EcstoreObjectIO,
     {
-        self.load_no_lock(pool).await
-    }
-
-    pub(crate) async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
-    where
-        S: EcstoreObjectIO,
-    {
-        let data = match read_config_no_lock(pool, POOL_META_NAME).await {
-            Ok(data) => data,
-            Err(err) => {
-                if err == Error::ConfigNotFound {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-        };
-        self.load_from_config_data(data)
+        let selection = load_pool_meta_replicas(pools, true).await?;
+        *self = selection.meta;
+        Ok(selection.replica_state)
     }
 
     fn encode_config_data(&self) -> Result<Vec<u8>> {
@@ -3334,7 +3530,8 @@ impl ECStore {
             pool_meta.clone()
         };
         let mut latest_pool_meta = PoolMeta::default();
-        latest_pool_meta.load_no_lock(rebalance_pool).await?;
+        let replica_state = latest_pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
+        replica_state.ensure_write_safe("decommission start failed")?;
         if latest_pool_meta.pools.is_empty() {
             latest_pool_meta = current_pool_meta;
         }
@@ -3592,8 +3789,6 @@ impl ECStore {
             }
             return Err(err);
         }
-        drop(operation_guard);
-
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
@@ -6868,6 +7063,167 @@ mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
     use serde::Serialize;
+
+    fn pool_meta_replica_test_meta(cmd_line: &str) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: cmd_line.to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            dont_save: false,
+        }
+    }
+
+    fn pool_meta_replica_test_data(cmd_line: &str) -> Vec<u8> {
+        pool_meta_replica_test_meta(cmd_line)
+            .encode_config_data()
+            .expect("pool metadata should encode")
+    }
+
+    fn pool_meta_legacy_replica_test_data(cmd_line: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
+            .expect("pool metadata format should encode");
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)
+            .expect("pool metadata version should encode");
+        pool_meta_replica_test_meta(cmd_line)
+            .serialize(&mut Serializer::new(&mut data))
+            .expect("legacy pool metadata should encode");
+        data
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_falls_back_from_corrupt_first_copy() {
+        let selection = select_pool_meta_replica(vec![
+            PoolMetaReplica::Corrupt("truncated".to_string()),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+        ])
+        .expect("a validated backup replica should be selected");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools.len(), 1);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-0");
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_incompatible_copy() {
+        let valid = pool_meta_replica_test_data("pool-0");
+        let mut incompatible = valid.clone();
+        LittleEndian::write_u16(&mut incompatible[2..4], POOL_META_VERSION + 1);
+
+        let err = select_pool_meta_replica(vec![decode_pool_meta_replica(valid), decode_pool_meta_replica(incompatible)])
+            .expect_err("an incompatible replica must block fallback and repair writes");
+
+        assert!(err.to_string().contains("pool 1 is incompatible"));
+        assert!(err.to_string().contains("without overwriting it"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_partial_write_divergence() {
+        let err = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-old")),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-new")),
+        ])
+        .expect_err("different valid snapshots have no safe ordering without a generation protocol");
+
+        assert!(err.to_string().contains("valid replicas in pools 0 and 1 diverge"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_normalizes_equivalent_legacy_copy() {
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_legacy_replica_test_data("pool-0")),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+        ])
+        .expect("equivalent legacy and current encodings should be compatible");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-0");
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_distinguishes_absent_from_unrecoverable() {
+        assert!(matches!(decode_pool_meta_replica(Vec::new()), PoolMetaReplica::Corrupt(_)));
+
+        let empty = select_pool_meta_replica(vec![PoolMetaReplica::Missing, PoolMetaReplica::Missing])
+            .expect("all missing replicas should preserve new-deployment behavior");
+        assert!(empty.meta.pools.is_empty());
+        assert!(!empty.replica_state.needs_repair);
+        assert!(empty.replica_state.repair_write_safe);
+
+        let err = select_pool_meta_replica(vec![
+            PoolMetaReplica::Missing,
+            PoolMetaReplica::Unreadable("read quorum unavailable".to_string()),
+        ])
+        .expect_err("an unreadable replica must not be treated as a new deployment");
+        assert!(err.to_string().contains("no valid replica is available"));
+        assert!(err.to_string().contains("pool 1 is unreadable"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_blocks_repair_for_unreadable_copy() {
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+            PoolMetaReplica::Unreadable("read quorum unavailable".to_string()),
+        ])
+        .expect("a validated replica should remain usable while another copy is unreadable");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(!selection.replica_state.repair_write_safe);
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_same_version_tuple_extension() {
+        #[derive(Serialize)]
+        struct FuturePersistedPoolMeta {
+            version: u16,
+            pools: Vec<PersistedPoolStatus>,
+            generation: u64,
+        }
+
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
+            .expect("pool metadata format should encode");
+        data.write_u16::<LittleEndian>(POOL_META_VERSION)
+            .expect("pool metadata version should encode");
+        FuturePersistedPoolMeta {
+            version: POOL_META_VERSION,
+            pools: Vec::new(),
+            generation: 2,
+        }
+        .serialize(&mut Serializer::new(&mut data))
+        .expect("extended tuple pool metadata should encode");
+
+        let err = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-0")),
+            decode_pool_meta_replica(data),
+        ])
+        .expect_err("same-version tuple extensions must block fallback repair writes");
+
+        assert!(err.to_string().contains("pool 1 is incompatible"));
+        assert!(err.to_string().contains("legacy tuple payload is not decodable"));
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_falls_back_from_truncated_current_tuple() {
+        let mut truncated = pool_meta_replica_test_data("pool-truncated");
+        truncated.pop();
+
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(truncated),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-valid")),
+        ])
+        .expect("a truncated tuple should not block a validated backup replica");
+
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-valid");
+    }
 
     #[test]
     fn ensure_pool_not_left_in_cmdline_after_decommission_allows_active_pool() {
