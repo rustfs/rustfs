@@ -128,6 +128,7 @@ fn build_preferred() -> russh::Preferred {
     russh::Preferred {
         kex: Cow::Borrowed(SFTP_KEX),
         key: Cow::Borrowed(SFTP_HOST_KEY_ALGORITHMS),
+        host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Borrowed(SFTP_CIPHERS),
         mac: Cow::Borrowed(SFTP_MACS),
         compression: Cow::Borrowed(SFTP_COMPRESSION),
@@ -1552,6 +1553,11 @@ mod tests {
         // curve25519 (RFC 8731) must come before pre-RFC variant.
         assert_eq!(SFTP_KEX[1], russh::kex::CURVE25519);
         assert_eq!(SFTP_KEX[2], russh::kex::CURVE25519_PRE_RFC_8731);
+    }
+
+    #[test]
+    fn server_does_not_prefer_client_host_key_certificates() {
+        assert!(build_preferred().host_key_certificates.is_empty());
     }
 
     #[test]
