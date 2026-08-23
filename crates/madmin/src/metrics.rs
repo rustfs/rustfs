@@ -302,6 +302,14 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_result: String,
     #[serde(rename = "last_usage_save_result_code", default)]
     pub last_usage_save_result_code: u64,
+    #[serde(rename = "deferred_pending", default)]
+    pub deferred_pending: bool,
+    #[serde(rename = "deferred_total", default)]
+    pub deferred_total: u64,
+    #[serde(rename = "last_deferred_unix_secs", default)]
+    pub last_deferred_unix_secs: u64,
+    #[serde(rename = "last_deferred_reason", default)]
+    pub last_deferred_reason: String,
 }
 
 impl ScannerUsageFreshnessSnapshot {
@@ -317,6 +325,12 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_usage_save_unix_secs = other.last_usage_save_unix_secs;
             self.last_usage_save_result = other.last_usage_save_result.clone();
             self.last_usage_save_result_code = other.last_usage_save_result_code;
+        }
+        self.deferred_pending |= other.deferred_pending;
+        self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        if other.last_deferred_unix_secs > self.last_deferred_unix_secs {
+            self.last_deferred_unix_secs = other.last_deferred_unix_secs;
+            self.last_deferred_reason = other.last_deferred_reason.clone();
         }
     }
 }
@@ -1564,6 +1578,36 @@ mod tests {
         let explicit_false: ScannerMetrics =
             serde_json::from_value(explicit_false_value).expect("explicit cycle-active should decode");
         assert_eq!(explicit_false.current_cycle_active, Some(false));
+    }
+
+    #[test]
+    fn usage_freshness_deferred_fields_are_backward_compatible_and_merge() {
+        let legacy: ScannerUsageFreshnessSnapshot = serde_json::from_value(serde_json::json!({
+            "dirty_pending_buckets": 2,
+            "last_usage_save_result": "success"
+        }))
+        .expect("legacy usage freshness should decode");
+        assert!(!legacy.deferred_pending);
+        assert_eq!(legacy.deferred_total, 0);
+
+        let mut merged = ScannerUsageFreshnessSnapshot::default();
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: true,
+            deferred_total: 2,
+            last_deferred_unix_secs: 20,
+            last_deferred_reason: "data_movement".to_string(),
+            ..Default::default()
+        });
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_total: 1,
+            last_deferred_unix_secs: 10,
+            last_deferred_reason: "older".to_string(),
+            ..Default::default()
+        });
+        assert!(merged.deferred_pending);
+        assert_eq!(merged.deferred_total, 3);
+        assert_eq!(merged.last_deferred_unix_secs, 20);
+        assert_eq!(merged.last_deferred_reason, "data_movement");
     }
 
     #[test]

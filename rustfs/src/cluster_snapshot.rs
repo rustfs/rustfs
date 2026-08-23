@@ -66,6 +66,10 @@ pub struct ClusterUsageFreshnessSnapshot {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_usage_save_result_code: u64,
+    pub deferred_pending: bool,
+    pub deferred_total: u64,
+    pub last_deferred_unix_secs: u64,
+    pub last_deferred_reason: String,
 }
 
 impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
@@ -79,6 +83,10 @@ impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
             last_usage_save_unix_secs: report.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: report.usage_freshness.last_usage_save_result.clone(),
             last_usage_save_result_code: report.usage_freshness.last_usage_save_result_code,
+            deferred_pending: report.usage_freshness.deferred_pending,
+            deferred_total: report.usage_freshness.deferred_total,
+            last_deferred_unix_secs: report.usage_freshness.last_deferred_unix_secs,
+            last_deferred_reason: report.usage_freshness.last_deferred_reason.clone(),
         }
     }
 }

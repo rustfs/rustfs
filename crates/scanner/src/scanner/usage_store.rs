@@ -150,6 +150,7 @@ where
                 state = "publication_blocked_before_reconcile",
                 "Scanner data usage publication deferred by the pool-state fence"
             );
+            global_metrics().record_scanner_usage_deferred(ScannerCycleDeferReason::DataMovement.as_str());
             outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             break;
         }
@@ -432,6 +433,7 @@ where
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+                global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::AlreadyDurable;
             }
             DataUsagePersistOutcome::PriorCycleDurable => {
@@ -442,6 +444,7 @@ where
                     invalidate_data_usage_snapshot_cache().await;
                 }
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+                global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::PriorCycleDurable;
             }
             DataUsagePersistOutcome::Failed | DataUsagePersistOutcome::NoUpdate => {
@@ -453,6 +456,7 @@ where
                 // A deferred publication is an intentional retryable state, not a
                 // failed save. Keep the last real save result so admin freshness
                 // reporting does not turn a pool-recovery fence into a false error.
+                global_metrics().record_scanner_usage_deferred(reason.as_str());
                 outcome = DataUsagePersistOutcome::Deferred(reason);
                 break 'updates;
             }
@@ -465,6 +469,7 @@ where
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+                global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::Saved;
             }
         }
