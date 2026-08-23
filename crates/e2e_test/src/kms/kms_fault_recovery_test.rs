@@ -37,7 +37,7 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -127,7 +127,7 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -218,7 +218,7 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;
@@ -401,7 +401,7 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    kms_env.wait_for_kms_ready().await?;
 
     let s3_client = kms_env.base_env.create_s3_client();
     kms_env.base_env.create_test_bucket(TEST_BUCKET).await?;

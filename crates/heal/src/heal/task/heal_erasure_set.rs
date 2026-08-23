@@ -231,6 +231,10 @@ impl HealTask {
                             "Heal erasure set format repair skipped because no format heal was required"
                         );
                     } else {
+                        let error = e;
+                        if error.is_recoverable_heal() {
+                            return Err(error);
+                        }
                         error!(
                             target: "rustfs::heal::task",
                             event = EVENT_HEAL_ERASURE_SET_RESULT,
@@ -239,7 +243,7 @@ impl HealTask {
                             task_id = %self.id,
                             set_disk_id,
                             result = "format_failed",
-                            error = %e,
+                            error = %error,
                             "Heal erasure set failed"
                         );
                         {
@@ -247,7 +251,7 @@ impl HealTask {
                             progress.update_progress(4, 4, 0, 0);
                         }
                         return Err(Error::TaskExecutionFailed {
-                            message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
+                            message: format!("Failed to heal disk format for {set_disk_id}: {error}"),
                         });
                     }
                 } else {
@@ -284,6 +288,9 @@ impl HealTask {
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
             Err(e) => {
+                if e.is_recoverable_heal() {
+                    return Err(e);
+                }
                 error!(
                     target: "rustfs::heal::task",
                     event = EVENT_HEAL_ERASURE_SET_RESULT,

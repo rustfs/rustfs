@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use crate::admin::auth::authorize_admin_request;
+use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::current_scanner_metrics_report;
+use crate::admin::runtime_sources::{
+    app_context_from_req, current_object_store_handle_for_context, current_scanner_metrics_report,
+};
 use crate::module_switches::{ENV_SCANNER_ENABLED, scanner_enabled_from_env};
 use crate::server::ADMIN_PREFIX;
 use chrono::Utc;
@@ -22,11 +25,13 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_common::metrics::{ScannerLifecycleExpirySnapshot, ScannerMaintenanceControlSnapshot, ScannerMetricsReport};
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 
@@ -38,6 +43,13 @@ struct ScannerStatusResponse {
     metrics: ScannerMetricsReport,
     cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
+    cycle_recovery: rustfs_scanner::ScannerCycleRecoveryStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScannerCycleResetRequest {
+    mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +129,7 @@ fn scanner_status_response(
         metrics,
         cycle_schedule,
         runtime_config,
+        cycle_recovery: rustfs_scanner::scanner::scanner_cycle_recovery_status(),
     }
 }
 
@@ -145,6 +158,11 @@ pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
         AdminOperation(&ScannerStatusHandler {}),
     )?;
     r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}/v3/scanner/cycle-state/reset").as_str(),
+        AdminOperation(&ScannerCycleStateResetHandler {}),
+    )?;
+    r.insert(
         Method::GET,
         format!("{ADMIN_PREFIX}/v3/ilm/expiry/status").as_str(),
         AdminOperation(&IlmExpiryStatusHandler {}),
@@ -161,6 +179,13 @@ async fn validate_scanner_status_request(req: &S3Request<Body>) -> S3Result<Cred
     }
 
     authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await
+}
+
+async fn validate_scanner_reset_request(req: &S3Request<Body>) -> S3Result<Credentials> {
+    if req.credentials.is_none() {
+        return Err(s3_error!(InvalidRequest, "missing credentials"));
+    }
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ConfigUpdateAdminAction)]).await
 }
 
 fn json_response(body: Vec<u8>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -191,6 +216,37 @@ impl Operation for ScannerStatusHandler {
 }
 
 pub struct IlmExpiryStatusHandler {}
+
+pub struct ScannerCycleStateResetHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ScannerCycleStateResetHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _cred = validate_scanner_reset_request(&req).await?;
+        let body = req
+            .input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
+        let reset = serde_json::from_slice::<ScannerCycleResetRequest>(&body)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
+        if reset.mode != "full-rescan" {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "reset mode must be full-rescan"));
+        }
+        let context = app_context_from_req(&req)
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        let store = current_object_store_handle_for_context(Some(context.as_ref()))
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        supervise_admin_mutation("scanner cycle state reset", async move {
+            rustfs_scanner::scanner::reset_scanner_cycle_recovery(CancellationToken::new(), store)
+                .await
+                .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?;
+            Ok::<_, S3Error>(())
+        })
+        .await?;
+        json_response(br#"{"status":"reset","mode":"full-rescan"}"#.to_vec())
+    }
+}
 
 #[async_trait::async_trait]
 impl Operation for IlmExpiryStatusHandler {
@@ -235,6 +291,38 @@ mod tests {
             .expect_err("a request without credentials must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("missing credentials"));
+    }
+
+    #[tokio::test]
+    async fn scanner_reset_gate_rejects_missing_credentials() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::POST,
+            uri: http::Uri::from_static("/rustfs/admin/v3/scanner/cycle-state/reset"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = validate_scanner_reset_request(&req)
+            .await
+            .expect_err("a reset request without credentials must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("missing credentials"));
+    }
+
+    #[test]
+    fn admin_reset_requires_full_rescan_or_verified_cursor() {
+        let full_rescan: ScannerCycleResetRequest =
+            serde_json::from_str(r#"{"mode":"full-rescan"}"#).expect("full rescan must be accepted");
+        assert_eq!(full_rescan.mode, "full-rescan");
+        let cursor: ScannerCycleResetRequest =
+            serde_json::from_str(r#"{"mode":"cursor"}"#).expect("mode validation belongs to the handler");
+        assert_ne!(cursor.mode, "full-rescan");
+        assert!(serde_json::from_str::<ScannerCycleResetRequest>(r#"{"mode":"full-rescan","cursor":"untrusted"}"#).is_err());
     }
 
     #[test]
@@ -304,6 +392,11 @@ mod tests {
         assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_enabled"], false);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_multiplier"], 1);
+        assert_eq!(encoded["cycle_recovery"]["state"], "healthy");
+        assert_eq!(
+            encoded["cycle_recovery"]["quarantine_path"],
+            rustfs_scanner::DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()
+        );
     }
 
     #[test]

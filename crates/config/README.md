@@ -84,6 +84,12 @@ Current guidance:
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
 
+Scanner cycle budget controls:
+
+- When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
+- An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+- A timed-out cycle cancels cooperative scanner work, then fences its leader epoch before releasing the lease. An uncooperative I/O operation is dropped after the bounded shutdown window; its cursor is not claimed to be durable and the scanner reports `recovery-required` when the worker cannot stop cooperatively, the cycle state was not confirmed durable, or epoch fencing cannot be persisted.
+
 ## Mmap read environment aliases
 
 - `RUSTFS_OBJECT_MMAP_READ_ENABLE` (canonical)
