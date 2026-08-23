@@ -3690,7 +3690,7 @@ impl SetDisks {
             .map(RenameDataCommit::into_legacy_tuple)
     }
 
-    fn scanner_publication_lease_token_for_disk(
+    pub(in crate::set_disk) fn scanner_publication_lease_token_for_disk(
         disk: Option<&DiskStore>,
         scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
     ) -> disk::error::Result<Option<Uuid>> {
@@ -3711,7 +3711,7 @@ impl SetDisks {
             .map(Some)
     }
 
-    fn scanner_publication_lease_tokens_for_disks(
+    pub(in crate::set_disk) fn scanner_publication_lease_tokens_for_disks(
         disks: &[Option<DiskStore>],
         scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
     ) -> disk::error::Result<Vec<Option<Uuid>>> {
@@ -5497,17 +5497,30 @@ impl SetDisks {
     }
 
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
+        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None).await
+    }
+
+    /// Delete a prefix with an optional per-remote-disk scanner publication
+    /// lease fence. The fence is transient and never reaches disk metadata;
+    /// remote deletes without a matching token fail closed before the RPC.
+    pub(in crate::set_disk) async fn delete_prefix_with_scanner_publication_lease(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+    ) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
+        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(&disks, scanner_publication_lease_tokens)?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
-        for disk_op in disks.iter() {
+        for (disk_op, scanner_publication_lease_token) in disks.iter().zip(fanout_fence_tokens) {
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
             futures.push(async move {
                 if let Some(disk) = disk_op {
-                    disk.delete(
+                    disk.delete_with_scanner_publication_lease(
                         &bucket,
                         &prefix,
                         DeleteOptions {
@@ -5515,6 +5528,7 @@ impl SetDisks {
                             immediate: true,
                             ..Default::default()
                         },
+                        scanner_publication_lease_token,
                     )
                     .await
                 } else {

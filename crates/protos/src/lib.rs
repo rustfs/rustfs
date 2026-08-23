@@ -999,6 +999,9 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.volume)?;
     body.push_str(&request.path)?;
     body.push_str(&request.options)?;
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -1334,6 +1337,7 @@ mod disk_mutation_canonical_tests {
             volume: "v".into(),
             path: "p".into(),
             options: "{\"o\":1}".into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
         for mutate in [
@@ -1341,6 +1345,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
             mutate(&mut request);

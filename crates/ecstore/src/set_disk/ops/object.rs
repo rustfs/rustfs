@@ -6337,6 +6337,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        // Scanner cleanup carries the per-peer lease fence as transient
+        // request metadata. Consume it before any delete-prefix fanout so it
+        // cannot be persisted or treated as user metadata.
+        let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut opts.user_defined)?;
         let preserve_delete_replication_state = should_preserve_delete_replication_state(&opts);
         let delete_config_snapshot = if opts.delete_prefix || opts.transition.expire_restored || preserve_delete_replication_state
         {
@@ -6463,7 +6467,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-            self.delete_prefix(bucket, object)
+            self.delete_prefix_with_scanner_publication_lease(bucket, object, scanner_publication_lease_tokens.as_ref())
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 

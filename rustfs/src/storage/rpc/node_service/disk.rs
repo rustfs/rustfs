@@ -1606,6 +1606,16 @@ impl NodeService {
     }
 
     pub(super) async fn handle_delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        if !request.get_ref().scanner_publication_lease_token.is_empty() {
+            let has_body_digest = request
+                .metadata()
+                .get("x-rustfs-content-sha256")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
+            if !has_body_digest {
+                return Err(Status::permission_denied("scanner publication lease delete requires a body-bound digest"));
+            }
+        }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -1617,6 +1627,38 @@ impl NodeService {
                         error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
                     }));
                 }
+            };
+            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+                None
+            } else {
+                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+                if token.is_nil() {
+                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+                }
+                Some(token)
+            };
+            // The target-side guard spans the complete delete operation. A
+            // lease expiry or movement transition cannot occur between this
+            // validation and the disk delete linearization point.
+            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
+                let Some(store) = self.resolve_object_store() else {
+                    return Ok(Response::new(DeleteResponse {
+                        success: false,
+                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                    }));
+                };
+                match store.acquire_scanner_publication_lease_guard(token).await {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        return Ok(Response::new(DeleteResponse {
+                            success: false,
+                            error: Some(DiskError::other(err.to_string()).into()),
+                        }));
+                    }
+                }
+            } else {
+                None
             };
             match disk.delete(&request.volume, &request.path, options).await {
                 Ok(_) => Ok(Response::new(DeleteResponse {

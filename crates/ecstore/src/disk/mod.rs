@@ -677,6 +677,23 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub(crate) async fn delete_with_scanner_publication_lease(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.delete(volume, path, opts).await,
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .delete_with_scanner_publication_lease(volume, path, opts, scanner_publication_lease_token)
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn rename_data_borrowed(
         &self,
         src_volume: &str,

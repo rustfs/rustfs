@@ -142,6 +142,9 @@ pub struct DeleteRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub options: ::prost::alloc::string::String,
+    /// Optional scanner publication lease token.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub scanner_publication_lease_token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteResponse {

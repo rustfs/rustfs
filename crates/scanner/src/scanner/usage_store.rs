@@ -593,6 +593,7 @@ where
                         &data_usage_info,
                         expected_publication_epoch,
                         remote_lease_deadline,
+                        scanner_publication_lease_fence.as_deref(),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -615,6 +616,7 @@ where
                         &data_usage_info,
                         expected_publication_epoch,
                         remote_lease_deadline,
+                        scanner_publication_lease_fence.as_deref(),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -656,6 +658,7 @@ where
                         &data_usage_info,
                         expected_publication_epoch,
                         remote_lease_deadline,
+                        scanner_publication_lease_fence.as_deref(),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -711,7 +714,8 @@ pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
     authoritative: &DataUsageInfo,
     expected_publication_epoch: Option<u64>,
 ) -> bool {
-    cleanup_observed_data_usage_snapshot_for_epoch_and_lease(storeapi, authoritative, expected_publication_epoch, None).await
+    cleanup_observed_data_usage_snapshot_for_epoch_and_lease(storeapi, authoritative, expected_publication_epoch, None, None)
+        .await
 }
 
 async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
@@ -719,6 +723,7 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
     authoritative: &DataUsageInfo,
     expected_publication_epoch: Option<u64>,
     remote_lease_deadline: Option<std::time::Instant>,
+    scanner_publication_lease_fence: Option<&str>,
 ) -> bool {
     if remote_lease_expired(remote_lease_deadline) {
         return false;
@@ -795,6 +800,14 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
             delete_prefix: true,
             delete_prefix_object: true,
             http_preconditions: Some(revision.preconditions()),
+            user_defined: scanner_publication_lease_fence
+                .map(|fence| {
+                    HashMap::from([(
+                        crate::storage_api::owner::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+                        fence.to_string(),
+                    )])
+                })
+                .unwrap_or_default(),
             ..Default::default()
         },
         read_epoch,

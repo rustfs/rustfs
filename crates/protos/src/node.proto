@@ -111,6 +111,9 @@ message DeleteRequest {
   string volume = 2;
   string path = 3;
   string options = 4;
+  // Optional scanner publication lease token. When present, the target binds
+  // the complete delete operation to its movement read admission.
+  bytes scanner_publication_lease_token = 5;
 }
 
 message DeleteResponse {

@@ -2802,6 +2802,7 @@ mod tests {
             volume: "bucket".to_string(),
             path: "object".to_string(),
             options: options.to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         }
     }
 
@@ -2972,6 +2973,7 @@ mod tests {
                 volume: "v".into(),
                 path: "p".into(),
                 options: "{}".into(),
+                scanner_publication_lease_token: Vec::new().into(),
             },
             rustfs_protos::canonical_delete_request_body
         );
@@ -3880,6 +3882,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             options: "{}".to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.delete(request).await;
@@ -3899,6 +3902,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             options: "invalid json".to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.delete(request).await;
