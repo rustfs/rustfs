@@ -61,6 +61,8 @@ pub mod runtime_config;
 pub mod scanner;
 pub mod scanner_budget;
 pub mod scanner_folder;
+#[cfg(test)]
+mod scanner_heal_admission_baseline;
 pub mod scanner_io;
 pub mod sleeper;
 pub(crate) mod storage_api;
