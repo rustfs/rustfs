@@ -239,6 +239,13 @@ fn classify_nsscanner_cycle(
     dirty_usage_status: DirtyUsageSnapshotStatus,
     activity_status: ScannerCycleActivityStatus,
 ) -> ScannerCycleStatus {
+    // The post-scan activity proof is required regardless of why the scan was
+    // incomplete.  Returning Incomplete first would apply the long ordinary
+    // retry/backoff path to an unverifiable publication and could acknowledge
+    // a cycle without a movement-generation proof.
+    if activity_status == ScannerCycleActivityStatus::Unverified {
+        return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+    }
     if budget_elapsed
         || cancelled
         || !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
@@ -252,13 +259,6 @@ fn classify_nsscanner_cycle(
 
     match (activity_status, dirty_usage_status) {
         (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        // A post-scan activity probe is part of the publication proof.  An
-        // unverifiable result must not be treated as an ordinary partial
-        // scan, otherwise the usage store can acknowledge the cycle and the
-        // next retry waits behind the long convergence backoff.
-        (ScannerCycleActivityStatus::Unverified, _) => {
-            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        }
         _ => ScannerCycleStatus::Superseded,
     }
 }

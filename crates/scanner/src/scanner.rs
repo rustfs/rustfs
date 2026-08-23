@@ -65,7 +65,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,

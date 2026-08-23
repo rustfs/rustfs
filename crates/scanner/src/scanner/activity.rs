@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Cycle wake/backoff policy and scanner activity observation (probing, generations, topology digest).
 use super::*;
+use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerCycleWakeReason {
