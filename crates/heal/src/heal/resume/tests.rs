@@ -1483,17 +1483,17 @@ async fn checkpoint_page_commit_keeps_ledger_until_cursor_is_durable() {
     let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
 
     checkpoint
-        .record_object_outcome(
-            "bucket/object:v1".to_string(),
-            CheckpointObjectOutcome::Processed,
-            1,
-            0,
-            0,
-            128,
-            0,
-            0,
-            false,
-        )
+        .record_object_outcome(CheckpointObjectOutcomeRecord {
+            object: "bucket/object:v1".to_string(),
+            outcome: CheckpointObjectOutcome::Processed,
+            successful: 1,
+            failed: 0,
+            skipped: 0,
+            bytes: 128,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
+            counter_unknown: false,
+        })
         .await
         .unwrap();
     checkpoint.advance_page(0, 1).await.unwrap();

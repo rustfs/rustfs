@@ -15,8 +15,8 @@
 use crate::heal::{
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
-        CheckpointManager, CheckpointObjectOutcome, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
-        replacement_target_identities_match,
+        CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ReplacementTargetIdentity, ResumeManager,
+        ResumeUtils, compose_key, replacement_target_identities_match,
     },
     storage::{HealStorageAPI, next_heal_listing_token},
     task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
@@ -909,17 +909,17 @@ impl ErasureSetHealer {
                         (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
                     };
                     checkpoint_manager
-                        .record_object_outcome(
-                            key,
-                            CheckpointObjectOutcome::Processed,
-                            *successful_objects,
-                            *failed_objects,
-                            *skipped_objects,
-                            bytes_processed,
-                            skipped_new,
-                            skipped_ilm,
-                            !counter_ok || counter_unknown,
-                        )
+                        .record_object_outcome(CheckpointObjectOutcomeRecord {
+                            object: key,
+                            outcome: CheckpointObjectOutcome::Processed,
+                            successful: *successful_objects,
+                            failed: *failed_objects,
+                            skipped: *skipped_objects,
+                            bytes: bytes_processed,
+                            skipped_new_versions: skipped_new,
+                            skipped_ilm_expired: skipped_ilm,
+                            counter_unknown: !counter_ok || counter_unknown,
+                        })
                         .await?;
                     if !counter_ok || counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
@@ -974,17 +974,17 @@ impl ErasureSetHealer {
                         (progress.skipped_new_versions, progress.skipped_ilm_expired, progress.counter_unknown)
                     };
                     checkpoint_manager
-                        .record_object_outcome(
-                            key,
-                            CheckpointObjectOutcome::Processed,
-                            *successful_objects,
-                            *failed_objects,
-                            *skipped_objects,
-                            bytes_processed,
-                            skipped_new,
-                            skipped_ilm,
-                            !counter_ok || counter_unknown,
-                        )
+                        .record_object_outcome(CheckpointObjectOutcomeRecord {
+                            object: key,
+                            outcome: CheckpointObjectOutcome::Processed,
+                            successful: *successful_objects,
+                            failed: *failed_objects,
+                            skipped: *skipped_objects,
+                            bytes: bytes_processed,
+                            skipped_new_versions: skipped_new,
+                            skipped_ilm_expired: skipped_ilm,
+                            counter_unknown: !counter_ok || counter_unknown,
+                        })
                         .await?;
                     if !counter_ok || counter_unknown {
                         resume_manager.mark_counter_unknown().await?;
@@ -1204,17 +1204,17 @@ impl ErasureSetHealer {
                     (progress.counter_unknown, progress.skipped_new_versions, progress.skipped_ilm_expired)
                 };
                 checkpoint_manager
-                    .record_object_outcome(
-                        key,
-                        checkpoint_outcome,
-                        *successful_objects,
-                        *failed_objects,
-                        *skipped_objects,
-                        bytes_processed,
+                    .record_object_outcome(CheckpointObjectOutcomeRecord {
+                        object: key,
+                        outcome: checkpoint_outcome,
+                        successful: *successful_objects,
+                        failed: *failed_objects,
+                        skipped: *skipped_objects,
+                        bytes: bytes_processed,
                         skipped_new_versions,
                         skipped_ilm_expired,
-                        telemetry_unknown || progress_unknown,
-                    )
+                        counter_unknown: telemetry_unknown || progress_unknown,
+                    })
                     .await?;
                 if telemetry_unknown || progress_unknown {
                     resume_manager.mark_counter_unknown().await?;
@@ -2413,17 +2413,17 @@ mod resume_loop_tests {
             },
         );
         env.checkpoint
-            .record_object_outcome(
-                compose_key("object", Some("v1")),
-                CheckpointObjectOutcome::Failed,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0,
-                false,
-            )
+            .record_object_outcome(CheckpointObjectOutcomeRecord {
+                object: compose_key("object", Some("v1")),
+                outcome: CheckpointObjectOutcome::Failed,
+                successful: 0,
+                failed: 1,
+                skipped: 0,
+                bytes: 0,
+                skipped_new_versions: 0,
+                skipped_ilm_expired: 0,
+                counter_unknown: false,
+            })
             .await
             .unwrap();
         env.checkpoint.advance_page(0, 1).await.unwrap();

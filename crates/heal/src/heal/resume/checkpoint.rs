@@ -41,6 +41,19 @@ pub enum CheckpointObjectOutcome {
     Skipped,
 }
 
+#[derive(Debug)]
+pub struct CheckpointObjectOutcomeRecord {
+    pub object: String,
+    pub outcome: CheckpointObjectOutcome,
+    pub successful: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub bytes: u64,
+    pub skipped_new_versions: u64,
+    pub skipped_ilm_expired: u64,
+    pub counter_unknown: bool,
+}
+
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
@@ -389,18 +402,18 @@ impl CheckpointManager {
     }
 
     /// Atomically persist an object's dedup identity with its aggregate result.
-    pub async fn record_object_outcome(
-        &self,
-        object: String,
-        outcome: CheckpointObjectOutcome,
-        successful: u64,
-        failed: u64,
-        skipped: u64,
-        bytes: u64,
-        skipped_new_versions: u64,
-        skipped_ilm_expired: u64,
-        counter_unknown: bool,
-    ) -> Result<()> {
+    pub async fn record_object_outcome(&self, record: CheckpointObjectOutcomeRecord) -> Result<()> {
+        let CheckpointObjectOutcomeRecord {
+            object,
+            outcome,
+            successful,
+            failed,
+            skipped,
+            bytes,
+            skipped_new_versions,
+            skipped_ilm_expired,
+            counter_unknown,
+        } = record;
         let mut checkpoint = self.checkpoint.write().await;
         match outcome {
             CheckpointObjectOutcome::Processed => checkpoint.add_processed_object(object),
