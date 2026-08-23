@@ -2124,26 +2124,13 @@ impl SetDisks {
 
             let put_object_size = known_put_object_storage_size(data.size());
             let shard_file_size_raw = erasure.shard_file_size(put_object_size);
-            let is_inline_buffer =
-                storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(shard_file_size_raw, erasure.data_shards, opts.versioned);
 
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
             let shard_size = erasure.shard_size();
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
-            {
-                use std::io::Write;
-                let msg = format!(
-                    "INLINE_DEBUG: bucket={} obj={} size={} shard_fs={} ds={} bs={} inline={} direct={} path={} iblock={} ver={}\n",
-                    bucket, object, put_object_size, shard_file_size_raw, erasure.data_shards, fi.erasure.block_size,
-                    is_inline_buffer, direct_inline_commit, write_path.metric_label(), storage_class_config.inline_block(), opts.versioned
-                );
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rustfs_inline_debug.log") {
-                    let _ = f.write_all(msg.as_bytes());
-                }
-                let _ = std::io::stderr().write_all(msg.as_bytes());
-            }
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
             let (mut writers, errors) = if direct_inline_commit {
