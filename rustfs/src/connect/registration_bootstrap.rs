@@ -50,6 +50,8 @@ pub enum RegistrationBootstrapError {
     RootCaFileSecurity,
     #[error("the Connect state path must be an explicit directory, not a symlink")]
     StateDirectorySecurity,
+    #[error("the Connect state directory parent must be pre-provisioned as a secure durable directory")]
+    StateParentRequired,
     #[error("the Connect bootstrap readiness marker must be an owner-only regular file")]
     StateMarkerSecurity,
     #[error("failed to read protected Connect registration input")]
@@ -142,67 +144,58 @@ fn prepare_state_directory_with_sync_and_missing_observer(
         std::env::current_dir().map_err(RegistrationBootstrapError::Input)?.join(path)
     };
 
-    let mut directories = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
-    directories.reverse();
-    let mut complete_ancestor_chain = true;
-    for directory in &directories {
-        match fs::symlink_metadata(directory) {
-            Ok(_) => validate_directory(directory, directory == &path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                complete_ancestor_chain = false;
-                break;
-            }
-            Err(error) => return Err(RegistrationBootstrapError::Input(error)),
+    let state_parent = path.parent().ok_or(RegistrationBootstrapError::StateParentRequired)?;
+    match fs::symlink_metadata(state_parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(RegistrationBootstrapError::StateParentRequired);
         }
+        Err(error) => return Err(RegistrationBootstrapError::Input(error)),
     }
+
+    let mut directories = state_parent.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    directories.reverse();
+    for directory in &directories {
+        validate_directory(directory, false)?;
+    }
+
+    let state_exists = match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            validate_directory(&path, true)?;
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(RegistrationBootstrapError::Input(error)),
+    };
     let store_directories = [path.join("identity"), path.join("credential")];
     let ready = path.join(BOOTSTRAP_READY_FILE);
-    if complete_ancestor_chain && ready_marker_exists(&ready)? {
+    if state_exists && ready_marker_exists(&ready)? {
         for directory in &store_directories {
             validate_directory(directory, true)?;
         }
         return Ok(path);
     }
 
-    let mut directories_observed_missing = Vec::new();
-    for directory in &directories {
-        if ensure_directory(directory, directory == &path, &mut observed_missing)? {
-            directories_observed_missing.push(directory.clone());
-        }
-    }
+    ensure_directory(&path, true, &mut observed_missing)?;
     for directory in &store_directories {
-        if ensure_directory(directory, true, &mut observed_missing)? {
-            directories_observed_missing.push(directory.clone());
-        }
+        ensure_directory(directory, true, &mut observed_missing)?;
     }
     for directory in &directories {
-        validate_directory(directory, directory == &path)?;
+        validate_directory(directory, false)?;
     }
+    validate_directory(&path, true)?;
     for directory in &store_directories {
         validate_directory(directory, true)?;
     }
 
-    let state_parent = path.parent().ok_or_else(|| {
-        RegistrationBootstrapError::Input(io::Error::new(io::ErrorKind::InvalidInput, "state directory has no parent"))
-    })?;
-
-    // Without a ready marker, an existing directory may be residue from an
-    // interrupted or concurrent creation. Re-sync the complete leaf-up chain;
-    // only the validated marker makes the zero-sync fast path safe.
-    let mut durability_directories = vec![
+    // The caller-provisioned parent is the durability anchor. Without a ready
+    // marker, repeat this complete commit sequence after every interruption.
+    for directory in [
         store_directories[0].clone(),
         store_directories[1].clone(),
         path.clone(),
         state_parent.to_path_buf(),
-    ];
-    for created in directories_observed_missing.iter().rev() {
-        for directory in [Some(created.as_path()), created.parent()].into_iter().flatten() {
-            if !durability_directories.iter().any(|candidate| candidate == directory) {
-                durability_directories.push(directory.to_path_buf());
-            }
-        }
-    }
-    for directory in durability_directories {
+    ] {
         sync(&directory).map_err(RegistrationBootstrapError::Input)?;
     }
     publish_ready_marker(&path, &ready)?;
@@ -296,11 +289,11 @@ fn ensure_directory(
     path: &Path,
     require_process_owner: bool,
     observed_missing: &mut impl FnMut(&Path),
-) -> Result<bool, RegistrationBootstrapError> {
+) -> Result<(), RegistrationBootstrapError> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
             validate_directory(path, require_process_owner)?;
-            Ok(false)
+            Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             observed_missing(path);
@@ -310,11 +303,11 @@ fn ensure_directory(
             match builder.create(path) {
                 Ok(()) => {
                     validate_directory(path, true)?;
-                    Ok(true)
+                    Ok(())
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     validate_directory(path, require_process_owner)?;
-                    Ok(true)
+                    Ok(())
                 }
                 Err(error) => Err(RegistrationBootstrapError::Input(error)),
             }
@@ -467,10 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn new_state_chain_syncs_created_directories_and_parents_leaf_up() {
+    fn new_state_syncs_managed_directories_and_preprovisioned_parent() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let ancestor = temp.path().join("connect");
-        let state = ancestor.join("state");
+        let state = temp.path().join("state");
         let observed = RefCell::new(Vec::new());
 
         let prepared = prepare_state_directory_with_sync(&state, |path| {
@@ -488,10 +480,31 @@ mod tests {
                 state.join("identity"),
                 state.join("credential"),
                 state,
-                ancestor,
                 temp.path().to_path_buf(),
             ],
-            "new state trees must sync only created directories and immediate parents leaf-up"
+            "new state trees must sync only managed directories and their durable parent"
+        );
+    }
+
+    #[test]
+    fn missing_state_parent_fails_before_creation_or_sync() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let missing_parent = temp.path().join("missing");
+        let state = missing_parent.join("state");
+        let calls = Cell::new(0);
+
+        let error = prepare_state_directory_with_sync(&state, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect_err("state parent must be provisioned before bootstrap");
+
+        assert!(matches!(error, RegistrationBootstrapError::StateParentRequired));
+        assert_eq!(calls.get(), 0);
+        assert!(!missing_parent.exists());
+        assert_eq!(
+            error.to_string(),
+            "the Connect state directory parent must be pre-provisioned as a secure durable directory"
         );
     }
 
@@ -581,14 +594,21 @@ mod tests {
     }
 
     #[test]
-    fn every_pre_marker_sync_failure_keeps_ready_absent() {
+    fn every_pre_marker_sync_failure_retries_the_complete_commit() {
         let temp = tempfile::tempdir().expect("temporary directory");
 
         for fail_at in 1..=4 {
             let state = temp.path().join(format!("state-{fail_at}"));
             create_secure_state_tree(&state);
+            let expected = [
+                state.join("identity"),
+                state.join("credential"),
+                state.clone(),
+                temp.path().to_path_buf(),
+            ];
             let calls = Cell::new(0);
-            let error = prepare_state_directory_with_sync(&state, |_| {
+            let error = prepare_state_directory_with_sync(&state, |path| {
+                assert_eq!(path, &expected[calls.get()]);
                 calls.set(calls.get() + 1);
                 if calls.get() == fail_at {
                     return Err(io::Error::other("injected pre-marker sync failure"));
@@ -600,71 +620,16 @@ mod tests {
             assert!(matches!(error, RegistrationBootstrapError::Input(_)));
             assert_eq!(calls.get(), fail_at);
             assert!(!state.join(BOOTSTRAP_READY_FILE).exists());
-        }
-    }
-
-    #[test]
-    fn multi_level_creation_retries_every_required_directory_sync() {
-        let temp = tempfile::tempdir().expect("temporary directory");
-
-        for fail_at in 1..=6 {
-            let safe = temp.path().join(format!("safe-{fail_at}"));
-            let connect = safe.join("connect");
-            let state = connect.join("state");
-            let expected = [
-                state.join("identity"),
-                state.join("credential"),
-                state.clone(),
-                connect,
-                safe,
-                temp.path().to_path_buf(),
-            ];
-            let calls = Cell::new(0);
-            let error = prepare_state_directory_with_sync(&state, |path| {
-                assert_eq!(path, &expected[calls.get()]);
-                calls.set(calls.get() + 1);
-                if calls.get() == fail_at {
-                    return Err(io::Error::other("injected multi-level sync failure"));
-                }
-                Ok(())
-            })
-            .expect_err("every new-directory durability failure must stop preparation");
-
-            assert!(matches!(error, RegistrationBootstrapError::Input(_)));
-            assert_eq!(calls.get(), fail_at);
-            assert!(!state.join(BOOTSTRAP_READY_FILE).exists());
 
             let retry = RefCell::new(Vec::new());
             prepare_state_directory_with_sync(&state, |path| {
                 retry.borrow_mut().push(path.to_path_buf());
                 Ok(())
             })
-            .expect("retry must complete every interrupted directory sync");
+            .expect("retry must repeat the complete durability commit");
             assert_eq!(retry.into_inner(), expected);
             assert!(ready_marker_exists(&state.join(BOOTSTRAP_READY_FILE)).expect("validate ready marker"));
         }
-
-        let safe = temp.path().join("safe-no-seventh-sync");
-        let connect = safe.join("connect");
-        let state = connect.join("state");
-        let expected = [
-            state.join("identity"),
-            state.join("credential"),
-            state.clone(),
-            connect,
-            safe,
-            temp.path().to_path_buf(),
-        ];
-        let calls = Cell::new(0);
-        prepare_state_directory_with_sync(&state, |path| {
-            let call = calls.get();
-            assert!(call < expected.len(), "system ancestors must not be synced");
-            assert_eq!(path, &expected[call]);
-            calls.set(call + 1);
-            Ok(())
-        })
-        .expect("the required six syncs must complete without a seventh callback");
-        assert_eq!(calls.get(), expected.len());
     }
 
     #[test]
@@ -766,21 +731,24 @@ mod tests {
     #[test]
     fn concurrent_preparation_publishes_one_safe_ready_marker() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let first_missing = temp.path().join("safe");
-        let state = first_missing.join("connect/state");
+        let state_parent = temp.path().join("preprovisioned");
+        fs::create_dir(&state_parent).expect("preprovision state parent");
+        fs::set_permissions(&state_parent, fs::Permissions::from_mode(0o700)).expect("secure state parent");
+        let state = state_parent.join("state");
         let barrier = Arc::new(Barrier::new(2));
 
         std::thread::scope(|scope| {
             let handles = (0..2)
                 .map(|_| {
                     let barrier = barrier.clone();
-                    let first_missing = first_missing.clone();
                     let state = state.clone();
                     scope.spawn(move || {
-                        prepare_state_directory_with_sync_and_missing_observer(&state, sync_directory, |missing| {
-                            if missing == first_missing {
+                        let first_sync = Cell::new(true);
+                        prepare_state_directory_with_sync(&state, |path| {
+                            if first_sync.replace(false) {
                                 barrier.wait();
                             }
+                            sync_directory(path)
                         })
                     })
                 })

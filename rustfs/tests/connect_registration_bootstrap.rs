@@ -522,6 +522,15 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).expect("restore CA mode");
 
+    let missing_parent = temp.path().join("missing-parent");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind parent gate");
+    let error = register_from_protected_input(endpoint, &root, &missing_parent.join("state"), Some(&token))
+        .await
+        .expect_err("missing state parent must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateParentRequired));
+    assert!(!missing_parent.exists(), "bootstrap must not create the durable parent");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after parent gate");
+
     let parent_state = temp.path().join("secure/connect/..");
     fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind state gate");
     let error = register_from_protected_input(endpoint, &root, &parent_state, Some(&token))
