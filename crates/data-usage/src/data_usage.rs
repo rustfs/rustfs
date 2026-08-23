@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize, ser::SerializeMap as _};
+use serde::{
+    Deserialize, Serialize,
+    de::{IgnoredAny, SeqAccess, Visitor},
+    ser::SerializeMap as _,
+};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, SystemTime},
@@ -48,6 +53,11 @@ pub const DATA_USAGE_OBSERVED_OBJECT_NAME: &str = ".usage.observed.json";
 // RUSTFS_COMPAT_TODO(scanner-usage-v2): keep .usage.json readable and removable during rolling upgrades from pre-v2 scanners. Remove after supported direct-upgrade sources all write .usage.v2.json.
 pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
 
+/// Fixed bucket for objects whose storage class is not in the scanner's
+/// cycle-local tier registry.  Keeping this key fixed prevents untrusted or
+/// stale tier names from growing persisted per-tier maps without bound.
+pub const UNKNOWN_TIER: &str = "UNKNOWN_TIER";
+
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
 /// trusted for staleness comparisons and a fresh snapshot save must be allowed.
@@ -78,9 +88,298 @@ impl TierStats {
             && self.num_objects.checked_add(u.num_objects).is_some()
     }
 
+    /// Add tier counters without allowing a counter to wrap.
+    pub fn checked_add(&self, u: &TierStats) -> Option<TierStats> {
+        Some(TierStats {
+            total_size: self.total_size.checked_add(u.total_size)?,
+            num_versions: self.num_versions.checked_add(u.num_versions)?,
+            num_objects: self.num_objects.checked_add(u.num_objects)?,
+        })
+    }
+
     /// True when this tier contributed nothing, i.e. merging it is a no-op.
     pub fn is_empty(&self) -> bool {
         self.total_size == 0 && self.num_versions == 0 && self.num_objects == 0
+    }
+}
+
+/// Bounded diagnostics for objects whose tier is absent from the cycle
+/// registry. Counters are authoritative; diagnostics are only a small,
+/// redacted reconciliation aid and may be dropped at the configured caps.
+pub const UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP: usize = 64;
+pub const UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP: usize = 4096;
+pub const UNKNOWN_TIER_DIAGNOSTIC_TTL: Duration = Duration::from_secs(60 * 60);
+const UNKNOWN_TIER_DIAGNOSTIC_KEY_BYTES: usize = 256;
+const UNKNOWN_TIER_DIAGNOSTIC_INPUT_CAP: usize = UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP * 4;
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct UnknownTierStats {
+    /// Logical bytes retained in the scanner's normal usage total.
+    pub unknown_bytes: u64,
+    /// Physical bytes recorded in the per-tier accounting dimension.
+    ///
+    /// Older writers only had `unknown_bytes`; decoding those snapshots keeps
+    /// this field at zero and the scanner fills it for new observations.
+    #[serde(default)]
+    pub unknown_physical_bytes: u64,
+    pub unknown_objects: u64,
+    pub unknown_versions: u64,
+    pub diagnostics_dropped: u64,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub diagnostics_at: Option<SystemTime>,
+    /// A saturating update occurred; this snapshot cannot prove conservation.
+    /// The field is persisted so a restarted scanner cannot mistake a
+    /// saturated legacy aggregate for exact accounting evidence.
+    #[serde(default)]
+    pub counter_overflowed: bool,
+}
+
+#[derive(Default)]
+struct BoundedDiagnostics {
+    entries: Vec<String>,
+    dropped: u64,
+}
+
+impl<'de> Deserialize<'de> for BoundedDiagnostics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedDiagnosticsVisitor;
+
+        impl<'de> Visitor<'de> for BoundedDiagnosticsVisitor {
+            type Value = BoundedDiagnostics;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of bounded tier diagnostics")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bounded = BoundedDiagnostics::default();
+                let mut bytes = 0_usize;
+                let mut inspected = 0_usize;
+                loop {
+                    if bounded.entries.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+                        || bytes >= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                        || inspected >= UNKNOWN_TIER_DIAGNOSTIC_INPUT_CAP
+                    {
+                        if sequence.next_element::<IgnoredAny>()?.is_none() {
+                            break;
+                        }
+                        bounded.dropped = bounded.dropped.saturating_add(1);
+                        continue;
+                    }
+                    let Some(diagnostic) = sequence.next_element::<Cow<'de, str>>()? else {
+                        break;
+                    };
+                    inspected = inspected.saturating_add(1);
+                    if !is_redacted_tier_diagnostic(&diagnostic)
+                        || bytes.saturating_add(diagnostic.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                        || bounded.entries.iter().any(|entry| entry == &diagnostic)
+                    {
+                        bounded.dropped = bounded.dropped.saturating_add(1);
+                        continue;
+                    }
+                    bytes = bytes.saturating_add(diagnostic.len());
+                    bounded.entries.push(diagnostic.into_owned());
+                }
+                Ok(bounded)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedDiagnosticsVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct UnknownTierStatsWire {
+    #[serde(default)]
+    unknown_bytes: u64,
+    #[serde(default)]
+    unknown_physical_bytes: u64,
+    #[serde(default)]
+    unknown_objects: u64,
+    #[serde(default)]
+    unknown_versions: u64,
+    #[serde(default)]
+    diagnostics_dropped: u64,
+    #[serde(default)]
+    diagnostics: BoundedDiagnostics,
+    #[serde(default)]
+    diagnostics_at: Option<SystemTime>,
+    #[serde(default)]
+    counter_overflowed: bool,
+}
+
+fn is_redacted_tier_diagnostic(diagnostic: &str) -> bool {
+    diagnostic
+        .strip_prefix("tier-hash:")
+        .is_some_and(|digest| digest.len() == 16 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn diagnostics_expired(at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(at).map_or(true, |age| age > UNKNOWN_TIER_DIAGNOSTIC_TTL)
+}
+
+fn checked_saturating_add(left: u64, right: u64, overflowed: &mut bool) -> u64 {
+    match left.checked_add(right) {
+        Some(value) => value,
+        None => {
+            *overflowed = true;
+            u64::MAX
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownTierStats {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = UnknownTierStatsWire::deserialize(deserializer)?;
+        let mut stats = Self {
+            unknown_bytes: wire.unknown_bytes,
+            unknown_physical_bytes: wire.unknown_physical_bytes,
+            unknown_objects: wire.unknown_objects,
+            unknown_versions: wire.unknown_versions,
+            counter_overflowed: wire.counter_overflowed,
+            diagnostics_dropped: wire.diagnostics_dropped,
+            diagnostics: wire.diagnostics.entries,
+            diagnostics_at: wire.diagnostics_at,
+        };
+        stats.diagnostics_dropped =
+            checked_saturating_add(stats.diagnostics_dropped, wire.diagnostics.dropped, &mut stats.counter_overflowed);
+        if stats
+            .diagnostics_at
+            .is_some_and(|at| diagnostics_expired(at, SystemTime::now()))
+        {
+            stats.diagnostics.clear();
+            stats.diagnostics_at = None;
+        }
+        Ok(stats)
+    }
+}
+
+impl UnknownTierStats {
+    /// Record one observation where the logical and physical dimensions are
+    /// the same. Kept as a small compatibility helper for callers that only
+    /// have one size value.
+    pub fn record(&mut self, tier: &str, bytes: u64, versions: u64, objects: u64) {
+        self.record_dimensions(tier, bytes, bytes, versions, objects);
+    }
+
+    /// Record one observation without conflating logical usage with physical
+    /// tier bytes. Both counters are saturating so malformed metadata cannot
+    /// wrap an aggregate.
+    pub fn record_dimensions(&mut self, tier: &str, logical_bytes: u64, physical_bytes: u64, versions: u64, objects: u64) {
+        self.unknown_bytes = checked_saturating_add(self.unknown_bytes, logical_bytes, &mut self.counter_overflowed);
+        self.unknown_physical_bytes =
+            checked_saturating_add(self.unknown_physical_bytes, physical_bytes, &mut self.counter_overflowed);
+        self.unknown_objects = checked_saturating_add(self.unknown_objects, objects, &mut self.counter_overflowed);
+        self.unknown_versions = checked_saturating_add(self.unknown_versions, versions, &mut self.counter_overflowed);
+
+        let digest = {
+            let mut hasher = DefaultHasher::new();
+            // Bound hashing work for hostile metadata while retaining enough
+            // length/prefix entropy to reconcile repeated observations.
+            hasher.write_u64(u64::try_from(tier.len()).unwrap_or(u64::MAX));
+            let bounded = &tier.as_bytes()[..tier.len().min(UNKNOWN_TIER_DIAGNOSTIC_KEY_BYTES)];
+            hasher.write(bounded);
+            hasher.write_u8(u8::from(bounded.iter().any(|byte| byte.is_ascii_control())));
+            format!("tier-hash:{:016x}", hasher.finish())
+        };
+        let now = SystemTime::now();
+        if self.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            self.diagnostics.clear();
+        }
+        self.diagnostics_at = Some(now);
+        if self.diagnostics.iter().any(|entry| entry == &digest) {
+            return;
+        }
+        let current_bytes: usize = self.diagnostics.iter().map(String::len).sum();
+        if self.diagnostics.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+            || current_bytes.saturating_add(digest.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+        {
+            self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+            return;
+        }
+        self.diagnostics.push(digest);
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.unknown_bytes = checked_saturating_add(self.unknown_bytes, other.unknown_bytes, &mut self.counter_overflowed);
+        self.unknown_physical_bytes =
+            checked_saturating_add(self.unknown_physical_bytes, other.unknown_physical_bytes, &mut self.counter_overflowed);
+        self.unknown_objects = checked_saturating_add(self.unknown_objects, other.unknown_objects, &mut self.counter_overflowed);
+        self.unknown_versions =
+            checked_saturating_add(self.unknown_versions, other.unknown_versions, &mut self.counter_overflowed);
+        self.diagnostics_dropped =
+            checked_saturating_add(self.diagnostics_dropped, other.diagnostics_dropped, &mut self.counter_overflowed);
+        self.counter_overflowed |= other.counter_overflowed;
+        let now = SystemTime::now();
+        if self.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            self.diagnostics.clear();
+            self.diagnostics_at = None;
+        }
+        if !other.diagnostics_at.is_some_and(|at| diagnostics_expired(at, now)) {
+            for diagnostic in &other.diagnostics {
+                if !is_redacted_tier_diagnostic(diagnostic) {
+                    self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+                    continue;
+                }
+                if self.diagnostics.iter().any(|entry| entry == diagnostic) {
+                    continue;
+                }
+                let current_bytes: usize = self.diagnostics.iter().map(String::len).sum();
+                if self.diagnostics.len() >= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP
+                    || current_bytes.saturating_add(diagnostic.len()) > UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP
+                {
+                    self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
+                    continue;
+                }
+                self.diagnostics.push(diagnostic.clone());
+            }
+        }
+        if !self.diagnostics.is_empty() {
+            self.diagnostics_at = Some(now);
+        }
+    }
+
+    pub fn fits_add(&self, other: &Self) -> bool {
+        !self.counter_overflowed
+            && !other.counter_overflowed
+            && self.unknown_bytes.checked_add(other.unknown_bytes).is_some()
+            && self
+                .unknown_physical_bytes
+                .checked_add(other.unknown_physical_bytes)
+                .is_some()
+            && self.unknown_objects.checked_add(other.unknown_objects).is_some()
+            && self.unknown_versions.checked_add(other.unknown_versions).is_some()
+            && self.diagnostics_dropped.checked_add(other.diagnostics_dropped).is_some()
+    }
+
+    pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if !self.fits_add(other) {
+            return None;
+        }
+        let mut merged = self.clone();
+        merged.merge(other);
+        Some(merged)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.counter_overflowed
+            && self.unknown_bytes == 0
+            && self.unknown_physical_bytes == 0
+            && self.unknown_objects == 0
+            && self.unknown_versions == 0
+            && self.diagnostics_dropped == 0
+            && self.diagnostics.is_empty()
     }
 }
 
@@ -123,6 +422,31 @@ impl AllTierStats {
             .tiers
             .iter()
             .all(|(tier, right)| self.tiers.get(tier).is_none_or(|left| left.fits_add(right)))
+    }
+
+    /// Fold keys from an older cache that are no longer present in the
+    /// current registry into the fixed unknown bucket. Built-in storage
+    /// classes remain known even when no remote tier is configured.
+    pub fn fold_unknown_tiers<'a, I>(&mut self, known_tiers: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let known: HashSet<&str> = known_tiers.into_iter().collect();
+        let mut unknown = self.tiers.remove(UNKNOWN_TIER).unwrap_or_default();
+        let retired_tiers: Vec<String> = self
+            .tiers
+            .keys()
+            .filter(|tier| tier.as_str() != "STANDARD" && tier.as_str() != "REDUCED_REDUNDANCY" && !known.contains(tier.as_str()))
+            .cloned()
+            .collect();
+        for tier in retired_tiers {
+            if let Some(stats) = self.tiers.remove(&tier) {
+                unknown = unknown.add(&stats);
+            }
+        }
+        if !unknown.is_empty() {
+            self.tiers.insert(UNKNOWN_TIER.to_string(), unknown);
+        }
     }
 }
 
@@ -211,6 +535,10 @@ pub struct DataUsageInfo {
     /// tier exists, so an absent value means "not accounted", never "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_stats: Option<AllTierStats>,
+    /// Bounded diagnostics and separate logical/physical counters for objects
+    /// classified into [`UNKNOWN_TIER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_tier_stats: Option<UnknownTierStats>,
 
     /// Total number of buckets in this cluster
     pub buckets_count: u64,
@@ -236,6 +564,15 @@ pub struct DataUsageInfo {
     /// without relying on synchronized clocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_snapshot_authoritative_baseline: Option<DataUsageSnapshotIdentity>,
+    /// Per-set freshness for an observational aggregate.  A set entry is
+    /// never sufficient to make the aggregate authoritative; it only records
+    /// which last-known-good generation contributed to the view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// An observational view may contain only the sets that completed this
+    /// cycle (or retained a compatible last-known-good cache).
+    #[serde(default)]
+    pub usage_snapshot_partial: bool,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
@@ -250,6 +587,22 @@ pub struct DataUsageSnapshotIdentity {
     pub last_update: Option<SystemTime>,
     pub scanner_cycle: Option<u64>,
     pub scanner_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageSnapshotSetState {
+    pub pool_index: u64,
+    pub set_index: u64,
+    #[serde(default)]
+    pub scanner_cycle: Option<u64>,
+    #[serde(default)]
+    pub scanner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_plan_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
 impl DataUsageInfo {
@@ -291,7 +644,7 @@ pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUs
 /// rollback delete/recreate fences the previous bucket incarnation too.
 pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
     observed.usage_snapshot_converged == Some(false)
-        && observed.is_complete_bucket_usage_snapshot()
+        && (observed.is_complete_bucket_usage_snapshot() || observed.is_valid_partial_snapshot())
         && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
         && data_usage_snapshot_is_newer(observed, authoritative)
 }
@@ -305,6 +658,80 @@ pub struct DiskUsageStatus {
     pub disk_index: Option<usize>,
     pub last_update: Option<SystemTime>,
     pub snapshot_exists: bool,
+}
+
+/// Independent conservation evidence for a scanner summary.
+///
+/// The totals are maintained while objects are accounted and are deliberately
+/// not reconstructed from the tier map at publish time. `*_known` records the
+/// portion represented by the corresponding accounting dimension.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TierAccountingProof {
+    pub logical_total: u64,
+    pub logical_known: u64,
+    pub physical_total: u64,
+    pub physical_known: u64,
+    #[serde(default)]
+    pub overflowed: bool,
+}
+
+impl TierAccountingProof {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        if self.overflowed || other.overflowed {
+            return None;
+        }
+        Some(Self {
+            logical_total: self.logical_total.checked_add(other.logical_total)?,
+            logical_known: self.logical_known.checked_add(other.logical_known)?,
+            physical_total: self.physical_total.checked_add(other.physical_total)?,
+            physical_known: self.physical_known.checked_add(other.physical_known)?,
+            overflowed: false,
+        })
+    }
+
+    pub fn saturating_add(&mut self, other: Self) {
+        let Some(merged) = (*self).checked_add(other) else {
+            self.logical_total = self.logical_total.saturating_add(other.logical_total);
+            self.logical_known = self.logical_known.saturating_add(other.logical_known);
+            self.physical_total = self.physical_total.saturating_add(other.physical_total);
+            self.physical_known = self.physical_known.saturating_add(other.physical_known);
+            self.overflowed = true;
+            return;
+        };
+        *self = merged;
+    }
+}
+
+/// A bounded reconciliation record for an object whose logical size could not
+/// be trusted at the scanner boundary. The scanner persists these records in
+/// its cache; keeping the model here avoids a second, incompatible accounting
+/// representation in storage-facing crates.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SizeReconciliationEntry {
+    /// Stable object/version identity key (not a metrics label).
+    pub key: String,
+    pub bucket: String,
+    pub object: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// Structured reason label; raw metadata values must never be stored here.
+    pub reason: String,
+    #[serde(default)]
+    pub physical_size: Option<u64>,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Object scope refreshed by one scanner pass. Existing debts in this scope
+/// are removed before the pass's unresolved records are inserted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SizeReconciliationScope {
+    pub bucket: String,
+    pub object: String,
 }
 
 /// Size summary for a single object or group of objects
@@ -336,6 +763,20 @@ pub struct SizeSummary {
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
     /// Per-tier accounting, keyed by storage class or remote tier name
     pub tier_stats: HashMap<String, TierStats>,
+    /// Counters and bounded diagnostics for unknown tiers in this summary.
+    pub unknown_tier_stats: UnknownTierStats,
+    /// Independent logical/physical conservation evidence.
+    pub tier_accounting_proof: TierAccountingProof,
+    /// Size-resolution debts observed while scanning this summary.
+    pub size_reconciliation: Vec<SizeReconciliationEntry>,
+    /// True when the per-object summary exceeded its bounded debt buffer.
+    /// Callers must retain prior ledger entries rather than treating the
+    /// partial list as a complete refresh.
+    pub size_reconciliation_truncated: bool,
+    /// Object scopes refreshed by this summary. They let the durable ledger
+    /// remove versions that resolved without allocating one key per healthy
+    /// version on the hot path.
+    pub reconciliation_scopes: Vec<SizeReconciliationScope>,
 }
 
 /// Replication target size summary
@@ -427,6 +868,10 @@ impl<'de> Deserialize<'de> for SizeHistogram {
 }
 
 impl SizeHistogram {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|value| *value == 0)
+    }
+
     pub fn add(&mut self, size: u64) {
         let intervals = [
             (0, 1024 - 1),                              // LESS_THAN_1024_B
@@ -541,6 +986,10 @@ impl<'de> Deserialize<'de> for VersionsHistogram {
 }
 
 impl VersionsHistogram {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|value| *value == 0)
+    }
+
     pub fn add(&mut self, count: u64) {
         let intervals = [
             (0, 0),            // UNVERSIONED
@@ -681,6 +1130,13 @@ pub struct DataUsageEntry {
     /// observed tier-classified objects.
     #[serde(default)]
     pub all_tier_stats: Option<AllTierStats>,
+    /// Bounded unknown-tier reconciliation state for this cache entry.
+    #[serde(default)]
+    pub unknown_tier_stats: Option<UnknownTierStats>,
+    /// Optional conservation proof. Missing values are legacy/unproven, not
+    /// zero-valued evidence.
+    #[serde(default)]
+    pub tier_accounting_proof: Option<TierAccountingProof>,
 }
 
 impl Serialize for DataUsageEntry {
@@ -691,7 +1147,9 @@ impl Serialize for DataUsageEntry {
         // Keep entries map-encoded so older readers can ignore fields appended
         // by newer scanner versions during rolling upgrades. The derived
         // (array) encoding made any appended field a decode error for them.
-        let mut state = serializer.serialize_map(Some(11))?;
+        let mut state = serializer.serialize_map(Some(
+            11 + usize::from(self.unknown_tier_stats.is_some()) + usize::from(self.tier_accounting_proof.is_some()),
+        ))?;
         state.serialize_entry("children", &self.children)?;
         state.serialize_entry("size", &self.size)?;
         state.serialize_entry("objects", &self.objects)?;
@@ -703,11 +1161,35 @@ impl Serialize for DataUsageEntry {
         state.serialize_entry("compacted", &self.compacted)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("all_tier_stats", &self.all_tier_stats)?;
+        // Keep the legacy no-unknown shape byte-for-byte stable. Once unknown
+        // accounting exists, append its map field before the optional proof.
+        if let Some(unknown_tier_stats) = self.unknown_tier_stats.as_ref() {
+            state.serialize_entry("unknown_tier_stats", unknown_tier_stats)?;
+        }
+        if let Some(proof) = self.tier_accounting_proof.as_ref() {
+            state.serialize_entry("tier_accounting_proof", proof)?;
+        }
         state.end()
     }
 }
 
 impl DataUsageEntry {
+    fn has_local_usage(&self) -> bool {
+        self.size != 0
+            || self.objects != 0
+            || self.versions != 0
+            || self.delete_markers != 0
+            || self.failed_objects != 0
+            || self.obj_sizes.0.iter().any(|value| *value != 0)
+            || self.obj_versions.0.iter().any(|value| *value != 0)
+            || self.replication_stats.as_ref().is_some_and(|stats| !stats.is_empty())
+            || self
+                .all_tier_stats
+                .as_ref()
+                .is_some_and(|stats| stats.tiers.values().any(|tier| !tier.is_empty()))
+            || self.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty())
+    }
+
     pub fn add_child(&mut self, hash: &DataUsageHash) {
         if self.children.contains(&hash.key()) {
             return;
@@ -716,6 +1198,8 @@ impl DataUsageEntry {
     }
 
     pub fn merge(&mut self, other: &DataUsageEntry) {
+        let self_had_local_usage = self.has_local_usage();
+        let other_had_local_usage = other.has_local_usage();
         self.objects += other.objects;
         self.versions += other.versions;
         self.delete_markers += other.delete_markers;
@@ -744,6 +1228,29 @@ impl DataUsageEntry {
         if let Some(o_tiers) = other.all_tier_stats.as_ref().filter(|tiers| !tiers.is_empty()) {
             self.all_tier_stats.get_or_insert_with(AllTierStats::new).merge(o_tiers);
         }
+        if let Some(other_unknown) = other.unknown_tier_stats.as_ref() {
+            self.unknown_tier_stats
+                .get_or_insert_with(UnknownTierStats::default)
+                .merge(other_unknown);
+        }
+
+        self.tier_accounting_proof = match (self.tier_accounting_proof, other.tier_accounting_proof) {
+            (Some(mut left), Some(right)) => {
+                left.saturating_add(right);
+                Some(left)
+            }
+            (None, Some(right)) if !self_had_local_usage => Some(right),
+            (Some(left), None) if !other_had_local_usage => Some(left),
+            (None, None) => None,
+            _ => None,
+        };
+        // A saturated unknown-tier counter invalidates conservation evidence;
+        // never let an otherwise valid proof hide that loss of precision.
+        if self.unknown_tier_stats.as_ref().is_some_and(|stats| stats.counter_overflowed)
+            && let Some(proof) = self.tier_accounting_proof.as_mut()
+        {
+            proof.overflowed = true;
+        }
 
         self.obj_sizes.merge_from(&other.obj_sizes);
         self.obj_versions.merge_from(&other.obj_versions);
@@ -755,6 +1262,15 @@ impl DataUsageEntry {
             return;
         }
         self.all_tier_stats.get_or_insert_with(AllTierStats::new).add_sizes(tiers);
+    }
+
+    pub fn add_unknown_tier_stats(&mut self, stats: &UnknownTierStats) {
+        if stats.is_empty() {
+            return;
+        }
+        self.unknown_tier_stats
+            .get_or_insert_with(UnknownTierStats::default)
+            .merge(stats);
     }
 
     pub fn checked_merge(&mut self, other: &DataUsageEntry) -> bool {
@@ -820,8 +1336,21 @@ impl DataUsageEntry {
             (_, None) | (None, Some(_)) => true,
             (Some(left), Some(right)) => left.fits_merge(right),
         };
+        let unknown_tier_stats_fit = match (&self.unknown_tier_stats, &other.unknown_tier_stats) {
+            (None, None) => true,
+            (Some(left), None) => !left.counter_overflowed,
+            (None, Some(right)) => !right.counter_overflowed,
+            (Some(left), Some(right)) => left.fits_add(right),
+        };
 
-        if !scalar_counts_fit || !histograms_fit || !replication_fits || !tier_stats_fit {
+        let proof_fit = match (self.tier_accounting_proof, other.tier_accounting_proof) {
+            (Some(left), Some(right)) => left.checked_add(right).is_some(),
+            (Some(proof), None) | (None, Some(proof)) => !proof.overflowed,
+            (None, None) => true,
+        };
+
+        if !scalar_counts_fit || !histograms_fit || !replication_fits || !tier_stats_fit || !unknown_tier_stats_fit || !proof_fit
+        {
             return false;
         }
         self.merge(other);
@@ -833,7 +1362,8 @@ impl DataUsageEntry {
 ///
 /// The canonical wire format is written by the hand-written map-encoded
 /// `Serialize` on the scanner-side `DataUsageCacheInfo`
-/// (`crates/scanner/src/data_usage_define.rs`), which carries 16 fields.
+/// (`crates/scanner/src/data_usage_define.rs`), which carries the original 16
+/// fields plus an optional reconciliation field.
 /// This type decodes only the shared subset and is deliberately not
 /// `Serialize`: a derived (array) encoding of this 6-field subset would
 /// corrupt the cache for scanner readers, so no write path may exist here.
@@ -1339,6 +1869,7 @@ impl DataUsageCache {
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
             tier_stats: flat.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: flat.unknown_tier_stats.filter(|stats| !stats.is_empty()),
             buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             usage_snapshot_complete: self.info.snapshot_complete,
@@ -1434,6 +1965,39 @@ impl DataUsageInfo {
         self.usage_snapshot_complete
             && self.last_update.is_some()
             && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
+    }
+
+    /// Validate provenance before an observational view can be selected for
+    /// admin display. Partial data is accepted only with unique set states,
+    /// a plan digest for every state, and at least one usable generation.
+    pub fn is_valid_partial_snapshot(&self) -> bool {
+        if !self.usage_snapshot_partial
+            || self.usage_snapshot_converged != Some(false)
+            || self.last_update.is_none()
+            || self.scanner_cycle.is_none()
+            || self.scanner_epoch.is_none()
+            || self.usage_snapshot_set_states.is_empty()
+            || u64::try_from(self.buckets_usage.len()).ok() != Some(self.buckets_count)
+        {
+            return false;
+        }
+
+        let mut previous = None;
+        let mut plan_digest = None;
+        let mut has_source = false;
+        for state in &self.usage_snapshot_set_states {
+            if state.scan_plan_digest.is_none()
+                || plan_digest.is_some_and(|digest| Some(digest) != state.scan_plan_digest)
+                || state.scanner_cycle.is_some() != state.scanner_epoch.is_some()
+                || previous.is_some_and(|(pool, set)| (pool, set) >= (state.pool_index, state.set_index))
+            {
+                return false;
+            }
+            previous = Some((state.pool_index, state.set_index));
+            plan_digest = state.scan_plan_digest;
+            has_source |= state.scanner_cycle.is_some() && !state.tombstone;
+        }
+        has_source
     }
 
     /// Add object metadata to data usage statistics
@@ -1766,6 +2330,20 @@ impl SizeSummary {
         self.replica_count = self.replica_count.saturating_add(other.replica_count);
         self.pending_count = self.pending_count.saturating_add(other.pending_count);
         self.failed_count = self.failed_count.saturating_add(other.failed_count);
+        self.unknown_tier_stats.merge(&other.unknown_tier_stats);
+        self.tier_accounting_proof.saturating_add(other.tier_accounting_proof);
+        if self.unknown_tier_stats.counter_overflowed {
+            self.tier_accounting_proof.overflowed = true;
+        }
+
+        // A disk/bucket aggregate is assembled from many object summaries.
+        // Keep the per-tier dimension in lockstep with the scalar counters;
+        // dropping this map here would recreate the original silent-loss bug
+        // at the cross-disk merge boundary.
+        for (tier, stats) in &other.tier_stats {
+            let entry = self.tier_stats.entry(tier.clone()).or_default();
+            *entry = entry.add(stats);
+        }
 
         // Merge replication target stats
         for (target, stats) in &other.repl_target_stats {
@@ -1776,6 +2354,51 @@ impl SizeSummary {
             entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
             entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
             entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
+        }
+
+        for entry in &other.size_reconciliation {
+            self.record_size_reconciliation(entry.clone());
+        }
+        self.size_reconciliation_truncated |= other.size_reconciliation_truncated;
+        for scope in &other.reconciliation_scopes {
+            self.record_reconciliation_scope(&scope.bucket, &scope.object);
+        }
+    }
+
+    /// Add one reconciliation debt, coalescing repeated observations in the
+    /// same object summary. The scanner cache applies its own larger bound.
+    pub fn record_size_reconciliation(&mut self, entry: SizeReconciliationEntry) {
+        const MAX_SUMMARY_RECONCILIATION_ENTRIES: usize = 1024;
+        if let Some(existing) = self.size_reconciliation.iter_mut().find(|value| value.key == entry.key) {
+            existing.reason = entry.reason;
+            existing.physical_size = entry.physical_size;
+            existing.generation = entry.generation;
+            existing.version_id = entry.version_id;
+            return;
+        }
+        if self.size_reconciliation.len() < MAX_SUMMARY_RECONCILIATION_ENTRIES {
+            self.size_reconciliation.push(entry);
+        } else {
+            self.size_reconciliation_truncated = true;
+        }
+    }
+
+    /// Mark one object scope as refreshed. Duplicate scopes are suppressed so
+    /// merging summaries remains bounded and deterministic.
+    pub fn record_reconciliation_scope(&mut self, bucket: &str, object: &str) {
+        if !self
+            .reconciliation_scopes
+            .iter()
+            .any(|scope| scope.bucket == bucket && scope.object == object)
+        {
+            if self.reconciliation_scopes.len() >= 1024 {
+                self.size_reconciliation_truncated = true;
+                return;
+            }
+            self.reconciliation_scopes.push(SizeReconciliationScope {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+            });
         }
     }
 }
@@ -1879,6 +2502,59 @@ mod tests {
     }
 
     #[test]
+    fn retired_tier_stats_fold_into_fixed_unknown_bucket() {
+        let mut stats = AllTierStats::default();
+        stats.tiers.insert(
+            "RETIRED".to_string(),
+            TierStats {
+                total_size: 9,
+                num_versions: 2,
+                num_objects: 1,
+            },
+        );
+        stats.tiers.insert(
+            "WARM".to_string(),
+            TierStats {
+                total_size: 4,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        );
+
+        stats.fold_unknown_tiers(["WARM"]);
+
+        assert!(!stats.tiers.contains_key("RETIRED"));
+        assert_eq!(stats.tiers.get("WARM").map(|v| v.total_size), Some(4));
+        assert_eq!(stats.tiers.get(UNKNOWN_TIER).map(|v| v.total_size), Some(9));
+    }
+
+    #[test]
+    fn unknown_tier_stats_deserialization_keeps_diagnostics_bounded() {
+        #[derive(Serialize)]
+        struct RawUnknownTierStats {
+            unknown_bytes: u64,
+            diagnostics: Vec<String>,
+            diagnostics_dropped: u64,
+        }
+
+        let mut diagnostics = vec!["tier-hash:0123456789abcdef".to_string(); UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP + 8];
+        diagnostics.push("raw-tier-name-that-must-not-be-exposed".to_string());
+        diagnostics.push("x".repeat(UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP + 1));
+        let encoded = rmp_serde::to_vec_named(&RawUnknownTierStats {
+            unknown_bytes: 7,
+            diagnostics,
+            diagnostics_dropped: 3,
+        })
+        .expect("unknown tier stats should encode");
+        let decoded: UnknownTierStats = rmp_serde::from_slice(&encoded).expect("unknown tier stats should decode");
+
+        assert_eq!(decoded.unknown_bytes, 7);
+        assert_eq!(decoded.diagnostics.len(), 1);
+        assert!(decoded.diagnostics_dropped >= 3);
+        assert!(decoded.diagnostics.iter().all(|entry| is_redacted_tier_diagnostic(entry)));
+    }
+
+    #[test]
     fn checked_merge_rejects_overflowing_tier_totals() {
         let mut left = tier_entry(
             "WARM",
@@ -1899,6 +2575,57 @@ mod tests {
 
         assert!(!left.checked_merge(&right), "saturating tier totals must not be published");
         assert_eq!(left.all_tier_stats.expect("left is untouched").tiers["WARM"].total_size, u64::MAX);
+    }
+
+    #[test]
+    fn checked_merge_rejects_unknown_counter_overflow_on_either_side() {
+        let overflowed = DataUsageEntry {
+            unknown_tier_stats: Some(UnknownTierStats {
+                counter_overflowed: true,
+                ..Default::default()
+            }),
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut left = DataUsageEntry::default();
+        assert!(!left.checked_merge(&overflowed));
+
+        let mut left = overflowed.clone();
+        assert!(!left.checked_merge(&DataUsageEntry::default()));
+    }
+
+    #[test]
+    fn checked_merge_rejects_one_sided_overflowed_proof_without_mutation() {
+        let mut left = DataUsageEntry {
+            size: 1,
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                overflowed: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let legacy = DataUsageEntry {
+            size: 2,
+            ..Default::default()
+        };
+
+        assert!(!left.checked_merge(&legacy));
+        assert_eq!(left.size, 1);
+        assert_eq!(
+            left.tier_accounting_proof,
+            Some(TierAccountingProof {
+                logical_total: 1,
+                logical_known: 1,
+                overflowed: true,
+                ..Default::default()
+            })
+        );
     }
 
     /// Entry shape released before per-tier accounting, using the derived
@@ -1938,6 +2665,72 @@ mod tests {
 
         let legacy: LegacyEntry = rmp_serde::from_slice(&encoded).expect("legacy reader should ignore the appended field");
         assert_eq!(legacy.objects, 0);
+    }
+
+    #[test]
+    fn tier_accounting_proof_is_optional_and_map_encoded() {
+        let entry = DataUsageEntry {
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 11,
+                logical_known: 11,
+                physical_total: 7,
+                physical_known: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec(&entry).expect("proof-bearing entry should encode");
+        let decoded: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("proof-bearing entry should decode");
+        assert_eq!(decoded.tier_accounting_proof, entry.tier_accounting_proof);
+
+        let legacy = LegacyEntry {
+            children: DataUsageHashMap::default(),
+            size: 12,
+            objects: 3,
+            versions: 4,
+            delete_markers: 1,
+            obj_sizes: SizeHistogram::default(),
+            obj_versions: VersionsHistogram::default(),
+            replication_stats: None,
+            compacted: false,
+            failed_objects: 2,
+        };
+        let legacy_bytes = rmp_serde::to_vec(&legacy).expect("legacy entry should encode");
+        let decoded: DataUsageEntry = rmp_serde::from_slice(&legacy_bytes).expect("legacy entry should decode");
+        assert!(decoded.tier_accounting_proof.is_none());
+    }
+
+    #[test]
+    fn empty_entry_merge_preserves_accounting_proof() {
+        let mut entry = DataUsageEntry {
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: 7,
+                logical_known: 7,
+                physical_total: 7,
+                physical_known: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        entry.merge(&DataUsageEntry::default());
+        assert!(entry.tier_accounting_proof.is_some());
+
+        let mut empty = DataUsageEntry::default();
+        empty.merge(&entry);
+        assert_eq!(empty.tier_accounting_proof, entry.tier_accounting_proof);
+    }
+
+    #[test]
+    fn unknown_counter_overflow_is_not_empty_and_survives_roundtrip() {
+        let stats = UnknownTierStats {
+            counter_overflowed: true,
+            ..Default::default()
+        };
+        assert!(!stats.is_empty());
+        let encoded = rmp_serde::to_vec_named(&stats).expect("overflow marker should encode");
+        let decoded: UnknownTierStats = rmp_serde::from_slice(&encoded).expect("overflow marker should decode");
+        assert!(decoded.counter_overflowed);
+        assert!(!decoded.is_empty());
     }
 
     #[test]
@@ -2263,6 +3056,55 @@ mod tests {
         assert!(!observed_data_usage_is_newer(&candidate(2, 9, Some(false), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(true), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(false), false), &authoritative));
+
+        let mut partial = candidate(2, 11, Some(false), false);
+        partial.usage_snapshot_partial = true;
+        partial.usage_snapshot_set_states = vec![DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(10),
+            scanner_epoch: Some(2),
+            scan_plan_digest: Some([1; 32]),
+            complete: false,
+            tombstone: false,
+        }];
+        assert!(observed_data_usage_is_newer(&partial, &authoritative));
+    }
+
+    #[test]
+    fn mixed_topology_snapshot_is_rejected() {
+        let mut partial = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(2),
+            buckets_count: 0,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_partial: true,
+            usage_snapshot_set_states: vec![
+                DataUsageSnapshotSetState {
+                    pool_index: 0,
+                    set_index: 0,
+                    scanner_cycle: Some(11),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([1; 32]),
+                    complete: true,
+                    tombstone: false,
+                },
+                DataUsageSnapshotSetState {
+                    pool_index: 1,
+                    set_index: 0,
+                    scanner_cycle: Some(10),
+                    scanner_epoch: Some(2),
+                    scan_plan_digest: Some([2; 32]),
+                    complete: false,
+                    tombstone: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!partial.is_valid_partial_snapshot());
+        partial.usage_snapshot_set_states[1].scan_plan_digest = Some([1; 32]);
+        assert!(partial.is_valid_partial_snapshot());
     }
 
     #[test]
@@ -2706,6 +3548,32 @@ mod tests {
                 num_objects: 2,
             }
         );
+    }
+
+    #[test]
+    fn test_dui_filters_empty_unknown_tier_usage_from_the_flattened_tree() {
+        let root_hash = hash_path("root");
+        let bucket_hash = hash_path("bucket-a");
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "root".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+
+        let child = DataUsageEntry {
+            objects: 1,
+            unknown_tier_stats: Some(UnknownTierStats::default()),
+            ..Default::default()
+        };
+        cache.replace_hashed(&bucket_hash, &Some(root_hash), &child);
+
+        let info = cache.dui("root", &["bucket-a".to_string()]);
+
+        assert_eq!(info.objects_total_count, 1);
+        assert!(info.unknown_tier_stats.is_none());
     }
 
     #[test]

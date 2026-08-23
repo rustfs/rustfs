@@ -16,6 +16,7 @@ pub mod bucket_lifecycle_audit;
 pub mod bucket_lifecycle_ops;
 mod config_boundary;
 pub mod core;
+mod durable_namespace;
 pub mod evaluator;
 pub mod manual_transition_job;
 mod metadata_boundary;
@@ -31,3 +32,8 @@ pub mod tier_free_version_recovery;
 pub mod tier_last_day_stats;
 pub mod tier_sweeper;
 pub mod transition_transaction;
+
+pub(crate) use durable_namespace::{
+    DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord, classify_durable_ilm_record,
+    validate_durable_ilm_record,
+};

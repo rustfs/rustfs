@@ -13,6 +13,7 @@
 // limitations under the License.
 /// bucket/cluster/prefix heal: the recursive bucket-objects sweep and the erasure-set usage baseline
 use super::*;
+use crate::heal::progress::{add_bytes, increment_counter, stable_generation};
 
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
@@ -32,7 +33,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("bucket: {bucket}")));
-            progress.update_progress(0, 3, 0, 0);
+            progress.update_stage(0, 3);
         }
 
         // Step 1: Check if bucket exists
@@ -66,7 +67,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
+            progress.update_stage(1, 3);
         }
 
         // Step 2: Perform bucket heal using ecstore
@@ -122,7 +123,7 @@ impl HealTask {
 
                 if !self.options.recursive {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
                 Ok(())
             }
@@ -142,7 +143,7 @@ impl HealTask {
                 );
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal bucket {bucket}: {e}"),
@@ -245,6 +246,7 @@ impl HealTask {
         let mut scanned = 0u64;
         let mut healed = 0u64;
         let mut failed = 0u64;
+        let mut skipped = 0u64;
         let mut retryable_failed = 0u64;
         let mut permanent_failed = 0u64;
         let mut bytes = 0u64;
@@ -286,16 +288,14 @@ impl HealTask {
                 let mut retry = Vec::with_capacity(pending.len());
                 for item in pending {
                     self.check_control_flags().await?;
+                    let mut telemetry_unknown = false;
                     let object = item.name.as_str();
-                    if retry_attempt == 0 {
-                        scanned = scanned.saturating_add(1);
-                    }
                     {
                         let mut progress = self.progress.write().await;
                         progress.set_current_object(Some(format!("{bucket}/{object}")));
-                        progress.update_progress(scanned, healed, failed, bytes);
                     }
 
+                    let mut terminal_outcome = true;
                     let error = match self
                         .await_with_control(
                             self.storage
@@ -304,13 +304,13 @@ impl HealTask {
                         .await
                     {
                         Ok((result, None)) => {
-                            healed = healed.saturating_add(1);
-                            bytes = bytes.saturating_add(u64::try_from(result.object_size).unwrap_or_default());
+                            telemetry_unknown |= !increment_counter(&mut healed);
+                            telemetry_unknown |= !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
                             self.record_result_item(result).await;
                             None
                         }
                         Ok((_, Some(err))) if is_missing_object_dir_heal_result(object, &err) => {
-                            healed = healed.saturating_add(1);
+                            telemetry_unknown |= !increment_counter(&mut healed);
                             debug!(
                                 target: "rustfs::heal::task",
                                 event = EVENT_HEAL_BUCKET_RESULT,
@@ -329,6 +329,7 @@ impl HealTask {
 
                     if let Some(err) = error {
                         if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                            telemetry_unknown |= !increment_counter(&mut skipped);
                             warn!(
                                 target: "rustfs::heal::task",
                                 event = EVENT_HEAL_BUCKET_RESULT,
@@ -342,6 +343,7 @@ impl HealTask {
                                 "Heal bucket object repair skipped due to transient metadata error"
                             );
                         } else if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
+                            terminal_outcome = false;
                             debug!(
                                 target: "rustfs::heal::task",
                                 event = EVENT_HEAL_BUCKET_RESULT,
@@ -357,7 +359,7 @@ impl HealTask {
                             );
                             retry.push(item);
                         } else {
-                            failed = failed.saturating_add(1);
+                            telemetry_unknown |= !increment_counter(&mut failed);
                             if err.is_recoverable_heal() {
                                 retryable_failed = retryable_failed.saturating_add(1);
                             } else {
@@ -383,8 +385,19 @@ impl HealTask {
                         }
                     }
 
+                    if terminal_outcome {
+                        telemetry_unknown |= !increment_counter(&mut scanned);
+                    }
+
+                    if !terminal_outcome {
+                        continue;
+                    }
+
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(scanned, healed, failed, bytes);
+                    progress.update_object_progress(scanned, healed, failed, skipped, bytes);
+                    if telemetry_unknown {
+                        progress.mark_unknown();
+                    }
                 }
                 pending = retry;
                 retry_attempt = retry_attempt.saturating_add(1);
@@ -432,6 +445,9 @@ impl HealTask {
     }
 
     pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<()> {
+        if matches!(self.options.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal) {
+            return Ok(());
+        }
         let baseline = match self
             .await_with_control(self.storage.erasure_set_usage_baseline(buckets))
             .await
@@ -442,9 +458,18 @@ impl HealTask {
             Err(_) => return Ok(()),
         };
 
-        let HealBucketUsageBaseline { objects_count, bytes } = baseline;
+        let HealBucketUsageBaseline {
+            objects_count,
+            bytes,
+            generation,
+        } = baseline;
+        let generation = generation.map(|snapshot_generation| stable_generation(&[&snapshot_generation.to_be_bytes()]));
         let mut progress = self.progress.write().await;
-        progress.set_total_baseline(objects_count, bytes);
+        if let Some(generation) = generation {
+            progress.set_total_baseline_with_generation(objects_count, bytes, generation);
+        } else {
+            progress.set_total_baseline(objects_count, bytes);
+        }
         Ok(())
     }
 }
