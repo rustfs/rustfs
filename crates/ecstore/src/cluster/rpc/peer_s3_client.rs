@@ -294,6 +294,10 @@ struct HealBucketRpcEnvelope {
 }
 
 pub fn encode_heal_bucket_rpc_options(opts: HealOpts, fenced_pools: &[usize]) -> Result<String> {
+    if fenced_pools.is_empty() {
+        return serde_json::to_string(&opts).map_err(Into::into);
+    }
+
     serde_json::to_string(&HealBucketRpcEnvelope {
         options: opts,
         fenced_pools: fenced_pools.to_vec(),
@@ -2507,7 +2511,11 @@ mod tests {
         assert_eq!(decoded.pool, Some(2));
         assert_eq!(fenced_pools, vec![1, 2]);
 
-        let legacy = serde_json::to_string(&opts).expect("encode legacy HealOpts");
+        let legacy = encode_heal_bucket_rpc_options(opts, &[]).expect("encode legacy HealOpts for an unfenced heal");
+        let old_peer_opts = serde_json::from_str::<HealOpts>(&legacy).expect("old peer should decode an unfenced heal request");
+        assert!(old_peer_opts.recreate);
+        assert_eq!(old_peer_opts.pool, Some(2));
+
         let (decoded, fenced_pools) = decode_heal_bucket_rpc_options(&legacy).expect("new peer should accept a legacy request");
         assert!(decoded.recreate);
         assert_eq!(decoded.pool, Some(2));
