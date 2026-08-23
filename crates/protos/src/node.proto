@@ -862,6 +862,10 @@ message ScannerPublicationLeaseRequest {
   // separate from the storage-owned deployment identity returned by the
   // lease response so a restart cannot reuse an old session token.
   string expected_session_id = 4;
+  // A non-empty token turns the acquire RPC into an in-place validation of an
+  // existing lease.  Keeping this on the existing RPC lets old peers reject
+  // the proof without changing the v7 activity wire shape.
+  bytes token = 5;
 }
 
 message ScannerPublicationLeaseResponse {

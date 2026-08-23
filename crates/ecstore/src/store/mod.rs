@@ -506,6 +506,29 @@ impl ECStore {
     pub async fn release_scanner_publication_lease(&self, token: Uuid) -> bool {
         self.ctx.remove_scanner_publication_lease(token).await
     }
+
+    /// Revalidate a previously acquired remote publication lease immediately
+    /// before the coordinator's final metadata write.  The operation read
+    /// guard makes the movement snapshot and token lookup one storage-owned
+    /// admission; a restarted context has no old token and therefore fails
+    /// closed even if its generation counter has returned to zero.
+    pub async fn validate_scanner_publication_lease(&self, token: Uuid, expected_generation: u64) -> Result<()> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_generation_exhausted()
+            || self.ctx.data_movement_operation_epoch_exhausted()
+            || self.ctx.data_movement_generation() != expected_generation
+        {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+        if !self.ctx.scanner_publication_lease_is_active(token).await {
+            return Err(Error::other("scanner publication lease is unknown or expired"));
+        }
+        Ok(())
+    }
 }
 
 // impl Clone for ECStore {
@@ -1228,6 +1251,29 @@ mod tests {
             .await
             .expect_err("a stale movement generation must not acquire a lease");
         assert!(error.to_string().contains("generation is stale"));
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_restart_aba_token() {
+        let first_store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = first_store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("the initial instance should grant a publication lease");
+        first_store
+            .validate_scanner_publication_lease(token, generation)
+            .await
+            .expect("the current instance should validate its own live token");
+
+        // A restarted storage instance starts its local generation at zero,
+        // but its process-owned lease table is empty.  The old token must not
+        // pass validation just because the numeric generation matches again.
+        let restarted_store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let error = restarted_store
+            .validate_scanner_publication_lease(token, generation)
+            .await
+            .expect_err("a token from a prior instance must fail closed after restart");
+        assert!(error.to_string().contains("unknown or expired"));
     }
 
     #[tokio::test]

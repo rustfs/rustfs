@@ -53,7 +53,7 @@ const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScannerPublicationLeaseGrant {
     pub host: String,
     pub lease: ScannerPublicationLease,
@@ -1530,6 +1530,37 @@ impl NotificationSys {
                 failures.join("; ")
             )))
         }
+    }
+
+    /// Revalidate every remote lease in deterministic host order immediately
+    /// before a final scanner metadata write.  A peer restart removes its
+    /// process-owned token table and changes its activity session, so an old
+    /// generation cannot pass this proof even when the numeric generation is
+    /// reused.
+    pub async fn validate_scanner_publication_leases(&self, grants: &[ScannerPublicationLeaseGrant]) -> Result<()> {
+        let mut grants = grants.to_vec();
+        grants.sort_by(|left, right| left.host.cmp(&right.host));
+        for pair in grants.windows(2) {
+            if pair[0].host == pair[1].host {
+                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].host)));
+            }
+        }
+        for grant in grants {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == grant.host)
+                .cloned()
+            else {
+                return Err(Error::other(format!("scanner publication lease peer {} is unavailable", grant.host)));
+            };
+            client
+                .validate_scanner_publication_lease(&grant.lease)
+                .await
+                .map_err(|err| Error::other(format!("scanner publication lease validation failed for {}: {err}", grant.host)))?;
+        }
+        Ok(())
     }
 
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {

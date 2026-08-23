@@ -1980,6 +1980,14 @@ impl Node for NodeService {
         if request.get_ref().expected_session_id != session_id {
             return Err(Status::failed_precondition("scanner publication lease session is stale"));
         }
+        let validation_token = if request.get_ref().token.is_empty() {
+            None
+        } else {
+            Some(
+                Uuid::from_slice(request.get_ref().token.as_ref())
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?,
+            )
+        };
         let challenge = request.get_ref().challenge.clone();
         let request = request.into_inner();
         let store = self
@@ -1989,9 +1997,20 @@ impl Node for NodeService {
             return Err(Status::unavailable("storage owner identity is not initialized"));
         }
         let owner_id = store.id.to_string();
-        let result = store
-            .acquire_scanner_publication_lease(request.expected_movement_generation, Duration::from_millis(request.ttl_ms))
-            .await;
+        let result = match validation_token {
+            Some(token) => store
+                .validate_scanner_publication_lease(token, request.expected_movement_generation)
+                .await
+                .map(|()| (token, request.expected_movement_generation)),
+            None => {
+                store
+                    .acquire_scanner_publication_lease(
+                        request.expected_movement_generation,
+                        Duration::from_millis(request.ttl_ms),
+                    )
+                    .await
+            }
+        };
         let mut response = match result {
             Ok((token, generation)) => ScannerPublicationLeaseResponse {
                 success: true,
@@ -5502,6 +5521,7 @@ mod tests {
                 expected_movement_generation: 0,
                 ttl_ms: SCANNER_PUBLICATION_LEASE_TTL_MS,
                 expected_session_id: String::new(),
+                token: Bytes::new(),
             }
         );
         assert_tampered!(

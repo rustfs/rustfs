@@ -539,6 +539,14 @@ pub fn canonical_scanner_publication_lease_request_body(
     body.extend_from_slice(&request.ttl_ms.to_be_bytes());
     body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
     body.extend_from_slice(session_id);
+    // Empty keeps the original acquire body byte-for-byte compatible.  A
+    // non-empty token is the authenticated validation form used immediately
+    // before a coordinator commits its final publication.
+    let token = request.token.as_ref();
+    if !token.is_empty() {
+        body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+        body.extend_from_slice(token);
+    }
     Ok(body)
 }
 
@@ -1895,6 +1903,7 @@ mod scanner_activity_tests {
             expected_movement_generation: 7,
             ttl_ms: 60_000,
             expected_session_id: "session-a".to_string(),
+            token: Vec::new().into(),
         };
         let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
         for variant in [
@@ -1908,6 +1917,10 @@ mod scanner_activity_tests {
             },
             ScannerPublicationLeaseRequest {
                 ttl_ms: 30_000,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                token: vec![3; 16].into(),
                 ..request.clone()
             },
         ] {

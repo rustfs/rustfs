@@ -302,6 +302,25 @@ impl InstanceContext {
         self.scanner_publication_leases.lock().await.remove(&token).is_some()
     }
 
+    /// Check a lease token while the caller holds the movement read guard.
+    ///
+    /// The token table is deliberately process-owned and non-persistent: a
+    /// restarted instance has no entries from the previous process, so an old
+    /// coordinator proof cannot become valid again merely because the
+    /// movement generation counter restarted at zero.
+    pub(crate) async fn scanner_publication_lease_is_active(&self, token: Uuid) -> bool {
+        let mut leases = self.scanner_publication_leases.lock().await;
+        let now = Instant::now();
+        let Some(expires_at) = leases.get(&token).map(|entry| entry.expires_at) else {
+            return false;
+        };
+        if expires_at <= now {
+            leases.remove(&token);
+            return false;
+        }
+        true
+    }
+
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
         let mut leases = self.scanner_publication_leases.lock().await;
         let should_remove = leases.get(&token).is_some_and(|entry| entry.expires_at <= expires_at);

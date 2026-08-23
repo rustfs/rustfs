@@ -1441,6 +1441,9 @@ async fn run_data_scanner_cycle_with_budget(
         .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
         .or(publication_defer_reason);
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
+    let remote_lease_probe = remote_publication_leases
+        .as_ref()
+        .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
     let mut usage_persist_outcome = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
@@ -1464,7 +1467,18 @@ async fn run_data_scanner_cycle_with_budget(
                     remote_lease_deadline,
                     move || {
                         let storeapi = route_probe_store.clone();
-                        async move { storeapi.scanner_data_usage_publication_blocked().await }
+                        let remote_lease_probe = remote_lease_probe.clone();
+                        async move {
+                            if let Some((notification_system, grants)) = remote_lease_probe.as_ref() {
+                                if notification_system.validate_scanner_publication_leases(grants).await.is_err() {
+                                    // A remote restart or movement flip invalidates
+                                    // the token proof; usage_store interprets this
+                                    // as a publication barrier and performs no PUT.
+                                    return true;
+                                }
+                            }
+                            storeapi.scanner_data_usage_publication_blocked().await
+                        }
                     },
                 )
                 .await

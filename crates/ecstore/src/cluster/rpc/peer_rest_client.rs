@@ -398,6 +398,25 @@ fn validate_scanner_publication_lease_response_fields(
     Ok((token, owner_id))
 }
 
+fn scanner_publication_lease_deadline(
+    request_started: std::time::Instant,
+    response_received: std::time::Instant,
+    lease_ttl_ms: u64,
+) -> Result<std::time::Instant> {
+    let lease_window = Duration::from_millis(lease_ttl_ms)
+        .checked_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN)
+        .ok_or_else(|| Error::other("scanner publication lease TTL is shorter than its safety margin"))?;
+    let elapsed = response_received
+        .checked_duration_since(request_started)
+        .ok_or_else(|| Error::other("scanner publication lease response clock moved backwards"))?;
+    if elapsed >= lease_window {
+        return Err(Error::other("scanner publication lease response arrived after its safety window"));
+    }
+    request_started
+        .checked_add(lease_window)
+        .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerRestClient {
     pub host: XHost,
@@ -1821,12 +1840,13 @@ impl PeerRestClient {
 
     /// Acquire a bounded, storage-owned read admission on the peer that
     /// produced the final activity generation. Older peers do not implement
-    /// this independent RPC and are rejected rather than downgraded.
+    /// the lease form and are rejected rather than downgraded.
     pub async fn acquire_scanner_publication_lease(
         &self,
         expected_session_id: &str,
         expected_generation: u64,
     ) -> Result<ScannerPublicationLease> {
+        let request_started = std::time::Instant::now();
         self.finalize_result(
             async {
                 let challenge = Uuid::new_v4();
@@ -1840,6 +1860,7 @@ impl PeerRestClient {
                     expected_movement_generation: expected_generation,
                     ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
                     expected_session_id: expected_session_id.to_string(),
+                    token: Bytes::new(),
                 });
                 let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
                     .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
@@ -1857,9 +1878,58 @@ impl PeerRestClient {
                     movement_generation: response.movement_generation,
                     owner_id,
                     session_id: response.session_id,
-                    expires_at: std::time::Instant::now()
-                        + Duration::from_millis(response.lease_ttl_ms).saturating_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN),
+                    expires_at: scanner_publication_lease_deadline(
+                        request_started,
+                        std::time::Instant::now(),
+                        response.lease_ttl_ms,
+                    )?,
                 })
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Revalidate the exact token immediately before the coordinator commits
+    /// its final publication.  The peer keeps the original movement read
+    /// guard in its token table; a restart drops that table and changes the
+    /// activity session, so this proof fails closed instead of accepting an
+    /// ABA generation value.
+    pub async fn validate_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: lease.movement_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: lease.session_id.clone(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease validation request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response).map_err(
+                        |_| Error::other("scanner publication lease validation response is too large to authenticate"),
+                    )?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease validation proof"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, &lease.session_id, lease.movement_generation)?;
+                if token != lease.token {
+                    return Err(Error::other("peer returned a different scanner publication lease token"));
+                }
+                if owner_id != lease.owner_id {
+                    return Err(Error::other("peer returned a different scanner publication lease owner"));
+                }
+                Ok(())
             }
             .await,
         )
@@ -2250,6 +2320,19 @@ mod tests {
         let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
             .expect_err("a response from an older scanner session must be rejected");
         assert!(error.to_string().contains("different scanner publication lease session"));
+    }
+
+    #[test]
+    fn scanner_publication_lease_deadline_accounts_for_delayed_rpc_response() {
+        let started = std::time::Instant::now();
+        let expected_deadline = started + Duration::from_secs(55);
+        let deadline = scanner_publication_lease_deadline(started, started + Duration::from_secs(10), 60_000)
+            .expect("a response inside the safety window should retain the original deadline");
+        assert_eq!(deadline, expected_deadline);
+
+        let error = scanner_publication_lease_deadline(started, started + Duration::from_secs(55), 60_000)
+            .expect_err("a response arriving at the safety boundary must fail closed");
+        assert!(error.to_string().contains("after its safety window"));
     }
 
     #[test]

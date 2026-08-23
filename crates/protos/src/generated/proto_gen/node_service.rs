@@ -1228,6 +1228,8 @@ pub struct ScannerPublicationLeaseRequest {
     pub ttl_ms: u64,
     #[prost(string, tag = "4")]
     pub expected_session_id: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub token: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerPublicationLeaseResponse {
