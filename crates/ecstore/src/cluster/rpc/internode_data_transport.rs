@@ -13,17 +13,18 @@
 // limitations under the License.
 
 use crate::cluster::rpc::{
-    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability, verify_put_file_capability,
+    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_tier_registry_generation,
+    verify_put_file_capability,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
-    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY,
-    PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION,
-    PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY,
-    WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY,
+    NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY,
+    PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY,
+    PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -137,6 +138,12 @@ fn put_file_capability_status_is_legacy(status: u16) -> bool {
     status == 404
 }
 
+fn ns_scanner_capability_error_allows_legacy(error: &Error) -> bool {
+    [400, 404, 405, 426]
+        .into_iter()
+        .any(|status| error.is_internode_http_status(status))
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[allow(
     dead_code,
@@ -220,6 +227,7 @@ pub struct NsScannerStreamRequest {
 #[derive(Debug, Clone)]
 pub struct NsScannerCapabilityRequest {
     pub endpoint: String,
+    pub supports_tier_registry_generation: bool,
 }
 
 /// Data-plane stream opener used by `RemoteDisk`.
@@ -251,6 +259,15 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     }
     async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
         Err(Error::MethodNotAllowed)
+    }
+    async fn probe_ns_scanner_capability(&self, request: NsScannerCapabilityRequest) -> Result<NsScannerCapabilityResponse> {
+        let server_epoch = self.probe_ns_scanner(request).await?;
+        Ok(NsScannerCapabilityResponse {
+            version: NS_SCANNER_PROTOCOL_VERSION,
+            server_epoch,
+            proof: Vec::new(),
+            supports_tier_registry_generation: None,
+        })
     }
     // Interface facet nobody calls yet: every transport implements both, but no
     // caller negotiates on them. Kept for the internode transport split
@@ -335,27 +352,44 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn probe_ns_scanner(&self, request: NsScannerCapabilityRequest) -> Result<Uuid> {
-        let challenge = Uuid::new_v4();
-        let url = build_ns_scanner_capability_url(&request, challenge);
-        let mut headers = msgpack_headers();
-        build_auth_headers(&url, &Method::GET, &mut headers)?;
-        let reader = HttpReader::new(url, Method::GET, headers, None).await?;
-        let mut body = Vec::new();
-        reader
-            .take(u64::try_from(NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE + 1).unwrap_or(u64::MAX))
-            .read_to_end(&mut body)
-            .await?;
-        if body.is_empty() || body.len() > NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE {
-            return Err(Error::other("invalid remote namespace scanner capability response size"));
+        Ok(self.probe_ns_scanner_capability(request).await?.server_epoch)
+    }
+
+    async fn probe_ns_scanner_capability(&self, request: NsScannerCapabilityRequest) -> Result<NsScannerCapabilityResponse> {
+        if request.supports_tier_registry_generation {
+            return match self.probe_ns_scanner_capability_once(&request).await {
+                Ok(response) => Ok(response),
+                Err(marked_error) if ns_scanner_capability_error_allows_legacy(&marked_error) => {
+                    // A v3 peer may reject the additive query marker, ignore
+                    // it, or return its legacy proof. Retry once without the
+                    // marker and only downgrade after that legacy response is
+                    // authenticated; an unverified epoch is never trusted.
+                    let legacy_request = NsScannerCapabilityRequest {
+                        endpoint: request.endpoint.clone(),
+                        supports_tier_registry_generation: false,
+                    };
+                    match self.probe_ns_scanner_capability_once(&legacy_request).await {
+                        Ok(mut response) => {
+                            response.supports_tier_registry_generation = None;
+                            Ok(response)
+                        }
+                        Err(legacy_error) if ns_scanner_capability_error_allows_legacy(&legacy_error) => {
+                            // Some old deployments expose only the legacy
+                            // protocol response (or advertise 426). Treat
+                            // the pair as an explicit unsupported result so
+                            // the scanner can use its coordinator fallback.
+                            Err(Error::MethodNotAllowed)
+                        }
+                        Err(_) => Err(marked_error),
+                    }
+                }
+                // A server failure, network failure, or authentication error
+                // is not evidence of an old parser. Do not issue an
+                // unauthenticated legacy probe or silently downgrade.
+                Err(marked_error) => Err(marked_error),
+            };
         }
-        let response: NsScannerCapabilityResponse =
-            rmp_serde::from_slice(&body).map_err(|_| Error::other("invalid remote namespace scanner capability response"))?;
-        if response.version != NS_SCANNER_PROTOCOL_VERSION || response.server_epoch.is_nil() {
-            return Err(Error::other("incompatible remote namespace scanner capability response"));
-        }
-        verify_ns_scanner_capability(challenge, response.server_epoch, &response.proof)
-            .map_err(|err| Error::other(format!("remote namespace scanner capability authentication failed: {err}")))?;
-        Ok(response.server_epoch)
+        self.probe_ns_scanner_capability_once(&request).await
     }
 
     fn name(&self) -> &'static str {
@@ -368,6 +402,53 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
 }
 
 impl TcpHttpInternodeDataTransport {
+    async fn probe_ns_scanner_capability_once(
+        &self,
+        request: &NsScannerCapabilityRequest,
+    ) -> Result<NsScannerCapabilityResponse> {
+        let challenge = Uuid::new_v4();
+        let url = build_ns_scanner_capability_url(request, challenge);
+        let mut headers = msgpack_headers();
+        build_auth_headers(&url, &Method::GET, &mut headers)?;
+        let reader = HttpReader::new(url, Method::GET, headers, None).await?;
+        let mut body = Vec::new();
+        reader
+            .take(u64::try_from(NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut body)
+            .await?;
+        if body.is_empty() || body.len() > NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE {
+            return Err(Error::other("invalid remote namespace scanner capability response size"));
+        }
+        let mut response: NsScannerCapabilityResponse =
+            rmp_serde::from_slice(&body).map_err(|_| Error::other("invalid remote namespace scanner capability response"))?;
+        if response.version != NS_SCANNER_PROTOCOL_VERSION || response.server_epoch.is_nil() {
+            return Err(Error::other("incompatible remote namespace scanner capability response"));
+        }
+        if let Err(err) = verify_ns_scanner_capability_with_tier_registry_generation(
+            challenge,
+            response.server_epoch,
+            &response.proof,
+            request.supports_tier_registry_generation,
+        ) {
+            // A permissive older peer can ignore the additive marker and
+            // return a valid legacy-scope proof with HTTP 200. Accept that
+            // response only after independently authenticating the legacy
+            // scope; all other verification failures remain fail-closed.
+            if request.supports_tier_registry_generation && ns_scanner_capability_legacy_proof_is_valid(challenge, &response) {
+                response.supports_tier_registry_generation = None;
+                return Ok(response);
+            }
+            return Err(Error::other(format!("remote namespace scanner capability authentication failed: {err}")));
+        }
+        // The proof authenticates the requested capability scope, not the
+        // optional response field. Derive the client-facing bit from that
+        // verified scope so an intermediary cannot strip or rewrite the field
+        // and force a silent downgrade after a successful generation-bound
+        // handshake.
+        normalize_ns_scanner_capability_response(&mut response, request.supports_tier_registry_generation);
+        Ok(response)
+    }
+
     async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
         resolve_put_file_auth_capability(endpoint, || async {
             tokio::time::timeout(PUT_FILE_CAPABILITY_PROBE_TIMEOUT, self.probe_put_file_auth(endpoint))
@@ -649,6 +730,14 @@ fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
     )
 }
 
+fn normalize_ns_scanner_capability_response(response: &mut NsScannerCapabilityResponse, requested_generation_support: bool) {
+    response.supports_tier_registry_generation = requested_generation_support.then_some(true);
+}
+
+fn ns_scanner_capability_legacy_proof_is_valid(challenge: Uuid, response: &NsScannerCapabilityResponse) -> bool {
+    verify_ns_scanner_capability_with_tier_registry_generation(challenge, response.server_epoch, &response.proof, false).is_ok()
+}
+
 fn build_ns_scanner_url(request: &NsScannerStreamRequest) -> String {
     let body_sha256 = hex_simd::encode_to_string(Sha256::digest(&request.body), hex_simd::AsciiCase::Lower);
     format!(
@@ -675,13 +764,18 @@ fn build_ns_scanner_url(request: &NsScannerStreamRequest) -> String {
 
 fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challenge: Uuid) -> String {
     format!(
-        "{}{}?{}={}&{}={}",
+        "{}{}?{}={}&{}={}{}",
         request.endpoint,
         NS_SCANNER_PATH,
         NS_SCANNER_PROTOCOL_VERSION_QUERY,
         NS_SCANNER_PROTOCOL_VERSION,
         NS_SCANNER_CAPABILITY_CHALLENGE_QUERY,
-        challenge
+        challenge,
+        if request.supports_tier_registry_generation {
+            format!("&{}=true", NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY)
+        } else {
+            String::new()
+        }
     )
 }
 
@@ -794,6 +888,7 @@ mod tests {
         let probe_err = transport
             .probe_ns_scanner(NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
+                supports_tier_registry_generation: false,
             })
             .await
             .expect_err("legacy transport should report namespace scanner as unsupported");
@@ -1387,6 +1482,7 @@ mod tests {
         let url = build_ns_scanner_capability_url(
             &NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
+                supports_tier_registry_generation: false,
             },
             challenge,
         );
@@ -1397,6 +1493,85 @@ mod tests {
                 "http://node1:9000/rustfs/rpc/ns_scanner?ns_scanner_protocol={NS_SCANNER_PROTOCOL_VERSION}&ns_scanner_challenge={challenge}"
             )
         );
+    }
+
+    #[test]
+    fn ns_scanner_capability_url_marks_generation_support_only_when_requested() {
+        let challenge = Uuid::new_v4();
+        let url = build_ns_scanner_capability_url(
+            &NsScannerCapabilityRequest {
+                endpoint: "http://node1:9000".to_string(),
+                supports_tier_registry_generation: true,
+            },
+            challenge,
+        );
+
+        assert!(url.contains(&format!("&{}=true", NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY)));
+    }
+
+    #[test]
+    fn ns_scanner_capability_legacy_fallback_requires_explicit_compatibility_status() {
+        for status in [400, 404, 405, 426] {
+            let error = Error::from(rustfs_rio::new_test_internode_http_io_error(
+                rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::from_u16(status).expect("test status")),
+            ));
+            assert!(
+                ns_scanner_capability_error_allows_legacy(&error),
+                "status {status} should permit legacy retry"
+            );
+        }
+
+        let marked_server_error = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
+        ));
+        let network_error = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionRefused,
+        ));
+        let authentication_error = Error::other("remote namespace scanner capability authentication failed");
+        assert!(!ns_scanner_capability_error_allows_legacy(&marked_server_error));
+        assert!(!ns_scanner_capability_error_allows_legacy(&network_error));
+        assert!(!ns_scanner_capability_error_allows_legacy(&authentication_error));
+    }
+
+    #[test]
+    fn authenticated_ns_scanner_capability_ignores_unprotected_response_bit() {
+        let mut response = NsScannerCapabilityResponse {
+            version: NS_SCANNER_PROTOCOL_VERSION,
+            server_epoch: Uuid::new_v4(),
+            proof: Vec::new(),
+            supports_tier_registry_generation: None,
+        };
+
+        normalize_ns_scanner_capability_response(&mut response, true);
+        assert_eq!(response.supports_tier_registry_generation, Some(true));
+
+        response.supports_tier_registry_generation = Some(false);
+        normalize_ns_scanner_capability_response(&mut response, false);
+        assert_eq!(response.supports_tier_registry_generation, None);
+    }
+
+    #[test]
+    fn ns_scanner_capability_accepts_only_authenticated_legacy_scope_after_marker_mismatch() {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let response = NsScannerCapabilityResponse {
+            version: NS_SCANNER_PROTOCOL_VERSION,
+            server_epoch: Uuid::new_v4(),
+            proof: crate::cluster::rpc::sign_ns_scanner_capability(challenge, Uuid::new_v4())
+                .expect("placeholder proof should be generated"),
+            supports_tier_registry_generation: None,
+        };
+        // A proof bound to a different challenge cannot authorize the legacy
+        // fallback, even though the response has the expected shape.
+        assert!(!ns_scanner_capability_legacy_proof_is_valid(challenge, &response));
+
+        let server_epoch = response.server_epoch;
+        let valid_response = NsScannerCapabilityResponse {
+            proof: crate::cluster::rpc::sign_ns_scanner_capability(challenge, server_epoch)
+                .expect("legacy proof should be generated"),
+            ..response
+        };
+        assert!(ns_scanner_capability_legacy_proof_is_valid(challenge, &valid_response));
     }
 
     #[test]

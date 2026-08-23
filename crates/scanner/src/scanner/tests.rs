@@ -2788,6 +2788,7 @@ async fn test_deferred_usage_save_keeps_last_real_save_metric() {
     assert_eq!(after.last_usage_save_result, before.last_usage_save_result);
     assert_eq!(after.last_usage_save_result_code, before.last_usage_save_result_code);
     assert_eq!(after.last_usage_save_unix_secs, before.last_usage_save_unix_secs);
+    assert_eq!(after.deferred_total, before.deferred_total.saturating_add(1));
 }
 
 #[tokio::test]

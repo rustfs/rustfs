@@ -566,11 +566,62 @@ impl ScannerItem {
         item.object_path()
     }
 
+    fn effective_tier(oi: &ObjectInfo) -> &str {
+        if oi.transitioned_object.status == crate::TRANSITION_COMPLETE {
+            oi.transitioned_object.tier.as_str()
+        } else {
+            oi.storage_class.as_deref().unwrap_or(crate::storageclass::STANDARD)
+        }
+    }
+
+    fn tier_name_is_known(tier: &str, tier_names: &[String]) -> bool {
+        !tier.is_empty()
+            && tier != crate::data_usage_define::UNKNOWN_TIER
+            && (tier == crate::storageclass::STANDARD
+                || tier == crate::storageclass::RRS
+                || tier_names.iter().any(|name| name == tier))
+    }
+
+    pub(crate) fn tier_is_known(oi: &ObjectInfo, tier_names: &[String]) -> bool {
+        Self::tier_name_is_known(Self::effective_tier(oi), tier_names)
+    }
+
+    fn action_requires_known_tier(action: IlmAction) -> bool {
+        matches!(
+            action,
+            IlmAction::TransitionAction
+                | IlmAction::TransitionVersionAction
+                | IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteRestoredAction
+                | IlmAction::DeleteRestoredVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        )
+    }
+
+    fn action_blocked_by_unknown_tier(
+        action: IlmAction,
+        oi: &ObjectInfo,
+        all_versions_known: bool,
+        tier_names: &[String],
+        target: &str,
+    ) -> bool {
+        if !Self::action_requires_known_tier(action) {
+            return false;
+        }
+        !Self::tier_is_known(oi, tier_names)
+            || (action.delete_all() && !all_versions_known)
+            || (matches!(action, IlmAction::TransitionAction | IlmAction::TransitionVersionAction)
+                && !Self::tier_name_is_known(target, tier_names))
+    }
+
     pub async fn apply_actions(
         &mut self,
         object_infos: Vec<ObjectInfo>,
         lock_retention: Option<Arc<ObjectLockConfiguration>>,
         versioning_config: VersioningConfiguration,
+        tier_names: &[String],
         size_summary: &mut SizeSummary,
     ) {
         let object_path = self.object_path();
@@ -694,6 +745,9 @@ impl ScannerItem {
         let mut noncurrent_unknown: Vec<&ObjectInfo> = Vec::new();
         let mut cumulative_size = 0;
         let mut remaining_versions = object_infos.len();
+        let all_versions_known = object_infos
+            .iter()
+            .all(|candidate| Self::tier_is_known(candidate, tier_names));
         'eventLoop: {
             for (i, event) in events.iter().enumerate() {
                 let oi = &object_infos[i];
@@ -798,6 +852,18 @@ impl ScannerItem {
 
                 let mut size = actual_size;
                 let mut account_now = true;
+
+                // A retired/unknown source tier may point at a remote object
+                // that cannot be safely deleted or transitioned. Lifecycle
+                // evaluation is still useful for accounting, but all
+                // side-effecting tier actions fail closed until the registry
+                // recognizes the source again.
+                if Self::action_blocked_by_unknown_tier(event.action, oi, all_versions_known, tier_names, &event.storage_class) {
+                    size = self.heal_actions(oi, actual_size, size_summary).await;
+                    size_summary.actions_accounting(oi, size, actual_size);
+                    cumulative_size += size;
+                    continue;
+                }
 
                 match event.action {
                     IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
@@ -1304,6 +1370,51 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tier_never_triggers_transition() {
+        let object = ObjectInfo {
+            storage_class: Some("retired-tier".to_string()),
+            ..Default::default()
+        };
+        let tier_names = ["WARM".to_string()];
+        assert!(!ScannerItem::tier_is_known(&object, &tier_names));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::TransitionAction));
+        assert!(ScannerItem::action_requires_known_tier(IlmAction::DeleteVersionAction));
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::NoneAction,
+            &object,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+
+        let known = ObjectInfo {
+            storage_class: Some(crate::storageclass::STANDARD.to_string()),
+            ..Default::default()
+        };
+        assert!(ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::DeleteAllVersionsAction,
+            &known,
+            false,
+            &tier_names,
+            "WARM"
+        ));
+        assert!(!ScannerItem::action_blocked_by_unknown_tier(
+            IlmAction::TransitionAction,
+            &known,
+            true,
+            &tier_names,
+            crate::storageclass::STANDARD
+        ));
+    }
+
+    #[test]
     fn size_resolution_rejects_negative_overflow_and_unknown_compression() {
         let compressed = |actual_size: i64, declared: Option<&str>| {
             let mut user_defined = HashMap::new();
@@ -1681,7 +1792,7 @@ mod tests {
             ..Default::default()
         };
         let mut summary = SizeSummary::default();
-        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &mut summary)
+        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &[], &mut summary)
             .await;
 
         let bounded_bucket = bounded_reconciliation_field(&item.bucket);

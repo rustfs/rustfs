@@ -1375,6 +1375,7 @@ async fn run_data_scanner_cycle_with_budget(
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
+    let publication_deferred = publication_defer_reason.is_some();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let usage_persist_outcome = match publication_defer_reason {
@@ -1539,6 +1540,9 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "deferred",
                 "Scanner cycle deferred before data usage publication"
             );
+            if publication_deferred {
+                global_metrics().record_scanner_usage_deferred(reason.as_str());
+            }
             emit_scan_cycle_deferred(cycle_start.elapsed());
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Deferred(reason);
@@ -1708,6 +1712,7 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "deferred",
                 "Scanner cycle deferred before usage scanning began"
             );
+            global_metrics().record_scanner_usage_deferred(reason.as_str());
             emit_scan_cycle_deferred(cycle_start.elapsed());
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Deferred(reason);
