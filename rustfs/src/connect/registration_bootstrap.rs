@@ -236,6 +236,15 @@ fn ready_marker_exists(path: &Path) -> Result<bool, RegistrationBootstrapError> 
 
 #[cfg(unix)]
 fn publish_ready_marker(state_directory: &Path, ready: &Path) -> Result<(), RegistrationBootstrapError> {
+    publish_ready_marker_with_existing_observer(state_directory, ready, || {})
+}
+
+#[cfg(unix)]
+fn publish_ready_marker_with_existing_observer(
+    state_directory: &Path,
+    ready: &Path,
+    mut existing_observer: impl FnMut(),
+) -> Result<(), RegistrationBootstrapError> {
     let (staging_path, mut staging) = loop {
         let staging_path = state_directory.join(format!(
             "{BOOTSTRAP_READY_FILE}.{}.{}.tmp",
@@ -277,8 +286,15 @@ fn publish_ready_marker(state_directory: &Path, ready: &Path) -> Result<(), Regi
     match published {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            ready_marker_exists(ready)?;
-            Ok(())
+            existing_observer();
+            if ready_marker_exists(ready)? {
+                Ok(())
+            } else {
+                Err(RegistrationBootstrapError::Input(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "bootstrap readiness marker disappeared during publication",
+                )))
+            }
         }
         Err(error) => Err(RegistrationBootstrapError::Input(error)),
     }
@@ -412,9 +428,16 @@ mod tests {
 
     use super::{
         BOOTSTRAP_READY_CONTENTS, BOOTSTRAP_READY_FILE, RegistrationBootstrapError, prepare_state_directory_with_sync,
-        prepare_state_directory_with_sync_and_missing_observer, ready_marker_exists, sync_directory, unix_ca_file_is_trusted,
-        unix_directory_is_trusted, unix_ready_marker_is_trusted,
+        prepare_state_directory_with_sync_and_missing_observer, publish_ready_marker_with_existing_observer, ready_marker_exists,
+        sync_directory, unix_ca_file_is_trusted, unix_directory_is_trusted, unix_ready_marker_is_trusted,
     };
+
+    fn secure_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(".connect-registration-bootstrap-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("temporary directory inside the protected checkout")
+    }
 
     fn create_secure_state_tree(state: &Path) {
         for directory in [state.to_path_buf(), state.join("identity"), state.join("credential")] {
@@ -461,7 +484,7 @@ mod tests {
 
     #[test]
     fn new_state_syncs_managed_directories_and_preprovisioned_parent() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let state = temp.path().join("state");
         let observed = RefCell::new(Vec::new());
 
@@ -488,7 +511,7 @@ mod tests {
 
     #[test]
     fn missing_state_parent_fails_before_creation_or_sync() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let missing_parent = temp.path().join("missing");
         let state = missing_parent.join("state");
         let calls = Cell::new(0);
@@ -510,7 +533,7 @@ mod tests {
 
     #[test]
     fn parent_components_fail_before_creation_or_sync_while_current_directory_is_allowed() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let absolute_parent = temp.path().join("secure/connect/..");
 
         for path in [absolute_parent.as_path(), Path::new("state/../other")] {
@@ -536,7 +559,7 @@ mod tests {
 
     #[test]
     fn missing_marker_retries_all_managed_syncs_after_final_parent_failure() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let state = temp.path().join("state");
         create_secure_state_tree(&state);
         let ready = state.join(BOOTSTRAP_READY_FILE);
@@ -595,7 +618,7 @@ mod tests {
 
     #[test]
     fn every_pre_marker_sync_failure_retries_the_complete_commit() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
 
         for fail_at in 1..=4 {
             let state = temp.path().join(format!("state-{fail_at}"));
@@ -634,7 +657,7 @@ mod tests {
 
     #[test]
     fn missing_directory_replacement_is_revalidated_after_create_race() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
 
         let target = temp.path().join("target");
         fs::create_dir(&target).expect("create symlink target");
@@ -674,7 +697,7 @@ mod tests {
 
     #[test]
     fn ready_marker_rejects_symlinks_shared_modes_non_files_and_invalid_contents() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
 
         for case in ["symlink", "shared", "directory", "contents"] {
             let state = temp.path().join(case);
@@ -706,8 +729,36 @@ mod tests {
     }
 
     #[test]
+    fn marker_removed_after_publication_conflict_fails_closed() {
+        let temp = secure_tempdir();
+        let state = temp.path().join("state");
+        create_secure_state_tree(&state);
+        let ready = state.join(BOOTSTRAP_READY_FILE);
+        fs::write(&ready, BOOTSTRAP_READY_CONTENTS).expect("write existing ready marker");
+        fs::set_permissions(&ready, fs::Permissions::from_mode(0o600)).expect("secure existing ready marker");
+
+        let error = publish_ready_marker_with_existing_observer(&state, &ready, || {
+            fs::remove_file(&ready).expect("remove marker after no-replace conflict");
+        })
+        .expect_err("a marker removed before validation must fail closed");
+
+        assert!(matches!(
+            error,
+            RegistrationBootstrapError::Input(ref source) if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!ready.exists());
+        assert!(
+            fs::read_dir(&state)
+                .expect("read state directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "failed publication must not leave staging files"
+        );
+    }
+
+    #[test]
     fn ready_marker_does_not_bypass_ancestor_validation() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let ancestor = temp.path().join("ancestor");
         let state = ancestor.join("state");
         create_secure_state_tree(&state);
@@ -730,7 +781,7 @@ mod tests {
 
     #[test]
     fn concurrent_preparation_publishes_one_safe_ready_marker() {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = secure_tempdir();
         let state_parent = temp.path().join("preprovisioned");
         fs::create_dir(&state_parent).expect("preprovision state parent");
         fs::set_permissions(&state_parent, fs::Permissions::from_mode(0o700)).expect("secure state parent");
