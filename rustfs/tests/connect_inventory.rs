@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::collections::VecDeque;
 use std::fs;
@@ -401,7 +401,7 @@ fn connect_inventory_bounds_fail_instead_of_truncating_or_inventing_values() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn connect_inventory_state_only_persists_without_constructing_transport() {
     let temp = safe_tempdir();
@@ -546,7 +546,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     }
     assert_eq!(original.as_object().expect("request object").len(), 10);
     restart.shutdown().await;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let latest_before_unchanged = {
         use std::os::unix::fs::MetadataExt as _;
         fs::metadata(temp.path().join("private-config-secret/inventory/latest.json"))
@@ -569,7 +569,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     ));
     assert_eq!(unchanged_samples.load(Ordering::Relaxed), 1);
     assert_eq!(restart_server.seen.lock().expect("seen lock").len(), 2);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt as _;
         assert_ne!(
@@ -847,20 +847,20 @@ async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_deliv
     assert!(server.seen.lock().expect("seen lock").is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn private_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private permissions");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn private_directory_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private directory permissions");
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn private_mode(_path: &std::path::Path) {}
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn private_directory_mode(_path: &std::path::Path) {}

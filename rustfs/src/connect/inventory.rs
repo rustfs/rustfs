@@ -14,16 +14,16 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 use std::io;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::io::Read as _;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::io::Write as _;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -47,13 +47,13 @@ const MAX_SEQUENCE: u64 = 9_007_199_254_740_991;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const ENVELOPE_FORMAT_VERSION: &str = "v1";
 const ENVELOPE_HASH_PREFIX: &[u8] = b"rustfs-connect-inventory-envelope-v1";
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const MAX_PERSISTED_BYTES: usize = 16 * 1024;
 #[allow(dead_code)] // Kept for the crate-private stopped-server reader consumed by R06.
 const MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const FILE_MODE: u32 = 0o600;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,19 +360,19 @@ impl InventorySender {
 
 #[derive(Clone)]
 pub(crate) struct InventoryStateStore {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     directory: Arc<fs::File>,
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     state_root: Arc<StateRootAnchor>,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct StateRootAnchor {
     root: fs::File,
     components: Vec<(std::ffi::OsString, fs::File)>,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl StateRootAnchor {
     fn state_root(&self) -> Result<&fs::File, InventoryError> {
         self.components
@@ -408,12 +408,12 @@ struct InventoryState {
 
 impl InventoryStateStore {
     pub(crate) fn from_state_root(path: &Path) -> Result<Self, InventoryError> {
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
             return Err(InventoryError::PlatformSecurity);
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             let (state_root, directory) = open_inventory_directory(path)?;
             Ok(Self {
@@ -424,11 +424,11 @@ impl InventoryStateStore {
     }
 
     pub(crate) fn try_runtime_lock(&self) -> Result<fs::File, InventoryError> {
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             Err(InventoryError::PlatformSecurity)
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             self.validate_anchor()?;
             let lock = open_file_at(&self.directory, ".state.lock", true, true)?;
@@ -497,12 +497,12 @@ impl InventoryStateStore {
         now: chrono::DateTime<chrono::Utc>,
         after_open: impl FnOnce(),
     ) -> Result<PersistedInventory, InventoryError> {
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = (now, after_open);
             return Err(InventoryError::PlatformSecurity);
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             self.validate_anchor()?;
             let mut file = open_file_at(&self.directory, "latest.json", false, false)?;
@@ -523,7 +523,7 @@ impl InventoryStateStore {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn validate_anchor(&self) -> Result<(), InventoryError> {
         self.state_root.validate()?;
         let state_root = self.state_root.state_root()?;
@@ -567,11 +567,11 @@ impl InventoryStateStore {
     }
 
     fn read(&self) -> Result<InventoryState, InventoryError> {
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             Err(InventoryError::PlatformSecurity)
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             self.validate_anchor()?;
             let mut file = match open_file_at(&self.directory, "state.json", false, false) {
@@ -618,7 +618,7 @@ impl InventoryStateStore {
             destination,
             bytes,
             cancelled,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             None,
         )
     }
@@ -628,14 +628,14 @@ impl InventoryStateStore {
         destination: &str,
         bytes: &[u8],
         cancelled: impl FnOnce() -> bool,
-        #[cfg(test)] fault: Option<PersistFault>,
+        #[cfg(all(test, target_os = "linux"))] fault: Option<PersistFault>,
     ) -> Result<(), InventoryError> {
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = (destination, bytes, cancelled);
             return Err(InventoryError::PlatformSecurity);
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             self.validate_anchor()?;
             match open_file_at(&self.directory, destination, false, false) {
@@ -689,7 +689,7 @@ impl InventoryStateStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 enum PersistFault {
     Write,
     TempSync,
@@ -769,7 +769,7 @@ fn valid_content_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_bounded(file: &mut fs::File) -> Result<Vec<u8>, InventoryError> {
     let mut bytes = Vec::new();
     file.take((MAX_PERSISTED_BYTES + 1) as u64)
@@ -781,7 +781,7 @@ fn read_bounded(file: &mut fs::File) -> Result<Vec<u8>, InventoryError> {
     Ok(bytes)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn open_inventory_directory(path: &Path) -> Result<(StateRootAnchor, fs::File), InventoryError> {
     use std::os::fd::AsRawFd as _;
@@ -837,7 +837,7 @@ fn open_inventory_directory(path: &Path) -> Result<(StateRootAnchor, fs::File), 
     Ok((state_root, child))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn sync_inventory_anchor(inventory: &fs::File, state_root: &fs::File) -> Result<(), InventoryError> {
     sync_inventory_anchor_with(|inventory_target| {
         if inventory_target {
@@ -848,18 +848,18 @@ fn sync_inventory_anchor(inventory: &fs::File, state_root: &fs::File) -> Result<
     })
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 fn sync_inventory_anchor_with(mut sync: impl FnMut(bool) -> io::Result<()>) -> Result<(), InventoryError> {
     sync(true).map_err(|_| InventoryError::StateIo)?;
     sync(false).map_err(|_| InventoryError::StateIo)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn open_directory_at(parent: &fs::File, name: &str) -> Result<fs::File, InventoryError> {
     open_directory_component_at(parent, std::ffi::OsStr::new(name))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn open_directory_component_at(parent: &fs::File, name: &std::ffi::OsStr) -> Result<fs::File, InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -880,7 +880,7 @@ fn open_directory_component_at(parent: &fs::File, name: &std::ffi::OsStr) -> Res
     Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn validate_directory(directory: &fs::File, dedicated: bool) -> Result<(), InventoryError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let metadata = directory.metadata().map_err(|_| InventoryError::StateIo)?;
@@ -892,14 +892,14 @@ fn validate_directory(directory: &fs::File, dedicated: bool) -> Result<(), Inven
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn unix_directory_is_trusted(owner: u32, mode: u32, process: u32, dedicated: bool) -> bool {
     let trusted_owner = owner == process || (!dedicated && owner == 0);
     let trusted_mode = if dedicated { mode == 0o700 } else { mode & 0o7022 == 0 };
     trusted_owner && trusted_mode
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn open_file_at(directory: &fs::File, name: &str, create: bool, write: bool) -> Result<fs::File, InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -923,7 +923,7 @@ fn open_file_at(directory: &fs::File, name: &str, create: bool, write: bool) -> 
     Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn stage_at(directory: &fs::File, destination: &str) -> Result<(String, fs::File), InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -958,7 +958,7 @@ fn stage_at(directory: &fs::File, destination: &str) -> Result<(String, fs::File
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn rename_at(directory: &fs::File, source: &str, destination: &str) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -972,7 +972,7 @@ fn rename_at(directory: &fs::File, source: &str, destination: &str) -> io::Resul
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn unlink_at(directory: &fs::File, name: &str) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
@@ -985,7 +985,7 @@ fn unlink_at(directory: &fs::File, name: &str) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn validate_regular_file(file: &fs::File) -> Result<(), InventoryError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let metadata = file.metadata().map_err(|_| InventoryError::StateIo)?;
@@ -997,12 +997,12 @@ fn validate_regular_file(file: &fs::File) -> Result<(), InventoryError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn unix_regular_file_is_secure(owner: u32, mode: u32, links: u64, process: u32) -> bool {
     owner == process && mode == FILE_MODE && links == 1
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Used by the crate-private stopped-server reader.
 fn file_identity(file: &fs::File) -> Result<(u64, u64, u64), InventoryError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1010,12 +1010,12 @@ fn file_identity(file: &fs::File) -> Result<(u64, u64, u64), InventoryError> {
     Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn c_name(name: &str) -> Result<std::ffi::CString, InventoryError> {
     std::ffi::CString::new(name).map_err(|_| InventoryError::StatePath)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn process_uid() -> u32 {
     // SAFETY: geteuid has no pointer arguments or caller preconditions.
@@ -1098,7 +1098,20 @@ mod tests {
         tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory")
     }
 
-    #[cfg(unix)]
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn persistence_fails_closed_before_accessing_state() {
+        let temp = safe_tempdir();
+        let state = temp.path().join("state-must-not-be-created");
+
+        assert!(matches!(
+            InventoryStateStore::from_state_root(&state),
+            Err(InventoryError::PlatformSecurity)
+        ));
+        assert!(!state.exists());
+    }
+
+    #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     fn make_fifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt as _;
@@ -1209,7 +1222,7 @@ mod tests {
         assert_eq!(decode_envelope(&old, now).expect("old envelope").age, Duration::from_secs(24 * 60 * 60));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancelled_publish_keeps_last_good_and_removes_staging_file() {
         let temp = safe_tempdir();
@@ -1232,7 +1245,7 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from("latest.json")]);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn reader_bounds_the_opened_latest_file_and_reports_missing_state() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1254,7 +1267,7 @@ mod tests {
         assert!(matches!(store.read_latest(now), Err(InventoryError::EnvelopeInvalid)));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn fifo_children_are_rejected_without_blocking_readers_or_writers() {
         let latest_temp = safe_tempdir();
@@ -1285,7 +1298,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn reader_rejects_insecure_file_modes_and_hardlinks() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -1314,7 +1327,7 @@ mod tests {
         assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn store_rejects_unsafe_ancestors_and_symlinked_inventory_directory() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -1346,7 +1359,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn unix_persistence_policy_rejects_wrong_owners_modes_and_link_counts() {
         let uid = 501;
@@ -1365,7 +1378,7 @@ mod tests {
         assert!(!unix_regular_file_is_secure(uid, 0o600, 2, uid));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn reader_rejects_a_real_wrong_owner_when_chown_is_permitted() {
         use std::os::unix::fs::chown;
@@ -1387,7 +1400,7 @@ mod tests {
         assert!(matches!(store.read_latest(now), Err(InventoryError::PersistenceSecurity)));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn directory_component_exchange_is_rejected_by_the_open_anchor() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1412,7 +1425,7 @@ mod tests {
         assert!(!temp.path().join("inventory/latest.json").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn state_root_and_ancestor_exchanges_are_rejected_by_the_path_anchor() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1451,7 +1464,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn fresh_state_concurrency_creates_one_anchor_and_allows_one_runtime_owner() {
         let temp = safe_tempdir();
@@ -1494,7 +1507,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn precommit_failures_preserve_last_good_and_postcommit_sync_failure_keeps_new_file() {
         let temp = safe_tempdir();
@@ -1527,7 +1540,7 @@ mod tests {
         assert_eq!(fs::read(temp.path().join("inventory/latest.json")).expect("committed latest"), new);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancellation_during_commit_does_not_interrupt_rename_or_sync() {
         let temp = safe_tempdir();
@@ -1551,7 +1564,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn reader_rejects_replacement_of_the_file_it_opened() {
         let temp = safe_tempdir();
@@ -1576,7 +1589,7 @@ mod tests {
         assert_eq!(store.read_latest(now).expect("replacement").snapshot, second_snapshot);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn concurrent_reader_observes_only_complete_old_or_new_envelopes() {
         let temp = safe_tempdir();
