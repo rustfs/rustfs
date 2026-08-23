@@ -156,7 +156,7 @@ fn inventory_snapshot(
     expected_drive_count: usize,
     info: rustfs_madmin::StorageInfo,
 ) -> std::result::Result<InventorySnapshot, InventoryError> {
-    let drive_count = inventory_topology_slot_count(&info.disks, expected_drive_count)?;
+    let drive_count = inventory_topology_slot_count(&info, expected_drive_count)?;
     let (total, free) = inventory_capacity(&info)?;
     let mut flags = Vec::with_capacity(3);
     if info.disks.iter().any(|disk| !inventory_disk_is_healthy(disk)) {
@@ -172,12 +172,35 @@ fn inventory_snapshot(
 }
 
 fn inventory_topology_slot_count(
-    disks: &[rustfs_madmin::Disk],
+    info: &rustfs_madmin::StorageInfo,
     expected_drive_count: usize,
 ) -> std::result::Result<usize, InventoryError> {
+    let total_sets = &info.backend.total_sets;
+    let drives_per_set = &info.backend.drives_per_set;
+    let geometry_drive_count = if total_sets.is_empty()
+        || total_sets.len() != drives_per_set.len()
+        || total_sets.contains(&0)
+        || drives_per_set.contains(&0)
+    {
+        None
+    } else {
+        total_sets
+            .iter()
+            .zip(drives_per_set)
+            .try_fold(0_usize, |total, (&sets, &drives)| {
+                sets.checked_mul(drives).and_then(|pool| total.checked_add(pool))
+            })
+    };
+    if geometry_drive_count != Some(expected_drive_count) {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: expected_drive_count,
+            observed: 0,
+        });
+    }
+
     let mut slots = BTreeSet::new();
     let mut invalid = false;
-    for disk in disks {
+    for disk in &info.disks {
         let key = match (
             usize::try_from(disk.pool_index),
             usize::try_from(disk.set_index),
@@ -189,6 +212,10 @@ fn inventory_topology_slot_count(
                 continue;
             }
         };
+        if key.0 >= total_sets.len() || key.1 >= total_sets[key.0] || key.2 >= drives_per_set[key.0] {
+            invalid = true;
+            continue;
+        }
         if !slots.insert(key) {
             invalid = true;
         }
@@ -305,9 +332,12 @@ mod tests {
     }
 
     fn info(disks: Vec<rustfs_madmin::Disk>) -> rustfs_madmin::StorageInfo {
+        let drive_count = disks.len();
         rustfs_madmin::StorageInfo {
             backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![disks.len()],
+                standard_sc_data: vec![drive_count],
+                total_sets: vec![1],
+                drives_per_set: vec![drive_count],
                 ..Default::default()
             },
             disks,
@@ -316,10 +346,9 @@ mod tests {
 
     #[test]
     fn inventory_rejects_a_partial_startup_storage_snapshot() {
-        let info = rustfs_madmin::StorageInfo {
-            disks: vec![rustfs_madmin::Disk::default()],
-            ..Default::default()
-        };
+        let mut info = info(vec![disk("ok", Some("online"), 0)]);
+        info.backend.standard_sc_data = vec![2];
+        info.backend.drives_per_set = vec![2];
 
         assert!(matches!(
             inventory_snapshot(2, 2, info),
@@ -350,6 +379,54 @@ mod tests {
                 observed: 1
             })
         ));
+    }
+
+    #[test]
+    fn inventory_rejects_slots_outside_the_configured_geometry() {
+        for (pool_index, set_index, disk_index) in [(0, 99, 0), (1, 0, 0), (0, 0, 2)] {
+            let valid = disk("ok", Some("online"), 0);
+            let mut invalid = disk("ok", Some("online"), disk_index);
+            invalid.pool_index = pool_index;
+            invalid.set_index = set_index;
+            let mut info = info(vec![valid, invalid]);
+            info.backend.total_sets = vec![1];
+            info.backend.drives_per_set = vec![2];
+
+            assert!(matches!(
+                inventory_snapshot(1, 2, info),
+                Err(InventoryError::SnapshotIncomplete {
+                    expected: 2,
+                    observed: 1
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn inventory_rejects_invalid_or_overflowing_geometry() {
+        for (total_sets, drives_per_set) in [
+            (Vec::new(), Vec::new()),
+            (vec![1], Vec::new()),
+            (Vec::new(), vec![1]),
+            (vec![1, 1], vec![1]),
+            (vec![0], vec![1]),
+            (vec![1], vec![0]),
+            (vec![1], vec![2]),
+            (vec![usize::MAX], vec![2]),
+            (vec![usize::MAX, 1], vec![1, 1]),
+        ] {
+            let mut info = info(vec![disk("ok", Some("online"), 0)]);
+            info.backend.total_sets = total_sets;
+            info.backend.drives_per_set = drives_per_set;
+
+            assert!(matches!(
+                inventory_snapshot(1, 1, info),
+                Err(InventoryError::SnapshotIncomplete {
+                    expected: 1,
+                    observed: 0
+                })
+            ));
+        }
     }
 
     #[test]
@@ -433,6 +510,8 @@ mod tests {
         let info = rustfs_madmin::StorageInfo {
             backend: rustfs_madmin::BackendInfo {
                 standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![2],
                 ..Default::default()
             },
             disks: vec![first, second],
