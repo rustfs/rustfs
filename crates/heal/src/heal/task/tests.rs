@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 use super::super::storage_api::status::BucketInfo;
-use crate::heal::progress::HealProgressState;
+use crate::heal::progress::{HealProgressState, aggregate_heal_progress};
 
 #[tokio::test]
 async fn retry_request_carries_remaining_timeout_budget() {
@@ -2153,6 +2153,55 @@ async fn erasure_set_heal_applies_usage_baseline_to_progress() {
     assert!(progress.baseline_known);
     assert_eq!(progress.bytes_processed, 2);
     assert!((progress.progress_percentage - 25.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn erasure_sets_from_one_usage_snapshot_share_baseline_generation() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage {
+        usage_baseline: Mutex::new(Some(HealBucketUsageBaseline {
+            objects_count: 10,
+            bytes: 8,
+            generation: Some(7),
+        })),
+        ..Default::default()
+    });
+    let buckets = vec!["bucket-a".to_string()];
+    let task_for_set = |set_disk_id: &str| {
+        HealTask::from_request(
+            HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: buckets.clone(),
+                    set_disk_id: set_disk_id.to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        )
+    };
+    let first = task_for_set("pool_0_set_0");
+    let second = task_for_set("pool_0_set_1");
+
+    first
+        .apply_erasure_set_usage_baseline(&buckets, "pool_0_set_0")
+        .await
+        .expect("first baseline");
+    second
+        .apply_erasure_set_usage_baseline(&buckets, "pool_0_set_1")
+        .await
+        .expect("second baseline");
+    first.progress.write().await.update_object_progress(0, 0, 0, 0, 0);
+    second.progress.write().await.update_object_progress(0, 0, 0, 0, 0);
+    let first = first.get_progress().await;
+    let second = second.get_progress().await;
+
+    let expected_generation = first.baseline_generation;
+    assert!(expected_generation.is_some());
+    assert_eq!(second.baseline_generation, expected_generation);
+    let aggregate = aggregate_heal_progress([first, second]).expect("aggregate progress");
+    assert!(aggregate.baseline_known);
+    assert_eq!(aggregate.baseline_generation, expected_generation);
+    assert_eq!(aggregate.progress_state, HealProgressState::Running);
 }
 
 #[tokio::test]
