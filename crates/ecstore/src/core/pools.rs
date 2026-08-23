@@ -930,10 +930,6 @@ fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>
     result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
 }
 
-fn resolve_decommission_bucket_done_save_result(result: Result<()>, idx: usize, bucket: &str) -> Result<()> {
-    result.map_err(|err| Error::other(format!("decommission metadata save failed for pool {idx} bucket {bucket}: {err}")))
-}
-
 fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
     match result {
         Ok(config) => Ok(Some(config)),
@@ -1662,7 +1658,24 @@ fn commit_decommission_cancel(pool_meta: &mut PoolMeta, idx: usize, commit: Deco
 }
 
 fn rollback_start_decommission_pool_meta(pool_meta: &mut PoolMeta, previous_pool_meta: &PoolMeta, indices: &[usize]) {
+    let active_updates = indices
+        .iter()
+        .filter_map(|&idx| pool_meta.pools.get(idx).map(|pool| (idx, pool.last_update)))
+        .collect::<Vec<_>>();
     rollback_decommission_pool_meta(pool_meta, previous_pool_meta, indices);
+    let rollback_at = OffsetDateTime::now_utc();
+    for (idx, active_update) in active_updates {
+        if let Some(pool) = pool_meta.pools.get_mut(idx) {
+            pool.last_update = std::cmp::max(rollback_at, active_update + Duration::nanoseconds(1));
+        }
+    }
+}
+
+fn ensure_pool_meta_write_fence(guard: &rustfs_lock::NamespaceLockGuard, operation: &str) -> Result<()> {
+    if guard.is_lock_lost() {
+        return Err(Error::other(format!("{operation}: pool metadata distributed fence was lost")));
+    }
+    Ok(())
 }
 
 fn ensure_pool_not_left_in_cmdline_after_decommission(position: usize, cmd_line: &str, completed: bool) -> Result<()> {
@@ -2344,6 +2357,10 @@ impl PoolMetaWriteState {
 
     fn block_writes(&mut self) {
         self.write_blocked = true;
+    }
+
+    fn restore_writes(&mut self, was_write_blocked: bool) {
+        self.write_blocked = was_write_blocked;
     }
 
     pub(crate) fn ensure_write_safe(self, operation: &str) -> Result<()> {
@@ -3066,10 +3083,10 @@ impl PoolMeta {
             .cloned()
             .ok_or_else(|| Error::other("pool metadata save failed: no storage pools available"))?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let _pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
         let selection = load_pool_meta_replicas(pools.clone(), true).await?;
         selection.replica_state.ensure_write_safe("pool metadata save failed")?;
-        self.save_no_lock(pools).await
+        self.save_no_lock_with_fence(pools, pool_meta_guard.lock_lost_signal()).await
     }
 
     /// Startup has a single elected local writer, so it must not depend on namespace locks here.
@@ -3084,36 +3101,67 @@ impl PoolMeta {
     where
         S: EcstoreObjectIO,
     {
+        self.save_no_lock_with_fence(pools, None).await
+    }
+
+    async fn save_no_lock_with_fence<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
         let data = self.encode_config_data()?;
         if data.is_empty() {
             return Ok(());
         }
         for pool in pools {
-            save_config_with_opts(
-                pool,
-                POOL_META_NAME,
-                data.clone(),
-                &ObjectOptions {
-                    max_parity: true,
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            if lock_lost.as_ref().is_some_and(|signal| signal.is_lost()) {
+                return Err(Error::other("pool metadata distributed fence was lost before a replica write"));
+            }
+            let mut opts = ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            };
+            if let Some(signal) = lock_lost.as_ref() {
+                opts.add_namespace_lock_lost_signal(signal.clone());
+            }
+            save_config_with_opts(pool, POOL_META_NAME, data.clone(), &opts).await?;
+            if lock_lost.as_ref().is_some_and(|signal| signal.is_lost()) {
+                return Err(Error::other("pool metadata distributed fence was lost during a replica write"));
+            }
         }
 
         Ok(())
     }
 
+    async fn save_no_lock_armed<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    ) -> Result<bool>
+    where
+        S: EcstoreObjectIO,
+    {
+        let was_write_blocked = write_state.write_blocked;
+        // Arm before the first replica write. If this future is dropped, the
+        // mutex guard is released with the sticky write gate still blocked.
+        write_state.block_writes();
+        self.save_no_lock_with_fence(pools, lock_lost).await?;
+        Ok(was_write_blocked)
+    }
+
+    #[cfg(test)]
     async fn save_no_lock_observing<S>(&self, pools: Vec<Arc<S>>, write_state: &mut PoolMetaWriteState) -> Result<()>
     where
         S: EcstoreObjectIO,
     {
-        let result = self.save_no_lock(pools).await;
-        if result.is_err() {
-            write_state.block_writes();
-        }
-        result
+        let was_write_blocked = self.save_no_lock_armed(pools, write_state, None).await?;
+        write_state.restore_writes(was_write_blocked);
+        Ok(())
     }
 
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
@@ -3909,16 +3957,22 @@ impl ECStore {
 
     async fn save_current_pool_meta(&self, indices: &[usize]) -> Result<()> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
-        let (_pool_meta_guard, mut snapshot) = self
+        let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "pool metadata save failed")
             .await?;
         {
             let pool_meta = self.pool_meta.read().await;
             merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, indices, "pool metadata save failed")?;
         }
-        snapshot.save_no_lock_observing(self.pools.clone(), &mut save_guard).await?;
+        let was_write_blocked = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+            .await?;
         let mut pool_meta = self.pool_meta.write().await;
+        ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
         publish_pool_meta_updates(&mut pool_meta, &snapshot, indices);
+        ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
+        drop(pool_meta);
+        save_guard.restore_writes(was_write_blocked);
         Ok(())
     }
 
@@ -3926,7 +3980,7 @@ impl ECStore {
         // Lock order: save gate, then the short pool metadata read/write sections. Peer
         // reloads are intentionally performed by the caller after both locks are released.
         let mut save_guard = self.pool_meta_save_gate.lock().await;
-        let (_pool_meta_guard, mut snapshot) = self
+        let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission progress save failed")
             .await?;
         let (snapshot, checkpoint) = {
@@ -3951,20 +4005,31 @@ impl ECStore {
             (snapshot, checkpoint)
         };
 
-        if let Err(err) = snapshot.save_no_lock_observing(self.pools.clone(), &mut save_guard).await {
-            let retry_after = OffsetDateTime::now_utc() + DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
-            let mut pool_meta = self.pool_meta.write().await;
-            pool_meta.defer_decommission_progress_checkpoint(idx, checkpoint, retry_after);
-            return Err(err);
-        }
+        let was_write_blocked = match snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+            .await
+        {
+            Ok(was_write_blocked) => was_write_blocked,
+            Err(err) => {
+                let retry_after = OffsetDateTime::now_utc() + DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
+                let mut pool_meta = self.pool_meta.write().await;
+                pool_meta.defer_decommission_progress_checkpoint(idx, checkpoint, retry_after);
+                return Err(err);
+            }
+        };
 
         let mut pool_meta = self.pool_meta.write().await;
-        Ok(pool_meta.commit_decommission_progress_checkpoint(idx, checkpoint))
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission progress save failed")?;
+        let committed = pool_meta.commit_decommission_progress_checkpoint(idx, checkpoint);
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission progress save failed")?;
+        drop(pool_meta);
+        save_guard.restore_writes(was_write_blocked);
+        Ok(committed)
     }
 
     async fn mark_decommission_bucket_done_and_save(&self, idx: usize, bucket: &DecomBucketInfo) -> Result<bool> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
-        let (_pool_meta_guard, mut snapshot) = self
+        let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission bucket completion save failed")
             .await?;
         let changed = {
@@ -3984,12 +4049,18 @@ impl ECStore {
             return Ok(false);
         }
 
-        resolve_decommission_bucket_done_save_result(
-            snapshot.save_no_lock_observing(self.pools.clone(), &mut save_guard).await,
-            idx,
-            bucket.name.as_str(),
-        )?;
-        self.pool_meta.write().await.mark_decommission_progress_saved();
+        let was_write_blocked = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+            .await
+            .map_err(|err| {
+                Error::other(format!("decommission metadata save failed for pool {idx} bucket {}: {err}", bucket.name))
+            })?;
+        let mut pool_meta = self.pool_meta.write().await;
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
+        pool_meta.mark_decommission_progress_saved();
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
+        drop(pool_meta);
+        save_guard.restore_writes(was_write_blocked);
         Ok(true)
     }
 
@@ -4007,7 +4078,7 @@ impl ECStore {
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
         let pool_meta_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let _pool_meta_guard = pool_meta_lock
+        let pool_meta_guard = pool_meta_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .map_err(decommission_pool_meta_lock_error)?;
@@ -4064,15 +4135,43 @@ impl ECStore {
             latest_pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
-        latest_pool_meta
-            .save_no_lock_observing(self.pools.clone(), &mut save_guard)
+        let was_write_blocked = latest_pool_meta
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
             .await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
+            ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start failed")?;
             publish_pool_meta_updates(&mut pool_meta, &latest_pool_meta, indices);
+            ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start failed")?;
         }
+        save_guard.restore_writes(was_write_blocked);
 
         Ok(previous_pool_meta)
+    }
+
+    async fn rollback_decommission_start_after_reload_failure(
+        &self,
+        movement_gate: &Arc<tokio::sync::RwLock<()>>,
+        previous_pool_meta: &PoolMeta,
+        indices: &[usize],
+    ) -> Result<()> {
+        let _movement_guard = movement_gate.write().await;
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, mut snapshot) = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "decommission start rollback failed")
+            .await?;
+        rollback_start_decommission_pool_meta(&mut snapshot, previous_pool_meta, indices);
+        let was_write_blocked = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+            .await?;
+        let mut pool_meta = self.pool_meta.write().await;
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
+        publish_pool_meta_updates(&mut pool_meta, &snapshot, indices);
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
+        drop(pool_meta);
+        save_guard.restore_writes(was_write_blocked);
+        self.ctx.advance_data_movement_operation_epoch();
+        Ok(())
     }
 
     async fn ensure_decommission_rebalance_idle_after_refresh(&self) -> Result<()> {
@@ -4153,7 +4252,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta) -> SaveFuture + Send + 'static,
+        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture + Send + 'static,
         SaveFuture: Future<Output = Result<()>> + Send + 'static,
     {
         let store = self.clone();
@@ -4173,7 +4272,7 @@ impl ECStore {
         save_pool_meta: Save,
     ) -> Result<()>
     where
-        Save: FnOnce(PoolMeta) -> SaveFuture,
+        Save: FnOnce(PoolMeta, Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> SaveFuture,
         SaveFuture: Future<Output = Result<()>>,
     {
         let owner = owner.as_ref();
@@ -4189,6 +4288,9 @@ impl ECStore {
             save_guard.ensure_write_safe("decommission cancel failed")?;
             (None, None)
         };
+        let pool_meta_fence = _pool_meta_guard
+            .as_ref()
+            .and_then(rustfs_lock::NamespaceLockGuard::lock_lost_signal);
 
         // Lock order: start gate, save gate, distributed pool metadata fence,
         // decommission_cancelers, then pool_meta. The state guards stay held
@@ -4278,7 +4380,13 @@ impl ECStore {
 
         let changed = pending.is_some();
         let commit_result = if let Some((snapshot, commit)) = pending {
-            if let Err(err) = save_pool_meta(snapshot).await {
+            if let Err(err) = save_pool_meta(snapshot, pool_meta_fence).await {
+                save_guard.block_writes();
+                return Err(err);
+            }
+            if let Some(pool_meta_guard) = _pool_meta_guard.as_ref()
+                && let Err(err) = ensure_pool_meta_write_fence(pool_meta_guard, "decommission cancel failed")
+            {
                 save_guard.block_writes();
                 return Err(err);
             }
@@ -4287,10 +4395,16 @@ impl ECStore {
             Ok(())
         };
 
+        commit_result?;
+        if let Some(pool_meta_guard) = _pool_meta_guard.as_ref()
+            && let Err(err) = ensure_pool_meta_write_fence(pool_meta_guard, "decommission cancel failed")
+        {
+            save_guard.block_writes();
+            return Err(err);
+        }
         if let Some(canceler) = terminal_canceler.as_ref() {
             take_and_cancel_decommission_canceler_for_operation(cancelers.as_mut_slice(), idx, canceler);
         }
-        commit_result?;
         drop(pool_meta);
         drop(cancelers);
         drop(_pool_meta_guard);
@@ -4428,20 +4542,47 @@ impl ECStore {
         let owner = owner.cloned();
         tokio::spawn(async move {
             store
-                .decommission_cancel_transaction(
-                    idx,
-                    owner,
-                    true,
-                    move |snapshot| async move { snapshot.save_no_lock(pools).await },
-                )
+                .decommission_cancel_transaction(idx, owner, true, move |snapshot, pool_meta_fence| async move {
+                    snapshot.save_no_lock_with_fence(pools, pool_meta_fence).await
+                })
                 .await
         })
         .await
         .map_err(|err| Error::other(format!("decommission cancel transaction task join error: {err}")))?
     }
 
+    #[cfg(test)]
+    async fn clear_decommission_with_save<Save, SaveFuture>(self: &Arc<Self>, idx: usize, save_pool_meta: Save) -> Result<()>
+    where
+        Save: FnOnce() -> SaveFuture + Send + 'static,
+        SaveFuture: Future<Output = Result<()>> + Send + 'static,
+    {
+        let store = self.clone();
+        tokio::spawn(async move { store.clear_decommission_transaction(idx, save_pool_meta).await })
+            .await
+            .map_err(|err| Error::other(format!("clear decommission transaction task join error: {err}")))?
+    }
+
     #[tracing::instrument(skip(self))]
-    pub async fn clear_decommission(&self, idx: usize) -> Result<()> {
+    pub async fn clear_decommission(self: &Arc<Self>, idx: usize) -> Result<()> {
+        let store = self.clone();
+        let save_store = store.clone();
+        // Dropping the RPC waiter detaches this task; once in-memory state can
+        // change, the transaction must persist or roll it back before ending.
+        tokio::spawn(async move {
+            store
+                .clear_decommission_transaction(idx, move || async move { save_store.save_current_pool_meta(&[idx]).await })
+                .await
+        })
+        .await
+        .map_err(|err| Error::other(format!("clear decommission transaction task join error: {err}")))?
+    }
+
+    async fn clear_decommission_transaction<Save, SaveFuture>(&self, idx: usize, save_pool_meta: Save) -> Result<()>
+    where
+        Save: FnOnce() -> SaveFuture,
+        SaveFuture: Future<Output = Result<()>>,
+    {
         ensure_decommission_terminal_operation_supported(self.single_pool(), "clear decommission")?;
         let _start_guard = self.start_gate.lock().await;
 
@@ -4472,7 +4613,7 @@ impl ECStore {
             (changed, changed.then_some(previous_pool_meta))
         };
 
-        if should_reload_pool_meta && let Err(err) = self.save_current_pool_meta(&[idx]).await {
+        if should_reload_pool_meta && let Err(err) = save_pool_meta().await {
             if let Some(previous_pool_meta) = previous_pool_meta {
                 let mut pool_meta = self.pool_meta.write().await;
                 rollback_decommission_pool_meta(&mut pool_meta, &previous_pool_meta, &[idx]);
@@ -4512,7 +4653,7 @@ impl ECStore {
             let movement_gate = self.ctx.data_movement_operation_gate();
             let _movement_guard = movement_gate.write().await;
             let mut save_guard = self.pool_meta_save_gate.lock().await;
-            let (_pool_meta_guard, mut snapshot) = self
+            let (pool_meta_guard, mut snapshot) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "decommission promotion failed")
                 .await?;
             let mut pool_meta = self.pool_meta.write().await;
@@ -4527,15 +4668,22 @@ impl ECStore {
             }
             drop(pool_meta);
 
-            let save_error = if changed {
-                snapshot
-                    .save_no_lock_observing(self.pools.clone(), &mut save_guard)
+            let (was_write_blocked, save_error) = if changed {
+                match snapshot
+                    .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
                     .await
-                    .err()
+                {
+                    Ok(was_write_blocked) => (Some(was_write_blocked), None),
+                    Err(err) => (None, Some(err)),
+                }
             } else {
-                None
+                (None, None)
             };
             let generation = self.active_decommission_generation(idx).await?;
+            ensure_pool_meta_write_fence(&pool_meta_guard, "decommission promotion failed")?;
+            if let Some(was_write_blocked) = was_write_blocked {
+                save_guard.restore_writes(was_write_blocked);
+            }
             (changed, generation, save_error)
         };
 
@@ -5255,7 +5403,7 @@ impl ECStore {
                 let mut capacity_failure = false;
                 for _ in 0..3 {
                     match classify_decommission_free_version_attempt(
-                        run_decommission_side_effect(&rx, &operation_gate, || async {
+                        self.run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                             self.decommission_tiered_object(
                                 bucket.as_str(),
                                 &version.name,
@@ -6946,19 +7094,9 @@ impl ECStore {
                 "Decommission start failed after pool metadata save"
             );
 
-            let rollback_result = {
-                let movement_guard = movement_gate.write().await;
-                {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    rollback_start_decommission_pool_meta(&mut pool_meta, &previous_pool_meta, &indices);
-                }
-                let rollback_result = self.save_current_pool_meta(&indices).await;
-                if rollback_result.is_ok() {
-                    self.ctx.advance_data_movement_operation_epoch();
-                }
-                drop(movement_guard);
-                rollback_result
-            };
+            let rollback_result = self
+                .rollback_decommission_start_after_reload_failure(&movement_gate, &previous_pool_meta, &indices)
+                .await;
             if let Err(rollback_save_err) = rollback_result {
                 error!(
                     event = EVENT_DECOMMISSION_STATE,
@@ -9551,30 +9689,29 @@ mod pools_tests {
         ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index, guard_decommission_cancelers,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
+        ensure_local_decommission_pool_leaders, ensure_pool_meta_write_fence, ensure_valid_decommission_pool_index, get_by_index,
+        guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
         merge_decommission_durable_ilm_receipts, merge_pool_meta_updates_for_save, merge_pool_status_refresh,
         missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
         publish_pool_meta_updates, reconcile_decommission_meta_buckets, require_decommission_store,
-        reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result,
-        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
-        resolve_start_decommission_pool_meta_reload_result, resumable_decommission_queue_indices,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
-        run_decommission_listing_with_retry_and_drain, run_decommission_phases, run_decommission_side_effect,
-        should_cleanup_decommission_source_entry, should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_fail_decommission_pool_after_exhausted_source_changed, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
-        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
-        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
-        validate_start_decommission_request, wait_decommission_retry_backoff, wait_decommission_worker_drain,
-        with_decommission_entry_context,
+        reserve_decommission_start_cancelers, resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
+        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
+        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
+        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_phases,
+        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed,
+        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
+        should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
+        spawn_decommission_index_cancelers, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, track_decommission_current_object, track_decommission_current_object_stage,
+        update_decommission_for_operation, validate_start_decommission_request, wait_decommission_retry_backoff,
+        wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -9592,6 +9729,7 @@ mod pools_tests {
     use crate::store::ECStore;
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
+    use rustfs_lock::{GlobalLockManager, LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use rustfs_rio::Index;
     use std::sync::{
         Arc, Mutex as StdMutex,
@@ -9627,6 +9765,8 @@ mod pools_tests {
     #[derive(Debug)]
     struct PartialPoolMetaWriteStorage {
         fail_write: bool,
+        pending_write: bool,
+        write_started: tokio::sync::Notify,
         wrote: AtomicBool,
     }
 
@@ -9658,6 +9798,10 @@ mod pools_tests {
             _data: &mut Self::PutObjectReader,
             _opts: &Self::ObjectOptions,
         ) -> std::result::Result<Self::ObjectInfo, Error> {
+            self.write_started.notify_one();
+            if self.pending_write {
+                std::future::pending().await
+            }
             if self.fail_write {
                 return Err(Error::Timeout);
             }
@@ -9671,10 +9815,14 @@ mod pools_tests {
         let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
         let committed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
         });
         let failed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: true,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
         });
         let snapshot = PoolMeta {
@@ -9704,6 +9852,274 @@ mod pools_tests {
 
         assert!(result.is_err(), "a partial pool metadata save must latch the sticky safety gate");
         assert!(!ran.load(Ordering::SeqCst), "the side effect must not run after a partial save");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_pool_meta_save_blocks_following_side_effect() {
+        let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
+        let committed = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+        });
+        let pending = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            pending_write: true,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+        });
+        let snapshot = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        };
+        let save_store = store.clone();
+        let save_committed = committed.clone();
+        let save_pending = pending.clone();
+        let save_task = tokio::spawn(async move {
+            let mut save_guard = save_store.pool_meta_save_gate.lock().await;
+            snapshot
+                .save_no_lock_observing(vec![save_committed, save_pending], &mut save_guard)
+                .await
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), pending.write_started.notified())
+            .await
+            .expect("the second replica write should start");
+        assert!(committed.wrote.load(Ordering::SeqCst));
+        save_task.abort();
+        assert!(
+            save_task.await.expect_err("the save task should be cancelled").is_cancelled(),
+            "the pending replica write should be aborted"
+        );
+
+        {
+            let save_guard = store.pool_meta_save_gate.lock().await;
+            save_guard
+                .ensure_write_safe("cancelled pool metadata save")
+                .expect_err("a cancelled replica update must latch the sticky safety gate");
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_by_operation = ran.clone();
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let result: std::result::Result<(), Error> = store
+            .run_guarded_decommission_side_effect(&CancellationToken::new(), &movement_gate, move || async move {
+                ran_by_operation.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_err(), "a cancelled pool metadata save must block following side effects");
+        assert!(!ran.load(Ordering::SeqCst), "the side effect must not run after a cancelled save");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_pool_meta_publish_keeps_write_gate_blocked() {
+        let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
+        let committed = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+        });
+        let snapshot = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        };
+        let publish_started = Arc::new(tokio::sync::Notify::new());
+        let publish_release = Arc::new(tokio::sync::Notify::new());
+        let save_store = store.clone();
+        let save_committed = committed.clone();
+        let task_publish_started = publish_started.clone();
+        let task_publish_release = publish_release.clone();
+        let save_task = tokio::spawn(async move {
+            let mut save_guard = save_store.pool_meta_save_gate.lock().await;
+            let was_write_blocked = snapshot
+                .save_no_lock_armed(vec![save_committed], &mut save_guard, None)
+                .await?;
+            task_publish_started.notify_one();
+            task_publish_release.notified().await;
+            save_guard.restore_writes(was_write_blocked);
+            Ok::<(), Error>(())
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), publish_started.notified())
+            .await
+            .expect("the replica save should complete before publication");
+        assert!(committed.wrote.load(Ordering::SeqCst));
+        save_task.abort();
+        assert!(
+            save_task
+                .await
+                .expect_err("the publication task should be cancelled")
+                .is_cancelled(),
+            "the task should be aborted while publication is pending"
+        );
+
+        let save_guard = store.pool_meta_save_gate.lock().await;
+        save_guard
+            .ensure_write_safe("cancelled pool metadata publication")
+            .expect_err("cancellation after replica save but before publication must keep writes blocked");
+    }
+
+    #[tokio::test]
+    async fn test_lost_pool_meta_fence_rejects_replica_write() {
+        let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let lock = NamespaceLock::with_clients_and_quorum("pool-meta-fence-loss".to_string(), vec![client], 1);
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, super::POOL_META_NAME),
+            LockType::Exclusive,
+            "stale-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1))
+        .with_ttl(StdDuration::from_millis(50))
+        .with_refresh_interval(StdDuration::from_millis(50));
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("pool metadata fence acquisition should not error")
+            .expect("the stale writer should acquire the pool metadata fence");
+        tokio::time::timeout(StdDuration::from_secs(2), guard.lock_lost_notified())
+            .await
+            .expect("the stale writer lease should expire");
+
+        let storage = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+        });
+        let snapshot = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        };
+        let mut write_state = super::PoolMetaWriteState::default();
+        let err = snapshot
+            .save_no_lock_armed(vec![storage.clone()], &mut write_state, guard.lock_lost_signal())
+            .await
+            .expect_err("a writer must not persist after losing the distributed pool metadata fence");
+
+        assert!(err.to_string().contains("distributed fence was lost"));
+        assert!(!storage.wrote.load(Ordering::SeqCst), "the stale writer must not reach replica storage");
+        write_state
+            .ensure_write_safe("lost pool metadata fence")
+            .expect_err("a lost distributed fence must latch the sticky write gate");
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_fence_loss_after_publish_keeps_write_gate_blocked() {
+        let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let lock = NamespaceLock::with_clients_and_quorum("pool-meta-publish-fence-loss".to_string(), vec![client], 1);
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, super::POOL_META_NAME),
+            LockType::Exclusive,
+            "publishing-writer",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1))
+        .with_ttl(StdDuration::from_secs(1))
+        .with_refresh_interval(StdDuration::from_secs(1));
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("pool metadata fence acquisition should not error")
+            .expect("the publishing writer should acquire the pool metadata fence");
+        let storage = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+        });
+        let mut saved = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        };
+        saved.pools[0].last_update = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let mut current = saved.clone();
+        current.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
+        let mut write_state = super::PoolMetaWriteState::default();
+        let was_write_blocked = saved
+            .save_no_lock_armed(vec![storage], &mut write_state, guard.lock_lost_signal())
+            .await
+            .expect("the replica save should finish while the fence is valid");
+
+        ensure_pool_meta_write_fence(&guard, "test pool metadata publish")
+            .expect("the fence should remain valid before publication");
+        publish_pool_meta_updates(&mut current, &saved, &[0]);
+        tokio::time::timeout(StdDuration::from_secs(2), guard.lock_lost_notified())
+            .await
+            .expect("the fence should expire after publication");
+        ensure_pool_meta_write_fence(&guard, "test pool metadata publish")
+            .expect_err("the post-publication fence check must observe the loss");
+
+        assert_eq!(current.pools[0].last_update, saved.pools[0].last_update);
+        assert!(!was_write_blocked);
+        write_state
+            .ensure_write_safe("lost pool metadata publish fence")
+            .expect_err("the sticky write gate must remain armed after post-publication fence loss");
+    }
+
+    #[tokio::test]
+    async fn test_clear_decommission_transaction_survives_caller_abort() {
+        let pool_meta = PoolMeta {
+            version: super::POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+        let store = decommission_worker_test_store(pool_meta, vec![None]);
+        let save_started = Arc::new(tokio::sync::Notify::new());
+        let save_release = Arc::new(tokio::sync::Notify::new());
+        let save_completed = Arc::new(AtomicBool::new(false));
+        let caller_store = store.clone();
+        let caller_save_started = save_started.clone();
+        let caller_save_release = save_release.clone();
+        let caller_save_completed = save_completed.clone();
+        let caller_task = tokio::spawn(async move {
+            caller_store
+                .clear_decommission_with_save(0, move || async move {
+                    caller_save_started.notify_one();
+                    caller_save_release.notified().await;
+                    caller_save_completed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+
+        tokio::time::timeout(StdDuration::from_secs(1), save_started.notified())
+            .await
+            .expect("the clear transaction should reach persistence");
+        caller_task.abort();
+        assert!(
+            caller_task
+                .await
+                .expect_err("the RPC waiter should be cancelled")
+                .is_cancelled(),
+            "the clear caller should be aborted while persistence is pending"
+        );
+        save_release.notify_one();
+
+        let _start_guard = tokio::time::timeout(StdDuration::from_secs(1), store.start_gate.lock())
+            .await
+            .expect("the detached clear transaction should finish");
+        assert!(
+            save_completed.load(Ordering::SeqCst),
+            "the detached transaction must finish persistence after the caller is aborted"
+        );
+        let pool_meta = store.pool_meta.read().await;
+        assert!(
+            pool_meta.pools[0].decommission.is_none(),
+            "the detached transaction should publish the persisted clear"
+        );
     }
 
     fn decommission_test_pool_endpoint(idx: usize, is_local: bool) -> PoolEndpoints {
@@ -10734,10 +11150,13 @@ mod pools_tests {
             ..Default::default()
         };
         let mut active = previous.clone();
+        let active_update = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        active.pools[0].last_update = active_update;
         active.pools[0].decommission = Some(PoolDecommissionInfo {
             start_time: Some(OffsetDateTime::UNIX_EPOCH),
             ..Default::default()
         });
+        let mut peer = active.clone();
 
         assert!(active.is_suspended(0));
         assert_eq!(
@@ -10749,6 +11168,9 @@ mod pools_tests {
 
         assert!(!active.is_suspended(0));
         assert_eq!(decommission_start_pool_state(active.pools.first()), DecommissionStartPoolState::Active);
+        assert!(active.pools[0].last_update > active_update);
+        assert!(merge_pool_status_refresh(&mut peer, active, &[false]));
+        assert!(peer.pools[0].decommission.is_none());
     }
 
     #[test]
@@ -11065,21 +11487,6 @@ mod pools_tests {
         assert!(
             err.to_string()
                 .contains("decommission preflight heal failed for bucket bucket-a")
-        );
-    }
-
-    #[test]
-    fn test_resolve_decommission_bucket_done_save_result_passthrough_ok() {
-        assert!(resolve_decommission_bucket_done_save_result(Ok(()), 1, "bucket-a").is_ok());
-    }
-
-    #[test]
-    fn test_resolve_decommission_bucket_done_save_result_wraps_error_context() {
-        let err = resolve_decommission_bucket_done_save_result(Err(Error::SlowDown), 2, "bucket-a")
-            .expect_err("metadata save failure should carry pool/bucket context");
-        assert!(
-            err.to_string()
-                .contains("decommission metadata save failed for pool 2 bucket bucket-a")
         );
     }
 
@@ -13587,7 +13994,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
 
         let err = store
-            .decommission_cancel_with_owner_and_save(0, Some(&canceler), |_| async { Err(Error::Timeout) })
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), |_, _| async { Err(Error::Timeout) })
             .await
             .expect_err("injected pool metadata timeout should fail cancel");
         assert!(matches!(err, Error::Timeout));
@@ -13616,7 +14023,7 @@ mod pools_tests {
         let retry_save_called = Arc::new(AtomicBool::new(false));
         let retry_save_called_by_closure = retry_save_called.clone();
         let retry_err = store
-            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_| async move {
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_, _| async move {
                 retry_save_called_by_closure.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -13673,7 +14080,7 @@ mod pools_tests {
         let save_called_by_closure = save_called.clone();
 
         let err = store
-            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_| async move {
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_, _| async move {
                 save_called_by_closure.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -13729,7 +14136,7 @@ mod pools_tests {
             let save_release = save_release.clone();
             async move {
                 store
-                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot, _| async move {
                         persisted_tx
                             .send(snapshot.encode_config_data()?)
                             .map_err(|_| Error::other("failed to expose saved cancel snapshot"))?;
@@ -13807,7 +14214,7 @@ mod pools_tests {
             let save_release = save_release.clone();
             async move {
                 store
-                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot, _| async move {
                         assert!(
                             snapshot.pools[0]
                                 .decommission
@@ -13911,7 +14318,7 @@ mod pools_tests {
             let save_entered = save_entered.clone();
             async move {
                 store
-                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_| async move {
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_, _| async move {
                         save_entered.store(true, Ordering::SeqCst);
                         save_started.notify_one();
                         save_release.notified().await;
@@ -14051,7 +14458,7 @@ mod pools_tests {
         let queued_replacement_for_save = queued_replacement.clone();
 
         store
-            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot| async move {
+            .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot, _| async move {
                 let saved_cancel = snapshot.pools[0]
                     .decommission
                     .as_ref()
