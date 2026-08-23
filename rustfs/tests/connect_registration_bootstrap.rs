@@ -456,7 +456,11 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
         .await
         .expect_err("malformed token must fail");
     assert!(matches!(error, RegistrationBootstrapError::Token(_)));
-    assert!(!malformed_state.exists());
+    assert_eq!(
+        fs::read(malformed_state.join(".bootstrap-ready")).expect("read durable state marker"),
+        b"v1\n"
+    );
+    assert_no_staging_files(&malformed_state);
 
     let expired = temp.path().join("expired-token.json");
     write_file(&expired, &token_document(OffsetDateTime::now_utc().unix_timestamp() - 1), 0o600);

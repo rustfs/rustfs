@@ -236,13 +236,14 @@ fn ready_marker_exists(path: &Path) -> Result<bool, RegistrationBootstrapError> 
 
 #[cfg(unix)]
 fn publish_ready_marker(state_directory: &Path, ready: &Path) -> Result<(), RegistrationBootstrapError> {
-    publish_ready_marker_with_existing_observer(state_directory, ready, || {})
+    publish_ready_marker_with_existing_observer(state_directory, ready, File::sync_all, || {})
 }
 
 #[cfg(unix)]
 fn publish_ready_marker_with_existing_observer(
     state_directory: &Path,
     ready: &Path,
+    mut sync_staging: impl FnMut(&File) -> io::Result<()>,
     mut existing_observer: impl FnMut(),
 ) -> Result<(), RegistrationBootstrapError> {
     let (staging_path, mut staging) = loop {
@@ -266,7 +267,7 @@ fn publish_ready_marker_with_existing_observer(
         staging.write_all(BOOTSTRAP_READY_CONTENTS)?;
         use std::os::unix::fs::PermissionsExt as _;
         staging.set_permissions(fs::Permissions::from_mode(0o600))?;
-        staging.sync_all()
+        sync_staging(&staging)
     })();
     drop(staging);
     if let Err(error) = staged {
@@ -420,7 +421,7 @@ fn unix_ca_file_is_trusted(owner_uid: u32, mode: u32, process_uid: u32) -> bool 
 #[cfg(all(test, unix))]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::fs;
+    use std::fs::{self, File};
     use std::io;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::Path;
@@ -737,7 +738,7 @@ mod tests {
         fs::write(&ready, BOOTSTRAP_READY_CONTENTS).expect("write existing ready marker");
         fs::set_permissions(&ready, fs::Permissions::from_mode(0o600)).expect("secure existing ready marker");
 
-        let error = publish_ready_marker_with_existing_observer(&state, &ready, || {
+        let error = publish_ready_marker_with_existing_observer(&state, &ready, File::sync_all, || {
             fs::remove_file(&ready).expect("remove marker after no-replace conflict");
         })
         .expect_err("a marker removed before validation must fail closed");
@@ -754,6 +755,36 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
             "failed publication must not leave staging files"
         );
+    }
+
+    #[test]
+    fn staging_sync_failure_does_not_publish_ready_marker_and_can_retry() {
+        let temp = secure_tempdir();
+        let state = temp.path().join("state");
+        create_secure_state_tree(&state);
+        let ready = state.join(BOOTSTRAP_READY_FILE);
+
+        let error = publish_ready_marker_with_existing_observer(
+            &state,
+            &ready,
+            |_| Err(io::Error::other("injected staging sync failure")),
+            || {},
+        )
+        .expect_err("staging sync failure must stop publication");
+
+        assert!(matches!(error, RegistrationBootstrapError::Input(ref source) if source.kind() == io::ErrorKind::Other));
+        assert!(!ready.exists(), "staging sync failure must not publish the marker");
+        assert!(
+            fs::read_dir(&state)
+                .expect("read state directory")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "staging sync failure must not leave staging files"
+        );
+
+        publish_ready_marker_with_existing_observer(&state, &ready, File::sync_all, || {})
+            .expect("retry should publish a durable marker");
+        assert!(ready_marker_exists(&ready).expect("validate retried ready marker"));
     }
 
     #[test]
