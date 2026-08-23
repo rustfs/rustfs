@@ -483,7 +483,6 @@ impl DataUsageCache {
             let path_clone = path.clone();
             let buf_clone = buf.to_vec();
             let revision = revision.clone();
-            let expected_epoch = expected_epoch;
             async move {
                 let publication_admission = match expected_epoch {
                     Some(expected_epoch) => scanner_publication_admission_for_epoch(store_clone.clone(), expected_epoch).await,
@@ -553,6 +552,7 @@ impl DataUsageCache {
         self.save_inner(store, name, None, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn save_with_revisions<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,

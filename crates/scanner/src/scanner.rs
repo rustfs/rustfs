@@ -18,10 +18,7 @@ use std::future::Future;
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use self::heal_info::{
-    BackgroundHealInfoReadStatus, classify_background_heal_read_error, decode_background_heal_info,
-    read_background_heal_info_with_epoch, save_background_heal_info_for_epoch,
-};
+use self::heal_info::{BackgroundHealInfoReadStatus, read_background_heal_info_with_epoch, save_background_heal_info_for_epoch};
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
     DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
@@ -405,6 +402,7 @@ fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
         .is_some_and(|cycle| cycle % DATA_USAGE_BACKUP_INTERVAL_CYCLES == 0)
 }
 
+#[cfg(test)]
 async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -1509,9 +1507,11 @@ async fn run_data_scanner_cycle_with_budget(
                 cycle_info,
                 cycle_revision,
                 leader_epoch,
-                required_cycle,
                 &mut cycle_metrics_guard,
-                publication_epoch,
+                ScannerCycleFloorOptions {
+                    required_cycle,
+                    expected_publication_epoch: publication_epoch,
+                },
             )
             .await;
             return if persisted {

@@ -669,6 +669,7 @@ pub struct ScannerDataUsagePublicationAdmission {
 }
 
 impl ScannerDataUsagePublicationAdmission {
+    #[cfg(test)]
     pub(crate) fn unfenced() -> Self {
         Self {
             epoch: 0,

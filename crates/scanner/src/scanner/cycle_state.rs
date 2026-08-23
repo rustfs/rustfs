@@ -1390,6 +1390,13 @@ pub(super) fn apply_persisted_usage_floor(cycle_info: &mut CurrentCycle, leader_
     *leader_epoch = (*leader_epoch).max(floor.leader_epoch);
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ScannerCycleFloorOptions {
+    pub(super) required_cycle: u64,
+    pub(super) expected_publication_epoch: Option<u64>,
+}
+
+#[cfg(test)]
 pub(super) async fn persist_scanner_cycle_state(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -1657,6 +1664,7 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
     false
 }
 
+#[cfg(test)]
 pub(super) async fn finalize_partial_scan_cycle(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -1719,6 +1727,7 @@ pub(super) async fn finalize_partial_scan_cycle_for_epoch(
     persisted
 }
 
+#[cfg(test)]
 pub(super) async fn persist_required_scanner_cycle_floor(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -1734,9 +1743,11 @@ pub(super) async fn persist_required_scanner_cycle_floor(
         cycle_info,
         revision,
         leader_epoch,
-        required_cycle,
         cycle_metrics_guard,
-        None,
+        ScannerCycleFloorOptions {
+            required_cycle,
+            expected_publication_epoch: None,
+        },
     )
     .await
 }
@@ -1747,18 +1758,17 @@ pub(super) async fn persist_required_scanner_cycle_floor_for_epoch(
     cycle_info: &mut CurrentCycle,
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
-    required_cycle: u64,
     cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
-    expected_publication_epoch: Option<u64>,
+    options: ScannerCycleFloorOptions,
 ) -> bool {
-    if required_cycle <= cycle_info.current || required_cycle == u64::MAX {
+    if options.required_cycle <= cycle_info.current || options.required_cycle == u64::MAX {
         error!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             current_cycle = cycle_info.current,
-            required_cycle,
+            required_cycle = options.required_cycle,
             state = "invalid_cache_cycle_floor",
             "Scanner cache cycle floor is invalid"
         );
@@ -1767,7 +1777,7 @@ pub(super) async fn persist_required_scanner_cycle_floor_for_epoch(
     }
 
     let previous_cycle_info = cycle_info.clone();
-    cycle_info.next = cycle_info.next.max(required_cycle);
+    cycle_info.next = cycle_info.next.max(options.required_cycle);
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
     let persisted = persist_scanner_cycle_state_for_epoch(
@@ -1776,11 +1786,11 @@ pub(super) async fn persist_required_scanner_cycle_floor_for_epoch(
         cycle_info,
         revision,
         leader_epoch,
-        expected_publication_epoch,
+        options.expected_publication_epoch,
     )
     .await;
     if !persisted
-        && let Some(expected_epoch) = expected_publication_epoch
+        && let Some(expected_epoch) = options.expected_publication_epoch
         && scanner_publication_admission_for_epoch(storeapi, expected_epoch)
             .await
             .is_none()

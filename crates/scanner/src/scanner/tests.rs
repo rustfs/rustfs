@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
 use crate::{
@@ -1927,9 +1928,8 @@ fn scanner_baseline_identity_requires_complete_or_strict_legacy_shape() {
     legacy.scanner_cycle = Some(7);
     assert!(data_usage_info_has_persisted_baseline_identity(&legacy));
 
-    let mut incomplete = legacy.clone();
-    incomplete.scanner_epoch = Some(3);
-    assert!(!data_usage_info_has_persisted_baseline_identity(&incomplete));
+    legacy.scanner_epoch = Some(3);
+    assert!(!data_usage_info_has_persisted_baseline_identity(&legacy));
 }
 
 #[test]
