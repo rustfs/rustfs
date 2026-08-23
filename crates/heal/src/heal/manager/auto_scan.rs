@@ -506,7 +506,18 @@ impl HealManager {
                                     &displaced_terminal,
                                 )
                                 .await;
-                                lock_mrf_repair_notice_targets(&mrf_repair_notice_targets).remove(&displaced_task_id);
+                                if let Some(targets) = lock_mrf_repair_notice_targets(&mrf_repair_notice_targets).remove(&displaced_task_id) {
+                                    for target in targets {
+                                        rustfs_common::mrf_channel::release_mrf_identity(
+                                            target.kind,
+                                            &target.bucket,
+                                            &target.object,
+                                            target.version_id,
+                                            target.scope,
+                                            target.lease,
+                                        );
+                                    }
+                                }
                             }
                             if matches!(admission, HealAdmissionResult::Accepted) {
                                 if should_notify {

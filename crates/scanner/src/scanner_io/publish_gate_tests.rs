@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
+use crate::data_usage_define::{UNKNOWN_TIER, UnknownTierStats, hash_path};
+use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage, TierAccountingProof};
 
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32]);
 
@@ -89,6 +90,11 @@ fn completed_root_cache(bucket: &str, objects: usize, update_secs: u64, source: 
         DataUsageEntry {
             objects,
             size: objects.saturating_mul(10),
+            tier_accounting_proof: Some(TierAccountingProof {
+                logical_total: u64::try_from(objects.saturating_mul(10)).unwrap_or(u64::MAX),
+                logical_known: u64::try_from(objects.saturating_mul(10)).unwrap_or(u64::MAX),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     );
@@ -102,7 +108,162 @@ fn completed_data_usage_info_for_test(
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let expected_sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
-    completed_data_usage_info(results, &expected_sources, all_buckets, true, budget_elapsed, cancelled)
+    completed_data_usage_info(results, &expected_sources, all_buckets, &[], true, budget_elapsed, cancelled)
+}
+
+fn lkg_root_cache(bucket: &str, objects: usize, source: DataUsageCacheSource) -> DataUsageCache {
+    let mut cache = completed_root_cache(bucket, objects, 10, source);
+    cache.info.snapshot_complete = false;
+    cache.info.next_cycle = 8;
+    cache.info.leader_epoch = 3;
+    cache.info.lkg_snapshot_complete = true;
+    cache.info.lkg_next_cycle = Some(7);
+    cache.info.lkg_last_update = cache.info.last_update;
+    cache.info.lkg_leader_epoch = Some(3);
+    cache.info.lkg_scan_plan_digest = Some(TEST_PLAN_DIGEST);
+    cache
+}
+
+#[test]
+fn partial_usage_is_observational_not_authoritative_for_quota() {
+    let all_buckets = vec!["bucket".to_string()];
+    let current_source = DataUsageCacheSource::new(0, 0);
+    let stalled_source = DataUsageCacheSource::new(1, 0);
+    let mut current = completed_root_cache("bucket", 2, 20, current_source);
+    current.info.next_cycle = 8;
+    current.info.leader_epoch = 3;
+    let stalled = lkg_root_cache("bucket", 1, stalled_source);
+    let expected = HashSet::from([current_source, stalled_source]);
+
+    assert!(
+        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false)
+            .is_none()
+    );
+    let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("a completed set should produce an observational view");
+    assert!(observed.usage_snapshot_partial);
+    assert!(!observed.usage_snapshot_complete);
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
+    assert_eq!(observed.usage_snapshot_set_states.len(), 2);
+}
+
+#[test]
+fn lkg_scope_does_not_count_as_current_cycle_completion() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut lkg = lkg_root_cache("bucket", 1, source);
+    lkg.info.last_update = None;
+    let expected = HashSet::from([source]);
+    assert!(!scanner_results_form_complete_snapshot(&[lkg], &expected));
+}
+
+#[test]
+fn stale_quota_uses_complete_baseline_plus_positive_deltas() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut current = completed_root_cache("bucket", 3, 20, source);
+    current.info.next_cycle = 8;
+    current.info.leader_epoch = 3;
+    let expected = HashSet::from([source]);
+    let (observed, _) = observational_data_usage_info(&[current], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("complete set data is a valid observational baseline");
+    assert_eq!(observed.objects_total_size, 30);
+    assert_eq!(observed.usage_snapshot_set_states[0].complete, true);
+}
+
+#[test]
+fn negative_delta_waits_for_set_reconciliation() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut stalled = lkg_root_cache("bucket", 4, source);
+    stalled.info.lkg_scan_plan_digest = Some(DataUsageScanPlanDigest([9; 32]));
+    let expected = HashSet::from([source]);
+    assert!(observational_data_usage_info(&[stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3).is_none());
+}
+
+#[test]
+fn set_membership_add_remove_uses_generation_and_tombstone() {
+    let state = DataUsageSnapshotSetState {
+        pool_index: 1,
+        set_index: 2,
+        scanner_cycle: Some(9),
+        scanner_epoch: Some(4),
+        scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
+        complete: false,
+        tombstone: true,
+    };
+    let encoded = serde_json::to_vec(&state).expect("set state should serialize");
+    let decoded: DataUsageSnapshotSetState = serde_json::from_slice(&encoded).expect("set state should deserialize");
+    assert_eq!(decoded, state);
+
+    let snapshot = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+        scanner_cycle: Some(9),
+        scanner_epoch: Some(4),
+        buckets_count: 0,
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_partial: true,
+        usage_snapshot_set_states: vec![
+            DataUsageSnapshotSetState {
+                pool_index: 0,
+                set_index: 0,
+                scanner_cycle: Some(9),
+                scanner_epoch: Some(4),
+                scan_plan_digest: Some(TEST_PLAN_DIGEST.0),
+                complete: true,
+                tombstone: false,
+            },
+            state,
+        ],
+        ..Default::default()
+    };
+    assert!(snapshot.is_valid_partial_snapshot());
+}
+
+#[test]
+fn old_set_completion_cannot_overwrite_new_aggregate() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut old = completed_root_cache("bucket", 1, 20, source);
+    old.info.next_cycle = 7;
+    old.info.leader_epoch = 2;
+    let expected = HashSet::from([source]);
+    assert!(observational_data_usage_info(&[old], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3).is_none());
+}
+
+#[test]
+fn usage_aggregate_survives_restart_and_leader_failover() {
+    let all_buckets = vec!["bucket".to_string()];
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut lkg = lkg_root_cache("bucket", 5, source);
+    lkg.info.lkg_leader_epoch = Some(4);
+    lkg.info.lkg_next_cycle = Some(9);
+    let expected = HashSet::from([source]);
+    let (observed, _) = observational_data_usage_info(&[lkg], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 10, 5)
+        .expect("compatible LKG should survive a leader change");
+    assert_eq!(observed.usage_snapshot_set_states[0].scanner_epoch, Some(4));
+    assert_eq!(observed.objects_total_size, 50);
+}
+
+#[test]
+fn usage_aggregate_cost_is_linear_in_set_count() {
+    let all_buckets = vec!["bucket".to_string()];
+    let mut results = Vec::new();
+    let mut expected = HashSet::new();
+    for index in 0..32 {
+        let source = DataUsageCacheSource::new(index, 0);
+        expected.insert(source);
+        let mut cache = completed_root_cache("bucket", 1, 20, source);
+        cache.info.next_cycle = 8;
+        cache.info.leader_epoch = 3;
+        results.push(cache);
+    }
+    let (observed, _) = observational_data_usage_info(&results, &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("all set snapshots should aggregate");
+    assert_eq!(observed.objects_total_count, 32);
+    let reversed = results.iter().rev().cloned().collect::<Vec<_>>();
+    let (reversed_observed, _) = observational_data_usage_info(&reversed, &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
+        .expect("reordered set snapshots should aggregate");
+    assert_eq!(observed.usage_snapshot_set_states, reversed_observed.usage_snapshot_set_states);
 }
 
 #[test]
@@ -122,11 +283,21 @@ fn completed_data_usage_info_publishes_tier_stats_across_sets() {
     let mut first_set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
     let mut tiered = DataUsageEntry::default();
     tiered.add_tier_sizes(&warm(100, 2, 1));
+    tiered.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 100,
+        physical_known: 100,
+        ..Default::default()
+    });
     first_set.replace("bucket-b", DATA_USAGE_ROOT, tiered);
 
     let mut second_set = completed_root_cache("bucket-b", 2, 20, DataUsageCacheSource::new(1, 0));
     let mut tiered = DataUsageEntry::default();
     tiered.add_tier_sizes(&warm(50, 1, 1));
+    tiered.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 50,
+        physical_known: 50,
+        ..Default::default()
+    });
     second_set.replace("bucket-a", DATA_USAGE_ROOT, tiered);
 
     let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
@@ -146,6 +317,269 @@ fn completed_data_usage_info_publishes_tier_stats_across_sets() {
 }
 
 #[test]
+fn completed_data_usage_info_rejects_logical_proof_mismatch() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_tier_sizes(&HashMap::from([(
+        "WARM".to_string(),
+        TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 10,
+        logical_known: 9,
+        physical_total: 10,
+        physical_known: 10,
+        ..Default::default()
+    });
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_logical_total_size_mismatch() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.size = 11;
+    entry.add_tier_sizes(&HashMap::from([(
+        "WARM".to_string(),
+        TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 10,
+        logical_known: 10,
+        physical_total: 10,
+        physical_known: 10,
+        ..Default::default()
+    });
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_physical_proof_mismatch() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_tier_sizes(&HashMap::from([(
+        "WARM".to_string(),
+        TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 10,
+        logical_known: 10,
+        physical_total: 9,
+        physical_known: 9,
+        ..Default::default()
+    });
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_unknown_physical_double_accounting() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_tier_sizes(&HashMap::from([(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_physical_bytes: 9,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 10,
+        logical_known: 10,
+        physical_total: 10,
+        physical_known: 10,
+        ..Default::default()
+    });
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_unknown_counter_overflow() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        counter_overflowed: true,
+        ..Default::default()
+    });
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_accepts_no_tier_standard_empty_map_with_proof() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+
+    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false, false)
+        .expect("no-tier STANDARD/RRS usage does not require a tier map");
+    assert!(info.tier_stats.is_none());
+}
+
+#[test]
+fn completed_data_usage_info_accepts_no_tier_unknown_and_standard_shape() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.size = 13;
+    entry.add_tier_sizes(&HashMap::from([(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 3,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 9,
+        unknown_physical_bytes: 3,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 13,
+        logical_known: 4,
+        physical_total: 7,
+        physical_known: 4,
+        ..Default::default()
+    });
+
+    let (info, _) = completed_data_usage_info_for_test(&[set], &all_buckets, false, false)
+        .expect("no-tier STANDARD plus UNKNOWN should remain publishable");
+    assert_eq!(
+        info.tier_stats.expect("unknown bucket should be retained").tiers[UNKNOWN_TIER].total_size,
+        3
+    );
+}
+
+#[test]
+fn completed_data_usage_info_accepts_unknown_only_with_current_registry_generation() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    set.info.tier_registry_generation = Some(7);
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.size = 13;
+    entry.add_tier_sizes(&HashMap::from([(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 3,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 9,
+        unknown_physical_bytes: 3,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 13,
+        logical_known: 4,
+        physical_total: 7,
+        physical_known: 4,
+        ..Default::default()
+    });
+
+    let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
+    assert!(
+        completed_data_usage_info(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_some()
+    );
+}
+
+#[test]
+fn completed_data_usage_info_rejects_non_registry_tier_in_current_generation() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    set.info.tier_registry_generation = Some(7);
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_tier_sizes(&HashMap::from([
+        (
+            "WARM".to_string(),
+            TierStats {
+                total_size: 4,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        ),
+        (
+            "RETIRED".to_string(),
+            TierStats {
+                total_size: 6,
+                num_versions: 1,
+                num_objects: 1,
+            },
+        ),
+    ]));
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        logical_total: 10,
+        logical_known: 10,
+        physical_total: 10,
+        physical_known: 10,
+        ..Default::default()
+    });
+
+    let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
+    assert!(
+        completed_data_usage_info(&[set], &expected_sources, &all_buckets, &["WARM".to_string()], true, false, false,).is_none()
+    );
+}
+
+#[test]
+fn completed_data_usage_info_rejects_legacy_proof_missing_when_tier_accounted() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.add_tier_sizes(&HashMap::from([(
+        "WARM".to_string(),
+        TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    )]));
+    entry.tier_accounting_proof = None;
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_legacy_proof_missing_for_scalar_usage() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let mut set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let entry = set.cache.get_mut(&hash_path("bucket-a").key()).expect("bucket entry");
+    entry.tier_accounting_proof = None;
+
+    assert!(completed_data_usage_info_for_test(&[set], &all_buckets, false, false).is_none());
+}
+
+#[test]
 fn completed_data_usage_info_omits_tier_stats_without_tiered_objects() {
     let all_buckets = vec!["bucket-a".to_string()];
     let set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
@@ -154,6 +588,51 @@ fn completed_data_usage_info_omits_tier_stats_without_tiered_objects() {
         completed_data_usage_info_for_test(&[set], &all_buckets, false, false).expect("completed set should publish a snapshot");
 
     assert!(data_usage_info.tier_stats.is_none());
+}
+
+#[test]
+fn completed_data_usage_info_rejects_legacy_and_new_tier_generations_mixed() {
+    let all_buckets = vec!["bucket-a".to_string()];
+    let legacy = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
+    let mut current = completed_root_cache("bucket-a", 1, 20, DataUsageCacheSource::new(1, 0));
+    current.info.tier_registry_generation = Some(42);
+
+    assert!(
+        completed_data_usage_info_for_test(&[legacy, current], &all_buckets, false, false).is_none(),
+        "legacy and generation-tagged sets must not publish a mixed snapshot"
+    );
+}
+
+#[test]
+fn current_cache_root_with_new_tier_generation_resets_old_cache() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut cache = completed_root_cache("bucket-a", 1, 10, source);
+    cache.info.tier_registry_generation = Some(1);
+
+    let state = current_cache_root_or_prepare_with_generation(
+        &mut cache,
+        DATA_USAGE_ROOT,
+        source,
+        0,
+        0,
+        TEST_PLAN_DIGEST,
+        DataUsageCacheReuseOptions {
+            require_source: false,
+            tier_registry_generation: Some(2),
+        },
+    );
+
+    assert!(matches!(
+        state,
+        DataUsageCacheScanState::Prepared {
+            outcome: DataUsageCachePrepareOutcome::Reset,
+            ..
+        }
+    ));
+    assert!(cache.cache.is_empty(), "old-generation entries must not be reused");
+    assert_eq!(cache.info.tier_registry_generation, None);
+    assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert!(!cache.info.snapshot_complete);
 }
 
 #[test]
@@ -280,6 +759,13 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
             replica_size: 2048,
             replica_count: 2,
         }),
+        tier_accounting_proof: Some(TierAccountingProof {
+            logical_total: 2048,
+            logical_known: 2048,
+            physical_total: 2048,
+            physical_known: 2048,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     nested.obj_sizes.add(2048);
@@ -347,7 +833,8 @@ fn completed_data_usage_info_requires_exact_topology_sources() {
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(1, 0)]);
 
     assert!(
-        completed_data_usage_info(&[first_set, unexpected_set], &expected_sources, &all_buckets, true, false, false).is_none()
+        completed_data_usage_info(&[first_set, unexpected_set], &expected_sources, &all_buckets, &[], true, false, false)
+            .is_none()
     );
 }
 
@@ -357,7 +844,7 @@ fn completed_data_usage_info_rejects_incomplete_bucket_plan() {
     let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
 
-    assert!(completed_data_usage_info(&[set], &expected_sources, &all_buckets, false, false, false).is_none());
+    assert!(completed_data_usage_info(&[set], &expected_sources, &all_buckets, &[], false, false, false).is_none());
 }
 
 #[test]

@@ -26,7 +26,7 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use russh::client::{self, Handle};
 use russh::keys::ssh_key::LineEnding;
-use russh::keys::{Algorithm, PrivateKey, PublicKey};
+use russh::keys::{Algorithm, PrivateKey, PublicKeyOrCertificate};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use std::path::Path;
@@ -46,7 +46,7 @@ pub struct AcceptAnyServerKey;
 impl client::Handler for AcceptAnyServerKey {
     type Error = anyhow::Error;
 
-    async fn check_server_key(&mut self, _server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, _server_public_key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }

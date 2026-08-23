@@ -846,7 +846,9 @@ message ScannerActivityResponse {
   bool dirty_usage_pending = 9;
 }
 
-message BackgroundHealStatusRequest {}
+message BackgroundHealStatusRequest {
+  uint32 protocol_version = 1;
+}
 
 message BackgroundHealStatusResponse {
   bool success = 1;

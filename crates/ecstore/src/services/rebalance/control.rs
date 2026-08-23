@@ -48,12 +48,12 @@ fn pool_rebalance_status_from_meta(meta: Option<&RebalanceMeta>, pool_index: usi
         .unwrap_or_default()
 }
 
-fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted: RebalanceMeta) {
+fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted: RebalanceMeta) -> bool {
     if persisted.id.is_empty() && persisted.pool_stats.is_empty() {
-        clear_rebalance_status_refresh(current);
-        return;
+        return clear_rebalance_status_refresh(current);
     }
 
+    let before = current.clone();
     match current.as_mut() {
         Some(current_meta) => {
             if merge_rebalance_meta(current_meta, &persisted) == RebalanceMetaMergeOutcome::RejectedActiveConflict
@@ -66,12 +66,39 @@ fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted
             *current = Some(persisted);
         }
     }
+
+    match (before.as_ref(), current.as_ref()) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(before), Some(after)) => rebalance_movement_snapshot_changed(Some(before), after),
+    }
 }
 
-fn clear_rebalance_status_refresh(current: &mut Option<RebalanceMeta>) {
+fn clear_rebalance_status_refresh(current: &mut Option<RebalanceMeta>) -> bool {
     if current.as_ref().is_none_or(|meta| !is_rebalance_actively_running(meta)) {
-        *current = None;
+        current.take().is_some()
+    } else {
+        false
     }
+}
+
+fn rebalance_movement_snapshot_changed(current: Option<&RebalanceMeta>, persisted: &RebalanceMeta) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    current.id != persisted.id
+        || current.stopped_at != persisted.stopped_at
+        || current.pool_stats.len() != persisted.pool_stats.len()
+        || current
+            .pool_stats
+            .iter()
+            .zip(persisted.pool_stats.iter())
+            .any(|(current, persisted)| {
+                current.participating != persisted.participating
+                    || current.info.status != persisted.info.status
+                    || current.info.stopping != persisted.info.stopping
+            })
 }
 
 impl ECStore {
@@ -121,7 +148,10 @@ impl ECStore {
             "Loading rebalance metadata"
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
+            let movement_changed = rebalance_movement_snapshot_changed(self.rebalance_meta.read().await.as_ref(), &meta);
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
 
@@ -130,6 +160,10 @@ impl ECStore {
                 drop(rebalance_meta);
             }
 
+            if movement_changed {
+                self.ctx.advance_data_movement_operation_epoch();
+            }
+            drop(_movement_guard);
             resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
             debug!(
                 event = EVENT_REBALANCE_STATE,
@@ -139,10 +173,15 @@ impl ECStore {
                 "Loaded rebalance metadata"
             );
         } else {
+            let movement_changed = self.rebalance_meta.read().await.is_some();
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
                 *rebalance_meta = None;
             }
+            if movement_changed {
+                self.ctx.advance_data_movement_operation_epoch();
+            }
+            drop(_movement_guard);
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -160,14 +199,20 @@ impl ECStore {
     pub async fn refresh_rebalance_status_meta(&self) -> Result<()> {
         let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
         let mut persisted = RebalanceMeta::new();
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         match persisted.load(pool).await {
             Ok(()) => {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-                merge_rebalance_status_refresh(&mut rebalance_meta, persisted);
+                if merge_rebalance_status_refresh(&mut rebalance_meta, persisted) {
+                    self.ctx.advance_data_movement_operation_epoch();
+                }
             }
             Err(Error::ConfigNotFound) => {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-                clear_rebalance_status_refresh(&mut rebalance_meta);
+                if clear_rebalance_status_refresh(&mut rebalance_meta) {
+                    self.ctx.advance_data_movement_operation_epoch();
+                }
             }
             Err(err) => {
                 return Err(Error::other(format!("rebalance metadata refresh failed during pool status: {err}")));
@@ -349,6 +394,8 @@ impl ECStore {
     #[tracing::instrument(skip(self, bucktes))]
     pub async fn init_rebalance_start(self: &Arc<Self>, bucktes: Vec<String>) -> Result<String> {
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         let decommission_running = self.is_decommission_running().await;
         {
@@ -356,12 +403,16 @@ impl ECStore {
             validate_init_rebalance_state(decommission_running, rebalance_meta.as_ref())?;
         }
 
-        self.init_rebalance_meta(bucktes).await
+        let id = self.init_rebalance_meta(bucktes).await?;
+        self.ctx.advance_data_movement_operation_epoch();
+        Ok(id)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn start_rebalance_for_id(self: &Arc<Self>, expected_id: &str) -> Result<()> {
         let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
 
         {
             let rebalance_meta = self.rebalance_meta.read().await;
@@ -379,7 +430,10 @@ impl ECStore {
             }
         }
 
-        self.start_rebalance().await
+        if self.start_rebalance_inner().await? {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        Ok(())
     }
 
     pub async fn rollback_rebalance_start_for_id(self: &Arc<Self>, expected_id: Option<&str>, start_error: String) -> Result<()> {
@@ -548,6 +602,9 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn stop_rebalance_for_id(self: &Arc<Self>, expected_id: Option<&str>) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)
@@ -560,6 +617,7 @@ impl ECStore {
                     .await,
                 "stop_rebalance",
             )?;
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())
@@ -570,6 +628,9 @@ impl ECStore {
         expected_id: Option<&str>,
         start_error: String,
     ) -> Result<()> {
+        let _start_guard = self.start_gate.lock().await;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             rollback_rebalance_start_meta_snapshot_for_id(
@@ -587,6 +648,7 @@ impl ECStore {
                     .await,
                 "rollback_rebalance_start",
             )?;
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())
@@ -597,6 +659,8 @@ impl ECStore {
             return Ok(());
         }
 
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let encoded_error = encode_rebalance_stop_propagation_record(&record);
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -610,6 +674,7 @@ impl ECStore {
                     .await,
                 "record_rebalance_stop_propagation",
             )?;
+            self.ctx.advance_data_movement_operation_epoch();
         }
 
         Ok(())
@@ -682,7 +747,7 @@ mod tests {
             ..Default::default()
         };
 
-        merge_rebalance_status_refresh(&mut current, persisted);
+        assert!(merge_rebalance_status_refresh(&mut current, persisted));
 
         let refreshed = current.as_ref().expect("refresh should keep rebalance metadata");
         assert_eq!(refreshed.pool_stats[0].info.status, RebalStatus::Completed);
@@ -721,7 +786,7 @@ mod tests {
             ..Default::default()
         };
 
-        merge_rebalance_status_refresh(&mut current, persisted);
+        assert!(!merge_rebalance_status_refresh(&mut current, persisted));
 
         assert!(
             current.as_ref().and_then(|meta| meta.cancel.as_ref()).is_some(),
