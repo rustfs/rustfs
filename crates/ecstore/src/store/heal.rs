@@ -19,6 +19,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_lock::NamespaceLockGuard;
+use std::collections::BTreeSet;
 use tracing::trace;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -292,7 +293,45 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        let res = self.peer_sys.heal_bucket(bucket, opts).await?;
+        let mut fenced_pools = BTreeSet::new();
+        {
+            let pool_meta = self.pool_meta.read().await;
+            fenced_pools.extend((0..pool_meta.pools.len()).filter(|pool_idx| pool_meta.is_suspended(*pool_idx)));
+            if let Some(pool_idx) = opts.pool {
+                if pool_idx >= pool_meta.pools.len() {
+                    return Err(invalid_heal_pool_index(pool_idx, pool_meta.pools.len()));
+                }
+                if pool_meta.is_suspended(pool_idx) {
+                    let complete = pool_meta.pools[pool_idx]
+                        .decommission
+                        .as_ref()
+                        .is_some_and(|decommission| decommission.complete);
+                    return Err(if complete {
+                        StorageError::InvalidArgument(
+                            "heal".to_string(),
+                            "pool".to_string(),
+                            format!("heal pool {pool_idx} has completed decommission"),
+                        )
+                    } else {
+                        Error::SlowDown
+                    });
+                }
+            }
+        }
+
+        let dispatch_fenced_pools = fenced_pools.iter().copied().collect::<Vec<_>>();
+        let mut res = self
+            .peer_sys
+            .heal_bucket_with_fence(bucket, opts, &dispatch_fenced_pools)
+            .await?;
+        {
+            let pool_meta = self.pool_meta.read().await;
+            fenced_pools.extend((0..pool_meta.pools.len()).filter(|pool_idx| pool_meta.is_suspended(*pool_idx)));
+        }
+        if !fenced_pools.is_empty() {
+            let pools = fenced_pools.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            res.detail = format!("skipped: bucket-volume heal fenced on decommission-suspended pool(s): {pools}");
+        }
 
         Ok(res)
     }
@@ -856,6 +895,64 @@ mod tests {
 
             assert!(matches!(err, Some(StorageError::SlowDown)));
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_heal_bucket_blocks_before_dispatch_when_pool_is_suspended() {
+        let mut store = minimal_heal_store().await;
+        store.pool_meta = RwLock::new(PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        });
+
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("suspended pool must be blocked before bucket-heal fan-out");
+        assert_eq!(err, Error::SlowDown);
+
+        store.pool_meta.write().await.pools[1]
+            .decommission
+            .as_mut()
+            .expect("decommission state should exist")
+            .complete = true;
+        let err = store
+            .handle_heal_bucket(
+                "bucket",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("completed pool must remain fenced from bucket heal");
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, ref field, ref reason)
+                if field == "pool" && reason.contains("completed decommission")),
+            "unexpected completed-pool error: {err:?}"
+        );
     }
 
     #[tokio::test]
