@@ -65,7 +65,10 @@ if rg -q -- 'dataset-setup' "$TRACE_FILE"; then
   echo "unexpected redundant dataset setup command" >&2
   exit 1
 fi
-! rg -q -- 'rustfs-bench' "$TRACE_FILE"
+if rg -q -- 'rustfs-bench' "$TRACE_FILE"; then
+  echo "unexpected rustfs-bench command" >&2
+  exit 1
+fi
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/A2-vs-A1' "$TRACE_FILE"
