@@ -53,21 +53,24 @@ fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted
         return clear_rebalance_status_refresh(current);
     }
 
+    let before = current.clone();
     match current.as_mut() {
         Some(current_meta) => {
             if merge_rebalance_meta(current_meta, &persisted) == RebalanceMetaMergeOutcome::RejectedActiveConflict
                 && !is_rebalance_actively_running(current_meta)
             {
                 *current = Some(persisted);
-                true
-            } else {
-                false
             }
         }
         None => {
             *current = Some(persisted);
-            true
         }
+    }
+
+    match (before.as_ref(), current.as_ref()) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(before), Some(after)) => rebalance_movement_snapshot_changed(Some(before), after),
     }
 }
 
@@ -743,7 +746,7 @@ mod tests {
             ..Default::default()
         };
 
-        merge_rebalance_status_refresh(&mut current, persisted);
+        assert!(merge_rebalance_status_refresh(&mut current, persisted));
 
         let refreshed = current.as_ref().expect("refresh should keep rebalance metadata");
         assert_eq!(refreshed.pool_stats[0].info.status, RebalStatus::Completed);
@@ -782,7 +785,7 @@ mod tests {
             ..Default::default()
         };
 
-        merge_rebalance_status_refresh(&mut current, persisted);
+        assert!(!merge_rebalance_status_refresh(&mut current, persisted));
 
         assert!(
             current.as_ref().and_then(|meta| meta.cancel.as_ref()).is_some(),

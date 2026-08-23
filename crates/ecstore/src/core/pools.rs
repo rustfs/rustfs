@@ -1056,17 +1056,41 @@ fn should_replace_pool_status_for_status_refresh(
     !has_active_worker && persisted.last_update > current.last_update
 }
 
+fn pool_decommission_movement_snapshot(
+    info: Option<&PoolDecommissionInfo>,
+) -> (bool, bool, bool, bool, bool, Option<OffsetDateTime>) {
+    info.map(|info| {
+        (
+            info.has_decommission_state(),
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.queued,
+            info.start_time,
+        )
+    })
+    .unwrap_or_default()
+}
+
+fn pool_meta_movement_snapshot_changed(before: &PoolMeta, after: &PoolMeta) -> bool {
+    before.pools.len() != after.pools.len()
+        || before.pools.iter().zip(after.pools.iter()).any(|(before, after)| {
+            pool_decommission_movement_snapshot(before.decommission.as_ref())
+                != pool_decommission_movement_snapshot(after.decommission.as_ref())
+        })
+}
+
 fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) -> bool {
     if persisted.pools.is_empty() {
         return false;
     }
 
+    let before = current.clone();
     if current.pools.is_empty() {
         *current = persisted;
-        return true;
+        return pool_meta_movement_snapshot_changed(&before, current);
     }
 
-    let mut changed = false;
     for (idx, persisted_pool) in persisted.pools.into_iter().enumerate() {
         if persisted_pool.id != idx {
             continue;
@@ -1076,15 +1100,13 @@ fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active
         if idx < current.pools.len() {
             if should_replace_pool_status_for_status_refresh(current.pools.get(idx), &persisted_pool, has_active_worker) {
                 current.pools[idx] = persisted_pool;
-                changed = true;
             }
         } else if idx == current.pools.len() && !has_active_worker {
             current.pools.push(persisted_pool);
-            changed = true;
         }
     }
 
-    changed
+    pool_meta_movement_snapshot_changed(&before, current)
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -6573,7 +6595,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[false]);
+        assert!(merge_pool_status_refresh(&mut current, persisted, &[false]));
 
         let info = current.pools[0]
             .decommission
@@ -6617,7 +6639,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[true]);
+        assert!(!merge_pool_status_refresh(&mut current, persisted, &[true]));
 
         let info = current.pools[0]
             .decommission
@@ -6658,7 +6680,7 @@ mod pools_tests {
             ..Default::default()
         };
 
-        merge_pool_status_refresh(&mut current, persisted, &[true]);
+        assert!(!merge_pool_status_refresh(&mut current, persisted, &[true]));
 
         let info = current.pools[0]
             .decommission
