@@ -67,10 +67,11 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    delete_config_with_publication_admission, get_lifecycle_config, get_replication_config,
-    invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    delete_config_with_publication_admission, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
+    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
     replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
-    save_config_with_publication_admission, scanner_is_erasure_sd,
+    save_config_with_publication_admission, save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch, scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -347,6 +348,10 @@ fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
     !info.is_complete_bucket_usage_snapshot()
 }
 
+pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageInfo) -> bool {
+    info.last_update.is_some() || info.scanner_cycle.is_some() || info.scanner_epoch.is_some() || info.usage_snapshot_complete
+}
+
 fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option<&DataUsageInfo>) -> bool {
     data_usage_info_is_cold(authoritative)
         || observed.is_some_and(|observed| observed_data_usage_is_newer(observed, authoritative))
@@ -392,29 +397,51 @@ async fn sync_data_usage_backup_from_primary(
             return Ok(());
         }
 
+        let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+            return Err(EcstoreError::other("data usage publication is blocked by data movement"));
+        };
         let (primary, _) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
-        let primary = primary.ok_or_else(|| EcstoreError::other("authoritative data usage snapshot is missing"))?;
-        serde_json::from_slice::<DataUsageInfo>(&primary)
+        let primary = primary.ok_or(EcstoreError::ConfigNotFound)?;
+        let primary_info = serde_json::from_slice::<DataUsageInfo>(&primary)
             .map_err(|err| EcstoreError::other(format!("authoritative data usage snapshot is invalid: {err}")))?;
+        if !data_usage_info_has_persisted_baseline_identity(&primary_info) {
+            return Err(EcstoreError::other(
+                "authoritative data usage snapshot has no persisted baseline identity",
+            ));
+        }
         let primary = Bytes::from(primary);
 
         let (backup, revision) = read_config_with_revision(storeapi.clone(), &backup_path).await?;
         if backup.as_deref() == Some(primary.as_ref()) {
-            return Ok(());
+            if scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+                .await
+                .is_some()
+            {
+                return Ok(());
+            }
+            if retry < SCANNER_PERSIST_CAS_RETRIES {
+                continue;
+            }
+            return Err(EcstoreError::other("data usage publication epoch changed during backup synchronization"));
         }
 
-        let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
-            return Err(EcstoreError::other("data usage publication is blocked by data movement"));
-        };
         let sha256hex = Some(hex_simd::encode_to_string(Sha256::digest(&primary), hex_simd::AsciiCase::Lower));
-        let save_result = save_config_shared_with_preconditions(
-            storeapi.clone(),
-            &backup_path,
-            primary.clone(),
-            sha256hex,
-            revision.preconditions(),
-        )
-        .await;
+        let save_result = {
+            let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
+                if retry < SCANNER_PERSIST_CAS_RETRIES {
+                    continue;
+                }
+                return Err(EcstoreError::other("data usage publication epoch changed during backup synchronization"));
+            };
+            save_config_shared_with_preconditions(
+                storeapi.clone(),
+                &backup_path,
+                primary.clone(),
+                sha256hex,
+                revision.preconditions(),
+            )
+            .await
+        };
 
         match save_result {
             Ok(_) => {}

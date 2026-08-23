@@ -335,6 +335,7 @@ async fn persist_cycle_recovery_marker(
     leader_epoch: u64,
     classification: &'static str,
     reason: &'static str,
+    expected_epoch: u64,
 ) -> Result<ScannerCycleRecoveryMarker, CycleRecoveryMarkerReadError> {
     let now = unix_now_secs();
     let (existing, existing_revision) = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
@@ -373,7 +374,7 @@ async fn persist_cycle_recovery_marker(
         state: "blocked".to_string(),
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| CycleRecoveryMarkerReadError::Invalid("marker serialization failed"))?;
-    let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+    let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch).await else {
         return Err(CycleRecoveryMarkerReadError::PublicationBlocked);
     };
     let save_result = save_config_with_preconditions(
@@ -521,7 +522,19 @@ async fn quarantine_invalid_cycle_state_with_reason(
         reason: Some(reason.to_string()),
     };
     set_scanner_cycle_recovery_status(base_status);
-    match persist_cycle_recovery_marker(storeapi, revision, generation, leader_epoch, classification, reason).await {
+    let Some(expected_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        set_scanner_cycle_recovery_status(recovery_status(
+            "transient",
+            Some("cycle recovery marker publication is blocked by data movement"),
+            true,
+        ));
+        return ScannerCycleStateStartup::Transient(ScannerError::Other(
+            "cycle recovery marker publication is blocked by data movement".to_string(),
+        ));
+    };
+    match persist_cycle_recovery_marker(storeapi, revision, generation, leader_epoch, classification, reason, expected_epoch)
+        .await
+    {
         Ok(marker) => set_scanner_cycle_recovery_status(recovery_status_from_marker(&marker, "blocked")),
         Err(CycleRecoveryMarkerReadError::Backend(_)) => {
             // Keep the poison object untouched and retry marker creation with the
@@ -562,16 +575,18 @@ async fn mark_cycle_recovery_cleanup_pending(
     storeapi: Arc<ECStore>,
     mut marker: ScannerCycleRecoveryMarker,
     marker_revision: &DataUsageCacheRevision,
+    expected_epoch: u64,
 ) -> Result<(ScannerCycleRecoveryMarker, DataUsageCacheRevision), ScannerError> {
     marker.state = "cleanup-pending".to_string();
     marker.last_attempt_at_unix_secs = unix_now_secs();
     let bytes = serde_json::to_vec(&marker)
         .map_err(|err| ScannerError::Other(format!("failed to encode cycle recovery marker: {err}")))?;
-    let info = save_config_with_publication_admission(
+    let info = save_config_with_publication_admission_for_epoch(
         storeapi.clone(),
         DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
         bytes,
         marker_revision.preconditions(),
+        expected_epoch,
     )
     .await
     .map_err(|err| ScannerError::Other(format!("failed to mark cycle recovery cleanup pending: {err}")))?;
@@ -768,6 +783,10 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         return Err(ScannerError::Other("scanner leader lock was lost before recovery reset".to_string()));
     }
 
+    let Some(reset_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner recovery reset is blocked by data movement".to_string()));
+    };
+
     let (marker_data, marker_revision, marker_body_invalid) = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
         Ok((marker_data, marker_revision)) => (marker_data, marker_revision, false),
         Err(CycleRecoveryMarkerReadError::Invalid(_)) => {
@@ -853,7 +872,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         };
         if let Some((primary_cycle, primary_epoch)) = primary_state {
             let (cleanup_marker, cleanup_marker_revision) =
-                mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker.clone(), &marker_revision).await?;
+                mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker.clone(), &marker_revision, reset_epoch).await?;
             set_scanner_cycle_recovery_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending"));
             let usage_floor = persisted_usage_floor(storeapi.clone()).await?;
             let fence_epoch = primary_epoch
@@ -873,14 +892,21 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "preserved scanner cycle state exceeds the bounded object size".to_string(),
                 ));
             }
-            let preserved_info = save_config_with_publication_admission(
+            let preserved_info = save_config_with_publication_admission_for_epoch(
                 storeapi.clone(),
                 DATA_USAGE_BLOOM_NAME_PATH.as_str(),
                 preserved_data,
                 primary_revision.preconditions(),
+                reset_epoch,
             )
             .await
-            .map_err(|err| ScannerError::Other(format!("failed to fence preserved scanner cycle state: {err}")))?;
+            .map_err(|err| {
+                if scanner_publication_epoch_changed(&err) {
+                    ScannerError::Other("scanner recovery reset deferred by a movement epoch change".to_string())
+                } else {
+                    ScannerError::Other(format!("failed to fence preserved scanner cycle state: {err}"))
+                }
+            })?;
             let preserved_revision = preserved_info
                 .etag
                 .filter(|etag| !etag.is_empty())
@@ -891,7 +917,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "scanner leader lock was lost after fencing newer cycle state".to_string(),
                 ));
             }
-            fence_scanner_usage_epoch(&ctx, storeapi.clone(), fence_epoch)
+            fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), fence_epoch, Some(reset_epoch))
                 .await
                 .map_err(|err| ScannerError::Other(format!("failed to fence preserved scanner usage epoch: {err}")))?;
             if guard.is_lock_lost() {
@@ -907,7 +933,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     "scanner cycle state changed before recovery marker cleanup".to_string(),
                 ));
             }
-            delete_config_with_publication_admission(
+            delete_config_with_publication_admission_for_epoch(
                 storeapi.clone(),
                 RUSTFS_META_BUCKET,
                 DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
@@ -918,9 +944,16 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
                     http_preconditions: Some(cleanup_marker_revision.preconditions()),
                     ..Default::default()
                 },
+                reset_epoch,
             )
             .await
-            .map_err(|err| ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}")))?;
+            .map_err(|err| {
+                if scanner_publication_epoch_changed(&err) {
+                    ScannerError::Other("scanner recovery reset deferred by a movement epoch change".to_string())
+                } else {
+                    ScannerError::Other(format!("failed to clear stale cycle recovery marker: {err}"))
+                }
+            })?;
             set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
             super::notify_scanner_cycle_recovery_wake();
             return Ok(());
@@ -964,16 +997,23 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     let (marker, marker_revision) = if marker.state == "cleanup-pending" {
         (marker, marker_revision)
     } else {
-        mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker, &marker_revision).await?
+        mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker, &marker_revision, reset_epoch).await?
     };
-    let rebuilt_info = save_config_with_publication_admission(
+    let rebuilt_info = save_config_with_publication_admission_for_epoch(
         storeapi.clone(),
         DATA_USAGE_BLOOM_NAME_PATH.as_str(),
         data,
         primary_revision.preconditions(),
+        reset_epoch,
     )
     .await
-    .map_err(|err| ScannerError::Other(format!("failed to persist rebuilt scanner cycle state: {err}")))?;
+    .map_err(|err| {
+        if scanner_publication_epoch_changed(&err) {
+            ScannerError::Other("scanner recovery reset deferred by a movement epoch change".to_string())
+        } else {
+            ScannerError::Other(format!("failed to persist rebuilt scanner cycle state: {err}"))
+        }
+    })?;
     let rebuilt_revision = rebuilt_info
         .etag
         .filter(|etag| !etag.is_empty())
@@ -983,7 +1023,8 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             "scanner leader lock was lost after rebuilding cycle state".to_string(),
         ));
     }
-    if let Err(err) = fence_scanner_usage_epoch(&ctx, storeapi.clone(), leader_epoch).await {
+    if let Err(err) = fence_scanner_usage_epoch_with_expected_epoch(&ctx, storeapi.clone(), leader_epoch, Some(reset_epoch)).await
+    {
         set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
@@ -1052,7 +1093,7 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
         ));
     }
 
-    if let Err(err) = delete_config_with_publication_admission(
+    if let Err(err) = delete_config_with_publication_admission_for_epoch(
         storeapi.clone(),
         RUSTFS_META_BUCKET,
         DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
@@ -1063,9 +1104,29 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
             http_preconditions: Some(marker_revision.preconditions()),
             ..Default::default()
         },
+        reset_epoch,
     )
     .await
     {
+        if scanner_publication_epoch_changed(&err) {
+            set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+                path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+                quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
+                state: "cleanup-pending".to_string(),
+                classification: Some(marker.classification.clone()),
+                primary_revision: Some(rebuilt_revision.clone()),
+                generation: Some(next),
+                leader_epoch: Some(leader_epoch),
+                retry_count: marker.retry_count,
+                max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
+                retryable: true,
+                reason: Some("movement epoch changed before recovery marker cleanup".to_string()),
+                ..Default::default()
+            });
+            return Err(ScannerError::Other(
+                "scanner recovery reset deferred by a movement epoch change".to_string(),
+            ));
+        }
         set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
             path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
             quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
@@ -1227,8 +1288,14 @@ pub(super) fn advance_scanner_cycle(cycle_info: &mut CurrentCycle) -> Result<(),
     Ok(())
 }
 
-pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -> Result<PersistedUsageFloor, ScannerError> {
+pub(super) async fn persisted_usage_floor(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<PersistedUsageFloor, ScannerError> {
+    let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner usage floor read is blocked by data movement".to_string()));
+    };
     let mut floor = PersistedUsageFloor::default();
+    let mut found_any = false;
     let update_floor = |floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str| -> Result<(), ScannerError> {
         floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
         if let Some(completed_cycle) = usage.scanner_cycle {
@@ -1247,6 +1314,11 @@ pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
                 })?;
+                if !data_usage_info_has_persisted_baseline_identity(&usage) {
+                    return Err(ScannerError::Other(format!(
+                        "scanner usage floor from {primary_path} has no persisted baseline identity"
+                    )));
+                }
                 let epoch = usage.scanner_epoch.unwrap_or_default();
                 update_floor(&mut floor, &usage, primary_path)?;
                 Some(epoch)
@@ -1265,6 +1337,11 @@ pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
                 })?;
+                if !data_usage_info_has_persisted_baseline_identity(&usage) {
+                    return Err(ScannerError::Other(format!(
+                        "scanner usage floor from {backup_path} has no persisted baseline identity"
+                    )));
+                }
                 let backup_epoch = usage.scanner_epoch.unwrap_or_default();
                 // A backup write from an older leader may complete after the
                 // primary epoch has been fenced. It must not advance the startup
@@ -1281,9 +1358,21 @@ pub(super) async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -
             }
         }
         if any_found {
+            found_any = true;
             break;
         }
     }
+
+    if !found_any {
+        return Err(ScannerError::Other(
+            "persisted scanner usage floor has no authoritative baseline".to_string(),
+        ));
+    }
+    let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi, read_epoch).await else {
+        return Err(ScannerError::Other(
+            "scanner usage floor changed while its epoch proof was being confirmed".to_string(),
+        ));
+    };
     Ok(floor)
 }
 
@@ -1333,8 +1422,11 @@ pub(super) async fn persist_scanner_cycle_state(
 
         #[cfg(test)]
         notify_scanner_cycle_state_persist_test_hook(leader_epoch);
+        let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+            return false;
+        };
         let save_result = {
-            let Some(_publication_admission) = storeapi.scanner_data_usage_publication_admission().await else {
+            let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
                 error!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_PERSIST_STATE,

@@ -148,9 +148,9 @@ impl ECStore {
             "Loading rebalance metadata"
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         if resolve_rebalance_meta_load_result(meta.load(pool).await)? {
-            let movement_gate = self.ctx.data_movement_operation_gate();
-            let _movement_guard = movement_gate.write().await;
             let movement_changed = rebalance_movement_snapshot_changed(self.rebalance_meta.read().await.as_ref(), &meta);
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -160,10 +160,11 @@ impl ECStore {
                 drop(rebalance_meta);
             }
 
-            resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
             if movement_changed {
                 self.ctx.advance_data_movement_operation_epoch();
             }
+            drop(_movement_guard);
+            resolve_load_rebalance_stats_update_result(self.update_rebalance_stats().await)?;
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -172,8 +173,6 @@ impl ECStore {
                 "Loaded rebalance metadata"
             );
         } else {
-            let movement_gate = self.ctx.data_movement_operation_gate();
-            let _movement_guard = movement_gate.write().await;
             let movement_changed = self.rebalance_meta.read().await.is_some();
             {
                 let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -182,6 +181,7 @@ impl ECStore {
             if movement_changed {
                 self.ctx.advance_data_movement_operation_epoch();
             }
+            drop(_movement_guard);
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -199,18 +199,16 @@ impl ECStore {
     pub async fn refresh_rebalance_status_meta(&self) -> Result<()> {
         let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
         let mut persisted = RebalanceMeta::new();
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         match persisted.load(pool).await {
             Ok(()) => {
-                let movement_gate = self.ctx.data_movement_operation_gate();
-                let _movement_guard = movement_gate.write().await;
                 let mut rebalance_meta = self.rebalance_meta.write().await;
                 if merge_rebalance_status_refresh(&mut rebalance_meta, persisted) {
                     self.ctx.advance_data_movement_operation_epoch();
                 }
             }
             Err(Error::ConfigNotFound) => {
-                let movement_gate = self.ctx.data_movement_operation_gate();
-                let _movement_guard = movement_gate.write().await;
                 let mut rebalance_meta = self.rebalance_meta.write().await;
                 if clear_rebalance_status_refresh(&mut rebalance_meta) {
                     self.ctx.advance_data_movement_operation_epoch();

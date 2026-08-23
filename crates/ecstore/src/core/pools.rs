@@ -2988,11 +2988,11 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("refresh_pool_status_meta: no pools available"))?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         let mut persisted = PoolMeta::default();
         persisted.load(pool, self.pools.clone()).await?;
 
-        let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = movement_gate.write().await;
         let active_workers = {
             let cancelers = self.decommission_cancelers.read().await;
             cancelers
@@ -5154,6 +5154,10 @@ impl ECStore {
         let previous_pool_meta = self
             .save_current_pool_meta_for_decommission_start(&indices, space_infos, decom_buckets)
             .await?;
+        self.ctx.advance_data_movement_operation_epoch();
+        // The local durable transition is now fenced. Release the writer
+        // before any peer RPC; remote reload must not block scanner admission.
+        drop(_movement_guard);
 
         if let Some(notification_sys) = runtime_sources::notification_sys()
             && let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await)
@@ -5168,11 +5172,20 @@ impl ECStore {
                 "Decommission start failed after pool metadata save"
             );
 
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
-            }
-            if let Err(rollback_save_err) = self.save_current_pool_meta().await {
+            let rollback_result = {
+                let movement_guard = movement_gate.write().await;
+                {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    rollback_start_decommission_pool_meta(&mut pool_meta, previous_pool_meta.clone());
+                }
+                let rollback_result = self.save_current_pool_meta().await;
+                if rollback_result.is_ok() {
+                    self.ctx.advance_data_movement_operation_epoch();
+                }
+                drop(movement_guard);
+                rollback_result
+            };
+            if let Err(rollback_save_err) = rollback_result {
                 error!(
                     event = EVENT_DECOMMISSION_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -5217,8 +5230,6 @@ impl ECStore {
             );
             return Err(Error::other(format!("{err}; decommission start rollback succeeded")));
         }
-
-        self.ctx.advance_data_movement_operation_epoch();
 
         Ok(index_cancelers)
     }

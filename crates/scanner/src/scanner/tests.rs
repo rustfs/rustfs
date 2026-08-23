@@ -2024,6 +2024,8 @@ async fn scanner_startup_prefers_v2_over_legacy_usage() {
 #[tokio::test]
 async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() {
     let store = Arc::new(MemoryConfigStore::default());
+    assert!(persisted_usage_floor(store.clone()).await.is_err());
+
     store.objects.lock().await.insert(
         memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
         b"not-json".to_vec(),
@@ -2650,6 +2652,35 @@ async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
             "the final pool-state fence must run before the first PUT"
         );
     }
+}
+
+#[tokio::test]
+async fn test_observational_usage_defers_when_authoritative_baseline_is_missing() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let (sender, receiver) = mpsc::channel(1);
+    let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+    observation.usage_snapshot_converged = Some(false);
+    sender.send(observation).await.expect("observation should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        None,
+        || async { false },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert!(
+        !store
+            .objects
+            .lock()
+            .await
+            .contains_key(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()))
+    );
 }
 
 #[tokio::test]
