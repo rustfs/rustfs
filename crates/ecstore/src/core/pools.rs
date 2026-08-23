@@ -2046,6 +2046,36 @@ where
     Ok(())
 }
 
+async fn run_decommission_phases<F>(
+    rx: CancellationToken,
+    regular_buckets: Vec<DecomBucketInfo>,
+    meta_buckets: Vec<DecomBucketInfo>,
+    bucket_concurrency: usize,
+    mut start_bucket: F,
+) -> Result<()>
+where
+    F: FnMut(DecomBucketInfo, CancellationToken) -> BoxFuture<'static, Result<()>>,
+{
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    for bucket in meta_buckets {
+        decommission_cancel_signal_result(rx.is_cancelled())?;
+        start_bucket(bucket, rx.clone()).await?;
+    }
+
+    decommission_cancel_signal_result(rx.is_cancelled())?;
+
+    if bucket_concurrency <= 1 {
+        for bucket in regular_buckets {
+            decommission_cancel_signal_result(rx.is_cancelled())?;
+            start_bucket(bucket, rx.clone()).await?;
+        }
+        return Ok(());
+    }
+
+    run_decommission_buckets_bounded(rx, regular_buckets, bucket_concurrency, start_bucket).await
+}
+
 #[cfg(test)]
 async fn wait_decommission_worker_drain(workers: &Semaphore, limit: usize) -> Result<()> {
     let permits = u32::try_from(limit)
@@ -6274,45 +6304,20 @@ impl ECStore {
         };
         let source_changed_exhaustions = Arc::new(AtomicUsize::new(0));
         let bucket_concurrency = decommission_bucket_concurrency_limit();
-        if bucket_concurrency <= 1 {
-            for bucket in pending {
-                self.decommission_pending_bucket(
-                    rx.clone(),
-                    idx,
-                    pool.clone(),
-                    bucket,
-                    entry_budget.clone(),
-                    Arc::clone(&source_changed_exhaustions),
-                )
-                .await?;
-            }
-            return Ok(());
-        }
-
         let (regular_buckets, meta_buckets) = split_decommission_buckets(pending);
-        self.decommission_buckets_concurrently(
-            rx.clone(),
-            idx,
-            pool.clone(),
-            regular_buckets,
-            entry_budget.clone(),
-            Arc::clone(&source_changed_exhaustions),
-        )
-        .await?;
-
-        for bucket in meta_buckets {
-            self.decommission_pending_bucket(
-                rx.clone(),
-                idx,
-                pool.clone(),
-                bucket,
-                entry_budget.clone(),
-                Arc::clone(&source_changed_exhaustions),
-            )
-            .await?;
-        }
-
-        Ok(())
+        let store = Arc::clone(self);
+        run_decommission_phases(rx.clone(), regular_buckets, meta_buckets, bucket_concurrency, move |bucket, rx| {
+            let store = Arc::clone(&store);
+            let pool = pool.clone();
+            let entry_budget = entry_budget.clone();
+            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
+            Box::pin(async move {
+                store
+                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
+                    .await
+            })
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -8936,29 +8941,26 @@ mod pools_tests {
         ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
-        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index, guard_decommission_cancelers,
-        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
-        load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
-        merge_decommission_durable_ilm_receipts, merge_pool_status_refresh, missing_decommission_worker_prefix,
-        observe_decommission_terminal_reload_result, pool_meta_has_active_decommission, reconcile_decommission_meta_buckets,
-        require_decommission_store, reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
+        ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, get_by_index,
+        guard_decommission_cancelers, has_active_decommission_canceler, is_decommission_active,
+        is_decommission_cancel_requested, load_decommission_entry_versions, local_decommission_queue_prefix,
+        mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts, merge_pool_status_refresh,
+        missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
+        reconcile_decommission_meta_buckets, require_decommission_store, reserve_decommission_start_cancelers,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
         resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
-        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_side_effect,
-        should_cleanup_decommission_source_entry, should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_fail_decommission_pool_after_exhausted_source_changed, should_preserve_decommission_canceled_state,
-        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
-        should_retry_decommission_listing, should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers,
-        split_decommission_buckets, take_and_cancel_decommission_canceler, take_decommission_canceler,
-        track_decommission_current_object, track_decommission_current_object_stage, update_decommission_for_operation,
-        validate_start_decommission_request, wait_decommission_retry_backoff, wait_decommission_worker_drain,
-        with_decommission_entry_context,
+        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_phases,
+        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload, should_retry_decommission_listing,
+        should_skip_canceled_decommission_routine, spawn_decommission_index_cancelers, split_decommission_buckets,
+        take_and_cancel_decommission_canceler, take_decommission_canceler, track_decommission_current_object,
+        track_decommission_current_object_stage, update_decommission_for_operation, validate_start_decommission_request,
+        wait_decommission_retry_backoff, wait_decommission_worker_drain, with_decommission_entry_context
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -8977,7 +8979,7 @@ mod pools_tests {
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_rio::Index;
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration as StdDuration;
@@ -9440,6 +9442,66 @@ mod pools_tests {
             DECOMMISSION_META_PREFIXES
         );
         assert!(!reconcile_decommission_meta_buckets(&mut meta, 0));
+    }
+
+    #[tokio::test]
+    async fn test_decommission_metadata_phase_precedes_regular_failure() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let err = run_decommission_phases(
+            CancellationToken::new(),
+            vec![
+                DecomBucketInfo {
+                    name: "regular-fails".to_string(),
+                    ..Default::default()
+                },
+                DecomBucketInfo {
+                    name: "regular-not-started".to_string(),
+                    ..Default::default()
+                },
+            ],
+            vec![
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::config::com::CONFIG_PREFIX.to_string(),
+                },
+                DecomBucketInfo {
+                    name: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                    prefix: crate::disk::BUCKET_META_PREFIX.to_string(),
+                },
+            ],
+            1,
+            {
+                let events = Arc::clone(&events);
+                move |bucket, _rx| {
+                    let events = Arc::clone(&events);
+                    Box::pin(async move {
+                        let event = if bucket.name == crate::disk::RUSTFS_META_BUCKET {
+                            format!("meta:{}", bucket.prefix)
+                        } else {
+                            format!("regular:{}", bucket.name)
+                        };
+                        events.lock().expect("phase event lock should not be poisoned").push(event);
+                        if bucket.name == "regular-fails" {
+                            Err(Error::SlowDown)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("regular failure should remain fatal after metadata completes");
+
+        assert!(matches!(err, Error::SlowDown));
+        assert_eq!(
+            *events.lock().expect("phase event lock should not be poisoned"),
+            vec![
+                format!("meta:{}", crate::config::com::CONFIG_PREFIX),
+                format!("meta:{}", crate::disk::BUCKET_META_PREFIX),
+                "regular:regular-fails".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
