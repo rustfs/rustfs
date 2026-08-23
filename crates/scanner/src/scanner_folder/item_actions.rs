@@ -249,10 +249,6 @@ fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
 }
 
 fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
-    if rule_id.is_empty() {
-        return false;
-    }
-
     let filter_has_size = |filter: &s3s::dto::LifecycleRuleFilter| {
         filter.object_size_greater_than.is_some()
             || filter.object_size_less_than.is_some()
@@ -264,7 +260,13 @@ fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule
     lifecycle
         .rules
         .iter()
-        .find(|rule| rule.id.as_deref() == Some(rule_id))
+        .find(|rule| {
+            if rule_id.is_empty() {
+                rule.id.as_deref().is_none_or(str::is_empty)
+            } else {
+                rule.id.as_deref() == Some(rule_id)
+            }
+        })
         .and_then(|rule| rule.filter.as_ref())
         .is_some_and(filter_has_size)
 }
@@ -606,7 +608,10 @@ impl ScannerItem {
                         size_summary.actions_accounting_unknown(oi);
                         continue;
                     }
-                    SizeResolution::Corrupt { .. } => continue,
+                    SizeResolution::Corrupt { .. } => {
+                        size_summary.actions_accounting_unknown(oi);
+                        continue;
+                    }
                 };
 
                 let size = self.heal_actions(oi, accounting_size, size_summary).await;
@@ -1596,7 +1601,7 @@ mod tests {
             },
             &size_filtered
         ));
-        assert!(!lifecycle_rule_has_size_filter(
+        assert!(lifecycle_rule_has_size_filter(
             &BucketLifecycleConfiguration {
                 rules: vec![s3s::dto::LifecycleRule {
                     status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),

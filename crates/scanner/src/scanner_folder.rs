@@ -675,6 +675,9 @@ pub struct FolderScanner {
     skip_heal: Arc<std::sync::atomic::AtomicBool>,
     local_disk: Arc<Disk>,
     pending_heals_changed: bool,
+    pending_size_reconciliation_keys: HashSet<String>,
+    pending_size_reconciliation_scopes: HashSet<String>,
+    pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
 }
@@ -688,6 +691,10 @@ fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
         + entry.reason.len()
         + std::mem::size_of::<u64>()
         + std::mem::size_of::<u32>()
+}
+
+fn size_reconciliation_scope_key(bucket: &str, object: &str) -> String {
+    format!("{}:{}|{}:{}", bucket.len(), bucket, object.len(), object)
 }
 
 fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
@@ -805,27 +812,17 @@ impl FolderScanner {
     /// so an incremental publication cannot lose a debt or its resolution.
     fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
         let now = Self::now_secs();
-        // Keep an unresolved identity in place while refreshing its object
-        // scope. This lets repeated observations increment `attempts`; only
-        // debts absent from the current pass are considered resolved.
-        let current_keys = summary
-            .size_reconciliation
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<HashSet<_>>();
+        self.pending_size_reconciliation_keys
+            .extend(summary.size_reconciliation.iter().map(|entry| entry.key.clone()));
+        self.pending_size_reconciliation_scopes.extend(
+            summary
+                .reconciliation_scopes
+                .iter()
+                .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
+        );
+        self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+
         for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
-            prune_size_reconciliation(info, now);
-
-            if !summary.size_reconciliation_truncated {
-                for scope in &summary.reconciliation_scopes {
-                    let scope_bucket = item_actions::bounded_reconciliation_field(&scope.bucket);
-                    let scope_object = item_actions::bounded_reconciliation_field(&scope.object);
-                    info.size_reconciliation.retain(|key, entry| {
-                        entry.bucket != scope_bucket || entry.object != scope_object || current_keys.contains(key)
-                    });
-                }
-            }
-
             for incoming in &summary.size_reconciliation {
                 if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
                     existing.reason = incoming.reason.clone();
@@ -844,6 +841,21 @@ impl FolderScanner {
                 entry.first_seen = now;
                 entry.attempts = 1;
                 info.size_reconciliation.insert(entry.key.clone(), entry);
+            }
+        }
+    }
+
+    fn finish_size_reconciliation_batch(&mut self) {
+        let now = Self::now_secs();
+        let current_keys = std::mem::take(&mut self.pending_size_reconciliation_keys);
+        let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
+        let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
+
+        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
+            if !truncated {
+                info.size_reconciliation.retain(|key, entry| {
+                    !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
+                });
             }
             prune_size_reconciliation(info, now);
         }
@@ -2207,6 +2219,7 @@ impl FolderScanner {
             }
         }
 
+        self.finish_size_reconciliation_batch();
         done_folder();
         let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
         emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
@@ -2292,6 +2305,9 @@ pub async fn scan_data_folder(
         skip_heal,
         local_disk,
         pending_heals_changed: false,
+        pending_size_reconciliation_keys: HashSet::new(),
+        pending_size_reconciliation_scopes: HashSet::new(),
+        pending_size_reconciliation_truncated: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,
     };

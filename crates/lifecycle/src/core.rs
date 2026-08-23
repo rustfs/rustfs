@@ -54,6 +54,7 @@ const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS: &str =
     "Days must be a positive integer and Date must not be specified inside Expiration with ExpiredObjectAllVersions";
 const ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS: &str = "Days must be a positive integer with DelMarkerExpiration";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
+const ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY: &str = "Rule ID must not be empty";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 const ERR_LIFECYCLE_DEL_MARKER_WITH_TAGS: &str = "Rule with DelMarkerExpiration cannot have tags based filtering";
 const ERR_LIFECYCLE_EXPIRED_OBJECT_DELETE_MARKER_WITH_TAGS: &str =
@@ -402,10 +403,13 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     NoncurrentVersionTransitionOps::validate(transition)?;
                 }
             }
-            if let Some(id) = &r.id
-                && id.len() > 255
-            {
-                return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+            if let Some(id) = &r.id {
+                if id.is_empty() {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY));
+                }
+                if id.len() > 255 {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+                }
             }
             r.validate()?;
             if let Some(object_lock_enabled) = lr.object_lock_enabled.as_ref()
@@ -3728,6 +3732,31 @@ mod tests {
         lc.validate(&ObjectLockConfiguration::default())
             .await
             .expect("empty prefix with filter should be valid");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_empty_rule_id() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(30),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some(String::new()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let error = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+        assert_eq!(error.to_string(), ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY);
     }
 
     // --- TASK-004 tests: ExpiredObjectAllVersions ---

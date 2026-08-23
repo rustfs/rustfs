@@ -326,6 +326,9 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         skip_heal: Arc::new(AtomicBool::new(false)),
         local_disk: disk,
         pending_heals_changed: false,
+        pending_size_reconciliation_keys: HashSet::new(),
+        pending_size_reconciliation_scopes: HashSet::new(),
+        pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
     };
 
