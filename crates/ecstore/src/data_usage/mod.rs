@@ -378,8 +378,15 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
             "nonconverged data usage observations cannot replace the quota-authoritative snapshot",
         ));
     }
+    let Some((baseline_publication_guard, expected_publication_epoch)) =
+        store.scanner_data_usage_publication_admission_guard().await
+    else {
+        return Err(Error::other("data usage publication is blocked by data movement"));
+    };
     // Prevent older data from overwriting newer persisted stats
-    if let Ok((existing, source)) = load_data_usage_snapshot(store.clone()).await
+    let existing_snapshot = load_data_usage_snapshot(store.clone()).await;
+    drop(baseline_publication_guard);
+    if let Ok((existing, source)) = existing_snapshot
         && source.is_authoritative()
         && let Some(reason) = stale_data_usage_persist_reason_for_source(&data_usage_info, &existing, source, SystemTime::now())
     {
@@ -390,19 +397,31 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
         return Ok(());
     }
 
-    save_data_usage_in_backend(data_usage_info, store).await
+    save_data_usage_in_backend(data_usage_info, store, expected_publication_epoch).await
 }
 
-async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
+async fn save_data_usage_in_backend(
+    data_usage_info: DataUsageInfo,
+    store: Arc<ECStore>,
+    expected_publication_epoch: u64,
+) -> Result<(), Error> {
     let data =
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
     // Save to backend using the same mechanism as original code
+    let Some((publication_guard, publication_epoch)) = store.scanner_data_usage_publication_admission_guard().await else {
+        return Err(Error::other("data usage publication is blocked by data movement"));
+    };
+    if publication_epoch != expected_publication_epoch {
+        return Err(Error::other("data usage publication epoch changed before save"));
+    }
     crate::config::com::save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data)
         .await
         .map_err(Error::other)?;
+    drop(publication_guard);
 
-    cleanup_observed_data_usage_after_authoritative_save(store.as_ref(), &data_usage_info).await;
+    cleanup_observed_data_usage_after_authoritative_save_with_publication(store.as_ref(), &data_usage_info, Some(store.as_ref()))
+        .await;
 
     // Invalidate the cached snapshot so readers observe the new save on their
     // next request instead of waiting out the remaining TTL. The next cached
@@ -443,7 +462,29 @@ async fn cleanup_observed_data_usage_after_authoritative_save<S>(store: &S, auth
 where
     S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
 {
-    let (observed, revision) = match load_data_usage_for_bucket_removal(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
+    cleanup_observed_data_usage_after_authoritative_save_with_publication(store, authoritative, None).await;
+}
+
+async fn cleanup_observed_data_usage_after_authoritative_save_with_publication<S>(
+    store: &S,
+    authoritative: &DataUsageInfo,
+    publication_store: Option<&ECStore>,
+) where
+    S: EcstoreObjectIO + ObservedDataUsageSnapshotCleanup + ?Sized,
+{
+    let observed_read_admission = match publication_store {
+        Some(publication_store) => {
+            let Some((guard, epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await else {
+                return;
+            };
+            Some((guard, epoch))
+        }
+        None => None,
+    };
+    let observed_snapshot = load_data_usage_for_bucket_removal(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await;
+    let observed_read_epoch = observed_read_admission.as_ref().map(|(_, epoch)| *epoch);
+    drop(observed_read_admission);
+    let (observed, revision) = match observed_snapshot {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return,
         Err(err) => {
@@ -459,6 +500,19 @@ where
         return;
     }
 
+    let publication_guard = match publication_store {
+        Some(publication_store) => {
+            let Some((guard, publication_epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await
+            else {
+                return;
+            };
+            if observed_read_epoch.is_some_and(|expected| expected != publication_epoch) {
+                return;
+            }
+            Some(guard)
+        }
+        None => None,
+    };
     match store.delete_observed_data_usage_snapshot(&revision).await {
         Ok(()) | Err(Error::ConfigNotFound | Error::FileNotFound | Error::ObjectNotFound(_, _) | Error::PreconditionFailed) => {}
         Err(err) => {
@@ -469,6 +523,7 @@ where
             );
         }
     }
+    drop(publication_guard);
 }
 
 fn set_buckets_count_from_usage(data_usage_info: &mut DataUsageInfo) {
@@ -509,7 +564,7 @@ pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str)
 
 pub(crate) async fn remove_bucket_usage_for_namespace_change(store: &ECStore, bucket: &str) -> Result<(), Error> {
     prepare_bucket_usage_for_namespace_change(bucket, None).await?;
-    remove_bucket_usage_from_backend_with_guard(store, bucket, None).await
+    remove_bucket_usage_from_backend_with_guard_fenced(store, bucket, None).await
 }
 
 pub(crate) async fn prepare_bucket_usage_for_namespace_change(
@@ -541,6 +596,24 @@ where
     S: EcstoreObjectIO + ?Sized,
 {
     let result = remove_bucket_usage_from_backend_with_store_and_guard(store, bucket, guard).await;
+    invalidate_bucket_usage_snapshot_caches(guard, bucket).await?;
+    result
+}
+
+pub(crate) async fn remove_bucket_usage_from_backend_with_guard_fenced(
+    store: &ECStore,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error> {
+    let result = remove_bucket_usage_from_backend_with_store_and_guard_and_publication(store, bucket, guard, Some(store)).await;
+    invalidate_bucket_usage_snapshot_caches(guard, bucket).await?;
+    result
+}
+
+async fn invalidate_bucket_usage_snapshot_caches(
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    bucket: &str,
+) -> Result<(), Error> {
     let mut snapshot_cache = data_usage_snapshot_cache().write().await;
     ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache invalidation")?;
     clear_data_usage_snapshot_cache(&mut snapshot_cache);
@@ -548,7 +621,7 @@ where
     let mut admin_snapshot_cache = admin_data_usage_snapshot_cache().write().await;
     ensure_bucket_namespace_guard(guard, bucket, "admin data usage snapshot cache invalidation")?;
     clear_admin_data_usage_snapshot_cache(&mut admin_snapshot_cache);
-    result
+    Ok(())
 }
 
 async fn load_data_usage_for_bucket_removal<S>(store: &S, object: &str) -> Result<Option<(DataUsageInfo, String)>, Error>
@@ -615,40 +688,80 @@ async fn remove_bucket_usage_from_backend_with_store_and_guard<S>(
 where
     S: EcstoreObjectIO + ?Sized,
 {
+    remove_bucket_usage_from_backend_with_store_and_guard_and_publication(store, bucket, guard, None).await
+}
+
+async fn remove_bucket_usage_from_backend_with_store_and_guard_and_publication<S>(
+    store: &S,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    publication_store: Option<&ECStore>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
     ensure_bucket_namespace_guard(guard, bucket, "data usage primary cleanup")?;
+    let primary_seed_admission = match publication_store {
+        Some(publication_store) => {
+            let Some((guard, epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await else {
+                return Err(Error::other("data usage publication is blocked by data movement"));
+            };
+            Some((guard, epoch))
+        }
+        None => None,
+    };
     let primary_seed = load_data_usage_seed_for_missing_primary(store).await?;
-    remove_bucket_usage_from_object_with_retries(
+    let primary_seed_epoch = primary_seed_admission.as_ref().map(|(_, epoch)| *epoch);
+    drop(primary_seed_admission);
+    remove_bucket_usage_from_object_with_retries_and_publication(
         store,
         DATA_USAGE_OBJ_NAME_PATH.as_str(),
         bucket,
         DATA_USAGE_REMOVE_CAS_RETRIES,
         Some(&primary_seed),
         guard,
+        publication_store,
+        primary_seed_epoch,
     )
     .await?;
 
     ensure_bucket_namespace_guard(guard, bucket, "data usage backup cleanup")?;
+    let backup_seed_admission = match publication_store {
+        Some(publication_store) => {
+            let Some((guard, epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await else {
+                return Err(Error::other("data usage publication is blocked by data movement"));
+            };
+            Some((guard, epoch))
+        }
+        None => None,
+    };
     let backup_seed = load_data_usage_for_bucket_removal(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await?
         .map_or(primary_seed, |(data_usage_info, _)| data_usage_info);
-    remove_bucket_usage_from_object_with_retries(
+    let backup_seed_epoch = backup_seed_admission.as_ref().map(|(_, epoch)| *epoch);
+    drop(backup_seed_admission);
+    remove_bucket_usage_from_object_with_retries_and_publication(
         store,
         DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
         bucket,
         DATA_USAGE_REMOVE_CAS_RETRIES,
         Some(&backup_seed),
         guard,
+        publication_store,
+        backup_seed_epoch,
     )
     .await?;
 
     ensure_bucket_namespace_guard(guard, bucket, "observed data usage cleanup")?;
-    if let Err(err) = remove_bucket_usage_from_object_with_retries(
+    if let Err(err) = remove_bucket_usage_from_object_with_retries_and_publication(
         store,
         DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
         bucket,
         DATA_USAGE_REMOVE_CAS_RETRIES,
         None,
         guard,
+        publication_store,
+        None,
     )
     .await
     {
@@ -662,7 +775,17 @@ where
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
         LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
     ] {
-        remove_bucket_usage_from_object_with_retries(store, object, bucket, DATA_USAGE_REMOVE_CAS_RETRIES, None, guard).await?;
+        remove_bucket_usage_from_object_with_retries_and_publication(
+            store,
+            object,
+            bucket,
+            DATA_USAGE_REMOVE_CAS_RETRIES,
+            None,
+            guard,
+            publication_store,
+            None,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -697,9 +820,50 @@ async fn remove_bucket_usage_from_object_with_retries<S>(
 where
     S: EcstoreObjectIO + ?Sized,
 {
+    remove_bucket_usage_from_object_with_retries_and_publication(
+        store,
+        object,
+        bucket,
+        cas_retries,
+        missing_seed,
+        guard,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn remove_bucket_usage_from_object_with_retries_and_publication<S>(
+    store: &S,
+    object: &str,
+    bucket: &str,
+    cas_retries: usize,
+    missing_seed: Option<&DataUsageInfo>,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    publication_store: Option<&ECStore>,
+    expected_publication_epoch: Option<u64>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
     for attempt in 0..=cas_retries {
         ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cleanup")?;
-        let (mut data_usage_info, revision) = match load_data_usage_for_bucket_removal(store, object).await? {
+        let read_admission = match publication_store {
+            Some(publication_store) => {
+                let Some((guard, epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await else {
+                    return Err(Error::other("data usage publication is blocked by data movement"));
+                };
+                if expected_publication_epoch.is_some_and(|expected| expected != epoch) {
+                    return Err(Error::other("data usage publication epoch changed before snapshot read"));
+                }
+                Some((guard, epoch))
+            }
+            None => None,
+        };
+        let loaded_snapshot = load_data_usage_for_bucket_removal(store, object).await?;
+        let read_epoch = read_admission.as_ref().map(|(_, epoch)| *epoch);
+        drop(read_admission);
+        let (mut data_usage_info, revision) = match loaded_snapshot {
             Some((data_usage_info, revision)) => (data_usage_info, Some(revision)),
             None => match missing_seed {
                 Some(data_usage_info) => (data_usage_info.clone(), None),
@@ -723,6 +887,22 @@ where
             },
         };
         ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot commit")?;
+        let publication_guard = match publication_store {
+            Some(publication_store) => {
+                let Some((guard, publication_epoch)) = publication_store.scanner_data_usage_publication_admission_guard().await
+                else {
+                    return Err(Error::other("data usage publication is blocked by data movement"));
+                };
+                if expected_publication_epoch
+                    .or(read_epoch)
+                    .is_some_and(|expected| expected != publication_epoch)
+                {
+                    return Err(Error::other("data usage publication epoch changed before snapshot commit"));
+                }
+                Some(guard)
+            }
+            None => None,
+        };
         let save_result = store
             .put_object(
                 RUSTFS_META_BUCKET,
@@ -735,6 +915,7 @@ where
                 },
             )
             .await;
+        drop(publication_guard);
         match save_result {
             Ok(_) => return Ok(()),
             Err(err) => {

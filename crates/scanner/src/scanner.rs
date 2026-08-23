@@ -1315,7 +1315,19 @@ async fn run_data_scanner_cycle_with_budget(
     }
 
     let cycle_start = std::time::Instant::now();
-    let usage_persist_baseline = match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+    // Baseline reads are part of the same publication proof as the eventual
+    // scanner aggregate. Hold only the short storage-owned admission guard
+    // across this metadata read; the full bucket scan runs after it is
+    // released and carries the captured epoch forward.
+    let Some((baseline_publication_guard, baseline_publication_epoch)) =
+        storeapi.scanner_data_usage_publication_admission_guard().await
+    else {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    };
+    let usage_persist_baseline_result = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await;
+    drop(baseline_publication_guard);
+    let usage_persist_baseline = match usage_persist_baseline_result {
         Ok((data, revision)) => DataUsagePersistBaseline {
             data: data.map(Bytes::from),
             revision,
@@ -1352,6 +1364,13 @@ async fn run_data_scanner_cycle_with_budget(
         )
         .await;
     let publication_defer_reason = match &scan_result {
+        Ok(result)
+            if result
+                .publication_epoch()
+                .is_some_and(|publication_epoch| publication_epoch != baseline_publication_epoch) =>
+        {
+            Some(ScannerCycleDeferReason::DataMovement)
+        }
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
