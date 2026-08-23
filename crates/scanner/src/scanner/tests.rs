@@ -5281,7 +5281,7 @@ fn background_heal_read_failures_never_become_initializable_defaults() {
     );
     assert_eq!(
         classify_background_heal_read_error(&EcstoreError::SlowDown),
-        BackgroundHealInfoReadStatus::Failed
+        BackgroundHealInfoReadStatus::Transient
     );
     assert!(decode_background_heal_info(b"not-json").is_err());
 }

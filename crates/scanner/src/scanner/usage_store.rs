@@ -123,6 +123,34 @@ where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = bool> + Send,
 {
+    store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch(
+        ctx,
+        storeapi,
+        receiver,
+        leader_epoch,
+        initial_baseline,
+        None,
+        route_probe,
+    )
+    .await
+}
+
+pub(super) async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch<
+    F,
+    Fut,
+>(
+    ctx: CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    mut receiver: mpsc::Receiver<DataUsageInfo>,
+    leader_epoch: Option<u64>,
+    initial_baseline: Option<DataUsagePersistBaseline>,
+    expected_publication_epoch: Option<u64>,
+    route_probe: F,
+) -> DataUsagePersistOutcome
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = bool> + Send,
+{
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
     let mut next_baseline = initial_baseline;
 
@@ -133,6 +161,14 @@ where
         }
         if let Some(leader_epoch) = leader_epoch {
             data_usage_info.scanner_epoch = Some(leader_epoch);
+        }
+        if let Some(expected_epoch) = expected_publication_epoch
+            && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                .await
+                .is_none()
+        {
+            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            break 'updates;
         }
         let observational = data_usage_info.usage_snapshot_converged == Some(false);
         let target_path = if observational {
@@ -154,11 +190,26 @@ where
             break;
         }
 
-        let mut publication_epoch = None;
+        let mut publication_epoch = expected_publication_epoch;
         if observational && data_usage_info.usage_snapshot_authoritative_baseline.is_none() {
-            let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
-                outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
-                break 'updates;
+            let read_epoch = match expected_publication_epoch {
+                Some(expected_epoch) => {
+                    if scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                        .await
+                        .is_none()
+                    {
+                        outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break 'updates;
+                    }
+                    expected_epoch
+                }
+                None => {
+                    let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+                        outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break 'updates;
+                    };
+                    read_epoch
+                }
             };
             publication_epoch = Some(read_epoch);
             let authoritative_data = match next_baseline.as_ref() {
@@ -269,14 +320,25 @@ where
                 break 'updates;
             }
 
-            let publication_epoch = match publication_epoch.take() {
-                Some(epoch) => epoch,
-                None => {
-                    let Some(epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+            let publication_epoch_for_save = match expected_publication_epoch {
+                Some(expected_epoch) => {
+                    if scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                        .await
+                        .is_none()
+                    {
                         break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
-                    };
-                    epoch
+                    }
+                    expected_epoch
                 }
+                None => match publication_epoch.take() {
+                    Some(epoch) => epoch,
+                    None => {
+                        let Some(epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+                            break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        };
+                        epoch
+                    }
+                },
             };
             let baseline = if !observational && cas_retry == 0 {
                 next_baseline.take()
@@ -369,7 +431,7 @@ where
             let done_save = Metrics::time(Metric::SaveUsage);
             let save_result = {
                 let Some(_publication_admission) =
-                    scanner_publication_admission_for_epoch(storeapi.clone(), publication_epoch).await
+                    scanner_publication_admission_for_epoch(storeapi.clone(), publication_epoch_for_save).await
                 else {
                     done_save();
                     break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
@@ -473,7 +535,16 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                        storeapi.clone(),
+                        &data_usage_info,
+                        expected_publication_epoch,
+                    )
+                    .await;
+                    if expected_publication_epoch.is_some() && !cleanup_ok {
+                        outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break 'updates;
+                    }
                     invalidate_data_usage_snapshot_cache().await;
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
@@ -484,7 +555,16 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                        storeapi.clone(),
+                        &data_usage_info,
+                        expected_publication_epoch,
+                    )
+                    .await;
+                    if expected_publication_epoch.is_some() && !cleanup_ok {
+                        outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break 'updates;
+                    }
                     invalidate_data_usage_snapshot_cache().await;
                 }
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
@@ -506,7 +586,16 @@ where
                 if observational {
                     invalidate_admin_data_usage_snapshot_cache().await;
                 } else {
-                    cleanup_observed_data_usage_snapshot(storeapi.clone(), &data_usage_info).await;
+                    let cleanup_ok = cleanup_observed_data_usage_snapshot_for_epoch(
+                        storeapi.clone(),
+                        &data_usage_info,
+                        expected_publication_epoch,
+                    )
+                    .await;
+                    if expected_publication_epoch.is_some() && !cleanup_ok {
+                        outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+                        break 'updates;
+                    }
                     invalidate_data_usage_snapshot_cache().await;
                     replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 }
@@ -517,7 +606,8 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            let backup_result = sync_data_usage_backup_from_primary(&ctx, storeapi.clone()).await;
+            let backup_result =
+                sync_data_usage_backup_from_primary_for_epoch(&ctx, storeapi.clone(), expected_publication_epoch).await;
             done_save();
             if let Err(e) = backup_result {
                 warn!(
@@ -546,14 +636,41 @@ where
 pub(super) async fn cleanup_observed_data_usage_snapshot(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     authoritative: &DataUsageInfo,
-) {
-    let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
-        return;
+) -> bool {
+    cleanup_observed_data_usage_snapshot_for_epoch(storeapi, authoritative, None).await
+}
+
+pub(super) async fn cleanup_observed_data_usage_snapshot_for_epoch(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    authoritative: &DataUsageInfo,
+    expected_publication_epoch: Option<u64>,
+) -> bool {
+    let read_epoch = match expected_publication_epoch {
+        Some(expected_epoch) => {
+            if scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                .await
+                .is_none()
+            {
+                return false;
+            }
+            expected_epoch
+        }
+        None => match scanner_publication_epoch(storeapi.clone()).await {
+            Some(read_epoch) => read_epoch,
+            None => return false,
+        },
     };
+    if expected_publication_epoch.is_some()
+        && scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+            .await
+            .is_none()
+    {
+        return false;
+    }
     let (observed_data, revision) =
         match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await {
             Ok((Some(data), revision)) => (data, revision),
-            Ok((None, _)) => return,
+            Ok((None, _)) => return true,
             Err(err) => {
                 error!(
                     target: "rustfs::scanner",
@@ -565,7 +682,7 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
                     error = %err,
                     "Scanner could not inspect observational data usage snapshot before authoritative cleanup"
                 );
-                return;
+                return true;
             }
         };
     let observed = match serde_json::from_slice::<DataUsageInfo>(&observed_data) {
@@ -581,11 +698,11 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
                 error = %err,
                 "Scanner refused to remove an invalid observational data usage snapshot after authoritative save"
             );
-            return;
+            return true;
         }
     };
     if observed_data_usage_is_newer(&observed, authoritative) {
-        return;
+        return true;
     }
 
     let result = delete_config_with_publication_admission_for_epoch(
@@ -621,6 +738,10 @@ pub(super) async fn cleanup_observed_data_usage_snapshot(
                 error = %err,
                 "Scanner could not remove stale observational data usage snapshot after authoritative save"
             );
+            if scanner_publication_epoch_changed(&err) {
+                return false;
+            }
         }
     }
+    true
 }

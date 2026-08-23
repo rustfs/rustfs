@@ -347,7 +347,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
 
         let done_save = Metrics::time(Metric::SaveUsage);
         if let Err(e) = cache_snapshot
-            .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+            .save_with_revisions_for_epoch(store.clone(), DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
             .await
         {
             error!(
@@ -374,6 +374,24 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             cache_name = DATA_USAGE_CACHE_NAME,
             state = "lock_lost_after_save",
             "Scanner cache snapshot publish skipped after lock loss"
+        );
+        return None;
+    }
+    // The persisted-root fast path performs no PUT, so it also needs the
+    // cycle token re-admission before forwarding the root to the aggregate.
+    // This final check covers both the fast path and a successful save.
+    if scanner_publication_admission_for_epoch(store.clone(), expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        error!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            cache_name = DATA_USAGE_CACHE_NAME,
+            state = "publication_epoch_changed_before_publish",
+            "Scanner cache root publish skipped after movement epoch change"
         );
         return None;
     }

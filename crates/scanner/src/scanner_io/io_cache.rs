@@ -31,6 +31,7 @@ impl ScannerIOCache for SetDisks {
             all_buckets,
             digest: scan_plan_digest,
             leader_epoch,
+            publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
             pending_maintenance_work,
@@ -40,8 +41,11 @@ impl ScannerIOCache for SetDisks {
         let set_label = self.set_index.to_string();
 
         let source = DataUsageCacheSource::new(self.pool_index, self.set_index);
-        let Some(expected_publication_epoch) = scanner_publication_epoch(self.clone()).await else {
-            return Err(StorageError::other("scanner cache publication is blocked by data movement"));
+        let expected_publication_epoch = match publication_epoch {
+            Some(epoch) => epoch,
+            None => scanner_publication_epoch(self.clone())
+                .await
+                .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
         };
         if buckets.is_empty() {
             let now = SystemTime::now();
@@ -707,6 +711,23 @@ impl ScannerIOCache for SetDisks {
                                     cache_name = %cache_name,
                                     state = "lock_lost_before_reuse",
                                     "Current scanner bucket cache root publish skipped after lock loss"
+                                );
+                                continue;
+                            }
+                            if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch)
+                                .await
+                                .is_none()
+                            {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                error!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "publication_epoch_changed_before_reuse",
+                                    "Current scanner bucket cache root publish skipped after movement epoch change"
                                 );
                                 continue;
                             }

@@ -64,6 +64,7 @@ impl ECStore {
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();
         let mut meta_to_save = None;
+        let mut movement_changed = false;
 
         {
             let mut rebalance_meta = self.rebalance_meta.write().await;
@@ -86,9 +87,11 @@ impl ECStore {
             let now = OffsetDateTime::now_utc();
             if complete_rebalance_pools_at_goal(meta, now) {
                 meta_to_save = Some(meta.clone());
+                movement_changed = true;
             }
             if complete_rebalance_pools_with_empty_queue(meta, now) {
                 meta_to_save = Some(meta.clone());
+                movement_changed = true;
             }
             meta.cancel = Some(cancel_tx);
 
@@ -127,7 +130,7 @@ impl ECStore {
                 reason = "no_participants",
                 "Skipped rebalance start because no pools are participating"
             );
-            return Ok(false);
+            return Ok(movement_changed);
         }
 
         let mut workers_started = 0usize;
@@ -195,7 +198,7 @@ impl ECStore {
                 reason = "no_local_participants",
                 "Skipped rebalance start because no local pools are participating"
             );
-            return Ok(false);
+            return Ok(movement_changed);
         }
 
         info!(

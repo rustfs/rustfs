@@ -33,6 +33,7 @@ pub(super) enum BackgroundHealInfoReadStatus {
     Loaded,
     Missing,
     Blocked,
+    Transient,
     Failed,
 }
 
@@ -46,7 +47,7 @@ pub(super) fn classify_background_heal_read_error(error: &EcstoreError) -> Backg
     if matches!(error, EcstoreError::ConfigNotFound) {
         BackgroundHealInfoReadStatus::Missing
     } else {
-        BackgroundHealInfoReadStatus::Failed
+        BackgroundHealInfoReadStatus::Transient
     }
 }
 
@@ -109,7 +110,7 @@ pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>)
         },
         Err(e) => {
             let status = classify_background_heal_read_error(&e);
-            if status == BackgroundHealInfoReadStatus::Failed {
+            if status == BackgroundHealInfoReadStatus::Transient {
                 warn!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_BACKGROUND_HEAL_STATE,

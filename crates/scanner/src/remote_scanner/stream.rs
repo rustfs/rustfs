@@ -22,7 +22,8 @@ use crate::scanner_io::{
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
-    DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle, scanner_publication_epoch,
+    DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_common::heal_channel::HealScanMode;
@@ -709,6 +710,14 @@ async fn scan_and_persist_local_bucket(
             if guard.is_lock_lost() {
                 return Err(RemoteScannerServerError::worker(
                     "remote namespace scanner cache lock was lost before reusing the current snapshot",
+                ));
+            }
+            if scanner_publication_admission_for_epoch(set.clone(), expected_publication_epoch)
+                .await
+                .is_none()
+            {
+                return Err(RemoteScannerServerError::worker(
+                    "remote namespace scanner cache publication epoch changed before reusing the current snapshot",
                 ));
             }
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {

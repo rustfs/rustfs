@@ -1388,6 +1388,17 @@ pub(super) async fn persist_scanner_cycle_state(
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
 ) -> bool {
+    persist_scanner_cycle_state_for_epoch(ctx, storeapi, cycle_info, revision, leader_epoch, None).await
+}
+
+pub(super) async fn persist_scanner_cycle_state_for_epoch(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    expected_publication_epoch: Option<u64>,
+) -> bool {
     let buf = match encode_scanner_cycle_state(cycle_info, leader_epoch) {
         Ok(buf) => buf,
         Err(e) => {
@@ -1425,6 +1436,9 @@ pub(super) async fn persist_scanner_cycle_state(
         let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
             return false;
         };
+        if expected_publication_epoch.is_some_and(|expected| expected != read_epoch) {
+            return false;
+        }
         let save_result = {
             let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
                 error!(
@@ -1467,6 +1481,13 @@ pub(super) async fn persist_scanner_cycle_state(
                         retry,
                         "Scanner state save completed after the leader fence was cancelled"
                     );
+                    return false;
+                }
+                if let Some(expected_epoch) = expected_publication_epoch
+                    && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                        .await
+                        .is_none()
+                {
                     return false;
                 }
                 debug!(
@@ -1560,6 +1581,13 @@ pub(super) async fn persist_scanner_cycle_state(
                     }
 
                     if persisted_cycle.next >= cycle_info.next {
+                        if let Some(expected_epoch) = expected_publication_epoch
+                            && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                                .await
+                                .is_none()
+                        {
+                            return false;
+                        }
                         *cycle_info = persisted_cycle;
                         debug!(
                             target: "rustfs::scanner",
@@ -1628,11 +1656,24 @@ pub(super) async fn finalize_partial_scan_cycle(
     leader_epoch: u64,
     cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
 ) -> bool {
+    finalize_partial_scan_cycle_for_epoch(ctx, storeapi, cycle_info, revision, leader_epoch, cycle_metrics_guard, None).await
+}
+
+pub(super) async fn finalize_partial_scan_cycle_for_epoch(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
+    expected_publication_epoch: Option<u64>,
+) -> bool {
     // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
     // must still advance (and persist) because per-bucket next_cycle is stamped from
     // it and compacted folders are only rescanned when their hash matches
     // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
     // expiry and usage refresh on every folder outside the stuck window.
+    let previous_cycle_info = cycle_info.clone();
     if let Err(err) = advance_scanner_cycle(cycle_info) {
         error!(
             target: "rustfs::scanner",
@@ -1648,7 +1689,23 @@ pub(super) async fn finalize_partial_scan_cycle(
     }
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
-    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    let persisted = persist_scanner_cycle_state_for_epoch(
+        ctx,
+        storeapi.clone(),
+        cycle_info,
+        revision,
+        leader_epoch,
+        expected_publication_epoch,
+    )
+    .await;
+    if !persisted
+        && let Some(expected_epoch) = expected_publication_epoch
+        && scanner_publication_admission_for_epoch(storeapi, expected_epoch)
+            .await
+            .is_none()
+    {
+        *cycle_info = previous_cycle_info;
+    }
     cycle_metrics_guard.finish(cycle_info.clone()).await;
     persisted
 }
@@ -1661,6 +1718,29 @@ pub(super) async fn persist_required_scanner_cycle_floor(
     leader_epoch: u64,
     required_cycle: u64,
     cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
+) -> bool {
+    persist_required_scanner_cycle_floor_for_epoch(
+        ctx,
+        storeapi,
+        cycle_info,
+        revision,
+        leader_epoch,
+        required_cycle,
+        cycle_metrics_guard,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn persist_required_scanner_cycle_floor_for_epoch(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    required_cycle: u64,
+    cycle_metrics_guard: &mut ScannerCycleMetricsGuard,
+    expected_publication_epoch: Option<u64>,
 ) -> bool {
     if required_cycle <= cycle_info.current || required_cycle == u64::MAX {
         error!(
@@ -1677,10 +1757,27 @@ pub(super) async fn persist_required_scanner_cycle_floor(
         return false;
     }
 
+    let previous_cycle_info = cycle_info.clone();
     cycle_info.next = cycle_info.next.max(required_cycle);
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
-    let persisted = persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await;
+    let persisted = persist_scanner_cycle_state_for_epoch(
+        ctx,
+        storeapi.clone(),
+        cycle_info,
+        revision,
+        leader_epoch,
+        expected_publication_epoch,
+    )
+    .await;
+    if !persisted
+        && let Some(expected_epoch) = expected_publication_epoch
+        && scanner_publication_admission_for_epoch(storeapi, expected_epoch)
+            .await
+            .is_none()
+    {
+        *cycle_info = previous_cycle_info;
+    }
     cycle_metrics_guard.finish(cycle_info.clone()).await;
     persisted
 }
