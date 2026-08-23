@@ -278,4 +278,9 @@ listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
 moving e2e tests so acceptance numbers in the test-strategy issues
 (backlog#1147–#1155) stay auditable. When a profile membership change is
 intentional, review its JSON listing before updating the matching
-`.config/e2e-*-selection.txt` test-ID digest.
+`.config/e2e-*-selection.txt` test-ID digest. Update only the platform that
+produced the listing:
+
+```bash
+python3 scripts/check_test_wiring.py --update-profile e2e-full /path/to/listing.json linux
+```
