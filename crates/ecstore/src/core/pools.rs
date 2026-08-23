@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::bucket::replication::replication_state_from_filemeta;
+#[cfg(test)]
+use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
@@ -967,6 +969,7 @@ fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
+#[cfg(test)]
 fn load_decommission_entry_versions(entry: &MetaCacheEntry, bucket: &str, stage: &str) -> Result<FileInfoVersions> {
     entry
         .file_info_versions(bucket)
@@ -1935,6 +1938,53 @@ async fn run_decommission_cleanup_mutation_hook(bucket: &str, object: &str, atte
         .clone();
     if let Some(hook) = hook {
         hook(bucket, object, attempt).await;
+    }
+}
+
+const DECOMMISSION_FREE_VERSION_MIGRATED_REASON: &str = "tier_free_version_migrated";
+const DECOMMISSION_FREE_VERSION_CONSUMED_REASON: &str = "tier_free_version_already_consumed";
+const DECOMMISSION_FREE_VERSION_RETAINED_REASON: &str = "tier_free_version_migration_failed";
+const DECOMMISSION_FREE_VERSION_SWEEP_REASON: &str = "tier_free_version_unresolved_after_decommission";
+const DECOMMISSION_FREE_VERSION_DISPOSITION_REASON: &str = "tier_free_version_disposition_recorded";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DecommissionFreeVersionDisposition {
+    migrated: usize,
+    consumed: usize,
+    retained: usize,
+}
+
+impl DecommissionFreeVersionDisposition {
+    fn record_migrated(&mut self) {
+        self.migrated += 1;
+    }
+
+    fn record_consumed(&mut self) {
+        self.consumed += 1;
+    }
+
+    fn record_retained(&mut self) {
+        self.retained += 1;
+    }
+
+    fn total(self) -> usize {
+        self.migrated.saturating_add(self.consumed).saturating_add(self.retained)
+    }
+}
+
+enum DecommissionFreeVersionAttempt {
+    Migrated,
+    Consumed,
+    CapacityFailure(Error),
+    Retry(Error),
+}
+
+fn classify_decommission_free_version_attempt(result: Result<()>) -> DecommissionFreeVersionAttempt {
+    match result {
+        Ok(()) => DecommissionFreeVersionAttempt::Migrated,
+        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => DecommissionFreeVersionAttempt::Consumed,
+        Err(err) if is_decommission_target_capacity_error(&err) => DecommissionFreeVersionAttempt::CapacityFailure(err),
+        Err(err) => DecommissionFreeVersionAttempt::Retry(err),
     }
 }
 
@@ -3414,8 +3464,12 @@ fn determine_decommission_final_state(items_failed: usize, was_cancelled: bool) 
     }
 }
 
-fn decommission_remaining_version_count(total_versions: usize, expired: usize) -> usize {
-    total_versions.saturating_sub(expired)
+fn decommission_remaining_version_count(versions: &[rustfs_filemeta::FileInfo], expired: usize) -> usize {
+    versions
+        .iter()
+        .filter(|version| !version.tier_free_version())
+        .count()
+        .saturating_sub(expired)
 }
 
 fn should_skip_decommission_delete_marker(
@@ -3478,6 +3532,7 @@ fn decommission_remote_tiered_opts(
         user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
+        incl_free_versions: version.tier_free_version(),
         include_part_checksums: true,
         http_preconditions: Some(data_movement::data_movement_target_precondition()),
         expected_bucket_incarnation_id,
@@ -4848,6 +4903,7 @@ impl ECStore {
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
+        let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut entry_blocked = false;
 
@@ -4856,6 +4912,115 @@ impl ECStore {
                 rx.cancel();
             }
             decommission_cancel_signal_result(rx.is_cancelled())?;
+
+            if version.tier_free_version() {
+                let version_id = version.version_id.map(|v| v.to_string());
+                let mut migration_error = None;
+                let mut migrated = false;
+                let mut consumed = false;
+                let mut capacity_failure = false;
+                for _ in 0..3 {
+                    match classify_decommission_free_version_attempt(
+                        run_decommission_side_effect(&rx, &operation_gate, || async {
+                            self.decommission_tiered_object(
+                                bucket.as_str(),
+                                &version.name,
+                                version,
+                                &decommission_remote_tiered_opts(
+                                    version,
+                                    version_id.clone(),
+                                    idx,
+                                    expected_bucket_incarnation_id,
+                                ),
+                            )
+                            .await
+                        })
+                        .await,
+                    ) {
+                        DecommissionFreeVersionAttempt::Migrated => {
+                            migrated = true;
+                            migration_error = None;
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::Consumed => {
+                            consumed = true;
+                            migration_error = None;
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::CapacityFailure(err) => {
+                            capacity_failure = true;
+                            migration_error = Some(err);
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::Retry(err) => migration_error = Some(err),
+                    }
+                }
+
+                if counted_versions.insert((version.version_id, version.deleted)) {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    ensure_decommission_generation(&pool_meta, idx, generation)?;
+                    if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, !migrated && !consumed) {
+                        return Err(with_decommission_entry_context(
+                            "count_decommission_item",
+                            bucket.as_str(),
+                            entry.name.as_str(),
+                            err,
+                        ));
+                    }
+                }
+
+                if migrated || consumed {
+                    decommissioned += 1;
+                    cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
+                }
+                if migrated {
+                    free_version_disposition.record_migrated();
+                } else if consumed {
+                    free_version_disposition.record_consumed();
+                } else {
+                    free_version_disposition.record_retained();
+                }
+
+                debug!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %version.name,
+                    version_id = ?version_id,
+                    result = ?migration_error,
+                    reason = if migrated {
+                        DECOMMISSION_FREE_VERSION_MIGRATED_REASON
+                    } else if consumed {
+                        DECOMMISSION_FREE_VERSION_CONSUMED_REASON
+                    } else {
+                        DECOMMISSION_FREE_VERSION_RETAINED_REASON
+                    },
+                    state = if migrated {
+                        "free_version_migrated"
+                    } else if consumed {
+                        "free_version_consumed"
+                    } else {
+                        "free_version_retained"
+                    },
+                    "Decommission free-version disposition recorded"
+                );
+
+                if capacity_failure {
+                    return Err(with_decommission_entry_context(
+                        "decommission_tier_free_version",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        migration_error.expect("capacity failure must retain its error"),
+                    ));
+                }
+
+                if !migrated && !consumed {
+                    break;
+                }
+                continue;
+            }
 
             if run_decommission_side_effect(&rx, &operation_gate, || async {
                 should_skip_lifecycle_for_data_movement(
@@ -4877,7 +5042,7 @@ impl ECStore {
                 continue;
             }
 
-            let remaining_versions = decommission_remaining_version_count(fivs.versions.len(), expired);
+            let remaining_versions = decommission_remaining_version_count(&fivs.versions, expired);
             if should_skip_decommission_delete_marker(version, remaining_versions, replication_config.is_some()) {
                 //
                 decommissioned += 1;
@@ -5343,6 +5508,24 @@ impl ECStore {
             }
         }
 
+        if free_version_disposition.total() > 0 {
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                free_versions_migrated = free_version_disposition.migrated,
+                free_versions_consumed = free_version_disposition.consumed,
+                free_versions_retained = free_version_disposition.retained,
+                free_versions_total = free_version_disposition.total(),
+                reason = DECOMMISSION_FREE_VERSION_DISPOSITION_REASON,
+                state = "free_version_disposition",
+                "Decommission free-version disposition summary"
+            );
+        }
+
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) && durable_ilm_record.is_none()
         {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
@@ -5591,6 +5774,36 @@ impl ECStore {
             None,
             expected_bucket_incarnation_id,
             source_changed_exhaustions,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_entry_for_test_with_bucket_incarnation(
+        self: &Arc<Self>,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+    ) -> Result<()> {
+        let expected_bucket_incarnation_id = if is_meta_bucketname(&bucket) {
+            None
+        } else {
+            Some(self.bucket_incarnation_id_from_disk(&bucket).await?)
+        };
+        let generation = self.active_decommission_generation(idx).await?;
+        self.decommission_entry(
+            CancellationToken::new(),
+            idx,
+            generation,
+            entry,
+            bucket,
+            set,
+            None,
+            None,
+            None,
+            expected_bucket_incarnation_id,
+            Arc::new(AtomicUsize::new(0)),
         )
         .await
     }
@@ -6263,30 +6476,6 @@ impl ECStore {
         warn!("decommission: decommission_pool bucket_done {}", &bucket.name);
 
         Ok(())
-    }
-
-    async fn decommission_buckets_concurrently(
-        self: &Arc<Self>,
-        rx: CancellationToken,
-        idx: usize,
-        pool: Arc<Sets>,
-        buckets: Vec<DecomBucketInfo>,
-        entry_budget: Arc<Semaphore>,
-        source_changed_exhaustions: Arc<AtomicUsize>,
-    ) -> Result<()> {
-        let store = Arc::clone(self);
-        run_decommission_buckets_bounded(rx, buckets, decommission_bucket_concurrency_limit(), move |bucket, rx| {
-            let store = Arc::clone(&store);
-            let pool = pool.clone();
-            let entry_budget = entry_budget.clone();
-            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
-            Box::pin(async move {
-                store
-                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
-                    .await
-            })
-        })
-        .await
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -7539,11 +7728,14 @@ impl ECStore {
                             return;
                         }
 
-                        let fivs = match load_decommission_entry_versions(
+                        let fivs = match load_decommission_entry_exact_versions(
+                            &source_set,
                             &entry,
                             &bucket_name,
                             "check_after_decommission.file_info_versions",
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(fivs) => fivs,
                             Err(err) => {
                                 let mut first_err = entry_error.lock().await;
@@ -7556,7 +7748,23 @@ impl ECStore {
                         };
 
                         let mut remaining = 0;
-                        for version in &fivs.versions {
+                        for version in fivs.versions.iter().chain(fivs.free_versions.iter()) {
+                            if version.tier_free_version() {
+                                remaining += 1;
+                                debug!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    pool_index = idx,
+                                    bucket = %bucket_name,
+                                    object = %entry.name,
+                                    version_id = ?version.version_id,
+                                    reason = DECOMMISSION_FREE_VERSION_SWEEP_REASON,
+                                    state = "free_version_retained",
+                                    "Decommission final sweep retained a free version"
+                                );
+                                continue;
+                            }
                             if version.deleted {
                                 continue;
                             }
@@ -7897,13 +8105,6 @@ mod tests {
     }
 
     #[test]
-    fn decommission_remaining_version_count_excludes_only_expired_versions() {
-        assert_eq!(decommission_remaining_version_count(1, 0), 1);
-        assert_eq!(decommission_remaining_version_count(2, 1), 1);
-        assert_eq!(decommission_remaining_version_count(1, 1), 0);
-    }
-
-    #[test]
     fn lifecycle_action_removes_data_movement_version_rejects_delete_marker_action() {
         assert!(!lifecycle_action_removes_data_movement_version(IlmAction::DeleteAction));
     }
@@ -7957,6 +8158,21 @@ mod tests {
             "object".to_string(),
             "version".to_string()
         )));
+    }
+
+    #[test]
+    fn decommission_free_version_attempt_treats_missing_source_as_consumed() {
+        let attempt =
+            classify_decommission_free_version_attempt(Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())));
+
+        assert!(matches!(attempt, DecommissionFreeVersionAttempt::Consumed));
+    }
+
+    #[test]
+    fn decommission_free_version_attempt_preserves_capacity_failure() {
+        let attempt = classify_decommission_free_version_attempt(Err(Error::DiskFull));
+
+        assert!(matches!(attempt, DecommissionFreeVersionAttempt::CapacityFailure(Error::DiskFull)));
     }
 
     #[test]
@@ -8134,6 +8350,12 @@ mod tests {
         assert!(opts.include_part_checksums);
         assert!(opts.http_preconditions.is_some());
         assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
+        assert!(!opts.incl_free_versions);
+
+        let mut free_version = version;
+        free_version.set_tier_free_version();
+        let free_opts = decommission_remote_tiered_opts(&free_version, Some("free-version-id".to_string()), 9, Some(incarnation));
+        assert!(free_opts.incl_free_versions);
     }
 
     #[test]
