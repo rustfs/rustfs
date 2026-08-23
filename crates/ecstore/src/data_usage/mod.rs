@@ -75,6 +75,13 @@ struct CachedBucketUsage {
     pending_scanner_position: Option<(u64, u64)>,
     // Deletes are visible to admin immediately, but quota admission keeps
     // them pending until a complete scanner generation reconciles the set.
+    // This marker intentionally remains process-local: the delete request
+    // updates this overlay before the scanner writes a durable snapshot. If
+    // the process restarts first, loading the persisted complete snapshot
+    // restores the pre-reconciliation (larger) baseline, which is
+    // conservative for quota admission. A persisted post-delete snapshot is
+    // necessarily a complete scanner reconciliation and therefore creates a
+    // fresh cache entry with no pending hold.
     pending_negative_delta: u64,
 }
 
@@ -4742,13 +4749,26 @@ mod tests {
     async fn negative_delta_waits_for_set_reconciliation() {
         clear_usage_memory_cache_for_test().await;
 
-        let baseline = data_usage_info_for_test("bucket-a", 1, 100, SystemTime::now());
+        let baseline = data_usage_info_for_test(
+            "bucket-a",
+            1,
+            100,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        );
         replace_bucket_usage_memory_from_info(&baseline).await;
         record_bucket_object_delete_memory("bucket-a", 25, true).await;
 
         assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(100));
 
-        let reconciled = data_usage_info_for_test("bucket-a", 0, 75, SystemTime::now() + Duration::from_secs(1));
+        // Simulate a process restart: the request-path overlay is gone, but
+        // the persisted authoritative snapshot is still the pre-reconciliation
+        // baseline. Quota must remain conservative until a complete scanner
+        // result proves the delete.
+        clear_usage_memory_cache_for_test().await;
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(100));
+
+        let reconciled = data_usage_info_for_test("bucket-a", 0, 75, SystemTime::UNIX_EPOCH + Duration::from_secs(101));
         replace_bucket_usage_memory_from_info(&reconciled).await;
         assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(75));
     }
