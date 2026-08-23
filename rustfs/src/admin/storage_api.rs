@@ -51,7 +51,7 @@ mod ecstore_disk {
 }
 
 mod ecstore_error {
-    pub(crate) use crate::storage::storage_api::ecstore_error::StorageError;
+    pub(crate) use crate::storage::storage_api::ecstore_error::{StorageError, is_err_bucket_not_found};
 }
 
 #[allow(unused_imports)]
@@ -919,6 +919,7 @@ pub(crate) mod contract {
 }
 
 pub(crate) mod error {
+    pub(crate) use super::ecstore_error::is_err_bucket_not_found;
     pub(crate) use super::{Error, StorageError};
 }
 
