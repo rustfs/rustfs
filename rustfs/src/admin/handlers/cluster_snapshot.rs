@@ -245,6 +245,7 @@ pub(crate) struct ClusterUsageFreshnessStatus {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_success_unix_secs: Option<u64>,
+    pub last_durable_success_unix_secs: u64,
     pub last_error: Option<String>,
     pub deferred_pending: bool,
     pub deferred_total: u64,
@@ -760,8 +761,8 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
             ),
         }
     };
-    let last_success_unix_secs = (freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0)
-        .then_some(freshness.last_usage_save_unix_secs);
+    let last_success_unix_secs =
+        (freshness.last_durable_success_unix_secs > 0).then_some(freshness.last_durable_success_unix_secs);
     let last_error = match freshness.last_usage_save_result.as_str() {
         "failed" | "skipped_stale" | "encode_failed" => Some(freshness.last_usage_save_result.clone()),
         _ => None,
@@ -779,6 +780,7 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
         last_usage_save_unix_secs: freshness.last_usage_save_unix_secs,
         last_usage_save_result: freshness.last_usage_save_result.clone(),
         last_success_unix_secs,
+        last_durable_success_unix_secs: freshness.last_durable_success_unix_secs,
         last_error,
         deferred_pending: freshness.deferred_pending,
         deferred_total: freshness.deferred_total,
@@ -1322,6 +1324,7 @@ mod tests {
             usage_freshness: ClusterUsageFreshnessSnapshot {
                 dirty_pending_buckets: 0,
                 last_usage_save_unix_secs: 456,
+                last_durable_success_unix_secs: 450,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
                 ..Default::default()
@@ -1335,6 +1338,7 @@ mod tests {
         assert_eq!(component.condition, "healthy");
         assert_eq!(component.last_usage_save_unix_secs, 456);
         assert_eq!(component.last_usage_save_result, "success");
+        assert_eq!(component.last_success_unix_secs, Some(450));
     }
 
     #[test]

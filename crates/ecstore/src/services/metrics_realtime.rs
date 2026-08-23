@@ -220,6 +220,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             last_usage_save_unix_secs: metrics.usage_freshness.last_usage_save_unix_secs,
             last_usage_save_result: metrics.usage_freshness.last_usage_save_result,
             last_usage_save_result_code: metrics.usage_freshness.last_usage_save_result_code,
+            last_durable_success_unix_secs: metrics.usage_freshness.last_durable_success_unix_secs,
             deferred_pending: metrics.usage_freshness.deferred_pending,
             deferred_total: metrics.usage_freshness.deferred_total,
             last_deferred_unix_secs: metrics.usage_freshness.last_deferred_unix_secs,

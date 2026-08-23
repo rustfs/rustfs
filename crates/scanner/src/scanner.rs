@@ -1256,6 +1256,7 @@ async fn run_data_scanner_cycle_with_budget(
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let usage_persist_outcome = match publication_defer_reason {
         Some(reason) => {
+            global_metrics().record_scanner_usage_deferred(reason.as_str());
             drop(receiver);
             DataUsagePersistOutcome::Deferred(reason)
         }
@@ -1558,6 +1559,7 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "deferred",
                 "Scanner cycle deferred before usage scanning began"
             );
+            global_metrics().record_scanner_usage_deferred(reason.as_str());
             emit_scan_cycle_deferred(cycle_start.elapsed());
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Deferred(reason);

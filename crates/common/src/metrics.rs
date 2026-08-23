@@ -918,6 +918,7 @@ pub struct Metrics {
     scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
     scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
     scanner_usage_last_save_unix_secs: AtomicU64,
+    scanner_usage_last_durable_success_unix_secs: AtomicU64,
     scanner_usage_last_save_result: AtomicU8,
     scanner_usage_deferred_pending: AtomicBool,
     scanner_usage_deferred_total: AtomicU64,
@@ -1220,6 +1221,8 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_usage_save_result_code: u64,
+    #[serde(default)]
+    pub last_durable_success_unix_secs: u64,
     #[serde(default)]
     pub deferred_pending: bool,
     #[serde(default)]
@@ -1957,6 +1960,7 @@ impl Metrics {
             scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
             scanner_usage_last_save_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_durable_success_unix_secs: AtomicU64::new(0),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_usage_deferred_pending: AtomicBool::new(false),
             scanner_usage_deferred_total: AtomicU64::new(0),
@@ -2301,6 +2305,8 @@ impl Metrics {
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
+        self.scanner_usage_last_durable_success_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
         self.scanner_usage_deferred_pending.store(false, Ordering::Release);
     }
 
@@ -3326,6 +3332,7 @@ impl Metrics {
             last_usage_save_unix_secs: self.scanner_usage_last_save_unix_secs.load(Ordering::Relaxed),
             last_usage_save_result: usage_save_result.as_str().to_string(),
             last_usage_save_result_code: usage_save_result as u8 as u64,
+            last_durable_success_unix_secs: self.scanner_usage_last_durable_success_unix_secs.load(Ordering::Relaxed),
             deferred_pending: self.scanner_usage_deferred_pending.load(Ordering::Acquire),
             deferred_total: self.scanner_usage_deferred_total.load(Ordering::Relaxed),
             last_deferred_unix_secs: self.scanner_usage_last_deferred_unix_secs.load(Ordering::Relaxed),
@@ -4725,6 +4732,7 @@ mod tests {
         let report = metrics.report().await;
         assert!(!report.usage_freshness.deferred_pending);
         assert_eq!(report.usage_freshness.deferred_total, 1);
+        assert!(report.usage_freshness.last_durable_success_unix_secs > 0);
     }
 
     #[tokio::test]

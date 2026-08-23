@@ -302,6 +302,8 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_result: String,
     #[serde(rename = "last_usage_save_result_code", default)]
     pub last_usage_save_result_code: u64,
+    #[serde(rename = "last_durable_success_unix_secs", default)]
+    pub last_durable_success_unix_secs: u64,
     #[serde(rename = "deferred_pending", default)]
     pub deferred_pending: bool,
     #[serde(rename = "deferred_total", default)]
@@ -326,8 +328,15 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_usage_save_result = other.last_usage_save_result.clone();
             self.last_usage_save_result_code = other.last_usage_save_result_code;
         }
-        self.deferred_pending |= other.deferred_pending;
+        self.last_durable_success_unix_secs = self.last_durable_success_unix_secs.max(other.last_durable_success_unix_secs);
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
+        let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
+        if other_deferred_state_at > self_deferred_state_at {
+            self.deferred_pending = other.deferred_pending;
+        } else if other_deferred_state_at == self_deferred_state_at {
+            self.deferred_pending |= other.deferred_pending;
+        }
         if other.last_deferred_unix_secs > self.last_deferred_unix_secs {
             self.last_deferred_unix_secs = other.last_deferred_unix_secs;
             self.last_deferred_reason = other.last_deferred_reason.clone();
@@ -1608,6 +1617,14 @@ mod tests {
         assert_eq!(merged.deferred_total, 3);
         assert_eq!(merged.last_deferred_unix_secs, 20);
         assert_eq!(merged.last_deferred_reason, "data_movement");
+
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: false,
+            last_durable_success_unix_secs: 30,
+            ..Default::default()
+        });
+        assert!(!merged.deferred_pending);
+        assert_eq!(merged.last_durable_success_unix_secs, 30);
     }
 
     #[test]
