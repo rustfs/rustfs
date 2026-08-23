@@ -509,6 +509,16 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
         .expect_err("CA symlink must fail");
     assert!(matches!(error, RegistrationBootstrapError::RootCaFileSecurity));
 
+    for mode in [0o664, 0o646] {
+        fs::set_permissions(&root, fs::Permissions::from_mode(mode)).expect("make CA writable by another user");
+        let error =
+            register_from_protected_input(endpoint, &root, &temp.path().join(format!("writable-ca-{mode:o}")), Some(&token))
+                .await
+                .expect_err("group/world-writable CA must fail");
+        assert!(matches!(error, RegistrationBootstrapError::RootCaFileSecurity));
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).expect("restore CA mode");
+
     let shared_state = temp.path().join("shared-state");
     fs::create_dir(&shared_state).expect("shared state directory");
     fs::set_permissions(&shared_state, fs::Permissions::from_mode(0o770)).expect("make state group-writable");

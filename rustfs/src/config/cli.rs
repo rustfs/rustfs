@@ -132,7 +132,7 @@ pub struct ConnectOpts {
 /// Allow-listed RustFS Connect operations
 #[derive(Subcommand, Clone)]
 pub enum ConnectCommands {
-    /// Exchange a protected one-time token for a durable device credential
+    /// Exchange a protected one-time token for a durable device credential (Unix only)
     Register(ConnectRegisterOpts),
 }
 
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn connect_register_has_no_token_value_or_environment_option() {
         for forbidden in ["--token", "--registration-token", "--token-env"] {
-            let error = Cli::try_parse_from([
+            let result = Cli::try_parse_from([
                 "rustfs",
                 "connect",
                 "register",
@@ -594,9 +594,22 @@ mod tests {
                 "/var/lib/rustfs/connect",
                 forbidden,
                 "secret",
-            ])
-            .expect_err("secret-bearing command-line options must be rejected");
+            ]);
+            let Err(error) = result else {
+                panic!("secret-bearing command-line options must be rejected");
+            };
             assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         }
+    }
+
+    #[test]
+    fn connect_register_help_states_the_unix_only_security_scope() {
+        let result = Cli::try_parse_from(["rustfs", "connect", "register", "--help"]);
+        let Err(help) = result else {
+            panic!("help exits without running registration");
+        };
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("Unix only"));
     }
 }

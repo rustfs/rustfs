@@ -38,7 +38,7 @@ pub struct RegistrationBootstrapResult {
 pub enum RegistrationBootstrapError {
     #[error("the Connect registration token file must be an owner-readable, owner-only regular file")]
     TokenFileSecurity,
-    #[error("the Connect root CA file must be a regular file")]
+    #[error("the Connect root CA file must be a trusted, non-shared-writable regular file")]
     RootCaFileSecurity,
     #[error("the Connect state path must be an explicit directory, not a symlink")]
     StateDirectorySecurity,
@@ -106,6 +106,14 @@ pub async fn register_from_protected_input(
 
 #[cfg(unix)]
 fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrapError> {
+    prepare_state_directory_with_sync(path, sync_directory)
+}
+
+#[cfg(unix)]
+fn prepare_state_directory_with_sync(
+    path: &Path,
+    mut sync: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<PathBuf, RegistrationBootstrapError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -117,14 +125,20 @@ fn prepare_state_directory(path: &Path) -> Result<PathBuf, RegistrationBootstrap
     for directory in &directories {
         ensure_directory(directory, directory == &path)?;
     }
-    for directory in [path.join("identity"), path.join("credential")] {
-        ensure_directory(&directory, true)?;
+    let store_directories = [path.join("identity"), path.join("credential")];
+    for directory in &store_directories {
+        ensure_directory(directory, true)?;
     }
-    for directory in directories {
-        validate_directory(&directory, directory == path)?;
+    for directory in &directories {
+        validate_directory(directory, directory == &path)?;
     }
-    for directory in [path.join("identity"), path.join("credential")] {
-        validate_directory(&directory, true)?;
+    for directory in &store_directories {
+        validate_directory(directory, true)?;
+    }
+    // Repeat the complete leaf-to-root sync chain even for existing entries. A retry after a
+    // previous sync failure must not reach registration while an ancestor is still non-durable.
+    for directory in store_directories.iter().chain(directories.iter().rev()) {
+        sync(directory).map_err(RegistrationBootstrapError::Input)?;
     }
 
     Ok(path)
@@ -149,6 +163,11 @@ fn ensure_directory(path: &Path, require_process_owner: bool) -> Result<(), Regi
 }
 
 #[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(unix)]
 fn validate_directory(path: &Path, require_process_owner: bool) -> Result<(), RegistrationBootstrapError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -169,8 +188,9 @@ fn unix_directory_is_trusted(owner_uid: u32, mode: u32, process_uid: u32, requir
 }
 
 #[cfg(unix)]
+// SAFETY: geteuid has no pointer arguments or caller preconditions.
+#[allow(unsafe_code)]
 fn process_uid() -> u32 {
-    // SAFETY: geteuid has no pointer arguments or caller preconditions.
     unsafe { libc::geteuid() }
 }
 
@@ -205,20 +225,31 @@ fn open_regular_file(path: &Path, owner_only: bool) -> Result<File, Registration
     if !metadata.is_file() {
         return Err(insecure());
     }
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let mode = metadata.permissions().mode() & 0o777;
     if owner_only {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let mode = metadata.permissions().mode() & 0o777;
         if metadata.uid() != process_uid() || mode & 0o400 == 0 || mode & 0o177 != 0 {
             return Err(RegistrationBootstrapError::TokenFileSecurity);
         }
+    } else if !unix_ca_file_is_trusted(metadata.uid(), mode, process_uid()) {
+        return Err(RegistrationBootstrapError::RootCaFileSecurity);
     }
     Ok(file)
 }
 
+#[cfg(unix)]
+fn unix_ca_file_is_trusted(owner_uid: u32, mode: u32, process_uid: u32) -> bool {
+    (owner_uid == process_uid || owner_uid == 0) && mode & 0o022 == 0
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::unix_directory_is_trusted;
+    use std::cell::RefCell;
+    use std::io;
+
+    use super::{
+        RegistrationBootstrapError, prepare_state_directory_with_sync, unix_ca_file_is_trusted, unix_directory_is_trusted,
+    };
 
     #[test]
     fn unix_directory_policy_rejects_wrong_owners_and_writable_modes_only() {
@@ -231,6 +262,44 @@ mod tests {
         assert!(!unix_directory_is_trusted(process_uid + 1, 0o700, process_uid, false));
         assert!(!unix_directory_is_trusted(process_uid, 0o720, process_uid, true));
         assert!(!unix_directory_is_trusted(process_uid, 0o702, process_uid, true));
+    }
+
+    #[test]
+    fn unix_ca_policy_accepts_only_process_or_root_owned_non_writable_files() {
+        let process_uid = 501;
+
+        assert!(unix_ca_file_is_trusted(process_uid, 0o600, process_uid));
+        assert!(unix_ca_file_is_trusted(0, 0o644, process_uid));
+        assert!(!unix_ca_file_is_trusted(process_uid + 1, 0o600, process_uid));
+        assert!(!unix_ca_file_is_trusted(process_uid, 0o620, process_uid));
+        assert!(!unix_ca_file_is_trusted(0, 0o646, process_uid));
+    }
+
+    #[test]
+    fn state_directories_are_synced_leaf_first_and_sync_failures_propagate() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let state = temp.path().join("state");
+        let observed = RefCell::new(Vec::new());
+
+        let error = prepare_state_directory_with_sync(&state, |path| {
+            observed.borrow_mut().push(path.to_path_buf());
+            if path == temp.path() {
+                return Err(io::Error::other("injected parent sync failure"));
+            }
+            Ok(())
+        })
+        .expect_err("parent sync failure must stop bootstrap preparation");
+
+        assert!(matches!(error, RegistrationBootstrapError::Input(_)));
+        assert_eq!(
+            observed.into_inner(),
+            vec![
+                state.join("identity"),
+                state.join("credential"),
+                state,
+                temp.path().to_path_buf(),
+            ]
+        );
     }
 }
 
