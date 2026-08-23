@@ -332,6 +332,38 @@ pub struct DiskUsageStatus {
     pub snapshot_exists: bool,
 }
 
+/// A bounded reconciliation record for an object whose logical size could not
+/// be trusted at the scanner boundary. The scanner persists these records in
+/// its cache; keeping the model here avoids a second, incompatible accounting
+/// representation in storage-facing crates.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SizeReconciliationEntry {
+    /// Stable object/version identity key (not a metrics label).
+    pub key: String,
+    pub bucket: String,
+    pub object: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// Structured reason label; raw metadata values must never be stored here.
+    pub reason: String,
+    #[serde(default)]
+    pub physical_size: Option<u64>,
+    #[serde(default)]
+    pub first_seen: u64,
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// Object scope refreshed by one scanner pass. Existing debts in this scope
+/// are removed before the pass's unresolved records are inserted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SizeReconciliationScope {
+    pub bucket: String,
+    pub object: String,
+}
+
 /// Size summary for a single object or group of objects
 #[derive(Debug, Default, Clone)]
 pub struct SizeSummary {
@@ -361,6 +393,16 @@ pub struct SizeSummary {
     pub repl_target_stats: HashMap<String, ReplTargetSizeSummary>,
     /// Per-tier accounting, keyed by storage class or remote tier name
     pub tier_stats: HashMap<String, TierStats>,
+    /// Size-resolution debts observed while scanning this summary.
+    pub size_reconciliation: Vec<SizeReconciliationEntry>,
+    /// True when the per-object summary exceeded its bounded debt buffer.
+    /// Callers must retain prior ledger entries rather than treating the
+    /// partial list as a complete refresh.
+    pub size_reconciliation_truncated: bool,
+    /// Object scopes refreshed by this summary. They let the durable ledger
+    /// remove versions that resolved without allocating one key per healthy
+    /// version on the hot path.
+    pub reconciliation_scopes: Vec<SizeReconciliationScope>,
 }
 
 /// Replication target size summary
@@ -858,7 +900,8 @@ impl DataUsageEntry {
 ///
 /// The canonical wire format is written by the hand-written map-encoded
 /// `Serialize` on the scanner-side `DataUsageCacheInfo`
-/// (`crates/scanner/src/data_usage_define.rs`), which carries 16 fields.
+/// (`crates/scanner/src/data_usage_define.rs`), which carries the original 16
+/// fields plus an optional reconciliation field.
 /// This type decodes only the shared subset and is deliberately not
 /// `Serialize`: a derived (array) encoding of this 6-field subset would
 /// corrupt the cache for scanner readers, so no write path may exist here.
@@ -1834,6 +1877,51 @@ impl SizeSummary {
             entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
             entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
             entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
+        }
+
+        for entry in &other.size_reconciliation {
+            self.record_size_reconciliation(entry.clone());
+        }
+        self.size_reconciliation_truncated |= other.size_reconciliation_truncated;
+        for scope in &other.reconciliation_scopes {
+            self.record_reconciliation_scope(&scope.bucket, &scope.object);
+        }
+    }
+
+    /// Add one reconciliation debt, coalescing repeated observations in the
+    /// same object summary. The scanner cache applies its own larger bound.
+    pub fn record_size_reconciliation(&mut self, entry: SizeReconciliationEntry) {
+        const MAX_SUMMARY_RECONCILIATION_ENTRIES: usize = 1024;
+        if let Some(existing) = self.size_reconciliation.iter_mut().find(|value| value.key == entry.key) {
+            existing.reason = entry.reason;
+            existing.physical_size = entry.physical_size;
+            existing.generation = entry.generation;
+            existing.version_id = entry.version_id;
+            return;
+        }
+        if self.size_reconciliation.len() < MAX_SUMMARY_RECONCILIATION_ENTRIES {
+            self.size_reconciliation.push(entry);
+        } else {
+            self.size_reconciliation_truncated = true;
+        }
+    }
+
+    /// Mark one object scope as refreshed. Duplicate scopes are suppressed so
+    /// merging summaries remains bounded and deterministic.
+    pub fn record_reconciliation_scope(&mut self, bucket: &str, object: &str) {
+        if !self
+            .reconciliation_scopes
+            .iter()
+            .any(|scope| scope.bucket == bucket && scope.object == object)
+        {
+            if self.reconciliation_scopes.len() >= 1024 {
+                self.size_reconciliation_truncated = true;
+                return;
+            }
+            self.reconciliation_scopes.push(SizeReconciliationScope {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+            });
         }
     }
 }
