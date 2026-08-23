@@ -146,6 +146,50 @@ async fn scanner_cache_locks_allow_cross_source_workers() {
 }
 
 #[tokio::test]
+async fn scanner_set_cache_admission_tracks_owner_snapshot_and_fails_closed() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let set = store.pools[0].disk_set[0].clone();
+
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_none(),
+        "a set must not publish before the owner has refreshed its movement snapshot"
+    );
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "an idle owner snapshot should admit the set cache"
+    );
+
+    let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
+    pool_stats[0] = EcstoreRebalanceStats {
+        participating: true,
+        info: EcstoreRebalanceInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            status: EcstoreRebalStatus::Started,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    *store.rebalance_meta.write().await = Some(EcstoreRebalanceMeta {
+        id: Uuid::new_v4().to_string(),
+        pool_stats,
+        ..Default::default()
+    });
+    assert!(store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_none(),
+        "active movement must keep set cache publication blocked"
+    );
+
+    *store.rebalance_meta.write().await = None;
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "an idle owner refresh must make set cache publication live again"
+    );
+}
+
+#[tokio::test]
 async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];

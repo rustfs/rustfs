@@ -69,6 +69,19 @@ impl ScannerIOCycle for ECStore {
             ));
         }
 
+        // Capture one storage-owned movement epoch for the entire cycle.  Set
+        // workers must not each observe a fresh epoch: a movement transition
+        // between sets would otherwise allow a mixed-generation aggregate.
+        let publication_epoch = match self.scanner_data_usage_publication_admission().await {
+            Some(admission) => Some(admission.epoch()),
+            None => {
+                return Ok(ScannerCycleResult::new(
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement),
+                    None,
+                ));
+            }
+        };
+
         let distributed = self.setup_is_dist_erasure().await;
         let activity_before = match scanner_activity_preflight(crate::scanner::probe_scanner_activity(self, distributed).await) {
             ScannerActivityPreflight::Ready(snapshot) => snapshot,
@@ -134,7 +147,9 @@ impl ScannerIOCycle for ECStore {
         if all_buckets.is_empty() {
             reset_set_scan_gauges();
             if !bucket_plan_complete {
-                return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None));
+                return Ok(
+                    ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch)
+                );
             }
             let activity_status = scanner_cycle_activity_status(self, distributed, &activity_before).await;
             let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
@@ -158,7 +173,7 @@ impl ScannerIOCycle for ECStore {
             )
             .await?
             {
-                return Ok(ScannerCycleResult::new(status, None));
+                return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
             }
             if status == ScannerCycleStatus::Complete {
                 complete_tier_registry_cycle(want_cycle, leader_epoch);
@@ -171,6 +186,7 @@ impl ScannerIOCycle for ECStore {
                 Vec::new()
             };
             return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
+                .with_publication_epoch(publication_epoch)
                 .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
         }
 
@@ -186,7 +202,7 @@ impl ScannerIOCycle for ECStore {
                 "Scanner set state update detected missing disk sets"
             );
             reset_set_scan_gauges();
-            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None));
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         }
 
         let set_scan_limit = scanner_budgeted_concurrency_limit(
@@ -257,6 +273,7 @@ impl ScannerIOCycle for ECStore {
                     digest: scan_plan_digest,
                     leader_epoch,
                     tier_registry_generation,
+                    publication_epoch,
                     dirty_usage_buckets: dirty_usage_snapshot.buckets.clone(),
                     bucket_failures: bucket_failures.clone(),
                     pending_maintenance_work: pending_maintenance_work.clone(),
@@ -442,6 +459,7 @@ impl ScannerIOCycle for ECStore {
             Vec::new()
         };
         Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
+            .with_publication_epoch(publication_epoch)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_failed_dirty_usage(!failed_buckets.is_empty())
             .with_pending_maintenance_work(pending_maintenance_work)

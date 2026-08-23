@@ -136,7 +136,8 @@ fn partial_usage_is_observational_not_authoritative_for_quota() {
     let expected = HashSet::from([current_source, stalled_source]);
 
     assert!(
-        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false).is_none()
+        completed_data_usage_info(&[current.clone(), stalled.clone()], &expected, &all_buckets, &[], true, false, false)
+            .is_none()
     );
     let (observed, _) = observational_data_usage_info(&[current, stalled], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
         .expect("a completed set should produce an observational view");

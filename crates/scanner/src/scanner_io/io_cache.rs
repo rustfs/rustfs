@@ -32,6 +32,7 @@ impl ScannerIOCache for SetDisks {
             digest: scan_plan_digest,
             leader_epoch,
             tier_registry_generation,
+            publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
             pending_maintenance_work,
@@ -41,6 +42,12 @@ impl ScannerIOCache for SetDisks {
         let set_label = self.set_index.to_string();
 
         let source = DataUsageCacheSource::new(self.pool_index, self.set_index);
+        let expected_publication_epoch = match publication_epoch {
+            Some(epoch) => epoch,
+            None => scanner_publication_epoch(self.clone())
+                .await
+                .ok_or_else(|| StorageError::other("scanner cache publication is blocked by data movement"))?,
+        };
         let mut old_cache = DataUsageCache::default();
         if let Err(e) = old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await {
             warn!(
@@ -78,10 +85,16 @@ impl ScannerIOCache for SetDisks {
                 cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
             }
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            return persist_and_publish_cache_snapshot(self, &updates, cache, cache_cycle_floor.as_ref())
-                .await
-                .map(|_| ())
-                .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
+            return persist_and_publish_cache_snapshot(
+                self,
+                &updates,
+                cache,
+                cache_cycle_floor.as_ref(),
+                expected_publication_epoch,
+            )
+            .await
+            .map(|_| ())
+            .ok_or_else(|| StorageError::other("failed to persist empty scanner set scope"));
         }
 
         let (disks, healing) = self.get_online_disks_with_healing(false).await;
@@ -425,6 +438,7 @@ impl ScannerIOCache for SetDisks {
             let pending_maintenance_work_clone = pending_maintenance_work.clone();
             let dirty_usage_buckets_clone = dirty_usage_buckets.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
+            let expected_publication_epoch_clone = expected_publication_epoch;
             let remote_server_epoch = match worker_mode {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
@@ -768,6 +782,23 @@ impl ScannerIOCache for SetDisks {
                                 );
                                 continue;
                             }
+                            if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch)
+                                .await
+                                .is_none()
+                            {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                error!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    bucket = %bucket.name,
+                                    cache_name = %cache_name,
+                                    state = "publication_epoch_changed_before_reuse",
+                                    "Current scanner bucket cache root publish skipped after movement epoch change"
+                                );
+                                continue;
+                            }
                             if let Err(e) =
                                 send_cache_root_entry(&bucket_result_tx_clone, *root, &cache, &pending_maintenance_work_clone)
                                     .await
@@ -916,7 +947,12 @@ impl ScannerIOCache for SetDisks {
                             {
                                 let done_save = Metrics::time(Metric::SaveUsage);
                                 if let Err(e) = cache
-                                    .save_with_revisions(store_clone_clone.clone(), cache_name.as_str(), &revisions)
+                                    .save_with_revisions_for_epoch(
+                                        store_clone_clone.clone(),
+                                        cache_name.as_str(),
+                                        &revisions,
+                                        expected_publication_epoch_clone,
+                                    )
                                     .await
                                 {
                                     error!(
@@ -973,7 +1009,12 @@ impl ScannerIOCache for SetDisks {
                             false
                         } else {
                             match partial_cache
-                                .save_with_revisions(store_clone_clone.clone(), cache_name.as_str(), &revisions)
+                                .save_with_revisions_for_epoch(
+                                    store_clone_clone.clone(),
+                                    cache_name.as_str(),
+                                    &revisions,
+                                    expected_publication_epoch_clone,
+                                )
                                 .await
                             {
                                 Ok(()) => true,
@@ -1044,7 +1085,12 @@ impl ScannerIOCache for SetDisks {
 
                     let done_save = Metrics::time(Metric::SaveUsage);
                     if let Err(e) = cache
-                        .save_with_revisions(store_clone_clone.clone(), &cache_name, &revisions)
+                        .save_with_revisions_for_epoch(
+                            store_clone_clone.clone(),
+                            &cache_name,
+                            &revisions,
+                            expected_publication_epoch_clone,
+                        )
                         .await
                     {
                         done_save();
@@ -1075,6 +1121,24 @@ impl ScannerIOCache for SetDisks {
                             cache_name = %cache_name,
                             state = "lock_lost_after_save",
                             "Scanner bucket cache root publish skipped after lock loss"
+                        );
+                        continue;
+                    }
+
+                    if scanner_publication_admission_for_epoch(store_clone_clone.clone(), expected_publication_epoch_clone)
+                        .await
+                        .is_none()
+                    {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        error!(
+                            target: "rustfs::scanner::io",
+                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_IO,
+                            bucket = %bucket.name,
+                            cache_name = %cache_name,
+                            state = "publication_epoch_changed_after_save",
+                            "Scanner bucket cache root publish skipped after movement epoch change"
                         );
                         continue;
                     }
@@ -1174,7 +1238,14 @@ impl ScannerIOCache for SetDisks {
                 cache.info.lkg_scan_plan_digest = None;
                 cache.clone()
             };
-            let _ = persist_and_publish_cache_snapshot(self.clone(), &updates, cache_snapshot, cache_cycle_floor.as_ref()).await;
+            let _ = persist_and_publish_cache_snapshot(
+                self.clone(),
+                &updates,
+                cache_snapshot,
+                cache_cycle_floor.as_ref(),
+                expected_publication_epoch,
+            )
+            .await;
         } else {
             let mut incomplete_scope = cache_mutex.lock().await.clone();
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();

@@ -727,6 +727,75 @@ where
     .await
 }
 
+pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    preconditions: HTTPPreconditions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    save_config_with_preconditions(api, file, data, preconditions).await
+}
+
+pub(crate) const SCANNER_PUBLICATION_EPOCH_CHANGED: &str = "scanner publication epoch changed before commit";
+
+pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
+    matches!(
+        error,
+        EcstoreError::Io(io_error) if io_error.to_string() == SCANNER_PUBLICATION_EPOCH_CHANGED
+    )
+}
+
+pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    opts: ScannerObjectOptions,
+    expected_epoch: u64,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
+        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+    };
+    api.delete_config_object(bucket, object, opts).await
+}
+
+/// Capture the storage-owned publication epoch without retaining the read
+/// guard across a potentially slow metadata read. Callers must compare this
+/// token with a fresh admission immediately before their conditional write.
+pub(crate) async fn scanner_publication_epoch<S>(api: Arc<S>) -> Option<u64>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    Some(admission.epoch())
+}
+
+/// Re-admit a publication only when the storage-owned movement epoch is still
+/// the one observed before the caller's metadata read. The returned guard
+/// remains held through the caller's short conditional commit.
+pub(crate) async fn scanner_publication_admission_for_epoch<S>(
+    api: Arc<S>,
+    expected_epoch: u64,
+) -> Option<ScannerDataUsagePublicationAdmission>
+where
+    S: ScannerConfigObjectDelete,
+{
+    let admission = api.scanner_data_usage_publication_admission().await?;
+    if admission.epoch() != expected_epoch {
+        return None;
+    }
+    Some(admission)
+}
+
 pub(crate) async fn save_config_shared_with_preconditions<S>(
     api: Arc<S>,
     file: &str,
@@ -801,6 +870,39 @@ pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
         object: &str,
         opts: ScannerObjectOptions,
     ) -> EcstoreResult<ScannerObjectInfo>;
+
+    /// Acquire storage-owned admission for one short data-usage publication
+    /// commit. Implementations without a storage-owned movement owner fail
+    /// closed; test fixtures opt into the explicit unfenced helper.
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        None
+    }
+}
+
+pub struct ScannerDataUsagePublicationAdmission {
+    epoch: u64,
+    _read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl ScannerDataUsagePublicationAdmission {
+    #[cfg(test)]
+    pub(crate) fn unfenced() -> Self {
+        Self {
+            epoch: 0,
+            _read_guard: None,
+        }
+    }
+
+    fn fenced(read_guard: tokio::sync::OwnedRwLockReadGuard<()>, epoch: u64) -> Self {
+        Self {
+            epoch,
+            _read_guard: Some(read_guard),
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 #[async_trait::async_trait]
@@ -812,6 +914,28 @@ impl ScannerConfigObjectDelete for ECStore {
         opts: ScannerObjectOptions,
     ) -> EcstoreResult<ScannerObjectInfo> {
         ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerConfigObjectDelete for SetDisks {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> EcstoreResult<ScannerObjectInfo> {
+        ObjectOperations::delete_object(self, bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
+        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
     }
 }
 

@@ -23,6 +23,7 @@ use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
     DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_common::heal_channel::HealScanMode;
@@ -693,6 +694,9 @@ async fn scan_and_persist_local_bucket(
                 source.pool_index, source.set_index
             ))
         })?;
+    let expected_publication_epoch = scanner_publication_epoch(set.clone()).await.ok_or_else(|| {
+        RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
+    })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
     let guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
@@ -731,6 +735,14 @@ async fn scan_and_persist_local_bucket(
             if guard.is_lock_lost() {
                 return Err(RemoteScannerServerError::worker(
                     "remote namespace scanner cache lock was lost before reusing the current snapshot",
+                ));
+            }
+            if scanner_publication_admission_for_epoch(set.clone(), expected_publication_epoch)
+                .await
+                .is_none()
+            {
+                return Err(RemoteScannerServerError::retry_bucket(
+                    "remote namespace scanner cache publication epoch changed before reusing the current snapshot",
                 ));
             }
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
@@ -821,9 +833,22 @@ async fn scan_and_persist_local_bucket(
         .await
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
     let done_save = Metrics::time(Metric::SaveUsage);
-    let save_result = cache.save_with_revisions(set, &cache_name, &revisions).await;
+    // Each physical main/backup PUT must still prove the epoch captured before
+    // the scan. A movement transition that starts and ends during the scan
+    // therefore cannot admit the stale cache under the new epoch.
+    let save_result = cache
+        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch)
+        .await;
     done_save();
     save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;
+    if scanner_publication_admission_for_epoch(set, expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote namespace scanner cache publication epoch changed after persistence",
+        ));
+    }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store)
         .await
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;

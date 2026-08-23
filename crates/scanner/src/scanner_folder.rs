@@ -20,8 +20,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageScanCheckpoint,
-    DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeSummary, hash_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
+    DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt,
+    SizeReconciliationEntry, SizeSummary, hash_path,
 };
 use crate::error::ScannerError;
 use crate::runtime_config::{
@@ -105,6 +106,9 @@ const METRIC_SCANNER_HEAL_DISCOVERY_UNVERIFIED_TOTAL: &str = "rustfs_scanner_hea
 const METRIC_SCANNER_HEAL_DISCOVERY_QUEUED_TOTAL: &str = "rustfs_scanner_heal_discovery_queued_total";
 const METRIC_SCANNER_HEAL_DISCOVERY_TRUNCATED_TOTAL: &str = "rustfs_scanner_heal_discovery_truncated_total";
 const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
+const MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET: usize = 10_000;
+const MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET: usize = 8 * 1024 * 1024;
+const MAX_SIZE_RECONCILIATION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 // --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
 //
@@ -372,7 +376,7 @@ impl PendingScannerAccounting<'_> {
     fn apply(self, size_summary: &mut SizeSummary, cumulative_size: &mut i64, queued: bool) {
         let size = if queued { self.expired_size } else { self.retained_size };
         size_summary.actions_accounting(self.object, size, self.retained_size);
-        *cumulative_size += size;
+        *cumulative_size = cumulative_size.saturating_add(size);
     }
 }
 
@@ -698,8 +702,63 @@ pub struct FolderScanner {
     /// next scan and cannot mix generations in one aggregate.
     tier_registry: TierRegistrySnapshot,
     pending_heals_changed: bool,
+    pending_size_reconciliation_keys: HashSet<String>,
+    pending_size_reconciliation_scopes: HashSet<String>,
+    pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
+}
+
+fn size_reconciliation_entry_bytes(entry: &SizeReconciliationEntry) -> usize {
+    entry.key.len()
+        + entry.bucket.len()
+        + entry.object.len()
+        + entry.version_id.as_deref().map_or(0, str::len)
+        + entry.generation.as_deref().map_or(0, str::len)
+        + entry.reason.len()
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<u32>()
+}
+
+fn size_reconciliation_scope_key(bucket: &str, object: &str) -> String {
+    format!("{}:{}|{}:{}", bucket.len(), bucket, object.len(), object)
+}
+
+fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
+    info.size_reconciliation.retain(|key, entry| {
+        if entry.first_seen == 0 || entry.first_seen > now {
+            entry.first_seen = now;
+        }
+        key == &entry.key
+            && entry.key.len() <= 4096
+            && entry.bucket.len() <= 512
+            && entry.object.len() <= 512
+            && entry.version_id.as_deref().is_none_or(|value| value.len() <= 64)
+            && entry.generation.as_deref().is_none_or(|value| value.len() <= 64)
+            && entry.reason.len() <= 64
+            && now.saturating_sub(entry.first_seen) <= MAX_SIZE_RECONCILIATION_AGE_SECS
+    });
+
+    while info.size_reconciliation.len() > MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET
+        || info
+            .size_reconciliation
+            .values()
+            .map(size_reconciliation_entry_bytes)
+            .sum::<usize>()
+            > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET
+    {
+        let oldest = info
+            .size_reconciliation
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        info.size_reconciliation.remove(&oldest);
+    }
 }
 
 impl FolderScanner {
@@ -772,6 +831,60 @@ impl FolderScanner {
         let remove_count = failed.len().saturating_sub(max_entries);
         for (key, _) in entries.into_iter().take(remove_count) {
             failed.remove(&key);
+        }
+    }
+
+    /// Apply the per-object size-resolution ledger updates in one place. The
+    /// scanner cache is the durable boundary; both working copies are updated
+    /// so an incremental publication cannot lose a debt or its resolution.
+    fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
+        let now = Self::now_secs();
+        self.pending_size_reconciliation_keys
+            .extend(summary.size_reconciliation.iter().map(|entry| entry.key.clone()));
+        self.pending_size_reconciliation_scopes.extend(
+            summary
+                .reconciliation_scopes
+                .iter()
+                .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
+        );
+        self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+
+        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
+            for incoming in &summary.size_reconciliation {
+                if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
+                    existing.reason = incoming.reason.clone();
+                    existing.physical_size = incoming.physical_size;
+                    existing.generation = incoming.generation.clone();
+                    existing.version_id = incoming.version_id.clone();
+                    existing.attempts = existing.attempts.saturating_add(1);
+                    continue;
+                }
+
+                if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
+                    continue;
+                }
+
+                let mut entry = incoming.clone();
+                entry.first_seen = now;
+                entry.attempts = 1;
+                info.size_reconciliation.insert(entry.key.clone(), entry);
+            }
+        }
+    }
+
+    fn finish_size_reconciliation_batch(&mut self) {
+        let now = Self::now_secs();
+        let current_keys = std::mem::take(&mut self.pending_size_reconciliation_keys);
+        let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
+        let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
+
+        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
+            if !truncated {
+                info.size_reconciliation.retain(|key, entry| {
+                    !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
+                });
+            }
+            prune_size_reconciliation(info, now);
         }
     }
 
@@ -1458,6 +1571,7 @@ impl FolderScanner {
                 abandoned_children.remove(&path_join_buf(&[&item.bucket, &item.object_path()]));
 
                 apply_scanner_size_summary(into, &sz);
+                self.apply_size_reconciliation(&sz);
                 into.objects += 1;
                 object_count += 1;
                 self.budget.record_object_scanned();
@@ -2178,6 +2292,7 @@ impl FolderScanner {
             }
         }
 
+        self.finish_size_reconciliation_batch();
         done_folder();
         let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
         emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
@@ -2268,9 +2383,16 @@ pub async fn scan_data_folder(
         local_disk,
         tier_registry,
         pending_heals_changed: false,
+        pending_size_reconciliation_keys: HashSet::new(),
+        pending_size_reconciliation_scopes: HashSet::new(),
+        pending_size_reconciliation_truncated: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,
     };
+
+    let now = FolderScanner::now_secs();
+    prune_size_reconciliation(&mut scanner.new_cache.info, now);
+    prune_size_reconciliation(&mut scanner.update_cache.info, now);
 
     // Check if context is cancelled
     if ctx.is_cancelled() {
@@ -2295,7 +2417,9 @@ pub async fn scan_data_folder(
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = cache.info.next_cycle;
-            let unresolved_objects = root.failed_objects > 0 || !new_cache.info.failed_objects.is_empty();
+            let unresolved_objects = root.failed_objects > 0
+                || !new_cache.info.failed_objects.is_empty()
+                || !new_cache.info.size_reconciliation.is_empty();
             new_cache.info.snapshot_complete = !unresolved_objects;
             let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
@@ -2323,7 +2447,7 @@ pub async fn scan_data_folder(
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);
                 }
-                if partial_cache_is_useful(&root, pending_heals_changed) {
+                if partial_cache_is_useful(&root, pending_heals_changed) || !new_cache.info.size_reconciliation.is_empty() {
                     if new_cache.root().is_some() {
                         new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     }

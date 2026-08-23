@@ -32,7 +32,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("metadata: {bucket}/{object}")));
-            progress.update_progress(0, 3, 0, 0);
+            progress.update_stage(0, 3);
         }
 
         // Step 1: Check if object exists
@@ -74,7 +74,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
+            progress.update_stage(1, 3);
         }
 
         // Step 2: Perform metadata heal using ecstore
@@ -122,7 +122,7 @@ impl HealTask {
                     );
                     {
                         let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
+                        progress.update_stage(3, 3);
                     }
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
@@ -145,7 +145,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
                 self.record_result_item(result).await;
                 Ok(())
@@ -167,7 +167,7 @@ impl HealTask {
                 );
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal metadata {bucket}/{object}: {e}"),
@@ -194,7 +194,7 @@ impl HealTask {
         {
             let mut progress = self.progress.write().await;
             progress.set_current_object(Some(format!("ec_decode: {bucket}/{object}")));
-            progress.update_progress(0, 3, 0, 0);
+            progress.update_stage(0, 3);
         }
 
         // Step 1: Check if object exists
@@ -236,7 +236,7 @@ impl HealTask {
 
         {
             let mut progress = self.progress.write().await;
-            progress.update_progress(1, 3, 0, 0);
+            progress.update_stage(1, 3);
         }
 
         // Step 2: Perform EC decode heal using ecstore
@@ -284,7 +284,7 @@ impl HealTask {
                     );
                     {
                         let mut progress = self.progress.write().await;
-                        progress.update_progress(3, 3, 0, 0);
+                        progress.update_stage(3, 3);
                     }
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),
@@ -309,7 +309,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, object_size);
+                    progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())
@@ -331,7 +331,7 @@ impl HealTask {
                 );
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, 0, 0);
+                    progress.update_stage(3, 3);
                 }
                 Err(Error::TaskExecutionFailed {
                     message: format!("Failed to heal EC decode {bucket}/{object}: {e}"),
