@@ -1062,7 +1062,7 @@ fn build_list_objects_v2_metadata_output(
                 object: Object {
                     key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                     last_modified: object.mod_time.map(Timestamp::from),
-                    size: Some(object.get_actual_size().unwrap_or_default()),
+                    size: Some(object.get_actual_size_or_physical()),
                     e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
                     storage_class: Some(ObjectStorageClass::from(
                         object

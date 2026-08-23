@@ -901,6 +901,10 @@ pub struct Metrics {
     scanner_cycle_max_duration_millis: AtomicU64,
     scanner_cycle_max_objects: AtomicU64,
     scanner_cycle_max_directories: AtomicU64,
+    scanner_cycle_timeout_total: AtomicU64,
+    scanner_cycle_recovery_required_total: AtomicU64,
+    scanner_cycle_last_progress_age_seconds: AtomicU64,
+    scanner_leader_lease_without_progress: AtomicBool,
     scanner_bitrot_cycle_enabled: AtomicBool,
     scanner_bitrot_cycle_millis: AtomicU64,
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
@@ -1370,6 +1374,14 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub cycle_max_directories: u64,
     #[serde(default)]
+    pub cycle_timeout_total: u64,
+    #[serde(default)]
+    pub cycle_recovery_required_total: u64,
+    #[serde(default)]
+    pub cycle_last_progress_age: u64,
+    #[serde(default)]
+    pub leader_lease_without_progress: bool,
+    #[serde(default)]
     pub bitrot_cycle_enabled: bool,
     #[serde(default)]
     pub bitrot_cycle_seconds: f64,
@@ -1430,6 +1442,9 @@ const OTEL_SCANNER_BUCKETS_SCANNED: &str = "rustfs_scanner_buckets_scanned_total
 const OTEL_SCANNER_CYCLES: &str = "rustfs_scanner_cycles_total";
 const OTEL_SCANNER_CYCLE_DURATION_SECONDS: &str = "rustfs_scanner_cycle_duration_seconds";
 const OTEL_SCANNER_BUCKET_DRIVE_DURATION_SECONDS: &str = "rustfs_scanner_bucket_drive_duration_seconds";
+const OTEL_SCANNER_CYCLE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cycle_timeout_total";
+const OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE: &str = "rustfs_scanner_cycle_last_progress_age";
+const OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS: &str = "rustfs_scanner_leader_lease_without_progress";
 
 fn scan_cycle_result_label(result: u8) -> &'static str {
     match result {
@@ -1913,6 +1928,10 @@ impl Metrics {
             scanner_cycle_max_duration_millis: AtomicU64::new(0),
             scanner_cycle_max_objects: AtomicU64::new(0),
             scanner_cycle_max_directories: AtomicU64::new(0),
+            scanner_cycle_timeout_total: AtomicU64::new(0),
+            scanner_cycle_recovery_required_total: AtomicU64::new(0),
+            scanner_cycle_last_progress_age_seconds: AtomicU64::new(0),
+            scanner_leader_lease_without_progress: AtomicBool::new(false),
             scanner_bitrot_cycle_enabled: AtomicBool::new(false),
             scanner_bitrot_cycle_millis: AtomicU64::new(0),
             scanner_checkpoint: Mutex::new(None),
@@ -2412,10 +2431,27 @@ impl Metrics {
             .store(cycle_max_objects.unwrap_or_default(), Ordering::Relaxed);
         self.scanner_cycle_max_directories
             .store(cycle_max_directories.unwrap_or_default(), Ordering::Relaxed);
+        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
+        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
         self.scanner_bitrot_cycle_enabled
             .store(bitrot_cycle.is_some(), Ordering::Relaxed);
         self.scanner_bitrot_cycle_millis
             .store(bitrot_cycle.map(duration_millis_saturated).unwrap_or_default(), Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_cycle_timeout(&self, recovery_required: bool, progress_age: Duration) {
+        self.scanner_cycle_timeout_total.fetch_add(1, Ordering::Relaxed);
+        if recovery_required {
+            self.scanner_cycle_recovery_required_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.scanner_cycle_last_progress_age_seconds
+            .store(progress_age.as_secs(), Ordering::Relaxed);
+        self.scanner_leader_lease_without_progress.store(true, Ordering::Relaxed);
+        metrics::counter!(OTEL_SCANNER_CYCLE_TIMEOUT_TOTAL).increment(1);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(progress_age.as_secs_f64());
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(1.0);
     }
 
     pub fn record_scanner_set_scan_state(&self, concurrency_limit: Option<usize>, queued: Option<usize>, active: Option<usize>) {
@@ -3265,6 +3301,10 @@ impl Metrics {
         m.cycle_max_duration_seconds = self.scanner_cycle_max_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.cycle_max_objects = self.scanner_cycle_max_objects.load(Ordering::Relaxed);
         m.cycle_max_directories = self.scanner_cycle_max_directories.load(Ordering::Relaxed);
+        m.cycle_timeout_total = self.scanner_cycle_timeout_total.load(Ordering::Relaxed);
+        m.cycle_recovery_required_total = self.scanner_cycle_recovery_required_total.load(Ordering::Relaxed);
+        m.cycle_last_progress_age = self.scanner_cycle_last_progress_age_seconds.load(Ordering::Relaxed);
+        m.leader_lease_without_progress = self.scanner_leader_lease_without_progress.load(Ordering::Relaxed);
         m.bitrot_cycle_enabled = self.scanner_bitrot_cycle_enabled.load(Ordering::Relaxed);
         m.bitrot_cycle_seconds = self.scanner_bitrot_cycle_millis.load(Ordering::Relaxed) as f64 / 1000.0;
         m.scan_checkpoint = match self.scanner_checkpoint.lock() {
@@ -4925,5 +4965,21 @@ mod tests {
         assert_eq!(report.cycle_max_directories, 0);
         assert!(!report.bitrot_cycle_enabled);
         assert_eq!(report.bitrot_cycle_seconds, 0.0);
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_timeout_metrics_reset_for_a_new_cycle() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_cycle_timeout(true, Duration::from_secs(17));
+        let timed_out = metrics.report().await;
+        assert_eq!(timed_out.cycle_timeout_total, 1);
+        assert_eq!(timed_out.cycle_last_progress_age, 17);
+        assert!(timed_out.leader_lease_without_progress);
+
+        metrics.record_scanner_cycle_config(Duration::from_secs(60), None, Some(Duration::from_secs(1)), None, None);
+        let current = metrics.report().await;
+        assert_eq!(current.cycle_timeout_total, 1);
+        assert_eq!(current.cycle_last_progress_age, 0);
+        assert!(!current.leader_lease_without_progress);
     }
 }

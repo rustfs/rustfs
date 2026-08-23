@@ -74,7 +74,7 @@ impl DataUsageCache {
         let loaded = Self::load_cache(store.clone(), name).await?;
         let backup = match loaded.backup_revision {
             Some(revision) => Some(revision),
-            None => match Self::revision_for_path(store, &backup_path).await {
+            None => match read_config_revision(store, &backup_path).await {
                 Ok(revision) => Some(revision),
                 Err(err) => {
                     counter!(METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL).increment(1);
@@ -333,33 +333,6 @@ impl DataUsageCache {
             Ok(Ok((None, revision, false))) => Ok(DataUsageCacheLoadAttempt::Missing { revision }),
             Ok(Err(err)) => Ok(DataUsageCacheLoadAttempt::Retryable(err)),
             Err(_) => Ok(DataUsageCacheLoadAttempt::Retryable(Error::other("scanner cache load timed out"))),
-        }
-    }
-
-    async fn revision_for_path<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
-        match store
-            .get_object_reader(
-                RUSTFS_META_BUCKET,
-                path,
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(reader) => reader
-                .object_info
-                .etag
-                .filter(|etag| !etag.is_empty())
-                .map(DataUsageCacheRevision::Etag)
-                .ok_or_else(|| StorageError::other(format!("scanner cache object {path} has no ETag"))),
-            Err(Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_)) => {
-                Ok(DataUsageCacheRevision::Missing)
-            }
-            Err(err) => Err(err),
         }
     }
 

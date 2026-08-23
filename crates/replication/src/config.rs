@@ -60,7 +60,9 @@ pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
     "Destination.ReplicationTime",
 ];
 
-pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 1;
+// v2: disableProxy moved from unsupported to writable (per-target read-proxy
+// opt-out is accepted by set-remote-target and the `proxy` update op).
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 2;
 
 pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "sourcebucket",
@@ -83,9 +85,12 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     // madmin default of 60s); the per-target health-check interval is not
     // yet applied — the heartbeat keeps its global env-configured interval.
     "healthCheckDuration",
+    // Per-target read-proxy opt-out, consumed by the proxy-target selector
+    // (contract v2; previously only importable via MinIO bucket-targets.json).
+    "disableProxy",
 ];
 
-pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["disableProxy", "edge", "edgeSyncBeforeExpiry"];
+pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["edge", "edgeSyncBeforeExpiry"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObjectOpts {

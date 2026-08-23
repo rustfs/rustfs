@@ -96,7 +96,6 @@ tokio-stream = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
 bytes = { workspace = true, features = ["serde"] }
-serial_test = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }

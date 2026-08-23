@@ -30,7 +30,7 @@ name: Runner Hygiene
 
 on:
   schedule:
-    - cron: "0 6 1 * *" # Monthly, 1st at 06:00 UTC (after the daily audit cron)
+    - cron: "37 6 1 * *" # Monthly, 1st at 06:37 UTC
   workflow_dispatch:
 
 permissions:

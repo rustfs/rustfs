@@ -48,16 +48,14 @@ cargo nextest run --profile e2e-smoke -p e2e_test
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
 
-# Protocols suite — fixed ports, MUST be single-threaded, gated by build features
-RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
-  cargo test -p e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
 The protocols suite has its own contract (fixed bind ports 9022–9301,
-`--test-threads=1`, feature-gated scheduling) documented in
+single-worker execution, feature-gated scheduling) documented in
 [`src/protocols/README.md`](src/protocols/README.md). `RUSTFS_BUILD_FEATURES`
 selects which features the spawned binary is built with; leave it unset to run
-every protocol entry.
+every protocol entry. Use the exact profile command under
+[Troubleshooting](#troubleshooting) for CI-equivalent execution.
 
 ### `#[ignore]` semantics
 
@@ -159,27 +157,26 @@ construction (random port + isolated temp dir) and need no serialization.
 ## CI map
 
 `e2e_test` is **excluded** from the main `cargo nextest run --profile ci --all`
-pass ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) line 158,
-`--exclude e2e_test`) — the whole crate is too slow to gate every PR. Subsets
-join CI through the nextest profile system only (never as ad-hoc jobs):
+pass (`--exclude e2e_test`) — the whole crate is too slow to gate every PR.
+Subsets join CI through nextest profiles; the fixed-port protocol suite uses
+the same profile for membership and execution with one nightly worker.
 
 | Suite | Runs where | Status |
 | --- | --- | --- |
 | Smoke subset (`e2e-smoke` profile) | `e2e-tests` job, every PR | **Active** (backlog#1149 ci-4) |
+| Full single-node suite (`e2e-full` profile) | `e2e-full` job, merge queue + main | **Active** (backlog#1149 ci-5) |
 | `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
-| KMS suite | — | Not in CI yet (backlog#1149 ci-5) |
-| Protocols (FTPS/WebDAV/SFTP) | — | Not in CI yet (backlog#1149 ci-7) |
+| KMS suite | `e2e-full` job, merge queue + main | **Active** |
+| Cluster faults (`e2e-nightly` profile) | consolidated nightly workflow | **Active** (backlog#1149 ci-7) |
+| Protocols (FTPS/WebDAV/SFTP) | consolidated nightly workflow, serial | **Active** (backlog#1149 ci-7) |
 | Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |
-| Replication (slow + dual-node) | `e2e-repl-nightly` profile, scheduled workflow | **Active** (backlog#1147 repl-1) |
-| `reliant/*` (pre-started server) | — | Manual only |
+| Replication (slow + multi-node) | `e2e-repl-nightly` profile, consolidated nightly workflow | **Active** (backlog#1147 repl-1) |
+| `reliant/*` | 19 tests in PR smoke; remaining default tests in `e2e-full` | **Active** except `#[ignore]` |
 
-Links: [`ci.yml`](../../.github/workflows/ci.yml) `e2e-tests` (line 347),
-`test-ilm-integration-serial` (line 196). The `e2e-smoke` `default-filter` in
-[`.config/nextest.toml`](../../.config/nextest.toml) is the **single wiring
-mechanism** — extend that filter (or add a sibling profile) to admit more
-tests; do not add e2e jobs to `ci.yml`. repl-1 / ilm-3 are landing in parallel
-and may add lanes; keep the table above easy to extend.
+The profile filters in [`.config/nextest.toml`](../../.config/nextest.toml) are
+the wiring source of truth. Committed test-ID digests under
+`.config/e2e-*-selection.txt` make every membership change explicit.
 
 ## Troubleshooting
 
@@ -188,9 +185,15 @@ and may add lanes; keep the table above easy to extend.
 ```bash
 # Smoke (e2e-tests job) — includes the 20 fast replication tests
 cargo nextest run --profile e2e-smoke -p e2e_test
-# Replication nightly lane (16 slow + dual-node tests; install awscurl for the
-# STS dual-node test, else it skips gracefully)
+# Full single-node merge/main lane
+cargo nextest run --profile e2e-full -p e2e_test
+# Cluster fault nightly lane
+cargo nextest run --profile e2e-nightly -p e2e_test
+# Replication nightly lane; install awscurl so STS paths do not skip
 cargo nextest run --profile e2e-repl-nightly -p e2e_test
+# Fixed-port protocol nightly lane
+RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
+  cargo nextest run -j 1 --profile e2e-protocols -p e2e_test --no-capture
 # ILM serial lane
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
@@ -273,4 +276,6 @@ current subset is.
 `docs/testing/e2e-suite-inventory.md` records the per-module test counts as
 listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
 moving e2e tests so acceptance numbers in the test-strategy issues
-(backlog#1147–#1155) stay auditable.
+(backlog#1147–#1155) stay auditable. When a profile membership change is
+intentional, review its JSON listing before updating the matching
+`.config/e2e-*-selection.txt` test-ID digest.

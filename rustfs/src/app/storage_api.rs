@@ -72,6 +72,11 @@ pub(crate) mod data_usage {
         compute_bucket_usage, live_bucket_usage_computations, seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 
+    #[cfg(test)]
+    pub(crate) async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+        crate::storage::storage_api::ecstore_data_usage::get_bucket_usage_memory(bucket).await
+    }
+
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
         crate::storage::storage_api::ecstore_data_usage::record_bucket_object_delete_memory(
             bucket,
@@ -1235,7 +1240,10 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
-    pub(crate) use super::{bucket, data_usage, ecfs, object_utils, runtime};
+    pub(crate) use super::{bucket, ecfs, object_utils, runtime};
+    pub(crate) mod data_usage {
+        pub(crate) use super::super::data_usage::*;
+    }
     pub(crate) use crate::storage::storage_api::test_consumer::{get_global_bucket_metadata_sys, set_bucket_metadata};
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,

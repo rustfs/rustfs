@@ -248,10 +248,13 @@ impl Config {
         let shard_size = shard_size as usize;
         // Keep the historical two-data-shard object budget while preventing
         // wider EC layouts from multiplying the maximum inline object size.
+        // Use div_ceil to match the shard_file_size calculation (which also uses
+        // div_ceil), avoiding a 1-byte rounding discrepancy that prevents inline
+        // for objects right at the threshold.
         let inline_block = if self.initialized && self.inline_block_explicit {
             self.inline_block
         } else {
-            (DEFAULT_INLINE_OBJECT_BUDGET / data_shards).min(DEFAULT_INLINE_BLOCK)
+            DEFAULT_INLINE_OBJECT_BUDGET.div_ceil(data_shards).min(DEFAULT_INLINE_BLOCK)
         };
 
         if versioned {

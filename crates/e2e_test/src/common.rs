@@ -30,6 +30,7 @@ use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use serde_json;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::io::ErrorKind;
@@ -1581,6 +1582,156 @@ impl Drop for RustFSTestClusterEnvironment {
             warn!("Failed to clean up cluster temp directory {}: {}", self.temp_dir, e);
         }
     }
+}
+
+/// Send a SigV4-signed HTTP request and return the raw `reqwest::Response`.
+///
+/// Unlike [`signed_s3_request`], this variant accepts `body: Option<Vec<u8>>`
+/// (binary-safe) and reorders parameters so that `access_key`/`secret_key`
+/// appear before the body — matching the convention used by the replication
+/// extension and object-lambda e2e suites.
+pub(crate) async fn signed_request(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Like [`signed_request`], but uses a caller-supplied `reqwest::Client`
+/// instead of the shared [`local_http_client`].
+pub(crate) async fn signed_request_with_client(
+    client: &reqwest::Client,
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Like [`signed_request`], but includes a `session_token` in the
+/// `x-amz-security-token` header and passes it to the SigV4 signer.
+pub(crate) async fn signed_request_with_session_token(
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if !session_token.is_empty() {
+        request = request.header("x-amz-security-token", session_token);
+    }
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(
+        request.body(Body::empty())?,
+        content_len,
+        access_key,
+        secret_key,
+        session_token,
+        "us-east-1",
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+/// Create a new user via the admin API.
+pub(crate) async fn admin_create_user(
+    env: &RustFSTestEnvironment,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
+    let body = serde_json::json!({
+        "secretKey": secret_key,
+        "status": "enabled"
+    });
+    let response = signed_request(
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.to_string().into_bytes()),
+        Some("application/json"),
+    )
+    .await?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("create user failed: {status} {body}").into());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
