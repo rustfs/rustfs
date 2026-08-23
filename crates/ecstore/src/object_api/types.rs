@@ -24,7 +24,7 @@ use crate::storage_api_contracts::{
 pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
     #[cfg(test)]
-    forced_lost: Arc<std::sync::atomic::AtomicBool>,
+    forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl Debug for NamespaceLockFence {
@@ -40,13 +40,17 @@ impl NamespaceLockFence {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
-            forced_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
         #[cfg(test)]
-        if self.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .forced_lost
+            .iter()
+            .any(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+        {
             return true;
         }
         self.signals.iter().any(|signal| signal.is_lost())
@@ -57,27 +61,26 @@ impl NamespaceLockFence {
     }
 
     fn extend(&mut self, other: &Self) {
-        if Arc::ptr_eq(&self.signals, &other.signals) {
-            return;
+        if !Arc::ptr_eq(&self.signals, &other.signals) {
+            Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         }
-        Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
         #[cfg(test)]
-        if other.forced_lost.load(std::sync::atomic::Ordering::Acquire) {
-            self.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
+            Arc::make_mut(&mut self.forced_lost).extend(other.forced_lost.iter().cloned());
         }
     }
 
     #[cfg(test)]
     pub(crate) fn lost_for_test() -> Self {
         let fence = Self::new();
-        fence.forced_lost.store(true, std::sync::atomic::Ordering::Release);
+        fence.forced_lost[0].store(true, std::sync::atomic::Ordering::Release);
         fence
     }
 
     #[cfg(test)]
     pub(crate) fn loss_handle_for_test() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
         let fence = Self::new();
-        (fence.clone(), Arc::clone(&fence.forced_lost))
+        (fence.clone(), Arc::clone(&fence.forced_lost[0]))
     }
 }
 
@@ -411,6 +414,13 @@ impl ObjectOptions {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+        self.namespace_lock_fence
+            .get_or_insert_with(NamespaceLockFence::new)
+            .extend(fence);
+    }
+
     pub(crate) fn ensure_lifecycle_delete_all_journal(&mut self) {
         self.lifecycle_delete_all_journal
             .get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(LifecycleDeleteAllJournalState::default())));
@@ -689,6 +699,9 @@ impl ObjectInfo {
     }
 
     pub fn get_actual_size(&self) -> std::io::Result<i64> {
+        if self.actual_size < -1 || (self.actual_size == -1 && !self.is_compressed()) {
+            return Err(std::io::Error::other("invalid negative actual size"));
+        }
         if self.actual_size > 0 {
             return Ok(self.actual_size);
         }
@@ -700,10 +713,25 @@ impl ObjectInfo {
                 let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                 return Ok(size);
             }
-            let mut actual_size = 0;
-            self.parts.iter().for_each(|part| {
-                actual_size += part.actual_size;
-            });
+            if self.actual_size == -1 && self.parts.is_empty() {
+                return Ok(-1);
+            }
+            let mut actual_size = 0_i64;
+            let mut unknown = false;
+            for part in self.parts.iter() {
+                match part.actual_size {
+                    -1 => unknown = true,
+                    size if size >= 0 => {
+                        actual_size = actual_size
+                            .checked_add(size)
+                            .ok_or_else(|| std::io::Error::other("compressed actual size overflow"))?;
+                    }
+                    _ => return Err(std::io::Error::other("invalid negative compressed part size")),
+                }
+            }
+            if unknown {
+                return Ok(-1);
+            }
             if actual_size == 0 && actual_size != self.size {
                 return Err(std::io::Error::other(format!("invalid decompressed size {} {}", actual_size, self.size)));
             }
@@ -716,6 +744,18 @@ impl ObjectInfo {
         }
 
         Ok(self.size)
+    }
+
+    /// Returns a non-negative size for client and replication boundaries.
+    ///
+    /// Compressed legacy metadata can retain the internal `-1` unknown-size
+    /// sentinel. Those boundaries cannot emit a negative length, so they use
+    /// the persisted physical size while quota accounting keeps the sentinel
+    /// distinction in [`crate::data_usage::quota_object_size`].
+    pub fn get_actual_size_or_physical(&self) -> i64 {
+        self.get_actual_size()
+            .map(|size| if size >= 0 { size } else { self.size.max(0) })
+            .unwrap_or_else(|_| self.size.max(0))
     }
 
     pub fn from_file_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
