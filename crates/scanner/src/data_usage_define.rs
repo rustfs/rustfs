@@ -36,13 +36,13 @@ use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{debug, warn};
 
-use crate::ScannerObjectIO;
 use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
-    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError, TRANSITION_COMPLETE, save_config,
-    save_config_with_preconditions, storageclass,
+    SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError,
+    TRANSITION_COMPLETE, save_config, save_config_with_preconditions, scanner_publication_admission_for_epoch, storageclass,
 };
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -119,9 +119,13 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
                 .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag")))?;
             Ok((Some(reader.read_all().await?), revision))
         }
-        Err(Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_)) => {
-            Ok((None, DataUsageCacheRevision::Missing))
-        }
+        Err(
+            Error::ConfigNotFound
+            | Error::FileNotFound
+            | Error::VolumeNotFound
+            | Error::ObjectNotFound(_, _)
+            | Error::BucketNotFound(_),
+        ) => Ok((None, DataUsageCacheRevision::Missing)),
         Err(err) => Err(err),
     }
 }
@@ -147,9 +151,13 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
             .filter(|etag| !etag.is_empty())
             .map(DataUsageCacheRevision::Etag)
             .ok_or_else(|| StorageError::other(format!("scanner config object {path} has no ETag"))),
-        Err(Error::FileNotFound | Error::VolumeNotFound | Error::ObjectNotFound(_, _) | Error::BucketNotFound(_)) => {
-            Ok(DataUsageCacheRevision::Missing)
-        }
+        Err(
+            Error::ConfigNotFound
+            | Error::FileNotFound
+            | Error::VolumeNotFound
+            | Error::ObjectNotFound(_, _)
+            | Error::BucketNotFound(_),
+        ) => Ok(DataUsageCacheRevision::Missing),
         Err(err) => Err(err),
     }
 }

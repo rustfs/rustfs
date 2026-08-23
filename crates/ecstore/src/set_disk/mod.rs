@@ -3614,6 +3614,26 @@ impl SetDisks {
         &self.ctx
     }
 
+    /// Admit one short scanner cache publication under this set's instance
+    /// movement fence. The caller must hold the returned guard through its
+    /// final conditional cache write; no scan-round work belongs under it.
+    pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.scanner_publication_state_allowed() {
+            let epoch = self.ctx.data_movement_operation_epoch();
+            return Some((operation_guard, epoch));
+        }
+
+        // The owner deliberately marks the cached state UNKNOWN after every
+        // movement epoch advance. Do not strand remote scanner writers in that
+        // state: release this guard before asking the storage owner to refresh
+        // its durable movement snapshot, since the owner uses the same gate.
+        drop(operation_guard);
+        let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
+        owner.scanner_data_usage_publication_admission_guard().await
+    }
+
     /// Whether both sets' namespace-lock implementations cover the same object key.
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {

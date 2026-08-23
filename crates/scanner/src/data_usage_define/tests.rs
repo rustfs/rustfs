@@ -199,6 +199,22 @@ impl ObjectIO for CacheReadStore {
 }
 
 #[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for CacheReadStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+    }
+}
+
+#[async_trait::async_trait]
 impl ObjectIO for AmbiguousCacheCommitStore {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
@@ -240,6 +256,22 @@ impl ObjectIO for AmbiguousCacheCommitStore {
         *self.data.lock().await = Some(bytes);
         self.puts.fetch_add(1, Ordering::SeqCst);
         Err(StorageError::PreconditionFailed)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for AmbiguousCacheCommitStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
     }
 }
 
@@ -311,6 +343,22 @@ impl ObjectIO for BackupFallbackStore {
             etag: Some(format!("saved-{object}")),
             ..Default::default()
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for BackupFallbackStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
     }
 }
 
