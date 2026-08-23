@@ -335,8 +335,8 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 #
 # Wired by .github/workflows/e2e-replication-nightly.yml (schedule +
 # workflow_dispatch), which builds the rustfs binary once, installs awscurl so
-# the STS dual-node test actually exercises its path (it skips gracefully with
-# a visible log line when awscurl is absent), and routes scheduled failures
+# the STS dual-node test actually exercises its path (the test fails when
+# awscurl is absent), and routes scheduled failures
 # through .github/actions/schedule-failure-issue (ci-8). Explicit division of
 # labor with e2e-full: these tests run only in the consolidated nightly
 # workflow, not in the merge/main lane.
