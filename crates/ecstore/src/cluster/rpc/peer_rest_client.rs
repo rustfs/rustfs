@@ -365,6 +365,39 @@ impl ScannerPublicationLease {
     }
 }
 
+fn validate_scanner_publication_lease_response_fields(
+    response: &ScannerPublicationLeaseResponse,
+    expected_session_id: &str,
+    expected_generation: u64,
+) -> Result<(Uuid, String)> {
+    if !response.success {
+        return Err(Error::other(
+            response
+                .error
+                .as_ref()
+                .map(|error| error.error_info.clone())
+                .unwrap_or_else(|| "peer rejected scanner publication lease".to_string()),
+        ));
+    }
+    if response.movement_generation != expected_generation {
+        return Err(Error::other("peer returned a different scanner publication lease generation"));
+    }
+    if response.session_id != expected_session_id {
+        return Err(Error::other("peer returned a different scanner publication lease session"));
+    }
+    let owner_id = Uuid::parse_str(&response.owner_id)
+        .ok()
+        .filter(|owner_id| !owner_id.is_nil())
+        .map(|owner_id| owner_id.to_string())
+        .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
+    if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
+        return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
+    }
+    let token = Uuid::from_slice(response.token.as_ref())
+        .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+    Ok((token, owner_id))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerRestClient {
     pub host: XHost,
@@ -1817,30 +1850,8 @@ impl PeerRestClient {
                         .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
                 verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
                     .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
-                if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error
-                            .map(|error| error.error_info)
-                            .unwrap_or_else(|| "peer rejected scanner publication lease".to_string()),
-                    ));
-                }
-                if response.movement_generation != expected_generation {
-                    return Err(Error::other("peer returned a different scanner publication lease generation"));
-                }
-                if response.session_id != expected_session_id {
-                    return Err(Error::other("peer returned a different scanner publication lease session"));
-                }
-                let owner_id = Uuid::parse_str(&response.owner_id)
-                    .ok()
-                    .filter(|owner_id| !owner_id.is_nil())
-                    .map(|owner_id| owner_id.to_string())
-                    .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
-                if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
-                    return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
-                }
-                let token = Uuid::from_slice(response.token.as_ref())
-                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, expected_session_id, expected_generation)?;
                 Ok(ScannerPublicationLease {
                     token,
                     movement_generation: response.movement_generation,
@@ -2207,6 +2218,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn scanner_publication_lease_response_rejects_stale_generation_and_session() {
+        let token = Uuid::new_v4();
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            movement_generation: 7,
+            lease_ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+            error: None,
+            response_proof: Bytes::new(),
+            owner_id: Uuid::new_v4().to_string(),
+            session_id: "session-a".to_string(),
+        };
+
+        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7).is_ok());
+
+        let stale_generation = ScannerPublicationLeaseResponse {
+            movement_generation: 6,
+            ..response.clone()
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7)
+            .expect_err("a response from an older movement generation must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease generation"));
+
+        let stale_session = ScannerPublicationLeaseResponse {
+            session_id: "session-b".to_string(),
+            ..response
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
+            .expect_err("a response from an older scanner session must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease session"));
+    }
 
     #[test]
     fn replication_stats_response_decodes_valid_empty_provider() {

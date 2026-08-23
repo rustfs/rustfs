@@ -2675,6 +2675,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_publication_lease_release_reports_all_unavailable_peers() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let grants = ["peer-a", "peer-b"]
+            .into_iter()
+            .map(|host| ScannerPublicationLeaseGrant {
+                host: host.to_string(),
+                lease: ScannerPublicationLease {
+                    token: Uuid::new_v4(),
+                    movement_generation: 3,
+                    owner_id: Uuid::new_v4().to_string(),
+                    session_id: "session-a".to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                },
+            })
+            .collect();
+
+        let error = sys
+            .release_scanner_publication_leases(grants)
+            .await
+            .expect_err("an unavailable peer must not silently release a remote lease");
+        let message = error.to_string();
+        assert!(message.contains("peer-a"));
+        assert!(message.contains("peer-b"));
+    }
+
+    #[tokio::test]
     async fn scanner_activity_probe_rejects_an_incomplete_peer_topology() {
         let client = PeerRestClient::new(
             "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),

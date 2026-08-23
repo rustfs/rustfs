@@ -2754,6 +2754,48 @@ async fn test_usage_route_barrier_precedes_durable_reconciliation() {
 }
 
 #[tokio::test]
+async fn coordinator_does_not_put_after_remote_generation_flip() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            1,
+        ))
+        .await
+        .expect("usage snapshot should enqueue");
+    drop(sender);
+
+    let route_store = store.clone();
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        Some(DataUsagePersistBaseline {
+            data: None,
+            revision: DataUsageCacheRevision::Missing,
+        }),
+        Some(0),
+        None,
+        move || {
+            let route_store = route_store.clone();
+            async move {
+                // Model the remote lease holder flipping its movement generation
+                // after the activity probe but before the coordinator's PUT.
+                route_store.publication_admission_blocked.store(true, Ordering::Release);
+                false
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert_eq!(store.put_counts.lock().await.get(&key), None);
+}
+
+#[tokio::test]
 async fn test_deferred_usage_save_keeps_last_real_save_metric() {
     let metrics = global_metrics();
     metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);

@@ -1168,6 +1168,68 @@ mod tests {
         assert_eq!(store.scanner_data_movement_generation(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_lease_blocks_movement_writer_until_release_or_expiry() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+        assert_eq!(generation, 0);
+
+        let gate = store.ctx.data_movement_operation_gate();
+        let (writer_started, writer_started_rx) = tokio::sync::oneshot::channel();
+        let mut movement_writer = tokio::spawn(async move {
+            let _ = writer_started.send(());
+            gate.write_owned().await
+        });
+        writer_started_rx
+            .await
+            .expect("movement writer should reach the gate before waiting");
+        assert!(
+            !movement_writer.is_finished(),
+            "a movement writer must wait while the remote lease owns the read guard"
+        );
+
+        assert!(store.release_scanner_publication_lease(token).await);
+        tokio::time::timeout(Duration::from_secs(1), movement_writer)
+            .await
+            .expect("movement writer should proceed after lease release")
+            .expect("movement writer task should not panic");
+
+        let (expiring_token, _) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("the store should grant a second publication lease");
+        let expiry_gate = store.ctx.data_movement_operation_gate();
+        let (expiry_started, expiry_started_rx) = tokio::sync::oneshot::channel();
+        let mut expiry_writer = tokio::spawn(async move {
+            let _ = expiry_started.send(());
+            expiry_gate.write_owned().await
+        });
+        expiry_started_rx
+            .await
+            .expect("expiry writer should reach the gate before waiting");
+        assert!(!expiry_writer.is_finished());
+        tokio::time::advance(crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), &mut expiry_writer)
+            .await
+            .expect("movement writer should proceed after lease expiry")
+            .expect("expiry writer task should not panic");
+        assert!(!store.release_scanner_publication_lease(expiring_token).await);
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_stale_generation_before_install() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let error = store
+            .acquire_scanner_publication_lease(1, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect_err("a stale movement generation must not acquire a lease");
+        assert!(error.to_string().contains("generation is stale"));
+    }
+
     #[tokio::test]
     async fn movement_generation_notifies_waiters_and_fails_closed_at_maximum() {
         let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
