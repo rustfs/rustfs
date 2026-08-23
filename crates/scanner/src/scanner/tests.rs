@@ -2094,6 +2094,40 @@ async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() 
 }
 
 #[tokio::test]
+async fn scanner_usage_floor_fails_closed_on_zero_byte_usage_objects() {
+    for path in [
+        DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+    ] {
+        let key = memory_config_key(RUSTFS_META_BUCKET, &path);
+        let existing = Arc::new(MemoryConfigStore::default());
+        existing.objects.lock().await.insert(key.clone(), Vec::new());
+
+        let err = persisted_usage_floor(existing)
+            .await
+            .expect_err("an empty usage object must not be treated as missing");
+        assert!(
+            err.to_string()
+                .contains(&format!("failed to decode scanner usage floor from {path}:")),
+            "unexpected error for {path}: {err}"
+        );
+
+        let appearing = Arc::new(MemoryConfigStore::default());
+        appearing.insert_after_gets.lock().await.insert(key, Vec::new());
+
+        let err = persisted_usage_floor(appearing)
+            .await
+            .expect_err("an empty usage object appearing during confirmation must prevent pristine bootstrap");
+        assert!(
+            err.to_string().contains("changed while confirming pristine state"),
+            "unexpected confirmation error for {path}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn scanner_usage_floor_requires_publication_admission_for_pristine_bootstrap() {
     let store = Arc::new(MemoryConfigStore::default());
     store.publication_admission_blocked.store(true, Ordering::Release);
