@@ -59,7 +59,7 @@ const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
 use crate::app::storage_api::object_usecase::bucket::replication::{
-    ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
+    OperatorRuleContract, ReplicateDecision, get_read_proxy_targets, must_replicate_metadata, schedule_metadata_replication,
 };
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
@@ -80,19 +80,20 @@ async fn site_replication_gate_enabled() -> S3Result<bool> {
     crate::admin::handlers::site_replication::site_replication_enabled().await
 }
 
-/// Remote site-replication peer deployment ids handed to the bucket usecase
-/// so an S3 replication-config edit keeps exactly the reconciler-owned rules
-/// (issue #1948). Read here, in the interface layer, because the usecase must
-/// not import the admin handlers (layer guard); a state-read failure
-/// propagates so the edit fails closed.
-async fn site_replication_peer_deployment_ids_for_edit() -> S3Result<std::collections::HashSet<String>> {
+/// Remote site-replication peer deployment ids and the operator-rule contract
+/// the peers support, handed to the bucket usecase so an S3 replication-config
+/// edit keeps exactly the reconciler-owned rules and merges the way every
+/// peer will (issue #1948). Read here, in the interface layer, because the
+/// usecase must not import the admin handlers (layer guard); a state-read
+/// failure propagates so the edit fails closed.
+async fn site_replication_edit_context() -> S3Result<(std::collections::HashSet<String>, OperatorRuleContract)> {
     // While the gate override is in effect the test exercises the deny/allow
     // branch, not the peer set; there is no persisted state to read.
     #[cfg(test)]
     if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-        return Ok(std::collections::HashSet::new());
+        return Ok((std::collections::HashSet::new(), OperatorRuleContract::Derived));
     }
-    crate::admin::handlers::site_replication::site_replication_remote_peer_deployment_ids().await
+    crate::admin::handlers::site_replication::site_replication_edit_context().await
 }
 
 /// MinIO `ErrReplicationDenyEditError`.
@@ -564,9 +565,9 @@ impl S3 for FS {
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         deny_replication_config_edit_for_non_owner(&req).await?;
-        let site_peers = site_replication_peer_deployment_ids_for_edit().await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_replication(req, site_peers).await
+        usecase.execute_delete_bucket_replication(req, site_peers, contract).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1419,9 +1420,9 @@ impl S3 for FS {
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         deny_replication_config_edit_for_non_owner(&req).await?;
-        let site_peers = site_replication_peer_deployment_ids_for_edit().await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_replication(req, site_peers).await
+        usecase.execute_put_bucket_replication(req, site_peers, contract).await
     }
 
     async fn put_bucket_request_payment(

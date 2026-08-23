@@ -32,7 +32,7 @@ use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::replication::{
-    assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
+    OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
     replication_target_arn_deployment_id, site_replication_rule_deployment_id,
 };
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
@@ -163,6 +163,8 @@ const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=endpoint-target-refresh";
 const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
+const SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH: &str =
+    "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=derived-rule-contract";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
 /// Peer-edit fencing token, carried as query parameters so a peer that predates
 /// the fence simply ignores them (unknown query keys are dropped) and keeps the
@@ -1135,12 +1137,76 @@ pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
 /// enabled. Read by the bucket usecase so an S3 replication-config edit keeps
 /// exactly the reconciler-owned rules (issue #1948); a state-read failure
 /// propagates so the edit fails closed.
-pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<HashSet<String>> {
-    let state = load_site_replication_state().await?;
-    if !state.enabled() {
-        return Ok(HashSet::new());
+pub(crate) async fn site_replication_edit_context() -> S3Result<(HashSet<String>, OperatorRuleContract)> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        // Enabled without a service account is a state this site cannot
+        // broadcast from either; the peers are still the reconciler's.
+        let state = load_site_replication_state().await?;
+        if !state.enabled() {
+            return Ok((HashSet::new(), OperatorRuleContract::Derived));
+        }
+        let peers = remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state));
+        return Ok((peers, OperatorRuleContract::Legacy));
+    };
+    let peers = remote_peer_deployment_ids(&runtime.state, &runtime.local_peer);
+    let contract = site_replication_operator_rule_contract(&runtime).await;
+    Ok((peers, contract))
+}
+
+/// Whether every remote peer merges replication configs under the derived
+/// contract, probed through the peer capability endpoint. A peer that does
+/// not (or cannot be asked) pins the cluster to [`OperatorRuleContract::Legacy`]
+/// for this edit: consistency across sites wins over keeping the operator's
+/// priority values, and the legacy merge keeps their order anyway.
+async fn site_replication_operator_rule_contract(runtime: &SiteReplicationRuntime) -> OperatorRuleContract {
+    let remote_peers: Vec<&PeerInfo> = runtime
+        .state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != runtime.local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        })
+        .collect();
+    let probes = futures::future::join_all(remote_peers.iter().map(|peer| async move {
+        let transport = PeerTransport::for_runtime_peer(peer).await?;
+        let (status, body) = send_peer_admin_request_raw_with_client(
+            &transport.client,
+            &transport.connection,
+            SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH,
+            &runtime.state.service_account_access_key,
+            &runtime.service_account_secret_key,
+            &(),
+        )
+        .await?;
+        peer_capability_response_supported(peer, status, &body)
+    }))
+    .await;
+    operator_rule_contract_from_probes(remote_peers.into_iter().zip(probes))
+}
+
+fn operator_rule_contract_from_probes<'a>(
+    probes: impl IntoIterator<Item = (&'a PeerInfo, S3Result<bool>)>,
+) -> OperatorRuleContract {
+    for (peer, probe) in probes {
+        match probe {
+            Ok(true) => {}
+            Ok(false) => return OperatorRuleContract::Legacy,
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "derived_rule_contract_probe_failed",
+                    peer = %peer.endpoint,
+                    error = %err,
+                    "admin site replication state"
+                );
+                return OperatorRuleContract::Legacy;
+            }
+        }
     }
-    Ok(remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state)))
+    OperatorRuleContract::Derived
 }
 
 fn remote_peer_deployment_ids(state: &SiteReplicationState, local_peer: &PeerInfo) -> HashSet<String> {
@@ -2031,7 +2097,7 @@ fn peer_tls_settings_changed(existing: Option<&PeerInfo>, proposed: &PeerInfo) -
 }
 
 fn peer_edit_capability_supported(capability: &str) -> bool {
-    matches!(capability, "endpoint-target-refresh" | "peer-tls-settings")
+    matches!(capability, "endpoint-target-refresh" | "peer-tls-settings" | "derived-rule-contract")
 }
 
 fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
@@ -2276,6 +2342,7 @@ fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at
         r#type: item_type.to_string(),
         updated_at,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        derived_rule_contract: true,
         ..Default::default()
     }
 }
@@ -6666,6 +6733,7 @@ fn bucket_metadata_snapshot_tombstone(item: &SRBucketMeta, observed_at: OffsetDa
         updated_at: Some(observed_at),
         expiry_updated_at: Some(observed_at),
         api_version: item.api_version.clone(),
+        derived_rule_contract: item.derived_rule_contract,
         ..Default::default()
     }
 }
@@ -9266,7 +9334,12 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
             };
             let local_absent = local.is_none();
             let site_deployment_ids = site_replication_deployment_ids().await?;
-            match merge_incoming_replication_config(incoming, local, &site_deployment_ids) {
+            let contract = if item.derived_rule_contract {
+                OperatorRuleContract::Derived
+            } else {
+                OperatorRuleContract::Legacy
+            };
+            match merge_incoming_replication_config(incoming, local, &site_deployment_ids, contract) {
                 Some(config) => Some(serialize(&config).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
                 })?),
@@ -13350,6 +13423,7 @@ mod tests {
 
         assert!(peer_edit_capability_supported("peer-tls-settings"));
         assert!(peer_edit_capability_supported("endpoint-target-refresh"));
+        assert!(peer_edit_capability_supported("derived-rule-contract"));
         assert!(!peer_edit_capability_supported("unknown"));
         assert!(peer_capability_response_supported(&remote, StatusCode::OK, br#"{"success":true}"#).expect("supported"));
         assert!(!peer_capability_response_supported(&remote, StatusCode::NOT_FOUND, b"").expect("legacy peer"));
@@ -16195,9 +16269,13 @@ mod tests {
     // itself. No bucket target backs that ARN, so every object was dropped without a log.
     #[test]
     fn test_merge_incoming_replication_config_keeps_local_reverse_rule() {
-        let merged =
-            merge_incoming_replication_config(Some(site_repl_config("home")), Some(site_repl_config("office")), &home_office())
-                .expect("merge should keep the local rule");
+        let merged = merge_incoming_replication_config(
+            Some(site_repl_config("home")),
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("merge should keep the local rule");
 
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
@@ -16208,8 +16286,13 @@ mod tests {
     // either — the delete travels as `replication-config` with no payload.
     #[test]
     fn test_merge_incoming_replication_config_survives_peer_delete() {
-        let merged = merge_incoming_replication_config(None, Some(site_repl_config("office")), &home_office())
-            .expect("local site rules must survive a peer delete");
+        let merged = merge_incoming_replication_config(
+            None,
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("local site rules must survive a peer delete");
 
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
@@ -16221,8 +16304,13 @@ mod tests {
         incoming.rules.push(operator_rule("nightly-backup"));
         incoming.role = "arn:rustfs:replication::home:photos".to_string();
 
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &home_office())
-            .expect("merge should produce rules");
+        let merged = merge_incoming_replication_config(
+            Some(incoming),
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("merge should produce rules");
 
         let ids: Vec<_> = merged.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
         assert_eq!(ids, vec!["nightly-backup", "site-repl-office"]);
@@ -16236,7 +16324,15 @@ mod tests {
 
     #[test]
     fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
-        assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None, &home_office()).is_none());
+        assert!(
+            merge_incoming_replication_config(
+                Some(site_repl_config("home")),
+                None,
+                &home_office(),
+                OperatorRuleContract::Derived
+            )
+            .is_none()
+        );
     }
 
     fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
@@ -16655,8 +16751,13 @@ mod tests {
         ] {
             let mut incoming = site_repl_config("home");
             incoming.role = operator_role.to_string();
-            let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")), &sites)
-                .expect("merge should produce rules");
+            let merged = merge_incoming_replication_config(
+                Some(incoming),
+                Some(site_repl_config("office")),
+                &sites,
+                OperatorRuleContract::Derived,
+            )
+            .expect("merge should produce rules");
             assert_eq!(merged.role, operator_role, "operator role must survive the merge");
         }
     }
@@ -17021,6 +17122,55 @@ mod tests {
         assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
         assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
+    }
+
+    // Issue #1948 review: one pre-contract peer pins an S3 edit to the legacy
+    // merge; only a cluster where every remote peer answered the probe moves
+    // to the derived contract. A probe error counts as a pre-contract peer.
+    #[test]
+    fn test_operator_rule_contract_requires_every_remote_peer() {
+        let home = normalize_peer_info(PeerInfo {
+            endpoint: "https://home.example.com".to_string(),
+            ..Default::default()
+        });
+        let office = normalize_peer_info(PeerInfo {
+            endpoint: "https://office.example.com".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(operator_rule_contract_from_probes([]), OperatorRuleContract::Derived);
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(true))]),
+            OperatorRuleContract::Derived
+        );
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(false))]),
+            OperatorRuleContract::Legacy
+        );
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Err(s3_error!(InternalError, "unreachable"))), (&office, Ok(true))]),
+            OperatorRuleContract::Legacy
+        );
+    }
+
+    // The contract travels with the payload: a pre-contract sender's item has
+    // no marker and is merged the legacy way; every item this site sends is
+    // marked, bootstrap snapshots included, so a preserved config is never
+    // renumbered by a peer on the derived contract.
+    #[test]
+    fn test_bucket_meta_items_carry_the_derived_rule_contract() {
+        let legacy: SRBucketMeta = serde_json::from_str(r#"{"type":"replication-config","bucket":"photos"}"#).expect("item");
+        assert!(!legacy.derived_rule_contract);
+
+        let bucket = SRBucketInfo {
+            bucket: "photos".to_string(),
+            ..Default::default()
+        };
+        let item = bootstrap_bucket_meta_item(&bucket, "replication-config", None);
+        assert!(item.derived_rule_contract);
+        let wire = serde_json::to_value(&item).expect("json");
+        assert_eq!(wire["derivedRuleContract"], serde_json::Value::Bool(true));
+        assert!(bucket_metadata_snapshot_tombstone(&item, OffsetDateTime::now_utc()).derived_rule_contract);
     }
 
     // Issue #1948 review: an owner's `site-repl-user` rule on an operator ARN

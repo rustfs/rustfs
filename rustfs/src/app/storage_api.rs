@@ -614,7 +614,7 @@ pub(crate) mod bucket {
 
         use crate::storage::storage_api::ecstore_bucket::replication as replication_contracts;
 
-        pub(crate) use replication_contracts::merge_user_replication_config;
+        pub(crate) use replication_contracts::{OperatorRuleContract, merge_user_replication_config};
 
         type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type DeleteReplicationConfigSnapshot =

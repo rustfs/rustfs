@@ -29,9 +29,9 @@ mod storage_api;
 pub mod tagging;
 
 pub use config::{
-    ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
-    ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationTargetValidationError,
+    ObjectOpts, OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+    REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+    REPLICATION_WRITABLE_FIELDS, ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationTargetValidationError,
     active_replication_rule_destination_arns, assign_site_replication_rule_priorities, invalid_replication_config_status_field,
     is_reconciler_owned_site_replication_rule, is_site_replication_role, is_site_replication_rule,
     merge_incoming_replication_config, merge_user_replication_config, replication_target_arn_deployment_id,

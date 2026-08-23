@@ -38,9 +38,9 @@ use super::storage_api::bucket_usecase::bucket::{
     metadata_sys,
     policy_sys::PolicySys,
     replication::{
-        ReplicationTargetValidationError, invalid_replication_config_status_field, merge_user_replication_config,
-        replication_target_arns, should_remove_replication_target, unsupported_replication_config_field,
-        validate_replication_config_structure, validate_replication_config_target_arns,
+        OperatorRuleContract, ReplicationTargetValidationError, invalid_replication_config_status_field,
+        merge_user_replication_config, replication_target_arns, should_remove_replication_target,
+        unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
     },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
@@ -509,6 +509,7 @@ fn sr_bucket_meta_item(bucket: String, item_type: &str) -> SRBucketMeta {
         r#type: item_type.to_string(),
         updated_at: Some(time::OffsetDateTime::now_utc()),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        derived_rule_contract: true,
         ..Default::default()
     }
 }
@@ -631,10 +632,13 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
 /// incoming impostors of those rules. An empty peer set (site replication
 /// disabled) keeps the verbatim overwrite semantics: rule ids are not
 /// reserved, so an operator's own `site-repl-*` rule is ordinary state there.
+/// `contract` is what the peers were probed to support; the merged config is
+/// what gets broadcast, so it is built the way every peer will merge it.
 fn merge_user_replication_config_update(
     incoming: ReplicationConfiguration,
     existing: Option<ReplicationConfiguration>,
     site_peer_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
 ) -> ReplicationConfiguration {
     if site_peer_deployment_ids.is_empty() {
         return incoming;
@@ -642,7 +646,7 @@ fn merge_user_replication_config_update(
     // `incoming` passed structure validation, so it holds at least one rule;
     // `None` is only reachable when every incoming rule impersonates a
     // reconciler rule, and then the stored reconciler rules are what remains.
-    merge_user_replication_config(Some(incoming.clone()), existing, site_peer_deployment_ids).unwrap_or(incoming)
+    merge_user_replication_config(Some(incoming.clone()), existing, site_peer_deployment_ids, contract).unwrap_or(incoming)
 }
 
 /// Split of an S3 DeleteBucketReplication on the stored config (issue #1948):
@@ -654,9 +658,10 @@ fn merge_user_replication_config_update(
 fn split_replication_config_for_user_delete(
     config: ReplicationConfiguration,
     site_peer_deployment_ids: &HashSet<String>,
+    contract: OperatorRuleContract,
 ) -> (Option<ReplicationConfiguration>, HashSet<String>) {
     let mut removable_arns = replication_target_arns(&config);
-    let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids);
+    let remaining = merge_user_replication_config(None, Some(config), site_peer_deployment_ids, contract);
     if let Some(remaining) = remaining.as_ref() {
         for rule in &remaining.rules {
             removable_arns.remove(rule.destination.bucket.trim());
@@ -1632,6 +1637,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
         site_peers: HashSet<String>,
+        contract: OperatorRuleContract,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -1652,7 +1658,7 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
         let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
-            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers);
+            let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers, contract);
             let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
             (remaining, targets)
         } else {
@@ -2520,11 +2526,13 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
 
-    /// See [`Self::execute_delete_bucket_replication`] for `site_peers`.
+    /// See [`Self::execute_delete_bucket_replication`] for `site_peers` and
+    /// `contract`.
     pub async fn execute_put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
         site_peers: HashSet<String>,
+        contract: OperatorRuleContract,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -2554,7 +2562,7 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
         let replication_configuration =
-            merge_user_replication_config_update(replication_configuration, existing_config, &site_peers);
+            merge_user_replication_config_update(replication_configuration, existing_config, &site_peers, contract);
         let data = serialize_config(&replication_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
             .await
@@ -3213,7 +3221,12 @@ mod tests {
             ],
         };
 
-        let merged = merge_user_replication_config_update(incoming, Some(existing), &site_peers(&["peer-dep"]));
+        let merged = merge_user_replication_config_update(
+            incoming,
+            Some(existing),
+            &site_peers(&["peer-dep"]),
+            OperatorRuleContract::Derived,
+        );
 
         let rules: Vec<_> = merged
             .rules
@@ -3243,10 +3256,11 @@ mod tests {
             rules: vec![replication_rule_with_id(user_arn, "site-repl-user", 1)],
         };
 
-        let stored = merge_user_replication_config_update(incoming.clone(), None, &HashSet::new());
+        let stored = merge_user_replication_config_update(incoming.clone(), None, &HashSet::new(), OperatorRuleContract::Derived);
         assert_eq!(stored, incoming, "PUT on a non-site-replication bucket is verbatim");
 
-        let (remaining, removable) = split_replication_config_for_user_delete(stored, &HashSet::new());
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(stored, &HashSet::new(), OperatorRuleContract::Derived);
         assert!(remaining.is_none(), "DELETE must remove the operator's site-repl-* rule");
         assert_eq!(removable, HashSet::from([user_arn.to_string()]));
     }
@@ -3268,7 +3282,8 @@ mod tests {
             ],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
 
         let remaining = remaining.expect("the reconciler-derived rule must survive");
         assert_eq!(remaining.rules.len(), 1);
@@ -3299,7 +3314,12 @@ mod tests {
             )],
         };
 
-        let merged = merge_user_replication_config_update(incoming.clone(), Some(existing), &HashSet::new());
+        let merged = merge_user_replication_config_update(
+            incoming.clone(),
+            Some(existing),
+            &HashSet::new(),
+            OperatorRuleContract::Derived,
+        );
 
         assert_eq!(merged.role, incoming.role);
         assert_eq!(merged.rules, incoming.rules, "non-SR buckets keep the verbatim overwrite semantics");
@@ -3317,7 +3337,8 @@ mod tests {
             ],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
 
         let remaining = remaining.expect("site-replication rules must survive a user delete");
         let ids: Vec<_> = remaining
@@ -3340,7 +3361,8 @@ mod tests {
             ],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
 
         assert!(remaining.is_some());
         assert!(
@@ -3357,7 +3379,8 @@ mod tests {
             rules: vec![replication_rule_with_id(user_arn, "user-rule", 1)],
         };
 
-        let (remaining, removable) = split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]));
+        let (remaining, removable) =
+            split_replication_config_for_user_delete(config, &site_peers(&["peer-dep"]), OperatorRuleContract::Derived);
 
         assert!(remaining.is_none(), "without site-replication rules the whole config is deleted");
         assert_eq!(removable, HashSet::from([user_arn.to_string()]));
@@ -3701,7 +3724,7 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_delete_bucket_replication(req, HashSet::new())
+            .execute_delete_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -4789,7 +4812,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_replication(req, HashSet::new()).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_replication(req, HashSet::new(), OperatorRuleContract::Derived)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -4807,7 +4833,7 @@ mod tests {
             .unwrap();
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new())
+            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new(), OperatorRuleContract::Derived)
             .await
             .expect_err("unsupported fields must be rejected before store access");
 
