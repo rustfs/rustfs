@@ -22,9 +22,7 @@
 //! - KMS backend configuration (Local and Vault)
 //! - SSE encryption testing utilities
 
-use crate::common::{
-    RustFSTestEnvironment, awscurl_available, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client,
-};
+use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
@@ -57,15 +55,6 @@ pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
 pub fn init_logging() {
     common_init_logging();
     // Additional KMS-specific logging configuration can be added here if needed
-}
-
-pub fn skip_if_kms_admin_tool_unavailable(test_name: &str) -> bool {
-    if awscurl_available() {
-        return false;
-    }
-
-    info!("Skipping {} because awscurl is not available in PATH", test_name);
-    true
 }
 
 pub fn sse_customer_key_md5_base64(key: &str) -> String {
@@ -490,10 +479,6 @@ pub async fn test_kms_key_management(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if skip_if_kms_admin_tool_unavailable("test_kms_key_management") {
-        return Ok(());
-    }
-
     info!("Testing KMS key management APIs");
 
     // Test CreateKey

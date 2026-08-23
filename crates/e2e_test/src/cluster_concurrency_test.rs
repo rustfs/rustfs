@@ -24,10 +24,9 @@ use tracing::{info, warn};
 const BUCKET: &str = "conditional-put-race-bucket";
 const BUCKET_METADATA_RELOAD_BUCKET: &str = "bucket-metadata-reload-barrier";
 
-async fn cleanup_object(client: &Client, key: &str) {
-    if let Err(e) = client.delete_object().bucket(BUCKET).key(key).send().await {
-        warn!("Failed to delete object '{}' from bucket '{}' during cleanup: {:?}", key, BUCKET, e);
-    }
+async fn cleanup_object(client: &Client, key: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    client.delete_object().bucket(BUCKET).key(key).send().await?;
+    Ok(())
 }
 
 async fn assert_bucket_cors_missing(client: &Client) {
@@ -83,14 +82,13 @@ async fn run_race_iteration(
     test_key: &str,
     iteration: usize,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    cleanup_object(&clients[0], test_key).await;
+    cleanup_object(&clients[0], test_key).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let head_result = clients[0].head_object().bucket(BUCKET).key(test_key).send().await;
-
-    if head_result.is_ok() {
-        warn!("Warning: Object still exists after cleanup, skipping iteration {}", iteration);
-        return Ok(0);
+    match clients[0].head_object().bucket(BUCKET).key(test_key).send().await {
+        Ok(_) => return Err(format!("object still exists after cleanup in iteration {iteration}").into()),
+        Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) => {}
+        Err(error) => return Err(format!("failed to verify cleanup in iteration {iteration}: {error:?}").into()),
     }
 
     info!("\n=== Iteration {} ===", iteration);
@@ -132,14 +130,16 @@ async fn run_race_iteration(
 
     info!("Result: {} out of {} succeeded", success_count, clients.len());
 
+    if had_error {
+        return Err("one or more conditional PUTs failed unexpectedly".into());
+    }
+
     if success_count > 1 {
         info!(">>> RACE CONDITION DETECTED!");
     } else if success_count == 1 {
         info!(">>> Correct behavior: exactly 1 writer succeeded.");
-    } else if had_error {
-        return Err("all conditional PUTs failed (e.g. cluster/bucket not ready)".into());
     } else {
-        info!(">>> Unexpected: no writers succeeded.");
+        return Err("no conditional PUT succeeded".into());
     }
 
     Ok(success_count)
@@ -179,7 +179,7 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
             }
         }
 
-        cleanup_object(&clients[0], &test_key).await;
+        cleanup_object(&clients[0], &test_key).await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
@@ -189,13 +189,17 @@ async fn test_conditional_put_race_cluster() -> Result<(), Box<dyn std::error::E
     info!("Total iterations:   {}", iterations);
     info!("Correct (1 winner): {}", correct_count);
     info!("Race conditions:    {}", races_detected);
-    info!("Errors (skipped):   {}", error_count);
+    info!("Failed iterations:  {}", error_count);
 
     assert_eq!(races_detected, 0, "Race conditions detected: {}/{}", races_detected, iterations);
     assert_eq!(
         error_count, 0,
         "{} iteration(s) failed due to errors (e.g. cluster not ready)",
         error_count
+    );
+    assert_eq!(
+        correct_count, iterations,
+        "only {correct_count}/{iterations} iterations observed exactly one winner"
     );
 
     Ok(())
@@ -213,7 +217,7 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
 
     let client = cluster.create_s3_client(0)?;
     let test_key = "basic-conditional-put";
-    cleanup_object(&client, test_key).await;
+    cleanup_object(&client, test_key).await?;
 
     let result = client
         .put_object()
@@ -245,7 +249,7 @@ async fn test_conditional_put_basic_cluster() -> Result<(), Box<dyn std::error::
         assert_eq!(code, "PreconditionFailed");
     }
 
-    cleanup_object(&client, test_key).await;
+    cleanup_object(&client, test_key).await?;
     Ok(())
 }
 

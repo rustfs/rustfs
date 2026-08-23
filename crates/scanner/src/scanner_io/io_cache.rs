@@ -31,6 +31,7 @@ impl ScannerIOCache for SetDisks {
             all_buckets,
             digest: scan_plan_digest,
             leader_epoch,
+            tier_registry_generation,
             publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
@@ -70,6 +71,7 @@ impl ScannerIOCache for SetDisks {
                     next_cycle: want_cycle,
                     last_update: Some(now),
                     leader_epoch,
+                    tier_registry_generation: Some(tier_registry_generation),
                     source: Some(source),
                     snapshot_complete: true,
                     scan_plan_digest: Some(scan_plan_digest),
@@ -267,7 +269,14 @@ impl ScannerIOCache for SetDisks {
         record_disk_bucket_scans_active(0, &pool_label, &set_label);
         let _reset_disk_bucket_scan_gauges = DiskBucketScanGaugeReset::new(pool_label.clone(), set_label.clone());
 
-        let old_lkg = old_cache.info.snapshot_complete.then(|| {
+        // Fence a stale set aggregate before copying entries into per-bucket work caches.
+        if old_cache.info.next_cycle <= want_cycle
+            && old_cache.info.leader_epoch <= leader_epoch
+            && old_cache.info.tier_registry_generation != Some(tier_registry_generation)
+        {
+            old_cache.info.scan_plan_digest = None;
+        }
+        let old_lkg = old_cache.info.snapshot_complete.then_some({
             (
                 old_cache.info.next_cycle,
                 old_cache.info.last_update,
@@ -333,6 +342,7 @@ impl ScannerIOCache for SetDisks {
                 name: DATA_USAGE_ROOT.to_string(),
                 next_cycle: want_cycle,
                 leader_epoch,
+                tier_registry_generation: Some(tier_registry_generation),
                 source: Some(source),
                 snapshot_complete: false,
                 scan_plan_digest: Some(scan_plan_digest),
@@ -394,8 +404,9 @@ impl ScannerIOCache for SetDisks {
                         };
 
                         let mut cache = cache_mutex_clone.lock().await;
-                        apply_bucket_result_to_cache(&mut cache, result, SystemTime::now());
-                        completed_bucket_count_clone.fetch_add(1, Ordering::Relaxed);
+                        if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
+                            completed_bucket_count_clone.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -527,6 +538,7 @@ impl ScannerIOCache for SetDisks {
                                 session_id: remote_session_id,
                                 session_sequence: request_sequence,
                                 scan_plan_digest: bucket_scan_plan_digest,
+                                tier_registry_generation,
                                 skip_healing: healing,
                                 scan_mode,
                             },
@@ -742,14 +754,17 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
-                    let scan_state = current_cache_root_or_prepare(
+                    let scan_state = current_cache_root_or_prepare_with_generation(
                         &mut cache,
                         &bucket.name,
                         source,
                         want_cycle,
                         leader_epoch,
                         bucket_scan_plan_digest,
-                        require_cache_source,
+                        DataUsageCacheReuseOptions {
+                            require_source: require_cache_source,
+                            tier_registry_generation: Some(tier_registry_generation),
+                        },
                     );
                     let outcome = match scan_state {
                         DataUsageCacheScanState::Current(root) => {
@@ -1237,6 +1252,7 @@ impl ScannerIOCache for SetDisks {
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;
             incomplete_scope.info.leader_epoch = leader_epoch;
+            incomplete_scope.info.tier_registry_generation = Some(tier_registry_generation);
             incomplete_scope.info.source = Some(source);
             incomplete_scope.info.snapshot_complete = false;
             incomplete_scope.info.scan_plan_digest = Some(scan_plan_digest);
