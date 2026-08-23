@@ -1939,13 +1939,13 @@ mod scanner_activity_tests {
             assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
         }
 
-        let release_a = proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+        let release_a = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
             challenge: vec![2; 16].into(),
             token: vec![3; 16].into(),
             owner_id: "owner-a".to_string(),
             session_id: "session-a".to_string(),
         };
-        let release_b = proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+        let release_b = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
             owner_id: "owner-b".to_string(),
             ..release_a.clone()
         };
