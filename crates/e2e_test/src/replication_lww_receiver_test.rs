@@ -26,6 +26,11 @@
 //! object version and asserts the newer tagging state wins regardless of
 //! delivery order, while a stale delivery still succeeds at the object level
 //! (a failure would loop through MRF re-delivering the stale value).
+//!
+//! The real dual-site path (sender, worker, status bookkeeping, MRF replay)
+//! is covered by
+//! `replication_extension_test::test_site_replication_tagging_lww_converges_active_active_real_dual_node`;
+//! this file stays as the fast, single-process receiver check.
 
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;

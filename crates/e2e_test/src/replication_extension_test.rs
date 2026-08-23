@@ -59,7 +59,7 @@ use rustfs_madmin::{
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use s3s::header::X_AMZ_REPLICATION_STATUS;
+use s3s::header::{X_AMZ_REPLICATION_STATUS, X_AMZ_TAGGING};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -2164,6 +2164,7 @@ async fn forward_replication_proxy_request(
     client: &reqwest::Client,
     request_count: &AtomicU64,
     mut replication_enabled: watch::Receiver<bool>,
+    mut held_tagging: watch::Receiver<Option<String>>,
 ) -> Response<Full<bytes::Bytes>> {
     let (parts, body) = request.into_parts();
     let is_replication = parts
@@ -2175,6 +2176,17 @@ async fn forward_replication_proxy_request(
         while !*replication_enabled.borrow() {
             if replication_enabled.changed().await.is_err() {
                 return proxy_error_response("replication gate closed");
+            }
+        }
+        // Content-keyed hold: park only the replication request whose
+        // `x-amz-tagging` matches the held value, letting every other delivery
+        // through, so a test can make one specific (stale) delivery the last
+        // write the backend sees.
+        if let Some(tagging) = parts.headers.get(X_AMZ_TAGGING).and_then(|value| value.to_str().ok()) {
+            while held_tagging.borrow().as_deref() == Some(tagging) {
+                if held_tagging.changed().await.is_err() {
+                    return proxy_error_response("replication tag hold closed");
+                }
             }
         }
     }
@@ -2211,12 +2223,26 @@ async fn start_replication_counting_proxy(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
 ) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
+    let (proxy_url, request_count, replication_enabled, _held_tagging) =
+        start_replication_counting_proxy_with_tag_hold(backend_url, tasks).await?;
+    Ok((proxy_url, request_count, replication_enabled))
+}
+
+/// [`start_replication_counting_proxy`] plus a content-keyed hold: while the
+/// returned `watch::Sender<Option<String>>` holds `Some(tagging)`, replication
+/// requests whose `x-amz-tagging` equals `tagging` are parked (and still
+/// counted); all other traffic flows. Send `None` to release them.
+async fn start_replication_counting_proxy_with_tag_hold(
+    backend_url: &str,
+    tasks: &mut JoinSet<()>,
+) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>, watch::Sender<Option<String>>), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_url = format!("http://{}", listener.local_addr()?);
     let backend_url = backend_url.to_string();
     let request_count = Arc::new(AtomicU64::new(0));
     let task_request_count = request_count.clone();
     let (replication_enabled, task_replication_enabled) = watch::channel(true);
+    let (held_tagging, task_held_tagging) = watch::channel(None);
     tasks.spawn(async move {
         let client = local_http_client();
         let mut connections = JoinSet::new();
@@ -2228,12 +2254,14 @@ async fn start_replication_counting_proxy(
                     let client = client.clone();
                     let request_count = task_request_count.clone();
                     let replication_enabled = task_replication_enabled.clone();
+                    let held_tagging = task_held_tagging.clone();
                     connections.spawn(async move {
                         let service = service_fn(move |request| {
                             let backend_url = backend_url.clone();
                             let client = client.clone();
                             let request_count = request_count.clone();
                             let replication_enabled = replication_enabled.clone();
+                            let held_tagging = held_tagging.clone();
                             async move {
                                 Ok::<_, Infallible>(
                                     forward_replication_proxy_request(
@@ -2242,6 +2270,7 @@ async fn start_replication_counting_proxy(
                                         &client,
                                         &request_count,
                                         replication_enabled,
+                                        held_tagging,
                                     )
                                     .await,
                                 )
@@ -2254,7 +2283,7 @@ async fn start_replication_counting_proxy(
             }
         }
     });
-    Ok((proxy_url, request_count, replication_enabled))
+    Ok((proxy_url, request_count, replication_enabled, held_tagging))
 }
 
 async fn site_replication_remove(
@@ -7090,6 +7119,391 @@ async fn test_site_replication_active_active_converges_without_loops_real_dual_n
     }
 }
 
+/// Replication status a site reports for one object version via HEAD
+/// (`x-amz-replication-status`), or `None` when the header is absent.
+async fn head_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?;
+    Ok(head.replication_status().map(|status| status.as_str().to_string()))
+}
+
+/// Poll one site until the version's replication status is one of `expected`.
+async fn wait_for_version_replication_status(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    expected: &[&str],
+    site: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let last = head_replication_status(client, bucket, key, version_id).await?;
+        if let Some(status) = last.as_deref()
+            && expected.contains(&status)
+        {
+            return Ok(status.to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{site}: {bucket}/{key}?versionId={version_id} replication status {last:?} never reached {expected:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn put_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key(tag_key).value(tag_value).build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn get_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let tagging = client
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?;
+    Ok(tagging
+        .tag_set()
+        .iter()
+        .find(|tag| tag.key() == tag_key)
+        .map(|tag| tag.value().to_string()))
+}
+
+/// Poll one site until the version's `tag_key` equals `expected`.
+async fn wait_for_single_tag(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    expected: &str,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = get_single_tag(client, bucket, key, version_id, tag_key).await?;
+        if observed.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{site}: {bucket}/{key}?versionId={version_id} tag {tag_key}={observed:?} never became {expected}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Tag key the dual-node LWW scenario edits on both sites.
+const LWW_TAG_KEY: &str = "owner";
+
+/// Assert the version's [`LWW_TAG_KEY`] stays `expected` on both sites for a
+/// full quiet window (no late stale delivery flips it back).
+async fn assert_tag_stable_on_both_sites(
+    site_a_client: &Client,
+    site_b_client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    expected: &str,
+    quiet: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + quiet;
+    loop {
+        let on_a = get_single_tag(site_a_client, bucket, key, version_id, LWW_TAG_KEY).await?;
+        let on_b = get_single_tag(site_b_client, bucket, key, version_id, LWW_TAG_KEY).await?;
+        assert_eq!(on_a.as_deref(), Some(expected), "site A tag {LWW_TAG_KEY} regressed from the LWW winner");
+        assert_eq!(on_b.as_deref(), Some(expected), "site B tag {LWW_TAG_KEY} regressed from the LWW winner");
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Wait until the counting proxy in front of a site has admitted `expected`
+/// replication requests in total (requests held by a closed gate still count).
+async fn wait_for_proxy_replication_requests(
+    counter: &AtomicU64,
+    expected: u64,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = counter.load(Ordering::Relaxed);
+        if observed >= expected {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{site} proxy saw {observed} replication requests, expected at least {expected}").into());
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// rustfs/backlog#1953 (audit A4/P1-6): receiver-side LWW for replicated
+/// metadata categories, exercised end to end over the real dual-node
+/// active-active site-replication control plane — sender, worker, status
+/// bookkeeping and MRF replay all participate (the single-server
+/// `replication_lww_receiver_test` only injects authorized replication PUTs).
+///
+/// Scenario on one versioned object:
+/// 1. reciprocal tag edits in real order (A then B) converge both sites on the
+///    newer tag and leave the author COMPLETED / the receiver REPLICA;
+/// 2. out-of-order delivery: A's edit is held at B's inbound proxy while B
+///    authors a newer edit that reaches A first; releasing the stale delivery
+///    must NOT roll B back — both sites settle on B's value and stay there
+///    through a quiet window, with no FAILED/PENDING status left behind;
+/// 3. MRF replay: B is stopped, A tags again (delivery fails -> MRF), B is
+///    restarted in place and the replayed edit converges both sites forward.
+#[tokio::test]
+async fn test_site_replication_tagging_lww_converges_active_active_real_dual_node() -> TestResult {
+    init_logging();
+
+    match tokio::time::timeout(Duration::from_secs(420), async {
+        // Fast health-check / MRF flush only; the scanner keeps its default
+        // cycle so no scanner re-drive can re-deliver the source's *current*
+        // state behind the deliberately stale delivery in step 2 (which would
+        // mask a receiver-side LWW regression by accident).
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut proxy_tasks = JoinSet::new();
+        let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging) =
+            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks).await?;
+        let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging) =
+            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let bucket = "site-repl-tag-lww";
+        let key = "lww.txt";
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "lww-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "lww-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+        let site_info = wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        // Route both directions through the counting proxies so inbound
+        // replication to B can be held (out-of-order delivery) and observed.
+        for (env_url, proxy_url, label) in [(&site_a_env.url, &site_a_proxy, "A"), (&site_b_env.url, &site_b_proxy, "B")] {
+            let mut peer = site_info
+                .sites
+                .iter()
+                .find(|peer| peer.endpoint == *env_url)
+                .ok_or_else(|| format!("site {label} peer missing from replication info"))?
+                .clone();
+            peer.endpoint = proxy_url.clone();
+            peer.sync_state = SyncStatus::Enable;
+            let edit = site_replication_edit(&site_a_env, "", &peer).await?;
+            assert!(edit.success, "unexpected site {label} endpoint edit: {edit:?}");
+        }
+        for env in [&site_a_env, &site_b_env] {
+            wait_for_site_replication_info(env, |info| {
+                info.sites.iter().any(|peer| peer.endpoint == site_a_proxy)
+                    && info.sites.iter().any(|peer| peer.endpoint == site_b_proxy)
+            })
+            .await?;
+        }
+
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        wait_for_bucket_on_target(&site_b_client, bucket).await?;
+
+        let version_id = site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"tag lww payload"))
+            .send()
+            .await?
+            .version_id()
+            .ok_or("site A PUT omitted version ID")?
+            .to_string();
+        wait_for_replicated_object(&site_b_client, bucket, key, "tag lww payload").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, 1, "site B").await?;
+
+        // --- 1. reciprocal edits in real order: A then B ----------------------
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a1").await?;
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "a1", "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, 2, "site B").await?;
+
+        put_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "b1").await?;
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "b1", "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["COMPLETED"], "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["REPLICA"], "site A").await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "b1", Duration::from_secs(3))
+            .await?;
+
+        // --- 2. concurrent edits, stale delivery last ------------------------
+        // Both sites edit the same version while each other's delivery is
+        // parked at the peer's inbound proxy (content-keyed: only the
+        // `owner=a2` / `owner=b2` replication PUTs wait, everything else
+        // flows). B's edit is the newer one. Releasing A's stale `a2` first
+        // makes it the last write B sees while A itself still holds `a2`, so
+        // nothing A could re-deliver carries the winner: only receiver-side
+        // LWW on B can keep `b2`. Releasing `b2` afterwards converges A.
+        site_b_held_tagging.send(Some("owner=a2".to_string()))?;
+        site_a_held_tagging.send(Some("owner=b2".to_string()))?;
+        let a2_parked_at = site_b_replication_requests.load(Ordering::Relaxed) + 1;
+        let b2_parked_at = site_a_replication_requests.load(Ordering::Relaxed) + 1;
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a2").await?;
+        wait_for_proxy_replication_requests(&site_b_replication_requests, a2_parked_at, "site B").await?;
+        sleep(Duration::from_millis(50)).await;
+        put_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "b2").await?;
+        wait_for_proxy_replication_requests(&site_a_replication_requests, b2_parked_at, "site A").await?;
+        assert_eq!(
+            get_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY)
+                .await?
+                .as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            get_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY)
+                .await?
+                .as_deref(),
+            Some("b2")
+        );
+
+        // Release the stale a2 delivery onto B: the newer local b2 must
+        // survive, and the delivery itself must still succeed (A reaches
+        // COMPLETED instead of looping through MRF with the stale value).
+        site_b_held_tagging.send(None)?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        let stale_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            assert_eq!(
+                get_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY)
+                    .await?
+                    .as_deref(),
+                Some("b2"),
+                "a stale inbound delivery rolled back site B's newer tag (receiver-side LWW regression)"
+            );
+            if tokio::time::Instant::now() >= stale_deadline {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+
+        // Release b2 onto A: the newer edit wins there and both sites settle.
+        // B's own version may legitimately read REPLICA here: the stale inbound
+        // a2 write re-labelled it as a replica write (keeping B's tags); what
+        // must not remain is PENDING/FAILED.
+        site_a_held_tagging.send(None)?;
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "b2", "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["COMPLETED", "REPLICA"], "site B")
+            .await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "b2", Duration::from_secs(4))
+            .await?;
+        for (client, site) in [(&site_a_client, "site A"), (&site_b_client, "site B")] {
+            let status = head_replication_status(client, bucket, key, &version_id).await?;
+            assert!(
+                matches!(status.as_deref(), Some("COMPLETED" | "REPLICA")),
+                "{site} must not be left PENDING/FAILED after the concurrent edits: {status:?}"
+            );
+        }
+
+        // --- 3. MRF replay: B is down while A edits; the replay converges forward
+        site_b_env.stop_server();
+        put_single_tag(&site_a_client, bucket, key, &version_id, LWW_TAG_KEY, "a3").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["PENDING", "FAILED"], "site A").await?;
+        site_b_env.restart_server_preserving_data(vec![], &site_env).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, LWW_TAG_KEY, "a3", "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+        assert_tag_stable_on_both_sites(&site_a_client, &site_b_client, bucket, key, &version_id, "a3", Duration::from_secs(3))
+            .await?;
+
+        // The object itself never forked: one version on each side.
+        tokio::time::timeout(
+            Duration::from_secs(70),
+            assert_replication_converged(&site_a_client, bucket, &site_b_client, bucket),
+        )
+        .await??;
+        let state = list_replication_state(&site_a_client, bucket).await?;
+        assert_eq!(state.len(), 1, "tag edits must not create new object versions: {state:?}");
+        assert_eq!(state[0].version_id, version_id);
+
+        proxy_tasks.abort_all();
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("site replication tagging LWW test timed out".into()),
+    }
+}
 #[tokio::test]
 async fn test_site_replication_replicates_policy_backed_user_access_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
