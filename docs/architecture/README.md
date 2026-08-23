@@ -54,6 +54,7 @@ Two rules keep this directory healthy:
 - [ecstore-config-consumer-inventory.md](ecstore-config-consumer-inventory.md)
 - [obs-ecstore-dependency-inventory.md](obs-ecstore-dependency-inventory.md)
 - [background-services-inventory.md](background-services-inventory.md)
+- [scanner-heal-admission.md](scanner-heal-admission.md)
 - [admin-route-action-snapshot.md](admin-route-action-snapshot.md)
 - [compat-cleanup-register.md](compat-cleanup-register.md)
 

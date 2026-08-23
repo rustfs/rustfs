@@ -37,7 +37,7 @@ use crate::bucket::lifecycle::{
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
-        save_transition_transaction_record,
+        load_transition_transaction_record, save_transition_transaction_record,
     },
 };
 use crate::bucket::quota::reservation;
@@ -4248,7 +4248,12 @@ fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, 
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
     if let Some(api) = api {
-        return delete_transition_transaction_record(api.clone(), transaction_id).await;
+        let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
+            Ok(transaction) => transaction,
+            Err(Error::ConfigNotFound) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        return delete_transition_transaction_record(api.clone(), &transaction).await;
     }
     Ok(())
 }
