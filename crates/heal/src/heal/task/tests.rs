@@ -547,6 +547,7 @@ struct MockStorage {
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     format_no_heal_required: Mutex<bool>,
+    format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
     replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
     replacement_targets_ready: Mutex<bool>,
@@ -867,6 +868,9 @@ impl HealStorageAPI for MockStorage {
 
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         *self.global_format_calls.lock().unwrap() += 1;
+        if let Some(error) = self.format_error.lock().unwrap().take() {
+            return Err(error);
+        }
         let no_heal_required = *self.format_no_heal_required.lock().unwrap();
         if no_heal_required {
             Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::NoHealRequired))))
@@ -2050,6 +2054,30 @@ async fn test_erasure_set_heal_continues_after_format_no_heal_required() {
         err.to_string().contains("not implemented in tests"),
         "erasure-set heal should continue past NoHealRequired format result, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn erasure_set_format_slowdown_is_propagated() {
+    let storage = Arc::new(MockStorage {
+        format_error: Mutex::new(Some(Error::Storage(EcstoreError::SlowDown))),
+        ..Default::default()
+    });
+    let request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("format SlowDown must remain recoverable for the task manager");
+
+    assert!(matches!(error, Error::Storage(EcstoreError::SlowDown)));
 }
 
 #[tokio::test]

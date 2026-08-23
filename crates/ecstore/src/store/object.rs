@@ -3194,7 +3194,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
-        let mut accounting = vec![None; objects.len()];
+        let accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
