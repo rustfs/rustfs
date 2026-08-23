@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::progress::stable_generation;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
@@ -34,6 +35,9 @@ pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 pub struct HealBucketUsageBaseline {
     pub objects_count: u64,
     pub bytes: u64,
+    /// Stable identity of the validated usage snapshot and selected scope.
+    /// `None` is retained for test/legacy providers that cannot expose one.
+    pub generation: Option<u64>,
 }
 
 pub struct HealLifecycleExpiryContext {
@@ -785,10 +789,51 @@ impl HealStorageAPI for ECStoreHealStorage {
         let mut baseline = HealBucketUsageBaseline::default();
         for bucket in buckets {
             if let Some(usage) = info.buckets_usage.get(bucket) {
-                baseline.objects_count = baseline.objects_count.saturating_add(usage.objects_count);
-                baseline.bytes = baseline.bytes.saturating_add(usage.size);
+                baseline.objects_count = match baseline.objects_count.checked_add(usage.objects_count) {
+                    Some(total) => total,
+                    // A corrupt/overflowing usage snapshot is not a usable
+                    // denominator.  Leave progress indeterminate instead of
+                    // turning saturation into a plausible percentage.
+                    None => return Ok(None),
+                };
+                baseline.bytes = match baseline.bytes.checked_add(usage.size) {
+                    Some(total) => total,
+                    None => return Ok(None),
+                };
             }
         }
+
+        let identity = info.snapshot_identity();
+        let mut canonical = Vec::new();
+        match identity.last_update {
+            Some(last_update) => {
+                canonical.push(1);
+                canonical.extend_from_slice(
+                    &last_update
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_be_bytes(),
+                );
+            }
+            None => canonical.push(0),
+        }
+        for value in [identity.scanner_cycle, identity.scanner_epoch] {
+            match value {
+                Some(value) => {
+                    canonical.push(1);
+                    canonical.extend_from_slice(&value.to_be_bytes());
+                }
+                None => canonical.push(0),
+            }
+        }
+        let mut scope = buckets.to_vec();
+        scope.sort_unstable();
+        for bucket in scope {
+            canonical.extend_from_slice(&(bucket.len() as u64).to_be_bytes());
+            canonical.extend_from_slice(bucket.as_bytes());
+        }
+        baseline.generation = Some(stable_generation(&[&canonical]));
 
         Ok(Some(baseline))
     }

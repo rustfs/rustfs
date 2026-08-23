@@ -88,6 +88,17 @@ impl MustReplicateOptions {
             return true;
         }
 
+        // A REPLICA version was delivered by a peer and carries no per-target
+        // internal status of its own; whether its local metadata edits flow
+        // back is the replication rule's ReplicaModifications decision
+        // (`ReplicationConfig::replicate` with `replica = true`, MinIO
+        // mustReplicate parity). Gating it on a COMPLETED target state would
+        // silently drop every replica-side tag / retention / legal-hold edit in
+        // an active-active topology (rustfs/backlog#1953).
+        if self.replication_status() == ReplicationStatusType::Replica {
+            return true;
+        }
+
         get_internal_metadata(&self.meta, SUFFIX_REPLICATION_STATUS)
             .as_deref()
             .and_then(|statuses| {
@@ -381,6 +392,13 @@ mod tests {
 
         assert!(options.metadata_target_is_eligible(arn));
         assert!(!options.metadata_target_is_eligible("arn:rustfs:replication:missing"));
+
+        // A replica-side metadata edit (active-active) has no per-target
+        // internal status; eligibility is left to the ReplicaModifications rule.
+        let replica = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Metadata, false)
+            .with_replication_status(ReplicationStatusType::Replica);
+        assert!(replica.metadata_target_is_eligible(arn));
+        assert!(replica.metadata_target_is_eligible("arn:rustfs:replication:missing"));
         assert!(
             MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Object, false)
                 .metadata_target_is_eligible(arn)

@@ -299,7 +299,11 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     pub(super) fn make_dedup_key(request: &HealRequest) -> String {
-        Self::make_dedup_key_for_type(&request.heal_type)
+        let base = Self::make_dedup_key_for_type(&request.heal_type);
+        match (&request.heal_type, request.options.set_key()) {
+            (HealType::Object { .. } | HealType::ECDecode { .. }, Some(scope)) => format!("{base}:scope:{scope}"),
+            _ => base,
+        }
     }
 
     pub(super) fn make_dedup_key_for_type(heal_type: &HealType) -> String {

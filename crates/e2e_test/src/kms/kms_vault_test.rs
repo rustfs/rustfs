@@ -22,8 +22,8 @@ use crate::common::{TEST_BUCKET, init_logging};
 use tracing::{error, info};
 
 use super::common::{
-    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
-    start_kms, test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
+    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, sse_customer_key_md5_base64, start_kms,
+    test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
     test_sse_kms_encryption, test_sse_s3_encryption,
 };
 
@@ -62,9 +62,6 @@ impl VaultKmsTestContext {
 #[tokio::test]
 async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_end_to_end") {
-        return Ok(());
-    }
     info!("Starting Vault KMS End-to-End Test with default key {}", VAULT_KEY_NAME);
 
     let context = VaultKmsTestContext::new().await?;
@@ -117,9 +114,6 @@ async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 #[tokio::test]
 async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_isolation") {
-        return Ok(());
-    }
     info!("Starting Vault KMS SSE-C key isolation test");
 
     let context = VaultKmsTestContext::new().await?;
@@ -203,9 +197,6 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 #[tokio::test]
 async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_large_file") {
-        return Ok(());
-    }
     info!("Starting Vault KMS large file SSE-S3 test");
 
     let context = VaultKmsTestContext::new().await?;
@@ -267,9 +258,6 @@ async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + S
 #[tokio::test]
 async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_multipart_upload") {
-        return Ok(());
-    }
     info!("Starting Vault KMS multipart upload encryption suite");
 
     let context = VaultKmsTestContext::new().await?;
@@ -297,9 +285,6 @@ async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Err
 #[tokio::test]
 async fn test_vault_kms_key_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_operations") {
-        return Ok(());
-    }
     info!("Starting Vault KMS key operations test (CRUD)");
 
     let context = VaultKmsTestContext::new().await?;

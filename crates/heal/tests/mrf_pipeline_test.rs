@@ -35,6 +35,7 @@ use storage_api::endpoint_index::{Endpoint, EndpointServerPools, Endpoints, Pool
 
 const META_BUCKET: &str = ".rustfs.sys";
 const JOURNAL_REL: &str = "buckets/.heal/mrf/journal.bin";
+const SCOPED_JOURNAL_REL: &str = "buckets/.heal/mrf/journal-scoped.bin";
 
 async fn heal_env() -> (Vec<std::path::PathBuf>, Arc<dyn HealStorageAPI>) {
     let env = rustfs_test_utils::TestECStoreEnv::builder()
@@ -79,12 +80,16 @@ fn journal_record(kind: u8, bucket: &str, object: &str, version: Option<[u8; 16]
     body
 }
 
-fn write_journal_to_disks(disk_paths: &[std::path::PathBuf], data: &[u8]) {
+fn write_journal_path_to_disks(disk_paths: &[std::path::PathBuf], relative_path: &str, data: &[u8]) {
     for path in disk_paths {
-        let journal = path.join(META_BUCKET).join(JOURNAL_REL);
+        let journal = path.join(META_BUCKET).join(relative_path);
         std::fs::create_dir_all(journal.parent().expect("journal parent")).expect("create journal dir");
         std::fs::write(&journal, data).expect("write journal fixture");
     }
+}
+
+fn write_journal_to_disks(disk_paths: &[std::path::PathBuf], data: &[u8]) {
+    write_journal_path_to_disks(disk_paths, JOURNAL_REL, data);
 }
 
 async fn wait_until<F, Fut>(deadline: Duration, mut probe: F) -> bool
@@ -187,8 +192,73 @@ async fn journal_replay_arms_intents_and_deletes_the_file() {
             .all(|path| !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()),
         "the journal file must be removed after a successful replay"
     );
+    assert!(
+        disk_paths
+            .iter()
+            .all(|path| !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()),
+        "the authoritative journal file must also be removed after replay"
+    );
 
     let snapshot = manager.operations_snapshot().await;
     assert_eq!(snapshot.queued_by_priority.urgent, 1, "the decode-failure record must replay as Urgent");
     assert!(snapshot.queued_by_priority.normal >= 1, "the partial-write record must replay as Normal");
+}
+
+/// A canonical snapshot and its compatibility mirror may differ after a
+/// partial flush. Replay must choose the complete canonical epoch instead of
+/// combining records that never coexisted in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn authoritative_journal_is_not_merged_with_legacy_mirror() {
+    let (disk_paths, storage) = heal_env().await;
+    let mut endpoints: Vec<Endpoint> = disk_paths
+        .iter()
+        .map(|p| Endpoint::try_from(p.to_string_lossy().as_ref()).expect("endpoint from disk path"))
+        .collect();
+    for (i, endpoint) in endpoints.iter_mut().enumerate() {
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(i);
+    }
+    let pool = PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: endpoints.len(),
+        endpoints: Endpoints::from(endpoints),
+        cmd_line: "mrf-authoritative-test".to_string(),
+        platform: String::new(),
+    };
+    init_local_disks(EndpointServerPools::from(vec![pool]))
+        .await
+        .expect("local disks should register");
+
+    let authoritative = journal_record(1, "authoritative-bucket", "authoritative-object", None, 0);
+    let legacy = journal_record(1, "legacy-bucket", "legacy-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &authoritative);
+    write_journal_path_to_disks(&disk_paths, JOURNAL_REL, &legacy);
+
+    let manager = make_manager(storage);
+    let replayed = mrf_queue::replay_journal_once(&manager).await;
+    assert_eq!(replayed, 1, "only the authoritative snapshot epoch may replay");
+
+    let snapshot = manager.operations_snapshot().await;
+    assert_eq!(snapshot.queued_by_source.mrf, 1);
+    assert!(
+        disk_paths.iter().all(|path| {
+            !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+                && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+        }),
+        "replay cleanup must remove both journal paths"
+    );
+
+    // A scoped-only snapshot is valid during a rollout where no legacy
+    // compatibility mirror was written. Missing legacy files must not leave
+    // the runtime in a permanent cleanup-retry state.
+    let scoped_only = journal_record(1, "scoped-only-bucket", "scoped-only-object", None, 0);
+    write_journal_path_to_disks(&disk_paths, SCOPED_JOURNAL_REL, &scoped_only);
+    assert_eq!(mrf_queue::replay_journal_once(&manager).await, 1);
+    assert!(disk_paths.iter().all(|path| {
+        !Path::new(path).join(META_BUCKET).join(JOURNAL_REL).exists()
+            && !Path::new(path).join(META_BUCKET).join(SCOPED_JOURNAL_REL).exists()
+    }));
 }

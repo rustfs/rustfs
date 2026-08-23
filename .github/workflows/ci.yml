@@ -681,6 +681,19 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
+
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
@@ -802,6 +815,20 @@ jobs:
 
       - name: Verify awscurl
         run: test -x "$AWSCURL_PATH"
+
+      - name: Install mc
+        env:
+          MC_VERSION: RELEASE.2025-08-13T08-35-41Z
+          MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
+        run: |
+          MC_BINARY="mc.linux-amd64.${MC_VERSION}"
+          curl -fsSLo "$RUNNER_TEMP/mc" "https://github.com/minio/mc/releases/download/${MC_VERSION}/${MC_BINARY}"
+          echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
+          chmod +x "$RUNNER_TEMP/mc"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Verify mc
+        run: mc --version
 
       - name: Install Vault
         run: |

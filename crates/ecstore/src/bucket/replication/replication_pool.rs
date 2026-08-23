@@ -4194,6 +4194,30 @@ mod tests {
         assert_eq!(ri.checksum, Some(checksum));
     }
 
+    #[test]
+    fn metadata_mrf_roundtrip_preserves_tags_and_admitted_targets() {
+        let target = "arn:rustfs:replication:target-a";
+        let object = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            user_tags: Arc::new("owner=a3".to_string()),
+            ..Default::default()
+        };
+        let live =
+            replicate_object_info_from_object_info(object.clone(), test_replicate_decision(&[target]), ReplicationType::Metadata);
+        let persisted = live.to_mrf_entry();
+        let encoded = encode_mrf_file(std::slice::from_ref(&persisted)).expect("metadata MRF entry should encode");
+        let decoded = decode_mrf_file(&encoded).expect("metadata MRF entry should decode");
+
+        assert_eq!(decoded[0].op, MrfOpKind::Metadata);
+        assert_eq!(decoded[0].target_arns, vec![target.to_string()]);
+        let replayed = admitted_mrf_replicate_object(object, &decoded[0], ReplicationType::Metadata);
+        assert_eq!(replayed.op_type, ReplicationType::Metadata);
+        assert_eq!(replayed.user_tags, "owner=a3");
+        assert_eq!(replayed.admitted_target_arns(), vec![target.to_string()]);
+    }
+
     #[tokio::test]
     async fn mrf_save_admission_waits_for_capacity_instead_of_dropping() {
         let (tx, mut rx) = mpsc::channel(1);
