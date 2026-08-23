@@ -7665,7 +7665,7 @@ impl ECStore {
         let buckets = self.get_buckets_to_decommission().await?;
         let pool = self.pools[idx].clone();
         self.ensure_decommission_multipart_uploads_drained(idx, pool.as_ref(), &buckets)
-        .await
+            .await
     }
     #[cfg(test)]
     pub(crate) async fn check_after_decommission_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
