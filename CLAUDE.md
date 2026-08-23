@@ -30,7 +30,8 @@ make build-docker BUILD_OS=ubuntu22.04
 - Crate membership: `Cargo.toml` `[workspace].members`
 - Architecture, layering, crate map: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Migration guardrails & readiness contracts: [docs/architecture/](docs/architecture/README.md)
-- CI gates: `.github/workflows/ci.yml` (source of truth; never copy its steps into docs)
+- CI workflow steps: `.github/workflows/`; event, timeout, and required-status
+  matrix: [docs/testing/ci-gates.md](docs/testing/ci-gates.md)
 - Test-layer taxonomy, per-layer entry commands, serial/nextest rules, flake
   policy: [docs/testing/README.md](docs/testing/README.md)
 - Tier/ILM transition debugging (xl.meta inspection, versionId tracing):
