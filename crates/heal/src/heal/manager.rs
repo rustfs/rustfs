@@ -2110,34 +2110,11 @@ impl HealManager {
             return None;
         }
 
-        let mut snapshot = HealProgress::default();
+        let mut progresses = Vec::with_capacity(active_tasks.len());
         for task in active_tasks {
-            let progress = task.get_progress().await;
-            snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
-            snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
-            snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
-            snapshot.skipped_new_versions = snapshot.skipped_new_versions.saturating_add(progress.skipped_new_versions);
-            snapshot.skipped_ilm_expired = snapshot.skipped_ilm_expired.saturating_add(progress.skipped_ilm_expired);
-            snapshot.objects_total_count = snapshot.objects_total_count.saturating_add(progress.objects_total_count);
-            snapshot.objects_total_size = snapshot.objects_total_size.saturating_add(progress.objects_total_size);
-            snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
-            snapshot.start_time = match (snapshot.start_time, progress.start_time) {
-                (Some(current), Some(next)) => Some(current.min(next)),
-                (None, next) => next,
-                (current, None) => current,
-            };
-            snapshot.last_update_time = match (snapshot.last_update_time, progress.last_update_time) {
-                (Some(current), Some(next)) => Some(current.max(next)),
-                (None, next) => next,
-                (current, None) => current,
-            };
-            if progress.current_object.is_some() {
-                snapshot.current_object = progress.current_object;
-            }
+            progresses.push(task.get_progress().await);
         }
-        snapshot.refresh_progress_percentage();
-        snapshot.refresh_estimated_completion_time();
-        Some(snapshot)
+        crate::heal::progress::aggregate_heal_progress(progresses)
     }
 }
 

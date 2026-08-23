@@ -1912,7 +1912,7 @@ impl Node for NodeService {
 
     async fn background_heal_status(
         &self,
-        _request: Request<BackgroundHealStatusRequest>,
+        request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
         if self.resolve_object_store().is_none() {
             return Ok(Response::new(BackgroundHealStatusResponse {
@@ -1922,7 +1922,7 @@ impl Node for NodeService {
             }));
         }
         let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
-        match heal::encode_node_heal_status(&snapshot) {
+        match heal::encode_node_heal_status(&snapshot, request.into_inner().protocol_version) {
             Ok(bg_heal_state) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: true,
                 bg_heal_state: bg_heal_state.into(),

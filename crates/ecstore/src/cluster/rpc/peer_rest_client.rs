@@ -1090,7 +1090,9 @@ impl PeerRestClient {
                     .await?
                     .max_decoding_message_size(BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE);
                 let response = match client
-                    .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+                    .background_heal_status(Request::new(BackgroundHealStatusRequest {
+                        protocol_version: rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION,
+                    }))
                     .await
                 {
                     Ok(response) => response.into_inner(),

@@ -1296,6 +1296,7 @@ async fn test_resume_state_progress() {
     assert_eq!(progress, 0.0); // total_objects is 0
 
     state.total_objects = 100;
+    state.baseline_known = true;
     let progress = state.get_progress_percentage();
     assert_eq!(progress, 10.0);
 }
@@ -1475,6 +1476,40 @@ fn test_checkpoint_object_sets_dedupe_and_prune() {
     assert!(checkpoint.failed_objects.is_empty());
 }
 
+#[tokio::test]
+async fn checkpoint_page_commit_keeps_ledger_until_cursor_is_durable() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone()).await.unwrap();
+
+    checkpoint
+        .record_object_outcome(CheckpointObjectOutcomeRecord {
+            object: "bucket/object:v1".to_string(),
+            outcome: CheckpointObjectOutcome::Processed,
+            successful: 1,
+            failed: 0,
+            skipped: 0,
+            bytes: 128,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
+            counter_unknown: false,
+        })
+        .await
+        .unwrap();
+    checkpoint.advance_page(0, 1).await.unwrap();
+
+    let reloaded = CheckpointManager::load_from_disk(disk.clone(), &task_id).await.unwrap();
+    let snapshot = reloaded.get_checkpoint().await;
+    assert_eq!(snapshot.current_object_index, 1);
+    assert_eq!(snapshot.successful_objects, 1);
+    assert_eq!(snapshot.processed_bytes, 128);
+    assert!(snapshot.processed_objects.contains("bucket/object:v1"));
+
+    checkpoint.prune_completed_page().await.unwrap();
+    let reloaded = CheckpointManager::load_from_disk(disk, &task_id).await.unwrap();
+    assert!(reloaded.get_checkpoint().await.processed_objects.is_empty());
+}
+
 #[test]
 fn test_checkpoint_loads_legacy_vec_format() {
     // Checkpoints written before the HashSet migration stored the object
@@ -1568,14 +1603,14 @@ async fn test_resumestate_schema_v0_discarded_on_load() {
 }
 
 #[tokio::test]
-async fn test_checkpoint_schema_v4_discarded_on_load() {
+async fn test_checkpoint_schema_v5_discarded_on_load() {
     let (temp_dir, disk) = schema_test_disk().await;
 
-    // The previous checkpoint schema is unsafe once its paired resume
-    // state is discarded: retaining either position would skip work.
+    // Schema v5 can persist failed identities without the aggregate counters
+    // that make those identities safe to deduplicate after an upgrade.
     let task_id = "00000000-0000-4000-8000-000000000002";
     let legacy = r#"{
-            "schema_version": 4,
+            "schema_version": 5,
             "task_id": "00000000-0000-4000-8000-000000000002",
             "checkpoint_time": 1700000000,
             "current_bucket_index": 2,
@@ -1663,6 +1698,120 @@ async fn current_normal_resume_schema_preserves_progress() {
     assert_eq!(restored.replacement_generation, None);
     assert_eq!(restored.replacement_phase, ReplacementPhase::None);
     temp_dir.close().expect("remove schema test directory");
+}
+
+#[test]
+fn progress_checkpoint_restores_bytes_and_generation() {
+    let mut checkpoint = ResumeCheckpoint::new("progress-checkpoint".to_string());
+    checkpoint.set_progress_baseline(9, 4096, Some(77));
+    checkpoint.update_progress(4, 1, 2, 2048);
+    checkpoint.set_skipped_version_counts(3, 1);
+    checkpoint.mark_counter_unknown();
+
+    let restored: ResumeCheckpoint =
+        serde_json::from_slice(&serde_json::to_vec(&checkpoint).expect("serialize checkpoint")).expect("deserialize checkpoint");
+    assert_eq!(restored.processed_bytes, 2048);
+    assert_eq!(restored.total_objects, 9);
+    assert_eq!(restored.total_bytes, 4096);
+    assert_eq!(restored.baseline_generation, Some(77));
+    assert!(restored.baseline_known);
+    assert_eq!(restored.skipped_new_versions, 3);
+    assert_eq!(restored.skipped_ilm_expired, 1);
+    assert!(restored.counter_unknown);
+}
+
+#[test]
+fn old_progress_schema_migrates_missing_fields_to_unknown() {
+    let state = ResumeState::new(
+        "legacy-progress".to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        Vec::new(),
+    );
+    let mut value = serde_json::to_value(state).expect("serialize legacy-compatible state");
+    let object = value.as_object_mut().expect("state must be an object");
+    for field in [
+        "processed_bytes",
+        "total_bytes",
+        "baseline_generation",
+        "baseline_known",
+        "skipped_new_versions",
+        "skipped_ilm_expired",
+    ] {
+        object.remove(field);
+    }
+    object.insert("total_objects".to_string(), serde_json::json!(10));
+    object.insert("processed_objects".to_string(), serde_json::json!(5));
+    let restored: ResumeState = serde_json::from_value(value).expect("deserialize old progress state");
+    assert_eq!(restored.processed_bytes, 0);
+    assert_eq!(restored.total_bytes, 0);
+    assert_eq!(restored.baseline_generation, None);
+    assert!(!restored.baseline_known, "missing baseline must remain unknown");
+    assert_eq!(restored.get_progress_percentage(), 0.0);
+    assert_eq!(restored.skipped_new_versions, 0);
+    assert_eq!(restored.skipped_ilm_expired, 0);
+}
+
+#[test]
+fn progress_counter_unknown_survives_resume_round_trip() {
+    let mut state = ResumeState::new(
+        "overflow-progress".to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        Vec::new(),
+    );
+    state.mark_counter_unknown();
+
+    let restored: ResumeState =
+        serde_json::from_slice(&serde_json::to_vec(&state).expect("serialize resume state")).expect("deserialize resume state");
+    assert!(restored.counter_unknown);
+}
+
+#[tokio::test]
+async fn checkpoint_progress_survives_a_torn_resume_summary_write() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let _resume = ResumeManager::new(
+        disk.clone(),
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+    )
+    .await
+    .expect("resume state should persist");
+    let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("checkpoint should persist");
+
+    // This is the ordering used by the erasure-set loop: the checkpoint is
+    // durable before the summary write.  Stop here to model a crash in the
+    // inter-store window and verify that the recovery authority retains the
+    // telemetry fence and bytes.
+    checkpoint
+        .update_progress(3, 0, 0, 1024)
+        .await
+        .expect("checkpoint progress should persist");
+    checkpoint.mark_counter_unknown().await.expect("unknown fence should persist");
+    checkpoint
+        .update_position(0, 3)
+        .await
+        .expect("checkpoint position should persist");
+
+    let restored_checkpoint = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("checkpoint should reload")
+        .get_checkpoint()
+        .await;
+    let restored_resume = ResumeManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("resume summary should reload")
+        .get_state()
+        .await;
+    assert!(restored_checkpoint.counter_unknown);
+    assert_eq!(restored_checkpoint.processed_bytes, 1024);
+    assert_eq!(restored_checkpoint.current_object_index, 3);
+    assert!(!restored_resume.counter_unknown, "summary is intentionally the torn/older store");
 }
 
 #[tokio::test]
