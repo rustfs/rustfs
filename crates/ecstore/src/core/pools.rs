@@ -7899,7 +7899,7 @@ mod pools_tests {
     fn decommission_manual_job_receipt_compacts_large_progress() {
         let prefix = "p".repeat(12 * 1024);
         let options = ManualTransitionRunOptions {
-            prefix: prefix.clone(),
+            prefix,
             ..Default::default()
         };
         let mut job = ManualTransitionJobRecord::new(uuid::Uuid::new_v4(), "bounded-receipt-bucket", &options, "owner");
