@@ -276,7 +276,7 @@ impl ScannerIOCache for SetDisks {
         {
             old_cache.info.scan_plan_digest = None;
         }
-        let old_lkg = old_cache.info.snapshot_complete.then(|| {
+        let old_lkg = old_cache.info.snapshot_complete.then_some({
             (
                 old_cache.info.next_cycle,
                 old_cache.info.last_update,

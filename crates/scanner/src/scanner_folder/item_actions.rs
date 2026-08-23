@@ -1792,7 +1792,7 @@ mod tests {
             ..Default::default()
         };
         let mut summary = SizeSummary::default();
-        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &mut summary)
+        item.apply_actions(vec![object], None, VersioningConfiguration::default(), &[], &mut summary)
             .await;
 
         let bounded_bucket = bounded_reconciliation_field(&item.bucket);

@@ -6980,13 +6980,7 @@ mod tests {
     #[test]
     fn decommission_classifiers_see_through_a_stage_wrapper() {
         let wrap = |inner: Error| {
-            data_movement::data_movement_stage_error_for_test(
-                "decommission_object",
-                "put_object",
-                "bucket-a",
-                "object-a",
-                inner,
-            )
+            data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "bucket-a", "object-a", inner)
         };
 
         // Capacity: the target pool filling up must still stop the loop.
