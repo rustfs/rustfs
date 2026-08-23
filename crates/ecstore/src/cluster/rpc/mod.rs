@@ -51,6 +51,9 @@ pub use peer_rest_client::{
     SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity,
 };
 pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
-pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys, ScannerBucketListing, ScannerSetBucketListing};
+pub use peer_s3_client::{
+    LocalPeerS3Client, PeerS3Client, S3PeerSys, ScannerBucketListing, ScannerSetBucketListing, decode_heal_bucket_rpc_options,
+    encode_heal_bucket_rpc_options,
+};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;
