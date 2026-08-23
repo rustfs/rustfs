@@ -66,7 +66,6 @@ use super::storage_api::bucket_usecase::{
 };
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
-    site_replication_remote_peer_deployment_ids,
 };
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
@@ -1624,9 +1623,15 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketPolicyOutput {}))
     }
 
+    /// `site_peers` is the set of remote site-replication peer deployment ids
+    /// (empty when site replication is disabled). The interface layer reads it
+    /// from the persisted state and fails closed on a read error, so this
+    /// usecase stays a pure function of its inputs (layer rule: app never
+    /// imports interface).
     pub async fn execute_delete_bucket_replication(
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
+        site_peers: HashSet<String>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -1647,7 +1652,6 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
         let (remaining_config, updated_targets) = if let Some(config) = replication_config.as_ref() {
-            let site_peers = site_replication_remote_peer_deployment_ids().await?;
             let (remaining, removable_arns) = split_replication_config_for_user_delete(config.clone(), &site_peers);
             let targets = replication_targets_without_arns(&bucket, &removable_arns).await?;
             (remaining, targets)
@@ -2516,9 +2520,11 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketCorsOutput::default()))
     }
 
+    /// See [`Self::execute_delete_bucket_replication`] for `site_peers`.
     pub async fn execute_put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
+        site_peers: HashSet<String>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -2547,7 +2553,6 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
-        let site_peers = site_replication_remote_peer_deployment_ids().await?;
         let replication_configuration =
             merge_user_replication_config_update(replication_configuration, existing_config, &site_peers);
         let data = serialize_config(&replication_configuration)?;
@@ -3695,7 +3700,10 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_delete_bucket_replication(req).await.unwrap_err();
+        let err = usecase
+            .execute_delete_bucket_replication(req, HashSet::new())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -4781,7 +4789,7 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
+        let err = usecase.execute_put_bucket_replication(req, HashSet::new()).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -4799,7 +4807,7 @@ mod tests {
             .unwrap();
 
         let err = DefaultBucketUsecase::without_context()
-            .execute_put_bucket_replication(build_request(input, Method::PUT))
+            .execute_put_bucket_replication(build_request(input, Method::PUT), HashSet::new())
             .await
             .expect_err("unsupported fields must be rejected before store access");
 

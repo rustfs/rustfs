@@ -80,6 +80,21 @@ async fn site_replication_gate_enabled() -> S3Result<bool> {
     crate::admin::handlers::site_replication::site_replication_enabled().await
 }
 
+/// Remote site-replication peer deployment ids handed to the bucket usecase
+/// so an S3 replication-config edit keeps exactly the reconciler-owned rules
+/// (issue #1948). Read here, in the interface layer, because the usecase must
+/// not import the admin handlers (layer guard); a state-read failure
+/// propagates so the edit fails closed.
+async fn site_replication_peer_deployment_ids_for_edit() -> S3Result<std::collections::HashSet<String>> {
+    // While the gate override is in effect the test exercises the deny/allow
+    // branch, not the peer set; there is no persisted state to read.
+    #[cfg(test)]
+    if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return Ok(std::collections::HashSet::new());
+    }
+    crate::admin::handlers::site_replication::site_replication_remote_peer_deployment_ids().await
+}
+
 /// MinIO `ErrReplicationDenyEditError`.
 fn replication_deny_edit_error() -> S3Error {
     let mut err = S3Error::with_message(
@@ -549,8 +564,9 @@ impl S3 for FS {
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         deny_replication_config_edit_for_non_owner(&req).await?;
+        let site_peers = site_replication_peer_deployment_ids_for_edit().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_replication(req).await
+        usecase.execute_delete_bucket_replication(req, site_peers).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1403,8 +1419,9 @@ impl S3 for FS {
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
         deny_replication_config_edit_for_non_owner(&req).await?;
+        let site_peers = site_replication_peer_deployment_ids_for_edit().await?;
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_replication(req).await
+        usecase.execute_put_bucket_replication(req, site_peers).await
     }
 
     async fn put_bucket_request_payment(
