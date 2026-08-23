@@ -392,7 +392,7 @@ impl ScannerIOCycle for ECStore {
                 observational_data_usage_info(
                     &results,
                     &expected_sources,
-                    &all_buckets,
+                    &all_bucket_names,
                     scan_plan_digest,
                     want_cycle,
                     leader_epoch,

@@ -255,7 +255,7 @@ pub(super) fn observational_data_usage_info(
     let mut sources = expected_sources.iter().copied().collect::<Vec<_>>();
     sources.sort_by_key(|source| (source.pool_index, source.set_index));
     for source in sources {
-        let result = by_source.get(source).copied();
+        let result = by_source.get(&source).copied();
         let current = result.filter(|result| {
             result.info.snapshot_complete
                 && result.info.next_cycle == scanner_cycle
