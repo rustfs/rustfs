@@ -48,8 +48,20 @@ fn scanner_alert_wire_names_match_canonical_event_names() {
 /// the backstop survives regardless of delivery.
 #[test]
 fn corrupt_metadata_recording_maps_delivery_to_backstop() {
-    assert_eq!(corrupt_metadata_recording(true), CorruptMetadataRecording::LedgerOnly);
-    assert_eq!(corrupt_metadata_recording(false), CorruptMetadataRecording::ImmediateAndLedger);
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Enqueued),
+        CorruptMetadataRecording::LedgerOnly
+    );
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Coalesced),
+        CorruptMetadataRecording::LedgerOnly
+    );
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Dropped(
+            rustfs_common::mrf_channel::MrfDropReason::Full
+        )),
+        CorruptMetadataRecording::ImmediateAndLedger
+    );
 }
 
 fn cooldown_map_len() -> usize {

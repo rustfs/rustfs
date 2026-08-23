@@ -119,6 +119,9 @@ struct MrfRepairNoticeTarget {
     bucket: Arc<str>,
     object: Arc<str>,
     version_id: Option<[u8; 16]>,
+    kind: rustfs_common::mrf_channel::MrfKind,
+    scope: Option<rustfs_common::mrf_channel::MrfScope>,
+    lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -889,7 +892,19 @@ impl HealManager {
     }
 
     fn remove_mrf_repair_notice_targets_for_task(&self, task_id: &str) {
-        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(task_id);
+        let targets = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(task_id);
+        if let Some(targets) = targets {
+            for target in targets {
+                rustfs_common::mrf_channel::release_mrf_identity(
+                    target.kind,
+                    &target.bucket,
+                    &target.object,
+                    target.version_id,
+                    target.scope,
+                    target.lease,
+                );
+            }
+        }
     }
 
     fn insert_mrf_repair_notice_target(
@@ -1279,7 +1294,20 @@ impl HealManager {
         }
         self.task_aliases.lock().await.clear();
         self.retrying_heals.lock().await.clear();
-        lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).clear();
+        let mrf_targets = {
+            let mut registry = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets);
+            registry.drain().flat_map(|(_, targets)| targets).collect::<Vec<_>>()
+        };
+        for target in mrf_targets {
+            rustfs_common::mrf_channel::release_mrf_identity(
+                target.kind,
+                &target.bucket,
+                &target.object,
+                target.version_id,
+                target.scope,
+                target.lease,
+            );
+        }
         crate::set_heal_queue_length(0);
 
         // update state
@@ -1311,12 +1339,32 @@ impl HealManager {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn submit_mrf_heal_request_with_receipt(
         &self,
         request: HealRequest,
         bucket: Arc<str>,
         object: Arc<str>,
         version_id: Option<[u8; 16]>,
+    ) -> Result<HealAdmissionReceipt> {
+        let kind = match &request.heal_type {
+            HealType::Metadata { .. } => rustfs_common::mrf_channel::MrfKind::MetadataCorruption,
+            HealType::ECDecode { .. } => rustfs_common::mrf_channel::MrfKind::DecodeFailure,
+            _ => rustfs_common::mrf_channel::MrfKind::PartialWrite,
+        };
+        self.submit_mrf_heal_request_with_receipt_and_identity(request, bucket, object, version_id, kind, None, None)
+            .await
+    }
+
+    pub(crate) async fn submit_mrf_heal_request_with_receipt_and_identity(
+        &self,
+        request: HealRequest,
+        bucket: Arc<str>,
+        object: Arc<str>,
+        version_id: Option<[u8; 16]>,
+        kind: rustfs_common::mrf_channel::MrfKind,
+        scope: Option<rustfs_common::mrf_channel::MrfScope>,
+        lease: Option<rustfs_common::mrf_channel::MrfIngressLease>,
     ) -> Result<HealAdmissionReceipt> {
         self.submit_heal_request_with_receipt_alias_and_mrf_notice(
             request,
@@ -1325,6 +1373,9 @@ impl HealManager {
                 bucket,
                 object,
                 version_id,
+                kind,
+                scope,
+                lease,
             }),
         )
         .await
@@ -1539,7 +1590,7 @@ impl HealManager {
             Self::insert_mrf_repair_notice_target(&mut targets, &task_id, target);
         }
         if let Some(displaced_task_id) = &displaced_task_id {
-            lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets).remove(displaced_task_id);
+            self.remove_mrf_repair_notice_targets_for_task(displaced_task_id);
         }
         drop(retrying_heals);
         drop(queue);
