@@ -716,7 +716,7 @@ async fn scan_and_persist_local_bucket(
                 .await
                 .is_none()
             {
-                return Err(RemoteScannerServerError::worker(
+                return Err(RemoteScannerServerError::retry_bucket(
                     "remote namespace scanner cache publication epoch changed before reusing the current snapshot",
                 ));
             }
@@ -812,10 +812,18 @@ async fn scan_and_persist_local_bucket(
     // the scan. A movement transition that starts and ends during the scan
     // therefore cannot admit the stale cache under the new epoch.
     let save_result = cache
-        .save_with_revisions_for_epoch(set, &cache_name, &revisions, expected_publication_epoch)
+        .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, expected_publication_epoch)
         .await;
     done_save();
     save_result.map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner cache save failed: {err}")))?;
+    if scanner_publication_admission_for_epoch(set, expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        return Err(RemoteScannerServerError::retry_bucket(
+            "remote namespace scanner cache publication epoch changed after persistence",
+        ));
+    }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store)
         .await
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
