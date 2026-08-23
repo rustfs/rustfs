@@ -37,6 +37,9 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const USAGE_DEFERRED_STALE_THRESHOLD_SECS: u64 = 300;
 
 pub fn register_cluster_snapshot_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -242,7 +245,16 @@ pub(crate) struct ClusterUsageFreshnessStatus {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_success_unix_secs: Option<u64>,
+    pub last_durable_success_unix_secs: u64,
+    pub last_publication_unix_secs: u64,
+    pub last_publication_state: String,
+    pub last_publication_reason: String,
     pub last_error: Option<String>,
+    pub deferred_pending: bool,
+    pub deferred_total: u64,
+    pub last_deferred_unix_secs: u64,
+    pub last_deferred_reason: String,
+    pub deferred_age_secs: Option<u64>,
 }
 
 fn component_status(source: &'static str, status: CapabilityStatus) -> ClusterComponentStatus {
@@ -701,32 +713,71 @@ fn summarize_listing_metacache(snapshot: &ClusterReadOnlySnapshot) -> ClusterLis
 
 fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsageFreshnessStatus {
     let freshness = &snapshot.usage_freshness;
-    let (condition, status) = match freshness.last_usage_save_result.as_str() {
-        "success" if freshness.dirty_pending_buckets == 0 => (
-            "healthy",
-            CapabilityStatus::supported().with_reason("usage cache was saved successfully and has no pending dirty buckets"),
-        ),
-        "success" | "" if freshness.dirty_pending_buckets > 0 => (
+    let deferred_age_secs = (freshness.deferred_pending && freshness.last_deferred_unix_secs > 0).then(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        now.saturating_sub(freshness.last_deferred_unix_secs)
+    });
+    let deferred_stale = deferred_age_secs.is_some_and(|age| age > USAGE_DEFERRED_STALE_THRESHOLD_SECS);
+    let (condition, status) = if freshness.last_publication_state == "no_update" {
+        (
+            "no_update",
+            CapabilityStatus::unknown().with_reason("usage cache publication produced no update"),
+        )
+    } else if freshness.deferred_pending && deferred_stale {
+        (
             "stale",
-            CapabilityStatus::unknown()
-                .with_reason(format!("usage cache has {} pending dirty buckets", freshness.dirty_pending_buckets)),
-        ),
-        "skipped_stale" => (
-            "stale",
-            CapabilityStatus::unknown().with_reason("last usage cache save was skipped because scanner data was stale"),
-        ),
-        "failed" => ("degraded", CapabilityStatus::unknown().with_reason("last usage cache save failed")),
-        "encode_failed" => (
-            "degraded",
-            CapabilityStatus::unknown().with_reason("last usage cache save failed during encoding"),
-        ),
-        _ => (
-            "unknown",
-            CapabilityStatus::unknown().with_reason("no usage cache save result has been reported"),
-        ),
+            CapabilityStatus::unknown().with_reason(format!(
+                "usage cache publication has been deferred for {} seconds (threshold: {} seconds)",
+                deferred_age_secs.unwrap_or_default(),
+                USAGE_DEFERRED_STALE_THRESHOLD_SECS
+            )),
+        )
+    } else if freshness.deferred_pending {
+        (
+            "deferred",
+            CapabilityStatus::unknown().with_reason(if freshness.last_deferred_reason.is_empty() {
+                "usage cache publication is temporarily deferred"
+            } else {
+                freshness.last_deferred_reason.as_str()
+            }),
+        )
+    } else {
+        match freshness.last_usage_save_result.as_str() {
+            "success" if freshness.dirty_pending_buckets == 0 => (
+                "healthy",
+                CapabilityStatus::supported().with_reason("usage cache was saved successfully and has no pending dirty buckets"),
+            ),
+            "success" | "" if freshness.dirty_pending_buckets > 0 => (
+                "stale",
+                CapabilityStatus::unknown()
+                    .with_reason(format!("usage cache has {} pending dirty buckets", freshness.dirty_pending_buckets)),
+            ),
+            "skipped_stale" => (
+                "stale",
+                CapabilityStatus::unknown().with_reason("last usage cache save was skipped because scanner data was stale"),
+            ),
+            "failed" => ("degraded", CapabilityStatus::unknown().with_reason("last usage cache save failed")),
+            "encode_failed" => (
+                "degraded",
+                CapabilityStatus::unknown().with_reason("last usage cache save failed during encoding"),
+            ),
+            _ => (
+                "unknown",
+                CapabilityStatus::unknown().with_reason("no usage cache save result has been reported"),
+            ),
+        }
     };
-    let last_success_unix_secs = (freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0)
-        .then_some(freshness.last_usage_save_unix_secs);
+    // Mixed-version nodes do not publish the additive durable timestamp yet;
+    // retain the legacy successful-save timestamp until all peers are upgraded.
+    let last_success_unix_secs = if freshness.last_durable_success_unix_secs > 0 {
+        Some(freshness.last_durable_success_unix_secs)
+    } else if freshness.last_usage_save_result == "success" && freshness.last_usage_save_unix_secs > 0 {
+        Some(freshness.last_usage_save_unix_secs)
+    } else {
+        None
+    };
     let last_error = match freshness.last_usage_save_result.as_str() {
         "failed" | "skipped_stale" | "encode_failed" => Some(freshness.last_usage_save_result.clone()),
         _ => None,
@@ -744,7 +795,16 @@ fn summarize_usage_freshness(snapshot: &ClusterReadOnlySnapshot) -> ClusterUsage
         last_usage_save_unix_secs: freshness.last_usage_save_unix_secs,
         last_usage_save_result: freshness.last_usage_save_result.clone(),
         last_success_unix_secs,
+        last_durable_success_unix_secs: freshness.last_durable_success_unix_secs,
+        last_publication_unix_secs: freshness.last_publication_unix_secs,
+        last_publication_state: freshness.last_publication_state.clone(),
+        last_publication_reason: freshness.last_publication_reason.clone(),
         last_error,
+        deferred_pending: freshness.deferred_pending,
+        deferred_total: freshness.deferred_total,
+        last_deferred_unix_secs: freshness.last_deferred_unix_secs,
+        last_deferred_reason: freshness.last_deferred_reason.clone(),
+        deferred_age_secs,
     }
 }
 
@@ -1282,6 +1342,7 @@ mod tests {
             usage_freshness: ClusterUsageFreshnessSnapshot {
                 dirty_pending_buckets: 0,
                 last_usage_save_unix_secs: 456,
+                last_durable_success_unix_secs: 450,
                 last_usage_save_result: "success".to_string(),
                 last_usage_save_result_code: 1,
                 ..Default::default()
@@ -1295,6 +1356,12 @@ mod tests {
         assert_eq!(component.condition, "healthy");
         assert_eq!(component.last_usage_save_unix_secs, 456);
         assert_eq!(component.last_usage_save_result, "success");
+        assert_eq!(component.last_success_unix_secs, Some(450));
+
+        let mut legacy_snapshot = snapshot.clone();
+        legacy_snapshot.usage_freshness.last_durable_success_unix_secs = 0;
+        let legacy_component = super::summarize_usage_freshness(&legacy_snapshot);
+        assert_eq!(legacy_component.last_success_unix_secs, Some(456));
     }
 
     #[test]

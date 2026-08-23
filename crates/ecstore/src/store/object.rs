@@ -1203,7 +1203,8 @@ fn inject_batch_delete_pool_errors(
     bucket: &str,
     pool_idx: usize,
     object_names: &[String],
-    result: &mut (Vec<DeletedObject>, Vec<Option<Error>>),
+    deleted: &[DeletedObject],
+    errors: &mut [Option<Error>],
 ) {
     let state = BATCH_DELETE_POOL_ERROR_INJECTION
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1220,8 +1221,8 @@ fn inject_batch_delete_pool_errors(
         let Some(error) = state.errors.get(object_name) else {
             continue;
         };
-        if result.1[idx].is_none() && result.0[idx].found {
-            result.1[idx] = Some(error.clone());
+        if errors[idx].is_none() && deleted[idx].found {
+            errors[idx] = Some(error.clone());
             state.observed.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -3194,7 +3195,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
-        let accounting = vec![None; objects.len()];
+        let mut accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
@@ -3333,11 +3334,12 @@ impl ECStore {
                     .iter()
                     .map(|object| object.object_name.clone())
                     .collect::<Vec<_>>();
-                let result = pool.delete_objects(bucket, pool_objects, pool_opts).await;
+                let result = pool.delete_objects_with_accounting(bucket, pool_objects, pool_opts).await;
                 #[cfg(test)]
                 let result = {
                     let mut result = result;
-                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, &mut result);
+                    let (deleted, errors, _) = &mut result;
+                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, deleted, errors);
                     result
                 };
                 (object_indices, result)
@@ -3347,7 +3349,7 @@ impl ECStore {
         let results = join_all(futures).await;
 
         for idx in 0..del_objects.len() {
-            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs))| {
+            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs, _))| {
                 let pool_object_idx = object_indices.binary_search(&idx).ok()?;
                 Some((&dels[pool_object_idx], &errs[pool_object_idx]))
             });
@@ -3364,6 +3366,12 @@ impl ECStore {
                     ..Default::default()
                 };
                 del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
+            }
+        }
+
+        for (object_indices, (_, _, pool_accounting)) in &results {
+            for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
+                accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
             }
         }
 
