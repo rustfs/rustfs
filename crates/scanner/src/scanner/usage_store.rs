@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Data-usage snapshot persistence: CAS store pipeline, epoch baselines, and observed-snapshot cleanup.
 use super::*;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum DataUsagePersistOutcome {
