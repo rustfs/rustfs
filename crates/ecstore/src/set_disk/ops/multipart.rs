@@ -2323,9 +2323,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // the staged upload metadata) and the source category timestamps on
         // the complete request. Read the destination version under the held
         // object write lock and keep any category this site modified more
-        // recently. Read failures (version absent on first replication, quorum
-        // errors) keep today's overwrite semantics: failing the complete would
-        // loop through MRF, re-delivering the stale value forever.
+        // recently. Only an absent version has no local state to compare;
+        // other read failures must leave the upload retryable rather than
+        // committing inbound metadata without the LWW check.
         if crate::set_disk::ops::object::replication_lww_applicable(opts)
             && let Some(version_id) = fi.version_id
         {
@@ -2351,21 +2351,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 // Version absent: first replication of this version, nothing
                 // local to compare — the normal path, not a degraded one.
                 Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
-                Err(err) => {
-                    // Degraded path: without the stored state the inbound
-                    // metadata is applied unchanged — exactly the overwrite
-                    // LWW exists to prevent — so this must be operator-visible.
-                    warn!(
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_SET_DISK,
-                        bucket,
-                        object,
-                        version_id = %version_id,
-                        error = %err,
-                        state = "replication_lww_read_unavailable",
-                        "SetDisk multipart replication LWW read skipped; inbound metadata applied without comparison"
-                    );
-                }
+                Err(err) => return Err(err),
             }
         }
 
@@ -7122,7 +7108,7 @@ mod tests {
             const T_OLD: &str = "2026-01-01T00:00:00Z";
             const T_LOCAL: &str = "2026-02-01T00:00:00Z";
 
-            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
             let bucket = "multipart-replication-lww-bucket";
             let object = "object";
             make_bucket_on_all(&disk_stores, bucket).await;
@@ -7171,6 +7157,55 @@ mod tests {
                 replication_tagging_timestamp: Some(OffsetDateTime::parse(T_OLD, &Rfc3339).expect("test timestamp should parse")),
                 ..Default::default()
             };
+
+            // Make the destination version unreadable on quorum while the
+            // staged upload remains intact. The commit barrier lets the old
+            // fail-open path move past the LWW read; restoring the metadata
+            // there proves it would otherwise commit the stale tags.
+            let mut damaged_metadata = Vec::new();
+            for temp_dir in temp_dirs.iter().take(3) {
+                let path = temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+                let original = tokio::fs::read(&path).await.expect("destination xl.meta should be readable");
+                tokio::fs::write(&path, b"not an xl.meta")
+                    .await
+                    .expect("destination xl.meta should be corruptible");
+                damaged_metadata.push((path, original));
+            }
+
+            let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeLockLost);
+            let first_set = set_disks.clone();
+            let first_upload_id = upload_id.clone();
+            let first_parts = parts.clone();
+            let first_opts = complete_opts.clone();
+            let mut first_completion = tokio::spawn(async move {
+                first_set
+                    .complete_multipart_upload(bucket, object, &first_upload_id, first_parts, &first_opts)
+                    .await
+            });
+
+            let first_result = tokio::select! {
+                result = &mut first_completion => result.expect("first completion task should finish"),
+                () = barrier.wait_until_paused() => {
+                    for (path, original) in &damaged_metadata {
+                        tokio::fs::write(path, original).await.expect("destination xl.meta should be restorable");
+                    }
+                    barrier.release();
+                    first_completion.await.expect("released completion task should finish")
+                }
+            };
+            for (path, original) in &damaged_metadata {
+                tokio::fs::write(path, original)
+                    .await
+                    .expect("destination xl.meta should be restored");
+            }
+            drop(barrier);
+
+            let first_error = first_result.expect_err("unreadable destination metadata must fail before multipart commit");
+            assert!(
+                !(is_err_object_not_found(&first_error) || is_err_version_not_found(&first_error)),
+                "corrupt destination metadata must not be treated as an absent version: {first_error}"
+            );
+
             set_disks
                 .clone()
                 .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
