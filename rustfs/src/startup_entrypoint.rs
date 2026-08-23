@@ -90,6 +90,18 @@ async fn async_main() -> Result<()> {
         // Inspect is offline like diagnose: read-only against drive paths, output
         // to stdout/--out, and must run before any observability/storage init.
         CommandResult::Inspect(opts) => return crate::inspect::execute_inspect(&opts).await,
+        CommandResult::ConnectRegister(opts) => {
+            let registered = crate::connect::register_from_protected_input(
+                &opts.endpoint,
+                &opts.ca_file,
+                &opts.state_dir,
+                opts.token_file.as_deref(),
+            )
+            .await
+            .map_err(Error::other)?;
+            println!("device={} cluster={}", registered.device_uid, registered.cluster_name);
+            return Ok(());
+        }
         CommandResult::Server(config) => config,
     };
 

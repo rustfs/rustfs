@@ -158,10 +158,11 @@ added by backlog#1153 infra-4.
 
 ## Coverage
 
-Line coverage is measured **weekly, not per-PR**, and is non-blocking: it
-exists for visibility and trend, never as a required check. Per-crate ratchets
-for the security-critical crates (iam / kms / policy / crypto) build on this
-baseline later (backlog#1153 infra-6, report-only first).
+Workspace line coverage is measured weekly. Pull requests that touch iam, kms,
+policy, or crypto also run a non-required, report-only comparison against
+`.config/coverage-baselines.toml`. During calibration, a regression is recorded
+in the job summary without failing the job; missing or malformed coverage
+evidence still fails closed (backlog#1153 infra-6).
 
 - **CI**: `.github/workflows/coverage.yml` runs every Sunday and on manual
   dispatch: `cargo llvm-cov nextest --workspace --exclude e2e_test` under the
@@ -174,6 +175,12 @@ baseline later (backlog#1153 infra-6, report-only first).
   plus the full suite). It prints the same per-crate table via
   `scripts/coverage_per_crate.py` and writes `target/llvm-cov/lcov.info` and
   `coverage.json`.
+- **Security-critical ratchet**: relevant pull requests compare iam / kms /
+  policy / crypto line coverage with the versioned baseline. Drops greater than
+  the configured one-percentage-point calibration threshold are marked
+  `REGRESSION (report-only)`. The weekly summary runs the same comparison so
+  calibration continues even when no relevant pull request is open. Baseline
+  changes require a linked coverage run and a reviewed explanation.
 - **Trend comparison**: each run's job summary is the weekly per-crate
   snapshot — open two runs from the Actions history (workflow "coverage") and
   compare their tables. For line-level diffs, download the two runs'

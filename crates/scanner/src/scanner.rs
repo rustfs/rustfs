@@ -18,6 +18,7 @@ use std::future::Future;
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use self::heal_info::{BackgroundHealInfoReadStatus, read_background_heal_info_with_epoch, save_background_heal_info_for_epoch};
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
     DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
@@ -30,8 +31,9 @@ use crate::runtime_config::{
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
-    ScannerCycleDeferReason, ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified, dirty_usage_buckets_pending,
-    dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
+    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified,
+    dirty_usage_buckets_pending, dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed,
+    scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
@@ -66,10 +68,12 @@ use crate::storage_api::scan::{
     SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
-    ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, invalidate_admin_data_usage_snapshot_cache,
-    invalidate_data_usage_snapshot_cache, read_config, replace_bucket_usage_memory_from_info, save_config,
-    save_config_shared_with_preconditions, save_config_with_preconditions, scanner_is_erasure_sd,
+    ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
+    ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
+    get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
+    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
+    save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd, scanner_publication_admission_for_epoch,
+    scanner_publication_epoch, scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -346,6 +350,23 @@ fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
     !info.is_complete_bucket_usage_snapshot()
 }
 
+pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageInfo) -> bool {
+    if info.is_complete_bucket_usage_snapshot() {
+        return true;
+    }
+
+    // Pre-marker snapshots remain readable only when their legacy identity is
+    // complete: a timestamp, a scanner cycle, and an exact bucket cardinality.
+    // A current snapshot with only scanner_epoch/scanner_cycle (or an explicit
+    // incomplete marker) is not evidence of a durable usage baseline.
+    !info.usage_snapshot_complete
+        && info.scanner_epoch.is_none()
+        && info.usage_snapshot_converged != Some(false)
+        && info.last_update.is_some()
+        && info.scanner_cycle.is_some()
+        && u64::try_from(info.buckets_usage.len()).ok() == Some(info.buckets_count)
+}
+
 fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option<&DataUsageInfo>) -> bool {
     data_usage_info_is_cold(authoritative)
         || observed.is_some_and(|observed| observed_data_usage_is_newer(observed, authoritative))
@@ -381,9 +402,18 @@ fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
         .is_some_and(|cycle| cycle % DATA_USAGE_BACKUP_INTERVAL_CYCLES == 0)
 }
 
+#[cfg(test)]
 async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
-    storeapi: Arc<impl ScannerObjectIO>,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<(), EcstoreError> {
+    sync_data_usage_backup_from_primary_for_epoch(ctx, storeapi, None).await
+}
+
+async fn sync_data_usage_backup_from_primary_for_epoch(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    expected_publication_epoch: Option<u64>,
 ) -> Result<(), EcstoreError> {
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
@@ -391,26 +421,62 @@ async fn sync_data_usage_backup_from_primary(
             return Ok(());
         }
 
+        let read_epoch = match expected_publication_epoch {
+            Some(expected_epoch) => {
+                if scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                    .await
+                    .is_none()
+                {
+                    return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+                }
+                expected_epoch
+            }
+            None => scanner_publication_epoch(storeapi.clone())
+                .await
+                .ok_or_else(|| EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED))?,
+        };
         let (primary, _) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
-        let primary = primary.ok_or_else(|| EcstoreError::other("authoritative data usage snapshot is missing"))?;
-        serde_json::from_slice::<DataUsageInfo>(&primary)
+        let primary = primary.ok_or(EcstoreError::ConfigNotFound)?;
+        let primary_info = serde_json::from_slice::<DataUsageInfo>(&primary)
             .map_err(|err| EcstoreError::other(format!("authoritative data usage snapshot is invalid: {err}")))?;
+        if !data_usage_info_has_persisted_baseline_identity(&primary_info) {
+            return Err(EcstoreError::other(
+                "authoritative data usage snapshot has no persisted baseline identity",
+            ));
+        }
         let primary = Bytes::from(primary);
 
         let (backup, revision) = read_config_with_revision(storeapi.clone(), &backup_path).await?;
         if backup.as_deref() == Some(primary.as_ref()) {
-            return Ok(());
+            if scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+                .await
+                .is_some()
+            {
+                return Ok(());
+            }
+            if retry < SCANNER_PERSIST_CAS_RETRIES {
+                continue;
+            }
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
         }
 
         let sha256hex = Some(hex_simd::encode_to_string(Sha256::digest(&primary), hex_simd::AsciiCase::Lower));
-        let save_result = save_config_shared_with_preconditions(
-            storeapi.clone(),
-            &backup_path,
-            primary.clone(),
-            sha256hex,
-            revision.preconditions(),
-        )
-        .await;
+        let save_result = {
+            let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
+                if retry < SCANNER_PERSIST_CAS_RETRIES {
+                    continue;
+                }
+                return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+            };
+            save_config_shared_with_preconditions(
+                storeapi.clone(),
+                &backup_path,
+                primary.clone(),
+                sha256hex,
+                revision.preconditions(),
+            )
+            .await
+        };
 
         match save_result {
             Ok(_) => {}
@@ -427,8 +493,19 @@ async fn sync_data_usage_backup_from_primary(
         }
 
         let (current_primary, _) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
-        if current_primary.as_deref() == Some(primary.as_ref()) {
+        if current_primary.as_deref() == Some(primary.as_ref())
+            && scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+                .await
+                .is_some()
+        {
             return Ok(());
+        }
+        if expected_publication_epoch.is_some()
+            && scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch)
+                .await
+                .is_none()
+        {
+            return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
         }
         if retry < SCANNER_PERSIST_CAS_RETRIES {
             continue;
@@ -1052,7 +1129,7 @@ async fn fence_scanner_epoch_after_cycle_timeout<Store, LockLost>(
     lock_lost: LockLost,
 ) -> bool
 where
-    Store: ScannerObjectIO,
+    Store: ScannerObjectIO + ScannerConfigObjectDelete,
     LockLost: Future<Output = ()>,
 {
     let fence_ctx = ctx.child_token();
@@ -1089,7 +1166,7 @@ async fn handle_scanner_cycle_deadline<Store>(
     worker_stopped: bool,
     guard: &mut NamespaceLockGuard,
 ) where
-    Store: ScannerObjectIO,
+    Store: ScannerObjectIO + ScannerConfigObjectDelete,
 {
     let fenced = fence_scanner_epoch_after_cycle_timeout(
         ctx,
@@ -1182,7 +1259,33 @@ async fn run_data_scanner_cycle_with_budget(
 
     let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
 
-    let mut background_heal_info = read_background_heal_info(storeapi.clone()).await;
+    // Refresh the storage-owned movement snapshot before reading background
+    // heal state. A missing heal object yields an in-memory default; do not
+    // let that default influence a cycle while publication is blocked.
+    if storeapi.scanner_data_usage_publication_blocked().await {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    }
+    let background_heal_read = read_background_heal_info_with_epoch(storeapi.clone()).await;
+    match background_heal_read.status {
+        BackgroundHealInfoReadStatus::Blocked => {
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+        }
+        BackgroundHealInfoReadStatus::Transient => {
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+        }
+        BackgroundHealInfoReadStatus::Failed => {
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Failed;
+        }
+        BackgroundHealInfoReadStatus::ErasureSd
+        | BackgroundHealInfoReadStatus::Loaded
+        | BackgroundHealInfoReadStatus::Missing => {}
+    }
+    let mut background_heal_info = background_heal_read.info;
+    let background_heal_epoch = background_heal_read.expected_epoch;
 
     let scan_mode = get_cycle_scan_mode(
         cycle_info.current,
@@ -1209,11 +1312,23 @@ async fn run_data_scanner_cycle_with_budget(
         configured_bitrot_cycle,
     ) {
         background_heal_info = new_heal_info.clone();
-        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
 
     let cycle_start = std::time::Instant::now();
-    let usage_persist_baseline = match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+    // Baseline reads are part of the same publication proof as the eventual
+    // scanner aggregate. Hold only the short storage-owned admission guard
+    // across this metadata read; the full bucket scan runs after it is
+    // released and carries the captured epoch forward.
+    let Some((baseline_publication_guard, baseline_publication_epoch)) =
+        storeapi.scanner_data_usage_publication_admission_guard().await
+    else {
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    };
+    let usage_persist_baseline_result = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await;
+    drop(baseline_publication_guard);
+    let usage_persist_baseline = match usage_persist_baseline_result {
         Ok((data, revision)) => DataUsagePersistBaseline {
             data: data.map(Bytes::from),
             revision,
@@ -1250,9 +1365,18 @@ async fn run_data_scanner_cycle_with_budget(
         )
         .await;
     let publication_defer_reason = match &scan_result {
+        Ok(result)
+            if result
+                .publication_epoch()
+                .is_some_and(|publication_epoch| publication_epoch != baseline_publication_epoch) =>
+        {
+            Some(ScannerCycleDeferReason::DataMovement)
+        }
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
+    let publication_deferred = publication_defer_reason.is_some();
+    let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let usage_persist_outcome = match publication_defer_reason {
         Some(reason) => {
@@ -1267,12 +1391,13 @@ async fn run_data_scanner_cycle_with_budget(
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
             let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
-                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch(
                     ctx_clone,
                     storeapi_clone,
                     receiver,
                     Some(leader_epoch),
                     Some(usage_persist_baseline),
+                    publication_epoch,
                     move || {
                         let storeapi = route_probe_store.clone();
                         async move { storeapi.scanner_data_usage_publication_blocked().await }
@@ -1344,7 +1469,7 @@ async fn run_data_scanner_cycle_with_budget(
             if !ctx.is_cancelled()
                 && let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, false)
             {
-                save_background_heal_info(storeapi.clone(), new_heal_info).await;
+                save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
             }
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Failed;
@@ -1377,19 +1502,29 @@ async fn run_data_scanner_cycle_with_budget(
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            let persisted = persist_required_scanner_cycle_floor(
+            let persisted = persist_required_scanner_cycle_floor_for_epoch(
                 ctx,
                 storeapi.clone(),
                 cycle_info,
                 cycle_revision,
                 leader_epoch,
-                required_cycle,
                 &mut cycle_metrics_guard,
+                ScannerCycleFloorOptions {
+                    required_cycle,
+                    expected_publication_epoch: publication_epoch,
+                },
             )
             .await;
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
+            } else if let Some(expected_epoch) = publication_epoch
+                && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                    .await
+                    .is_none()
+            {
+                emit_scan_cycle_deferred(cycle_start.elapsed());
+                ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
                 ScannerCycleOutcome::Failed
             };
@@ -1405,6 +1540,9 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "deferred",
                 "Scanner cycle deferred before data usage publication"
             );
+            if publication_deferred {
+                global_metrics().record_scanner_usage_deferred(reason.as_str());
+            }
             emit_scan_cycle_deferred(cycle_start.elapsed());
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Deferred(reason);
@@ -1446,18 +1584,26 @@ async fn run_data_scanner_cycle_with_budget(
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        let persisted = finalize_partial_scan_cycle(
+        let persisted = finalize_partial_scan_cycle_for_epoch(
             ctx,
             storeapi.clone(),
             cycle_info,
             cycle_revision,
             leader_epoch,
             &mut cycle_metrics_guard,
+            publication_epoch,
         )
         .await;
         return if persisted {
             cycle_budget.mark_cycle_state_persisted();
             ScannerCycleOutcome::Partial
+        } else if let Some(expected_epoch) = publication_epoch
+            && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                .await
+                .is_none()
+        {
+            emit_scan_cycle_deferred(cycle_start.elapsed());
+            ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
         } else {
             ScannerCycleOutcome::Failed
         };
@@ -1531,18 +1677,26 @@ async fn run_data_scanner_cycle_with_budget(
                 );
             }
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            let persisted = finalize_partial_scan_cycle(
+            let persisted = finalize_partial_scan_cycle_for_epoch(
                 ctx,
                 storeapi.clone(),
                 cycle_info,
                 cycle_revision,
                 leader_epoch,
                 &mut cycle_metrics_guard,
+                publication_epoch,
             )
             .await;
             return if persisted {
                 cycle_budget.mark_cycle_state_persisted();
                 ScannerCycleOutcome::Partial
+            } else if let Some(expected_epoch) = publication_epoch
+                && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                    .await
+                    .is_none()
+            {
+                emit_scan_cycle_deferred(cycle_start.elapsed());
+                ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement)
             } else {
                 ScannerCycleOutcome::Failed
             };
@@ -1558,6 +1712,7 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "deferred",
                 "Scanner cycle deferred before usage scanning began"
             );
+            global_metrics().record_scanner_usage_deferred(reason.as_str());
             emit_scan_cycle_deferred(cycle_start.elapsed());
             mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
             return ScannerCycleOutcome::Deferred(reason);
@@ -1572,13 +1727,14 @@ async fn run_data_scanner_cycle_with_budget(
                 state = "superseded",
                 "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
             );
-            if finalize_partial_scan_cycle(
+            if finalize_partial_scan_cycle_for_epoch(
                 ctx,
                 storeapi.clone(),
                 cycle_info,
                 cycle_revision,
                 leader_epoch,
                 &mut cycle_metrics_guard,
+                publication_epoch,
             )
             .await
             {
@@ -1586,11 +1742,29 @@ async fn run_data_scanner_cycle_with_budget(
                 emit_scan_cycle_superseded(cycle_start.elapsed());
                 return ScannerCycleOutcome::Superseded;
             }
+            if let Some(expected_epoch) = publication_epoch
+                && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                    .await
+                    .is_none()
+            {
+                emit_scan_cycle_deferred(cycle_start.elapsed());
+                return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+            }
             emit_scan_cycle_complete(false, cycle_start.elapsed());
             return ScannerCycleOutcome::Failed;
         }
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => {}
     }
+    if let Some(expected_epoch) = publication_epoch
+        && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+            .await
+            .is_none()
+    {
+        emit_scan_cycle_deferred(cycle_start.elapsed());
+        mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+        return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+    }
+    let previous_cycle_info = cycle_info.clone();
     if let Err(err) = advance_scanner_cycle(cycle_info) {
         error!(
             target: "rustfs::scanner",
@@ -1610,7 +1784,19 @@ async fn run_data_scanner_cycle_with_budget(
     global_metrics().clear_current_scan_mode();
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
-    if !persist_scanner_cycle_state(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+    if !persist_scanner_cycle_state_for_epoch(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch, publication_epoch)
+        .await
+    {
+        if let Some(expected_epoch) = publication_epoch
+            && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                .await
+                .is_none()
+        {
+            *cycle_info = previous_cycle_info;
+            emit_scan_cycle_deferred(cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
+            return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
+        }
         cycle_metrics_guard.finish(cycle_info.clone()).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
@@ -1620,7 +1806,7 @@ async fn run_data_scanner_cycle_with_budget(
     done_cycle();
     emit_scan_cycle_complete(true, cycle_start.elapsed());
     if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, true) {
-        save_background_heal_info(storeapi.clone(), new_heal_info).await;
+        save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
 
     info!(
@@ -2274,9 +2460,8 @@ async fn final_data_usage_publication_defer_reason(
             }
         }
         ScannerCycleStatus::Deferred(reason) => Some(reason),
-        // Incomplete cycles do not publish a usage snapshot. Keep the
-        // decision permissive so existing partial-cycle handling remains
-        // unchanged if a future scanner path emits a bookkeeping update.
+        // Incomplete cycles may publish a non-authoritative observational
+        // snapshot when at least one set has a usable current/LKG view.
         ScannerCycleStatus::Incomplete => None,
     }
 }

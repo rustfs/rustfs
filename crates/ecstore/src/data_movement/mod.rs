@@ -813,7 +813,7 @@ pub(crate) fn is_equivalent_data_movement_metadata(
             .all(|(key, value)| source.user_defined.get(key) == Some(value))
 }
 
-fn is_equivalent_data_movement_object_identity(
+pub(crate) fn is_equivalent_data_movement_object_identity(
     source: &ObjectInfo,
     target: &ObjectInfo,
     compare_mod_time: bool,

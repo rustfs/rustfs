@@ -16,6 +16,14 @@ printf '%s\n' "$header" >"$TMP_DIR/equal-budget.csv"
 printf '%s\n' '1MiB,warp,1,100,100,0.00,1,1,0.00,100,100,0.00,2,2,0.00,3,3,0.00,9,10,1,0,10.00,0.00,10.00' >>"$TMP_DIR/equal-budget.csv"
 "$GATE" --require-tail-error --fail-pct 10 --warn-pct 5 --compare-csv "$TMP_DIR/equal-budget.csv" >/dev/null
 
+"$GATE" --require-tail-error \
+  --labeled-compare-csv sync-on/put-4kib/B1-vs-A1 "$TMP_DIR/equal-budget.csv" \
+  --labeled-compare-csv sync-off/put-4kib/B1-vs-A1 "$TMP_DIR/equal-budget.csv" \
+  --markdown "$TMP_DIR/labeled.md" >/dev/null
+rg -qF '| Configuration | Workload | Metric |' "$TMP_DIR/labeled.md"
+rg -qF '| sync-on/put-4kib/B1-vs-A1 | 1MiB/warp@1 |' "$TMP_DIR/labeled.md"
+rg -qF '| sync-off/put-4kib/B1-vs-A1 | 1MiB/warp@1 |' "$TMP_DIR/labeled.md"
+
 printf '%s\n' "$header" >"$TMP_DIR/rounded-error.csv"
 printf '%s\n' '1MiB,warp,1,100,100,0.00,1,1,0.00,100,100,0.00,2,2,0.00,3,3,0.00,2,5,1,1,33.33,16.67,16.67' >>"$TMP_DIR/rounded-error.csv"
 if "$GATE" --require-tail-error --fail-pct 20 --warn-pct 10 --compare-csv "$TMP_DIR/rounded-error.csv" >/dev/null; then

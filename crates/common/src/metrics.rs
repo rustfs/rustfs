@@ -918,7 +918,15 @@ pub struct Metrics {
     scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
     scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
     scanner_usage_last_save_unix_secs: AtomicU64,
+    scanner_usage_last_durable_success_unix_secs: AtomicU64,
+    scanner_usage_last_publication_unix_secs: AtomicU64,
+    scanner_usage_last_publication_state: Mutex<String>,
+    scanner_usage_last_publication_reason: Mutex<String>,
     scanner_usage_last_save_result: AtomicU8,
+    scanner_usage_deferred_pending: AtomicBool,
+    scanner_usage_deferred_total: AtomicU64,
+    scanner_usage_last_deferred_unix_secs: AtomicU64,
+    scanner_usage_last_deferred_reason: Mutex<String>,
     scanner_source_work: Vec<ScannerSourceWorkCounters>,
     current_scan_cycle_source_work_start: Vec<ScannerSourceWorkCounters>,
     last_scan_cycle_source_work: Vec<ScannerSourceWorkCounters>,
@@ -1216,6 +1224,22 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_usage_save_unix_secs: u64,
     pub last_usage_save_result: String,
     pub last_usage_save_result_code: u64,
+    #[serde(default)]
+    pub last_durable_success_unix_secs: u64,
+    #[serde(default)]
+    pub last_publication_unix_secs: u64,
+    #[serde(default)]
+    pub last_publication_state: String,
+    #[serde(default)]
+    pub last_publication_reason: String,
+    #[serde(default)]
+    pub deferred_pending: bool,
+    #[serde(default)]
+    pub deferred_total: u64,
+    #[serde(default)]
+    pub last_deferred_unix_secs: u64,
+    #[serde(default)]
+    pub last_deferred_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1945,7 +1969,15 @@ impl Metrics {
             scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
             scanner_usage_last_save_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_durable_success_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_publication_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_publication_state: Mutex::new(String::new()),
+            scanner_usage_last_publication_reason: Mutex::new(String::new()),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
+            scanner_usage_deferred_pending: AtomicBool::new(false),
+            scanner_usage_deferred_total: AtomicU64::new(0),
+            scanner_usage_last_deferred_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_deferred_reason: Mutex::new(String::new()),
             scanner_source_work: ScannerWorkSource::all()
                 .iter()
                 .map(|_| ScannerSourceWorkCounters::default())
@@ -2268,6 +2300,44 @@ impl Metrics {
         self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
         self.scanner_usage_last_save_unix_secs
             .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Record an intentional retryable usage publication deferral separately
+    /// from the last durable save result.
+    pub fn record_scanner_usage_deferred(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.record_scanner_usage_publication("deferred", reason.clone());
+        self.scanner_usage_deferred_pending.store(true, Ordering::Release);
+        self.scanner_usage_deferred_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_usage_last_deferred_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_usage_last_deferred_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason;
+    }
+
+    pub fn record_scanner_usage_durable_success(&self) {
+        self.record_scanner_usage_publication("success", "");
+        self.scanner_usage_last_durable_success_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        self.scanner_usage_deferred_pending.store(false, Ordering::Release);
+    }
+
+    pub fn record_scanner_usage_publication(&self, state: &str, reason: impl Into<String>) {
+        self.scanner_usage_last_publication_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut publication_state = match self.scanner_usage_last_publication_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *publication_state = state.to_string();
+        let mut publication_reason = match self.scanner_usage_last_publication_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *publication_reason = reason.into();
     }
 
     pub fn record_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
@@ -3292,6 +3362,23 @@ impl Metrics {
             last_usage_save_unix_secs: self.scanner_usage_last_save_unix_secs.load(Ordering::Relaxed),
             last_usage_save_result: usage_save_result.as_str().to_string(),
             last_usage_save_result_code: usage_save_result as u8 as u64,
+            last_durable_success_unix_secs: self.scanner_usage_last_durable_success_unix_secs.load(Ordering::Relaxed),
+            last_publication_unix_secs: self.scanner_usage_last_publication_unix_secs.load(Ordering::Relaxed),
+            last_publication_state: match self.scanner_usage_last_publication_state.lock() {
+                Ok(state) => state.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            last_publication_reason: match self.scanner_usage_last_publication_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            deferred_pending: self.scanner_usage_deferred_pending.load(Ordering::Acquire),
+            deferred_total: self.scanner_usage_deferred_total.load(Ordering::Relaxed),
+            last_deferred_unix_secs: self.scanner_usage_last_deferred_unix_secs.load(Ordering::Relaxed),
+            last_deferred_reason: match self.scanner_usage_last_deferred_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
         };
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -4663,6 +4750,7 @@ mod tests {
         metrics.record_scanner_dirty_usage_cycle_snapshot(1);
         metrics.record_scanner_dirty_usage_cycle_clear(1, 1);
         metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+        metrics.record_scanner_usage_deferred("data_movement");
 
         let report = metrics.report().await;
 
@@ -4674,6 +4762,22 @@ mod tests {
         assert!(report.usage_freshness.last_usage_save_unix_secs > 0);
         assert_eq!(report.usage_freshness.last_usage_save_result, "success");
         assert_eq!(report.usage_freshness.last_usage_save_result_code, 1);
+        assert!(report.usage_freshness.deferred_pending);
+        assert_eq!(report.usage_freshness.deferred_total, 1);
+        assert!(report.usage_freshness.last_deferred_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_deferred_reason, "data_movement");
+
+        metrics.record_scanner_usage_durable_success();
+        let report = metrics.report().await;
+        assert!(!report.usage_freshness.deferred_pending);
+        assert_eq!(report.usage_freshness.deferred_total, 1);
+        assert!(report.usage_freshness.last_durable_success_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_publication_state, "success");
+
+        metrics.record_scanner_usage_publication("no_update", "no_update");
+        let report = metrics.report().await;
+        assert_eq!(report.usage_freshness.last_publication_state, "no_update");
+        assert_eq!(report.usage_freshness.last_publication_reason, "no_update");
     }
 
     #[tokio::test]

@@ -75,11 +75,7 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: 'false'
 
-      # awscurl lets the STS dual-node test actually exercise its path. Without
-      # it the test skips gracefully with a visible log line
-      # (`awscurl_available()` in crates/e2e_test/src/common.rs), so the lane
-      # still passes — installing it just upgrades that one test from skip to
-      # real coverage.
+      # The STS dual-node test requires awscurl and fails if it is unavailable.
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -87,7 +83,7 @@ jobs:
 
       - name: Install awscurl
         run: |
-          python3 -m pip install --user --upgrade pip awscurl
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
           echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
 
       - name: Verify awscurl
@@ -196,8 +192,11 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Verify protocol socket oracle
-        run: ss -tn state CLOSE-WAIT >/dev/null
+      - name: Install and verify protocol socket oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2
+          ss -tn state CLOSE-WAIT >/dev/null
 
       # The suite owns fixed protocol ports and serializes its internal cases.
       - name: Verify protocol e2e membership
