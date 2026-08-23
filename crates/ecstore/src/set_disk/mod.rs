@@ -3630,9 +3630,7 @@ impl SetDisks {
         // state: release this guard before asking the storage owner to refresh
         // its durable movement snapshot, since the owner uses the same gate.
         drop(operation_guard);
-        let Some(owner) = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx)) else {
-            return None;
-        };
+        let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
         owner.scanner_data_usage_publication_admission_guard().await
     }
 
