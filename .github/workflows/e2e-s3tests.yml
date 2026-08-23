@@ -21,6 +21,9 @@
 #     suite and reports promotion candidates. Regressions, unclassified tests,
 #     incomplete execution, and infrastructure errors fail the job; classified
 #     failures for not-yet-implemented features remain informational.
+#   - Non-blocking upstream HEAD canary: collects current upstream node IDs and
+#     reports new, removed, duplicate, or overlapping classifications without
+#     making upstream drift a release gate.
 #   - Manual runs (workflow_dispatch): same, with configurable mode/scope.
 #
 # All test execution is delegated to scripts/s3-tests/run.sh (single source of
@@ -358,6 +361,85 @@ jobs:
         with:
           name: s3tests-${{ env.TEST_MODE }}-shard-${{ matrix.shard-index }}
           path: artifacts/**
+
+  upstream-head-canary:
+    name: Upstream HEAD classification canary
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install collection tool
+        run: |
+          python3 -m pip install --user "tox==4.60.0"
+          python3 - <<'PY'
+          from importlib.metadata import version
+
+          assert version("tox") == "4.60.0"
+          PY
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Compare upstream HEAD classifications
+        id: upstream-compare
+        run: |
+          ARTIFACT_DIR="artifacts/s3tests-upstream-head"
+          UPSTREAM_DIR="${RUNNER_TEMP}/s3-tests-upstream"
+          mkdir -p "${ARTIFACT_DIR}"
+          git clone --depth 1 https://github.com/ceph/s3-tests.git "${UPSTREAM_DIR}"
+          git -C "${UPSTREAM_DIR}" rev-parse HEAD > "${ARTIFACT_DIR}/upstream-sha.txt"
+          cp "${UPSTREAM_DIR}/s3tests.conf.SAMPLE" "${UPSTREAM_DIR}/s3tests.conf"
+          (
+            cd "${UPSTREAM_DIR}"
+            S3TEST_CONF="${UPSTREAM_DIR}/s3tests.conf" tox -- \
+              -q --collect-only s3tests/functional/test_s3.py \
+              -m "not rustfs_never_marker"
+          ) 2>&1 | tee "${ARTIFACT_DIR}/collect.log"
+          grep -E '^s3tests/functional/test_s3\.py::' \
+            "${ARTIFACT_DIR}/collect.log" > "${ARTIFACT_DIR}/collected-nodeids.txt"
+          python3 scripts/s3-tests/report_compat.py \
+            --lists-dir scripts/s3-tests \
+            --collected-nodeids "${ARTIFACT_DIR}/collected-nodeids.txt" \
+            --check-classifications-only 2>&1 | tee "${ARTIFACT_DIR}/classification-drift.txt"
+
+      - name: Publish canary report
+        if: always()
+        env:
+          CANARY_OUTCOME: ${{ steps.upstream-compare.outcome }}
+        run: |
+          {
+            echo "## ceph/s3-tests upstream HEAD canary"
+            echo
+            if [ -f artifacts/s3tests-upstream-head/upstream-sha.txt ]; then
+              echo "Upstream HEAD: $(cat artifacts/s3tests-upstream-head/upstream-sha.txt)"
+            fi
+            echo
+            echo '```text'
+            if [ -s artifacts/s3tests-upstream-head/classification-drift.txt ]; then
+              cat artifacts/s3tests-upstream-head/classification-drift.txt
+            elif [ "${CANARY_OUTCOME}" != "success" ]; then
+              echo "Canary did not complete; inspect the collection log artifact."
+            else
+              echo "No classification drift detected."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload canary artifacts
+        if: always() && env.ACT != 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: s3tests-upstream-head
+          path: artifacts/s3tests-upstream-head/**
+          retention-days: 14
 
   alert-on-failure:
     name: Alert on scheduled failure
