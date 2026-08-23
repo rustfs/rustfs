@@ -415,9 +415,9 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
-        start_remote_version_state_fleet_probe,
+        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        acquire_cross_pool_fence_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -455,13 +455,15 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
+        ScannerBucketListing, ScannerPeerActivity, ScannerPublicationLease, TONIC_RPC_PREFIX, TonicInterceptor,
+        build_put_file_auth_trailer,
         check_and_record_signed_rpc_nonce, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
         gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
         normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
         sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer,
+        verify_put_file_auth_trailer,
         verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
         verify_tonic_rpc_signature_with_bootstrap,
@@ -491,7 +493,7 @@ pub mod storage {
     pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
         init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
         prewarm_local_disk_id_map_with_instance_ctx,
     };

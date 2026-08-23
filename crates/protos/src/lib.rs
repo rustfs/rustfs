@@ -522,6 +522,116 @@ pub fn canonical_scanner_activity_v7_response_body(
     Ok(body)
 }
 
+/// Builds the body authenticated by the short-lived remote scanner publication
+/// lease request. This is a separate domain from ScannerActivity so v6/v7
+/// observation proofs remain byte-for-byte compatible.
+pub fn canonical_scanner_publication_lease_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let session_id = request.expected_session_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
+    body.extend_from_slice(&request.ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+/// Builds the body authenticated by a remote scanner publication lease
+/// release request.
+pub fn canonical_scanner_publication_lease_release_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let token = request.token.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + token.len() + 16);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    let token = response.token.as_ref();
+    let owner_id = response.owner_id.as_bytes();
+    let session_id = response.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.push(u8::from(response.success));
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&response.movement_generation.to_be_bytes());
+    body.extend_from_slice(&response.lease_ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_release_response_body(
+    challenge: &[u8],
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+    response: &proto_gen::node_service::ScannerPublicationLeaseReleaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-response-v1\0";
+    let token = request.token.as_ref();
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 56,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.success));
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
 /// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
 /// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
 /// distinct field values can never collide into the same canonical bytes.
@@ -1602,7 +1712,11 @@ mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
         canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
-        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
+        canonical_scanner_publication_lease_response_body,
+        proto_gen::node_service::{
+            ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        },
     };
 
     #[test]
@@ -1771,6 +1885,67 @@ mod scanner_activity_tests {
             baseline,
             canonical_scanner_activity_v4_response_body(&[1; 16], &extended)
                 .expect("scanner activity v4 response should ignore v5 fields")
+        );
+    }
+
+    #[test]
+    fn scanner_publication_lease_canonical_bodies_bind_session_owner_and_generation() {
+        let request = ScannerPublicationLeaseRequest {
+            challenge: vec![1; 16].into(),
+            expected_movement_generation: 7,
+            ttl_ms: 60_000,
+            expected_session_id: "session-a".to_string(),
+        };
+        let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
+        for variant in [
+            ScannerPublicationLeaseRequest {
+                expected_movement_generation: 8,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                expected_session_id: "session-b".to_string(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                ttl_ms: 30_000,
+                ..request.clone()
+            },
+        ] {
+            assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
+        }
+
+        let release_a = proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            challenge: vec![2; 16].into(),
+            token: vec![3; 16].into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let release_b = proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            owner_id: "owner-b".to_string(),
+            ..release_a.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_release_request_body(&release_a).unwrap(),
+            canonical_scanner_publication_lease_release_request_body(&release_b).unwrap()
+        );
+
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: vec![4; 16].into(),
+            movement_generation: 7,
+            lease_ttl_ms: 60_000,
+            error: None,
+            response_proof: Vec::new().into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let response_changed = ScannerPublicationLeaseResponse {
+            owner_id: "owner-b".to_string(),
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
         );
     }
 }

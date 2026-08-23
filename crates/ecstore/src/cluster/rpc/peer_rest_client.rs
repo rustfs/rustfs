@@ -46,8 +46,9 @@ use rustfs_protos::proto_gen::node_service::{
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse,
-    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+    ScannerPublicationLeaseResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
     TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
@@ -85,6 +86,11 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+/// Reserve time for the acquire response's network/clock uncertainty.  The
+/// server owns the real expiry; this local deadline is intentionally earlier
+/// so a coordinator never starts a bounded persistence operation at the edge
+/// of a remote lease.
+const SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 const BUCKET_METADATA_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -339,6 +345,24 @@ pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
     pub next_sequence: u64,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScannerPublicationLease {
+    pub token: Uuid,
+    pub movement_generation: u64,
+    /// Stable storage owner identity. This is distinct from the activity
+    /// session and is bound into both acquire and release proofs.
+    pub owner_id: String,
+    /// Process/session nonce observed by the final activity probe.
+    pub session_id: String,
+    pub expires_at: std::time::Instant,
+}
+
+impl ScannerPublicationLease {
+    pub fn is_valid(&self) -> bool {
+        std::time::Instant::now() < self.expires_at
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1760,6 +1784,115 @@ impl PeerRestClient {
         } else {
             result
         }
+    }
+
+    /// Acquire a bounded, storage-owned read admission on the peer that
+    /// produced the final activity generation. Older peers do not implement
+    /// this independent RPC and are rejected rather than downgraded.
+    pub async fn acquire_scanner_publication_lease(
+        &self,
+        expected_session_id: &str,
+        expected_generation: u64,
+    ) -> Result<ScannerPublicationLease> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: expected_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: expected_session_id.to_string(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response)
+                        .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
+                if !response.success {
+                    return Err(Error::other(
+                        response
+                            .error
+                            .map(|error| error.error_info)
+                            .unwrap_or_else(|| "peer rejected scanner publication lease".to_string()),
+                    ));
+                }
+                if response.movement_generation != expected_generation {
+                    return Err(Error::other("peer returned a different scanner publication lease generation"));
+                }
+                if response.session_id != expected_session_id {
+                    return Err(Error::other("peer returned a different scanner publication lease session"));
+                }
+                let owner_id = Uuid::parse_str(&response.owner_id)
+                    .ok()
+                    .filter(|owner_id| !owner_id.is_nil())
+                    .map(|owner_id| owner_id.to_string())
+                    .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
+                if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
+                    return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
+                }
+                let token = Uuid::from_slice(response.token.as_ref())
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+                Ok(ScannerPublicationLease {
+                    token,
+                    movement_generation: response.movement_generation,
+                    owner_id,
+                    session_id: response.session_id,
+                    expires_at: std::time::Instant::now()
+                        + Duration::from_millis(response.lease_ttl_ms).saturating_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN),
+                })
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn release_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(ScannerPublicationLeaseReleaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                    owner_id: lease.owner_id.clone(),
+                    session_id: lease.session_id.clone(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_release_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease release request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let request_body = request.get_ref().clone();
+                let response = client.release_scanner_publication_lease(request).await?.into_inner();
+                let response_body = rustfs_protos::canonical_scanner_publication_lease_release_response_body(
+                    challenge.as_bytes(),
+                    &request_body,
+                    &response,
+                )
+                .map_err(|_| Error::other("scanner publication lease release response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease release proof"))?;
+                if response.success {
+                    Ok(())
+                } else {
+                    Err(Error::other(
+                        response
+                            .error
+                            .map(|error| error.error_info)
+                            .unwrap_or_else(|| "peer rejected scanner publication lease release".to_string()),
+                    ))
+                }
+            }
+            .await,
+        )
+        .await
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {

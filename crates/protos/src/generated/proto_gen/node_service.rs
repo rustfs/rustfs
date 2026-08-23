@@ -1218,6 +1218,56 @@ pub struct ScannerActivityResponse {
     #[prost(bool, optional, tag = "11")]
     pub publication_blocked: ::core::option::Option<bool>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub expected_movement_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
+    #[prost(string, tag = "4")]
+    pub expected_session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub token: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub movement_generation: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_ttl_ms: u64,
+    #[prost(message, optional, tag = "5")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub response_proof: ::prost::bytes::Bytes,
+    #[prost(string, tag = "7")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseReleaseRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub token: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub owner_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerPublicationLeaseReleaseResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub response_proof: ::prost::bytes::Bytes,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusRequest {
     #[prost(uint32, tag = "1")]
@@ -2699,6 +2749,36 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ScannerActivity"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn acquire_scanner_publication_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerPublicationLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/AcquireScannerPublicationLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "AcquireScannerPublicationLease"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn release_scanner_publication_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerPublicationLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseReleaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReleaseScannerPublicationLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReleaseScannerPublicationLease"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn background_heal_status(
             &mut self,
             request: impl tonic::IntoRequest<super::BackgroundHealStatusRequest>,
@@ -3212,6 +3292,18 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ScannerActivityRequest>,
         ) -> std::result::Result<tonic::Response<super::ScannerActivityResponse>, tonic::Status>;
+        async fn acquire_scanner_publication_lease(
+            &self,
+            _request: tonic::Request<super::ScannerPublicationLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("scanner publication leases are unsupported"))
+        }
+        async fn release_scanner_publication_lease(
+            &self,
+            _request: tonic::Request<super::ScannerPublicationLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerPublicationLeaseReleaseResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("scanner publication leases are unsupported"))
+        }
         async fn background_heal_status(
             &self,
             request: tonic::Request<super::BackgroundHealStatusRequest>,
@@ -5483,6 +5575,67 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ScannerActivitySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/AcquireScannerPublicationLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcquireScannerPublicationLeaseSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerPublicationLeaseRequest> for AcquireScannerPublicationLeaseSvc<T> {
+                        type Response = super::ScannerPublicationLeaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ScannerPublicationLeaseRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::acquire_scanner_publication_lease(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AcquireScannerPublicationLeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReleaseScannerPublicationLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseScannerPublicationLeaseSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerPublicationLeaseReleaseRequest>
+                        for ReleaseScannerPublicationLeaseSvc<T>
+                    {
+                        type Response = super::ScannerPublicationLeaseReleaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ScannerPublicationLeaseReleaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::release_scanner_publication_lease(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReleaseScannerPublicationLeaseSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
