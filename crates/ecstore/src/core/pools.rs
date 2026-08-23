@@ -3592,8 +3592,6 @@ impl ECStore {
             }
             return Err(err);
         }
-        drop(operation_guard);
-
         if let Some(canceler) = terminal_canceler.as_ref() {
             self.release_decommission_canceler_slot(idx, canceler).await;
         }
