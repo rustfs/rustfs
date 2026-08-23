@@ -19,11 +19,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::progress::stable_generation;
 use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
@@ -805,14 +804,36 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
 
         let identity = info.snapshot_identity();
-        let mut hasher = DefaultHasher::new();
-        identity.last_update.hash(&mut hasher);
-        identity.scanner_cycle.hash(&mut hasher);
-        identity.scanner_epoch.hash(&mut hasher);
+        let mut canonical = Vec::new();
+        match identity.last_update {
+            Some(last_update) => {
+                canonical.push(1);
+                canonical.extend_from_slice(
+                    &last_update
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_be_bytes(),
+                );
+            }
+            None => canonical.push(0),
+        }
+        for value in [identity.scanner_cycle, identity.scanner_epoch] {
+            match value {
+                Some(value) => {
+                    canonical.push(1);
+                    canonical.extend_from_slice(&value.to_be_bytes());
+                }
+                None => canonical.push(0),
+            }
+        }
         let mut scope = buckets.to_vec();
         scope.sort_unstable();
-        scope.hash(&mut hasher);
-        baseline.generation = Some(hasher.finish());
+        for bucket in scope {
+            canonical.extend_from_slice(&(bucket.len() as u64).to_be_bytes());
+            canonical.extend_from_slice(bucket.as_bytes());
+        }
+        baseline.generation = Some(stable_generation(&[&canonical]));
 
         Ok(Some(baseline))
     }

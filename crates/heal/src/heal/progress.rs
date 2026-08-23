@@ -15,6 +15,27 @@
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
+pub(crate) fn stable_generation(parts: &[&[u8]]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in parts {
+        for byte in (part.len() as u64).to_be_bytes().into_iter().chain(part.iter().copied()) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+#[cfg(test)]
+mod stable_generation_tests {
+    use super::stable_generation;
+
+    #[test]
+    fn stable_generation_has_a_fixed_vector() {
+        assert_eq!(stable_generation(&[b"rustfs", b"heal", b"42"]), 11_007_672_338_488_385_056);
+    }
+}
+
 pub(crate) fn increment_counter(counter: &mut u64) -> bool {
     match counter.checked_add(1) {
         Some(next) => {
@@ -845,6 +866,23 @@ mod tests {
         assert_eq!(aggregate.baseline_generation, None);
         assert_eq!(aggregate.progress_state, HealProgressState::Indeterminate);
         assert_eq!(aggregate.progress_percentage, 0.0);
+    }
+
+    #[test]
+    fn aggregate_accepts_multiple_sets_from_one_snapshot_generation() {
+        let progress = |objects_scanned| HealProgress {
+            kind: HealProgressKind::ObjectSweep,
+            objects_scanned,
+            objects_total_count: 10,
+            progress_state: HealProgressState::Running,
+            baseline_generation: Some(7),
+            baseline_known: true,
+            ..Default::default()
+        };
+
+        let aggregate = aggregate_heal_progress([progress(5), progress(3)]).expect("progress should aggregate");
+        assert!(aggregate.baseline_known);
+        assert_eq!(aggregate.baseline_generation, Some(7));
     }
 
     #[test]

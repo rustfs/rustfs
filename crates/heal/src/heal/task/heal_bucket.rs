@@ -13,7 +13,7 @@
 // limitations under the License.
 /// bucket/cluster/prefix heal: the recursive bucket-objects sweep and the erasure-set usage baseline
 use super::*;
-use crate::heal::progress::{add_bytes, increment_counter};
+use crate::heal::progress::{add_bytes, increment_counter, stable_generation};
 
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
@@ -444,7 +444,7 @@ impl HealTask {
         Ok(())
     }
 
-    pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String], set_disk_id: &str) -> Result<()> {
+    pub(super) async fn apply_erasure_set_usage_baseline(&self, buckets: &[String], _set_disk_id: &str) -> Result<()> {
         if matches!(self.options.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal) {
             return Ok(());
         }
@@ -463,15 +463,7 @@ impl HealTask {
             bytes,
             generation,
         } = baseline;
-        let generation = generation.map(|snapshot_generation| {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            snapshot_generation.hash(&mut hasher);
-            set_disk_id.hash(&mut hasher);
-            self.options.pool_index.hash(&mut hasher);
-            self.options.set_index.hash(&mut hasher);
-            hasher.finish()
-        });
+        let generation = generation.map(|snapshot_generation| stable_generation(&[&snapshot_generation.to_be_bytes()]));
         let mut progress = self.progress.write().await;
         if let Some(generation) = generation {
             progress.set_total_baseline_with_generation(objects_count, bytes, generation);
