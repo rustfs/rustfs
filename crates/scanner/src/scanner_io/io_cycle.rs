@@ -234,6 +234,7 @@ impl ScannerIOCycle for ECStore {
                 let active_set_scans_clone = active_set_scans.clone();
 
                 let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
+                let failed_scope_tx = tx.clone();
 
                 // Spawn task to receive and store results
                 let receiver_fut = tokio::spawn(async move {
@@ -314,6 +315,21 @@ impl ScannerIOCycle for ECStore {
                             state = "set_scan_failed",
                             "Scanner set scan failed; continuing cycle"
                         );
+                        let _ = failed_scope_tx
+                            .send(DataUsageCache {
+                                info: DataUsageCacheInfo {
+                                    name: DATA_USAGE_ROOT.to_string(),
+                                    next_cycle: want_cycle_clone,
+                                    leader_epoch,
+                                    source: Some(source),
+                                    snapshot_complete: false,
+                                    scan_plan_digest: Some(scan_plan_digest),
+                                    cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+                                    ..Default::default()
+                                },
+                                cache: HashMap::new(),
+                            })
+                            .await;
                         let mut first_err = first_err_mutex_clone.lock().await;
                         record_set_scan_failure(&mut first_err, e);
                     }
@@ -370,6 +386,19 @@ impl ScannerIOCycle for ECStore {
             budget_elapsed,
             ctx.is_cancelled(),
         );
+        let observational_usage = completed_usage
+            .is_none()
+            .then(|| {
+                observational_data_usage_info(
+                    &results,
+                    &expected_sources,
+                    &all_bucket_names,
+                    scan_plan_digest,
+                    want_cycle,
+                    leader_epoch,
+                )
+            })
+            .flatten();
         let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
         let cycle_status = classify_nsscanner_cycle(
             structurally_complete_snapshot,
@@ -381,6 +410,10 @@ impl ScannerIOCycle for ECStore {
         );
         if let Some((data_usage_info, _)) = completed_usage {
             publish_usage_snapshot(&updates, cycle_status, data_usage_info).await?;
+        } else if !ctx.is_cancelled()
+            && let Some((data_usage_info, _)) = observational_usage
+        {
+            publish_observational_snapshot(&updates, data_usage_info).await?;
         }
         let dirty_usage_clear = should_clear_dirty_usage_snapshot(
             result.is_ok(),

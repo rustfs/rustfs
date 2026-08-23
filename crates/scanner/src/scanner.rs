@@ -2274,9 +2274,8 @@ async fn final_data_usage_publication_defer_reason(
             }
         }
         ScannerCycleStatus::Deferred(reason) => Some(reason),
-        // Incomplete cycles do not publish a usage snapshot. Keep the
-        // decision permissive so existing partial-cycle handling remains
-        // unchanged if a future scanner path emits a bookkeeping update.
+        // Incomplete cycles may publish a non-authoritative observational
+        // snapshot when at least one set has a usable current/LKG view.
         ScannerCycleStatus::Incomplete => None,
     }
 }

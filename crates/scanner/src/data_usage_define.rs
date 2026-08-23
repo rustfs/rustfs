@@ -28,8 +28,9 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
     AllTierStats, BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DATA_USAGE_OBSERVED_OBJECT_NAME,
-    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry,
-    PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, hash_path, prefix_usage_in_cache,
+    DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSnapshotSetState, LEGACY_DATA_USAGE_OBJECT_NAME,
+    PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary, SizeSummary, TierStats, hash_path,
+    prefix_usage_in_cache,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -344,6 +345,18 @@ pub struct DataUsageCacheInfo {
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
     pub cache_key_format: u16,
+    /// Whether the entries retained while a set scan was incomplete come
+    /// from a prior complete set snapshot.  This is observational input only.
+    #[serde(default)]
+    pub lkg_snapshot_complete: bool,
+    #[serde(default)]
+    pub lkg_next_cycle: Option<u64>,
+    #[serde(default)]
+    pub lkg_last_update: Option<SystemTime>,
+    #[serde(default)]
+    pub lkg_leader_epoch: Option<u64>,
+    #[serde(default)]
+    pub lkg_scan_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -353,7 +366,7 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let mut state = serializer.serialize_map(Some(16))?;
+        let mut state = serializer.serialize_map(Some(21))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
@@ -370,6 +383,11 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;
         state.serialize_entry("cache_key_format", &self.cache_key_format)?;
+        state.serialize_entry("lkg_snapshot_complete", &self.lkg_snapshot_complete)?;
+        state.serialize_entry("lkg_next_cycle", &self.lkg_next_cycle)?;
+        state.serialize_entry("lkg_last_update", &self.lkg_last_update)?;
+        state.serialize_entry("lkg_leader_epoch", &self.lkg_leader_epoch)?;
+        state.serialize_entry("lkg_scan_plan_digest", &self.lkg_scan_plan_digest)?;
         state.end()
     }
 }
