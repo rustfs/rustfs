@@ -209,6 +209,7 @@ where
                 state = "reject_incomplete_snapshot",
                 "Scanner refused to persist an incomplete data usage snapshot"
             );
+            global_metrics().record_scanner_usage_publication("failed", "incomplete_snapshot");
             global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
             outcome = DataUsagePersistOutcome::Failed;
             continue;
@@ -227,6 +228,7 @@ where
                     error = %e,
                     "Scanner data usage encode failed"
                 );
+                global_metrics().record_scanner_usage_publication("failed", "encode_failed");
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::EncodeFailed);
                 outcome = DataUsagePersistOutcome::Failed;
                 continue;

@@ -2300,13 +2300,13 @@ impl Metrics {
         self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
         self.scanner_usage_last_save_unix_secs
             .store(unix_now_secs(), Ordering::Relaxed);
-        self.record_scanner_usage_publication(result.as_str(), result.as_str());
     }
 
     /// Record an intentional retryable usage publication deferral separately
     /// from the last durable save result.
     pub fn record_scanner_usage_deferred(&self, reason: impl Into<String>) {
-        self.record_scanner_usage_publication("deferred", reason);
+        let reason = reason.into();
+        self.record_scanner_usage_publication("deferred", reason.clone());
         self.scanner_usage_deferred_pending.store(true, Ordering::Release);
         self.scanner_usage_deferred_total.fetch_add(1, Ordering::Relaxed);
         self.scanner_usage_last_deferred_unix_secs
@@ -2315,7 +2315,7 @@ impl Metrics {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *last_reason = reason.into();
+        *last_reason = reason;
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
