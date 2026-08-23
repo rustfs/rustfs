@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::heal::{
-    progress::HealProgress,
+    progress::{HealProgress, add_bytes, increment_counter},
     resume::{
-        CheckpointManager, ReplacementTargetIdentity, ResumeManager, ResumeUtils, compose_key,
-        replacement_target_identities_match,
+        CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ReplacementTargetIdentity, ResumeManager,
+        ResumeUtils, compose_key, replacement_target_identities_match,
     },
     storage::{HealStorageAPI, next_heal_listing_token},
     task::{demote_to_debug_when, is_missing_object_dir_heal_result, take_failure_log_sample},
@@ -373,6 +373,11 @@ impl ErasureSetHealer {
         set_disk_id: &str,
         buckets: &[String],
     ) -> Result<(ResumeManager, CheckpointManager)> {
+        if self.replacement_task_id.is_none() && CheckpointManager::is_blocked(&self.disk, task_id).await {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Resume task {task_id} has a blocked checkpoint"),
+            });
+        }
         // check if resume state exists
         let has_resume_state = if self.replacement_task_id.is_some() {
             ResumeManager::has_replacement_intent(&self.disk, task_id).await
@@ -410,6 +415,9 @@ impl ErasureSetHealer {
                 && state.successful_objects == 0
                 && state.failed_objects == 0
                 && state.skipped_objects == 0
+                && state.skipped_new_versions == 0
+                && state.skipped_ilm_expired == 0
+                && state.processed_bytes == 0
             {
                 // schedule_retry persists the authoritative resume reset before
                 // resetting the checkpoint. Reapply the checkpoint reset after
@@ -474,6 +482,23 @@ impl ErasureSetHealer {
 
         // 2. initialize progress
         self.initialize_progress(buckets, &state).await;
+        let (baseline_known, baseline_count, baseline_size, baseline_generation) = {
+            let baseline = self.progress.read().await;
+            (
+                baseline.baseline_known,
+                baseline.objects_total_count,
+                baseline.objects_total_size,
+                baseline.baseline_generation,
+            )
+        };
+        if baseline_known {
+            resume_manager
+                .set_progress_baseline(baseline_count, baseline_size, baseline_generation)
+                .await?;
+            checkpoint_manager
+                .set_progress_baseline(baseline_count, baseline_size, baseline_generation)
+                .await?;
+        }
 
         // 3. continue from checkpoint
         let current_bucket_index = checkpoint.current_bucket_index;
@@ -483,12 +508,66 @@ impl ErasureSetHealer {
         let mut successful_objects = state.successful_objects;
         let mut failed_objects = state.failed_objects;
         let mut skipped_objects = state.skipped_objects;
+        let checkpoint_has_progress = checkpoint.baseline_known
+            || checkpoint.successful_objects > 0
+            || checkpoint.failed_object_count > 0
+            || checkpoint.skipped_object_count > 0
+            || checkpoint.skipped_new_versions > 0
+            || checkpoint.skipped_ilm_expired > 0
+            || checkpoint.processed_bytes > 0
+            || checkpoint.total_objects > 0
+            || checkpoint.total_bytes > 0
+            || checkpoint.baseline_generation.is_some()
+            || checkpoint.counter_unknown;
+        let checkpoint_generation_mismatch = checkpoint.baseline_known && checkpoint.baseline_generation != baseline_generation;
+        let mut restored_counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
+        if checkpoint_has_progress {
+            successful_objects = checkpoint.successful_objects;
+            failed_objects = checkpoint.failed_object_count;
+            skipped_objects = checkpoint.skipped_object_count;
+            let restored_processed_objects = successful_objects
+                .checked_add(failed_objects)
+                .and_then(|value| value.checked_add(skipped_objects))
+                .and_then(|value| value.checked_add(checkpoint.skipped_new_versions))
+                .and_then(|value| value.checked_add(checkpoint.skipped_ilm_expired));
+            let checkpoint_counter_overflow = restored_processed_objects.is_none();
+            restored_counter_unknown |= checkpoint_counter_overflow;
+            processed_objects = restored_processed_objects.unwrap_or(u64::MAX);
+            let mut progress = self.progress.write().await;
+            progress.objects_scanned = processed_objects;
+            progress.objects_healed = successful_objects;
+            progress.objects_failed = failed_objects;
+            progress.skipped_objects = skipped_objects;
+            progress.skipped_new_versions = checkpoint.skipped_new_versions;
+            progress.skipped_ilm_expired = checkpoint.skipped_ilm_expired;
+            if checkpoint.baseline_known && !checkpoint_generation_mismatch {
+                progress.objects_total_count = checkpoint.total_objects;
+                progress.objects_total_size = checkpoint.total_bytes;
+                progress.baseline_generation = checkpoint.baseline_generation;
+                progress.baseline_known = true;
+            }
+            progress.bytes_processed = checkpoint.processed_bytes;
+            progress.counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
+            progress.refresh_progress_percentage();
+            if checkpoint_generation_mismatch || checkpoint_counter_overflow || progress.counter_unknown {
+                progress.mark_unknown();
+            }
+        }
+        if checkpoint_generation_mismatch {
+            restored_counter_unknown = true;
+        }
+        if restored_counter_unknown {
+            checkpoint_manager.mark_counter_unknown().await?;
+            resume_manager.mark_counter_unknown().await?;
+        }
         let mut failed_buckets = 0u64;
 
         // 4. process remaining buckets
         for (bucket_idx, bucket) in buckets.iter().enumerate().skip(current_bucket_index) {
             // check if completed
             if state.completed_buckets.contains(bucket) {
+                checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
+                current_object_index = 0;
                 continue;
             }
 
@@ -516,13 +595,42 @@ impl ErasureSetHealer {
                 return bucket_result;
             }
 
-            // update checkpoint position
-            checkpoint_manager.update_position(bucket_idx, current_object_index).await?;
-
             // update progress
-            resume_manager
-                .update_progress(processed_objects, successful_objects, failed_objects, skipped_objects)
+            let progress_snapshot = self.progress.read().await;
+            let bytes_processed = progress_snapshot.bytes_processed;
+            let skipped_new_versions = progress_snapshot.skipped_new_versions;
+            let skipped_ilm_expired = progress_snapshot.skipped_ilm_expired;
+            let counter_unknown = progress_snapshot.counter_unknown;
+            drop(progress_snapshot);
+            // The checkpoint is the recovery authority for object progress.
+            // Publish its counters and fence before the resume summary so a
+            // crash between the two stores cannot make recovery select newer
+            // summary bytes with an older checkpoint ledger.
+            if counter_unknown {
+                checkpoint_manager.mark_counter_unknown().await?;
+            }
+            checkpoint_manager
+                .update_progress(successful_objects, failed_objects, skipped_objects, bytes_processed)
                 .await?;
+            checkpoint_manager
+                .set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired)
+                .await?;
+            checkpoint_manager.update_position(bucket_idx, current_object_index).await?;
+            resume_manager
+                .update_progress_with_bytes(
+                    processed_objects,
+                    successful_objects,
+                    failed_objects,
+                    skipped_objects,
+                    bytes_processed,
+                )
+                .await?;
+            resume_manager
+                .set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired)
+                .await?;
+            if counter_unknown {
+                resume_manager.mark_counter_unknown().await?;
+            }
 
             // check cancel status
             if self.cancel_token.is_cancelled() {
@@ -542,6 +650,7 @@ impl ErasureSetHealer {
             match bucket_result {
                 Ok(_) => {
                     resume_manager.complete_bucket(bucket).await?;
+                    checkpoint_manager.complete_bucket(bucket_idx.saturating_add(1)).await?;
                     debug!(
                         target: "rustfs::heal::erasure_healer",
                         event = EVENT_HEAL_ERASURE_BUCKET_STATE,
@@ -567,7 +676,9 @@ impl ErasureSetHealer {
                         error = %e,
                         "Erasure set bucket heal failed"
                     );
-                    // continue to next bucket, do not interrupt the whole process
+                    // A single durable cursor and ledger cannot safely preserve
+                    // this bucket while processing a later one.
+                    break;
                 }
             }
 
@@ -775,20 +886,49 @@ impl ErasureSetHealer {
 
                 // Per-version dedup identity — the single canonical key.
                 let key = compose_key(&item.name, item.version_id.as_deref());
-                if checkpoint.processed_objects.contains(&key) || checkpoint.skipped_objects.contains(&key) {
+                if checkpoint.processed_objects.contains(&key)
+                    || checkpoint.failed_objects.contains(&key)
+                    || checkpoint.skipped_objects.contains(&key)
+                {
                     continue;
                 }
 
                 if should_skip_new_version(item.mod_time_unix_nanos, started_at_secs) {
-                    checkpoint_manager.add_processed_object(key).await?;
-                    *processed_objects = processed_objects.saturating_add(1);
+                    let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_new_versions_total").increment(1);
-                    {
+                    let (outcome_record, counter_unknown) = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_new_version();
                         progress.set_current_object(Some(format!("skipped_new: {bucket}/{}", item.name)));
-                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                        progress.update_object_progress(
+                            *processed_objects,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                        );
+                        if !counter_ok {
+                            progress.mark_unknown();
+                        }
+                        (
+                            CheckpointObjectOutcomeRecord {
+                                object: key,
+                                outcome: CheckpointObjectOutcome::Processed,
+                                successful: progress.objects_healed,
+                                failed: progress.objects_failed,
+                                skipped: progress.skipped_objects,
+                                bytes: progress.bytes_processed,
+                                skipped_new_versions: progress.skipped_new_versions,
+                                skipped_ilm_expired: progress.skipped_ilm_expired,
+                                counter_unknown: progress.counter_unknown,
+                            },
+                            progress.counter_unknown,
+                        )
+                    };
+                    checkpoint_manager.record_object_outcome(outcome_record).await?;
+                    if counter_unknown {
+                        resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
                         target: "rustfs::heal::erasure_healer",
@@ -820,15 +960,41 @@ impl ErasureSetHealer {
                         )
                         .await?
                 {
-                    checkpoint_manager.add_processed_object(key).await?;
-                    *processed_objects = processed_objects.saturating_add(1);
+                    let counter_ok = increment_counter(processed_objects);
                     completed_in_page = completed_in_page.saturating_add(1);
                     counter!("rustfs_heal_skipped_ilm_expired_total").increment(1);
-                    {
+                    let (outcome_record, counter_unknown) = {
                         let mut progress = self.progress.write().await;
                         progress.record_skipped_ilm_expired();
                         progress.set_current_object(Some(format!("skipped_ilm: {bucket}/{}", item.name)));
-                        progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                        progress.update_object_progress(
+                            *processed_objects,
+                            *successful_objects,
+                            *failed_objects,
+                            *skipped_objects,
+                            bytes_processed,
+                        );
+                        if !counter_ok {
+                            progress.mark_unknown();
+                        }
+                        (
+                            CheckpointObjectOutcomeRecord {
+                                object: key,
+                                outcome: CheckpointObjectOutcome::Processed,
+                                successful: progress.objects_healed,
+                                failed: progress.objects_failed,
+                                skipped: progress.skipped_objects,
+                                bytes: progress.bytes_processed,
+                                skipped_new_versions: progress.skipped_new_versions,
+                                skipped_ilm_expired: progress.skipped_ilm_expired,
+                                counter_unknown: progress.counter_unknown,
+                            },
+                            progress.counter_unknown,
+                        )
+                    };
+                    checkpoint_manager.record_object_outcome(outcome_record).await?;
+                    if counter_unknown {
+                        resume_manager.mark_counter_unknown().await?;
                     }
                     debug!(
                         target: "rustfs::heal::erasure_healer",
@@ -954,11 +1120,11 @@ impl ErasureSetHealer {
 
             while let Some((key, object, version_id, result)) = page_tasks.next().await {
                 let (object_size, result) = result;
-                match result {
+                let mut telemetry_unknown = false;
+                let checkpoint_outcome = match result {
                     Ok(true) => {
-                        *successful_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
-                        checkpoint_manager.add_processed_object(key).await?;
+                        telemetry_unknown |= !increment_counter(successful_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -971,11 +1137,11 @@ impl ErasureSetHealer {
                             state = "healed",
                             "Erasure set object healed"
                         );
+                        CheckpointObjectOutcome::Processed
                     }
                     Ok(false) => {
-                        checkpoint_manager.add_processed_object(key).await?;
-                        *successful_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
+                        telemetry_unknown |= !increment_counter(successful_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
                             target: "rustfs::heal::erasure_healer",
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
@@ -988,12 +1154,12 @@ impl ErasureSetHealer {
                             state = "missing_treated_as_ok",
                             "Erasure set missing object treated as ok"
                         );
+                        CheckpointObjectOutcome::Processed
                     }
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(Error::TransientSkip { message }) => {
-                        *skipped_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
-                        checkpoint_manager.add_skipped_object(key).await?;
+                        telemetry_unknown |= !increment_counter(skipped_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -1006,11 +1172,11 @@ impl ErasureSetHealer {
                             error = %message,
                             "Erasure set object heal skipped due to transient error"
                         });
+                        CheckpointObjectOutcome::Skipped
                     }
                     Err(err) => {
-                        *failed_objects += 1;
-                        bytes_processed = bytes_processed.saturating_add(object_size);
-                        checkpoint_manager.add_failed_object(key).await?;
+                        telemetry_unknown |= !increment_counter(failed_objects);
+                        telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         demote_to_debug_when!(!take_failure_log_sample(&mut failure_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
                             event = EVENT_HEAL_ERASURE_OBJECT_STATE,
                             component = LOG_COMPONENT_HEAL,
@@ -1023,15 +1189,43 @@ impl ErasureSetHealer {
                             error = %err,
                             "Erasure set object heal failed"
                         });
+                        CheckpointObjectOutcome::Failed
                     }
-                }
+                };
 
-                *processed_objects += 1;
+                telemetry_unknown |= !increment_counter(processed_objects);
                 completed_in_page += 1;
-                {
+                let (outcome_record, counter_unknown) = {
                     let mut progress = self.progress.write().await;
                     progress.set_current_object(Some(format!("{bucket}/{object}")));
-                    progress.update_progress(*processed_objects, *successful_objects, *failed_objects, bytes_processed);
+                    progress.update_object_progress(
+                        *processed_objects,
+                        *successful_objects,
+                        *failed_objects,
+                        *skipped_objects,
+                        bytes_processed,
+                    );
+                    if telemetry_unknown {
+                        progress.mark_unknown();
+                    }
+                    (
+                        CheckpointObjectOutcomeRecord {
+                            object: key,
+                            outcome: checkpoint_outcome,
+                            successful: progress.objects_healed,
+                            failed: progress.objects_failed,
+                            skipped: progress.skipped_objects,
+                            bytes: progress.bytes_processed,
+                            skipped_new_versions: progress.skipped_new_versions,
+                            skipped_ilm_expired: progress.skipped_ilm_expired,
+                            counter_unknown: progress.counter_unknown,
+                        },
+                        progress.counter_unknown,
+                    )
+                };
+                checkpoint_manager.record_object_outcome(outcome_record).await?;
+                if counter_unknown {
+                    resume_manager.mark_counter_unknown().await?;
                 }
 
                 if completed_in_page.is_multiple_of(100) {
@@ -1041,16 +1235,22 @@ impl ErasureSetHealer {
 
             *current_object_index = global_obj_idx;
 
-            // Persist the authoritative cursor FIRST (points at the next page
-            // boundary), then prune the per-version dedup sets. Both are
-            // idempotent under crash: heal_object re-heals safely.
-            let next_cursor = if is_truncated { next_token.clone() } else { None };
-            resume_manager.set_resume_cursor(next_cursor.clone()).await?;
-            checkpoint_manager.complete_page(bucket_index, *current_object_index).await?;
+            // Persist the checkpoint ledger and page position before exposing
+            // the next resume cursor. A crash before cursor publication keeps
+            // the page identities available for exact-once replay.
+            checkpoint_manager.advance_page(bucket_index, *current_object_index).await?;
             // Check if there are more pages
             if !is_truncated {
                 break;
             }
+            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
+            if continuation_token.is_none() {
+                // A truncated page without a continuation token is terminal.
+                // Retain its ledger until bucket completion is durable.
+                break;
+            }
+            resume_manager.set_resume_cursor(continuation_token.clone()).await?;
+            checkpoint_manager.prune_completed_page().await?;
 
             // Anti-loop guard: an empty page reported as truncated cannot advance
             // the cursor (there is no last identity to move past), so treat it as a
@@ -1069,12 +1269,6 @@ impl ErasureSetHealer {
                 )));
             }
             previous_page_last = page_last;
-
-            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
-            if continuation_token.is_none() {
-                // Truncated but no continuation token: treat as end of listing.
-                break;
-            }
         }
 
         Ok(())
@@ -1083,10 +1277,66 @@ impl ErasureSetHealer {
     /// initialize progress tracking
     async fn initialize_progress(&self, _buckets: &[String], state: &crate::heal::resume::ResumeState) {
         let mut progress = self.progress.write().await;
-        progress.objects_scanned = state.total_objects;
+        let existing_baseline = (
+            progress.objects_total_count,
+            progress.objects_total_size,
+            progress.baseline_generation,
+            progress.progress_state,
+            progress.baseline_known,
+        );
+        let baseline_generation_mismatch =
+            state.baseline_known && existing_baseline.4 && state.baseline_generation != existing_baseline.2;
+        let use_persisted_baseline = state.baseline_known && !baseline_generation_mismatch;
+        progress.objects_scanned = state.processed_objects;
         progress.objects_healed = state.successful_objects;
         progress.objects_failed = state.failed_objects;
-        progress.bytes_processed = 0; // Resume state tracks object counts, not byte counters.
+        progress.skipped_objects = state.skipped_objects;
+        progress.skipped_new_versions = state.skipped_new_versions;
+        progress.skipped_ilm_expired = state.skipped_ilm_expired;
+        progress.bytes_processed = state.processed_bytes;
+        progress.counter_unknown = state.counter_unknown;
+        if use_persisted_baseline
+            || existing_baseline.0 > 0
+            || existing_baseline.1 > 0
+            || existing_baseline.2.is_some()
+            || existing_baseline.4
+        {
+            progress.objects_total_count = if use_persisted_baseline {
+                state.total_objects
+            } else {
+                existing_baseline.0
+            };
+            progress.objects_total_size = if use_persisted_baseline {
+                state.total_bytes
+            } else {
+                existing_baseline.1
+            };
+            progress.baseline_generation = if use_persisted_baseline {
+                state.baseline_generation
+            } else {
+                existing_baseline.2
+            };
+            progress.baseline_known = use_persisted_baseline
+                || existing_baseline.0 > 0
+                || existing_baseline.1 > 0
+                || existing_baseline.2.is_some()
+                || existing_baseline.4;
+        }
+        progress.progress_state = if use_persisted_baseline
+            || existing_baseline.0 > 0
+            || existing_baseline.1 > 0
+            || existing_baseline.2.is_some()
+            || existing_baseline.4
+        {
+            crate::heal::progress::HealProgressState::Running
+        } else {
+            crate::heal::progress::HealProgressState::Indeterminate
+        };
+        if baseline_generation_mismatch || state.counter_unknown {
+            progress.mark_unknown();
+        }
+        progress.ledger_complete = false;
+        progress.refresh_progress_percentage();
         progress.start_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.start_time));
         progress.last_update_time = UNIX_EPOCH.checked_add(Duration::from_secs(state.last_update));
         progress.set_current_object(state.current_object.clone());
@@ -1264,8 +1514,8 @@ mod resume_loop_tests {
     };
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
-        CheckpointManager, RESUME_CHECKPOINT_FILE, ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils,
-        compose_key,
+        CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, RESUME_CHECKPOINT_FILE,
+        ReplacementTargetIdentity, ResumeDeleteFailure, ResumeManager, ResumeUtils, compose_key,
     };
     use crate::heal::storage::{HealLifecycleExpiryContext, HealListItem, HealObjectInfo, HealStorageAPI};
     use crate::heal::storage_api::status::BucketInfo;
@@ -1405,6 +1655,7 @@ mod resume_loop_tests {
         list_include_lifecycle_object_info: Mutex<Vec<bool>>,
         replacement_target_identity_sequences: Mutex<VecDeque<Vec<ReplacementTargetIdentity>>>,
         fail_listing: AtomicBool,
+        fail_listing_buckets: Mutex<HashSet<String>>,
     }
 
     impl FakeStorage {
@@ -1440,6 +1691,9 @@ mod resume_loop_tests {
         }
         fn fail_listing(&self) {
             self.fail_listing.store(true, Ordering::SeqCst);
+        }
+        fn fail_bucket_listing(&self, bucket: &str) {
+            self.fail_listing_buckets.lock().unwrap().insert(bucket.to_string());
         }
     }
 
@@ -1531,7 +1785,7 @@ mod resume_loop_tests {
         }
         async fn list_objects_for_heal_page(
             &self,
-            _bucket: &str,
+            bucket: &str,
             _prefix: &str,
             continuation_token: Option<&str>,
             include_lifecycle_object_info: bool,
@@ -1540,7 +1794,7 @@ mod resume_loop_tests {
                 .lock()
                 .unwrap()
                 .push(include_lifecycle_object_info);
-            if self.fail_listing.load(Ordering::SeqCst) {
+            if self.fail_listing.load(Ordering::SeqCst) || self.fail_listing_buckets.lock().unwrap().contains(bucket) {
                 return Err(Error::other("injected listing failure"));
             }
             let key = continuation_token.map(str::to_string);
@@ -1919,6 +2173,49 @@ mod resume_loop_tests {
     }
 
     #[tokio::test]
+    async fn bucket_failure_stops_before_a_later_bucket_checkpoint() {
+        let env = make_env().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let buckets = vec!["a".to_string(), "b".to_string()];
+        let resume = ResumeManager::new(
+            env.healer.disk.clone(),
+            task_id.clone(),
+            "erasure_set".to_string(),
+            "pool_0_set_0".to_string(),
+            buckets.clone(),
+        )
+        .await
+        .unwrap();
+        let checkpoint = CheckpointManager::new(env.healer.disk.clone(), task_id.clone())
+            .await
+            .unwrap();
+        env.storage.fail_bucket_listing("a");
+        for _ in 0..3 {
+            assert!(resume.schedule_retry().await.unwrap());
+        }
+
+        env.healer
+            .execute_heal_with_resume(&buckets, "pool_0_set_0", &resume, &checkpoint)
+            .await
+            .expect_err("the first bucket failure must keep the pass incomplete");
+        let persisted = checkpoint.get_checkpoint().await;
+        assert_eq!(persisted.current_bucket_index, 0);
+        assert!(resume.get_state().await.completed_buckets.is_empty());
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&buckets, "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect_err("recovery must retry the earlier failed bucket");
+        assert!(!resumed.get_state().await.completed);
+    }
+
+    #[tokio::test]
     async fn completed_resume_state_is_not_selected_for_a_new_heal() {
         let env = make_env().await;
         env.resume
@@ -2107,8 +2404,175 @@ mod resume_loop_tests {
         let mut names: Vec<String> = env.storage.calls().into_iter().map(|(n, _)| n).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b", "c", "d"], "every object exactly once, none dropped/doubled");
-        // Final page not truncated => cursor cleared.
-        assert_eq!(env.resume.resume_cursor().await, None);
+        // Keep the final page cursor until the outer loop durably completes the
+        // bucket, so a crash can replay only this page against its identities.
+        assert_eq!(env.resume.resume_cursor().await, Some("t1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn persisted_failure_waits_for_the_bounded_retry_after_page_replay() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.checkpoint
+            .record_object_outcome(CheckpointObjectOutcomeRecord {
+                object: compose_key("object", Some("v1")),
+                outcome: CheckpointObjectOutcome::Failed,
+                successful: 0,
+                failed: 1,
+                skipped: 0,
+                bytes: 0,
+                skipped_new_versions: 0,
+                skipped_ilm_expired: 0,
+                counter_unknown: false,
+            })
+            .await
+            .unwrap();
+        env.checkpoint.advance_page(0, 1).await.unwrap();
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect_err("the persisted failure must schedule a bounded retry");
+        assert!(
+            env.storage.calls().is_empty(),
+            "the failed identity must not be repeated in the same pass"
+        );
+
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("the bounded retry must heal the object");
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 1);
+        assert_eq!(state.failed_objects, 0);
+    }
+
+    #[tokio::test]
+    async fn final_page_crash_replays_only_the_retained_page_identities() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("first", Some("v1"), false)],
+                next: Some("final-page".to_string()),
+                truncated: true,
+            },
+        );
+        env.storage.set_page(
+            Some("final-page"),
+            Page {
+                items: vec![item("last", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("the bucket pass must finish before the simulated crash");
+        assert_eq!((processed, successful, failed, skipped), (2, 2, 0, 0));
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("the retained final-page ledger must make recovery exact");
+
+        assert_eq!(
+            env.storage.calls(),
+            vec![
+                ("first".to_string(), Some("v1".to_string())),
+                ("last".to_string(), Some("v1".to_string()))
+            ]
+        );
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 2);
+        assert_eq!(state.processed_objects, 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_page_without_token_retains_its_replay_ledger() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: true,
+            },
+        );
+
+        let (processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("the tokenless truncated page is a terminal page");
+        assert_eq!((processed, successful, failed, skipped), (1, 1, 0, 0));
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("terminal-page recovery must not replay a durable identity");
+
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let state = resumed.get_state().await;
+        assert_eq!(state.successful_objects, 1);
+        assert_eq!(state.processed_objects, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_bucket_reconciles_its_final_page_checkpoint_after_crash() {
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("object", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+
+        let (_, _, _, _, result) = run(&env).await;
+        result.expect("the bucket pass must finish before the simulated crash");
+        env.resume.complete_bucket("b").await.unwrap();
+
+        let resumed = ResumeManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .unwrap();
+        env.healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &resumed, &checkpoint)
+            .await
+            .expect("recovery must finish the checkpoint transition without replaying the bucket");
+
+        assert_eq!(env.storage.calls(), vec![("object".to_string(), Some("v1".to_string()))]);
+        let checkpoint = checkpoint.get_checkpoint().await;
+        assert_eq!(checkpoint.current_bucket_index, 1);
+        assert!(checkpoint.processed_objects.is_empty());
     }
 
     #[tokio::test]

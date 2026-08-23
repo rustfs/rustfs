@@ -31,6 +31,10 @@ use crate::admin::storage_api::bucket::metadata::{
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::quota::BucketQuota;
 use crate::admin::storage_api::bucket::replication;
+use crate::admin::storage_api::bucket::replication::{
+    OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role, merge_incoming_replication_config,
+    replication_target_arn_deployment_id, site_replication_rule_deployment_id,
+};
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
@@ -138,6 +142,11 @@ const SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE: usize = 100;
 const SITE_REPL_RESYNC_MAX_PAGE_SIZE: usize = 1000;
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on waiting for the lifecycle lock (below). 3x the peer request
+/// timeout: outlives one full peer round of a healthy concurrent lifecycle
+/// operation, while converting a holder wedged on unreachable peers into a
+/// retryable 503 for the waiter instead of an unbounded hang.
+const SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT: usize = 32;
 const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
@@ -160,6 +169,8 @@ const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=endpoint-target-refresh";
 const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
+const SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH: &str =
+    "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=derived-rule-contract";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
 /// Peer-edit fencing token, carried as query parameters so a peer that predates
 /// the fence simply ignores them (unknown query keys are dropped) and keeps the
@@ -388,9 +399,17 @@ struct SiteReplicationLifecycleGuard {
 }
 
 impl SiteReplicationLifecycleGuard {
-    async fn acquire() -> Self {
-        Self {
-            _guard: SITE_REPLICATION_LIFECYCLE_LOCK.lock().await,
+    /// Bounded acquire: a holder wedged on unreachable peers (each probe
+    /// costs up to [`SITE_REPLICATION_PEER_REQUEST_TIMEOUT`]) must not hang
+    /// every other lifecycle operation indefinitely, so waiters get a
+    /// retryable 503 after [`SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT`].
+    async fn acquire() -> S3Result<Self> {
+        match tokio::time::timeout(SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT, SITE_REPLICATION_LIFECYCLE_LOCK.lock()).await {
+            Ok(guard) => Ok(Self { _guard: guard }),
+            Err(_) => Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "another site replication lifecycle operation is in progress; retry later".to_string(),
+            )),
         }
     }
 
@@ -1116,6 +1135,114 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
             format!("failed to load site replication state: {err}"),
         )),
     }
+}
+
+/// Whether this deployment participates in site replication (two or more
+/// peers in the persisted state). Read by the S3 interface layer to gate
+/// replication-config edits (MinIO `ErrReplicationDenyEditError` semantics,
+/// issue #1948); a state-read failure propagates so the gate fails closed.
+pub(crate) async fn site_replication_enabled() -> S3Result<bool> {
+    Ok(load_site_replication_state().await?.enabled())
+}
+
+/// Deployment ids of the remote peers the reconciler derives a
+/// `site-repl-<id>` rule for on every bucket (the same peer filter as
+/// `build_site_replication_config`); empty when site replication is not
+/// enabled. Read by the bucket usecase so an S3 replication-config edit keeps
+/// exactly the reconciler-owned rules (issue #1948); a state-read failure
+/// propagates so the edit fails closed.
+pub(crate) async fn site_replication_edit_context() -> S3Result<(HashSet<String>, OperatorRuleContract)> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        // Enabled without a service account is a state this site cannot
+        // broadcast from either; the peers are still the reconciler's.
+        let state = load_site_replication_state().await?;
+        if !state.enabled() {
+            return Ok((HashSet::new(), OperatorRuleContract::Derived));
+        }
+        let peers = remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state));
+        return Ok((peers, OperatorRuleContract::Legacy));
+    };
+    let peers = remote_peer_deployment_ids(&runtime.state, &runtime.local_peer);
+    let contract = site_replication_operator_rule_contract(&runtime).await;
+    Ok((peers, contract))
+}
+
+/// Whether every remote peer merges replication configs under the derived
+/// contract, probed through the peer capability endpoint. A peer that does
+/// not (or cannot be asked) pins the cluster to [`OperatorRuleContract::Legacy`]
+/// for this edit: consistency across sites wins over keeping the operator's
+/// priority values, and the legacy merge keeps their order anyway.
+async fn site_replication_operator_rule_contract(runtime: &SiteReplicationRuntime) -> OperatorRuleContract {
+    let remote_peers: Vec<&PeerInfo> = runtime
+        .state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != runtime.local_peer.deployment_id
+                && !same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        })
+        .collect();
+    let probes = futures::future::join_all(remote_peers.iter().map(|peer| async move {
+        let transport = PeerTransport::for_runtime_peer(peer).await?;
+        let (status, body) = send_peer_admin_request_raw_with_client(
+            &transport.client,
+            &transport.connection,
+            SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH,
+            &runtime.state.service_account_access_key,
+            &runtime.service_account_secret_key,
+            &(),
+        )
+        .await?;
+        peer_capability_response_supported(peer, status, &body)
+    }))
+    .await;
+    operator_rule_contract_from_probes(remote_peers.into_iter().zip(probes))
+}
+
+fn operator_rule_contract_from_probes<'a>(
+    probes: impl IntoIterator<Item = (&'a PeerInfo, S3Result<bool>)>,
+) -> OperatorRuleContract {
+    for (peer, probe) in probes {
+        match probe {
+            Ok(true) => {}
+            Ok(false) => return OperatorRuleContract::Legacy,
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "derived_rule_contract_probe_failed",
+                    peer = %peer.endpoint,
+                    error = %err,
+                    "admin site replication state"
+                );
+                return OperatorRuleContract::Legacy;
+            }
+        }
+    }
+    OperatorRuleContract::Derived
+}
+
+fn remote_peer_deployment_ids(state: &SiteReplicationState, local_peer: &PeerInfo) -> HashSet<String> {
+    state
+        .peers
+        .values()
+        .filter(|peer| {
+            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+        })
+        .map(|peer| peer.deployment_id.clone())
+        .collect()
+}
+
+/// Deployment ids of every site in the cluster, this one included: the set
+/// a peer's derived rules can name (its rule towards this site carries this
+/// site's id). Empty when site replication is not enabled.
+async fn site_replication_deployment_ids() -> S3Result<HashSet<String>> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(HashSet::new());
+    }
+    Ok(state.peers.values().map(|peer| peer.deployment_id.clone()).collect())
 }
 
 async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
@@ -1984,7 +2111,7 @@ fn peer_tls_settings_changed(existing: Option<&PeerInfo>, proposed: &PeerInfo) -
 }
 
 fn peer_edit_capability_supported(capability: &str) -> bool {
-    matches!(capability, "endpoint-target-refresh" | "peer-tls-settings")
+    matches!(capability, "endpoint-target-refresh" | "peer-tls-settings" | "derived-rule-contract")
 }
 
 fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
@@ -2128,6 +2255,27 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
     add_preflight_info_from_sr_info(site, info, idp_settings)
 }
 
+/// Preflight every site in an add request while the lifecycle lock is held.
+/// Probes run concurrently (matching the other peer fan-outs in this file):
+/// k unreachable sites cost roughly one peer request timeout, not k of them.
+/// Results (and the first error, if any) are reported in request order.
+async fn add_preflight_infos(
+    sites: &[PeerSite],
+    current_state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+) -> S3Result<Vec<SiteReplicationAddPreflightInfo>> {
+    futures::future::join_all(sites.iter().map(|site| async move {
+        if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
+            local_add_preflight_info(current_state, local_peer, site).await
+        } else {
+            remote_add_preflight_info(site).await
+        }
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
 fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
     let mut deployment_ids = HashSet::new();
     let mut local_seen = false;
@@ -2251,6 +2399,7 @@ fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at
         r#type: item_type.to_string(),
         updated_at,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        derived_rule_contract: true,
         ..Default::default()
     }
 }
@@ -6632,6 +6781,7 @@ fn bucket_metadata_snapshot_tombstone(item: &SRBucketMeta, observed_at: OffsetDa
         updated_at: Some(observed_at),
         expiry_updated_at: Some(observed_at),
         api_version: item.api_version.clone(),
+        derived_rule_contract: item.derived_rule_contract,
         ..Default::default()
     }
 }
@@ -7762,20 +7912,6 @@ fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
     replication_target_arn_deployment_id(&target.arn)
 }
 
-fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
-    let parts: Vec<_> = arn.split(':').collect();
-    if parts.len() == 6
-        && parts[0] == "arn"
-        && matches!(parts[1], "rustfs" | "minio")
-        && parts[2] == "replication"
-        && !parts[4].is_empty()
-    {
-        return Some(parts[4].to_string());
-    }
-
-    None
-}
-
 fn prune_removed_site_replication_bucket_targets(
     existing: BucketTargets,
     removed_deployment_ids: &HashSet<String>,
@@ -7800,10 +7936,6 @@ fn prune_removed_site_replication_bucket_targets(
     (BucketTargets { targets }, removed)
 }
 
-fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
-    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
-}
-
 /// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
 ///
 /// The rule set alone cannot answer this: a rule can be perfectly formed while the endpoint
@@ -7816,7 +7948,7 @@ async fn site_replication_targets_online(bucket: &str, replication_config_xml: &
         return true;
     };
 
-    for rule in config.rules.iter().filter(|rule| is_site_replication_rule(rule)) {
+    for rule in config.rules.iter().filter(|rule| is_derived_site_replication_rule(rule)) {
         if BucketTargetSys::get()
             .get_remote_target_client_by_arn(bucket, &rule.destination.bucket)
             .await
@@ -7827,52 +7959,6 @@ async fn site_replication_targets_online(bucket: &str, replication_config_xml: &
     }
 
     true
-}
-
-/// Merge a peer's replication config into the local one.
-///
-/// `site-repl-*` rules encode the *sender's* outbound direction — their destination ARN
-/// names the receiver — so applying a peer's rule set verbatim replaces the receiver's
-/// reverse rule with one pointing at itself. No bucket target can satisfy that ARN
-/// (`reconcile_site_replication_bucket_targets` skips the local peer), so the receiver
-/// silently stops replicating back: the one-directional symptom. Only operator-authored
-/// rules travel between sites; each site owns its own `site-repl-*` rules.
-fn merge_incoming_replication_config(
-    incoming: Option<ReplicationConfiguration>,
-    local: Option<ReplicationConfiguration>,
-) -> Option<ReplicationConfiguration> {
-    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
-    // Operator rules first, then the local site rules — the same order
-    // `ensure_site_replication_bucket_replication_config_with_runtime` produces, so its
-    // no-op check matches and the bucket metadata is written once per broadcast, not twice.
-    let mut rules: Vec<ReplicationRule> = incoming
-        .into_iter()
-        .flat_map(|config| config.rules)
-        .filter(|rule| !is_site_replication_rule(rule))
-        .collect();
-    rules.extend(
-        local
-            .into_iter()
-            .flat_map(|config| config.rules)
-            .filter(is_site_replication_rule),
-    );
-
-    if rules.is_empty() {
-        return None;
-    }
-
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
-
-    // A site-replication ARN in `role` is the sender's, and `site_replication_target_arns_by_peer`
-    // reads it — carrying it over would pin the receiver's targets to the sender's identity.
-    let role = match replication_target_arn_deployment_id(&incoming_role) {
-        Some(_) => String::new(),
-        None => incoming_role,
-    };
-
-    Some(ReplicationConfiguration { role, rules })
 }
 
 /// Merge a peer's ILM expiry document into the local lifecycle config.
@@ -8090,7 +8176,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8099,7 +8185,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
             }
             Ok(quick_xml::events::Event::Empty(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8122,7 +8208,9 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
                 seen_declaration = true;
             }
             Ok(quick_xml::events::Event::DocType(_)) => break false,
-            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+            Ok(quick_xml::events::Event::Text(text))
+                if depth == 0 && !text.as_ref().bytes().all(|byte| byte.is_ascii_whitespace()) =>
+            {
                 break false;
             }
             Ok(quick_xml::events::Event::Text(_)) => {}
@@ -8169,6 +8257,17 @@ fn lifecycle_expiry_statement(
     }
 }
 
+/// Whether `rule` is in the shape the reconciler derives (`site-repl-<id>`
+/// naming the deployment its ARN targets). The reconciler rebuilds every such
+/// rule from the current peer set — current peer or not, so a leftover from a
+/// removed peer or a self-pointing rule is rebuilt away — while the merges
+/// keep only the current peers' rules and treat a leftover as operator state
+/// the edit replaces. An operator-authored `site-repl-*` id on an operator
+/// ARN is outside the shape and survives every pass.
+fn is_derived_site_replication_rule(rule: &ReplicationRule) -> bool {
+    site_replication_rule_deployment_id(rule).is_some()
+}
+
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
@@ -8213,9 +8312,7 @@ fn prune_removed_site_replication_rules(
         return (None, removed);
     }
 
-    for (index, rule) in config.rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    assign_site_replication_rule_priorities(&mut config.rules, is_derived_site_replication_rule);
 
     (Some(config), removed)
 }
@@ -8375,30 +8472,32 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
         return Ok(());
     };
 
-    // `site-repl-*` rules are derived state owned by this site: rebuild them from the
-    // current peer set on every pass instead of preserving whatever is on disk. A rule
-    // left over from a removed peer — or one whose destination ARN names this very
-    // deployment, which no bucket target can ever satisfy — must not survive, otherwise
-    // objects are queued against an ARN that resolves to nothing.
+    // Derived rules are state owned by this site: rebuild them from the current peer
+    // set on every pass instead of preserving whatever is on disk. A rule left over
+    // from a removed peer — or one whose destination ARN names this very deployment,
+    // which no bucket target can ever satisfy — must not survive, otherwise objects
+    // are queued against an ARN that resolves to nothing.
     let (existing_role, existing_rules) = existing
         .map(|config| (config.role, config.rules))
         .unwrap_or_else(|| (String::new(), Vec::new()));
     let mut rules: Vec<ReplicationRule> = existing_rules
         .iter()
-        .filter(|rule| !is_site_replication_rule(rule))
+        .filter(|rule| !is_derived_site_replication_rule(rule))
         .cloned()
         .collect();
     rules.extend(desired.rules);
-    for (index, rule) in rules.iter_mut().enumerate() {
-        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
-    }
+    // Operator priorities are the operator's policy; only the derived rules
+    // take free slots, by the same function as the config merges so a merged
+    // write and this pass agree byte for byte.
+    assign_site_replication_rule_priorities(&mut rules, is_derived_site_replication_rule);
 
-    // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
+    // Only a `role` naming a current peer is ours to drop — an operator-authored role is
     // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
     // quietly rewrite it. Same rule as `merge_incoming_replication_config`.
-    let role = match replication_target_arn_deployment_id(&existing_role) {
-        Some(_) => String::new(),
-        None => existing_role.clone(),
+    let role = if is_site_replication_role(&existing_role, &remote_peer_deployment_ids(state, local_peer)) {
+        String::new()
+    } else {
+        existing_role.clone()
     };
 
     if rules == existing_rules && role == existing_role {
@@ -9284,7 +9383,13 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
                 Err(err) => return Err(ApiError::from(err).into()),
             };
             let local_absent = local.is_none();
-            match merge_incoming_replication_config(incoming, local) {
+            let site_deployment_ids = site_replication_deployment_ids().await?;
+            let contract = if item.derived_rule_contract {
+                OperatorRuleContract::Derived
+            } else {
+                OperatorRuleContract::Legacy
+            };
+            match merge_incoming_replication_config(incoming, local, &site_deployment_ids, contract) {
                 Some(config) => Some(serialize(&config).map_err(|e| {
                     S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
                 })?),
@@ -9872,7 +9977,7 @@ impl Operation for SiteReplicationAddHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
-        let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         // Everything up to the commit below is preflight: peer probes, IAM
         // work and the join fan-out all talk to the network, so none of it may
         // run inside the state transaction. The snapshot read here is what the
@@ -9887,14 +9992,7 @@ impl Operation for SiteReplicationAddHandler {
         // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
         ensure_local_site_present(&mut sites, &local_peer);
         validate_add_sites(&sites, &local_peer)?;
-        let mut preflight_infos = Vec::with_capacity(sites.len());
-        for site in &sites {
-            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
-                preflight_infos.push(local_add_preflight_info(&current_state, &local_peer, site).await?);
-            } else {
-                preflight_infos.push(remote_add_preflight_info(site).await?);
-            }
-        }
+        let preflight_infos = add_preflight_infos(&sites, &current_state, &local_peer).await?;
         validate_add_preflight_topology(&preflight_infos, &local_peer)?;
         let expected_updated_at = current_state.updated_at;
         require_add_peer_tls_capability(&sites, &local_peer).await?;
@@ -10102,7 +10200,7 @@ impl Operation for SiteReplicationRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         // The request body is read before the bucket-op guard and the state
         // transaction: a client that stalls mid-body must hold neither the
         // state-object lock nor the write half of the bucket-op RwLock (which
@@ -10312,7 +10410,7 @@ where
     F: FnOnce(SRPeerJoinReq) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = S3Result<()>> + Send + 'static,
 {
-    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+    let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
     admit_peer_join_across_nodes(local_endpoint, join_req, defer_sync_state_enable, apply_iam).await
 }
 
@@ -11142,7 +11240,7 @@ impl Operation for SRPeerRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
         let removed_deployment_ids = update_site_replication_state(move |state| {
             if pending_endpoint_refresh(state).is_some() {
@@ -11186,7 +11284,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         let operation = query.get("operation").cloned().unwrap_or_default();
         let resolved_store = object_store_from_req(&req);
         let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let (peer, existing_status) = {
             let state = load_site_replication_state().await?;
             let local_peer = current_local_runtime_peer(&state);
@@ -11478,7 +11576,7 @@ impl Operation for SRRotateServiceAccountHandler {
         // mid-repair and race its own IAM write against the reconciler's
         // stale one. (The removed process mutex used to provide this
         // exclusion as a side effect.)
-        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let local_endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
         let rotation_parent = cred.access_key.clone();
         let (pending_rotation, local_peer, previous_access_key) = update_site_replication_state_when_changed(move |state| {
@@ -13395,6 +13493,7 @@ mod tests {
 
         assert!(peer_edit_capability_supported("peer-tls-settings"));
         assert!(peer_edit_capability_supported("endpoint-target-refresh"));
+        assert!(peer_edit_capability_supported("derived-rule-contract"));
         assert!(!peer_edit_capability_supported("unknown"));
         assert!(peer_capability_response_supported(&remote, StatusCode::OK, br#"{"success":true}"#).expect("supported"));
         assert!(!peer_capability_response_supported(&remote, StatusCode::NOT_FOUND, b"").expect("legacy peer"));
@@ -14019,7 +14118,9 @@ mod tests {
     async fn test_add_bootstrap_scope_only_allows_expected_bucket_setup_until_guard_drops() {
         let token;
         {
-            let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let lifecycle = SiteReplicationLifecycleGuard::acquire()
+                .await
+                .expect("acquire lifecycle guard");
             let guard = SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::from(["legacy-bucket".to_string()]))
                 .expect("start site replication add guard");
             token = guard.token.to_string();
@@ -14075,14 +14176,18 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_add_lifecycle_allows_callback_before_remove_writer() {
-        let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+        let lifecycle = SiteReplicationLifecycleGuard::acquire()
+            .await
+            .expect("acquire lifecycle guard");
         let add_guard =
             SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
         let remove = tokio::spawn(async move {
             let _ = started_tx.send(());
-            let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let _lifecycle = SiteReplicationLifecycleGuard::acquire()
+                .await
+                .expect("acquire lifecycle guard");
             let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             let _ = entered_tx.send(());
         });
@@ -14100,6 +14205,111 @@ mod tests {
             .expect("remove should enter after add finishes")
             .expect("remove task should finish");
         entered_rx.await.expect("remove entered lifecycle");
+    }
+
+    /// Deleting either constant (or "simplifying" the client builders to
+    /// inline values) removes the only bound on how long a lifecycle
+    /// operation can be wedged per unreachable peer (#1889 C1 / #1952 C2).
+    #[test]
+    fn test_peer_timeout_constants_bound_unreachable_peer_probes() {
+        assert_eq!(SITE_REPLICATION_PEER_REQUEST_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(SITE_REPLICATION_PEER_CONNECT_TIMEOUT, Duration::from_secs(3));
+        assert!(
+            SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT >= SITE_REPLICATION_PEER_REQUEST_TIMEOUT,
+            "a waiter must not give up before the holder's single wedged peer probe can finish"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_lifecycle_guard_acquire_times_out_with_retryable_503() {
+        let holder = SiteReplicationLifecycleGuard::acquire().await.expect("first acquire");
+        let err =
+            match tokio::time::timeout(SITE_REPLICATION_LIFECYCLE_LOCK_TIMEOUT * 2, SiteReplicationLifecycleGuard::acquire())
+                .await
+                .expect("bounded acquire must not hang while the lock is held")
+            {
+                Ok(_) => panic!("acquire while the lock is held should time out"),
+                Err(err) => err,
+            };
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+
+        drop(holder);
+        tokio::time::timeout(Duration::from_secs(1), SiteReplicationLifecycleGuard::acquire())
+            .await
+            .expect("acquire after release must not wait")
+            .expect("acquire after release");
+    }
+
+    #[derive(Clone)]
+    struct PreflightFanoutTestState {
+        metainfo_barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    async fn preflight_fanout_test_handler(State(state): State<PreflightFanoutTestState>, uri: Uri) -> (StatusCode, String) {
+        if uri.path().ends_with("/site-replication/metainfo") {
+            state.metainfo_barrier.wait().await;
+        }
+        (StatusCode::OK, "{}".to_string())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_add_preflight_probes_sites_concurrently() {
+        temp_env::async_with_vars(
+            [(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))],
+            add_preflight_probes_sites_concurrently_inner(),
+        )
+        .await;
+    }
+
+    async fn add_preflight_probes_sites_concurrently_inner() {
+        const REMOTE_SITES: usize = 3;
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind preflight test server: {err}"),
+        };
+        let endpoint = format!("http://{}", listener.local_addr().expect("preflight test address"));
+        let state = PreflightFanoutTestState {
+            metainfo_barrier: Arc::new(tokio::sync::Barrier::new(REMOTE_SITES)),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(any(preflight_fanout_test_handler)).with_state(state))
+                .await
+                .expect("serve preflight test requests");
+        });
+
+        let sites: Vec<PeerSite> = (0..REMOTE_SITES)
+            .map(|index| PeerSite {
+                name: format!("site-{index}"),
+                endpoint: endpoint.clone(),
+                access_key: "test-access".to_string(),
+                secret_key: "test-secret".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let local_peer = PeerInfo {
+            deployment_id: "local".to_string(),
+            endpoint: "http://192.0.2.1:9000".to_string(),
+            ..Default::default()
+        };
+        let current_state = SiteReplicationState::default();
+
+        // Each site's metainfo request parks on a barrier that only releases
+        // once every site's request has arrived: serial probing never sends
+        // the second request and dies on the peer request timeout, so
+        // finishing well inside that timeout proves the probes overlap —
+        // which is what caps k unreachable sites at one timeout, not k.
+        let infos = tokio::time::timeout(
+            SITE_REPLICATION_PEER_REQUEST_TIMEOUT / 2,
+            add_preflight_infos(&sites, &current_state, &local_peer),
+        )
+        .await
+        .expect("preflight probes must fan out concurrently, not serially")
+        .expect("preflight infos");
+        assert_eq!(infos.len(), REMOTE_SITES);
+        server.abort();
     }
 
     #[test]
@@ -16186,6 +16396,10 @@ mod tests {
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
     }
 
+    fn home_office() -> HashSet<String> {
+        HashSet::from(["home".to_string(), "office".to_string()])
+    }
+
     fn site_repl_config(peer: &str) -> ReplicationConfiguration {
         ReplicationConfiguration {
             role: String::new(),
@@ -16284,8 +16498,13 @@ mod tests {
     // itself. No bucket target backs that ARN, so every object was dropped without a log.
     #[test]
     fn test_merge_incoming_replication_config_keeps_local_reverse_rule() {
-        let merged = merge_incoming_replication_config(Some(site_repl_config("home")), Some(site_repl_config("office")))
-            .expect("merge should keep the local rule");
+        let merged = merge_incoming_replication_config(
+            Some(site_repl_config("home")),
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("merge should keep the local rule");
 
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
@@ -16296,8 +16515,13 @@ mod tests {
     // either — the delete travels as `replication-config` with no payload.
     #[test]
     fn test_merge_incoming_replication_config_survives_peer_delete() {
-        let merged = merge_incoming_replication_config(None, Some(site_repl_config("office")))
-            .expect("local site rules must survive a peer delete");
+        let merged = merge_incoming_replication_config(
+            None,
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("local site rules must survive a peer delete");
 
         assert_eq!(merged.rules.len(), 1);
         assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
@@ -16309,8 +16533,13 @@ mod tests {
         incoming.rules.push(operator_rule("nightly-backup"));
         incoming.role = "arn:rustfs:replication::home:photos".to_string();
 
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
-            .expect("merge should produce rules");
+        let merged = merge_incoming_replication_config(
+            Some(incoming),
+            Some(site_repl_config("office")),
+            &home_office(),
+            OperatorRuleContract::Derived,
+        )
+        .expect("merge should produce rules");
 
         let ids: Vec<_> = merged.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
         assert_eq!(ids, vec!["nightly-backup", "site-repl-office"]);
@@ -16324,7 +16553,15 @@ mod tests {
 
     #[test]
     fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
-        assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
+        assert!(
+            merge_incoming_replication_config(
+                Some(site_repl_config("home")),
+                None,
+                &home_office(),
+                OperatorRuleContract::Derived
+            )
+            .is_none()
+        );
     }
 
     fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> s3s::dto::LifecycleRule {
@@ -16727,26 +16964,31 @@ mod tests {
     }
 
     // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
-    // drop only a sender-owned site-replication ARN, never an operator's own role — the same
-    // rule the merge path applies, so both paths agree on what is ours to rewrite.
+    // drop only a role naming a current peer, never an operator's own role — an IAM role or
+    // a remote target whose ARN carries an empty region — the same rule the merge path
+    // applies, so both paths agree on what is ours to rewrite.
     #[test]
-    fn test_replication_role_is_only_cleared_when_it_is_a_site_replication_arn() {
-        let operator_role = "arn:aws:iam::123456789012:role/replication";
-        assert!(
-            replication_target_arn_deployment_id(operator_role).is_none(),
-            "an operator IAM role is not a site-replication ARN and must be preserved"
-        );
-        assert_eq!(
-            replication_target_arn_deployment_id("arn:rustfs:replication::home:photos").as_deref(),
-            Some("home"),
-            "a site-replication ARN is sender-owned and gets cleared"
-        );
+    fn test_replication_role_is_only_cleared_when_it_names_a_peer() {
+        let sites = home_office();
+        assert!(!is_site_replication_role("arn:aws:iam::123456789012:role/replication", &sites));
+        assert!(!is_site_replication_role("arn:minio:replication::operator-dep:photos", &sites));
+        assert!(is_site_replication_role("arn:rustfs:replication::home:photos", &sites));
 
-        let mut incoming = site_repl_config("home");
-        incoming.role = operator_role.to_string();
-        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
+        for operator_role in [
+            "arn:aws:iam::123456789012:role/replication",
+            "arn:minio:replication::operator-dep:photos",
+        ] {
+            let mut incoming = site_repl_config("home");
+            incoming.role = operator_role.to_string();
+            let merged = merge_incoming_replication_config(
+                Some(incoming),
+                Some(site_repl_config("office")),
+                &sites,
+                OperatorRuleContract::Derived,
+            )
             .expect("merge should produce rules");
-        assert_eq!(merged.role, operator_role, "operator role must survive the merge");
+            assert_eq!(merged.role, operator_role, "operator role must survive the merge");
+        }
     }
 
     // Rules and targets are keyed off the same ARN. Minting a fresh one while
@@ -17089,7 +17331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_removed_site_replication_rules_removes_site_rule_and_reorders_priorities() {
+    fn test_prune_removed_site_replication_rules_removes_site_rule_and_keeps_operator_priority() {
         let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
         let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
         let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
@@ -17106,9 +17348,90 @@ mod tests {
         assert!(updated.role.is_empty());
         assert_eq!(updated.rules.len(), 2);
         assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));
-        assert_eq!(updated.rules[0].priority, Some(1));
+        assert_eq!(updated.rules[0].priority, Some(9), "the operator's priority is policy and stays");
         assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
-        assert_eq!(updated.rules[1].priority, Some(2));
+        assert_eq!(updated.rules[1].priority, Some(1), "the derived rule moves to the lowest free slot");
+    }
+
+    // Issue #1948 review: one pre-contract peer pins an S3 edit to the legacy
+    // merge; only a cluster where every remote peer answered the probe moves
+    // to the derived contract. A probe error counts as a pre-contract peer.
+    #[test]
+    fn test_operator_rule_contract_requires_every_remote_peer() {
+        let home = normalize_peer_info(PeerInfo {
+            endpoint: "https://home.example.com".to_string(),
+            ..Default::default()
+        });
+        let office = normalize_peer_info(PeerInfo {
+            endpoint: "https://office.example.com".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(operator_rule_contract_from_probes([]), OperatorRuleContract::Derived);
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(true))]),
+            OperatorRuleContract::Derived
+        );
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Ok(true)), (&office, Ok(false))]),
+            OperatorRuleContract::Legacy
+        );
+        assert_eq!(
+            operator_rule_contract_from_probes([(&home, Err(s3_error!(InternalError, "unreachable"))), (&office, Ok(true))]),
+            OperatorRuleContract::Legacy
+        );
+    }
+
+    // The contract travels with the payload: a pre-contract sender's item has
+    // no marker and is merged the legacy way; every item this site sends is
+    // marked, bootstrap snapshots included, so a preserved config is never
+    // renumbered by a peer on the derived contract.
+    #[test]
+    fn test_bucket_meta_items_carry_the_derived_rule_contract() {
+        let legacy: SRBucketMeta = serde_json::from_str(r#"{"type":"replication-config","bucket":"photos"}"#).expect("item");
+        assert!(!legacy.derived_rule_contract);
+
+        let bucket = SRBucketInfo {
+            bucket: "photos".to_string(),
+            ..Default::default()
+        };
+        let item = bootstrap_bucket_meta_item(&bucket, "replication-config", None);
+        assert!(item.derived_rule_contract);
+        let wire = serde_json::to_value(&item).expect("json");
+        assert_eq!(wire["derivedRuleContract"], serde_json::Value::Bool(true));
+        assert!(bucket_metadata_snapshot_tombstone(&item, OffsetDateTime::now_utc()).derived_rule_contract);
+    }
+
+    // Issue #1948 review: an owner's `site-repl-user` rule on an operator ARN
+    // is outside the derived shape, so neither the prune nor the reconciler
+    // treats it as theirs; a leftover in the derived shape still is.
+    #[test]
+    fn test_derived_shape_excludes_owner_site_repl_user_rule() {
+        let owner_rule = build_site_replication_rule("arn:minio:replication:us-east-1:2f1c-remote:photos", 9, "site-repl-user");
+        assert!(!is_derived_site_replication_rule(&owner_rule));
+        assert!(is_derived_site_replication_rule(&build_site_replication_rule(
+            "arn:rustfs:replication::gone-dep:photos",
+            1,
+            "site-repl-gone-dep"
+        )));
+
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep"),
+                owner_rule,
+                build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 2, "site-repl-kept-dep"),
+            ],
+        };
+        let (updated, removed) = prune_removed_site_replication_rules(config, &HashSet::from(["removed-dep".to_string()]));
+        let updated = updated.expect("rules remain");
+        assert_eq!(removed, 1);
+        let rules: Vec<_> = updated
+            .rules
+            .iter()
+            .map(|rule| (rule.id.as_deref().unwrap(), rule.priority))
+            .collect();
+        assert_eq!(rules, vec![("site-repl-user", Some(9)), ("site-repl-kept-dep", Some(1))]);
     }
 
     #[test]

@@ -5,7 +5,8 @@ set -euo pipefail
 # Reuses scripts/run_object_batch_bench.sh and exports reproducible artifacts:
 # - run manifest with scenario/tool metadata and git revision
 # - object benchmark summaries per scenario/workload/concurrency
-# - optional internode operation metric deltas from a Prometheus text endpoint
+# - optional internode operation metric deltas from Prometheus text snapshots or
+#   PromQL increase() queries
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -32,6 +33,8 @@ SCENARIOS="local=http://127.0.0.1:9000,distributed=http://127.0.0.1:9001"
 # Optional Prometheus text exposition URL.
 # If empty, metrics delta collection is skipped.
 INTERNODE_METRICS_URL=""
+INTERNODE_METRICS_MODE="text-delta"
+INTERNODE_METRICS_RANGE=""
 
 usage() {
   cat <<'USAGE'
@@ -53,7 +56,9 @@ Optional:
   --samples <n>                      Default: 20000 (for s3bench)
   --warp-bin <path>                  Default: warp
   --s3bench-bin <path>               Default: s3bench
-  --metrics-url <url>                Prometheus text endpoint for internode metrics delta
+  --metrics-url <url>                Metrics URL for internode deltas. Use a Prometheus text endpoint with text-delta mode, or /api/v1/query with prometheus-increase mode
+  --metrics-mode <mode>              text-delta or prometheus-increase. Default: text-delta
+  --metrics-range <range>            PromQL range for prometheus-increase mode. Default: --duration
   --out-dir <dir>                    Default: target/bench/internode-transport-<timestamp>
   --extra-args "<args>"              Passed to run_object_batch_bench.sh --extra-args
   --insecure                         TLS insecure (self-signed)
@@ -62,6 +67,7 @@ Optional:
 
 Notes:
   - This baseline covers S3 PUT/GET workloads and records internode metric deltas when --metrics-url is set.
+  - Use --metrics-mode prometheus-increase with a Prometheus /api/v1/query URL when service restarts may reset counters between runs.
   - The run manifest intentionally omits access keys, secret keys, and extra args to avoid writing credentials to artifacts.
   - Healing/replication-specific workloads should be run separately and appended to the same artifact directory.
 USAGE
@@ -91,6 +97,8 @@ parse_args() {
       --warp-bin) WARP_BIN="$2"; shift 2 ;;
       --s3bench-bin) S3BENCH_BIN="$2"; shift 2 ;;
       --metrics-url) INTERNODE_METRICS_URL="$2"; shift 2 ;;
+      --metrics-mode) INTERNODE_METRICS_MODE="$2"; shift 2 ;;
+      --metrics-range) INTERNODE_METRICS_RANGE="$2"; shift 2 ;;
       --out-dir) OUT_DIR="$2"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$2"; shift 2 ;;
       --insecure) INSECURE=true; shift ;;
@@ -117,6 +125,13 @@ validate_args() {
   if [[ -z "${SCENARIOS}" ]]; then
     echo "ERROR: --scenarios cannot be empty" >&2
     exit 1
+  fi
+  if [[ "${INTERNODE_METRICS_MODE}" != "text-delta" && "${INTERNODE_METRICS_MODE}" != "prometheus-increase" ]]; then
+    echo "ERROR: --metrics-mode must be text-delta or prometheus-increase" >&2
+    exit 1
+  fi
+  if [[ "${INTERNODE_METRICS_MODE}" == "prometheus-increase" && -n "${INTERNODE_METRICS_URL}" && -z "${INTERNODE_METRICS_RANGE}" ]]; then
+    INTERNODE_METRICS_RANGE="${DURATION}"
   fi
 }
 
@@ -159,11 +174,79 @@ write_run_manifest() {
     echo "samples=${SAMPLES}"
     echo "insecure=${INSECURE}"
     echo "metrics_url=${INTERNODE_METRICS_URL:-N/A}"
+    echo "metrics_mode=${INTERNODE_METRICS_MODE}"
+    echo "metrics_range=${INTERNODE_METRICS_RANGE:-N/A}"
     echo "out_dir=${OUT_DIR}"
     echo "extra_args_present=$([[ -n "${EXTRA_ARGS}" ]] && echo true || echo false)"
     echo "access_key=REDACTED"
     echo "secret_key=REDACTED"
   } > "${manifest}"
+}
+
+collect_internode_increases() {
+  local snapshot_file="$1"
+  if [[ -z "${INTERNODE_METRICS_URL}" ]]; then
+    : > "${snapshot_file}"
+    return 0
+  fi
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    : > "${snapshot_file}"
+    return 0
+  fi
+
+  python3 - "${INTERNODE_METRICS_URL}" "${INTERNODE_METRICS_RANGE}" "${snapshot_file}" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+query_url, prom_range, snapshot_raw = sys.argv[1:]
+snapshot_path = pathlib.Path(snapshot_raw)
+metrics = [
+    "rustfs_system_network_internode_operation_requests_outgoing_total",
+    "rustfs_system_network_internode_operation_requests_incoming_total",
+    "rustfs_system_network_internode_operation_errors_total",
+    "rustfs_system_network_internode_operation_classified_errors_total",
+]
+
+
+def escape_label(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def query_prometheus(query):
+    separator = "&" if "?" in query_url else "?"
+    url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("status") != "success":
+        raise RuntimeError(f"Prometheus query failed: {payload!r}")
+    return payload.get("data", {}).get("result", [])
+
+
+lines = []
+try:
+    for metric_name in metrics:
+        query = f"sum by(operation, backend) (increase({metric_name}[{prom_range}]))"
+        for sample in query_prometheus(query):
+            labels = {
+                key: value
+                for key, value in sample.get("metric", {}).items()
+                if key in {"operation", "backend"}
+            }
+            value = sample.get("value", [None, None])[1]
+            if value is None:
+                continue
+            label_text = ",".join(f'{key}="{escape_label(value)}"' for key, value in sorted(labels.items()))
+            lines.append(f"{metric_name}{{{label_text}}} {value}")
+except Exception as err:  # noqa: BLE001 - shell harness reports and skips metrics on query errors.
+    snapshot_path.write_text(f"# prometheus_increase_failed error={err}\n", encoding="utf-8")
+    raise SystemExit(0)
+
+snapshot_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+PY
 }
 
 collect_internode_snapshot() {
@@ -202,7 +285,7 @@ extract_internode_rows() {
     n = split($0, parts, " ")
     value = parts[n]
     gsub(/[[:space:]]+/, "", value)
-    if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+    if (value ~ /^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$/) {
       print metric "," op "," backend "," value
     }
   }' "${src}"
@@ -243,6 +326,30 @@ append_metric_deltas() {
   rm -f "${before_rows}" "${after_rows}"
 }
 
+append_metric_increases() {
+  local scenario="$1"
+  local workload="$2"
+  local conc="$3"
+  local size="$4"
+  local increase_file="$5"
+
+  local increase_rows
+  increase_rows="$(mktemp)"
+  extract_internode_rows "${increase_file}" > "${increase_rows}"
+
+  awk -F',' -v scenario="${scenario}" -v workload="${workload}" -v conc="${conc}" -v size="${size}" '
+    {
+      metric = $1
+      operation = $2
+      backend = $3
+      delta = $4 + 0
+      printf "%s,%s,%s,%s,%s,%s,%s,%.0f,%.0f,%.0f\n", scenario, workload, conc, size, metric, operation, backend, 0, delta, delta
+    }
+  ' "${increase_rows}" >> "${OUT_DIR}/internode_metric_deltas.csv"
+
+  rm -f "${increase_rows}"
+}
+
 append_object_summary() {
   local scenario="$1"
   local endpoint="$2"
@@ -274,9 +381,10 @@ run_workload() {
   local bucket="${BUCKET_PREFIX}-${scenario}-${workload}-c${conc}"
   local before_metrics="${run_dir}/metrics_before.prom"
   local after_metrics="${run_dir}/metrics_after.prom"
+  local increase_metrics="${run_dir}/metrics_increase.prom"
 
   mkdir -p "${run_dir}"
-  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+  if [[ -n "${INTERNODE_METRICS_URL}" && "${INTERNODE_METRICS_MODE}" == "text-delta" ]]; then
     collect_internode_snapshot "${before_metrics}"
   fi
 
@@ -311,9 +419,12 @@ run_workload() {
   "${cmd[@]}"
 
   append_object_summary "${scenario}" "${endpoint}" "${workload}" "${conc}" "${run_dir}"
-  if [[ -n "${INTERNODE_METRICS_URL}" ]]; then
+  if [[ -n "${INTERNODE_METRICS_URL}" && "${INTERNODE_METRICS_MODE}" == "text-delta" ]]; then
     collect_internode_snapshot "${after_metrics}"
     append_metric_deltas "${scenario}" "${workload}" "${conc}" "all_sizes" "${before_metrics}" "${after_metrics}"
+  elif [[ -n "${INTERNODE_METRICS_URL}" && "${INTERNODE_METRICS_MODE}" == "prometheus-increase" ]]; then
+    collect_internode_increases "${increase_metrics}"
+    append_metric_increases "${scenario}" "${workload}" "${conc}" "all_sizes" "${increase_metrics}"
   fi
 }
 
@@ -350,7 +461,11 @@ main() {
   validate_args
   require_cmd awk
   if [[ -n "${INTERNODE_METRICS_URL}" && "${DRY_RUN}" != "true" ]]; then
-    require_cmd curl
+    if [[ "${INTERNODE_METRICS_MODE}" == "text-delta" ]]; then
+      require_cmd curl
+    else
+      require_cmd python3
+    fi
   fi
   if [[ ! -x "${OBJECT_BENCH_SCRIPT}" ]]; then
     echo "ERROR: benchmark script not executable: ${OBJECT_BENCH_SCRIPT}" >&2
