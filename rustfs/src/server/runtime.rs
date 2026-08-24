@@ -50,7 +50,7 @@ mod tests {
 }
 
 #[inline]
-fn detect_cores() -> usize {
+fn detect_cores().min(16) -> usize {
     // Uses cgroup-aware detection from cgroup_resources module
     // Returns effective CPU cores considering cgroup limits and overrides
     crate::cgroup_resources::container_resources().cpu_cores
@@ -58,9 +58,9 @@ fn detect_cores() -> usize {
 
 #[inline]
 fn compute_default_worker_threads() -> usize {
-    // Physical cores are used by default (closer to CPU compute resources and cache topology)
+    // Cap at 16 worker threads for optimal small-object PUT performance.
     // Now cgroup-aware: in containers, uses the container's CPU limit
-    detect_cores()
+    detect_cores().min(16)
 }
 
 /// Default max_blocking_threads calculations based on sysinfo:
@@ -76,7 +76,7 @@ fn compute_default_max_blocking_threads() -> usize {
     // Each blocking thread can use up to 1 MiB stack space
     const SMALL_CONTAINER_MAX_THREADS: usize = 256;
 
-    let cores = detect_cores();
+    let cores = detect_cores().min(16);
 
     let mut threads = BASE_THREADS;
     let mut threshold = BASE_CORES;
