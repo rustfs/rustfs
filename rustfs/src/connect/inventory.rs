@@ -834,6 +834,7 @@ fn read_bounded(file: &mut fs::File) -> Result<Vec<u8>, InventoryError> {
 }
 
 #[cfg(target_os = "linux")]
+// SAFETY: libc path operations use validated directory descriptors and checked C strings; returned descriptors become owned files.
 #[allow(unsafe_code)]
 fn open_inventory_directory(path: &Path) -> Result<(StateRootAnchor, fs::File), InventoryError> {
     use std::os::fd::AsRawFd as _;
@@ -952,6 +953,7 @@ fn unix_directory_is_trusted(owner: u32, mode: u32, process: u32, dedicated: boo
 }
 
 #[cfg(target_os = "linux")]
+// SAFETY: openat receives a live directory descriptor and checked C string; a successful descriptor becomes an owned file.
 #[allow(unsafe_code)]
 fn open_file_at(directory: &fs::File, name: &str, create: bool, write: bool) -> Result<fs::File, InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -976,6 +978,7 @@ fn open_file_at(directory: &fs::File, name: &str, create: bool, write: bool) -> 
 }
 
 #[cfg(target_os = "linux")]
+// SAFETY: openat receives a live directory descriptor and checked C string; a successful descriptor becomes an owned file.
 #[allow(unsafe_code)]
 fn stage_at(directory: &fs::File, destination: &str) -> Result<(String, fs::File), InventoryError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
