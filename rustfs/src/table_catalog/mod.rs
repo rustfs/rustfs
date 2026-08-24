@@ -383,6 +383,9 @@ fn is_missing_storage_error(err: &StorageError) -> bool {
 }
 
 fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStoreError {
+    if err.is_quorum_error() {
+        return TableCatalogStoreError::Unavailable(format!("{action}: {err}"));
+    }
     match err {
         StorageError::ObjectNotFound(bucket, object) => TableCatalogStoreError::NotFound(format!("{action}: {bucket}/{object}")),
         StorageError::BucketNotFound(bucket) => TableCatalogStoreError::NotFound(format!("{action}: bucket {bucket}")),

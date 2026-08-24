@@ -60,6 +60,33 @@ fn catalog_lock_authority_failures_are_typed_as_unavailable() {
 }
 
 #[test]
+fn catalog_storage_quorum_failures_are_typed_as_unavailable() {
+    for error in [
+        StorageError::ErasureReadQuorum,
+        StorageError::ErasureWriteQuorum,
+        StorageError::InsufficientReadQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::InsufficientWriteQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: ".rustfs.sys".to_string(),
+            object: "s3tables/catalog/strong-backing/snapshot.json".to_string(),
+            required: 2,
+            achieved: 0,
+        },
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", error),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    assert_matches!(
+        storage_error_to_catalog("stat catalog object", StorageError::FileCorrupt),
+        TableCatalogStoreError::Internal(_)
+    );
+}
+
+#[test]
 fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
     assert!(is_reserved_table_object_key(".rustfs-table"));
     assert!(is_reserved_table_object_key(".rustfs-table/"));
