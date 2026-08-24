@@ -52,24 +52,37 @@ mod tests {
 
 #[inline]
 fn detect_cores() -> usize {
-    // Priority physical cores, fallback logic cores, minimum 1
-    let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
-    sys.refresh_cpu_all();
-    sys.cpus().len().max(1)
+    // Priority: cgroup limits > host CPU count
+    // This ensures containerized environments get correct CPU limits
+    let host_cores = {
+        let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
+        sys.refresh_cpu_all();
+        sys.cpus().len().max(1)
+    };
+
+    // Use cgroup-aware effective CPU cores
+    crate::cgroup_resources::effective_cpu_cores(host_cores)
 }
 
 #[inline]
 fn compute_default_worker_threads() -> usize {
     // Physical cores are used by default (closer to CPU compute resources and cache topology)
+    // Now cgroup-aware: in containers, uses the container's CPU limit
     detect_cores()
 }
 
 /// Default max_blocking_threads calculations based on sysinfo:
 /// 16 cores -> 1024; more than 16 cores are doubled by multiples:
 /// 1..=16 -> 1024, 17..=32 -> 2048, 33..=64 -> 4096, and so on.
+///
+/// For containerized environments with limited resources, this is capped
+/// to prevent excessive memory usage from thread stacks.
 fn compute_default_max_blocking_threads() -> usize {
     const BASE_CORES: usize = rustfs_config::DEFAULT_WORKER_THREADS;
     const BASE_THREADS: usize = rustfs_config::DEFAULT_MAX_BLOCKING_THREADS;
+    // Cap for small containers to prevent excessive memory usage
+    // Each blocking thread can use up to 1 MiB stack space
+    const SMALL_CONTAINER_MAX_THREADS: usize = 256;
 
     let cores = detect_cores();
 
@@ -80,6 +93,12 @@ fn compute_default_max_blocking_threads() -> usize {
     while cores > threshold {
         threads = threads.saturating_mul(2);
         threshold = threshold.saturating_mul(2);
+    }
+
+    // For small containers (<=4 cores), cap the blocking threads to prevent memory issues
+    // This prevents a 1 GiB container from allocating up to 1 GiB just for thread stacks
+    if cores <= 4 {
+        threads = threads.min(SMALL_CONTAINER_MAX_THREADS);
     }
 
     threads
