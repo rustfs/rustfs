@@ -56,9 +56,6 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
-# Allocator features
-mimalloc = ["dep:rustfs-mimalloc", "dep:rustfs-mimalloc-sys"]
-jemalloc = ["dep:tikv-jemallocator"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -339,14 +336,13 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
-rustfs-mimalloc = { workspace = true, optional = true }
+rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys = { workspace = true, optional = true }
-tikv-jemallocator = { version = "0.6", optional = true }
+rustfs-mimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
@@ -355,7 +351,7 @@ tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
 insta = { workspace = true, features = ["yaml", "json"] }
-proptest = "1"
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }

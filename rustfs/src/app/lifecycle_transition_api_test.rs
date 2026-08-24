@@ -1694,10 +1694,27 @@ async fn compensation_driven_copy_still_completes_transition() {
     assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-async fn compensation_driven_complete_multipart_upload_still_transitions() {
+#[test]
+fn compensation_driven_complete_multipart_upload_still_transitions() {
+    std::thread::Builder::new()
+        .name("lifecycle-compensation-complete-multipart".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("compensation multipart test runtime should build");
+
+            runtime.block_on(compensation_driven_complete_multipart_upload_still_transitions_inner());
+        })
+        .expect("compensation multipart test thread should spawn")
+        .join()
+        .expect("compensation multipart test thread should finish");
+}
+
+async fn compensation_driven_complete_multipart_upload_still_transitions_inner() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultMultipartUsecase::from_global();
 
@@ -2223,10 +2240,27 @@ async fn restore_object_usecase_reports_ongoing_conflict() {
     get_barrier.release();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#4879"]
-async fn restore_object_usecase_completes_suspended_null_version_in_place() {
+#[test]
+fn restore_object_usecase_completes_suspended_null_version_in_place() {
+    std::thread::Builder::new()
+        .name("lifecycle-restore-suspended-null".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("suspended null-version restore test runtime should build");
+
+            runtime.block_on(restore_object_usecase_completes_suspended_null_version_in_place_inner());
+        })
+        .expect("suspended null-version restore test thread should spawn")
+        .join()
+        .expect("suspended null-version restore test thread should finish");
+}
+
+async fn restore_object_usecase_completes_suspended_null_version_in_place_inner() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();

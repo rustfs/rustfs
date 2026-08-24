@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! Shared test bootstrap helpers for RustFS integration tests
 //! (backlog#1153 infra-1).
 //!
@@ -188,8 +190,7 @@ impl TestECStoreEnvBuilder {
     }
 
     /// Whether to run `init_bucket_metadata_sys` after the store comes up
-    /// (default `true`, as the heal bootstraps did). The IAM bootstrap test
-    /// opts out to preserve its historical semantics.
+    /// (default `true`, as the heal bootstraps did).
     pub fn init_bucket_metadata(mut self, yes: bool) -> Self {
         self.init_bucket_metadata = yes;
         self

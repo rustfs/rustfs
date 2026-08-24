@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::{
+    collections::HashMap,
     fs::Metadata,
-    path::Path,
-    sync::{Arc, OnceLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::{self, File},
@@ -223,6 +225,78 @@ pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await
+}
+
+// Bucket existence cache - reduces statx syscalls for repeated bucket checks
+
+/// Cache for bucket directory existence checks.
+struct BucketExistenceCache {
+    cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
+    ttl: Duration,
+}
+
+impl BucketExistenceCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    fn check_exists(&self, path: &PathBuf) -> Option<bool> {
+        let mut cache = self.cache.lock().ok()?;
+        if let Some((timestamp, exists)) = cache.get(path) {
+            if timestamp.elapsed() < self.ttl {
+                return Some(*exists);
+            }
+            cache.remove(path);
+        }
+        None
+    }
+
+    fn record(&self, path: PathBuf, exists: bool) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(path, (Instant::now(), exists));
+        }
+    }
+
+    fn invalidate(&self, path: &PathBuf) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(path);
+        }
+    }
+}
+
+static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
+    std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
+
+/// Cached access check - reduces statx syscalls
+pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
+    let path_buf = path.as_ref().to_path_buf();
+
+    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
+        if exists {
+            return Ok(());
+        }
+        return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
+    }
+
+    let result = fs::metadata(&path_buf).await;
+
+    match &result {
+        Ok(_) => BUCKET_EXISTENCE_CACHE.record(path_buf, true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            BUCKET_EXISTENCE_CACHE.record(path_buf, false);
+        }
+        _ => {}
+    }
+
+    result?;
+    Ok(())
+}
+
+pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
+    BUCKET_EXISTENCE_CACHE.invalidate(&path.as_ref().to_path_buf());
 }
 
 #[cfg(test)]
@@ -593,81 +667,4 @@ mod tests {
         // Should be different files
         assert!(!same_file(&metadata1, &metadata2));
     }
-}
-
-// Bucket existence cache - reduces statx syscalls for repeated bucket checks
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
-/// Cache for bucket directory existence checks.
-struct BucketExistenceCache {
-    cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
-    ttl: Duration,
-}
-
-impl BucketExistenceCache {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
-            ttl,
-        }
-    }
-
-    fn check_exists(&self, path: &PathBuf) -> Option<bool> {
-        let mut cache = self.cache.lock().ok()?;
-        if let Some((timestamp, exists)) = cache.get(path) {
-            if timestamp.elapsed() < self.ttl {
-                return Some(*exists);
-            }
-            cache.remove(path);
-        }
-        None
-    }
-
-    fn record(&self, path: PathBuf, exists: bool) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(path, (Instant::now(), exists));
-        }
-    }
-
-    fn invalidate(&self, path: &PathBuf) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.remove(path);
-        }
-    }
-}
-
-static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
-    std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
-
-/// Cached access check - reduces statx syscalls
-pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
-    let path_buf = path.as_ref().to_path_buf();
-
-    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
-        if exists {
-            return Ok(());
-        } else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
-        }
-    }
-
-    let result = fs::metadata(&path_buf).await;
-
-    match &result {
-        Ok(_) => BUCKET_EXISTENCE_CACHE.record(path_buf, true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            BUCKET_EXISTENCE_CACHE.record(path_buf, false);
-        }
-        _ => {}
-    }
-
-    result?;
-    Ok(())
-}
-
-pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
-    BUCKET_EXISTENCE_CACHE.invalidate(&path.as_ref().to_path_buf());
 }

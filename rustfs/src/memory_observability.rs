@@ -17,6 +17,7 @@ use rustfs_io_metrics::{
     record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
+#[cfg(any(not(target_os = "windows"), test))]
 use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -228,6 +229,7 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
     let json = rustfs_mimalloc::MiMalloc::stats_json();
     if json.is_empty() {
@@ -240,6 +242,12 @@ fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    None
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_value(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
@@ -250,6 +258,7 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => fields
@@ -261,6 +270,7 @@ fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
@@ -277,10 +287,12 @@ fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> 
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
     mimalloc_stat_field(value, metric, "current")
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64> {
     metrics
         .iter()
@@ -289,6 +301,7 @@ fn mimalloc_stat_sum(value: &Value, metrics: &[&str], field: &str) -> Option<u64
         .filter(|value| *value > 0)
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
     let malloc_metrics = ["malloc_normal", "malloc_huge"];
@@ -547,6 +560,8 @@ mod tests {
         let snapshot = super::read_allocator_memory_snapshot();
         #[cfg(not(target_os = "windows"))]
         assert!(snapshot.is_some(), "allocator snapshot should be available on non-Windows");
+        #[cfg(target_os = "windows")]
+        assert!(snapshot.is_none(), "allocator snapshot should be absent without mimalloc");
     }
 
     #[test]

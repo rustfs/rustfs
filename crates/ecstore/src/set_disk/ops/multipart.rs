@@ -5519,7 +5519,7 @@ mod tests {
         assert_eq!(body, vec![0x54; 4096], "the retry's generation must be the one served");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial]
     async fn put_object_part_fences_part_lock_loss_before_rename() {
         let target = Arc::new(std::sync::RwLock::new(None));
@@ -5533,10 +5533,14 @@ mod tests {
         let bucket = "multipart-put-part-part-lock-loss-bucket";
         let object = "object";
         make_bucket_on_all(&disk_stores, bucket).await;
-        let upload = set_disks
-            .new_multipart_upload(bucket, object, &ObjectOptions::default())
-            .await
-            .expect("multipart upload should be created");
+        let upload = temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+            set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+        })
+        .await
+        .expect("multipart upload should be created");
+        tokio::time::pause();
         let upload_id = upload.upload_id;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         let part_lock_path = format!("{upload_id_path}/part.1");
@@ -5584,7 +5588,7 @@ mod tests {
         assert!(listed.parts.is_empty(), "part lock loss before rename must not publish the part");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial]
     async fn put_object_part_fences_upload_lock_loss_before_rename() {
         let target = Arc::new(std::sync::RwLock::new(None));
@@ -5598,10 +5602,14 @@ mod tests {
         let bucket = "multipart-put-part-lock-loss-bucket";
         let object = "object";
         make_bucket_on_all(&disk_stores, bucket).await;
-        let upload = set_disks
-            .new_multipart_upload(bucket, object, &ObjectOptions::default())
-            .await
-            .expect("multipart upload should be created");
+        let upload = temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+            set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+        })
+        .await
+        .expect("multipart upload should be created");
+        tokio::time::pause();
         let upload_id = upload.upload_id;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         *target.write().expect("lock-loss target should be writable") =
@@ -6375,7 +6383,7 @@ mod tests {
             .expect("failed completion must leave the upload retryable");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial]
     async fn complete_fences_upload_lock_loss_before_commit() {
         temp_env::async_with_vars([(crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
@@ -6394,7 +6402,12 @@ mod tests {
                 user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]),
                 ..Default::default()
             };
-            let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x44; 4096], &create_opts).await;
+            let (upload_id, parts) =
+                temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &[0x44; 4096], &create_opts).await
+                })
+                .await;
+            tokio::time::pause();
             let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
             *target.write().expect("lock-loss target should be writable") =
                 Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));

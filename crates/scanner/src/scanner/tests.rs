@@ -33,6 +33,10 @@ use tokio::time::{Duration, advance};
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
+    setup_scanner_cycle_store_with_usage_baseline(true).await
+}
+
+async fn setup_scanner_cycle_store_with_usage_baseline(seed_usage_baseline: bool) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
     let mut endpoints = Vec::new();
@@ -69,14 +73,16 @@ async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     .await
     .expect("scanner cycle test ECStore should initialize");
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
-    save_config(
-        store.clone(),
-        DATA_USAGE_OBJ_NAME_PATH.as_str(),
-        serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
-            .expect("scanner cycle usage baseline should encode"),
-    )
-    .await
-    .expect("scanner cycle usage baseline should persist");
+    if seed_usage_baseline {
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+                .expect("scanner cycle usage baseline should encode"),
+        )
+        .await
+        .expect("scanner cycle usage baseline should persist");
+    }
 
     (temp_dir, store)
 }
@@ -2148,7 +2154,7 @@ async fn scanner_usage_floor_fails_closed_on_zero_byte_usage_objects() {
         let appearing = Arc::new(MemoryConfigStore::default());
         appearing.insert_after_gets.lock().await.insert(key, Vec::new());
 
-        let err = persisted_usage_floor(appearing)
+        let err = persisted_usage_floor_for_startup(appearing, true)
             .await
             .expect_err("an empty usage object appearing during confirmation must prevent pristine bootstrap");
         assert!(
@@ -2171,7 +2177,7 @@ async fn scanner_usage_floor_fails_closed_when_usage_appears_during_pristine_con
     let store = Arc::new(MemoryConfigStore::default());
     insert_usage_after_first_legacy_backup_read(store.as_ref()).await;
 
-    let err = persisted_usage_floor(store)
+    let err = persisted_usage_floor_for_startup(store, true)
         .await
         .expect_err("an appearing usage snapshot must prevent pristine bootstrap");
     assert!(err.to_string().contains("changed while confirming pristine state"));
@@ -2212,7 +2218,7 @@ fn scanner_pristine_cycle_state_requires_no_durable_progress() {
 
 #[tokio::test]
 async fn scanner_pristine_bootstrap_allows_first_bucket_to_win_startup() {
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
     let cycle = CurrentCycle::default();
     let revision = DataUsageCacheRevision::Missing;
 
@@ -4626,19 +4632,56 @@ fn scanner_cycle_schedule_status_reports_effective_backoff() {
 
     let status = scanner_cycle_schedule_status();
 
+    assert_eq!(status.execution_role, "leader");
+    assert!(status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 86_401);
     assert!(status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 2_048);
     assert!(status.superseded_retry_backoff_enabled);
     assert_eq!(status.superseded_cycles, 7);
 
+    record_scanner_cycle_schedule_role("follower");
+    let status = scanner_cycle_schedule_status();
+    assert_eq!(status.execution_role, "follower");
+    assert!(!status.effective_interval_available);
+    assert_eq!(status.effective_interval_seconds, 0);
+
     reset_scanner_cycle_schedule();
     let status = scanner_cycle_schedule_status();
+    assert_eq!(status.execution_role, "unknown");
+    assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
     assert!(!status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 1);
     assert!(!status.superseded_retry_backoff_enabled);
     assert_eq!(status.superseded_cycles, 0);
+}
+
+#[test]
+fn scanner_leader_lock_failure_classifies_only_timeout_as_expected_contention() {
+    let timeout = LockError::timeout(".rustfs.sys/leader.lock@latest", Duration::from_secs(5));
+    assert!(matches!(
+        classify_scanner_leader_lock_failure(&timeout),
+        ScannerLeaderLockFailure::Contended
+    ));
+
+    let failures = [
+        LockError::internal("lock service unavailable"),
+        LockError::network(
+            "leader lock transport unavailable",
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+        ),
+        LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+    ];
+    for failure in &failures {
+        assert!(matches!(
+            classify_scanner_leader_lock_failure(failure),
+            ScannerLeaderLockFailure::Failed(_)
+        ));
+    }
 }
 
 #[test]

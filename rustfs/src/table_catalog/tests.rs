@@ -21,6 +21,72 @@ use std::sync::Arc;
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]
+fn catalog_lock_authority_failures_are_typed_as_unavailable() {
+    for error in [
+        rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
+        rustfs_lock::LockError::Network {
+            message: "peer unavailable".to_string(),
+            source: Box::new(std::io::Error::other("peer unavailable")),
+        },
+        rustfs_lock::LockError::AlreadyLocked {
+            resource: "table-publication".to_string(),
+            owner: "another-node".to_string(),
+        },
+        rustfs_lock::LockError::InsufficientNodes {
+            required: 3,
+            available: 1,
+        },
+        rustfs_lock::LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+        rustfs_lock::LockError::QueueFull {
+            message: "lock queue is full".to_string(),
+        },
+    ] {
+        assert_matches!(
+            super::store::catalog_lock_acquisition_error("acquire catalog table lock", error),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    assert_matches!(
+        super::store::catalog_lock_acquisition_error(
+            "acquire catalog table lock",
+            rustfs_lock::LockError::configuration("invalid lock configuration"),
+        ),
+        TableCatalogStoreError::Internal(_)
+    );
+}
+
+#[test]
+fn catalog_storage_quorum_failures_are_typed_as_unavailable() {
+    for error in [
+        StorageError::ErasureReadQuorum,
+        StorageError::ErasureWriteQuorum,
+        StorageError::InsufficientReadQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::InsufficientWriteQuorum(".rustfs.sys".to_string(), "snapshot.json".to_string()),
+        StorageError::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: ".rustfs.sys".to_string(),
+            object: "s3tables/catalog/strong-backing/snapshot.json".to_string(),
+            required: 2,
+            achieved: 0,
+        },
+    ] {
+        assert_matches!(
+            storage_error_to_catalog("stat catalog object", error),
+            TableCatalogStoreError::Unavailable(_)
+        );
+    }
+
+    assert_matches!(
+        storage_error_to_catalog("stat catalog object", StorageError::FileCorrupt),
+        TableCatalogStoreError::Internal(_)
+    );
+}
+
+#[test]
 fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
     assert!(is_reserved_table_object_key(".rustfs-table"));
     assert!(is_reserved_table_object_key(".rustfs-table/"));

@@ -210,6 +210,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6"
 zeroize = { version = "1.9.0" }
+proptest = "1"
 
 # Time and Date
 chrono = { version = "0.4.45" }

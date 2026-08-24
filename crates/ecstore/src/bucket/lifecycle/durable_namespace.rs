@@ -388,6 +388,7 @@ impl ManualTransitionJobProgressProof {
         queue_snapshot: &ManualTransitionQueueSnapshot,
         cursor_revision: Option<u64>,
     ) -> Result<Self> {
+        let cursor_revision = cursor_revision.or_else(|| manual_transition_job::manual_transition_cursor_revision(report));
         let cursor_marker = match report.continuation_token.as_deref() {
             Some(token) => {
                 let marker = decode_manual_transition_continuation_token(token)?
@@ -604,6 +605,11 @@ fn manual_job_cursor_reaches(
 ) -> bool {
     if previous.continuation_token_sha256 == next.continuation_token_sha256 {
         return previous.cursor_marker == next.cursor_marker && previous.cursor_revision == next.cursor_revision;
+    }
+    if let (Some(previous_marker), Some(next_marker)) = (&previous.cursor_marker, &next.cursor_marker)
+        && previous_marker != next_marker
+    {
+        return next.scanned > previous.scanned && next_marker > previous_marker;
     }
     match (&previous.continuation_token_sha256, &next.continuation_token_sha256) {
         (None, Some(_)) => {
@@ -911,7 +917,7 @@ mod tests {
     fn try_manual_job_checkpoint(job: &manual_transition_job::ManualTransitionJobRecord) -> Result<DurableIlmRecordCheckpoint> {
         let path =
             manual_transition_job::manual_transition_job_record_object_name(job.job_id).expect("manual job path should build");
-        let encoded = job.encode().expect("manual job should encode");
+        let encoded = job.encode().map_err(|err| Error::other(err.to_string()))?;
         Ok(validate_durable_ilm_record(&path, &encoded)?.checkpoint)
     }
 
@@ -955,10 +961,10 @@ mod tests {
         let options = super::super::bucket_lifecycle_ops::ManualTransitionRunOptions::default();
         let mut job =
             manual_transition_job::ManualTransitionJobRecord::new(Uuid::new_v4(), "legacy-checkpoint-bucket", &options, "owner");
-        job.cursor_revision = None;
-        job.updated_at_unix_nanos += 1;
-        job.report.scanned = 1;
-        job.report.continuation_token = Some(continuation_token("logs/a"));
+        let mut report = job.report.clone();
+        report.scanned = 1;
+        report.continuation_token = Some(continuation_token("logs/a"));
+        job.update_running_progress(report, ManualTransitionQueueSnapshot::default());
         let compact = manual_job_checkpoint(&job);
         let mut legacy = compact.clone();
         let DurableIlmRecordCheckpoint::ManualTransitionJob {
@@ -1090,8 +1096,8 @@ mod tests {
         counter_rollback.updated_at_unix_nanos += 1;
         counter_rollback.report.scanned = 9;
         assert!(
-            previous_checkpoint
-                .validate_successor(&manual_job_checkpoint(&counter_rollback))
+            try_manual_job_checkpoint(&counter_rollback)
+                .and_then(|checkpoint| previous_checkpoint.validate_successor(&checkpoint))
                 .is_err()
         );
 
@@ -1100,8 +1106,8 @@ mod tests {
         cursor_rollback.report.scanned += 1;
         cursor_rollback.report.continuation_token = Some(continuation_token("logs/a"));
         assert!(
-            previous_checkpoint
-                .validate_successor(&manual_job_checkpoint(&cursor_rollback))
+            try_manual_job_checkpoint(&cursor_rollback)
+                .and_then(|checkpoint| previous_checkpoint.validate_successor(&checkpoint))
                 .is_err()
         );
 
@@ -1125,8 +1131,8 @@ mod tests {
         same_marker_version_rollback.report.continuation_token =
             Some(continuation_token_with_version("logs/b", Some("opaque-arbitrary-version")));
         assert!(
-            same_marker_version_previous_checkpoint
-                .validate_successor(&manual_job_checkpoint(&same_marker_version_rollback))
+            try_manual_job_checkpoint(&same_marker_version_rollback)
+                .and_then(|checkpoint| same_marker_version_previous_checkpoint.validate_successor(&checkpoint))
                 .is_err(),
             "a different opaque version marker without producer evidence must fail closed"
         );

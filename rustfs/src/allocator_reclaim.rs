@@ -376,7 +376,7 @@ fn collect_allocator_memory(force: bool) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn collect_allocator_memory(_force: bool) -> Result<(), String> {
-    Err("allocator reclaim is not supported on Windows".to_string())
+    Err("allocator reclaim requires mimalloc on a non-Windows target".to_string())
 }
 
 /// Execute one allocator collection and publish the outcome metrics.

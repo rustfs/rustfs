@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 mod ecstore_test_compat;
 
 use ecstore_test_compat::fixture::try_migrate_iam_config;
@@ -94,14 +96,9 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     let temp_dir = tempfile::TempDir::with_prefix("rustfs_minio_iam_migration_").expect("temp directory must be created");
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .base_dir(temp_dir.path())
-        .init_bucket_metadata(false)
         .build()
         .await;
-    for disk_path in &env.disk_paths {
-        tokio::fs::create_dir_all(disk_path.join(LEGACY_META_BUCKET))
-            .await
-            .expect("legacy metadata volume must be created");
-    }
+    env.make_bucket(LEGACY_META_BUCKET, false).await;
 
     let regular_source = json!({
         "version": 1,

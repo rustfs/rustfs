@@ -430,7 +430,7 @@ pub async fn check_key_valid_with_context(
                     reason = "account_disabled",
                     "Access key validation rejected"
                 );
-                return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             }
 
             warn!(

@@ -7002,6 +7002,15 @@ mod tests {
                 .await
                 .expect("free-version metadata should remain readable");
             let mut metadata = FileMeta::load(&encoded).expect("free-version metadata should decode");
+            let mut free_version_delete = FileInfo {
+                version_id: Some(stale_version_id),
+                deleted: true,
+                ..Default::default()
+            };
+            free_version_delete.set_tier_free_version();
+            metadata
+                .delete_version(&free_version_delete)
+                .expect("stale free version should be consumed before its ID is reused");
             metadata
                 .add_version(FileInfo {
                     volume: bucket.clone(),

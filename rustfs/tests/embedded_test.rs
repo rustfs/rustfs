@@ -17,6 +17,8 @@
 // This test starts a RustFS server in-process and exercises it via the
 // standard AWS S3 SDK — exactly as you would in your own integration tests.
 
+#![recursion_limit = "256"]
+
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};

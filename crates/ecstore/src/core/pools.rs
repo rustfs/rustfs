@@ -56,6 +56,7 @@ use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
     list::ListOperations as _,
+    namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
@@ -2911,12 +2912,14 @@ fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSe
             }
             PoolMetaReplica::Valid { raw, canonical, meta } => {
                 observed_version = observed_version.max(meta.version);
-                if let Some((selected_idx, selected_raw, selected_canonical, _)) = selected.as_ref() {
+                if let Some((selected_idx, selected_raw, selected_canonical, selected_meta)) = selected.as_ref() {
                     if selected_canonical != &canonical {
-                        if *selected_idx == 0 {
+                        if selected_meta.version == meta.version && *selected_idx == 0 {
                             // Pool zero is the durable commit record: every
                             // pool metadata writer commits it before replicas,
                             // and pre-replica-recovery startup read it alone.
+                            // This ordering is safe only within one format
+                            // version because V1 cannot preserve V2-only data.
                             needs_repair = true;
                         } else {
                             return Err(Error::other(format!(
@@ -9793,7 +9796,7 @@ mod tests {
         let err = meta
             .encode_config_data_for_v2_gate(false)
             .expect_err("v1 must not drop the unresolved ledger");
-        assert!(err.to_string().contains("Pool metadata V2 is required"));
+        assert!(err.to_string().contains("pool metadata V2 is required"));
     }
 
     #[test]
@@ -9897,6 +9900,7 @@ mod tests {
         assert_selection_blocks(vec![PoolMetaReplica::Corrupt("truncated".to_string())]);
         assert_selection_blocks(vec![PoolMetaReplica::Incompatible("future format".to_string())]);
         assert_selection_blocks(vec![
+            PoolMetaReplica::Corrupt("canonical unavailable".to_string()),
             decode_pool_meta_replica(pool_meta_replica_test_data("pool-old")),
             decode_pool_meta_replica(pool_meta_replica_test_data("pool-new")),
         ]);
@@ -11146,7 +11150,7 @@ mod pools_tests {
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
-    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
     use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
     use crate::store::ECStore;
     use byteorder::{ByteOrder, LittleEndian};
@@ -11985,7 +11989,7 @@ mod pools_tests {
                     cmd_line: "pool-0".to_string(),
                     last_update: older,
                     decommission: Some(PoolDecommissionInfo {
-                        complete: true,
+                        failed: true,
                         ..Default::default()
                     }),
                 },
@@ -13349,22 +13353,27 @@ mod pools_tests {
         let (dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
         let bucket = "decommission-final-sweep-unresolved";
         let object = "corrupt-object";
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         store
-            .peer_sys
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("test bucket should be created");
-        metadata_sys::init_bucket_metadata_sys(store.clone(), vec![bucket.to_string()]).await;
 
         let generation = OffsetDateTime::now_utc();
-        {
+        let active_meta = {
             let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.version = POOL_META_VERSION;
             pool_meta.dont_save = false;
             pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
                 start_time: Some(generation),
                 ..Default::default()
             });
-        }
+            pool_meta.clone()
+        };
+        active_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active V2 decommission metadata should be persisted before the final sweep");
 
         for (disk_index, dir) in dirs.iter().enumerate() {
             let object_dir = dir.path().join(bucket).join(object);
@@ -13380,7 +13389,10 @@ mod pools_tests {
             .check_after_decommission(0, &CancellationToken::new(), generation)
             .await
             .expect_err("real final sweep must fail closed on unresolved listing metadata");
-        assert!(err.to_string().contains("decommission listing could not resolve metadata"));
+        assert!(
+            err.to_string().contains("decommission listing could not resolve metadata"),
+            "unexpected final sweep error: {err:?}"
+        );
 
         let in_memory_entries = store.pool_meta.read().await.pools[0]
             .decommission
@@ -15766,9 +15778,10 @@ mod pools_tests {
 
     #[tokio::test]
     async fn test_decommission_worker_metadata_missing_releases_owned_slot() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let canceler = DecommissionCanceler::new(CancellationToken::new());
-        let store = decommission_worker_test_store(PoolMeta::default(), vec![Some(canceler.clone())]);
-        canceler.cancel();
+        *store.pool_meta.write().await = PoolMeta::default();
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
 
         let err = store
             .do_decommission_in_routine(canceler.clone(), 0, Arc::new(Semaphore::new(1)))
