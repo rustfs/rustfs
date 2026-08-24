@@ -17,8 +17,9 @@ use crate::storage_api::startup::services::{ECStore, EndpointServerPools, Server
 use crate::{
     config::Config,
     connect::{
-        CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime, InventorySchedule,
-        InventorySnapshot, spawn_heartbeat_runtime, spawn_inventory_runtime,
+        CoarseNodeSummary, HeartbeatConfig, HeartbeatError, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime,
+        InventorySchedule, InventorySnapshot, runtime::heartbeat_failure_reason, spawn_heartbeat_runtime,
+        spawn_inventory_runtime,
     },
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
@@ -130,7 +131,11 @@ fn start_heartbeat_runtime(
         .ok()
         .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
         .ok_or_else(|| std::io::Error::other("Connect heartbeat node count is outside protocol bounds"))?;
-    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(std::io::Error::other)
+    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(startup_heartbeat_error)
+}
+
+fn startup_heartbeat_error(error: HeartbeatError) -> std::io::Error {
+    std::io::Error::other(heartbeat_failure_reason(&error))
 }
 
 fn start_inventory_runtime(
@@ -321,6 +326,16 @@ fn aggregate_inventory_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_startup_errors_expose_only_stable_codes() {
+        let error = startup_heartbeat_error(HeartbeatError::StateIo {
+            path: std::path::PathBuf::from("/private/connect/canary/state.json"),
+            source: std::io::Error::other("private-source-canary"),
+        });
+
+        assert_eq!(error.to_string(), "connect_heartbeat_state_io");
+    }
 
     fn disk(state: &str, runtime_state: Option<&str>, disk_index: i32) -> rustfs_madmin::Disk {
         rustfs_madmin::Disk {

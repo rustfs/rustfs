@@ -301,6 +301,10 @@ impl PendingInventory {
     fn content_hash(&self) -> Result<String, InventoryError> {
         self.snapshot.content_hash()
     }
+
+    pub(crate) fn snapshot(&self) -> &InventorySnapshot {
+        &self.snapshot
+    }
 }
 
 pub(crate) enum InventoryDelivery {
@@ -430,9 +434,10 @@ impl InventoryStateStore {
         #[cfg(target_os = "linux")]
         {
             self.validate_anchor()?;
-            let lock = open_file_at(&self.directory, ".state.lock", true, true)?;
+            let lock = open_file_at(&self.directory, ".state.json.lock", true, true)?;
             validate_regular_file(&lock)?;
             lock.try_lock().map_err(|_| InventoryError::AlreadyRunning)?;
+            self.validate_anchor()?;
             Ok(lock)
         }
     }
@@ -477,6 +482,22 @@ impl InventoryStateStore {
             .map_err(|_| InventoryError::StateIo)?
     }
 
+    pub(crate) async fn ensure_latest(
+        &self,
+        snapshot: InventorySnapshot,
+        captured_at: String,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), InventoryError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || match store.read_latest(chrono::Utc::now()) {
+            Ok(latest) if latest.snapshot == snapshot => Ok(()),
+            Ok(_) | Err(InventoryError::StateMissing) => store.publish_latest_sync(snapshot, captured_at, &shutdown),
+            Err(error) => Err(error),
+        })
+        .await
+        .map_err(|_| InventoryError::StateIo)?
+    }
+
     #[allow(dead_code)] // R06 reads this after the server has stopped.
     pub(crate) fn read_latest(&self, now: chrono::DateTime<chrono::Utc>) -> Result<PersistedInventory, InventoryError> {
         self.read_latest_inner(now, || {})
@@ -518,6 +539,7 @@ impl InventoryStateStore {
             if before != file_identity(&current)? {
                 return Err(InventoryError::PersistenceSecurity);
             }
+            self.validate_anchor()?;
             decode_envelope(&bytes, now)
         }
     }
@@ -580,6 +602,7 @@ impl InventoryStateStore {
             };
             validate_regular_file(&file)?;
             let bytes = read_bounded(&mut file)?;
+            self.validate_anchor()?;
             let state: InventoryState = serde_json::from_slice(&bytes).map_err(|_| InventoryError::StateInvalid)?;
             let last_hash_valid = state.last_accepted_content_hash.as_deref().is_none_or(valid_content_hash);
             let pending_valid = state.pending.as_ref().is_none_or(|pending| {
@@ -619,6 +642,8 @@ impl InventoryStateStore {
             cancelled,
             #[cfg(all(test, target_os = "linux"))]
             None,
+            #[cfg(all(test, target_os = "linux"))]
+            || {},
         )
     }
 
@@ -628,6 +653,7 @@ impl InventoryStateStore {
         bytes: &[u8],
         cancelled: impl FnOnce() -> bool,
         #[cfg(all(test, target_os = "linux"))] fault: Option<PersistFault>,
+        #[cfg(all(test, target_os = "linux"))] before_commit: impl FnOnce(),
     ) -> Result<(), InventoryError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -668,6 +694,12 @@ impl InventoryStateStore {
                 return Err(error);
             }
             #[cfg(test)]
+            before_commit();
+            if let Err(error) = self.validate_anchor() {
+                let _ = unlink_at(&self.directory, &temp_name);
+                return Err(error);
+            }
+            #[cfg(test)]
             if let Some(PersistFault::CancelDuringCommit(token)) = fault.as_ref() {
                 token.cancel();
             }
@@ -683,7 +715,8 @@ impl InventoryStateStore {
             if matches!(fault.as_ref(), Some(PersistFault::DirectorySync)) {
                 return Err(InventoryError::DurabilityAfterCommit);
             }
-            self.directory.sync_all().map_err(|_| InventoryError::DurabilityAfterCommit)
+            self.directory.sync_all().map_err(|_| InventoryError::DurabilityAfterCommit)?;
+            self.validate_anchor()
         }
     }
 }
@@ -1504,6 +1537,71 @@ mod tests {
         for thread in threads {
             let _ = thread.join().expect("thread");
         }
+        assert!(state_root.join("inventory/.state.json.lock").is_file());
+        assert!(!state_root.join("inventory/.state.lock").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange_path_component(temp: &Path, state_root: &Path, component: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let ancestor = state_root.parent().expect("state ancestor");
+        let inventory = state_root.join("inventory");
+        let exchanged = match component {
+            "ancestor" => ancestor,
+            "state-root" => state_root,
+            "inventory" => &inventory,
+            _ => unreachable!(),
+        };
+        fs::rename(exchanged, temp.join(format!("original-{component}"))).expect("exchange path component");
+        fs::create_dir_all(&inventory).expect("replacement inventory path");
+        for directory in [ancestor, state_root, inventory.as_path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).expect("replacement directory mode");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_exchanges_during_reads_and_writes_fail_closed() {
+        for operation in ["read", "write"] {
+            for component in ["ancestor", "state-root", "inventory"] {
+                let temp = safe_tempdir();
+                let ancestor = temp.path().join("anchor");
+                let state_root = ancestor.join("state");
+                fs::create_dir_all(&state_root).expect("state root");
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).expect("ancestor mode");
+                fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("state mode");
+                let store = InventoryStateStore::from_state_root(&state_root).expect("store");
+                let captured_at = "2026-08-23T01:02:03Z";
+                store
+                    .publish_latest_sync(snapshot(), captured_at.to_owned(), &tokio_util::sync::CancellationToken::new())
+                    .expect("seed latest");
+
+                let error = if operation == "read" {
+                    let now = chrono::DateTime::parse_from_rfc3339(captured_at)
+                        .expect("time")
+                        .with_timezone(&chrono::Utc);
+                    store
+                        .read_latest_after_open(now, || exchange_path_component(temp.path(), &state_root, component))
+                        .expect_err("path exchange during read")
+                } else {
+                    let replacement = encode_envelope(snapshot(), "2026-08-23T02:02:03Z".to_owned()).expect("replacement");
+                    store
+                        .replace_file_inner(
+                            "latest.json",
+                            &replacement,
+                            || false,
+                            None,
+                            || exchange_path_component(temp.path(), &state_root, component),
+                        )
+                        .expect_err("path exchange before commit")
+                };
+
+                assert!(matches!(error, InventoryError::PersistenceSecurity));
+                assert!(!state_root.join("inventory/latest.json").exists());
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1518,7 +1616,7 @@ mod tests {
 
         for fault in [PersistFault::Write, PersistFault::TempSync, PersistFault::Rename] {
             assert!(matches!(
-                store.replace_file_inner("latest.json", &new, || false, Some(fault)),
+                store.replace_file_inner("latest.json", &new, || false, Some(fault), || {}),
                 Err(InventoryError::StateIo)
             ));
             assert_eq!(fs::read(temp.path().join("inventory/latest.json")).expect("last good"), old);
@@ -1533,7 +1631,7 @@ mod tests {
         }
 
         assert!(matches!(
-            store.replace_file_inner("latest.json", &new, || false, Some(PersistFault::DirectorySync)),
+            store.replace_file_inner("latest.json", &new, || false, Some(PersistFault::DirectorySync), || {}),
             Err(InventoryError::DurabilityAfterCommit)
         ));
         assert_eq!(fs::read(temp.path().join("inventory/latest.json")).expect("committed latest"), new);
@@ -1553,6 +1651,7 @@ mod tests {
                 &replacement,
                 || cancellation.is_cancelled(),
                 Some(PersistFault::CancelDuringCommit(cancellation.clone())),
+                || {},
             )
             .expect("commit ignores cancellation after its cancellation gate");
 

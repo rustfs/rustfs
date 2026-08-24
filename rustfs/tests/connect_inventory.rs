@@ -507,6 +507,8 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
         assert_eq!(latest["snapshot"][field], original[field]);
     }
     runtime.shutdown().await;
+    fs::remove_file(temp.path().join("private-config-secret/inventory/latest.json"))
+        .expect("simulate a pending snapshot created before local persistence");
 
     let mut limited = Reply::error(StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED");
     limited.retry_after = Some("0");
@@ -528,6 +530,11 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
             if accepted == content_hash && received_at == "2026-08-22T01:02:03Z"
     ));
     assert_eq!(restart_samples.load(Ordering::Relaxed), 0);
+    let restored_latest: Value = serde_json::from_slice(
+        &fs::read(temp.path().join("private-config-secret/inventory/latest.json")).expect("restored latest inventory"),
+    )
+    .expect("restored latest envelope");
+    assert_eq!(restored_latest["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
     let delivered = restart_server.seen.lock().expect("seen lock").clone();
     assert_eq!(delivered, vec![original.clone(), original.clone()]);
     assert_eq!(original["sequence"], 0);

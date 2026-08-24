@@ -208,7 +208,19 @@ where
                 break;
             }
             let pending = match if sender.is_some() { store.pending().await } else { Ok(None) } {
-                Ok(Some(pending)) => pending,
+                Ok(Some(pending)) => {
+                    let captured_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    if let Err(error) = store
+                        .ensure_latest(pending.snapshot().clone(), captured_at, task_shutdown.clone())
+                        .await
+                    {
+                        if matches!(error, InventoryError::Cancelled) && task_shutdown.is_cancelled() {
+                            break;
+                        }
+                        return failed_inventory(&status_tx, error);
+                    }
+                    pending
+                }
                 Ok(None) => {
                     let snapshot = match cancellable(&task_shutdown, sample()).await {
                         Some(Ok(snapshot)) => snapshot,
@@ -330,7 +342,7 @@ fn failed(status: &watch::Sender<HeartbeatStatus>, error: HeartbeatError) {
     });
 }
 
-fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
+pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
     use super::registration::CredentialValidationError;
 
     match error {
