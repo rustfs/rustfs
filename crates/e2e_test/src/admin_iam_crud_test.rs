@@ -30,6 +30,7 @@ use crate::common::{
     RustFSTestEnvironment, admin_ok, admin_request, admin_request_with_session_token, build_test_sts_client, init_logging,
 };
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 use reqwest::StatusCode;
@@ -411,8 +412,13 @@ async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
         .key("before-attach")
         .body(ByteStream::from_static(b"x"))
         .send()
-        .await;
-    assert!(denied.is_err(), "user without a policy must not be able to write to {bucket}");
+        .await
+        .expect_err("user without a policy must not be able to write to the bucket");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "user without a policy must receive AccessDenied: {denied:?}"
+    );
 
     // --- attach policy: the credential actually gains S3 access -----------------
     admin_ok(
@@ -499,13 +505,19 @@ async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
             .body(ByteStream::from_static(b"x"))
             .send()
             .await;
-        if revoked.is_err() {
-            break;
+        match revoked {
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                return Err("deleted service account credential still works".into());
+            }
+            Ok(_) => sleep(Duration::from_millis(500)).await,
+            Err(error) => {
+                let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
+                if matches!(code, Some("AccessDenied" | "InvalidAccessKeyId")) {
+                    break;
+                }
+                return Err(format!("deleted service account must fail with an authorization error, got {error:?}").into());
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("deleted service account credential still works".into());
-        }
-        sleep(Duration::from_millis(500)).await;
     }
 
     // Disable then remove the user; the credential must stop working.
@@ -525,13 +537,19 @@ async fn test_admin_user_policy_service_account_crud_lifecycle() -> TestResult {
             .body(ByteStream::from_static(b"x"))
             .send()
             .await;
-        if disabled.is_err() {
-            break;
+        match disabled {
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                return Err("disabled user credential still works".into());
+            }
+            Ok(_) => sleep(Duration::from_millis(500)).await,
+            Err(error) => {
+                let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
+                if matches!(code, Some("AccessDenied" | "InvalidAccessKeyId")) {
+                    break;
+                }
+                return Err(format!("disabled user must fail with an authorization error, got {error:?}").into());
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("disabled user credential still works".into());
-        }
-        sleep(Duration::from_millis(500)).await;
     }
 
     admin_ok(

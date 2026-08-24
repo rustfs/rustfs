@@ -18,6 +18,7 @@
 
 use crate::common::{RustFSTestEnvironment, awscurl_delete, awscurl_post_sts_form_urlencoded, awscurl_put, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier, Tag, Tagging};
 use aws_sdk_s3::{Client, Config};
@@ -208,10 +209,17 @@ async fn test_e2e_iam_policy_existing_object_tag_get_object() -> Result<(), Box<
     let _ = out.body.collect().await?;
 
     put_object_tag_kv(&admin, &bucket, key, "security", "private").await?;
-    let denied = uclient.get_object().bucket(&bucket).key(key).send().await;
-    assert!(
-        denied.is_err(),
-        "GetObject must be denied when ExistingObjectTag no longer matches IAM policy"
+    let denied = uclient
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("GetObject must be denied when ExistingObjectTag no longer matches IAM policy");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "IAM ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
     );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
@@ -245,8 +253,13 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
         .bucket(&bucket)
         .key(key)
         .send()
-        .await;
-    assert!(deny_before.is_err(), "without bucket policy, user must be denied");
+        .await
+        .expect_err("without bucket policy, user must be denied");
+    assert_eq!(
+        deny_before.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "missing bucket policy must return AccessDenied: {deny_before:?}"
+    );
 
     let bp = serde_json::json!({
         "Version": "2012-10-17",
@@ -268,8 +281,18 @@ async fn test_e2e_bucket_policy_existing_object_tag_get_object() -> Result<(), B
     let _ = ok.body.collect().await?;
 
     put_object_tag_kv(&admin, &bucket, key, "security", "private").await?;
-    let denied = uclient.get_object().bucket(&bucket).key(key).send().await;
-    assert!(denied.is_err(), "GetObject must fail when tag no longer satisfies bucket policy");
+    let denied = uclient
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("GetObject must fail when tag no longer satisfies bucket policy");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "bucket-policy ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
+    );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
     admin_remove_user(&env, &user).await;
@@ -335,10 +358,17 @@ async fn test_e2e_sts_assume_role_session_policy_existing_object_tag() -> Result
     let _ = ok.body.collect().await?;
 
     put_object_tag_kv(&parent_client, &bucket, key, "security", "private").await?;
-    let denied = session_client.get_object().bucket(&bucket).key(key).send().await;
-    assert!(
-        denied.is_err(),
-        "session policy must deny GetObject when ExistingObjectTag no longer matches"
+    let denied = session_client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect_err("session policy must deny GetObject when ExistingObjectTag no longer matches");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("AccessDenied"),
+        "STS ExistingObjectTag mismatch must return AccessDenied: {denied:?}"
     );
 
     cleanup_bucket_and_object(&admin, &bucket, key).await;
