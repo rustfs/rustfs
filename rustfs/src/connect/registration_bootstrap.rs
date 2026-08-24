@@ -434,10 +434,11 @@ mod tests {
     };
 
     fn secure_tempdir() -> tempfile::TempDir {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("test requires a protected home directory"));
         tempfile::Builder::new()
             .prefix(".connect-registration-bootstrap-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("temporary directory inside the protected checkout")
+            .tempdir_in(home)
+            .expect("temporary directory inside the protected home directory")
     }
 
     fn create_secure_state_tree(state: &Path) {

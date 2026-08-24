@@ -278,10 +278,11 @@ fn prepare_inputs(temp: &tempfile::TempDir, root_pem: &str) -> (std::path::PathB
 }
 
 fn secure_tempdir() -> tempfile::TempDir {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("test requires a protected home directory"));
     tempfile::Builder::new()
         .prefix(".connect-registration-")
-        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-        .expect("temporary directory inside the protected checkout")
+        .tempdir_in(home)
+        .expect("temporary directory inside the protected home directory")
 }
 
 fn run_binary(endpoint: String, root: std::path::PathBuf, state: std::path::PathBuf, token: Vec<u8>) -> std::process::Output {
