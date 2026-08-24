@@ -64,6 +64,10 @@ fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display) {
 async fn async_main() -> Result<()> {
     hotpath::tokio_runtime!();
 
+    // Log container resource detection early in startup
+    // This helps operators verify that RustFS correctly detected cgroup limits
+    crate::cgroup_resources::log_container_resources();
+
     let env_compat_report = bootstrap_external_prefix_compat()?;
 
     // Parse command line arguments
