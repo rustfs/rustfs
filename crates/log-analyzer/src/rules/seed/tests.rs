@@ -265,7 +265,7 @@ fn every_rule_has_a_positive_sample() {
             msg("failed to start decommission: insufficient target pool capacity: required 100 bytes available 50 bytes"),
         ),
         // ops
-        ("decom-object-failed", msg("decommission_pool: decommission_object err timeout")),
+        ("decom-object-failed", msg("Decommission object migration failed")),
         ("rebalance-worker-error", msg("Rebalance worker 3 error: disk gone")),
         (
             "datamove-same-pool",
