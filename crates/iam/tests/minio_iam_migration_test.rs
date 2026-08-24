@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 mod ecstore_test_compat;
 
 use ecstore_test_compat::fixture::try_migrate_iam_config;
