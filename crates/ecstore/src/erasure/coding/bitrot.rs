@@ -21,6 +21,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
+use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
@@ -635,11 +636,15 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
             shard_size = left;
         }
 
-        let mut buf = vec![0; shard_size];
+        let mut buf = get_ec_buffer(shard_size);
+        buf.resize(shard_size, 0);
         let read = r.read_exact(&mut buf).await?;
 
         let actual_hash = algo.hash_encode(&buf);
-        if actual_hash.as_ref() != &hash_buf[0..n] {
+        let hash_ok = actual_hash.as_ref() == &hash_buf[0..n];
+        drop(actual_hash); // 释放借用
+        return_ec_buffer(buf);
+        if !hash_ok {
             return Err(std::io::Error::other("bitrot hash mismatch"));
         }
 
