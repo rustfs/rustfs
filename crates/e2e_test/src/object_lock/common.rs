@@ -21,6 +21,8 @@
 //! - Bypass governance retention header handling
 
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::delete_object::DeleteObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
@@ -236,7 +238,7 @@ pub async fn delete_object_with_bypass(
     key: &str,
     version_id: Option<&str>,
     bypass_governance: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), SdkError<DeleteObjectError>> {
     let mut request = client
         .delete_object()
         .bucket(bucket)
