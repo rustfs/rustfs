@@ -9106,6 +9106,7 @@ mod inline_put_commit_path_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn ec_8_4_default_budget_keeps_large_inline_candidate_out_of_xl_meta() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
         set_disks.set_test_storage_class_config(
@@ -9117,10 +9118,15 @@ mod inline_put_commit_path_tests {
         make_bucket(&disk_stores, bucket).await;
 
         let mut reader = PutObjReader::from_vec(payload.clone());
-        set_disks
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("EC8+4 PUT should commit through the non-inline path");
+        temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            set_disks.put_object(bucket, object, &mut reader, &ObjectOptions::default()),
+        )
+        .await
+        .expect("EC8+4 PUT should commit through the non-inline path");
 
         for (disk_index, disk) in disk_stores.iter().enumerate() {
             let file_info = disk
@@ -9146,6 +9152,7 @@ mod inline_put_commit_path_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn ec_8_4_versioned_budget_reaches_put_placement_decision() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(12).await;
         set_disks.set_test_storage_class_config(
@@ -9161,10 +9168,15 @@ mod inline_put_commit_path_tests {
             ..Default::default()
         };
         let mut reader = PutObjReader::from_vec(payload.clone());
-        set_disks
-            .put_object(bucket, object, &mut reader, &options)
-            .await
-            .expect("versioned EC8+4 PUT should use the reduced inline budget");
+        temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            set_disks.put_object(bucket, object, &mut reader, &options),
+        )
+        .await
+        .expect("versioned EC8+4 PUT should use the reduced inline budget");
 
         for (disk_index, disk) in disk_stores.iter().enumerate() {
             let file_info = disk
@@ -11933,7 +11945,14 @@ mod transition_upload_integrity_tests {
         let bucket = "restore-finalize-acquired-lock-lost-bucket";
         let object = "object.bin";
         let operation_id = Uuid::new_v4();
-        let restored = write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await;
+        let restored = temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await },
+        )
+        .await;
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = RestoreFinalizeBarrier::install(bucket, object);
         let finalize_set = Arc::clone(&set_disks);
@@ -12669,7 +12688,14 @@ mod transition_upload_integrity_tests {
         let bucket = "data-movement-cleanup-lock-lost";
         let object = "object.bin";
         let payload = b"lost data movement cleanup lock must preserve the source".repeat(1024);
-        write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
+        )
+        .await;
         let expected = set_disks
             .load_file_info_versions_exact(bucket, object)
             .await
@@ -12722,7 +12748,14 @@ mod transition_upload_integrity_tests {
         let bucket = "data-movement-cleanup-bucket-fence-lost";
         let object = "object.bin";
         let payload = b"lost bucket fence must preserve the source".repeat(1024);
-        write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
+        )
+        .await;
         let expected = set_disks
             .load_file_info_versions_exact(bucket, object)
             .await
@@ -12871,7 +12904,14 @@ mod transition_upload_integrity_tests {
         let bucket = "transition-lock-lost-bucket";
         let object = "object.bin";
         let payload = b"lost transition commit lock must clean the remote candidate".repeat(1024);
-        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let original = temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
+        )
+        .await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
@@ -13314,7 +13354,14 @@ mod transition_upload_integrity_tests {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
         let bucket = "tagging-lock-lost-bucket";
         let object = "object.bin";
-        write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await;
+        temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await },
+        )
+        .await;
 
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = ObjectTaggingCommitBarrier::install(bucket, object);
@@ -13806,6 +13853,10 @@ mod heterogeneous_pool_put_tests {
             [
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                (
+                    crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                    Some("false"),
+                ),
             ],
             async {
                 let mut first_reader = PutObjReader::from_vec(large_payload(0x11));
@@ -13869,6 +13920,10 @@ mod heterogeneous_pool_put_tests {
             [
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                (
+                    crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                    Some("false"),
+                ),
             ],
             async {
                 let mut first_reader = PutObjReader::from_vec(large_payload(0x31));

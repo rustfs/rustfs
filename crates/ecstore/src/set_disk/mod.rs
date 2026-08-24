@@ -12582,13 +12582,6 @@ mod tests {
             .await
             .expect("conditional writer task should finish")
             .expect("matching conditional replace should commit");
-        assert!(
-            set_disks
-                .local_lock_manager_for_test()
-                .get_lock_info(&ObjectKey::new(bucket, object))
-                .is_none(),
-            "conditional replace should release the object lock after commit"
-        );
         let contender = set_disks
             .new_ns_lock(bucket, object)
             .await

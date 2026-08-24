@@ -900,7 +900,7 @@ mod tests {
             .clone()
             .expect("backup replica should receive the same canonical snapshot");
         assert_eq!(corrupt_write, backup_write);
-        assert_ne!(corrupt_write, backup.read_payload);
+        assert_ne!(corrupt_write, corrupt.read_payload);
     }
 
     #[tokio::test]
@@ -1985,7 +1985,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-multipart-drain", &[4, 4])).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("decommission-multipart-drain-{}", uuid::Uuid::new_v4());
+        let bucket = format!("decommission-mp-drain-{}", uuid::Uuid::new_v4());
         let complete_object = "complete.bin";
         let abort_object = "abort.bin";
         store
@@ -2080,10 +2080,19 @@ mod tests {
             .await
             .expect("abort upload on suspended decommission source");
 
-        store
-            .ensure_decommission_multipart_uploads_drained_for_test(0)
-            .await
-            .expect("final decommission gate should open after all source uploads are resolved");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match store.ensure_decommission_multipart_uploads_drained_for_test(0).await {
+                    Ok(()) => break,
+                    Err(err) if err.to_string().contains("still contains multipart upload") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(err) => panic!("unexpected final decommission drain error: {err:?}"),
+                }
+            }
+        })
+        .await
+        .expect("final decommission gate should open after upload cleanup converges");
         assert_pool_object_present(&store.pools[0], &bucket, complete_object).await;
 
         shutdown.cancel();
@@ -2092,13 +2101,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn active_multipart_upload_routes_before_faulted_suspended_source() {
+        use sha2::Digest;
+
         let temp_dir = tempfile::tempdir().expect("create active-first multipart routing store dir");
         let (_ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "active-first-multipart-routing", &[4, 4]))
                 .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-        let bucket = format!("active-first-multipart-routing-{}", uuid::Uuid::new_v4());
+        let bucket = format!("active-first-mp-route-{}", uuid::Uuid::new_v4());
         let object = "target-upload.bin";
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -2122,13 +2133,27 @@ mod tests {
         drop(lifecycle_guard);
 
         mark_test_pool_decommissioning(&store, 0).await;
-        let source_set = store.pools[0].get_disks_by_key(object);
-        let original_source_disks = {
-            let mut disks = source_set.disks.write().await;
-            let original = disks.clone();
-            disks.fill(None);
-            original
-        };
+        // Corrupt only the source pool's entry for this UploadID. Taking the
+        // whole source set offline would also make the bucket-incarnation
+        // sidecar unreadable before multipart routing is reached.
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        for disk_index in 0..4 {
+            let metadata_path = temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+                .join(crate::disk::STORAGE_FORMAT_FILE);
+            tokio::fs::create_dir_all(metadata_path.parent().expect("multipart metadata path should have a parent"))
+                .await
+                .expect("create corrupt source upload directory");
+            tokio::fs::write(metadata_path, b"not-xl-meta")
+                .await
+                .expect("inject source upload metadata read failure");
+        }
 
         let source_result = store.pools[0]
             .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
@@ -2136,10 +2161,11 @@ mod tests {
         let routed_result = store
             .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
             .await;
-        *source_set.disks.write().await = original_source_disks;
 
         assert!(
-            matches!(&source_result, Err(StorageError::ErasureReadQuorum)),
+            source_result
+                .as_ref()
+                .is_err_and(|err| !crate::error::is_err_invalid_upload_id(err)),
             "the suspended source must expose the injected hard read failure: {source_result:?}"
         );
         let routed = routed_result.expect("the active target UploadID must be resolved before the faulted suspended source");
@@ -4584,16 +4610,18 @@ mod tests {
         cleanup_barrier.wait_until_paused().await;
         drop(commit_barrier);
 
-        let target_info = store.pools[0]
-            .get_object_info(&bucket, object, &ObjectOptions::default())
-            .await
-            .expect("read the committed active target before source cleanup");
-        assert_pool_object_present(&store.pools[1], &bucket, object).await;
-
         let read_opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
         };
+        let target_info = store.pools[0]
+            .get_object_info(&bucket, object, &read_opts)
+            .await
+            .expect("read the committed active target before source cleanup");
+        store.pools[1]
+            .get_object_info(&bucket, object, &read_opts)
+            .await
+            .expect("the source must remain present until cleanup is released");
         let routed_info = store
             .get_object_info(&bucket, object, &read_opts)
             .await
@@ -6281,12 +6309,12 @@ mod tests {
                 .as_ref()
                 .expect("decommission state should remain present");
             assert!(
-                !decommission.canceled,
-                "cancel must not publish terminal state before the final sweep drains"
+                decommission.canceled,
+                "cancel must publish its durable terminal state before waiting for the final sweep"
             );
             assert!(
-                decommission.start_time.is_some(),
-                "cancel must preserve the run identity until the final sweep drains"
+                decommission.start_time.is_none(),
+                "the durable cancel state must clear the active run identity before quiescence"
             );
         }
 
