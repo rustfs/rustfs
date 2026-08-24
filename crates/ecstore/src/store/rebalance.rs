@@ -23,10 +23,13 @@ pub(in crate::store) mod support;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_POOLS: &str = "pools";
 const EVENT_POOL_META_RELOAD: &str = "pool_meta_reload";
+#[cfg(test)]
+use support::resolve_latest_object_info_candidates;
 use support::{
     LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
-    rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates, resolve_rebalance_delete_from_all_pools_result,
-    resolve_rebalance_delete_from_all_pools_results, resolve_store_rebalance_pool_meta_reload_result,
+    rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates_with_pool_state,
+    resolve_rebalance_delete_from_all_pools_result, resolve_rebalance_delete_from_all_pools_results,
+    resolve_store_rebalance_pool_meta_reload_result,
 };
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -611,9 +614,19 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, usize)> {
+        let suspended_pools = if opts.skip_decommissioned {
+            let pool_meta = self.pool_meta.read().await;
+            Some(
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         let mut futures = Vec::with_capacity(self.pools.len());
         for (idx, pool) in self.pools.iter().enumerate() {
-            if opts.skip_decommissioned && self.is_suspended(idx).await {
+            if suspended_pools.as_ref().is_some_and(|pools| pools[idx]) {
                 continue;
             }
 
@@ -646,10 +659,20 @@ impl ECStore {
             }
         }
 
+        let suspended_pools = match suspended_pools {
+            Some(pools) => pools,
+            None => {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            }
+        };
+
         // Delete markers are returned as latest object infos here. Higher-level
         // access paths are responsible for translating them into read/write
         // semantics such as object-not-found or method-not-allowed.
-        resolve_latest_object_info_candidates(candidates, bucket, object, opts)
+        resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)
     }
 
     pub(super) async fn delete_object_from_all_pools(
@@ -1524,6 +1547,83 @@ mod tests {
             .expect("operation should succeed");
 
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_prefers_active_target_over_higher_suspended_source() {
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let target = source.clone();
+
+        let (info, idx) = resolve_latest_object_info_candidates_with_pool_state(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("an active committed target should fence an equivalent suspended source");
+
+        assert_eq!(idx, 0);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_keeps_lone_suspended_source_readable() {
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let (_, idx) = resolve_latest_object_info_candidates_with_pool_state(
+            vec![LatestObjectInfoCandidate {
+                info: Some(source),
+                idx: 1,
+                err: None,
+            }],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a source-only object must remain readable before migration commits");
+
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_suspended_source_identity_conflict() {
+        let target = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-new".to_string()));
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-old".to_string()));
+
+        let err = resolve_latest_object_info_candidates_with_pool_state(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect_err("pool state must not mask an equal-time identity conflict");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
     }
 
     #[test]

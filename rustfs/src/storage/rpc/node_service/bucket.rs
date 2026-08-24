@@ -17,9 +17,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, reload_bucket_metadata, remove_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, decode_heal_bucket_rpc_options, reload_bucket_metadata, remove_bucket_metadata,
 };
-use rustfs_common::heal_channel::HealOpts;
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
 use tracing::debug;
@@ -239,7 +238,7 @@ impl NodeService {
     ) -> Result<Response<HealBucketResponse>, Status> {
         debug!("heal bucket");
         let request = request.into_inner();
-        let options = match serde_json::from_str::<HealOpts>(&request.options) {
+        let (options, fenced_pools) = match decode_heal_bucket_rpc_options(&request.options) {
             Ok(options) => options,
             Err(err) => {
                 return Ok(Response::new(HealBucketResponse {
@@ -249,7 +248,11 @@ impl NodeService {
             }
         };
 
-        match self.local_peer.heal_bucket(&request.bucket, &options).await {
+        match self
+            .local_peer
+            .heal_bucket_with_fence(&request.bucket, &options, &fenced_pools)
+            .await
+        {
             Ok(_) => Ok(Response::new(HealBucketResponse {
                 success: true,
                 error: None,

@@ -144,6 +144,8 @@ pub struct RebalanceMeta {
     #[serde(skip)]
     pub cancel: Option<CancellationToken>, // To be invoked on rebalance-stop
     #[serde(skip)]
+    pub activation_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
+    #[serde(skip)]
     pub last_refreshed_at: Option<OffsetDateTime>,
     #[serde(rename = "stopTs")]
     pub stopped_at: Option<OffsetDateTime>, // Time when rebalance-stop was issued

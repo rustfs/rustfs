@@ -100,17 +100,17 @@ pub(super) fn resolve_rebalance_meta_save_result(result: Result<()>, stage: &str
     result.map_err(|err| Error::other(format!("rebalance meta save failed during {stage}: {err}")))
 }
 
-pub(super) fn rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+pub(super) fn rebalance_meta_lock_error(err: rustfs_lock::LockError, mode: &'static str) -> Error {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
-            mode: "write",
+            mode,
             bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
             object: REBAL_META_NAME.to_string(),
             required,
             achieved,
         },
         other => Error::other(format!(
-            "failed to acquire rebalance metadata write lock on {}/{}: {other}",
+            "failed to acquire rebalance metadata {mode} lock on {}/{}: {other}",
             crate::disk::RUSTFS_META_BUCKET,
             REBAL_META_NAME
         )),

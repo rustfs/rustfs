@@ -31,6 +31,15 @@ failure pattern reported in rustfs/rustfs#4304.
 > older build is not supported: older readers ignore the sidecar and can
 > report an object checksum in place of the requested part checksum.
 
+> [!WARNING]
+> Writing pool metadata version 2 remains inactive unless both
+> `RUSTFS_POOL_META_V2_WRITE=true` and
+> `RUSTFS_POOL_META_V2_FLEET_CONFIRMED=true`. Leave either setting disabled
+> until every node that can read or write `pool.bin` supports version 2. Once a node
+> observes or writes version 2 it will not downgrade the file, and older
+> binaries or rollback builds cannot read it. Unresolved decommission entries
+> fail closed instead of being written in the version 1 format.
+
 ## TL;DR
 
 - **Rolling restart (no downtime):** restart **one node at a time**, and wait
