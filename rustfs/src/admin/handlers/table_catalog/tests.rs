@@ -290,6 +290,26 @@ fn catalog_conflicts_use_operation_specific_iceberg_errors() {
 }
 
 #[test]
+fn catalog_unavailable_errors_use_iceberg_503() {
+    let unavailable = catalog_store_error(crate::table_catalog::TableCatalogStoreError::Unavailable(
+        "failed to acquire catalog table lock: quorum required 3, achieved 1".to_string(),
+    ));
+    assert_eq!(unavailable.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(unavailable.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert_eq!(unavailable.message(), Some("table catalog is temporarily unavailable"));
+    assert!(
+        unavailable
+            .headers()
+            .is_none_or(|headers| !headers.contains_key(rustfs_utils::http::RETRY_AFTER))
+    );
+
+    let internal = catalog_store_error(crate::table_catalog::TableCatalogStoreError::Internal(
+        "commit state is unknown".to_string(),
+    ));
+    assert_eq!(internal.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+}
+
+#[test]
 fn table_catalog_admin_operation_result_labels_are_stable() {
     let success: Result<(), ()> = Ok(());
     let failure: Result<(), ()> = Err(());
@@ -4597,6 +4617,66 @@ async fn commit_publication_holds_referenced_object_locks_until_pointer_publish(
             "snapshot metadata lock must be released after catalog publication: {location}"
         );
     }
+}
+
+#[tokio::test]
+async fn commit_publication_authority_unavailable_returns_503_without_catalog_advance() {
+    let store = TestTableCatalogStore::default();
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let before = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse");
+    metadata_backend
+        .fail_next_write_lock(
+            crate::table_catalog::default_table_publication_lock_path(&namespace, &table),
+            crate::table_catalog::TableCatalogStoreError::Unavailable(
+                "failed to acquire catalog table lock: quorum required 3, achieved 1".to_string(),
+            ),
+        )
+        .await;
+    let commit_backend = TableCommitObjectBackend::trusted(metadata_backend);
+
+    let error = publish_table_commit(
+        &store,
+        &commit_backend,
+        false,
+        crate::table_catalog::TableCommitRequest {
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            commit_id: "authority-unavailable".to_string(),
+            idempotency_key: None,
+            operation: "append".to_string(),
+            expected_version_token: before.version_token.clone(),
+            expected_metadata_location: before.metadata_location.clone(),
+            new_metadata_location: "tables/table-id/metadata/00002.metadata.json".to_string(),
+            requirements: Vec::new(),
+            writer: Some("authority-contract-test".to_string()),
+        },
+    )
+    .await
+    .expect_err("missing publication authority must fail before catalog publication");
+
+    assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+    assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert_eq!(error.message(), Some("table catalog is temporarily unavailable"));
+    let after = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should remain");
+    assert_eq!(after.metadata_location, before.metadata_location);
+    assert_eq!(after.version_token, before.version_token);
+    assert_eq!(after.generation, before.generation);
+    assert!(
+        store.commits.lock().await.is_empty(),
+        "an unattempted commit must not enter recovery history"
+    );
 }
 
 #[tokio::test]

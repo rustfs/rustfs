@@ -52,6 +52,11 @@
 //! tests where you start one server in a background task, run all your
 //! tests, and then shut it down.
 
+#[cfg(all(feature = "mimalloc", feature = "jemalloc"))]
+compile_error!("allocator features 'mimalloc' and 'jemalloc' are mutually exclusive");
+#[cfg(all(feature = "jemalloc", target_os = "windows"))]
+compile_error!("allocator feature 'jemalloc' is not supported on Windows");
+
 /// Scope-based hotpath measurement for `#[async_trait]` methods, where
 /// `#[hotpath::measure]` would only time the boxed-future construction.
 /// The guard records wall time from this statement until the enclosing
