@@ -2145,6 +2145,13 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                     candidate.insert(preserved);
                     continue;
                 }
+                if existing.authoritative && existing.dirty && bucket_usage_counts_match(&existing.usage, &candidate.get().usage)
+                {
+                    // Matching core counts make the complete scanner snapshot
+                    // equivalent for every field tracked by process-local
+                    // mutations, even when its timestamp predates the request.
+                    continue;
+                }
                 if existing.authoritative && existing.usage_updated_at > usage_updated_at {
                     candidate.insert(existing.clone());
                     continue;
