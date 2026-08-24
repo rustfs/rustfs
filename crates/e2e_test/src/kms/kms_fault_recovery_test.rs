@@ -393,11 +393,10 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Test KMS resilience to temporary resource constraints
+/// Test concurrent KMS encryption requests
 #[tokio::test]
-async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_kms_concurrent_encryption_requests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    info!("🧪 Testing KMS behavior under resource constraints");
 
     let mut kms_env = LocalKMSTestEnvironment::new().await?;
     let _default_key_id = kms_env.start_rustfs_for_local_kms().await?;
@@ -431,29 +430,27 @@ async fn test_kms_resource_constraints() -> Result<(), Box<dyn std::error::Error
     }
 
     // Wait for all uploads to complete
-    let mut successful_uploads = 0;
-    let mut failed_uploads = 0;
+    let mut failures = Vec::new();
 
     for task in upload_tasks {
-        let (object_key, result) = task.await.unwrap();
+        let (object_key, result) = task.await?;
         match result {
             Ok(_) => {
-                successful_uploads += 1;
                 info!("✅ Rapid upload {} succeeded", object_key);
             }
             Err(e) => {
-                failed_uploads += 1;
                 warn!("❌ Rapid upload {} failed: {}", object_key, e);
+                failures.push(format!("{object_key}: {e}"));
             }
         }
     }
 
-    info!("📊 Rapid upload results: {} succeeded, {} failed", successful_uploads, failed_uploads);
-
-    // We expect most uploads to succeed even under load
-    assert!(successful_uploads >= 7, "Expected at least 7/10 rapid uploads to succeed");
+    assert!(
+        failures.is_empty(),
+        "all 10 concurrent KMS uploads must succeed; failures: {}",
+        failures.join("; ")
+    );
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
-    info!("✅ Resource constraints test completed successfully");
     Ok(())
 }

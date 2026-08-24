@@ -14,14 +14,17 @@
 
 //! Tests for AWS IAM policy variables with single-value, multi-value, and nested scenarios
 
-use crate::common::{awscurl_delete, awscurl_put, init_logging};
-use crate::policy::test_env::PolicyTestEnvironment;
+use crate::common::{
+    RustFSTestEnvironment, awscurl_delete, awscurl_put, build_test_s3_config, build_test_sts_client, init_logging,
+};
+use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use tracing::info;
 
 /// Helper function to create a regular user with given credentials
 async fn create_user(
-    env: &PolicyTestEnvironment,
+    env: &RustFSTestEnvironment,
     username: &str,
     password: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,20 +39,9 @@ async fn create_user(
     Ok(())
 }
 
-/// Helper function to create an STS user with given credentials
-async fn create_sts_user(
-    env: &PolicyTestEnvironment,
-    username: &str,
-    password: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // For STS, we create a regular user first, then use it to assume roles
-    create_user(env, username, password).await?;
-    Ok(())
-}
-
 /// Helper function to create and attach a policy
 async fn create_and_attach_policy(
-    env: &PolicyTestEnvironment,
+    env: &RustFSTestEnvironment,
     policy_name: &str,
     username: &str,
     policy_document: serde_json::Value,
@@ -70,9 +62,9 @@ async fn create_and_attach_policy(
 }
 
 /// Helper function to clean up test resources
-async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, policy_name: &str) {
+async fn cleanup_user_and_policy(env: &RustFSTestEnvironment, username: &str, policy_name: &str) {
     // Create admin client for cleanup
-    let admin_client = env.create_s3_client(&env.access_key, &env.secret_key);
+    let admin_client = env.create_s3_client();
 
     // Delete buckets that might have been created by this user
     let bucket_patterns = [
@@ -84,7 +76,7 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
         format!("{username}-test"),
         format!("{username}-sts-bucket"),
         format!("{username}-service-bucket"),
-        "private-test-bucket".to_string(), // For deny test
+        format!("{username}-private-bucket"),
     ];
 
     // Try to delete objects and buckets
@@ -121,24 +113,18 @@ async fn cleanup_user_and_policy(env: &PolicyTestEnvironment, username: &str, po
 
 /// Test AWS policy variables with single-value scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_single_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_single_value_impl().await
-}
-
-/// Implementation function for single-value policy variables test
-pub async fn test_aws_policy_variables_single_value_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables single-value test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_single_value_impl_with_env(&env).await
 }
 
-/// Implementation function for single-value policy variables test with shared environment
-pub async fn test_aws_policy_variables_single_value_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_single_value_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser1";
@@ -198,9 +184,7 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
     awscurl_put(&attach_policy_url, "", &env.access_key, &env.secret_key).await?;
 
     // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let test_client = env.create_s3_client_with_credentials(test_user, test_password);
 
     // Test 1: User should be able to list buckets (allowed by policy)
     info!("Test 1: User listing buckets");
@@ -257,11 +241,13 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
     // Test 6: User should NOT be able to create bucket NOT matching username pattern
     info!("Test 6: User attempting to create bucket NOT matching pattern");
     let other_bucket_name = "other-user-bucket";
-    let create_other_result = test_client.create_bucket().bucket(other_bucket_name).send().await;
-    if create_other_result.is_ok() {
-        cleanup().await;
-        return Err("User should NOT be able to create bucket NOT matching username pattern".into());
-    }
+    let denied = test_client
+        .create_bucket()
+        .bucket(other_bucket_name)
+        .send()
+        .await
+        .expect_err("a bucket outside the username pattern must be denied");
+    assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
 
     // Cleanup
     info!("Cleaning up test resources");
@@ -273,24 +259,18 @@ pub async fn test_aws_policy_variables_single_value_impl_with_env(
 
 /// Test AWS policy variables with multi-value scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_multi_value() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_multi_value_impl().await
-}
-
-/// Implementation function for multi-value policy variables test
-pub async fn test_aws_policy_variables_multi_value_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables multi-value test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_multi_value_impl_with_env(&env).await
 }
 
-/// Implementation function for multi-value policy variables test with shared environment
-pub async fn test_aws_policy_variables_multi_value_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_multi_value_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser2";
@@ -338,7 +318,7 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     create_and_attach_policy(env, policy_name, test_user, policy_document).await?;
 
     // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
+    let test_client = env.create_s3_client_with_credentials(test_user, test_password);
 
     // Test 1: User should be able to create buckets matching any of the multi-value patterns
     info!("Test 1: User creating first bucket matching multi-value pattern");
@@ -368,11 +348,13 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
     // Test 4: User should NOT be able to create bucket NOT matching any multi-value pattern
     info!("Test 4: User attempting to create bucket NOT matching any pattern");
     let other_bucket_name = format!("{test_user}-other-bucket");
-    let create_other_result = test_client.create_bucket().bucket(&other_bucket_name).send().await;
-    if create_other_result.is_ok() {
-        cleanup().await;
-        return Err("User should NOT be able to create bucket NOT matching any multi-value pattern".into());
-    }
+    let denied = test_client
+        .create_bucket()
+        .bucket(&other_bucket_name)
+        .send()
+        .await
+        .expect_err("a bucket outside all allowed patterns must be denied");
+    assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
 
     // Test 5: User should be able to list objects in their allowed buckets
     info!("Test 5: User listing objects in allowed buckets");
@@ -398,24 +380,18 @@ pub async fn test_aws_policy_variables_multi_value_impl_with_env(
 
 /// Test AWS policy variables with variable concatenation
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_concatenation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_concatenation_impl().await
-}
-
-/// Implementation function for concatenation policy variables test
-pub async fn test_aws_policy_variables_concatenation_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables concatenation test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_concatenation_impl_with_env(&env).await
 }
 
-/// Implementation function for concatenation policy variables test with shared environment
-pub async fn test_aws_policy_variables_concatenation_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_concatenation_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser3";
@@ -455,10 +431,7 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
     create_and_attach_policy(env, policy_name, test_user, policy_document).await?;
 
     // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
-
-    // Add a small delay to allow policy to propagate
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let test_client = env.create_s3_client_with_credentials(test_user, test_password);
 
     // Test: User should be able to create bucket matching concatenated pattern
     info!("Test: User creating bucket matching concatenated pattern");
@@ -487,41 +460,30 @@ pub async fn test_aws_policy_variables_concatenation_impl_with_env(
 
 /// Test AWS policy variables with nested scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_nested() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_nested_impl().await
-}
-
-/// Implementation function for nested policy variables test
-pub async fn test_aws_policy_variables_nested_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables nested test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_nested_impl_with_env(&env).await
 }
 
 /// Test AWS policy variables with STS temporary credentials
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_sts() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_sts_impl().await
-}
-
-/// Implementation function for STS policy variables test
-pub async fn test_aws_policy_variables_sts_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables STS test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_sts_impl_with_env(&env).await
 }
 
-/// Implementation function for nested policy variables test with shared environment
-pub async fn test_aws_policy_variables_nested_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_nested_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser4";
@@ -561,10 +523,7 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
     create_and_attach_policy(env, policy_name, test_user, policy_document).await?;
 
     // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
-
-    // Add a small delay to allow policy to propagate
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let test_client = env.create_s3_client_with_credentials(test_user, test_password);
 
     // Test nested variable resolution
     info!("Test: Nested variable resolution");
@@ -581,14 +540,14 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
         return Err(format!("User should be able to create bucket with nested variable: {e}").into());
     }
 
-    // Verify bucket creation fails with unresolved variable
-    let unresolved_bucket = format!("${{}}-test {test_user}");
-    let create_unresolved = test_client.create_bucket().bucket(&unresolved_bucket).send().await;
-
-    if create_unresolved.is_ok() {
-        cleanup().await;
-        return Err("User should NOT be able to create bucket with unresolved variable".into());
-    }
+    // Verify a valid bucket name outside the resolved resource is denied.
+    let denied = test_client
+        .create_bucket()
+        .bucket("other-user-test")
+        .send()
+        .await
+        .expect_err("a bucket outside the resolved nested variable must be denied");
+    assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
 
     // Cleanup
     info!("Cleaning up test resources");
@@ -598,9 +557,8 @@ pub async fn test_aws_policy_variables_nested_impl_with_env(
     Ok(())
 }
 
-/// Implementation function for STS policy variables test with shared environment
-pub async fn test_aws_policy_variables_sts_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_sts_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user for STS
     let test_user = "testuser-sts";
@@ -612,8 +570,7 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
         cleanup_user_and_policy(env, test_user, policy_name).await;
     };
 
-    // Create STS user
-    create_sts_user(env, test_user, test_password).await?;
+    create_user(env, test_user, test_password).await?;
 
     // Create policy with STS-compatible variables
     let policy_document = serde_json::json!({
@@ -626,12 +583,22 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
             },
             {
                 "Effect": "Allow",
+                "Action": ["sts:AssumeRole"],
+                "Resource": ["arn:aws:s3:::*"]
+            },
+            {
+                "Effect": "Allow",
                 "Action": ["s3:CreateBucket"],
                 "Resource": [format!("arn:aws:s3:::{}-sts-bucket", "${aws:username}")]
             },
             {
                 "Effect": "Allow",
-                "Action": ["s3:ListBucket", "s3:PutObject", "s3:GetObject"],
+                "Action": ["s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{}-sts-bucket", "${aws:username}")]
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:GetObject"],
                 "Resource": [format!("arn:aws:s3:::{}-sts-bucket/*", "${aws:username}")]
             }
         ]
@@ -639,11 +606,22 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
 
     create_and_attach_policy(env, policy_name, test_user, policy_document).await?;
 
-    // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
-
-    // Add a small delay to allow policy to propagate
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let assumed = build_test_sts_client(&env.url, test_user, test_password, None, "policy-variable-sts")
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/policy-variable")
+        .role_session_name("policy-variable-e2e")
+        .send()
+        .await?;
+    let credentials = assumed
+        .credentials()
+        .ok_or("AssumeRole response should contain temporary credentials")?;
+    let test_client = Client::from_conf(build_test_s3_config(
+        &env.url,
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        Some(credentials.session_token()),
+        "policy-variable-sts-session",
+    ));
 
     // Test: User should be able to create bucket matching STS pattern
     info!("Test: User creating bucket matching STS pattern");
@@ -699,24 +677,18 @@ pub async fn test_aws_policy_variables_sts_impl_with_env(
 
 /// Test AWS policy variables with deny scenarios
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server; enable when running full E2E"]
 pub async fn test_aws_policy_variables_deny() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_aws_policy_variables_deny_impl().await
-}
-
-/// Implementation function for deny policy variables test
-pub async fn test_aws_policy_variables_deny_impl() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting AWS policy variables deny test");
 
-    let env = PolicyTestEnvironment::with_address("127.0.0.1:9000").await?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
 
     test_aws_policy_variables_deny_impl_with_env(&env).await
 }
 
-/// Implementation function for deny policy variables test with shared environment
-pub async fn test_aws_policy_variables_deny_impl_with_env(
-    env: &PolicyTestEnvironment,
+async fn test_aws_policy_variables_deny_impl_with_env(
+    env: &RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create test user
     let test_user = "testuser5";
@@ -759,10 +731,7 @@ pub async fn test_aws_policy_variables_deny_impl_with_env(
     create_and_attach_policy(env, policy_name, test_user, policy_document).await?;
 
     // Create S3 client for test user
-    let test_client = env.create_s3_client(test_user, test_password);
-
-    // Add a small delay to allow policy to propagate
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let test_client = env.create_s3_client_with_credentials(test_user, test_password);
 
     // Test 1: User should be able to create bucket matching username pattern
     info!("Test 1: User creating bucket matching username pattern");
@@ -775,12 +744,14 @@ pub async fn test_aws_policy_variables_deny_impl_with_env(
 
     // Test 2: User should NOT be able to create bucket with "private" in the name (deny rule)
     info!("Test 2: User attempting to create bucket with 'private' in name (should be denied)");
-    let private_bucket_name = "private-test-bucket";
-    let create_private_result = test_client.create_bucket().bucket(private_bucket_name).send().await;
-    if create_private_result.is_ok() {
-        cleanup().await;
-        return Err("User should NOT be able to create bucket with 'private' in name due to deny rule".into());
-    }
+    let private_bucket_name = format!("{test_user}-private-bucket");
+    let denied = test_client
+        .create_bucket()
+        .bucket(&private_bucket_name)
+        .send()
+        .await
+        .expect_err("the explicit deny must reject a matching bucket name");
+    assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
 
     // Cleanup
     info!("Cleaning up test resources");

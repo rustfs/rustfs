@@ -151,7 +151,8 @@ impl ScannerIOCycle for ECStore {
                     ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch)
                 );
             }
-            let activity_status = scanner_cycle_activity_status(self, distributed, &activity_before).await;
+            let (activity_status, remote_publication_lease_targets) =
+                scanner_cycle_activity_status(self, distributed, &activity_before).await;
             let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
             let status = classify_nsscanner_cycle(
                 true,
@@ -187,6 +188,7 @@ impl ScannerIOCycle for ECStore {
             };
             return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
                 .with_publication_epoch(publication_epoch)
+                .with_remote_publication_lease_targets(remote_publication_lease_targets)
                 .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
         }
 
@@ -400,7 +402,8 @@ impl ScannerIOCycle for ECStore {
         let budget_elapsed = budget.budget_elapsed();
         let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
         let dirty_usage_current = dirty_usage_status == DirtyUsageSnapshotStatus::Current;
-        let activity_status = scanner_cycle_activity_status(self, distributed, &activity_before).await;
+        let (activity_status, remote_publication_lease_targets) =
+            scanner_cycle_activity_status(self, distributed, &activity_before).await;
         let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
         let completed_usage = completed_data_usage_info(
             &results,
@@ -460,6 +463,7 @@ impl ScannerIOCycle for ECStore {
         };
         Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
+            .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_failed_dirty_usage(!failed_buckets.is_empty())
             .with_pending_maintenance_work(pending_maintenance_work)
