@@ -44,7 +44,7 @@ use std::sync::OnceLock;
 static CGROUP_RESOURCES: OnceLock<CgroupResources> = OnceLock::new();
 
 /// Detected cgroup resource limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CgroupResources {
     /// CPU quota in cores (e.g., 2 means 2 cores). None if unlimited.
     pub cpu_cores: Option<usize>,
@@ -54,21 +54,9 @@ pub struct CgroupResources {
     pub detected: bool,
 }
 
-impl Default for CgroupResources {
-    fn default() -> Self {
-        Self {
-            cpu_cores: None,
-            memory_bytes: None,
-            detected: false,
-        }
-    }
-}
-
 // Linux-specific cgroup detection
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::CgroupResources;
-
     /// Cgroup v2 CPU limit path
     const CGROUP_V2_CPU_MAX_PATH: &str = "/sys/fs/cgroup/cpu.max";
     /// Cgroup v1 CPU quota path
@@ -95,7 +83,7 @@ mod linux {
     /// Format: `"$MAX_PERIOD"` or `"$QUOTA $PERIOD"` where MAX means unlimited.
     fn detect_cgroup_v2_cpus() -> Option<usize> {
         let content = std::fs::read_to_string(CGROUP_V2_CPU_MAX_PATH).ok()?;
-        let parts: Vec<&str> = content.trim().split_whitespace().collect();
+        let parts: Vec<&str> = content.split_whitespace().collect();
 
         match parts.len() {
             1 => {
@@ -105,11 +93,11 @@ mod linux {
                 }
                 // Some systems use single value as quota with default period
                 let quota = parts[0].parse::<u64>().ok()?;
-                if quota <= 0 {
+                if quota == 0 {
                     return None;
                 }
                 let period = 100_000u64; // Default cgroup period
-                Some(((quota + period - 1) / period) as usize)
+                Some(quota.div_ceil(period) as usize)
             }
             2 => {
                 // Format: "$QUOTA $PERIOD"
@@ -118,10 +106,10 @@ mod linux {
                 }
                 let quota = parts[0].parse::<u64>().ok()?;
                 let period = parts[1].parse::<u64>().ok()?;
-                if quota <= 0 || period <= 0 {
+                if quota == 0 || period == 0 {
                     return None;
                 }
-                Some(((quota + period - 1) / period) as usize)
+                Some(quota.div_ceil(period) as usize)
             }
             _ => None,
         }
@@ -139,7 +127,7 @@ mod linux {
             return None;
         }
 
-        Some(((quota + period - 1) / period) as usize)
+        Some(quota.div_ceil(period) as usize)
     }
 
     /// Detect CPU cores from cgroup, trying v2 first, then v1.
