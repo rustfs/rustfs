@@ -103,8 +103,7 @@ fn apply_object_traffic_snapshot(report: &mut DependencyReadinessReport, snapsho
 
 pub(crate) fn readiness_source_for_probe(probe: HealthProbe) -> Option<HealthReadinessSource> {
     match probe {
-        HealthProbe::Liveness => None,
-        HealthProbe::Readiness => Some(HealthReadinessSource::Node),
+        HealthProbe::Liveness | HealthProbe::Readiness => Some(HealthReadinessSource::Node),
         HealthProbe::ClusterWrite => Some(HealthReadinessSource::ClusterWrite),
         HealthProbe::ClusterRead => Some(HealthReadinessSource::ClusterRead),
     }
@@ -117,15 +116,19 @@ pub(crate) fn health_check_state(
     peer_health_ready: bool,
     probe: HealthProbe,
 ) -> HealthCheckState {
+    let ready = storage_ready && iam_ready && peer_health_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
+
     if probe == HealthProbe::Liveness {
+        // Liveness always returns HTTP 200 (process is alive), but the `ready`
+        // field now reflects actual node readiness so that callers who inspect
+        // the body get a truthful signal instead of a hardcoded `true`.
         return HealthCheckState {
             status_code: StatusCode::OK,
-            status: "ok",
-            ready: true,
+            status: if ready { "ok" } else { "degraded" },
+            ready,
         };
     }
 
-    let ready = storage_ready && iam_ready && peer_health_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
     let status = if ready { "ok" } else { "degraded" };
 
     let status_code = if ready {
@@ -287,7 +290,7 @@ pub(crate) fn build_health_response_parts(
 ) -> HealthResponseParts {
     let (storage_ready, iam_ready, lock_quorum_ready, mut health, mut degraded_reasons, include_dependency_details) =
         match (probe, readiness_report) {
-            (probe @ (HealthProbe::Readiness | HealthProbe::ClusterWrite | HealthProbe::ClusterRead), Some(readiness_report)) => {
+            (probe, Some(readiness_report)) => {
                 let storage_ready = readiness_report.readiness.storage_ready;
                 let iam_ready = readiness_report.readiness.iam_ready;
                 let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
@@ -313,7 +316,7 @@ pub(crate) fn build_health_response_parts(
                 vec![ReadinessDegradedReason::StorageIamAndLockUnavailable],
                 true,
             ),
-            (HealthProbe::Liveness, _) => (
+            (HealthProbe::Liveness, None) => (
                 false,
                 false,
                 false,
