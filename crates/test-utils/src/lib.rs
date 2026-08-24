@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! Shared test bootstrap helpers for RustFS integration tests
 //! (backlog#1153 infra-1).
 //!
