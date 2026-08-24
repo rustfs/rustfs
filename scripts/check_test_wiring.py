@@ -209,17 +209,142 @@ def check_runner_selection(root: Path) -> list[str]:
         errors.append("scripts/run_e2e_tests.sh: --test is documented as a pattern and must not force exact matching")
     if 'eval "$test_cmd"' in runner:
         errors.append("scripts/run_e2e_tests.sh: command construction must not use eval")
+    start = re.search(r"start_rustfs\(\) \{(?P<body>.*?)\n\}\n\n# Function to run tests", runner, re.DOTALL)
+    start_body = start.group("body") if start else ""
+    if '"http://localhost:9000/health/ready"' not in start_body or not re.search(
+        r"curl [^\n]*(?:--fail|-f(?:\s|$))", start_body
+    ):
+        errors.append("scripts/run_e2e_tests.sh: startup must require the ready endpoint to return HTTP success")
+    if start_body.count("return 0") != 1 or "nc -z" in start_body:
+        errors.append("scripts/run_e2e_tests.sh: startup readiness must not fall back to process or port liveness")
+    failed_start = re.search(r"if ! start_rustfs; then(?P<body>.*?)\n\s*fi", runner, re.DOTALL)
+    failed_start_commands = (
+        [line.strip() for line in failed_start.group("body").splitlines() if line.strip()] if failed_start else []
+    )
+    if failed_start_commands != ['print_error "Failed to start RustFS properly"', "exit 1"]:
+        errors.append("scripts/run_e2e_tests.sh: failed startup must not continue into tests")
     return errors
 
 
 def check_s3_tests_runner(root: Path) -> list[str]:
     runner = (root / "scripts/s3-tests/run.sh").read_text()
+    errors: list[str] = []
     if "--showlocals" in runner:
-        return ["scripts/s3-tests/run.sh: pytest failure diagnostics must not dump local values"]
-    return []
+        errors.append("scripts/s3-tests/run.sh: pytest failure diagnostics must not dump local values")
+    readiness = re.search(
+        r"test_s3_api_ready\(\) \{(?P<body>.*?)\n\}\n\n# First, wait",
+        runner,
+        re.DOTALL,
+    )
+    readiness_body = readiness.group("body") if readiness else ""
+    if (
+        '"http://${S3_HOST}:${S3_PORT}/health/ready"' not in readiness_body
+        or re.search(r"/health(?=[\"'\s])", readiness_body)
+        or '[ "${READY_CODE}" != "200" ]' not in readiness_body
+    ):
+        errors.append("scripts/s3-tests/run.sh: startup must require the ready endpoint to return HTTP 200")
+    signed_probe = re.search(
+        r"if command -v awscurl\b[^\n]*; then(?P<body>.*?)\n\s*fi\s*"
+        r"(?:#[^\n]*\n\s*)*return 0\s*$",
+        readiness_body,
+        re.DOTALL,
+    )
+    signed_body = signed_probe.group("body") if signed_probe else ""
+    readiness_code = "\n".join(line.split("#", 1)[0] for line in readiness_body.splitlines())
+    signed_code = "\n".join(line.split("#", 1)[0] for line in signed_body.splitlines())
+    signed_commands = [
+        command
+        for line in signed_body.splitlines()
+        if (command := line.split("#", 1)[0].strip())
+    ]
+    signed_success = re.search(
+        r'if echo "\$\{RESPONSE\}" \| grep -q "<ListAllMyBucketsResult"; then\s*'
+        r"(?:#[^\n]*\n\s*)*return 0\s*\n\s*fi",
+        signed_body,
+    )
+    response_capture = re.search(
+        r"^\s*RESPONSE=\$\((?P<command>.*?)\)\s*$",
+        signed_code,
+        re.DOTALL | re.MULTILINE,
+    )
+    response_command = response_capture.group("command") if response_capture else ""
+    response_command = response_command.replace("\\\n", " ").strip()
+    response_operators = re.search(
+        r";|\|\||&&|(?<![>|])\|(?!\|)|(?<![>&])&(?![>&0-9])|\$\(|[<>]\(|`",
+        response_command,
+    )
+    if (
+        len(re.findall(r"\breturn\s+0\b", readiness_code)) != 2
+        or len(re.findall(r"\breturn\s+0\b", signed_code)) != 1
+        or len(re.findall(r"(?<![A-Za-z0-9_])RESPONSE=", signed_code)) != 1
+        or not response_command.startswith("awscurl ")
+        or "\n" in response_command
+        or response_operators
+        or not signed_success
+        or not signed_commands
+        or signed_commands[-1] != "return 1"
+    ):
+        errors.append("scripts/s3-tests/run.sh: readiness must bind success to the signed probe")
+    return errors
 
 
-def profile_selection(root: Path, profile: str) -> str:
+def check_workflow_readiness(root: Path) -> list[str]:
+    errors: list[str] = []
+    for relative in (".github/workflows/e2e-s3tests.yml", ".github/workflows/mint.yml"):
+        path = root / relative
+        try:
+            lines = path.read_text().splitlines()
+        except FileNotFoundError:
+            errors.append(f"{relative}: missing workflow")
+            continue
+        start = next(
+            (index for index, line in enumerate(lines) if line.strip() == "- name: Wait for RustFS ready"),
+            None,
+        )
+        if start is None:
+            errors.append(f"{relative}: missing RustFS readiness step")
+            continue
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].strip().startswith("- name:")
+                and len(lines[index]) - len(lines[index].lstrip()) <= indent
+            ),
+            len(lines),
+        )
+        readiness_step = "\n".join(lines[start:end])
+        ready_branch = re.search(
+            r"if curl [^\n]*/health/ready[^\n]*; then(?P<body>.*?)\n\s*fi",
+            readiness_step,
+            re.DOTALL,
+        )
+        ready_body = ready_branch.group("body") if ready_branch else ""
+        ready_condition = ready_branch.group(0).splitlines()[0].rsplit("; then", 1)[0] if ready_branch else ""
+        step_commands = [
+            command
+            for line in readiness_step.splitlines()
+            if (command := line.split("#", 1)[0].strip())
+        ]
+        step_code = "\n".join(step_commands)
+        ready_code = "\n".join(line.split("#", 1)[0] for line in ready_body.splitlines())
+        if (
+            "/health/ready" not in readiness_step
+            or re.search(r"/health(?=[\"'\s])", readiness_step)
+            or not re.search(r"curl [^\n]*(?:-sf|-fs|--fail)", readiness_step)
+            or not ready_branch
+            or re.search(r"\|\||&&|(?<![>|])\|(?!\|)|;|(?<![>&])&(?![>&])", ready_condition)
+            or len(re.findall(r"\bexit\s+0\b", step_code)) != 1
+            or not re.search(r"\bexit\s+0\b", ready_code)
+            or not step_commands
+            or step_commands[-1] != "exit 1"
+        ):
+            errors.append(f"{relative}: RustFS readiness step must fail closed on /health/ready")
+    return errors
+
+
+def profile_selection_entries(root: Path, profile: str) -> tuple[Path, list[str], dict[str, str]]:
     if not re.fullmatch(r"e2e-[a-z0-9-]+", profile):
         raise ValueError(f"invalid e2e profile name: {profile}")
     path = root / f".config/{profile}-selection.txt"
@@ -227,11 +352,39 @@ def profile_selection(root: Path, profile: str) -> str:
     values = dict(line.split("=", 1) for line in lines if "=" in line)
     if len(values) != len(lines) or any(not re.fullmatch(r"sha256(?:-[a-z0-9]+)?", key) for key in values):
         raise ValueError(f"{path.relative_to(root).as_posix()}: invalid sha256 entry")
+    return path, lines, values
+
+
+def profile_selection(root: Path, profile: str) -> str:
+    path, _, values = profile_selection_entries(root, profile)
     key = f"sha256-{sys.platform}"
     digest = values.get(key, values.get("sha256", ""))
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError(f"{path.relative_to(root).as_posix()}: missing sha256 for {sys.platform}")
     return digest
+
+
+def profile_listing_digest(listing: Path) -> tuple[int, str]:
+    data = json.loads(listing.read_text())
+    selected = sorted(
+        f"{suite_id}::{test_name}"
+        for suite_id, suite in data["rust-suites"].items()
+        for test_name, testcase in suite["testcases"].items()
+        if testcase.get("filter-match", {}).get("status") == "matches"
+    )
+    return len(selected), hashlib.sha256(("\n".join(selected) + "\n").encode()).hexdigest()
+
+
+def update_profile_selection(root: Path, profile: str, listing: Path, platform: str) -> tuple[int, str, str]:
+    if not re.fullmatch(r"[a-z0-9]+", platform):
+        raise ValueError(f"invalid platform name: {platform}")
+    path, lines, values = profile_selection_entries(root, profile)
+    key = "sha256" if "sha256" in values else f"sha256-{platform}"
+    if key not in values:
+        raise ValueError(f"{path.relative_to(root).as_posix()}: missing {key} entry")
+    count, digest = profile_listing_digest(listing)
+    path.write_text("\n".join(f"{key}={digest}" if line.startswith(f"{key}=") else line for line in lines) + "\n")
+    return count, digest, key
 
 
 def check_profile_definitions(root: Path) -> list[str]:
@@ -547,22 +700,15 @@ def check_scheduled_alerts(root: Path) -> list[str]:
 def check_profile_listing(root: Path, profile: str, listing: Path) -> list[str]:
     try:
         expected_digest = profile_selection(root, profile)
-        data = json.loads(listing.read_text())
-        selected = sorted(
-            f"{suite_id}::{test_name}"
-            for suite_id, suite in data["rust-suites"].items()
-            for test_name, testcase in suite["testcases"].items()
-            if testcase.get("filter-match", {}).get("status") == "matches"
-        )
-        digest = hashlib.sha256(("\n".join(selected) + "\n").encode()).hexdigest()
+        count, digest = profile_listing_digest(listing)
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         return [f"cannot read {profile} nextest listing: {error}"]
     if digest != expected_digest:
         return [
-            f"{profile} selection changed: count={len(selected)} sha256={digest}; "
+            f"{profile} selection changed: count={count} sha256={digest}; "
             f"expected sha256={expected_digest}"
         ]
-    print(f"{profile} selection OK: {len(selected)} tests, sha256={digest}")
+    print(f"{profile} selection OK: {count} tests, sha256={digest}")
     return []
 
 
@@ -572,12 +718,46 @@ def validate(root: Path) -> list[str]:
     errors.extend(check_fuzz_targets(root))
     errors.extend(check_runner_selection(root))
     errors.extend(check_s3_tests_runner(root))
+    errors.extend(check_workflow_readiness(root))
     errors.extend(check_profile_definitions(root))
     errors.extend(check_scheduled_alerts(root))
     return errors
 
 
 class SelfTests(unittest.TestCase):
+    def test_runner_readiness_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "scripts/run_e2e_tests.sh"
+            script.parent.mkdir(parents=True)
+            valid_runner = (
+                "start_rustfs() {\n"
+                '  curl --fail "http://localhost:9000/health/ready" && return 0\n'
+                "  return 1\n"
+                "}\n\n# Function to run tests\n"
+                "--include-ignored --test-threads=1\n"
+                "if ! start_rustfs; then\n"
+                '  print_error "Failed to start RustFS properly"\n'
+                "  exit 1\n"
+                "fi\n"
+            )
+            script.write_text(valid_runner)
+            self.assertEqual(check_runner_selection(root), [])
+
+            script.write_text(valid_runner.replace("/health/ready", "/health"))
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
+            script.write_text(valid_runner.replace("return 1", "nc -z localhost 9000 && return 0"))
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
+            script.write_text(
+                valid_runner.replace(
+                    '  print_error "Failed to start RustFS properly"\n  exit 1',
+                    '  if [ -n "$RUSTFS_PID" ]; then\n    echo continuing\n  else\n    exit 1\n  fi',
+                )
+            )
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
     def test_e2e_requires_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -647,18 +827,113 @@ class SelfTests(unittest.TestCase):
             root = Path(tmp)
             runner = root / "scripts/s3-tests/run.sh"
             runner.parent.mkdir(parents=True)
-            runner.write_text("tox -- -vv -ra --tb=long\n")
+            valid_runner = (
+                "test_s3_api_ready() {\n"
+                '    READY_CODE=$(curl "http://${S3_HOST}:${S3_PORT}/health/ready")\n'
+                '    if [ "${READY_CODE}" != "200" ]; then\n'
+                "        return 1\n"
+                "    fi\n"
+                "    if command -v awscurl; then\n"
+                "        RESPONSE=$(awscurl --service s3)\n"
+                '        if echo "${RESPONSE}" | grep -q "<ListAllMyBucketsResult"; then\n'
+                "            return 0\n"
+                "        fi\n"
+                "        return 1\n"
+                "    fi\n"
+                "    return 0\n"
+                "}\n\n# First, wait\n"
+                "tox -- -vv -ra --tb=long\n"
+            )
+            runner.write_text(valid_runner)
             self.assertEqual(check_s3_tests_runner(root), [])
-            runner.write_text("tox -- -vv -ra --showlocals --tb=long\n")
+            runner.write_text(valid_runner.replace("--tb=long", "--showlocals --tb=long"))
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(valid_runner.replace("/health/ready", "/health"))
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(valid_runner.replace("    return 0\n}\n", "    return 0\n    return 0\n}\n"))
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(
+                valid_runner.replace(
+                    "        return 1\n    fi\n    return 0\n",
+                    "        return 0\n    fi\n    return 1\n",
+                )
+            )
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(valid_runner.replace("        return 1\n    fi", "        false || return 0\n        return 1\n    fi"))
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(valid_runner.replace('echo "${RESPONSE}"', 'echo "<ListAllMyBucketsResult"'))
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(
+                valid_runner.replace(
+                    "RESPONSE=$(awscurl --service s3)",
+                    'RESPONSE=$(awscurl --service s3 || echo "<ListAllMyBucketsResult")',
+                )
+            )
+            self.assertEqual(len(check_s3_tests_runner(root)), 1)
+            runner.write_text(
+                valid_runner.replace(
+                    "RESPONSE=$(awscurl --service s3)",
+                    'RESPONSE=$(awscurl --service s3; echo "<ListAllMyBucketsResult")',
+                )
+            )
             self.assertEqual(len(check_s3_tests_runner(root)), 1)
             with (
                 mock.patch(__name__ + ".check_e2e_modules", return_value=[]),
                 mock.patch(__name__ + ".check_fuzz_targets", return_value=[]),
                 mock.patch(__name__ + ".check_runner_selection", return_value=[]),
+                mock.patch(__name__ + ".check_workflow_readiness", return_value=[]),
                 mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
                 mock.patch(__name__ + ".check_scheduled_alerts", return_value=[]),
             ):
                 self.assertEqual(len(validate(root)), 1)
+
+    def test_workflow_readiness_requires_dependency_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            valid_workflow = (
+                "jobs:\n"
+                "  test:\n"
+                "    steps:\n"
+                "      - name: Wait for RustFS ready\n"
+                "        run: |\n"
+                "          for _ in {1..60}; do\n"
+                "            if curl -sf http://127.0.0.1:9000/health/ready; then\n"
+                "              exit 0\n"
+                "            fi\n"
+                "          done\n"
+                "          exit 1\n"
+                "      - name: Run tests\n"
+                "        run: true\n"
+            )
+            for name in ("e2e-s3tests.yml", "mint.yml"):
+                (workflows / name).write_text(valid_workflow)
+            self.assertEqual(check_workflow_readiness(root), [])
+
+            (workflows / "mint.yml").write_text(valid_workflow.replace("/health/ready", "/health"))
+            self.assertEqual(len(check_workflow_readiness(root)), 1)
+            (workflows / "mint.yml").write_text(
+                valid_workflow.replace(
+                    "if curl -sf http://127.0.0.1:9000/health/ready; then",
+                    "if curl -sf http://127.0.0.1:9000/health/ready || true; then",
+                )
+            )
+            self.assertEqual(len(check_workflow_readiness(root)), 1)
+            (workflows / "mint.yml").write_text(
+                valid_workflow.replace(
+                    "if curl -sf http://127.0.0.1:9000/health/ready; then",
+                    "if curl -sf http://127.0.0.1:9000/health/ready || :; then",
+                )
+            )
+            self.assertEqual(len(check_workflow_readiness(root)), 1)
+            (workflows / "mint.yml").write_text(
+                valid_workflow.replace(
+                    "if curl -sf http://127.0.0.1:9000/health/ready; then\n              exit 0\n            fi",
+                    "curl -sf http://127.0.0.1:9000/health/ready || true\n            exit 0",
+                )
+            )
+            self.assertEqual(len(check_workflow_readiness(root)), 1)
 
     def test_profile_listing_enforces_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -706,6 +981,45 @@ class SelfTests(unittest.TestCase):
             )
             with mock.patch.object(sys, "platform", "linux"):
                 self.assertEqual(len(check_profile_listing(root, "e2e-full", listing)), 1)
+
+    def test_update_profile_selection_changes_only_requested_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".config").mkdir()
+            darwin_digest = "a" * 64
+            (root / ".config/e2e-full-selection.txt").write_text(
+                f"sha256-darwin={darwin_digest}\nsha256-linux={'b' * 64}\n"
+            )
+            listing = root / "listing.json"
+            listing.write_text(
+                json.dumps(
+                    {
+                        "rust-suites": {
+                            "suite": {
+                                "testcases": {"linux": {"filter-match": {"status": "matches"}}}
+                            }
+                        }
+                    }
+                )
+            )
+
+            count, digest, key = update_profile_selection(root, "e2e-full", listing, "linux")
+
+            self.assertEqual(count, 1)
+            self.assertEqual(key, "sha256-linux")
+            self.assertEqual(
+                (root / ".config/e2e-full-selection.txt").read_text(),
+                f"sha256-darwin={darwin_digest}\nsha256-linux={digest}\n",
+            )
+            with mock.patch.object(sys, "platform", "linux"):
+                self.assertEqual(check_profile_listing(root, "e2e-full", listing), [])
+            selection = root / ".config/e2e-smoke-selection.txt"
+            selection.write_text(f"sha256={'a' * 64}\n")
+
+            count, digest, key = update_profile_selection(root, "e2e-smoke", listing, "linux")
+
+            self.assertEqual((count, key), (1, "sha256"))
+            self.assertEqual(selection.read_text(), f"sha256={digest}\n")
 
     def test_scheduled_alerts_require_completion_watchdog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -984,9 +1298,18 @@ def main() -> int:
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
         return 0
+    if len(sys.argv) == 5 and sys.argv[1] == "--update-profile":
+        try:
+            count, digest, key = update_profile_selection(ROOT, sys.argv[2], Path(sys.argv[3]), sys.argv[4])
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"ERROR: cannot update {sys.argv[2]} selection: {error}", file=sys.stderr)
+            return 1
+        print(f"Updated .config/{sys.argv[2]}-selection.txt: count={count} {key}={digest}")
+        return 0
     if sys.argv[1:]:
         print(
-            "usage: check_test_wiring.py [--self-test | --check-profile PROFILE LISTING]",
+            "usage: check_test_wiring.py [--self-test | --check-profile PROFILE LISTING | "
+            "--update-profile PROFILE LISTING PLATFORM]",
             file=sys.stderr,
         )
         return 2

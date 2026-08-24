@@ -46,10 +46,16 @@ pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
 pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
 pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
 pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 6;
+/// Protocol v6 carries the activity fields that predate the storage-owned
+/// movement generation.  It remains readable during the rolling upgrade, but
+/// a scanner must not use it as a publication proof because terminal movement
+/// state is not authenticated by that version.
+pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +63,8 @@ pub struct NsScannerCapabilityResponse {
     pub version: u16,
     pub server_epoch: uuid::Uuid,
     pub proof: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_tier_registry_generation: Option<bool>,
 }
 
 pub mod admin;

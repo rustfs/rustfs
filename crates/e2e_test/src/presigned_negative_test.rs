@@ -340,7 +340,18 @@ async fn tampered_presigned_put_returns_signature_does_not_match() -> Result<(),
     assert_error_code(&body, "SignatureDoesNotMatch");
 
     // The rejected write must not have created the object.
-    let head = env.create_s3_client().head_object().bucket(BUCKET).key(key).send().await;
-    assert!(head.is_err(), "tampered presigned PUT must not store the object");
+    let error = env
+        .create_s3_client()
+        .head_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("tampered presigned PUT must not store the object");
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "tampered presigned PUT absence probe must return HTTP 404, got {error:?}"
+    );
     Ok(())
 }

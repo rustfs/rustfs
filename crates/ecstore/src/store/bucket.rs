@@ -327,7 +327,7 @@ impl ECStore {
     async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
         run_bucket_usage_cleanup(guard, bucket, async {
             crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
-            crate::data_usage::remove_bucket_usage_from_backend_with_guard(self, bucket, guard).await
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, guard).await
         })
         .await
     }
@@ -842,6 +842,7 @@ mod tests {
     use crate::runtime::instance::InstanceContext;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations as _, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
+        list::ListOperations as _,
         object::{ObjectIO as _, ObjectOperations as _},
     };
     use crate::store::{ECStore, init_local_disks_with_instance_ctx};
@@ -1662,6 +1663,70 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("DeleteBucket must succeed once the client has drained the bucket");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_succeeds_after_listing_and_deleting_an_unversioned_overwrite() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-after-overwrite-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("unversioned bucket should be created");
+
+        let mut first_reader = PutObjReader::from_vec(b"version A".to_vec());
+        let first = ecstore
+            .put_object(&bucket, object, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("version A should be written");
+        let mut second_reader = PutObjReader::from_vec(b"version B".to_vec());
+        let second = ecstore
+            .put_object(&bucket, object, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("version B should overwrite version A");
+        assert_ne!(first.data_dir, second.data_dir, "the overwrite must publish a new body generation");
+
+        let listing = ecstore
+            .clone()
+            .list_object_versions(&bucket, "", None, None, None, 1000)
+            .await
+            .expect("the overwritten object should remain listable for teardown");
+        assert_eq!(listing.objects.len(), 1, "an unversioned overwrite should expose one current version");
+        let current = &listing.objects[0];
+        assert_eq!(current.name, object);
+        assert!(current.is_latest, "the listed null version must be current");
+        assert_eq!(current.version_id, None, "an unversioned object must be exposed as the null version");
+        assert_eq!(
+            current.data_dir, second.data_dir,
+            "listing must expose version B, not the overwritten body"
+        );
+
+        for version in listing.objects {
+            let version_id = version.version_id.map(|version_id| version_id.to_string());
+            ecstore
+                .delete_object(
+                    &bucket,
+                    &version.name,
+                    ObjectOptions {
+                        version_id,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("each version returned by teardown listing should be deletable");
+        }
+
+        assert!(
+            !any_disk_has_object_metadata(&disk_paths, &bucket).await,
+            "deleting the listed null version must remove every xl.meta"
+        );
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("DeleteBucket should succeed after the listed overwrite is deleted");
     }
 
     #[tokio::test]

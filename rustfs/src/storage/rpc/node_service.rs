@@ -24,9 +24,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_S
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
-    reload_transition_tier_config,
+    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+    SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _,
+    StorageResult, all_local_disk_path, find_local_disk_by_ref, reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
 use crate::storage::storage_api::{
@@ -153,7 +153,7 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -237,7 +237,23 @@ fn scanner_activity_response(
         response_proof: Bytes::new(),
         dirty_usage_generation: dirty_usage.generation,
         dirty_usage_pending: dirty_usage.pending,
+        movement_generation: None,
+        publication_blocked: None,
     }
+}
+
+fn scanner_activity_response_v7(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+    movement_generation: u64,
+    publication_blocked: bool,
+) -> ScannerActivityResponse {
+    let mut response = scanner_activity_response(namespace_generation, topology_digest, data_movement_active, dirty_usage);
+    response.movement_generation = Some(movement_generation);
+    response.publication_blocked = Some(publication_blocked);
+    response
 }
 
 fn previous_scanner_activity_response(
@@ -255,6 +271,8 @@ fn previous_scanner_activity_response(
         response_proof: Bytes::new(),
         dirty_usage_generation: 0,
         dirty_usage_pending: false,
+        movement_generation: None,
+        publication_blocked: None,
     }
 }
 
@@ -269,6 +287,29 @@ fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivit
         response_proof: Bytes::new(),
         dirty_usage_generation: 0,
         dirty_usage_pending: false,
+        movement_generation: None,
+        publication_blocked: None,
+    }
+}
+
+fn v6_scanner_activity_response(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+        topology_digest: topology_digest.to_vec().into(),
+        data_movement_active,
+        response_proof: Bytes::new(),
+        dirty_usage_generation: dirty_usage.generation,
+        dirty_usage_pending: dirty_usage.pending,
+        movement_generation: None,
+        publication_blocked: None,
     }
 }
 
@@ -1826,7 +1867,7 @@ impl Node for NodeService {
                     return Err(Status::invalid_argument("scanner activity protocol v4 cannot acknowledge dirty usage"));
                 }
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION | rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
                 let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
                     .map_err(|_| Status::invalid_argument("scanner activity request is too large to authenticate"))?;
                 verify_tonic_canonical_body_digest(&request, &canonical)
@@ -1873,16 +1914,24 @@ impl Node for NodeService {
         }
         let namespace_generation = store.scanner_namespace_mutation_generation();
         let topology_digest = rustfs_scanner::scanner_topology_digest(store.as_ref());
-        let data_movement_active = store.scanner_data_movement_active().await;
+        let (data_movement_active, publication_blocked, movement_generation) = store.scanner_data_movement_activity().await;
         let mut response = match request_protocol {
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION | SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 previous_scanner_activity_response(namespace_generation, topology_digest, data_movement_active)
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response(
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => v6_scanner_activity_response(
                 namespace_generation,
                 topology_digest,
                 data_movement_active,
                 rustfs_scanner::scanner_dirty_usage_state(),
+            ),
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response_v7(
+                namespace_generation,
+                topology_digest,
+                data_movement_active,
+                rustfs_scanner::scanner_dirty_usage_state(),
+                movement_generation,
+                publication_blocked || store.scanner_data_movement_generation_exhausted(),
             ),
             version => {
                 return Err(Status::failed_precondition(format!(
@@ -1894,8 +1943,11 @@ impl Node for NodeService {
             SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_v4_response_body(&challenge, &response)
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_response_body(&challenge, &response)
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                rustfs_protos::canonical_scanner_activity_v7_response_body(&challenge, &response)
             }
             version => {
                 return Err(Status::internal(format!(
@@ -1910,9 +1962,136 @@ impl Node for NodeService {
         Ok(Response::new(response))
     }
 
+    async fn acquire_scanner_publication_lease(
+        &self,
+        request: Request<ScannerPublicationLeaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseResponse>, Status> {
+        let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("scanner publication lease request is too large to authenticate"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical)
+            .map_err(|err| Status::permission_denied(format!("scanner publication lease authentication failed: {err}")))?;
+        if request.get_ref().challenge.len() != 16 {
+            return Err(Status::invalid_argument("scanner publication lease challenge must be 16 bytes"));
+        }
+        if request.get_ref().ttl_ms != SCANNER_PUBLICATION_LEASE_TTL_MS {
+            return Err(Status::invalid_argument("scanner publication lease TTL is unsupported"));
+        }
+        let session_id = rustfs_scanner::scanner_activity_epoch().to_string();
+        if request.get_ref().expected_session_id != session_id {
+            return Err(Status::failed_precondition("scanner publication lease session is stale"));
+        }
+        let validation_token = if request.get_ref().token.is_empty() {
+            None
+        } else {
+            Some(
+                Uuid::from_slice(request.get_ref().token.as_ref())
+                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?,
+            )
+        };
+        let challenge = request.get_ref().challenge.clone();
+        let request = request.into_inner();
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        if store.id.is_nil() {
+            return Err(Status::unavailable("storage owner identity is not initialized"));
+        }
+        let owner_id = store.id.to_string();
+        let result = match validation_token {
+            Some(token) => store
+                .validate_scanner_publication_lease(token, request.expected_movement_generation)
+                .await
+                .map(|()| (token, request.expected_movement_generation)),
+            None => {
+                store
+                    .acquire_scanner_publication_lease(
+                        request.expected_movement_generation,
+                        Duration::from_millis(request.ttl_ms),
+                    )
+                    .await
+            }
+        };
+        let mut response = match result {
+            Ok((token, generation)) => ScannerPublicationLeaseResponse {
+                success: true,
+                token: token.as_bytes().to_vec().into(),
+                movement_generation: generation,
+                lease_ttl_ms: request.ttl_ms,
+                error: None,
+                response_proof: Bytes::new(),
+                owner_id: owner_id.clone(),
+                session_id: session_id.clone(),
+            },
+            Err(err) => ScannerPublicationLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                movement_generation: store.scanner_data_movement_generation(),
+                lease_ttl_ms: 0,
+                error: Some(rustfs_protos::proto_gen::node_service::Error {
+                    code: 1,
+                    error_info: err.to_string(),
+                }),
+                response_proof: Bytes::new(),
+                owner_id: owner_id.clone(),
+                session_id: session_id.clone(),
+            },
+        };
+        let response_body = rustfs_protos::canonical_scanner_publication_lease_response_body(&challenge, &response)
+            .map_err(|_| Status::internal("scanner publication lease response is too large to authenticate"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&response_body)
+            .map_err(|_| Status::unavailable("scanner publication lease response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
+    }
+
+    async fn release_scanner_publication_lease(
+        &self,
+        request: Request<ScannerPublicationLeaseReleaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseReleaseResponse>, Status> {
+        let canonical = rustfs_protos::canonical_scanner_publication_lease_release_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("scanner publication lease release request is too large to authenticate"))?;
+        verify_tonic_canonical_body_digest(&request, &canonical).map_err(|err| {
+            Status::permission_denied(format!("scanner publication lease release authentication failed: {err}"))
+        })?;
+        if request.get_ref().challenge.len() != 16 {
+            return Err(Status::invalid_argument("scanner publication lease challenge must be 16 bytes"));
+        }
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        if store.id.is_nil() {
+            return Err(Status::unavailable("storage owner identity is not initialized"));
+        }
+        let owner_id = store.id.to_string();
+        let session_id = rustfs_scanner::scanner_activity_epoch().to_string();
+        if request.get_ref().owner_id != owner_id || request.get_ref().session_id != session_id {
+            return Err(Status::failed_precondition("scanner publication lease owner or session is stale"));
+        }
+        let token = Uuid::from_slice(request.get_ref().token.as_ref())
+            .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+        let challenge = request.get_ref().challenge.clone();
+        let request = request.into_inner();
+        let released = store.release_scanner_publication_lease(token).await;
+        let mut response = ScannerPublicationLeaseReleaseResponse {
+            success: released,
+            error: (!released).then(|| rustfs_protos::proto_gen::node_service::Error {
+                code: 1,
+                error_info: "scanner publication lease is unknown or expired".to_string(),
+            }),
+            response_proof: Bytes::new(),
+        };
+        let response_body =
+            rustfs_protos::canonical_scanner_publication_lease_release_response_body(&challenge, &request, &response)
+                .map_err(|_| Status::internal("scanner publication lease response is too large to authenticate"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&response_body)
+            .map_err(|_| Status::unavailable("scanner publication lease response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
+    }
+
     async fn background_heal_status(
         &self,
-        _request: Request<BackgroundHealStatusRequest>,
+        request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
         if self.resolve_object_store().is_none() {
             return Ok(Response::new(BackgroundHealStatusResponse {
@@ -1922,7 +2101,7 @@ impl Node for NodeService {
             }));
         }
         let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
-        match heal::encode_node_heal_status(&snapshot) {
+        match heal::encode_node_heal_status(&snapshot, request.into_inner().protocol_version) {
             Ok(bg_heal_state) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: true,
                 bg_heal_state: bg_heal_state.into(),
@@ -1987,8 +2166,10 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
+        // Recover missing workers only after the reload merged newer state; a
+        // stale or duplicate reload must not spawn workers for an older generation.
         match store.reload_pool_meta().await {
-            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+            Ok(true) => match store.spawn_missing_local_decommission_routines().await {
                 Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
                     success: true,
                     error_info: None,
@@ -1998,6 +2179,10 @@ impl Node for NodeService {
                     error_info: Some(err.to_string()),
                 })),
             },
+            Ok(false) => Ok(Response::new(ReloadPoolMetaResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
@@ -2198,12 +2383,13 @@ mod tests {
     use super::{
         CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, KMS_SIGNAL_SUBSYSTEM, MetricType, Node as _,
         NodeService, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
-        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint,
-        initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response, make_heal_control_server,
-        make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
-        previous_scanner_activity_response, remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
+        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, admit_heal_control_replay,
+        background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
+        initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response,
+        make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
+        make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
+        scanner_activity_response_v7, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
@@ -2237,11 +2423,12 @@ mod tests {
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
         ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState,
-        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest, WriteRequest,
+        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerPublicationLeaseReleaseRequest,
+        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
+        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState, TierMutationPrepareRequest,
+        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -2615,6 +2802,7 @@ mod tests {
             volume: "bucket".to_string(),
             path: "object".to_string(),
             options: options.to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         }
     }
 
@@ -2714,6 +2902,7 @@ mod tests {
                 dst_volume: "dst".into(),
                 dst_path: "dp".into(),
                 file_info_bin: vec![0x80].into(),
+                scanner_publication_lease_token: Vec::new().into(),
             },
             rustfs_protos::canonical_rename_data_request_body
         );
@@ -2784,6 +2973,7 @@ mod tests {
                 volume: "v".into(),
                 path: "p".into(),
                 options: "{}".into(),
+                scanner_publication_lease_token: Vec::new().into(),
             },
             rustfs_protos::canonical_delete_request_body
         );
@@ -3303,7 +3493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v2_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3368,7 +3558,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &1_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &2_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");
@@ -3692,6 +3882,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             options: "{}".to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.delete(request).await;
@@ -3711,6 +3902,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             options: "invalid json".to_string(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.delete(request).await;
@@ -3885,6 +4077,7 @@ mod tests {
             dst_path: "dst-path".to_string(),
             file_info: "{}".to_string(),
             file_info_bin: Vec::new().into(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -3907,6 +4100,7 @@ mod tests {
             dst_path: "dst-path".to_string(),
             file_info: "invalid json".to_string(),
             file_info_bin: Vec::new().into(),
+            scanner_publication_lease_token: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -5327,6 +5521,25 @@ mod tests {
                 acknowledge_dirty_usage_generation: 0,
             }
         );
+        assert_tampered!(
+            acquire_scanner_publication_lease,
+            ScannerPublicationLeaseRequest {
+                challenge: vec![7; 16].into(),
+                expected_movement_generation: 0,
+                ttl_ms: SCANNER_PUBLICATION_LEASE_TTL_MS,
+                expected_session_id: String::new(),
+                token: Bytes::new(),
+            }
+        );
+        assert_tampered!(
+            release_scanner_publication_lease,
+            ScannerPublicationLeaseReleaseRequest {
+                challenge: vec![7; 16].into(),
+                token: vec![1; 16].into(),
+                owner_id: String::new(),
+                session_id: String::new(),
+            }
+        );
         assert_tampered!(reload_pool_meta, ReloadPoolMetaRequest::default());
         assert_tampered!(stop_rebalance, StopRebalanceRequest::default());
         assert_tampered!(load_rebalance_meta, LoadRebalanceMetaRequest::default());
@@ -5483,7 +5696,7 @@ mod tests {
 
     #[test]
     fn test_scanner_activity_response_uses_process_epoch_and_generations() {
-        let response = scanner_activity_response(
+        let response = scanner_activity_response_v7(
             17,
             [7; 32],
             true,
@@ -5491,6 +5704,8 @@ mod tests {
                 generation: 11,
                 pending: true,
             },
+            23,
+            true,
         );
 
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
@@ -5501,6 +5716,8 @@ mod tests {
         assert!(response.data_movement_active);
         assert_eq!(response.dirty_usage_generation, 11);
         assert!(response.dirty_usage_pending);
+        assert_eq!(response.movement_generation, Some(23));
+        assert_eq!(response.publication_blocked, Some(true));
     }
 
     #[test]

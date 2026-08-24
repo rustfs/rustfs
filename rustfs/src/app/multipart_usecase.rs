@@ -524,9 +524,10 @@ impl DefaultMultipartUsecase {
                 .await
                 .map_err(ApiError::from)?,
         );
+        let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
         let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info, &current_opts)?;
+                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
                 let physical_size = existing_obj_info.size.max(0) as u64;
                 let logical_size = quota_object_size(&existing_obj_info);
                 Some((physical_size, logical_size))
@@ -897,7 +898,9 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
         match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => validate_existing_object_lock_for_write(&existing_obj_info, &opts)?,
+            Ok(existing_obj_info) => {
+                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
+            }
             Err(err) => {
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());

@@ -37,7 +37,7 @@ use crate::bucket::lifecycle::{
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
-        save_transition_transaction_record,
+        load_transition_transaction_record, save_transition_transaction_record,
     },
 };
 use crate::bucket::quota::reservation;
@@ -49,10 +49,11 @@ use crate::data_usage::quota_object_size;
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
-use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::object_api::{NamespaceLockFence, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY};
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
+use crate::set_disk::core::io_primitives::{RenameTailCleanup, finish_rename_tail_heal};
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
 use futures::FutureExt as _;
@@ -63,6 +64,60 @@ use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
+
+fn take_scanner_publication_lease_tokens(user_defined: &mut HashMap<String, String>) -> Result<Option<HashMap<String, Uuid>>> {
+    let Some(encoded) = user_defined.remove(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if encoded.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES {
+        return Err(Error::other("scanner publication lease fence is too large"));
+    }
+    let encoded_tokens = serde_json::from_str::<HashMap<String, String>>(&encoded)
+        .map_err(|err| Error::other(format!("invalid scanner publication lease fence: {err}")))?;
+    if encoded_tokens.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES {
+        return Err(Error::other("scanner publication lease fence has too many entries"));
+    }
+    let mut tokens = HashMap::with_capacity(encoded_tokens.len());
+    for (host, token) in encoded_tokens {
+        if host.is_empty() || host.len() > 1024 {
+            return Err(Error::other("invalid scanner publication lease fence host"));
+        }
+        let token = Uuid::parse_str(&token)
+            .map_err(|err| Error::other(format!("invalid scanner publication lease fence token: {err}")))?;
+        if token.is_nil() {
+            return Err(Error::other("invalid scanner publication lease fence token"));
+        }
+        tokens.insert(host, token);
+    }
+    Ok(Some(tokens))
+}
+
+#[cfg(test)]
+mod scanner_publication_lease_fence_tests {
+    use super::*;
+
+    #[test]
+    fn scanner_publication_lease_fence_is_transient_and_validated() {
+        let token = Uuid::new_v4();
+        let mut metadata = HashMap::from([(
+            SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            serde_json::json!({"http://node-a:9000": token.to_string()}).to_string(),
+        )]);
+        let parsed = take_scanner_publication_lease_tokens(&mut metadata)
+            .expect("valid scanner publication lease fence should parse")
+            .expect("scanner publication lease fence should be present");
+        assert_eq!(parsed.get("http://node-a:9000"), Some(&token));
+        assert!(!metadata.contains_key(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY));
+
+        let mut malformed = HashMap::from([(
+            SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            r#"{"http://node-a:9000":"not-a-uuid"}"#.to_string(),
+        )]);
+        assert!(take_scanner_publication_lease_tokens(&mut malformed).is_err());
+    }
+}
 
 struct PutObjectCommitCancellation {
     token: CancellationToken,
@@ -1881,7 +1936,139 @@ fn delete_file_info_with_replication_transport_metadata(fi: &FileInfo) -> FileIn
     transported
 }
 
+/// True when an authorized replication write carries at least one per-category
+/// source timestamp, i.e. receiver-side LWW has something to judge.
+pub(in crate::set_disk) fn replication_lww_applicable(opts: &ObjectOptions) -> bool {
+    opts.replication_request
+        && (opts.replication_tagging_timestamp.is_some()
+            || opts.replication_retention_timestamp.is_some()
+            || opts.replication_legalhold_timestamp.is_some())
+}
+
+/// The stored per-category state of a destination version, as compared by
+/// [`merge_replication_metadata_lww`]. `ObjectInfo::from_file_info`
+/// externalizes tags into `user_tags` (stripping the metadata key), so the
+/// tag value is folded back into map form here.
+pub(in crate::set_disk) fn stored_replication_category_metadata(existing: &ObjectInfo) -> HashMap<String, String> {
+    let mut stored = (*existing.user_defined).clone();
+    if !existing.user_tags.is_empty() {
+        stored.insert(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING.to_string(), (*existing.user_tags).clone());
+    }
+    stored
+}
+
+/// Receiver-side last-writer-wins for authorized replication writes
+/// (rustfs/backlog#1953, audit A4/P1-6). Metadata-only replication reuses the
+/// whole-object transports, so in active-active topologies an inbound write
+/// carries the source's tags / retention / legal hold verbatim and would
+/// otherwise overwrite a category the destination modified more recently —
+/// both sites end up permanently diverged while reporting COMPLETED.
+///
+/// Judged per category, only when the inbound request carries that category's
+/// source timestamp (`ObjectOptions::replication_*_timestamp`):
+/// - stored timestamp newer than inbound: the local category values and
+///   timestamp are kept; the rest of the write proceeds per the inbound
+///   metadata and the object-level result stays successful (failing the write
+///   instead would loop through MRF, re-delivering the stale value forever);
+/// - otherwise the inbound category wins and its internal timestamp key is
+///   pinned to the source-authored time — the PUT path re-stamps the
+///   object-lock timestamps with the receiver's clock
+///   (`parse_object_lock_retention` / `parse_object_lock_legal_hold` insert
+///   `now()` via `eval_metadata`), which would make the replica's clock the
+///   LWW authority and wedge later convergence;
+/// - no stored timestamp (pre-P1-6 data) or no inbound timestamp: the current
+///   overwrite behavior is preserved.
+///
+/// Returns whether `inbound` was modified. Callers must hold the object write
+/// lock so the stored values compared here are the ones being replaced.
+pub(in crate::set_disk) fn merge_replication_metadata_lww(
+    inbound: &mut HashMap<String, String>,
+    existing: &HashMap<String, String>,
+    opts: &ObjectOptions,
+) -> bool {
+    use rustfs_utils::http::headers::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING,
+    };
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
+        remove_str,
+    };
+    use time::format_description::well_known::Rfc3339;
+
+    let categories: [(Option<OffsetDateTime>, &str, &[&str]); 3] = [
+        (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP, &[AMZ_OBJECT_TAGGING]),
+        (
+            opts.replication_retention_timestamp,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            &[AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER],
+        ),
+        (
+            opts.replication_legalhold_timestamp,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+            &[AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER],
+        ),
+    ];
+
+    let mut changed = false;
+    for (inbound_timestamp, timestamp_suffix, value_keys) in categories {
+        let Some(inbound_timestamp) = inbound_timestamp else { continue };
+        let is_category_value_key = |key: &str| value_keys.iter().any(|value_key| key.eq_ignore_ascii_case(value_key));
+        let stored_timestamp = get_str(existing, timestamp_suffix).and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+        if stored_timestamp.is_some_and(|stored| stored > inbound_timestamp) {
+            inbound.retain(|key, _| !is_category_value_key(key));
+            remove_str(inbound, timestamp_suffix);
+            for (key, value) in existing {
+                if is_category_value_key(key) {
+                    inbound.insert(key.clone(), value.clone());
+                }
+            }
+            // Restore the winning timestamp via insert_str, not a verbatim key
+            // copy: a MinIO-written version may carry only the
+            // x-minio-internal- key, and the dual-key invariant requires every
+            // write to produce both keys.
+            if let Some(stored_value) = get_str(existing, timestamp_suffix) {
+                rustfs_utils::http::insert_str(inbound, timestamp_suffix, stored_value);
+            }
+            changed = true;
+        } else if let Ok(source_authored) = inbound_timestamp.format(&Rfc3339)
+            && get_str(inbound, timestamp_suffix).as_deref() != Some(source_authored.as_str())
+        {
+            rustfs_utils::http::insert_str(inbound, timestamp_suffix, source_authored);
+            changed = true;
+        }
+    }
+    changed
+}
+
 impl SetDisks {
+    pub(in crate::set_disk) async fn cleanup_rename_tail(
+        &self,
+        targets: Vec<RenameTailCleanup>,
+        bucket: &str,
+        object: &str,
+        committed_data_dir: Option<Uuid>,
+        epoch: Option<Uuid>,
+    ) {
+        for target in targets {
+            let mut disks = vec![None; self.set_drive_count];
+            disks[target.disk_index] = Some(target.disk);
+            self.persist_old_data_cleanup_receipts(&disks, bucket, object, target.old_data_dir, committed_data_dir, epoch)
+                .await;
+            let cleanup = self
+                .commit_rename_data_dir_and_mark_capacity(
+                    &disks,
+                    bucket,
+                    object,
+                    &target.old_data_dir.to_string(),
+                    &committed_data_dir.unwrap_or_default().to_string(),
+                    1,
+                )
+                .await;
+            self.report_old_data_dir_cleanup(bucket, object, &target.old_data_dir.to_string(), &cleanup)
+                .await;
+        }
+    }
+
     pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
         &self,
         disks: &[Option<DiskStore>],
@@ -2072,6 +2259,15 @@ impl SetDisks {
             for (key, value) in eval_metadata {
                 user_defined.insert(key.clone(), value.clone());
             }
+        }
+        let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut user_defined)?;
+        if replication_lww_applicable(opts) {
+            // Object Lock evaluation stamps category timestamps with this
+            // receiver's clock. Pin them back to the source-authored times
+            // before the first copy of a version is committed; the existing-
+            // version branch below may still replace them with newer local
+            // state.
+            merge_replication_metadata_lww(&mut user_defined, &HashMap::new(), opts);
         }
         if expected_restore_operation_id.is_some() {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
@@ -2559,8 +2755,34 @@ impl SetDisks {
                         let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
                             Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
                         })?;
-                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some() {
+                        // The WORM gate protects the locked version from local
+                        // overwrites; an authorized replication write passes it
+                        // only when the LWW merge below will judge every
+                        // locking category (see
+                        // `replication_write_may_pass_worm_gate`, which judges
+                        // the same authoritative lock state as the gate,
+                        // bucket default retention included). Gate first so
+                        // malformed lock metadata still fails closed.
+                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some()
+                            && !replication_write_may_pass_worm_gate(object_lock_config.state(), &existing, opts)?
+                        {
                             return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                        }
+                        // Receiver-side LWW (rustfs/backlog#1953): reuse this
+                        // commit-lock read of the destination version so a
+                        // category (tags / retention / legal hold) modified
+                        // more recently on this site is kept instead of being
+                        // overwritten by the inbound replication metadata.
+                        if replication_lww_applicable(opts) {
+                            let stored = stored_replication_category_metadata(&existing);
+                            let mut merged = parts_metadatas[response_metadata_slot].metadata.clone();
+                            if merge_replication_metadata_lww(&mut merged, &stored, opts) {
+                                for (pfi, disk) in parts_metadatas.iter_mut().zip(shuffle_disks.iter()) {
+                                    if disk.is_some() {
+                                        pfi.metadata = merged.clone();
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
@@ -2747,8 +2969,8 @@ impl SetDisks {
             let commit_tmp_dir = tmp_dir.clone();
             let commit_object_lock_guard = object_lock_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
-            let detach_commit_owner =
-                commit_object_lock_guard.is_some() || commit_bucket_lifecycle_guard.is_some() || quota_mutation_fence;
+            let commit_allows_early_ack = commit_object_lock_guard.is_some();
+            let detach_commit_owner = commit_allows_early_ack || commit_bucket_lifecycle_guard.is_some() || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
             let commit_is_versioned = opts.versioned || opts.version_suspended;
             let commit_versioned = opts.versioned;
@@ -2758,11 +2980,12 @@ impl SetDisks {
             let commit_bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
             let commit_capacity_scope_token = opts.capacity_scope_token;
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
+            let commit_scanner_publication_lease_tokens = scanner_publication_lease_tokens;
             tmp_cleanup_owned = true;
 
             let commit = move |cancellation: Option<CancellationToken>| async move {
-                let _object_lock_guard = commit_object_lock_guard;
-                let _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                let mut _object_lock_guard = commit_object_lock_guard;
+                let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
                 let pre_rename = async {
@@ -2877,17 +3100,104 @@ impl SetDisks {
                 }
 
                 Self::assign_rename_data_indexes(&mut parts_metadatas);
-                let rename_result = SetDisks::rename_data_owned(
+                let mut rename_result = SetDisks::rename_data_owned_with_fence(
                     &commit_disks,
-                    RUSTFS_META_TMP_BUCKET,
-                    commit_tmp_dir.as_str(),
+                    (RUSTFS_META_TMP_BUCKET, commit_tmp_dir.as_str()),
                     parts_metadatas,
-                    &commit_bucket,
-                    &commit_object,
-                    write_quorum,
+                    (&commit_bucket, &commit_object),
+                    commit_allows_early_ack,
+                    crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
+                        write_quorum,
+                        commit_scanner_publication_lease_tokens.as_ref(),
+                    ),
                 )
                 .await;
-                if quota_mutation_fence {
+                #[cfg(any(test, feature = "test-util"))]
+                if rename_result.is_ok() {
+                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
+                }
+                let mut rename_guard_release = None;
+                let mut needs_immediate_heal = false;
+                let mut tail_owns_tmp_cleanup = false;
+                if let Ok(rename_commit) = rename_result.as_mut() {
+                    commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
+                    // Install the tail watcher before any post-commit await. The
+                    // latch keeps namespace guards through their prior handoff point.
+                    needs_immediate_heal = rename_commit.needs_immediate_heal();
+                    if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
+                        tail_owns_tmp_cleanup = true;
+                        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                            commit_bucket.clone(),
+                            Some(commit_object.clone()),
+                            false,
+                            Some(HealChannelPriority::Normal),
+                            Some(commit_set.pool_index),
+                            Some(commit_set.set_index),
+                        );
+                        request.object_version_id = committed_version_id
+                            .or_else(|| commit_version_suspended.then(Uuid::nil))
+                            .map(|version_id| version_id.to_string());
+                        let object_lock_guard = _object_lock_guard.take();
+                        let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
+                        let cleanup_bucket = commit_bucket.clone();
+                        let cleanup_object = commit_object.clone();
+                        let heal_set = commit_set.clone();
+                        let cleanup_set = commit_set.clone();
+                        let cleanup_tmp_dir = commit_tmp_dir.clone();
+                        let fence_disks = commit_disks.clone();
+                        let fence_tokens = quota_fence_tokens.clone();
+                        let fence_bucket = commit_bucket.clone();
+                        let fence_object = commit_object.clone();
+                        let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
+                        rename_guard_release = Some(guard_release_tx);
+                        tokio::spawn(finish_rename_tail_heal(
+                            rename_tail_drain,
+                            guard_release_rx,
+                            (object_lock_guard, bucket_lifecycle_guard),
+                            request,
+                            move || async move {
+                                if quota_mutation_fence {
+                                    let _ = SetDisks::release_quota_mutation_fences(
+                                        &fence_disks,
+                                        &fence_tokens,
+                                        &fence_bucket,
+                                        &fence_object,
+                                        write_quorum,
+                                    )
+                                    .await;
+                                }
+                            },
+                            move |(object_lock_guard, bucket_lifecycle_guard), targets| async move {
+                                drop(object_lock_guard);
+                                drop(bucket_lifecycle_guard);
+                                cleanup_set
+                                    .cleanup_rename_tail(
+                                        targets,
+                                        &cleanup_bucket,
+                                        &cleanup_object,
+                                        committed_data_dir,
+                                        transaction_epoch,
+                                    )
+                                    .await;
+                                if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
+                                    warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                                } else if issue3031_diag_enabled() {
+                                    warn!(
+                                        target: "rustfs_ecstore::set_disk",
+                                        tmp_dir = %cleanup_tmp_dir,
+                                        "issue3031_put_object_tmp_cleanup_done"
+                                    );
+                                }
+                            },
+                            |request| async move { heal_set.submit_rename_tail_heal(request).await },
+                        ));
+                    }
+                }
+                #[cfg(any(test, feature = "test-util"))]
+                if rename_result.is_ok() {
+                    pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameHandoff).await;
+                }
+                if quota_mutation_fence && !tail_owns_tmp_cleanup {
                     let _ = SetDisks::release_quota_mutation_fences(
                         &commit_disks,
                         &quota_fence_tokens,
@@ -2918,16 +3228,12 @@ impl SetDisks {
                     }
                 };
                 let online_disks = rename_commit.online_disks;
-                let convergence = rename_commit.convergence;
                 let op_old_dir = rename_commit.data_dir;
                 let cleanup_disks = rename_commit.cleanup_disks;
                 let old_current_size = rename_commit.old_current_size;
                 let mut fi = rename_commit.committed_file_info;
-                let rename_tail_drain = rename_commit.tail_drain;
-                // Do this before any post-commit await so request cancellation cannot
-                // bypass best-effort admission. A process crash before admission
-                // remains subject to the existing scanner reconciliation path.
-                if convergence.needs_heal() {
+
+                if needs_immediate_heal {
                     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
@@ -2936,7 +3242,9 @@ impl SetDisks {
                         Some(commit_set.pool_index),
                         Some(commit_set.set_index),
                     );
-                    request.object_version_id = committed_version_id.map(|version_id| version_id.to_string());
+                    request.object_version_id = committed_version_id
+                        .or_else(|| commit_version_suspended.then(Uuid::nil))
+                        .map(|version_id| version_id.to_string());
                     tokio::spawn(async move {
                         let _ = rustfs_common::heal_channel::send_heal_request(request).await;
                     });
@@ -2962,38 +3270,13 @@ impl SetDisks {
                     .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                     .await;
 
-                // `rename_data` has completed the authoritative quorum commit. With
-                // the default-off early-ACK experiment, tail disk rename tasks may
-                // still be draining after quorum. Keep the namespace guards alive
-                // until that drain completes so the next same-object mutation cannot
-                // race a background tail rename.
-                if let Some(rename_tail_drain) = rename_tail_drain {
-                    let object_lock_guard = _object_lock_guard;
-                    let bucket_lifecycle_guard = _bucket_lifecycle_guard;
-                    let tail_bucket = commit_bucket.clone();
-                    let tail_object = commit_object.clone();
-                    tokio::spawn(async move {
-                        let _object_lock_guard = object_lock_guard;
-                        let _bucket_lifecycle_guard = bucket_lifecycle_guard;
-                        if let Err(err) = rename_tail_drain.await {
-                            warn!(
-                                event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                state = "failed",
-                                bucket = %tail_bucket,
-                                object = %tail_object,
-                                error = %err,
-                                "rename tail drain failed"
-                            );
-                        }
-                    });
-                } else {
-                    // The exact old-data-dir reclamation below is best-effort space
-                    // cleanup; it must not serialize the next operation on this object.
-                    drop(_object_lock_guard);
-                    drop(_bucket_lifecycle_guard);
+                if let Some(release) = rename_guard_release.take() {
+                    let _ = release.send(true);
                 }
+                // The exact old-data-dir reclamation below is best-effort space
+                // cleanup; it must not serialize the next operation on this object.
+                drop(_object_lock_guard.take());
+                drop(_bucket_lifecycle_guard.take());
 
                 rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
                 if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -3022,7 +3305,7 @@ impl SetDisks {
                     // deliberately do NOT `?`-propagate it into a 503. On residue the
                     // report path emits the leak metric and enqueues a heal.
                     let cleanup = commit_set
-                        .commit_rename_data_dir(
+                        .commit_rename_data_dir_and_mark_capacity(
                             &cleanup_disks,
                             &commit_bucket,
                             &commit_object,
@@ -3058,12 +3341,9 @@ impl SetDisks {
                         );
                     }
                 }
-
                 if is_compressed {
                     record_compression_total_memory(actual_size as u64, w_size as u64).await;
                 }
-                commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
-
                 fi.replication_state_internal = Some(commit_replication_state);
 
                 fi.is_latest = true;
@@ -3120,19 +3400,21 @@ impl SetDisks {
                     );
                 }
 
-                let cleanup_set = commit_set.clone();
-                let cleanup_tmp_dir = commit_tmp_dir.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
-                        warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
-                    } else if issue3031_diag_enabled() {
-                        warn!(
-                            target: "rustfs_ecstore::set_disk",
-                            tmp_dir = %cleanup_tmp_dir,
-                            "issue3031_put_object_tmp_cleanup_done"
-                        );
-                    }
-                });
+                if !tail_owns_tmp_cleanup {
+                    let cleanup_set = commit_set.clone();
+                    let cleanup_tmp_dir = commit_tmp_dir.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
+                            warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                        } else if issue3031_diag_enabled() {
+                            warn!(
+                                target: "rustfs_ecstore::set_disk",
+                                tmp_dir = %cleanup_tmp_dir,
+                                "issue3031_put_object_tmp_cleanup_done"
+                            );
+                        }
+                    });
+                }
 
                 Ok((
                     ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned),
@@ -4248,7 +4530,12 @@ fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, 
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
     if let Some(api) = api {
-        return delete_transition_transaction_record(api.clone(), transaction_id).await;
+        let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
+            Ok(transaction) => transaction,
+            Err(Error::ConfigNotFound) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        return delete_transition_transaction_record(api.clone(), &transaction).await;
     }
     Ok(())
 }
@@ -4622,6 +4909,8 @@ pub enum PutObjectCommitPause {
     BeforeQuotaRename,
     BeforeMetadata,
     BeforeTransactionEpochVerify,
+    AfterRenameQuorum,
+    AfterRenameHandoff,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -6275,6 +6564,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        // Scanner cleanup carries the per-peer lease fence as transient
+        // request metadata. Consume it before any delete-prefix fanout so it
+        // cannot be persisted or treated as user metadata.
+        let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut opts.user_defined)?;
         let preserve_delete_replication_state = should_preserve_delete_replication_state(&opts);
         let delete_config_snapshot = if opts.delete_prefix || opts.transition.expire_restored || preserve_delete_replication_state
         {
@@ -6401,7 +6694,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-            self.delete_prefix(bucket, object)
+            self.delete_prefix_with_scanner_publication_lease(bucket, object, scanner_publication_lease_tokens.as_ref())
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
@@ -6519,6 +6812,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let find_vid = Uuid::new_v4();
+        #[cfg(test)]
+        pause_delete_object_commit(bucket, object).await;
 
         if mark_delete && (opts.versioned || opts.version_suspended) {
             if !delete_marker {
@@ -6587,8 +6882,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             dfi.set_skip_tier_free_version();
         }
 
-        #[cfg(test)]
-        pause_delete_object_commit(bucket, object).await;
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
@@ -6637,12 +6930,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
         // MRF journal intent: partial-write recovery must survive a restart
         // (HS-01); the heal request below remains the in-memory fast path.
-        rustfs_common::mrf_channel::try_send_mrf_intent(
-            rustfs_common::mrf_channel::MrfKind::PartialWrite,
-            bucket,
-            object,
-            uuid::Uuid::try_parse(version_id).ok(),
-        );
+        let version_uuid = if version_id.is_empty() {
+            Some(None)
+        } else {
+            uuid::Uuid::try_parse(version_id).ok().map(Some)
+        };
+        if let Some(version_uuid) = version_uuid
+            && let (Ok(pool_index), Ok(set_index)) = (u32::try_from(self.pool_index), u32::try_from(self.set_index))
+        {
+            let scope = rustfs_common::mrf_channel::MrfScope { pool_index, set_index };
+            let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(
+                rustfs_common::mrf_channel::MrfKind::PartialWrite,
+                bucket,
+                object,
+                version_uuid,
+                Some(scope),
+            );
+        }
         let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),
@@ -7750,9 +8054,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     /// for tests that never touch context-resolved services registered on the
     /// ambient context (tier config manager, expiry state, ...), because the
     /// isolated context starts every one of those cells fresh.
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_isolated(
-        disk_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
     }
 
@@ -8063,6 +8365,640 @@ mod replication_quota_safety_tests {
             .await
             .expect_err("ciphertext replication without a server-observed logical size must fail closed");
         assert!(matches!(err, StorageError::PartMissingOrCorrupt));
+    }
+}
+
+#[cfg(test)]
+mod replication_lww_tests {
+    //! Receiver-side LWW for authorized replication writes (rustfs/backlog#1953,
+    //! audit A4/P1-6): an inbound replication PUT whose per-category timestamp
+    //! (tags / retention / legal hold) is older than the destination version's
+    //! stored timestamp must keep the local category values instead of
+    //! overwriting them; categories are judged independently and the write
+    //! itself still succeeds.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use rustfs_utils::http::headers::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING,
+    };
+    use rustfs_utils::http::{
+        SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
+        insert_str,
+    };
+    use time::format_description::well_known::Rfc3339;
+
+    const T_OLD: &str = "2026-01-01T00:00:00Z";
+    const T_LOCAL: &str = "2026-02-01T00:00:00Z";
+    const T_NEW: &str = "2026-03-01T00:00:00Z";
+
+    fn parse_ts(value: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(value, &Rfc3339).expect("test timestamp should parse")
+    }
+
+    async fn make_bucket(disks: &[DiskStore], bucket: &str) {
+        for disk in disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    async fn put_version(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str, opts: &ObjectOptions) {
+        let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, opts)
+            .await
+            .expect("versioned put should commit");
+        assert_eq!(opts.version_id.as_deref(), Some(version_id));
+    }
+
+    fn versioned_opts(version_id: &str, user_defined: HashMap<String, String>) -> ObjectOptions {
+        ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            user_defined,
+            // Explicit-version PUTs require the bucket Object Lock snapshot.
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            ..Default::default()
+        }
+    }
+
+    /// Local state: version `version_id` with tags "site=local" stamped `T_LOCAL`.
+    async fn seed_local_tagged_version(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str) {
+        let mut user_defined = HashMap::new();
+        user_defined.insert(AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string());
+        insert_str(&mut user_defined, SUFFIX_TAGGING_TIMESTAMP, T_LOCAL.to_string());
+        put_version(set_disks, bucket, object, version_id, &versioned_opts(version_id, user_defined)).await;
+    }
+
+    fn inbound_tagging_opts(version_id: &str, tags: &str, timestamp: &str) -> ObjectOptions {
+        let mut user_defined = HashMap::new();
+        user_defined.insert(AMZ_OBJECT_TAGGING.to_string(), tags.to_string());
+        insert_str(&mut user_defined, SUFFIX_TAGGING_TIMESTAMP, timestamp.to_string());
+        ObjectOptions {
+            replication_request: true,
+            replication_tagging_timestamp: Some(parse_ts(timestamp)),
+            ..versioned_opts(version_id, user_defined)
+        }
+    }
+
+    async fn version_info(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str) -> ObjectInfo {
+        set_disks
+            .get_object_info(bucket, object, &versioned_opts(version_id, HashMap::new()))
+            .await
+            .expect("version should be readable")
+    }
+
+    #[tokio::test]
+    async fn inbound_stale_tagging_keeps_newer_local_tags() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-tagging-stale";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_local_tagged_version(&set_disks, bucket, object, &version_id).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_tagging_opts(&version_id, "site=remote", T_OLD),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_tags.as_str(),
+            "site=local",
+            "older inbound tags must not overwrite newer local tags"
+        );
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(),
+            Some(T_LOCAL),
+            "the winning local tagging timestamp must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_newer_tagging_overwrites_local_tags() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-tagging-newer";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_local_tagged_version(&set_disks, bucket, object, &version_id).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_tagging_opts(&version_id, "site=remote", T_NEW),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_tags.as_str(),
+            "site=remote",
+            "newer inbound tags must overwrite older local tags"
+        );
+        assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_NEW));
+    }
+
+    #[tokio::test]
+    async fn inbound_wins_when_local_has_no_tagging_timestamp() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-tagging-no-local-ts";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        // Pre-P1-6 data: local tags without a stored tagging timestamp.
+        let mut user_defined = HashMap::new();
+        user_defined.insert(AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, user_defined)).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_tagging_opts(&version_id, "site=remote", T_OLD),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_tags.as_str(),
+            "site=remote",
+            "without a local timestamp the inbound category must win (pre-LWW data compatibility)"
+        );
+    }
+
+    #[tokio::test]
+    async fn categories_are_judged_independently() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-category-independent";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+
+        // Local: newer tags (T_LOCAL), older *cleared* retention (T_OLD) —
+        // timestamp key only, the shape a replicated retention clear stores.
+        // (An active local retention would already block the overwrite at the
+        // WORM gate; the LWW-reachable retention states are cleared/expired.)
+        let mut local = HashMap::new();
+        local.insert(AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string());
+        insert_str(&mut local, SUFFIX_TAGGING_TIMESTAMP, T_LOCAL.to_string());
+        insert_str(&mut local, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
+
+        // Inbound: older tags (T_OLD), newer retention (T_NEW).
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_TAGGING.to_string(), "site=remote".to_string());
+        insert_str(&mut inbound, SUFFIX_TAGGING_TIMESTAMP, T_OLD.to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2028-01-01T00:00:00Z".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_NEW.to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_tagging_timestamp: Some(parse_ts(T_OLD)),
+            replication_retention_timestamp: Some(parse_ts(T_NEW)),
+            ..versioned_opts(&version_id, inbound)
+        };
+        put_version(&set_disks, bucket, object, &version_id, &opts).await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(info.user_tags.as_str(), "site=local", "the stale tagging category must keep local values");
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            Some("COMPLIANCE"),
+            "the newer retention category must be applied in the same write"
+        );
+        assert_eq!(get_str(&info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP).as_deref(), Some(T_NEW));
+    }
+
+    #[tokio::test]
+    async fn inbound_stale_legal_hold_keeps_local_value() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-legalhold-stale";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+
+        // Local: legal hold released (OFF) at T_LOCAL. (A local hold that is
+        // still ON already blocks the overwrite at the WORM gate; the
+        // LWW-reachable divergence is a stale inbound ON resurrecting a hold
+        // that was released more recently on this site.)
+        let mut local = HashMap::new();
+        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_LOCAL.to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
+
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: Some(parse_ts(T_OLD)),
+            ..versioned_opts(&version_id, inbound)
+        };
+        put_version(&set_disks, bucket, object, &version_id, &opts).await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            Some("OFF"),
+            "a stale inbound legal hold must not resurrect a hold released more recently"
+        );
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(),
+            Some(T_LOCAL)
+        );
+    }
+
+    /// Dual-key invariant under LWW: a MinIO-written destination version may
+    /// carry only the x-minio-internal timestamp key; when the local category
+    /// wins, the restored map must still hold BOTH compatibility keys.
+    #[test]
+    fn local_win_restores_both_internal_timestamp_keys_for_minio_only_metadata() {
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_TAGGING.to_string(), "site=remote".to_string());
+        insert_str(&mut inbound, SUFFIX_TAGGING_TIMESTAMP, T_OLD.to_string());
+        let existing = HashMap::from([
+            (AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string()),
+            ("X-Minio-Internal-Tagging-Timestamp".to_string(), T_LOCAL.to_string()),
+        ]);
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_tagging_timestamp: Some(parse_ts(T_OLD)),
+            ..Default::default()
+        };
+
+        assert!(merge_replication_metadata_lww(&mut inbound, &existing, &opts));
+        assert_eq!(inbound.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some("site=local"));
+        assert_eq!(
+            inbound.get("x-rustfs-internal-tagging-timestamp").map(String::as_str),
+            Some(T_LOCAL),
+            "the RustFS twin key must be materialized even when the source version only had the MinIO key"
+        );
+        assert_eq!(inbound.get("x-minio-internal-tagging-timestamp").map(String::as_str), Some(T_LOCAL));
+    }
+
+    /// When the inbound category wins, the stored timestamp must be the
+    /// source-authored one: the PUT path's eval_metadata stamps the
+    /// object-lock timestamps with the receiver's clock
+    /// (`parse_object_lock_retention`), which would otherwise make this
+    /// replica's clock the LWW authority and wedge later convergence.
+    #[tokio::test]
+    async fn inbound_win_pins_stored_timestamp_to_source_authored_value() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-retention-ts-pinned";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+
+        // Local cleared retention at T_OLD.
+        let mut local = HashMap::new();
+        insert_str(&mut local, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
+
+        // Inbound newer retention: the source authored T_LOCAL, but the PUT
+        // path's eval_metadata stomped the metadata key with receiver-now
+        // (simulated by T_NEW here).
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2028-01-01T00:00:00Z".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_NEW.to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_retention_timestamp: Some(parse_ts(T_LOCAL)),
+            ..versioned_opts(&version_id, inbound)
+        };
+        put_version(&set_disks, bucket, object, &version_id, &opts).await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP).as_deref(),
+            Some(T_LOCAL),
+            "the stored category timestamp must be the source-authored time, not the receiver's clock"
+        );
+        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
+    }
+
+    #[tokio::test]
+    async fn first_inbound_version_pins_source_authored_timestamp() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-first-version-ts-pinned";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_string());
+        let mut evaluated = inbound.clone();
+        insert_str(&mut evaluated, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_NEW.to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: Some(parse_ts(T_OLD)),
+            eval_metadata: Some(evaluated),
+            ..versioned_opts(&version_id, inbound)
+        };
+
+        put_version(&set_disks, bucket, object, &version_id, &opts).await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(),
+            Some(T_OLD),
+            "the first copy must store the source timestamp, not the receiver evaluation time"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_local_tag_deletion_survives_stale_inbound_tags() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-tagging-deleted";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        // Local DeleteObjectTagging state: no tags, but a newer tagging timestamp.
+        let mut local = HashMap::new();
+        insert_str(&mut local, SUFFIX_TAGGING_TIMESTAMP, T_LOCAL.to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_tagging_opts(&version_id, "site=remote", T_OLD),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert!(
+            info.user_tags.is_empty(),
+            "a newer local tag deletion must not be resurrected by older inbound tags"
+        );
+        assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_LOCAL));
+    }
+
+    /// Destination version under an active legal hold at `hold_timestamp`,
+    /// plus an active COMPLIANCE retention (no retention timestamp).
+    async fn seed_locked_version(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, version_id: &str, hold_timestamp: &str) {
+        let mut local = HashMap::new();
+        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
+        insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, hold_timestamp.to_string());
+        local.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        local.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        put_version(set_disks, bucket, object, version_id, &versioned_opts(version_id, local)).await;
+    }
+
+    /// Inbound legal-hold release from a source that also carries the (same)
+    /// COMPLIANCE retention; the sender stamps a source timestamp for every
+    /// category the source version has.
+    fn inbound_legal_hold_release_opts(version_id: &str, timestamp: &str) -> ObjectOptions {
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, timestamp.to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        insert_str(&mut inbound, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_string());
+        ObjectOptions {
+            replication_request: true,
+            replication_legalhold_timestamp: Some(parse_ts(timestamp)),
+            replication_retention_timestamp: Some(parse_ts(T_OLD)),
+            ..versioned_opts(version_id, inbound)
+        }
+    }
+
+    /// The source's lock state governs the replica: a legal-hold release (or a
+    /// retention change) can only reach this site through the authorized
+    /// replication write, so the commit-time WORM gate must not reject it
+    /// because the destination version is currently locked.
+    #[tokio::test]
+    async fn inbound_newer_legal_hold_release_updates_locked_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-release-newer";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_OLD).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_legal_hold_release_opts(&version_id, T_NEW),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            Some("OFF"),
+            "a newer source-side legal hold release must be applied to the locked replica"
+        );
+        assert_eq!(get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(), Some(T_NEW));
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            Some("COMPLIANCE"),
+            "the untouched retention category must survive the write"
+        );
+    }
+
+    /// Skipping the WORM gate for replication writes must not weaken LWW: a
+    /// stale inbound release still loses to a hold applied more recently here.
+    #[tokio::test]
+    async fn inbound_stale_legal_hold_release_keeps_newer_local_hold() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-release-stale";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_LOCAL).await;
+
+        put_version(
+            &set_disks,
+            bucket,
+            object,
+            &version_id,
+            &inbound_legal_hold_release_opts(&version_id, T_OLD),
+        )
+        .await;
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(
+            info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str),
+            Some("ON"),
+            "a stale inbound release must not lift a hold applied more recently on this site"
+        );
+        assert_eq!(
+            get_str(&info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP).as_deref(),
+            Some(T_LOCAL)
+        );
+    }
+
+    /// A replication write that carries no source decision for a locking
+    /// category (here: tags changed at a source that never held the object)
+    /// must not lift the destination's hold by replacing the metadata
+    /// unjudged; it stays WORM-rejected like a local overwrite.
+    #[tokio::test]
+    async fn inbound_without_legal_hold_timestamp_stays_rejected_on_held_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-unjudged-category";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_OLD).await;
+
+        let mut inbound = HashMap::new();
+        inbound.insert(AMZ_OBJECT_TAGGING.to_string(), "k=v".to_string());
+        insert_str(&mut inbound, SUFFIX_TAGGING_TIMESTAMP, T_NEW.to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
+        inbound.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string());
+        let opts = ObjectOptions {
+            replication_request: true,
+            replication_tagging_timestamp: Some(parse_ts(T_NEW)),
+            replication_retention_timestamp: Some(parse_ts(T_NEW)),
+            replication_legalhold_timestamp: None,
+            ..versioned_opts(&version_id, inbound)
+        };
+        let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+        let err = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect_err("a replication write without the legal-hold source timestamp must stay rejected");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
+    }
+
+    fn default_retention_snapshot(mode: &'static str) -> Arc<ObjectLockConfigSnapshot> {
+        Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
+            config: s3s::dto::ObjectLockConfiguration {
+                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
+                rule: Some(s3s::dto::ObjectLockRule {
+                    default_retention: Some(s3s::dto::DefaultRetention {
+                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(mode)),
+                        days: Some(1),
+                        years: None,
+                    }),
+                }),
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        }))
+    }
+
+    /// The bucket default retention locks a version that carries no explicit
+    /// retention keys. A tagging-only authorized replication write carries no
+    /// source retention decision, so it must stay WORM-rejected exactly like
+    /// it does for an explicitly retained version; with the retention source
+    /// timestamp the write passes and LWW judges it.
+    #[tokio::test]
+    async fn inbound_without_retention_timestamp_stays_rejected_under_bucket_default_retention() {
+        for mode in [
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
+            s3s::dto::ObjectLockRetentionMode::GOVERNANCE,
+        ] {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "lww-locked-default-retention";
+            let object = "object";
+            let version_id = Uuid::new_v4().to_string();
+            make_bucket(&disk_stores, bucket).await;
+            seed_local_tagged_version(&set_disks, bucket, object, &version_id).await;
+            let seeded = version_info(&set_disks, bucket, object, &version_id).await;
+            assert!(
+                !seeded.user_defined.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER),
+                "the seeded version must be protected by the bucket default only"
+            );
+
+            let tagging_only = ObjectOptions {
+                object_lock_config_snapshot: Some(default_retention_snapshot(mode)),
+                ..inbound_tagging_opts(&version_id, "site=remote", T_NEW)
+            };
+            let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+            let err = set_disks
+                .put_object(bucket, object, &mut reader, &tagging_only)
+                .await
+                .expect_err("{mode}: a tagging-only replication write must not pass the bucket default retention lock");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{mode}: unexpected error: {err}");
+            let info = version_info(&set_disks, bucket, object, &version_id).await;
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=local",
+                "{mode}: the default-protected version must be untouched"
+            );
+
+            let with_retention_decision = ObjectOptions {
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                ..tagging_only
+            };
+            put_version(&set_disks, bucket, object, &version_id, &with_retention_decision).await;
+            let info = version_info(&set_disks, bucket, object, &version_id).await;
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=remote",
+                "{mode}: with the retention source timestamp the newer inbound tags win"
+            );
+        }
+    }
+
+    /// The gate runs before the replication bypass, so malformed persisted
+    /// lock metadata still fails closed for an authorized replication write.
+    #[tokio::test]
+    async fn replication_write_on_malformed_lock_metadata_still_fails_closed() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-malformed";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        let mut local = HashMap::new();
+        local.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "MAYBE".to_string());
+        put_version(&set_disks, bucket, object, &version_id, &versioned_opts(&version_id, local)).await;
+
+        let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+        let err = set_disks
+            .put_object(bucket, object, &mut reader, &inbound_legal_hold_release_opts(&version_id, T_NEW))
+            .await
+            .expect_err("malformed persisted lock metadata must fail the replication write closed");
+        assert!(!matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("MAYBE"));
+    }
+
+    /// The bypass is scoped to authorized replication writes: the same
+    /// explicit-version PUT without `replication_request` stays WORM-rejected.
+    #[tokio::test]
+    async fn non_replication_overwrite_of_locked_version_is_still_rejected() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "lww-locked-plain-put";
+        let object = "object";
+        let version_id = Uuid::new_v4().to_string();
+        make_bucket(&disk_stores, bucket).await;
+        seed_locked_version(&set_disks, bucket, object, &version_id, T_OLD).await;
+
+        let opts = ObjectOptions {
+            replication_request: false,
+            ..inbound_legal_hold_release_opts(&version_id, T_NEW)
+        };
+        let mut reader = PutObjReader::from_vec(b"lww-body".to_vec());
+        let err = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect_err("a non-replication overwrite of a locked version must stay rejected");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
+
+        let info = version_info(&set_disks, bucket, object, &version_id).await;
+        assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("ON"));
     }
 }
 
@@ -11815,6 +12751,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    namespace_lock_lost_signal: None,
                     ..Default::default()
                 },
                 "test_data_movement",
@@ -13136,8 +14073,10 @@ mod put_object_tmp_cleanup_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
-    use crate::set_disk::core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
-    use std::time::Duration;
+    use crate::set_disk::core::io_primitives::{
+        ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier, rename_fault_injection,
+    };
+    use std::{collections::HashSet, time::Duration};
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
@@ -13176,6 +14115,45 @@ mod put_object_tmp_cleanup_tests {
             assert!(tokio::time::Instant::now() < deadline, "{failure_context}, leftovers: {leftovers:?}");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn recovered_disk_tmp_cleanup_marks_the_snapshot_it_mutates() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let recovered = disk_stores[0].clone();
+        let tmp_path = "recovered-disk-cleanup/part.1";
+        recovered
+            .write_all(RUSTFS_META_TMP_BUCKET, tmp_path, Bytes::from_static(b"stale tmp shard"))
+            .await
+            .expect("recovered disk should contain staged tmp data");
+
+        set_disks.disks.write().await[0] = None;
+        let stale_snapshot = set_disks.get_disks_internal().await;
+        assert!(stale_snapshot[0].is_none(), "the pre-cleanup snapshot must exclude the disk");
+        set_disks.disks.write().await[0] = Some(recovered.clone());
+        let _ = drain_global_dirty_scopes();
+
+        set_disks
+            .delete_all(RUSTFS_META_TMP_BUCKET, "recovered-disk-cleanup")
+            .await
+            .expect("tmp cleanup should use the recovered disk");
+
+        assert!(matches!(
+            recovered.read_all(RUSTFS_META_TMP_BUCKET, tmp_path).await,
+            Err(DiskError::FileNotFound)
+        ));
+        let expected = capacity_scope_from_disks(&[Some(recovered)])
+            .disks
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let marked = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+        assert!(
+            expected.is_subset(&marked),
+            "tmp cleanup must mark the recovered disk it actually mutated"
+        );
     }
 
     #[tokio::test]
@@ -13340,19 +14318,35 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn cancelled_post_commit_cleanup_does_not_retain_namespace_lock() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+            assert_cancelled_post_commit_cleanup_does_not_retain_namespace_lock().await;
+        })
+        .await;
+    }
+
+    async fn assert_cancelled_post_commit_cleanup_does_not_retain_namespace_lock() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "put-commit-lock-cancelled-cleanup";
         let object = "commit-lock-cancelled-cleanup-object";
         for disk in &disk_stores {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
+        let candidate_disks = disk_stores.iter().cloned().map(Some).collect::<Vec<_>>();
+        let expected_scope = capacity_scope_from_disks(&candidate_disks)
+            .disks
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         let mut initial_reader = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
         set_disks
             .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
             .await
             .expect("initial object should be committed");
+        let _ = drain_global_dirty_scopes();
 
         let cleanup_tasks = rename_fanout_barrier::observe_tasks(object);
         let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
@@ -13386,6 +14380,11 @@ mod put_object_tmp_cleanup_tests {
                 .expect_err("the first request should be cancelled during cleanup")
                 .is_cancelled()
         );
+        let committed_scope = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+        assert!(
+            expected_scope.is_subset(&committed_scope),
+            "a committed overwrite must mark every candidate disk before caller cancellation can interrupt post-commit awaits"
+        );
         assert!(
             cleanup_tasks.running() >= 1,
             "cancelled cleanup must remain observable until its disk task drains"
@@ -13399,6 +14398,17 @@ mod put_object_tmp_cleanup_tests {
         .await
         .expect("cancelled cleanup disk tasks should drain");
         drop(cleanup_barrier);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let after_cleanup = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+                if expected_scope.is_subset(&after_cleanup) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed old-data cleanup must re-mark every candidate disk after a refresh drain");
 
         second_commit_barrier.release();
         second
@@ -13413,6 +14423,7 @@ mod put_object_tmp_cleanup_tests {
         let mut body = Vec::new();
         reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
         assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+        let _ = drain_global_dirty_scopes();
     }
 
     #[tokio::test]
@@ -13484,7 +14495,7 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(rename_quorum_ack)]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn early_ack_tail_drain_retains_namespace_lock_until_background_rename_finishes() {
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -13551,6 +14562,368 @@ mod put_object_tmp_cleanup_tests {
             let mut body = Vec::new();
             reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
             assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_successful_tail_reclaims_its_old_non_inline_data_dir() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-early-ack-tail-cleanup";
+            let object = "early-ack-tail-cleanup-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let expected_scope = capacity_scope_from_disks(&disk_stores.iter().cloned().map(Some).collect::<Vec<_>>())
+                .disks
+                .into_iter()
+                .collect::<HashSet<_>>();
+
+            let mut initial = PutObjReader::from_vec(vec![b'0'; TEST_OBJECT_SIZE]);
+            set_disks
+                .put_object(bucket, object, &mut initial, &ObjectOptions::default())
+                .await
+                .expect("initial non-inline object should commit");
+            drop(
+                set_disks
+                    .acquire_write_lock_diag("tail_cleanup_fixture_ready", bucket, object)
+                    .await
+                    .expect("initial PUT tail should drain before inspecting one disk"),
+            );
+            let old_data_dir = disk_stores[0]
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("initial object metadata should be readable")
+                .data_dir
+                .expect("one-megabyte test object should have a data directory");
+            let old_part = format!("{object}/{old_data_dir}/part.1");
+
+            let mut heal_requests = set_disks.capture_test_rename_tail_heals();
+            let tail_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let overwrite_set = Arc::clone(&set_disks);
+            let overwrite = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                overwrite_set
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("one overwrite tail should pause during rename");
+            let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+            overwrite
+                .await
+                .expect("early-ACK overwrite task should join")
+                .expect("overwrite should return after write quorum");
+            let retained_before_tail = futures::future::join_all(disk_stores.iter().map(|disk| disk.read_all(bucket, &old_part)))
+                .await
+                .into_iter()
+                .filter(|result| result.is_ok())
+                .count();
+            assert_eq!(
+                retained_before_tail, 1,
+                "only the paused tail disk should still retain the referenced old body"
+            );
+            let _ = drain_global_dirty_scopes();
+
+            rename_barrier.release();
+            tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+                .await
+                .expect("the successful tail should pause before reclaiming its old body");
+            let after_tail = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected_scope.is_subset(&after_tail),
+                "the completed rename tail must re-mark capacity after the first scope was drained"
+            );
+            cleanup_barrier.release();
+            let cleanup_wait = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let retained = futures::future::join_all(disk_stores.iter().map(|disk| disk.read_all(bucket, &old_part)))
+                        .await
+                        .into_iter()
+                        .filter(|result| result.is_ok())
+                        .count();
+                    if retained == 0 && tail_tasks.running() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if cleanup_wait.is_err() {
+                let retained = futures::future::join_all(disk_stores.iter().map(|disk| disk.read_all(bucket, &old_part)))
+                    .await
+                    .into_iter()
+                    .filter(|result| result.is_ok())
+                    .count();
+                panic!(
+                    "the successful tail must reclaim its old body and drain: retained={retained}, running={}",
+                    tail_tasks.running()
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let after_cleanup = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+                    if expected_scope.is_subset(&after_cleanup) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the completed tail cleanup must re-mark capacity after its preceding scope was drained");
+
+            for (idx, disk) in disk_stores.iter().enumerate() {
+                assert!(
+                    matches!(disk.read_all(bucket, &old_part).await, Err(DiskError::FileNotFound)),
+                    "disk {idx} must reclaim the dereferenced old body"
+                );
+            }
+            let mut reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the overwrite should remain readable after tail cleanup");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("overwritten body should drain");
+            assert_eq!(body, vec![b'1'; TEST_OBJECT_SIZE]);
+            assert!(
+                matches!(heal_requests.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+                "successful tail cleanup must not submit heal"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_put_holds_quota_fences_and_re_marks_capacity_after_tail_drain() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-early-ack-capacity-scope";
+            let object = "early-ack-capacity-scope-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let candidate_disks = disk_stores.iter().cloned().map(Some).collect::<Vec<_>>();
+            let expected = capacity_scope_from_disks(&candidate_disks)
+                .disks
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let _ = drain_global_dirty_scopes();
+            let mut heal_requests = set_disks.capture_test_rename_tail_heals();
+
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let put_store = Arc::clone(&set_disks);
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                let mut opts = ObjectOptions::default();
+                assert!(opts.set_quota_admission(0, u64::MAX));
+                put_store.put_object(bucket, object, &mut reader, &opts).await
+            });
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("PUT should pause one tail disk during rename");
+            put.await
+                .expect("early-ACK PUT task should join before tail release")
+                .expect("early-ACK PUT should return after write quorum");
+            assert!(rename_tasks.running() >= 1, "the paused tail disk must remain in flight after quorum ACK");
+
+            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(expected.is_subset(&initial), "the quorum ACK must mark every candidate disk dirty");
+
+            rename_barrier.release();
+            let tail_done = tokio::time::timeout(
+                Duration::from_secs(30),
+                set_disks.acquire_write_lock_diag("capacity_scope_tail_probe", bucket, object),
+            )
+            .await
+            .expect("the object lock should become available after the tail drain")
+            .expect("the tail completion probe should acquire the object lock");
+            drop(tail_done);
+
+            let after_tail = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&after_tail),
+                "a tail completing after refresh drained the first mark must re-mark every candidate disk"
+            );
+            for (disk_index, disk) in disk_stores.iter().enumerate() {
+                disk.read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {disk_index} must claim its quota fence and finish the rename: {err}"));
+            }
+            assert!(
+                matches!(heal_requests.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+                "a successful rename tail must not submit heal"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn detached_early_ack_handoff_survives_caller_cancellation() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-early-ack-cancelled-handoff";
+            let object = "early-ack-cancelled-handoff-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let candidate_disks = disk_stores.iter().cloned().map(Some).collect::<Vec<_>>();
+            let expected = capacity_scope_from_disks(&candidate_disks)
+                .disks
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let _ = drain_global_dirty_scopes();
+            let mut heal_requests = set_disks.capture_test_rename_tail_heals();
+            let expected_version_id = Uuid::nil().to_string();
+
+            let tail_tasks = rename_fanout_barrier::observe_tasks(object);
+            let tail_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let _fault = rename_fault_injection::fail_rename_on(object, &[0]);
+            let quorum_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterRenameQuorum);
+            let handoff_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterRenameHandoff);
+            let put_store = Arc::clone(&set_disks);
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                put_store
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            version_suspended: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(30), tail_barrier.wait_until_paused())
+                .await
+                .expect("one rename tail should pause while the other disks publish quorum");
+            quorum_barrier.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await.expect_err("the request task should be cancelled").is_cancelled(),
+                "the caller should be cancelled after quorum publication"
+            );
+
+            quorum_barrier.release();
+            handoff_barrier.wait_until_paused().await;
+            assert!(tail_tasks.running() >= 1, "the detached owner must retain the paused tail");
+            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&initial),
+                "the detached continuation must install the full capacity scope"
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    set_disks.acquire_write_lock_diag("cancelled_handoff_probe", bucket, object),
+                )
+                .await
+                .is_err(),
+                "the watcher must own the namespace guard before the detached continuation awaits"
+            );
+
+            handoff_barrier.release();
+            tail_barrier.release();
+            let tail_done = tokio::time::timeout(
+                Duration::from_secs(30),
+                set_disks.acquire_write_lock_diag("cancelled_handoff_tail_probe", bucket, object),
+            )
+            .await
+            .expect("the namespace guard should release after the detached tail drains")
+            .expect("the post-tail probe should acquire the namespace guard");
+            drop(tail_done);
+
+            let after_tail = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&after_tail),
+                "the detached tail must re-mark capacity after the first scope was drained"
+            );
+            let request = tokio::time::timeout(Duration::from_secs(30), heal_requests.recv())
+                .await
+                .expect("a failed tail should submit heal")
+                .expect("the per-set heal capture should stay connected");
+            assert_eq!(request.bucket, bucket);
+            assert_eq!(request.object_prefix.as_deref(), Some(object));
+            assert_eq!(request.object_version_id.as_deref(), Some(expected_version_id.as_str()));
+            assert_eq!(request.pool_index, Some(set_disks.pool_index));
+            assert_eq!(request.set_index, Some(set_disks.set_index));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn no_lock_put_waits_for_rename_tail_under_outer_guard() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "put-no-lock-serial-rename";
+            let object = "put-no-lock-serial-rename-object";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+
+            let outer_guard = set_disks
+                .acquire_write_lock_diag("outer_no_lock_put", bucket, object)
+                .await
+                .expect("the outer caller should hold the namespace guard");
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let put_store = Arc::clone(&set_disks);
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                put_store
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("no-lock PUT should reach the paused rename disk");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the other rename disks should finish while one disk remains paused");
+            assert!(
+                !put.is_finished(),
+                "a no-lock caller that cannot hand off its outer guard must await the full rename fanout"
+            );
+
+            rename_barrier.release();
+            put.await
+                .expect("no-lock PUT task should join")
+                .expect("no-lock PUT should commit after the rename tail releases");
+            drop(outer_guard);
         })
         .await;
     }
@@ -14051,6 +15424,72 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("protected body should drain");
         assert_eq!(body, original_body);
+    }
+
+    /// A local PutObjectRetention / PutObjectLegalHold clear persists empty
+    /// lock keys (`parse_object_lock_retention`). The commit-time WORM gate
+    /// must read that as unlocked: an explicit-version PUT (the inbound
+    /// replication transport) and a version delete both have to succeed
+    /// (rustfs/backlog#1953).
+    #[tokio::test]
+    async fn explicit_version_overwrite_and_delete_succeed_after_local_lock_clear() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "put-explicit-version-cleared-lock";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(b"original".to_vec());
+        let initial = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initial version should be written");
+        let version_id = initial
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let version_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.clone()),
+            delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::default())),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([
+                        (X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(), String::new()),
+                        (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), String::new()),
+                        (X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), String::new()),
+                    ])),
+                    ..version_opts.clone()
+                },
+            )
+            .await
+            .expect("cleared lock metadata should be written");
+
+        let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement, &version_opts)
+            .await
+            .expect("explicit-version PUT must not be wedged by cleared lock metadata");
+
+        set_disks
+            .delete_object(bucket, object, version_opts)
+            .await
+            .expect("version delete must not be wedged by cleared lock metadata");
     }
 
     #[tokio::test]

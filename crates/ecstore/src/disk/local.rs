@@ -80,6 +80,11 @@ use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(test)]
+tokio::task_local! {
+    static DIRECTORY_LISTING_ENTRY_PROBE_COUNT: Arc<AtomicUsize>;
+}
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const INLINE_METADATA_ROLLBACK_DIR_XOR: u128 = 0x7275737466735f696e6c696e655f7262;
 const DELETE_MARKER_ROLLBACK_FILE: &str = "xl.meta.delete-marker.rollback";
@@ -7057,6 +7062,7 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             if opts.recursive
                                 || opts.incl_deleted
+                                || opts.skip_hidden_prefix_check
                                 || self
                                     .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
                                     .await?
@@ -7201,6 +7207,10 @@ impl LocalDisk {
             if current.is_empty() {
                 continue;
             }
+
+            #[cfg(test)]
+            let _previous_probe_count =
+                DIRECTORY_LISTING_ENTRY_PROBE_COUNT.try_with(|probe_count| probe_count.fetch_add(1, Ordering::Relaxed));
 
             let entries = match with_walk_stall_timeout(stall, self.list_dir("", bucket, &current, -1)).await {
                 Ok(entries) => entries,
@@ -8000,10 +8010,15 @@ impl DiskAPI for LocalDisk {
             use std::io::Write as _;
 
             let file_path = self.io_get_object_path(volume, path)?;
-            let lock_path = file_path.with_extension("rustfs-cas.lock");
             let path = path.to_string();
             let sync_metadata = effective_durability(volume).syncs_commit_metadata();
             return Ok(tokio::task::spawn_blocking(move || {
+                // A persistent directory lock bounds metadata growth. Removing
+                // per-target lock files can split flock ownership across inodes.
+                let lock_path = file_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?
+                    .join(".rustfs-cas.lock");
                 let lock = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -8068,7 +8083,25 @@ impl DiskAPI for LocalDisk {
             .map_err(DiskError::from)??);
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let file_path = self.io_get_object_path(volume, path)?;
+            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            let publication_root = self.publication_root.clone();
+            return Ok(tokio::task::spawn_blocking(move || {
+                os::compare_and_update_control_file(
+                    &file_path,
+                    expected.as_deref(),
+                    replacement.as_deref(),
+                    sync_metadata,
+                    &publication_root,
+                )
+            })
+            .await
+            .map_err(DiskError::from)??);
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (volume, path, expected, replacement);
             Err(DiskError::MethodNotAllowed)
@@ -8940,6 +8973,7 @@ impl DiskAPI for LocalDisk {
         )
         .await?;
 
+        out.close().await?;
         Ok(())
     }
 
@@ -17490,6 +17524,86 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_dir_nonrecursive_visible_prefix_probe_cost() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        const PREFIX_COUNT: usize = 64;
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let mut expected_names = Vec::with_capacity(PREFIX_COUNT);
+
+        for index in 0..PREFIX_COUNT {
+            let prefix = format!("prefix-{index:04}");
+            let object_name = format!("{prefix}/nested/object");
+            let object_dir = bucket_dir.join(&object_name);
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("visible object directory should be created");
+
+            let mut metadata = FileMeta::default();
+            let mut file_info = FileInfo::new(&object_name, 1, 1);
+            file_info.mod_time = Some(OffsetDateTime::now_utc());
+            metadata.add_version(file_info).expect("visible metadata should be valid");
+            fs::write(
+                object_dir.join(STORAGE_FORMAT_FILE),
+                metadata.marshal_msg().expect("visible metadata should encode"),
+            )
+            .await
+            .expect("visible object metadata should be written");
+            expected_names.push(format!("{prefix}/"));
+        }
+
+        async fn scan_prefixes(disk: &LocalDisk, bucket: &str, skip_hidden_prefix_check: bool) -> (Vec<String>, usize) {
+            let probe_count = Arc::new(AtomicUsize::new(0));
+            let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+            let mut output = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                skip_hidden_prefix_check,
+                ..Default::default()
+            };
+            let mut objects_returned = 0;
+
+            DIRECTORY_LISTING_ENTRY_PROBE_COUNT
+                .scope(
+                    Arc::clone(&probe_count),
+                    disk.scan_dir("".to_string(), "".to_string(), &opts, &mut output, &mut objects_returned, false, None),
+                )
+                .await
+                .expect("scan_dir should succeed");
+            output.close().await.expect("metacache writer should close");
+            drop(output);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let names = reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+
+            (names, probe_count.load(Ordering::Relaxed))
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be UTF-8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+
+        let (conservative_names, conservative_probes) = scan_prefixes(&disk, bucket, false).await;
+        let (fast_path_names, fast_path_probes) = scan_prefixes(&disk, bucket, true).await;
+
+        assert_eq!(conservative_names, expected_names);
+        assert_eq!(fast_path_names, expected_names);
+        assert_eq!(conservative_probes, PREFIX_COUNT * 3);
+        assert_eq!(fast_path_probes, 0);
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_nonrecursive_skips_dirs_with_only_hidden_delete_markers() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -21825,9 +21939,9 @@ mod test {
         assert!(matches!(results[1].as_ref().unwrap_err(), DiskError::Io(_)));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn conditional_file_update_never_deletes_a_new_owner() {
+    async fn windows_and_unix_conditional_file_update_never_deletes_a_new_owner() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -21858,8 +21972,18 @@ mod test {
             disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
                 .await
                 .expect("new owner marker should remain"),
-            owner_b
+            owner_b.clone()
         );
+        assert_eq!(
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, Some(owner_b), None)
+                .await
+                .expect("current owner should remove marker"),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(matches!(
+            disk.read_all(RUSTFS_META_BUCKET, HEALING_MARKER_PATH).await,
+            Err(DiskError::FileNotFound)
+        ));
     }
 
     #[cfg(unix)]
@@ -21874,7 +21998,10 @@ mod test {
         let marker_path = disk
             .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
             .expect("marker path should resolve");
-        let lock_path = marker_path.with_extension("rustfs-cas.lock");
+        let lock_path = marker_path
+            .parent()
+            .expect("marker path should have a parent")
+            .join(".rustfs-cas.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -21883,6 +22010,40 @@ mod test {
             .open(lock_path)
             .expect("marker lock should open");
         flock(&lock, FlockOperation::LockExclusive).expect("marker lock should be held");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            disk.compare_and_update_file(RUSTFS_META_BUCKET, HEALING_MARKER_PATH, None, Some(Bytes::from_static(b"owner"))),
+        )
+        .await
+        .expect("contended conditional update must not block")
+        .expect_err("contended conditional update must retry");
+
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == ErrorKind::WouldBlock));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_conditional_file_update_returns_would_block_when_marker_lock_is_contended() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        let marker_path = disk
+            .get_object_path(RUSTFS_META_BUCKET, HEALING_MARKER_PATH)
+            .expect("marker path should resolve");
+        let lock_path = marker_path
+            .parent()
+            .expect("marker path should have a parent")
+            .join(".rustfs-cas.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .expect("marker lock should open");
+        lock.try_lock().expect("marker lock should be held");
 
         let err = tokio::time::timeout(
             Duration::from_secs(1),

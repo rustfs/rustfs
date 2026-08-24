@@ -70,7 +70,9 @@ mod ecstore_notification {
 }
 
 #[allow(unused_imports)]
-mod ecstore_rebalance {
+pub(crate) mod ecstore_rebalance {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_rebalance::test_util;
     pub(crate) use crate::storage::storage_api::ecstore_rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
@@ -441,8 +443,10 @@ pub(crate) mod quota {
 
 pub(crate) mod replication {
     pub(crate) use super::ecstore_bucket::replication::{
-        REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-        REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+        OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+        REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+        REPLICATION_WRITABLE_FIELDS, assign_site_replication_rule_priorities, is_site_replication_role,
+        merge_incoming_replication_config, replication_target_arn_deployment_id, site_replication_rule_deployment_id,
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;

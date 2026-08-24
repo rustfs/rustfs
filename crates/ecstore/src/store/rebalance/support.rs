@@ -67,7 +67,7 @@ pub(super) fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &Obj
     }
 }
 
-pub(super) fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
+pub(super) fn resolve_store_rebalance_pool_meta_reload_result<T>(result: Result<T>, stage: &str) -> Result<T> {
     result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
 }
 
@@ -214,51 +214,82 @@ fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     }
 }
 
-/// Pool-specific erasure geometry is intentionally excluded: `get_object_info`
-/// returns each pool's own `data_blocks`/`parity_blocks`, so those values can
-/// differ for the same object version while the selected winner still carries
-/// the chosen pool's layout. `put_object_reader` is also intentionally
-/// excluded because it is a transient request handle that `ObjectInfo::clone`
-/// drops. Every other ObjectInfo field is part of the production-visible
-/// identity and must agree before the pool index can provide a deterministic
-/// tie-break.
+/// Pool-specific erasure geometry and data-movement rewrites are intentionally
+/// excluded. The selected winner still carries the chosen pool's layout, while
+/// the remaining read-visible fields must agree before the pool index can
+/// provide a deterministic tie-break.
 fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
-    left.bucket == right.bucket
+    let same_read_surface = left.bucket == right.bucket
         && left.name == right.name
-        && left.storage_class == right.storage_class
+        && left.is_dir == right.is_dir
+        && left.restore_ongoing == right.restore_ongoing
+        && left.restore_expires == right.restore_expires
+        && left.is_latest == right.is_latest
+        && left.content_type == right.content_type
+        && left.content_encoding == right.content_encoding
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time
+        && left.inlined == right.inlined
+        && left.metadata_only == right.metadata_only
+        && left.version_only == right.version_only
+        && left.replication_decision == right.replication_decision;
+
+    if !same_read_surface {
+        return false;
+    }
+
+    let exact_identity = left.storage_class == right.storage_class
         && left.mod_time == right.mod_time
         && left.size == right.size
         && left.actual_size == right.actual_size
-        && left.is_dir == right.is_dir
         && same_user_defined_identity(left, right)
         && left.user_tags == right.user_tags
         && left.version_id == right.version_id
         && left.data_dir == right.data_dir
         && left.delete_marker == right.delete_marker
         && same_transition_identity(left, right)
-        && left.restore_ongoing == right.restore_ongoing
-        && left.restore_expires == right.restore_expires
         && left.parts == right.parts
-        && left.is_latest == right.is_latest
-        && left.content_type == right.content_type
-        && left.content_encoding == right.content_encoding
         && left.expires == right.expires
-        && left.num_versions == right.num_versions
-        && left.successor_mod_time == right.successor_mod_time
         && left.etag == right.etag
-        && left.inlined == right.inlined
-        && left.metadata_only == right.metadata_only
-        && left.version_only == right.version_only
         && left.replication_status_internal == right.replication_status_internal
         && left.replication_status == right.replication_status
         && left.version_purge_status_internal == right.version_purge_status_internal
         && left.version_purge_status == right.version_purge_status
-        && left.replication_decision == right.replication_decision
-        && left.checksum == right.checksum
+        && left.checksum == right.checksum;
+
+    if exact_identity {
+        return true;
+    }
+
+    let left_moved =
+        rustfs_utils::http::get_consistent_str(&left.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED) == Some("true");
+    let right_moved =
+        rustfs_utils::http::get_consistent_str(&right.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED) == Some("true");
+
+    match (left_moved, right_moved) {
+        (false, false) => false,
+        (false, true) => crate::data_movement::is_equivalent_data_movement_object_identity(left, right, true, true),
+        (true, false) => crate::data_movement::is_equivalent_data_movement_object_identity(right, left, true, true),
+        (true, true) => {
+            crate::data_movement::is_equivalent_data_movement_object_identity(left, right, true, true)
+                || crate::data_movement::is_equivalent_data_movement_object_identity(right, left, true, true)
+        }
+    }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_latest_object_info_candidates(
     candidates: Vec<LatestObjectInfoCandidate>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    resolve_latest_object_info_candidates_with_pool_state(candidates, &[], bucket, object, opts)
+}
+
+pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
+    candidates: Vec<LatestObjectInfoCandidate>,
+    suspended_pools: &[bool],
     bucket: &str,
     object: &str,
     opts: &ObjectOptions,
@@ -271,7 +302,15 @@ pub(super) fn resolve_latest_object_info_candidates(
             .filter(|candidate| latest_candidate_mod_time(candidate) == Some(latest_mod_time))
             .collect::<Vec<_>>();
 
-        latest_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.idx));
+        // A decommission source remains readable until its target commits. Once
+        // equivalent copies exist, prefer the active target without hiding a
+        // same-time identity conflict behind pool state.
+        latest_candidates.sort_by_key(|candidate| {
+            (
+                suspended_pools.get(candidate.idx).copied().unwrap_or(false),
+                std::cmp::Reverse(candidate.idx),
+            )
+        });
 
         let Some(winner) = latest_candidates.first() else {
             return Err(Error::ErasureReadQuorum);

@@ -161,7 +161,7 @@ pub mod bucket {
         pub mod objectlock_sys {
             pub use crate::bucket::object_lock::objectlock_sys::{
                 BucketObjectLockSys, ObjectLockBlockReason, add_years, check_object_lock_for_deletion,
-                check_retention_for_modification, is_retention_active,
+                check_retention_for_modification, is_retention_active, replication_write_may_pass_worm_gate,
             };
         }
     }
@@ -187,22 +187,24 @@ pub mod bucket {
         pub use crate::bucket::replication::{
             BucketReplicationResyncStatus, BucketReplicationStat, BucketReplicationStats, BucketStats,
             DeleteReplicationConfigSnapshot, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool, InQueueMetric,
-            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION,
-            REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATE_INCOMING_DELETE,
-            REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
-            ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
+            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, OperatorRuleContract,
+            REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+            REPLICATE_INCOMING_DELETE, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+            REPLICATION_WRITABLE_FIELDS, ReplicateDecision, ReplicateObjectInfo, ReplicationBatchAdmission, ReplicationConfig,
             ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
             ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
             ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
             ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
             ReplicationType, ResyncOpts, ResyncStatusType, RuntimeReplicationTargetBacklog, TargetReplicationResyncStatus,
-            VersionPurgeStatusType, XferStats, commit_force_delete_intent, complete_force_delete_intent,
-            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
-            get_global_replication_stats, get_proxy_targets, init_background_replication,
-            invalid_replication_config_status_field, persist_force_delete_intent, read_durable_mrf_backlog,
-            replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map, replication_target_arns,
-            resync_start_conflict_id, should_remove_replication_target, should_schedule_delete_replication,
-            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            VersionPurgeStatusType, XferStats, assign_site_replication_rule_priorities, commit_force_delete_intent,
+            complete_force_delete_intent, delete_replication_state_from_config, delete_replication_version_id,
+            get_global_replication_pool, get_global_replication_stats, get_proxy_targets, init_background_replication,
+            invalid_replication_config_status_field, is_site_replication_role, is_site_replication_rule,
+            merge_incoming_replication_config, merge_user_replication_config, persist_force_delete_intent,
+            read_durable_mrf_backlog, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
+            replication_target_arn_deployment_id, replication_target_arns, resync_start_conflict_id,
+            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+            should_use_existing_delete_replication_source, site_replication_rule_deployment_id,
             unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
             version_purge_status_to_filemeta,
         };
@@ -241,8 +243,8 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
-        path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
@@ -413,9 +415,9 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, new_global_notification_sys,
-        start_remote_version_state_fleet_probe,
+        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        acquire_cross_pool_fence_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        new_global_notification_sys, start_remote_version_state_fleet_probe,
     };
 }
 
@@ -424,9 +426,10 @@ pub mod object {
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
         ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
-        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, StreamConsumer,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, StreamConsumer, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
@@ -440,6 +443,12 @@ pub mod rebalance {
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::rebalance::PausedRebalanceEntryTestFixture;
+        pub use crate::services::rebalance::test_store_with_persisted_rebalance_meta;
+    }
 }
 
 pub mod rio {
@@ -453,14 +462,17 @@ pub mod rpc {
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
-        check_and_record_signed_rpc_nonce, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+        ScannerBucketListing, ScannerPeerActivity, ScannerPublicationLease, TONIC_RPC_PREFIX, TonicInterceptor,
+        build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options,
+        encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
         gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-        normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_put_file_capability,
-        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature,
-        verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
-        verify_tonic_rpc_response_proof, verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
+        sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+        verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer,
+        verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 
@@ -487,7 +499,7 @@ pub mod storage {
     pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
         init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
         prewarm_local_disk_id_map_with_instance_ctx,
     };

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::metadata_sys::{get_versioning_config, has_authoritative_never_versioned_state};
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
@@ -261,6 +261,9 @@ pub struct ListPathOptions {
     // InclDeleted will keep all entries where latest version is a delete marker.
     pub incl_deleted: bool,
 
+    // Authoritative bucket metadata proves that delete markers cannot exist.
+    pub skip_hidden_prefix_check: bool,
+
     // Scan recursively.
     // If false only main directory will be scanned.
     // Should always be true if Separator is n SlashSeparator.
@@ -291,6 +294,16 @@ pub struct ListPathOptions {
     pub cursor_generation: Option<String>,
     pub walkdir_timeout: Option<Duration>,
     pub walkdir_stall_timeout: Option<Duration>,
+}
+
+async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
+    if options.recursive || options.incl_deleted || options.versioned {
+        return false;
+    }
+
+    has_authoritative_never_versioned_state(&options.bucket)
+        .await
+        .unwrap_or(false)
 }
 
 const MARKER_TAG_VERSION: &str = "v2";
@@ -2523,6 +2536,7 @@ struct ListingSupplementOptions {
     path: String,
     recursive: bool,
     incl_deleted: bool,
+    skip_hidden_prefix_check: bool,
     filter_prefix: Option<String>,
     forward_to: Option<String>,
     per_disk_limit: i32,
@@ -2655,6 +2669,7 @@ async fn read_fallback_listing_disk(
                 base_dir: options.path,
                 recursive: options.recursive,
                 incl_deleted: options.incl_deleted,
+                skip_hidden_prefix_check: options.skip_hidden_prefix_check,
                 report_notfound: false,
                 filter_prefix: options.filter_prefix,
                 forward_to: options.forward_to,
@@ -4010,6 +4025,8 @@ impl ECStore {
             o.recursive = true
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -4357,6 +4374,7 @@ impl ECStore {
                             path: path.clone(),
                             recursive: true,
                             incl_deleted: !opts.latest_only,
+                            skip_hidden_prefix_check: false,
                             filter_prefix: Some(filter_prefix.clone()),
                             forward_to: opts.marker.clone(),
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
@@ -5288,6 +5306,8 @@ impl Sets {
             o.recursive = true;
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -5583,6 +5603,7 @@ impl Sets {
                         path: path.clone(),
                         recursive: true,
                         incl_deleted: !opts.latest_only,
+                        skip_hidden_prefix_check: false,
                         filter_prefix: Some(filter_prefix.clone()),
                         forward_to: opts.marker.clone(),
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
@@ -6338,6 +6359,8 @@ impl SetDisks {
             o.recursive = true;
         }
 
+        o.skip_hidden_prefix_check = can_skip_hidden_prefix_check(&o).await;
+
         o.parse_marker();
 
         if o.base_dir.is_empty() {
@@ -6562,6 +6585,7 @@ impl SetDisks {
                 path: opts.base_dir.clone(),
                 recursive: opts.recursive,
                 incl_deleted: opts.incl_deleted,
+                skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
                 filter_prefix: opts.filter_prefix.clone(),
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
@@ -6584,6 +6608,7 @@ impl SetDisks {
                 path: opts.base_dir,
                 recursive: opts.recursive,
                 incl_deleted: opts.incl_deleted,
+                skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
                 filter_prefix: opts.filter_prefix,
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
@@ -6960,6 +6985,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 100,
@@ -6976,6 +7002,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,
@@ -7032,6 +7059,7 @@ mod test {
                 path: String::new(),
                 recursive: true,
                 incl_deleted: false,
+                skip_hidden_prefix_check: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,

@@ -72,7 +72,7 @@ The reason string on each attribute is the classifier. Current classes:
 
 - **Needs a pre-started server** — `"requires running RustFS server at
   localhost:9000"` / `"Connects to existing rustfs server"`. These are the
-  `reliant/*` and `policy/test_runner` tests; start a server first (e.g.
+  `reliant/*` tests; start a server first (e.g.
   [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh)) or use
   `--run-ignored`.
 - **Heavy / external tool** — `"Starts a rustfs server; enable when running
@@ -123,7 +123,7 @@ via `create_s3_client(idx)` / `create_all_clients()`. See
 | `find_available_port` | Random free port (isolation primitive) |
 | `rustfs_binary_path` / `_with_features` | Locate/build the binary; honors `RUSTFS_BUILD_FEATURES` |
 | `requested_rustfs_build_features` / `rustfs_build_feature_enabled` | Feature-gate a test to what the binary was built with |
-| `awscurl_available` + `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl` (skip gracefully when absent) |
+| `execute_awscurl` / `awscurl_post` / `_get` / `_put` / `_delete` / `awscurl_post_sts_form_urlencoded` | Admin/STS API calls via `awscurl`; missing binaries are test failures |
 | `replication_fast_env` | Env vars that shrink replication timers (from repl-4); pass to `start_rustfs_server_with_env` |
 | `local_http_client` / `init_logging` | Loopback HTTP client; idempotent tracing init |
 | `RustFSTestClusterEnvironment` (`new`/`start`/`start_node`/`stop_node`/`create_all_clients`) | Multi-node harness |
@@ -189,7 +189,7 @@ cargo nextest run --profile e2e-smoke -p e2e_test
 cargo nextest run --profile e2e-full -p e2e_test
 # Cluster fault nightly lane
 cargo nextest run --profile e2e-nightly -p e2e_test
-# Replication nightly lane; install awscurl so STS paths do not skip
+# Replication nightly lane; awscurl is required for STS paths
 cargo nextest run --profile e2e-repl-nightly -p e2e_test
 # Fixed-port protocol nightly lane
 RUSTFS_BUILD_FEATURES=ftps,webdav,sftp \
@@ -221,9 +221,8 @@ The `s3s-e2e` CI job selects a random `RUSTFS_TEST_PORT` (see the `e2e-tests`
 job) to dodge this; local single-node tests already use random ports, so a
 lingering orphan is usually the cause of a spurious bind failure.
 
-**`awscurl` not found.** `awscurl`-dependent tests skip gracefully with a
-visible log line (`awscurl_available()`); install `awscurl` to actually run
-them.
+**`awscurl` not found.** `awscurl`-dependent tests fail closed with a process
+spawn error. Install the pinned CI version before running their profiles.
 
 ## Related
 
@@ -258,10 +257,9 @@ A test module may join the smoke filter only if every test in it is:
 2. **Single-node** — spawns its own server via
    `RustFSTestEnvironment`/`start_rustfs_server` on a random port with an
    isolated temp dir. No `RustFSTestClusterEnvironment`, no fixed ports.
-3. **Dependency-free** — no pre-started server at `localhost:9000`, no Vault,
-   no fixed protocol ports. Tools that may be absent on the runner (e.g.
-   `awscurl`) are acceptable only when the test skips gracefully with a
-   visible log line (see `bucket_policy_check_test.rs`).
+3. **Hermetic dependencies** — no pre-started server at `localhost:9000`, no
+   Vault, and no fixed protocol ports. Any required CLI must be pinned and
+   installed by the workflow; a missing CLI must fail the test.
 4. **Not `#[ignore]`** — ignored tests are activation work (backlog#1149
    ci-13 / backlog#1148 ilm-3), not smoke candidates.
 
@@ -278,4 +276,9 @@ listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
 moving e2e tests so acceptance numbers in the test-strategy issues
 (backlog#1147–#1155) stay auditable. When a profile membership change is
 intentional, review its JSON listing before updating the matching
-`.config/e2e-*-selection.txt` test-ID digest.
+`.config/e2e-*-selection.txt` test-ID digest. Update only the platform that
+produced the listing:
+
+```bash
+python3 scripts/check_test_wiring.py --update-profile e2e-full /path/to/listing.json linux
+```

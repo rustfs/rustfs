@@ -813,7 +813,7 @@ pub(crate) fn is_equivalent_data_movement_metadata(
             .all(|(key, value)| source.user_defined.get(key) == Some(value))
 }
 
-fn is_equivalent_data_movement_object_identity(
+pub(crate) fn is_equivalent_data_movement_object_identity(
     source: &ObjectInfo,
     target: &ObjectInfo,
     compare_mod_time: bool,
@@ -1023,10 +1023,11 @@ pub(crate) enum SourceCleanupError {
     Storage(#[from] Error),
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) expected_incarnation_id: Option<uuid::Uuid>,
     pub(crate) lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    pub(crate) namespace_lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     pub(crate) object_mutation_fence: Option<&'a SourceCleanupMutationFence>,
 }
 
@@ -1061,7 +1062,7 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
     ensure_source_cleanup_versions_match(expected, &current, allowed_missing)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct SourceCleanupDeleteBarrierState {
     bucket: String,
     object: String,
@@ -1071,7 +1072,7 @@ struct SourceCleanupDeleteBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
@@ -1080,11 +1081,11 @@ pub(crate) struct SourceCleanupDeleteBarrier {
     state: Arc<SourceCleanupDeleteBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static SOURCE_CLEANUP_DELETE_BARRIERS: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<SourceCleanupDeleteBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[allow(
     dead_code,
     reason = "installed by set_disk object tests behind `--features test-util` (backlog#1823)"
@@ -1148,7 +1149,7 @@ pub(crate) fn notify_source_cleanup_mutation_fence_pending(bucket: &str, object:
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for SourceCleanupDeleteBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -1160,7 +1161,7 @@ impl Drop for SourceCleanupDeleteBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
     let barrier = SOURCE_CLEANUP_DELETE_BARRIERS
         .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -1220,7 +1221,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pause_source_cleanup_before_delete(bucket, object).await;
 
     let mut opts = ObjectOptions {
@@ -1239,6 +1240,9 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
     }
     if let Some(bucket_lifecycle_guard) = bucket_fence.lifecycle_guard {
         opts.add_bucket_lifecycle_lock_guard(bucket_lifecycle_guard);
+    }
+    if let Some(signal) = bucket_fence.namespace_lock_lost_signal {
+        opts.add_namespace_lock_lost_signal(signal);
     }
     let result = set.delete_object(bucket, cleanup_key.as_str(), opts).await;
     if result.is_ok() {
@@ -1410,11 +1414,13 @@ pub(crate) async fn migrate_decommission_object(
         rd,
         source_bucket_incarnation_id,
         op_label,
+        None,
         Some(&_mutation_fence),
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn migrate_object(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1423,9 +1429,33 @@ pub(crate) async fn migrate_object(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
 ) -> Result<()> {
-    migrate_object_inner(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
+    migrate_object_with_lock_lost_signal(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn migrate_object_with_lock_lost_signal(
+    store: Arc<ECStore>,
+    pool_idx: usize,
+    bucket: String,
+    rd: GetObjectReader,
+    source_bucket_incarnation_id: Option<uuid::Uuid>,
+    op_label: &str,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+) -> Result<()> {
+    migrate_object_inner(
+        store,
+        pool_idx,
+        bucket,
+        rd,
+        source_bucket_incarnation_id,
+        op_label,
+        lock_lost_signal,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn migrate_object_inner(
     store: Arc<ECStore>,
     pool_idx: usize,
@@ -1433,6 +1463,7 @@ async fn migrate_object_inner(
     rd: GetObjectReader,
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     mutation_fence: Option<&ObjectLockDiagGuard>,
 ) -> Result<()> {
     let object_info = rd.object_info.clone();
@@ -1446,6 +1477,9 @@ async fn migrate_object_inner(
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
         new_multipart_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+        if let Some(signal) = lock_lost_signal.as_ref() {
+            new_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
             .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts, mutation_fence)
             .await
@@ -1490,7 +1524,7 @@ async fn migrate_object_inner(
                             err,
                         )
                     })?;
-                let part_opts = ObjectOptions {
+                let mut part_opts = ObjectOptions {
                     part_number: Some(part.number),
                     preserve_etag: Some(part.etag.clone()),
                     data_movement: true,
@@ -1498,6 +1532,9 @@ async fn migrate_object_inner(
                     expected_bucket_incarnation_id,
                     ..Default::default()
                 };
+                if let Some(signal) = lock_lost_signal.as_ref() {
+                    part_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                }
                 let pi = match store
                     .put_object_part_for_data_movement(
                         target_pool_idx,
@@ -1542,6 +1579,9 @@ async fn migrate_object_inner(
                     )
                 })?;
             complete_multipart_opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
+            if let Some(signal) = lock_lost_signal.as_ref() {
+                complete_multipart_opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+            }
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement(
@@ -1590,18 +1630,18 @@ async fn migrate_object_inner(
 
         if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
             let abort_result = store
-                .abort_multipart_upload_for_data_movement(
-                    target_pool_idx,
-                    &bucket,
-                    &object_info.name,
-                    &res.upload_id,
-                    &ObjectOptions {
+                .abort_multipart_upload_for_data_movement(target_pool_idx, &bucket, &object_info.name, &res.upload_id, &{
+                    let mut opts = ObjectOptions {
                         data_movement: true,
                         src_pool_idx: pool_idx,
                         expected_bucket_incarnation_id,
                         ..Default::default()
-                    },
-                )
+                    };
+                    if let Some(signal) = lock_lost_signal.as_ref() {
+                        opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                    }
+                    opts
+                })
                 .await;
             match abort_result {
                 Ok(()) => return Ok(()),
@@ -1659,18 +1699,18 @@ async fn migrate_object_inner(
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
                 return match store
-                    .abort_multipart_upload_for_data_movement(
-                        target_pool_idx,
-                        &bucket,
-                        &object_info.name,
-                        &res.upload_id,
-                        &ObjectOptions {
+                    .abort_multipart_upload_for_data_movement(target_pool_idx, &bucket, &object_info.name, &res.upload_id, &{
+                        let mut opts = ObjectOptions {
                             data_movement: true,
                             src_pool_idx: pool_idx,
                             expected_bucket_incarnation_id,
                             ..Default::default()
-                        },
-                    )
+                        };
+                        if let Some(signal) = lock_lost_signal.as_ref() {
+                            opts.add_namespace_lock_lost_signal(Arc::clone(signal));
+                        }
+                        opts
+                    })
                     .await
                 {
                     Ok(()) => Err(primary_err),
@@ -1705,6 +1745,9 @@ async fn migrate_object_inner(
 
     let mut put_opts = data_movement_put_object_opts(&object_info, pool_idx);
     put_opts.expected_bucket_incarnation_id = source_bucket_incarnation_id;
+    if let Some(signal) = lock_lost_signal {
+        put_opts.add_namespace_lock_lost_signal(signal);
+    }
     let (target_pool_idx, put_result) = store
         .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts, mutation_fence)
         .await
@@ -1946,6 +1989,19 @@ mod tests {
         let expected = cleanup_test_versions(vec![migrated.clone(), expired.clone()]);
         let current = cleanup_test_versions(vec![migrated]);
         let allowed_missing = vec![source_cleanup_version_identity(&expired)];
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+    }
+
+    #[test]
+    fn test_decommission_cleanup_preflight_accepts_migrated_free_version_consumed_from_source() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let mut free_version = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "tier-cleanup");
+        free_version.deleted = true;
+        free_version.set_tier_free_version();
+        let expected = cleanup_test_versions(vec![migrated.clone(), free_version.clone()]);
+        let current = cleanup_test_versions(vec![migrated]);
+        let allowed_missing = vec![source_cleanup_version_identity(&free_version)];
 
         assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
     }

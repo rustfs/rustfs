@@ -131,8 +131,18 @@ mod tests {
 
         // DELETE through the raw key removes the normalized object.
         client.delete_object().bucket(bucket).key("//keyname").send().await?;
-        let result = client.get_object().bucket(bucket).key("keyname").send().await;
-        assert!(result.is_err(), "object must be gone after DELETE with raw key");
+        let error = client
+            .get_object()
+            .bucket(bucket)
+            .key("keyname")
+            .send()
+            .await
+            .expect_err("object must be gone after DELETE with raw key");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "GET after DELETE with raw key must return HTTP 404, got {error:?}"
+        );
 
         env.stop_server();
         info!("Test completed successfully");

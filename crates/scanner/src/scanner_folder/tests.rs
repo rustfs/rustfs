@@ -17,7 +17,7 @@ use crate::SCANNER_SLEEPER;
 use super::*;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
-use rustfs_filemeta::{FileInfo, FileMeta};
+use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -48,8 +48,20 @@ fn scanner_alert_wire_names_match_canonical_event_names() {
 /// the backstop survives regardless of delivery.
 #[test]
 fn corrupt_metadata_recording_maps_delivery_to_backstop() {
-    assert_eq!(corrupt_metadata_recording(true), CorruptMetadataRecording::LedgerOnly);
-    assert_eq!(corrupt_metadata_recording(false), CorruptMetadataRecording::ImmediateAndLedger);
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Enqueued),
+        CorruptMetadataRecording::LedgerOnly
+    );
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Coalesced),
+        CorruptMetadataRecording::LedgerOnly
+    );
+    assert_eq!(
+        corrupt_metadata_recording(rustfs_common::mrf_channel::MrfIngressResult::Dropped(
+            rustfs_common::mrf_channel::MrfDropReason::Full
+        )),
+        CorruptMetadataRecording::ImmediateAndLedger
+    );
 }
 
 fn cooldown_map_len() -> usize {
@@ -325,7 +337,15 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
         local_disk: disk,
+        tier_registry: crate::TierRegistrySnapshot {
+            generation: 0,
+            names: Arc::new([]),
+            refresh_failed: false,
+        },
         pending_heals_changed: false,
+        pending_size_reconciliation_keys: HashSet::new(),
+        pending_size_reconciliation_scopes: HashSet::new(),
+        pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
     };
 
@@ -386,6 +406,71 @@ async fn test_record_failed_ttl_zero_noop() {
     let now = FolderScanner::now_secs();
     scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
     assert!(!scanner.should_skip_failed("path2"));
+}
+
+#[tokio::test]
+async fn malformed_size_reconciliation_replays_after_restart() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+
+    let entry = SizeReconciliationEntry {
+        key: "1:b|6:object|0:|0:".to_string(),
+        bucket: "b".to_string(),
+        object: "object".to_string(),
+        reason: "invalid_declared_size".to_string(),
+        physical_size: Some(12),
+        ..Default::default()
+    };
+    let mut summary = SizeSummary::default();
+    summary.record_size_reconciliation(entry.clone());
+    summary.record_reconciliation_scope("b", "object");
+    scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
+    scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
+
+    assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
+    assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
+    assert_eq!(scanner.new_cache.info.size_reconciliation[&entry.key].attempts, 2);
+
+    let encoded = rmp_serde::to_vec_named(&scanner.new_cache.info).expect("size ledger should encode");
+    let decoded: crate::data_usage_define::DataUsageCacheInfo =
+        rmp_serde::from_slice(&encoded).expect("size ledger should decode");
+    assert_eq!(decoded.size_reconciliation.len(), 1);
+    assert_eq!(decoded.size_reconciliation[&entry.key].reason, "invalid_declared_size");
+
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("b", "object");
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    assert!(scanner.new_cache.info.size_reconciliation.is_empty());
+    assert!(scanner.update_cache.info.size_reconciliation.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_size_reconciliation_clears_bounded_long_object_scope() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir);
+    let long_object = "o".repeat(600);
+    let bounded_object = item_actions::bounded_reconciliation_field(&long_object);
+    let entry = SizeReconciliationEntry {
+        key: "long-object-key".to_string(),
+        bucket: "b".to_string(),
+        object: bounded_object.clone(),
+        reason: "invalid_declared_size".to_string(),
+        ..Default::default()
+    };
+    let mut summary = SizeSummary::default();
+    summary.record_size_reconciliation(entry);
+    scanner.apply_size_reconciliation(&summary);
+    scanner.finish_size_reconciliation_batch();
+    assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
+
+    let mut resolved = SizeSummary::default();
+    resolved.record_reconciliation_scope("b", &bounded_object);
+    scanner.apply_size_reconciliation(&resolved);
+    scanner.finish_size_reconciliation_batch();
+    assert!(scanner.new_cache.info.size_reconciliation.is_empty());
 }
 
 #[test]
@@ -983,6 +1068,21 @@ fn test_build_object_heal_request_omits_nil_version_id() {
 }
 
 #[test]
+fn test_build_non_destructive_object_heal_request_disables_removal() {
+    let request = build_non_destructive_object_heal_request(
+        "bucket".to_string(),
+        "path/to/object".to_string(),
+        HealScanMode::Deep,
+        HealChannelPriority::High,
+    );
+
+    assert_eq!(request.object_version_id, None);
+    assert_eq!(request.remove_corrupted, Some(false));
+    assert_eq!(request.recreate_missing, Some(false));
+    assert_eq!(request.source, HealRequestSource::Scanner);
+}
+
+#[test]
 fn test_build_bucket_heal_request_disables_recreate_for_scanner() {
     let request = build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low);
 
@@ -1119,6 +1219,42 @@ fn test_pending_heal_reconstructs_object_request_with_version() {
     assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
     assert_eq!(request.priority, HealChannelPriority::High);
     assert_eq!(request.source, HealRequestSource::Scanner);
+}
+
+#[test]
+fn test_pending_heal_reconstructs_unversioned_request_without_removal() {
+    let pending = pending_heal(PendingScannerHealKind::Object, "bucket", Some("object"), None, 1, 1);
+
+    let request = build_pending_scanner_heal_request(&pending).expect("unversioned object request should rebuild");
+
+    assert!(request.object_version_id.is_none());
+    assert_eq!(request.remove_corrupted, Some(false));
+    assert_eq!(request.recreate_missing, Some(false));
+}
+
+#[tokio::test]
+async fn test_pending_heal_reason_preserves_sub_quorum_discovery() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
+
+    scanner.update_pending_scanner_heal_after_admission(
+        PendingScannerHealKind::Object,
+        "bucket",
+        Some("object"),
+        Some("version-a"),
+        HealScanMode::Deep,
+        HealAdmissionResult::Full,
+    );
+    scanner.mark_pending_scanner_heal_reason(
+        PendingScannerHealKind::Object,
+        "bucket",
+        Some("object"),
+        Some("version-a"),
+        "sub_quorum_metadata",
+    );
+
+    assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
+    assert_eq!(scanner.new_cache.info.pending_heals[0].last_admission_reason, "sub_quorum_metadata");
 }
 
 #[test]
@@ -1320,6 +1456,20 @@ fn metadata_for_object(bucket: &str, object: &str) -> Vec<u8> {
         ..Default::default()
     })
     .expect("test metadata version should be accepted");
+    meta.marshal_msg().expect("test metadata should marshal")
+}
+
+fn metadata_for_object_version(bucket: &str, object: &str, version_id: Option<Uuid>) -> Vec<u8> {
+    let mut file_info = FileInfo::new(object, 4, 2);
+    file_info.volume = bucket.to_string();
+    file_info.name = object.to_string();
+    file_info.version_id = version_id;
+    file_info.versioned = version_id.is_some();
+    file_info.mod_time = Some(OffsetDateTime::now_utc());
+    file_info.size = 1;
+
+    let mut meta = FileMeta::new();
+    meta.add_version(file_info).expect("test metadata version should be accepted");
     meta.marshal_msg().expect("test metadata should marshal")
 }
 
@@ -1726,12 +1876,21 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     let heal_starts = Arc::new(AtomicUsize::new(0));
     let heal_starts_clone = heal_starts.clone();
+    let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let healed_versions_clone = healed_versions.clone();
     let mut heal_rx =
         rustfs_common::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_common::heal_channel::HealChannelCommand::Start { response_tx, .. } = command {
+            if let rustfs_common::heal_channel::HealChannelCommand::Start {
+                request, response_tx, ..
+            } = command
+            {
                 heal_starts_clone.fetch_add(1, Ordering::Relaxed);
+                healed_versions_clone
+                    .lock()
+                    .expect("heal version capture lock should not be poisoned")
+                    .push(request.object_version_id);
                 let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
             }
         }
@@ -1739,13 +1898,18 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
 
     let bucket = "src-archive";
     let object = "snapshots/37b3f20d941e2f5e6d99114d9bb2f3e67a8a2e5c9c4c5a1b0d6e7f8091a2b3c4";
-    let metadata = metadata_for_object(bucket, object);
-    write_test_object_metadata_bytes(&temp_dir, bucket, object, &metadata).await;
+    let orphan_version = Uuid::from_u128(0x1934);
+    let shared_version = Uuid::from_u128(0x1935);
+    let orphan_metadata = metadata_for_object_version(bucket, object, Some(orphan_version));
+    let shared_metadata = metadata_for_object_version(bucket, object, Some(shared_version));
+    write_test_object_metadata_bytes(&temp_dir, bucket, object, &orphan_metadata).await;
+    let mut expected_metadata = vec![(temp_dir.join(bucket).join(object).join("xl.meta"), orphan_metadata.clone())];
 
     let mut disks = vec![scanner.local_disk.clone()];
     for disk_name in ["disk2", "disk3", "disk4"] {
         let disk_root = temp_dir.join(disk_name);
-        write_test_object_metadata_bytes(&disk_root, bucket, object, &metadata).await;
+        write_test_object_metadata_bytes(&disk_root, bucket, object, &shared_metadata).await;
+        expected_metadata.push((disk_root.join(bucket).join(object).join("xl.meta"), shared_metadata.clone()));
         let endpoint = Endpoint::try_from(disk_root.to_string_lossy().as_ref()).expect("failed to create extra disk endpoint");
         let disk = new_disk(
             &endpoint,
@@ -1794,8 +1958,29 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
         .new_cache
         .checked_flatten(bucket)
         .expect("healed cache must contain canonical child links");
-    assert_eq!(root.objects, 1);
+    // The fixture intentionally exposes two divergent version histories, so
+    // the scanner keeps both logical versions visible while discovering heals.
+    assert_eq!(root.objects, 2);
     assert!(heal_starts.load(Ordering::Relaxed) > 0, "test must execute the heal child-link path");
+    let orphan_version_text = orphan_version.to_string();
+    assert!(
+        healed_versions
+            .lock()
+            .expect("heal version capture lock should not be poisoned")
+            .iter()
+            .any(|version| version.as_deref() == Some(orphan_version_text.as_str())),
+        "sub-quorum orphan version must be submitted as an exact heal candidate"
+    );
+    for (path, expected) in expected_metadata {
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("scanner discovery must not delete metadata"),
+            expected,
+            "scanner discovery must not modify candidate metadata: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]

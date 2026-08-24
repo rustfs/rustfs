@@ -20,6 +20,7 @@ use crate::cluster::rpc::{set_tonic_canonical_body_digest, set_tonic_mutation_bo
 use crate::error::{Error, Result};
 use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
 };
 use crate::{
     bucket::replication::BucketStats,
@@ -45,8 +46,9 @@ use rustfs_protos::proto_gen::node_service::{
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse,
-    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
+    ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+    ScannerPublicationLeaseResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
+    StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
     TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
@@ -84,7 +86,13 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+/// Reserve time for the acquire response's network/clock uncertainty.  The
+/// server owns the real expiry; this local deadline is intentionally earlier
+/// so a coordinator never starts a bounded persistence operation at the edge
+/// of a remote lease.
+const SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(5);
 const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+const BUCKET_METADATA_RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error for a peer that reported `success = false` without an `error_info` payload.
 ///
@@ -149,6 +157,8 @@ pub struct ScannerPeerActivity {
     pub data_movement_active: Option<bool>,
     pub dirty_usage_generation: Option<u64>,
     pub dirty_usage_pending: Option<bool>,
+    pub movement_generation: Option<u64>,
+    pub publication_blocked: Option<bool>,
 }
 
 fn decode_scanner_activity_with_verifier(
@@ -165,7 +175,14 @@ fn decode_scanner_activity_with_verifier(
     {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
     }
-    let (topology_digest, data_movement_active, dirty_usage_generation, dirty_usage_pending) = match response.protocol_version {
+    let (
+        topology_digest,
+        data_movement_active,
+        dirty_usage_generation,
+        dirty_usage_pending,
+        movement_generation,
+        publication_blocked,
+    ) = match response.protocol_version {
         // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): legacy response fields are unauthenticated. Remove after protocol v0 peers are unsupported.
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION
             if response.topology_digest.is_empty()
@@ -174,7 +191,7 @@ fn decode_scanner_activity_with_verifier(
                 && response.dirty_usage_generation == 0
                 && !response.dirty_usage_pending =>
         {
-            (None, None, None, None)
+            (None, None, None, None, None, None)
         }
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
             return Err(Error::other("legacy scanner activity peer returned unexpected extended fields"));
@@ -197,9 +214,11 @@ fn decode_scanner_activity_with_verifier(
                 Some(response.data_movement_active),
                 None,
                 None,
+                None,
+                None,
             )
         }
-        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+        SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
             if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
                 return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
             }
@@ -217,11 +236,42 @@ fn decode_scanner_activity_with_verifier(
                 Some(response.data_movement_active),
                 Some(response.dirty_usage_generation),
                 Some(response.dirty_usage_pending),
+                None,
+                None,
             )
         }
-        version => {
-            return Err(Error::other(format!("peer returned unsupported scanner activity protocol {version}")));
+        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
+                return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
+            }
+            let movement_generation = response
+                .movement_generation
+                .ok_or_else(|| Error::other("scanner activity peer omitted its movement generation"))?;
+            let publication_blocked = response
+                .publication_blocked
+                .ok_or_else(|| Error::other("scanner activity peer omitted its publication blocked state"))?;
+            if movement_generation == u64::MAX {
+                return Err(Error::other("scanner activity peer exhausted its movement generation"));
+            }
+            let canonical = rustfs_protos::canonical_scanner_activity_v7_response_body(challenge, &response)
+                .map_err(|_| Error::other("scanner activity peer response is too large to authenticate"))?;
+            verify_proof(&canonical, &response.response_proof)?;
+            (
+                Some(
+                    response
+                        .topology_digest
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+                ),
+                Some(response.data_movement_active),
+                Some(response.dirty_usage_generation),
+                Some(response.dirty_usage_pending),
+                Some(movement_generation),
+                Some(publication_blocked),
+            )
         }
+        version => return Err(Error::other(format!("peer returned unsupported scanner activity protocol {version}"))),
     };
     Ok(ScannerPeerActivity {
         instance_id: response.instance_id,
@@ -232,6 +282,8 @@ fn decode_scanner_activity_with_verifier(
         data_movement_active,
         dirty_usage_generation,
         dirty_usage_pending,
+        movement_generation,
+        publication_blocked,
     })
 }
 
@@ -240,6 +292,17 @@ fn decode_scanner_activity(response: ScannerActivityResponse, challenge: &[u8; 1
         verify_tonic_rpc_response_proof(canonical, proof)
             .map_err(|_| Error::other("peer returned an invalid scanner activity response proof"))
     })
+}
+
+fn scanner_activity_protocol_unsupported(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Io(io_err)
+            if embedded_tonic_status(io_err).is_some_and(|status| {
+                status.code() == tonic::Code::FailedPrecondition
+                    && status.message().starts_with("unsupported scanner activity request protocol")
+            })
+    )
 }
 
 fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) -> Result<()> {
@@ -282,6 +345,76 @@ pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
     pub next_sequence: u64,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScannerPublicationLease {
+    pub token: Uuid,
+    pub movement_generation: u64,
+    /// Stable storage owner identity. This is distinct from the activity
+    /// session and is bound into both acquire and release proofs.
+    pub owner_id: String,
+    /// Process/session nonce observed by the final activity probe.
+    pub session_id: String,
+    pub expires_at: std::time::Instant,
+}
+
+impl ScannerPublicationLease {
+    pub fn is_valid(&self) -> bool {
+        std::time::Instant::now() < self.expires_at
+    }
+}
+
+fn validate_scanner_publication_lease_response_fields(
+    response: &ScannerPublicationLeaseResponse,
+    expected_session_id: &str,
+    expected_generation: u64,
+) -> Result<(Uuid, String)> {
+    if !response.success {
+        return Err(Error::other(
+            response
+                .error
+                .as_ref()
+                .map(|error| error.error_info.clone())
+                .unwrap_or_else(|| "peer rejected scanner publication lease".to_string()),
+        ));
+    }
+    if response.movement_generation != expected_generation {
+        return Err(Error::other("peer returned a different scanner publication lease generation"));
+    }
+    if response.session_id != expected_session_id {
+        return Err(Error::other("peer returned a different scanner publication lease session"));
+    }
+    let owner_id = Uuid::parse_str(&response.owner_id)
+        .ok()
+        .filter(|owner_id| !owner_id.is_nil())
+        .map(|owner_id| owner_id.to_string())
+        .ok_or_else(|| Error::other("peer returned an invalid scanner publication lease owner"))?;
+    if response.lease_ttl_ms != crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS {
+        return Err(Error::other("peer returned an unsupported scanner publication lease TTL"));
+    }
+    let token = Uuid::from_slice(response.token.as_ref())
+        .map_err(|_| Error::other("peer returned an invalid scanner publication lease token"))?;
+    Ok((token, owner_id))
+}
+
+fn scanner_publication_lease_deadline(
+    request_started: std::time::Instant,
+    response_received: std::time::Instant,
+    lease_ttl_ms: u64,
+) -> Result<std::time::Instant> {
+    let lease_window = Duration::from_millis(lease_ttl_ms)
+        .checked_sub(SCANNER_PUBLICATION_LEASE_SAFETY_MARGIN)
+        .ok_or_else(|| Error::other("scanner publication lease TTL is shorter than its safety margin"))?;
+    let elapsed = response_received
+        .checked_duration_since(request_started)
+        .ok_or_else(|| Error::other("scanner publication lease response clock moved backwards"))?;
+    if elapsed >= lease_window {
+        return Err(Error::other("scanner publication lease response arrived after its safety window"));
+    }
+    request_started
+        .checked_add(lease_window)
+        .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
 }
 
 #[derive(Clone, Debug)]
@@ -1089,7 +1222,9 @@ impl PeerRestClient {
                     .await?
                     .max_decoding_message_size(BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE);
                 let response = match client
-                    .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+                    .background_heal_status(Request::new(BackgroundHealStatusRequest {
+                        protocol_version: rustfs_protos::BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION,
+                    }))
                     .await
                 {
                     Ok(response) => response.into_inner(),
@@ -1328,27 +1463,38 @@ impl PeerRestClient {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
-        self.finalize_result(
-            async {
-                let mut client = self.get_client().await?;
-                let mut request = Request::new(LoadBucketMetadataRequest {
-                    bucket: bucket.to_string(),
-                    scanner_maintenance_change,
-                });
-                set_tonic_mutation_body_digest(&mut request)?;
-
-                let response = client.load_bucket_metadata(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
-                }
-                Ok(())
+        let result = tokio::time::timeout(BUCKET_METADATA_RELOAD_TIMEOUT, async {
+            let result = self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;
+            if let Err(err) = &result
+                && Self::is_network_like_error(err)
+            {
+                self.prepare_retry().await;
+                return self.load_bucket_metadata_once(bucket, scanner_maintenance_change).await;
             }
-            .await,
-        )
+            result
+        })
         .await
+        .unwrap_or_else(|_| Err(Error::other(format!("load_bucket_metadata({bucket}) timed out"))));
+        self.finalize_result(result).await
+    }
+
+    async fn load_bucket_metadata_once(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
+        let mut client = self.get_client().await?;
+        let mut request = Request::new(LoadBucketMetadataRequest {
+            bucket: bucket.to_string(),
+            scanner_maintenance_change,
+        });
+        set_tonic_mutation_body_digest(&mut request)?;
+        request.set_timeout(BUCKET_METADATA_RELOAD_TIMEOUT);
+
+        let response = client.load_bucket_metadata(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
+            }
+            return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
+        }
+        Ok(())
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {
@@ -1626,10 +1772,11 @@ impl PeerRestClient {
         .await
     }
 
-    async fn scanner_activity_request(
+    async fn scanner_activity_request_with_protocol(
         &self,
         acknowledge_instance_id: String,
         acknowledge_dirty_usage_generation: u64,
+        protocol_version: u32,
     ) -> Result<ScannerPeerActivity> {
         self.finalize_result(
             async {
@@ -1641,7 +1788,7 @@ impl PeerRestClient {
                     .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
                 let mut request = Request::new(ScannerActivityRequest {
                     challenge: challenge.as_bytes().to_vec().into(),
-                    protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                    protocol_version,
                     acknowledge_instance_id,
                     acknowledge_dirty_usage_generation,
                 });
@@ -1657,11 +1804,168 @@ impl PeerRestClient {
     }
 
     pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
-        self.scanner_activity_request(String::new(), 0).await
+        let result = self
+            .scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_PROTOCOL_VERSION)
+            .await;
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+            // A v6 peer cannot parse the v7 marker.  Its authenticated
+            // response is still decoded as untrusted terminal state, so the
+            // scanner will defer publication until every peer is v7.
+            self.scanner_activity_request_with_protocol(String::new(), 0, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                .await
+        } else {
+            result
+        }
     }
 
     pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
-        self.scanner_activity_request(instance_id, generation).await
+        let result = self
+            .scanner_activity_request_with_protocol(instance_id.clone(), generation, SCANNER_ACTIVITY_PROTOCOL_VERSION)
+            .await;
+        if result.as_ref().err().is_some_and(scanner_activity_protocol_unsupported) {
+            self.scanner_activity_request_with_protocol(instance_id, generation, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION)
+                .await
+        } else {
+            result
+        }
+    }
+
+    /// Acquire a bounded, storage-owned read admission on the peer that
+    /// produced the final activity generation. Older peers do not implement
+    /// the lease form and are rejected rather than downgraded.
+    pub async fn acquire_scanner_publication_lease(
+        &self,
+        expected_session_id: &str,
+        expected_generation: u64,
+    ) -> Result<ScannerPublicationLease> {
+        let request_started = std::time::Instant::now();
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: expected_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: expected_session_id.to_string(),
+                    token: Bytes::new(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response)
+                        .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, expected_session_id, expected_generation)?;
+                Ok(ScannerPublicationLease {
+                    token,
+                    movement_generation: response.movement_generation,
+                    owner_id,
+                    session_id: response.session_id,
+                    expires_at: scanner_publication_lease_deadline(
+                        request_started,
+                        std::time::Instant::now(),
+                        response.lease_ttl_ms,
+                    )?,
+                })
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Revalidate the exact token immediately before the coordinator commits
+    /// its final publication.  The peer keeps the original movement read
+    /// guard in its token table; a restart drops that table and changes the
+    /// activity session, so this proof fails closed instead of accepting an
+    /// ABA generation value.
+    pub async fn validate_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let mut request = Request::new(ScannerPublicationLeaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    expected_movement_generation: lease.movement_generation,
+                    ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+                    expected_session_id: lease.session_id.clone(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease validation request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let response = client.acquire_scanner_publication_lease(request).await?.into_inner();
+                let response_body =
+                    rustfs_protos::canonical_scanner_publication_lease_response_body(challenge.as_bytes(), &response).map_err(
+                        |_| Error::other("scanner publication lease validation response is too large to authenticate"),
+                    )?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease validation proof"))?;
+                let (token, owner_id) =
+                    validate_scanner_publication_lease_response_fields(&response, &lease.session_id, lease.movement_generation)?;
+                if token != lease.token {
+                    return Err(Error::other("peer returned a different scanner publication lease token"));
+                }
+                if owner_id != lease.owner_id {
+                    return Err(Error::other("peer returned a different scanner publication lease owner"));
+                }
+                Ok(())
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn release_scanner_publication_lease(&self, lease: &ScannerPublicationLease) -> Result<()> {
+        self.finalize_result(
+            async {
+                let challenge = Uuid::new_v4();
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(ScannerPublicationLeaseReleaseRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                    token: lease.token.as_bytes().to_vec().into(),
+                    owner_id: lease.owner_id.clone(),
+                    session_id: lease.session_id.clone(),
+                });
+                let canonical = rustfs_protos::canonical_scanner_publication_lease_release_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner publication lease release request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
+                let request_body = request.get_ref().clone();
+                let response = client.release_scanner_publication_lease(request).await?.into_inner();
+                let response_body = rustfs_protos::canonical_scanner_publication_lease_release_response_body(
+                    challenge.as_bytes(),
+                    &request_body,
+                    &response,
+                )
+                .map_err(|_| Error::other("scanner publication lease release response is too large to authenticate"))?;
+                verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
+                    .map_err(|_| Error::other("peer returned an invalid scanner publication lease release proof"))?;
+                if response.success {
+                    Ok(())
+                } else {
+                    Err(Error::other(
+                        response
+                            .error
+                            .map(|error| error.error_info)
+                            .unwrap_or_else(|| "peer rejected scanner publication lease release".to_string()),
+                    ))
+                }
+            }
+            .await,
+        )
+        .await
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
@@ -1978,6 +2282,52 @@ mod tests {
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
     #[test]
+    fn scanner_publication_lease_response_rejects_stale_generation_and_session() {
+        let token = Uuid::new_v4();
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: token.as_bytes().to_vec().into(),
+            movement_generation: 7,
+            lease_ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
+            error: None,
+            response_proof: Bytes::new(),
+            owner_id: Uuid::new_v4().to_string(),
+            session_id: "session-a".to_string(),
+        };
+
+        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7).is_ok());
+
+        let stale_generation = ScannerPublicationLeaseResponse {
+            movement_generation: 6,
+            ..response.clone()
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7)
+            .expect_err("a response from an older movement generation must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease generation"));
+
+        let stale_session = ScannerPublicationLeaseResponse {
+            session_id: "session-b".to_string(),
+            ..response
+        };
+        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
+            .expect_err("a response from an older scanner session must be rejected");
+        assert!(error.to_string().contains("different scanner publication lease session"));
+    }
+
+    #[test]
+    fn scanner_publication_lease_deadline_accounts_for_delayed_rpc_response() {
+        let started = std::time::Instant::now();
+        let expected_deadline = started + Duration::from_secs(55);
+        let deadline = scanner_publication_lease_deadline(started, started + Duration::from_secs(10), 60_000)
+            .expect("a response inside the safety window should retain the original deadline");
+        assert_eq!(deadline, expected_deadline);
+
+        let error = scanner_publication_lease_deadline(started, started + Duration::from_secs(55), 60_000)
+            .expect_err("a response arriving at the safety boundary must fail closed");
+        assert!(error.to_string().contains("after its safety window"));
+    }
+
+    #[test]
     fn replication_stats_response_decodes_valid_empty_provider() {
         let mut stats = BucketStats::default();
         stats.replication_stats.provider_available = true;
@@ -2215,6 +2565,8 @@ mod tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         })
         .expect("legacy peers should retain their activity generations during a rolling upgrade");
         assert_eq!(
@@ -2228,6 +2580,8 @@ mod tests {
                 data_movement_active: None,
                 dirty_usage_generation: None,
                 dirty_usage_pending: None,
+                movement_generation: None,
+                publication_blocked: None,
             }
         );
 
@@ -2241,6 +2595,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         })
         .expect("protocol v4 peers should remain observable during a rolling upgrade");
         assert_eq!(
@@ -2254,8 +2610,28 @@ mod tests {
                 data_movement_active: Some(true),
                 dirty_usage_generation: None,
                 dirty_usage_pending: None,
+                movement_generation: None,
+                publication_blocked: None,
             }
         );
+
+        let v6 = decode_test_scanner_activity(ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: true,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
+        })
+        .expect("v6 peers should remain readable without a v7 publication proof");
+        assert_eq!(v6.movement_generation, None);
+        assert_eq!(v6.publication_blocked, None);
+        assert_eq!(v6.dirty_usage_generation, Some(11));
 
         let malformed_topology = ScannerActivityResponse {
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
@@ -2267,6 +2643,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(malformed_topology)
@@ -2285,6 +2663,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(missing_instance)
@@ -2303,6 +2683,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(malformed_instance)
@@ -2321,6 +2703,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         })
         .expect("complete activity responses should be accepted");
         assert_eq!(
@@ -2334,7 +2718,29 @@ mod tests {
                 data_movement_active: Some(true),
                 dirty_usage_generation: Some(11),
                 dirty_usage_pending: Some(true),
+                movement_generation: Some(19),
+                publication_blocked: Some(false),
             }
+        );
+
+        let missing_movement_generation = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: Some(false),
+        };
+        assert!(
+            decode_test_scanner_activity(missing_movement_generation)
+                .expect_err("v7 activity must carry movement generation")
+                .to_string()
+                .contains("movement generation")
         );
 
         let pending_without_generation = ScannerActivityResponse {
@@ -2347,6 +2753,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(pending_without_generation)
@@ -2365,6 +2773,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(previous_with_dirty_usage)
@@ -2383,6 +2793,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(legacy_with_topology)
@@ -2401,6 +2813,8 @@ mod tests {
             response_proof: b"proof".to_vec().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: None,
+            publication_blocked: None,
         };
         assert!(
             decode_test_scanner_activity(unsupported_protocol)
@@ -2419,6 +2833,8 @@ mod tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         assert!(
             decode_test_scanner_activity(missing_proof)

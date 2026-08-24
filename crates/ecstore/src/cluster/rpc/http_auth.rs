@@ -94,6 +94,7 @@ const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
 const REPLAY_CACHE_AUTO_MAX_CAPACITY: usize = 33_554_432;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
+const NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-generation-v1";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     get_env_bool(
@@ -636,40 +637,79 @@ pub fn verify_put_file_capability(challenge: Uuid, server_epoch: Uuid, version: 
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid put_file capability proof"))
 }
 
-fn update_ns_scanner_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid) {
+fn update_ns_scanner_capability_mac(
+    mac: &mut HmacSha256,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) {
     mac.update(NS_SCANNER_CAPABILITY_AUTH_DOMAIN);
     mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
     mac.update(challenge.as_bytes());
     mac.update(server_epoch.as_bytes());
+    if supports_tier_registry_generation {
+        // The optional response capability is part of the authenticated
+        // scope. A proxy cannot turn an old/unsupported peer into a worker
+        // that receives generation-fenced scanner work.
+        mac.update(NS_SCANNER_TIER_REGISTRY_GENERATION_AUTH_DOMAIN);
+    }
 }
 
-fn generate_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+fn generate_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<Vec<u8>> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
     }
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
-    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch, supports_tier_registry_generation);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn verify_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+fn verify_ns_scanner_capability_proof(
+    secret: &str,
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<()> {
     if challenge.is_nil() || server_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
     }
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
-    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch, supports_tier_registry_generation);
     mac.verify_slice(proof)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid namespace scanner capability proof"))
 }
 
 pub fn sign_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
-    generate_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch)
+    sign_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, false)
 }
 
 pub fn verify_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
-    verify_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, proof)
+    verify_ns_scanner_capability_with_tier_registry_generation(challenge, server_epoch, proof, false)
+}
+
+pub fn sign_ns_scanner_capability_with_tier_registry_generation(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, supports_tier_registry_generation)
+}
+
+pub fn verify_ns_scanner_capability_with_tier_registry_generation(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+    supports_tier_registry_generation: bool,
+) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, proof, supports_tier_registry_generation)
 }
 
 #[derive(Clone, Copy)]
@@ -1709,13 +1749,28 @@ mod tests {
         let secret = "test-scanner-capability-secret";
         let challenge = Uuid::new_v4();
         let server_epoch = Uuid::new_v4();
-        let proof =
-            generate_ns_scanner_capability_proof(secret, challenge, server_epoch).expect("capability proof should be generated");
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false)
+            .expect("capability proof should be generated");
 
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof).is_ok());
-        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof).is_err());
-        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof).is_err());
-        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof, false).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof, false).is_err());
+        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false).is_err());
+    }
+
+    #[test]
+    fn namespace_scanner_capability_proof_binds_tier_registry_generation_support() {
+        let secret = "test-scanner-capability-secret";
+        let challenge = Uuid::new_v4();
+        let server_epoch = Uuid::new_v4();
+        let proof = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, true)
+            .expect("generation capability proof should be generated");
+
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, true).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof, false).is_err());
+        let legacy = generate_ns_scanner_capability_proof(secret, challenge, server_epoch, false)
+            .expect("legacy capability proof should be generated");
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &legacy, true).is_err());
     }
 
     /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,
@@ -2939,6 +2994,7 @@ mod tests {
             dst_volume: "bucket".to_string(),
             dst_path: "object".to_string(),
             file_info_bin: vec![0x81, 0xA1, 0x76, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let body = rustfs_protos::canonical_rename_data_request_body(&message).expect("small request should encode");
         let mut request = tonic::Request::new(());

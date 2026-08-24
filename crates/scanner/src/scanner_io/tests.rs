@@ -23,7 +23,7 @@ use crate::storage_api::owner::{
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
     DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
-    ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
+    ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
 use rustfs_filemeta::FileInfo;
@@ -146,6 +146,50 @@ async fn scanner_cache_locks_allow_cross_source_workers() {
 }
 
 #[tokio::test]
+async fn scanner_set_cache_admission_tracks_owner_snapshot_and_fails_closed() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let set = store.pools[0].disk_set[0].clone();
+
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "a set should refresh the idle owner snapshot before its first publication"
+    );
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "an idle owner snapshot should admit the set cache"
+    );
+
+    let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
+    pool_stats[0] = EcstoreRebalanceStats {
+        participating: true,
+        info: EcstoreRebalanceInfo {
+            start_time: Some(OffsetDateTime::now_utc()),
+            status: EcstoreRebalStatus::Started,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    *store.rebalance_meta.write().await = Some(EcstoreRebalanceMeta {
+        id: Uuid::new_v4().to_string(),
+        pool_stats,
+        ..Default::default()
+    });
+    assert!(store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_none(),
+        "active movement must keep set cache publication blocked"
+    );
+
+    *store.rebalance_meta.write().await = None;
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    assert!(
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "an idle owner refresh must make set cache publication live again"
+    );
+}
+
+#[tokio::test]
 async fn scanner_cycle_is_deferred_while_rebalance_is_active() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let mut pool_stats = vec![EcstoreRebalanceStats::default(); store.pools.len()];
@@ -222,6 +266,36 @@ async fn data_usage_publish_fails_when_receiver_is_closed() {
         .expect_err("closed usage receiver must reject the scanner update");
 
     assert!(err.to_string().contains("receiver closed"));
+}
+
+#[tokio::test]
+async fn data_usage_publish_rejects_a_second_terminal_update_without_blocking() {
+    for (status, data_usage_info) in [
+        (ScannerCycleStatus::Complete, DataUsageInfo::default()),
+        (
+            ScannerCycleStatus::Superseded,
+            DataUsageInfo {
+                scanner_cycle: Some(7),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (updates, mut receiver) = mpsc::channel(1);
+        assert!(
+            publish_usage_snapshot(&updates, status, data_usage_info)
+                .await
+                .expect("first terminal update should be accepted")
+        );
+
+        let err =
+            tokio::time::timeout(Duration::from_secs(1), publish_usage_snapshot(&updates, status, DataUsageInfo::default()))
+                .await
+                .expect("a full terminal update must fail without waiting")
+                .expect_err("a second terminal update must be rejected");
+        assert!(err.to_string().contains("already queued"));
+        assert!(receiver.try_recv().is_ok(), "the first terminal update must remain owned by the receiver");
+        assert!(receiver.try_recv().is_err(), "the rejected second update must not enter the channel");
+    }
 }
 
 #[tokio::test]
@@ -692,7 +766,7 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
         ),
-        ScannerCycleStatus::Incomplete
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
 
     for status in [
@@ -741,6 +815,34 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
     }
 }
 
+#[test]
+fn unverified_activity_defers_partial_and_floor_cycles() {
+    let expected = ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+
+    assert_eq!(
+        classify_nsscanner_cycle(
+            true,
+            false,
+            false,
+            ScannerBucketScanStatus::Partial,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn structurally_complete_superseded_cycles_publish_without_claiming_convergence() {
     let (updates, mut receiver) = mpsc::channel(2);
@@ -759,6 +861,15 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
         !publish_usage_snapshot(&updates, ScannerCycleStatus::Incomplete, DataUsageInfo::default())
             .await
             .expect("incomplete snapshot suppression should succeed")
+    );
+    assert!(
+        !publish_usage_snapshot(
+            &updates,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            DataUsageInfo::default(),
+        )
+        .await
+        .expect("unverified activity suppression should succeed")
     );
 
     assert_eq!(
@@ -781,11 +892,7 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
 
 #[test]
 fn scanner_cycle_fails_closed_for_namespace_disappearance() {
-    for activity_status in [
-        ScannerCycleActivityStatus::Changed,
-        ScannerCycleActivityStatus::Unchanged,
-        ScannerCycleActivityStatus::Unverified,
-    ] {
+    for activity_status in [ScannerCycleActivityStatus::Changed, ScannerCycleActivityStatus::Unchanged] {
         assert_eq!(
             classify_nsscanner_cycle(
                 false,
@@ -798,6 +905,17 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
             ScannerCycleStatus::Incomplete
         );
     }
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::NamespaceNotFound,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
     assert_eq!(
         classify_nsscanner_cycle(
             true,
@@ -986,8 +1104,8 @@ fn is_xl_meta_path_accepts_forward_separator() {
 fn tier_stats_template_seeds_tiers_and_standard_classes() {
     let template = tier_stats_template(&["WARM".to_string(), "COLD".to_string()]);
 
-    assert_eq!(template.len(), 4);
-    for tier in ["WARM", "COLD", storageclass::STANDARD, storageclass::RRS] {
+    assert_eq!(template.len(), 5);
+    for tier in ["WARM", "COLD", storageclass::STANDARD, storageclass::RRS, UNKNOWN_TIER] {
         assert_eq!(template.get(tier), Some(&TierStats::default()), "missing seed for tier {tier}");
     }
 }
@@ -1328,7 +1446,7 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
     );
 
     let update_time = SystemTime::now();
-    apply_bucket_result_to_cache(
+    assert!(apply_bucket_result_to_cache(
         &mut cache,
         DataUsageEntryInfo {
             name: "bucket".to_string(),
@@ -1338,12 +1456,51 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
                 objects: 2,
                 ..Default::default()
             },
+            tier_registry_generation: None,
         },
         update_time,
-    );
+    ));
 
     assert_eq!(cache.info.last_update, Some(update_time));
     let entry = cache.find("bucket").expect("bucket entry should remain present");
     assert_eq!(entry.size, 10);
     assert_eq!(entry.objects, 2);
+}
+
+#[test]
+fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            tier_registry_generation: Some(7),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        DATA_USAGE_ROOT,
+        DataUsageEntry {
+            size: 3,
+            ..Default::default()
+        },
+    );
+
+    let applied = apply_bucket_result_to_cache(
+        &mut cache,
+        DataUsageEntryInfo {
+            name: "bucket".to_string(),
+            parent: DATA_USAGE_ROOT.to_string(),
+            entry: DataUsageEntry {
+                size: 11,
+                ..Default::default()
+            },
+            tier_registry_generation: Some(8),
+        },
+        SystemTime::now(),
+    );
+
+    assert!(!applied);
+    assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
+    assert!(cache.info.last_update.is_none());
 }

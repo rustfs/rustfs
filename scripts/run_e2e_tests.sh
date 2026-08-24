@@ -148,7 +148,7 @@ start_rustfs() {
     
     # Wait for RustFS to be ready
     print_info "Waiting for RustFS to be ready..."
-    local max_attempts=15  # Reduced from 30 to 15 seconds
+    local max_attempts=60
     local attempt=0
     
     while [ $attempt -lt $max_attempts ]; do
@@ -160,25 +160,10 @@ start_rustfs() {
             exit 1
         fi
         
-        # Try simple HTTP connection first (most reliable)
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/" >/dev/null 2>&1; then
+        if curl --silent --show-error --fail --noproxy localhost --connect-timeout 2 --max-time 3 \
+            "http://localhost:9000/health/ready" >/dev/null 2>&1; then
             print_success "RustFS is ready!"
             return 0
-        fi
-        
-        # Try health endpoint if available
-        if curl -s --noproxy localhost --connect-timeout 2 --max-time 3 "http://localhost:9000/health" >/dev/null 2>&1; then
-            print_success "RustFS is ready!"
-            return 0
-        fi
-        
-        # Try port connectivity check (faster than HTTP)
-        if nc -z localhost 9000 2>/dev/null; then
-            print_info "Port 9000 is open, verifying HTTP response..."
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is ready!"
-                return 0
-            fi
         fi
         
         sleep 1
@@ -187,34 +172,10 @@ start_rustfs() {
     done
     
     echo
-    print_warning "RustFS health check failed within $max_attempts seconds"
-    print_info "Checking if RustFS process is still running..."
-    if kill -0 "$RUSTFS_PID" 2>/dev/null; then
-        print_info "RustFS process is still running (PID: $RUSTFS_PID)"
-        print_info "Trying final connection attempts..."
-        
-        # Quick final attempts with shorter timeouts
-        for i in 1 2 3; do
-            if curl -s --noproxy localhost --connect-timeout 1 --max-time 2 "http://localhost:9000/" >/dev/null 2>&1; then
-                print_success "RustFS is now ready!"
-                return 0
-            fi
-            if nc -z localhost 9000 2>/dev/null; then
-                print_info "Port 9000 is accessible, continuing with tests..."
-                return 0
-            fi
-            sleep 1
-        done
-        
-        print_warning "RustFS may be slow to respond, but process is running"
-        print_info "Continuing with tests anyway..."
-        return 0
-    else
-        print_error "RustFS process has died"
-        print_error "Log output:"
-        cat "$TARGET_DIR/rustfs.log" || true
-        return 1
-    fi
+    print_error "RustFS readiness check failed within $max_attempts seconds"
+    print_error "Log output:"
+    cat "$TARGET_DIR/rustfs.log" || true
+    return 1
 }
 
 # Function to run tests
@@ -295,13 +256,7 @@ main() {
     # Start RustFS
     if ! start_rustfs; then
         print_error "Failed to start RustFS properly"
-        print_info "Checking if we can still run tests..."
-        if [ ! -z "$RUSTFS_PID" ] && kill -0 "$RUSTFS_PID" 2>/dev/null; then
-            print_info "RustFS process is still running, attempting to continue..."
-        else
-            print_error "RustFS is not running, cannot proceed with tests"
-            exit 1
-        fi
+        exit 1
     fi
     
     # Run tests

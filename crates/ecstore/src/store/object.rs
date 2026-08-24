@@ -490,6 +490,82 @@ fn decommission_mutation_fence_for_test(
         .map(|hook| hook.fence.clone())
 }
 
+#[cfg(test)]
+struct DecommissionFreeVersionSourceRaceState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionFreeVersionSourceRaceBarrier {
+    state: Arc<DecommissionFreeVersionSourceRaceState>,
+}
+
+#[cfg(test)]
+static DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DecommissionFreeVersionSourceRaceState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DecommissionFreeVersionSourceRaceBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(DecommissionFreeVersionSourceRaceState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission free-version source race barrier should not poison");
+        assert!(slot.is_none(), "decommission free-version source race barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("decommission should pause before acquiring the free-version source lock");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecommissionFreeVersionSourceRaceBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission free-version source race barrier should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_decommission_free_version_before_source_lock(bucket: &str, object: &str) {
+    let state = DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission free-version source race barrier should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+    }
+}
+
 pub(crate) struct SourceCleanupMutationFence {
     guard: ObjectLockDiagGuard,
     source_lock_covered: bool,
@@ -1203,7 +1279,8 @@ fn inject_batch_delete_pool_errors(
     bucket: &str,
     pool_idx: usize,
     object_names: &[String],
-    result: &mut (Vec<DeletedObject>, Vec<Option<Error>>),
+    deleted: &[DeletedObject],
+    errors: &mut [Option<Error>],
 ) {
     let state = BATCH_DELETE_POOL_ERROR_INJECTION
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1220,8 +1297,8 @@ fn inject_batch_delete_pool_errors(
         let Some(error) = state.errors.get(object_name) else {
             continue;
         };
-        if result.1[idx].is_none() && result.0[idx].found {
-            result.1[idx] = Some(error.clone());
+        if errors[idx].is_none() && deleted[idx].found {
+            errors[idx] = Some(error.clone());
             state.observed.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -1494,13 +1571,15 @@ fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo,
         && source_actual_size == target_actual_size
 }
 
-fn tiered_data_movement_source_matches(
+pub(crate) fn tiered_data_movement_source_matches(
     expected: &rustfs_filemeta::FileInfo,
     current: &rustfs_filemeta::FileInfo,
 ) -> Result<bool> {
     let expected_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&expected.metadata)?;
     let current_backend = crate::services::tier::tier::tier_destination_id_from_metadata(&current.metadata)?;
     Ok(expected.version_id == current.version_id
+        && expected.deleted == current.deleted
+        && expected.tier_free_version() == current.tier_free_version()
         && expected.data_dir == current.data_dir
         && expected.mod_time == current.mod_time
         && expected.size == current.size
@@ -1512,6 +1591,14 @@ fn tiered_data_movement_source_matches(
         && expected.transition_version == current.transition_version
         && expected.transition_version_state == current.transition_version_state
         && expected_backend == current_backend)
+}
+
+fn decommission_free_version_overwrite_error(bucket: &str, object: &str, version_id: Option<Uuid>) -> Error {
+    StorageError::DataMovementOverwriteErr(
+        bucket.to_owned(),
+        object.to_owned(),
+        version_id.map(|id| id.to_string()).unwrap_or_default(),
+    )
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
@@ -2221,6 +2308,23 @@ impl ECStore {
         )
     }
 
+    async fn has_equivalent_data_movement_tier_free_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        source: &rustfs_filemeta::FileInfo,
+        opts: &ObjectOptions,
+        target_pool_idx: usize,
+    ) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("invalid tiered data movement target pool {target_pool_idx}")))?;
+        pool.get_disks_by_key(object)
+            .has_decommission_tier_free_version_write_quorum(bucket, object, source, opts)
+            .await
+    }
+
     fn resolve_decommission_target_pool_idx_result(result: Result<usize>, bucket: &str, object: &str) -> Result<usize> {
         result.map_err(|err| Error::other(format!("failed to select decommission target pool for {bucket}/{object}: {err}")))
     }
@@ -2240,6 +2344,10 @@ impl ECStore {
         check_put_object_args(bucket, object)?;
 
         let mut opts = opts.clone();
+        let is_free_version = fi.tier_free_version();
+        if is_free_version {
+            opts.incl_free_versions = true;
+        }
         let bucket_incarnation_fence = if is_meta_bucketname(bucket) {
             None
         } else {
@@ -2277,6 +2385,10 @@ impl ECStore {
                 &object,
             )?
         };
+        #[cfg(test)]
+        if is_free_version {
+            pause_decommission_free_version_before_source_lock(bucket, logical_object).await;
+        }
         let _object_guards = self
             .acquire_data_movement_object_write_locks(bucket, &object, opts.src_pool_idx, idx, &mut opts)
             .await?;
@@ -2294,7 +2406,7 @@ impl ECStore {
                 versions
                     .versions
                     .iter()
-                    .find(|current| current.version_id == fi.version_id && !current.tier_free_version())
+                    .find(|current| current.version_id == fi.version_id && current.tier_free_version() == is_free_version)
             })
             .ok_or_else(|| to_object_err(StorageError::FileNotFound, vec![bucket, object.as_str()]))?;
         if !tiered_data_movement_source_matches(fi, current_source)? {
@@ -2309,24 +2421,34 @@ impl ECStore {
                 .get_available_pool_idx_excluding(bucket, &object, fi.size, opts.src_pool_idx)
                 .await;
             let target_pool_idx = resolve_data_movement_resume_target_pool(idx, resume_target_pool_idx, opts.src_pool_idx);
-            if self
-                .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, target_pool_idx)
-                .await?
-            {
+            if is_free_version && target_pool_idx == opts.src_pool_idx {
+                return Err(Error::DiskFull);
+            }
+            let equivalent = if is_free_version {
+                self.has_equivalent_data_movement_tier_free_version(bucket, &object, &fi, &opts, target_pool_idx)
+                    .await?
+            } else {
+                self.has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, target_pool_idx)
+                    .await?
+            };
+            if equivalent {
                 return Ok(());
             }
 
-            return Err(StorageError::DataMovementOverwriteErr(
-                bucket.to_owned(),
-                object.to_owned(),
-                opts.version_id.clone().unwrap_or_default(),
-            ));
+            return Err(decommission_free_version_overwrite_error(bucket, &object, fi.version_id));
         }
 
-        let result = self.pools[idx]
-            .get_disks_by_key(&object)
-            .decommission_tiered_object(bucket, &object, &fi, &opts)
-            .await;
+        let result = if is_free_version {
+            self.pools[idx]
+                .get_disks_by_key(&object)
+                .decommission_tier_free_version(bucket, &object, &fi, &opts)
+                .await
+        } else {
+            self.pools[idx]
+                .get_disks_by_key(&object)
+                .decommission_tiered_object(bucket, &object, &fi, &opts)
+                .await
+        };
         if matches!(result, Err(Error::PreconditionFailed)) {
             if self
                 .has_equivalent_data_movement_tiered_object(bucket, &object, &fi, &opts, idx)
@@ -2586,13 +2708,13 @@ impl ECStore {
         };
 
         if cp_src_dst_same {
-            let pool_idx = self
-                .get_pool_info_existing_with_opts(src_bucket, &src_object, &writer_pool_lookup_opts(src_opts, true))
-                .await?
-                .0
-                .index;
+            let (_, pool_idx) = self
+                .get_latest_accessible_object_info_with_idx(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
+                .await?;
+            let source_pool_writable = !self.is_suspended(pool_idx).await && !self.is_pool_rebalancing(pool_idx).await;
 
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+            if source_pool_writable
+                && let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
                 && src_vid == dst_vid
             {
                 return self.pools[pool_idx]
@@ -2600,7 +2722,7 @@ impl ECStore {
                     .await;
             }
 
-            if !dst_opts.versioned && src_opts.version_id.is_none() {
+            if source_pool_writable && !dst_opts.versioned && src_opts.version_id.is_none() {
                 if src_info.metadata_only {
                     // Zero-copy update: only xl.meta is rewritten, the data blocks stay as they
                     // are. The caller must therefore guarantee that the destination metadata
@@ -2643,7 +2765,7 @@ impl ECStore {
                 };
             }
 
-            if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+            if source_pool_writable && dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
                 // Restoring a specific historical version onto the current key creates a NEW
                 // version. When the caller supplies a reader (S3 CopyObject), write the fetched
                 // bytes through put_object so any re-encryption/compression applied to the reader
@@ -3194,7 +3316,7 @@ impl ECStore {
 
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
-        let accounting = vec![None; objects.len()];
+        let mut accounting = vec![None; objects.len()];
 
         let mut del_errs = Vec::with_capacity(objects.len());
         for _ in 0..objects.len() {
@@ -3333,11 +3455,12 @@ impl ECStore {
                     .iter()
                     .map(|object| object.object_name.clone())
                     .collect::<Vec<_>>();
-                let result = pool.delete_objects(bucket, pool_objects, pool_opts).await;
+                let result = pool.delete_objects_with_accounting(bucket, pool_objects, pool_opts).await;
                 #[cfg(test)]
                 let result = {
                     let mut result = result;
-                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, &mut result);
+                    let (deleted, errors, _) = &mut result;
+                    inject_batch_delete_pool_errors(bucket, pool.pool_idx, &pool_object_names, deleted, errors);
                     result
                 };
                 (object_indices, result)
@@ -3347,7 +3470,7 @@ impl ECStore {
         let results = join_all(futures).await;
 
         for idx in 0..del_objects.len() {
-            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs))| {
+            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs, _))| {
                 let pool_object_idx = object_indices.binary_search(&idx).ok()?;
                 Some((&dels[pool_object_idx], &errs[pool_object_idx]))
             });
@@ -3364,6 +3487,12 @@ impl ECStore {
                     ..Default::default()
                 };
                 del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
+            }
+        }
+
+        for (object_indices, (_, _, pool_accounting)) in &results {
+            for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
+                accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
             }
         }
 
@@ -5320,7 +5449,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -5383,7 +5512,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }

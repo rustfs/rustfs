@@ -47,6 +47,7 @@ use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_config, check_object_lock_for_deletion_with_state, check_retention_for_modification,
+    replication_write_may_pass_worm_gate,
 };
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
@@ -225,6 +226,69 @@ pub(super) fn restore_commit_operation_id_from_metadata(metadata: &HashMap<Strin
         return Ok(None);
     }
     restore_operation_id_from_metadata(metadata)
+}
+
+async fn inspect_decommission_tier_free_version_target(
+    disk: &DiskStore,
+    bucket: &str,
+    object: &str,
+    source: &FileInfo,
+) -> Result<bool> {
+    let raw = match disk.read_xl(bucket, object, false).await {
+        Ok(raw) => raw,
+        Err(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let meta = FileMeta::load(&raw.buf)?;
+    let source_version_id = source.version_id.filter(|version_id| !version_id.is_nil());
+    let mut matching_count = 0;
+    let mut all_matching_versions_equivalent = true;
+    for existing in meta
+        .versions
+        .iter()
+        .filter(|version| version.header.version_id.filter(|version_id| !version_id.is_nil()) == source_version_id)
+    {
+        matching_count += 1;
+        let existing = existing.into_fileinfo(bucket, object, true)?;
+        existing.validate_for_metadata_read()?;
+        if !existing.tier_free_version() || !crate::store::tiered_data_movement_source_matches(source, &existing)? {
+            all_matching_versions_equivalent = false;
+        }
+    }
+    if matching_count == 0 {
+        return Ok(false);
+    }
+    if matching_count == 1 && all_matching_versions_equivalent {
+        return Ok(true);
+    }
+
+    Err(StorageError::DataMovementOverwriteErr(
+        bucket.to_owned(),
+        object.to_owned(),
+        source_version_id.map(|version_id| version_id.to_string()).unwrap_or_default(),
+    ))
+}
+
+fn ensure_decommission_tier_free_version_commit_fence(bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    if opts
+        .namespace_lock_fence
+        .as_ref()
+        .is_some_and(NamespaceLockFence::is_lock_lost)
+        || opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "decommission_tier_free_version_commit",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+
+    Ok(())
 }
 
 impl SetDisks {
@@ -556,8 +620,9 @@ impl SetDisks {
     }
 }
 
-/// Build an ad-hoc, deduplicated dirty scope from `disks`. Used by the heal
-/// path where disks are not in physical-slot order (backlog#1315).
+/// Build an ad-hoc, deduplicated dirty scope from `disks`. Used where the
+/// per-set generation fast path is intentionally bypassed: heal rewrites and
+/// an early-ACK tail whose first mark was drained before it completed.
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
     let mut unique = HashSet::with_capacity(disks.len());
     let mut scoped_disks = Vec::with_capacity(disks.len());
@@ -735,6 +800,9 @@ pub(crate) use core::io_primitives::disk_call_counters;
 mod ctx;
 mod metadata;
 mod ops;
+
+#[cfg(test)]
+pub(crate) use ops::hermetic_set_disks_isolated;
 #[cfg(test)]
 pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 #[cfg(any(test, feature = "test-util"))]
@@ -1449,6 +1517,21 @@ mod prepared_get_object_metadata_tests {
 }
 
 impl SetDisks {
+    #[cfg(test)]
+    async fn pause_tiered_metadata_commit(bucket: &str, object: &str) {
+        let barrier = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned")
+            .as_ref()
+            .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+            .cloned();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+
     pub(crate) async fn prepare_get_object_metadata(
         &self,
         bucket: &str,
@@ -3027,6 +3110,9 @@ pub struct SetDisks {
     capacity_dirty_generation: Arc<AtomicU64>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
+    #[cfg(test)]
+    rename_tail_heal_capture:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_common::heal_channel::HealChannelRequest>>>>,
 }
 
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
@@ -3302,6 +3388,37 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn submit_rename_tail_heal(&self, request: rustfs_common::heal_channel::HealChannelRequest) {
+        #[cfg(test)]
+        {
+            let capture = self
+                .rename_tail_heal_capture
+                .lock()
+                .expect("rename tail heal capture mutex should not poison")
+                .clone();
+            if let Some(capture) = capture {
+                let _ = capture.send(request);
+                return;
+            }
+        }
+
+        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::set_disk) fn capture_test_rename_tail_heals(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_common::heal_channel::HealChannelRequest> {
+        let (capture, requests) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = self
+            .rename_tail_heal_capture
+            .lock()
+            .expect("rename tail heal capture mutex should not poison");
+        assert!(slot.is_none(), "only one rename tail heal capture may be installed per set");
+        *slot = Some(capture);
+        requests
+    }
+
     fn storage_class_config_snapshot(&self) -> Arc<storageclass::Config> {
         #[cfg(test)]
         if let Some(config) = self
@@ -3605,6 +3722,8 @@ impl SetDisks {
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(test)]
+            rename_tail_heal_capture: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -3612,6 +3731,26 @@ impl SetDisks {
     #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    /// Admit one short scanner cache publication under this set's instance
+    /// movement fence. The caller must hold the returned guard through its
+    /// final conditional cache write; no scan-round work belongs under it.
+    pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.scanner_publication_state_allowed() {
+            let epoch = self.ctx.data_movement_operation_epoch();
+            return Some((operation_guard, epoch));
+        }
+
+        // The owner deliberately marks the cached state UNKNOWN after every
+        // movement epoch advance. Do not strand remote scanner writers in that
+        // state: release this guard before asking the storage owner to refresh
+        // its durable movement snapshot, since the owner uses the same gate.
+        drop(operation_guard);
+        let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
+        owner.scanner_data_usage_publication_admission_guard().await
     }
 
     /// Whether both sets' namespace-lock implementations cover the same object key.
@@ -4665,6 +4804,94 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
 }
 
 impl SetDisks {
+    /// Publish an internal tier free-version record without changing its
+    /// delete-marker shape or remote-tier identity. The caller holds the
+    /// source and target object locks; a write quorum is required before the
+    /// source cleanup may remove the original record.
+    #[tracing::instrument(skip(self, fi, opts))]
+    pub(crate) async fn decommission_tier_free_version(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        if !fi.deleted || !fi.tier_free_version() {
+            return Err(Error::other("decommission tier free-version write requires a free version record"));
+        }
+        ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+
+        let write_quorum = self.default_write_quorum();
+        if self
+            .count_decommission_tier_free_version_equivalents(bucket, object, fi)
+            .await?
+            >= write_quorum
+        {
+            ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+            return Ok(());
+        }
+        ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+
+        let disks = self.disks.read().await.clone();
+        let futures = disks.into_iter().map(|disk| {
+            let file_info = fi.clone();
+            async move {
+                if let Some(disk) = disk {
+                    disk.write_metadata("", bucket, object, file_info).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            }
+        });
+
+        let mut errs = Vec::new();
+        for result in join_all(futures).await {
+            match result {
+                Ok(_) => errs.push(None),
+                Err(err) => errs.push(Some(err)),
+            }
+        }
+
+        ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+    }
+
+    async fn count_decommission_tier_free_version_equivalents(&self, bucket: &str, object: &str, fi: &FileInfo) -> Result<usize> {
+        // The caller holds the source and target object locks. Inspect every
+        // target disk before an idempotent return or metadata fan-out so a
+        // sub-quorum conflict cannot be hidden by a successful quorum.
+        let disks = self.disks.read().await.clone();
+        let preflight = disks.iter().map(|disk| async {
+            match disk {
+                Some(disk) => inspect_decommission_tier_free_version_target(disk, bucket, object, fi).await,
+                None => Ok(false),
+            }
+        });
+        let mut equivalent = 0;
+        for result in join_all(preflight).await {
+            if result? {
+                equivalent += 1;
+            }
+        }
+        Ok(equivalent)
+    }
+
+    pub(crate) async fn has_decommission_tier_free_version_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        opts: &ObjectOptions,
+    ) -> Result<bool> {
+        ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+        let equivalent = self
+            .count_decommission_tier_free_version_equivalents(bucket, object, fi)
+            .await?;
+        ensure_decommission_tier_free_version_commit_fence(bucket, object, opts)?;
+        Ok(equivalent >= self.default_write_quorum())
+    }
+
     #[tracing::instrument(skip(self, fi, opts))]
     pub(crate) async fn decommission_tiered_object(
         &self,
@@ -4717,6 +4944,8 @@ impl SetDisks {
         )?;
         let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
         let write_quorum = layout.write_quorum;
+        #[cfg(test)]
+        Self::pause_tiered_metadata_commit(bucket, object).await;
         if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || opts
                 .namespace_lock_fence
@@ -4736,7 +4965,15 @@ impl SetDisks {
                 achieved: 0,
             });
         }
-        let parts_metadata = vec![fi.clone(); disks.len()];
+        // Rebuilt tiered metadata starts with index zero, but shuffling validates
+        // each source slot before assigning the shuffled index below.
+        let parts_metadata: Vec<FileInfo> = (0..disks.len())
+            .map(|disk_index| {
+                let mut part = fi.clone();
+                part.erasure.index = fi.erasure.distribution[disk_index];
+                part
+            })
+            .collect();
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let mut errs = Vec::with_capacity(shuffle_disks.len());
@@ -4761,6 +4998,66 @@ impl SetDisks {
         }
 
         resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+    }
+}
+
+#[cfg(test)]
+struct TieredMetadataCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct TieredMetadataCommitBarrier {
+    state: Arc<TieredMetadataCommitBarrierState>,
+}
+
+#[cfg(test)]
+static TIERED_METADATA_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TieredMetadataCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TieredMetadataCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TieredMetadataCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned");
+        assert!(slot.is_none(), "tiered metadata commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("tiered metadata write should reach its deterministic commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TieredMetadataCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
     }
 }
 
@@ -7334,7 +7631,7 @@ mod tests {
     // the ad-hoc scope the previous per-write construction produced, otherwise
     // dirty-disk keys diverge from the disk-cache keys and capacity counts drift.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn capacity_scope_memo_matches_adhoc_and_is_reused() {
         use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
 
@@ -7360,7 +7657,7 @@ mod tests {
     // write of each generation; steady-state writes skip it. Reverting the
     // generation skip makes the upgrade count grow per write and fails this test.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn record_capacity_scope_upgrades_registry_once_per_generation() {
         use rustfs_object_capacity::capacity_scope::{drain_global_dirty_scopes, global_dirty_upgrade_count};
 
@@ -7409,7 +7706,7 @@ mod tests {
     // backlog#1315: an offline slot must not force the per-write slow path, and
     // the resolved scope must still cover every online disk.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn capacity_scope_tolerates_offline_slot_without_reallocating() {
         use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
 
@@ -9885,6 +10182,147 @@ mod tests {
         assert_eq!(updated.erasure.parity_blocks, 4);
         assert_eq!(layout.write_quorum, 12);
         assert_ne!(updated.erasure.distribution, original.erasure.distribution);
+    }
+
+    #[tokio::test]
+    async fn decommission_tier_free_version_preserves_remote_identity() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "free-version-decommission";
+        let object = "object.txt";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("target bucket should exist before free-version migration");
+        let version_id = Uuid::new_v4();
+        let mut free_version = FileInfo {
+            name: object.to_string(),
+            volume: bucket.to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            deleted: true,
+            transition_tier: "WARM-TIER".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            ..Default::default()
+        };
+        free_version.set_tier_free_version();
+        // Decoded free versions always carry the on-disk free-version
+        // suffix alongside the in-memory tier marker; mirror that here so
+        // the record satisfies delete-marker metadata validation.
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut free_version.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_FREE_VERSION,
+            String::new(),
+        );
+
+        set_disks
+            .decommission_tier_free_version(bucket, object, &free_version, &ObjectOptions::default())
+            .await
+            .expect("free-version metadata should reach the target quorum");
+        set_disks
+            .decommission_tier_free_version(bucket, object, &free_version, &ObjectOptions::default())
+            .await
+            .expect("replaying the same free-version metadata should be idempotent");
+
+        let versions = set_disks
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("migrated free-version metadata should decode")
+            .expect("migrated free-version metadata should exist");
+        let migrated = versions
+            .versions
+            .iter()
+            .find(|version| version.version_id == Some(version_id))
+            .expect("free version should be present on the target");
+
+        assert_eq!(
+            versions
+                .versions
+                .iter()
+                .filter(|version| version.version_id == Some(version_id))
+                .count(),
+            1
+        );
+        assert!(migrated.tier_free_version());
+        assert_eq!(migrated.transition_tier, "WARM-TIER");
+        assert_eq!(migrated.transitioned_objname, "remote/object");
+    }
+
+    #[tokio::test]
+    async fn decommission_tier_free_version_resume_requires_write_quorum() {
+        let set_disks = make_local_bucket_test_set_disks_with_drive_count(4).await;
+        let bucket = "free-version-decommission-resume";
+        let object = "object.txt";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("target bucket should exist before free-version migration");
+        let mut free_version = FileInfo {
+            name: object.to_string(),
+            volume: bucket.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            deleted: true,
+            transition_tier: "WARM-TIER".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            ..Default::default()
+        };
+        free_version.set_tier_free_version();
+        // Decoded free versions always carry the on-disk free-version
+        // suffix alongside the in-memory tier marker; mirror that here so
+        // the record satisfies delete-marker metadata validation.
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut free_version.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_FREE_VERSION,
+            String::new(),
+        );
+        let opts = ObjectOptions::default();
+
+        let disks = set_disks.get_disks_internal().await;
+        for disk in disks.iter().take(2).flatten() {
+            disk.write_metadata("", bucket, object, free_version.clone())
+                .await
+                .expect("partial first attempt should leave equivalent metadata");
+        }
+        assert!(
+            !set_disks
+                .has_decommission_tier_free_version_write_quorum(bucket, object, &free_version, &opts)
+                .await
+                .expect("partial target metadata should remain valid"),
+            "write-quorum-minus-one must not be accepted as an idempotent migration"
+        );
+
+        disks[2]
+            .as_ref()
+            .expect("third target disk should be online")
+            .write_metadata("", bucket, object, free_version.clone())
+            .await
+            .expect("third equivalent target write should complete quorum");
+        assert!(
+            set_disks
+                .has_decommission_tier_free_version_write_quorum(bucket, object, &free_version, &opts)
+                .await
+                .expect("write-quorum target metadata should remain valid")
+        );
+    }
+
+    #[test]
+    fn decommission_tier_free_version_commit_rejects_lost_fence() {
+        let opts = ObjectOptions {
+            namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+            ..Default::default()
+        };
+
+        let err = ensure_decommission_tier_free_version_commit_fence("bucket", "object", &opts)
+            .expect_err("lost target lock must fail the free-version commit");
+        assert!(matches!(
+            err,
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "decommission_tier_free_version_commit",
+                required: 1,
+                achieved: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

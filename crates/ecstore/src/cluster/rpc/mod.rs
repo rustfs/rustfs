@@ -35,8 +35,9 @@ pub use http_auth::{
     TONIC_RPC_PREFIX, build_auth_headers, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, gen_signature_headers,
     gen_tonic_replay_scope_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
     set_tonic_mutation_body_digest, set_tonic_rolling_canonical_body_digest, set_tonic_rolling_mutation_body_digest,
-    sign_ns_scanner_capability, sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge,
-    tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_put_file_auth_trailer,
+    sign_ns_scanner_capability, sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability,
+    sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+    verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer,
     verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
     verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
     verify_tonic_rpc_signature_with_bootstrap,
@@ -47,9 +48,12 @@ pub use internode_data_transport::build_internode_data_transport_from_env;
 pub(crate) use peer_rest_client::TierConfigReloadOutcome;
 pub use peer_rest_client::{
     KMS_SIGNAL_SUBSYSTEM, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, ScannerPublicationLease,
 };
 pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
-pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys, ScannerBucketListing, ScannerSetBucketListing};
+pub use peer_s3_client::{
+    LocalPeerS3Client, PeerS3Client, S3PeerSys, ScannerBucketListing, ScannerSetBucketListing, decode_heal_bucket_rpc_options,
+    encode_heal_bucket_rpc_options,
+};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;

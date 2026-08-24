@@ -781,14 +781,16 @@ impl RemoteDisk {
         if self.health.is_faulty() {
             return Err(DiskError::FaultyDisk);
         }
-        let probe = self.data_transport.probe_ns_scanner(NsScannerCapabilityRequest {
+        let probe = self.data_transport.probe_ns_scanner_capability(NsScannerCapabilityRequest {
             endpoint: self.endpoint.grid_host(),
+            supports_tier_registry_generation: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
             .map_err(|_| DiskError::other("remote namespace scanner capability probe timed out"))?;
         match result {
-            Ok(server_epoch) => Ok(Some(server_epoch)),
+            Ok(response) if response.supports_tier_registry_generation == Some(true) => Ok(Some(response.server_epoch)),
+            Ok(_) => Ok(None),
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
             Err(DiskError::MethodNotAllowed) => Ok(None),
             Err(err)
@@ -1980,6 +1982,20 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+            .await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -2011,9 +2027,18 @@ impl RemoteDisk {
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                     file_info_bin: file_info_bin.into(),
+                    scanner_publication_lease_token: scanner_publication_lease_token
+                        .map(|token| token.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                if scanner_publication_lease_token.is_some() {
+                    let canonical_body =
+                        canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                }
 
                 let response = client.rename_data(request).await?.into_inner();
 
@@ -2028,6 +2053,70 @@ impl RemoteDisk {
                 )?;
 
                 Ok(rename_data_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    /// Delete a path while binding the target-side operation to a scanner
+    /// publication lease. The ordinary `DiskAPI::delete` path keeps the
+    /// legacy digest/compatibility behavior by passing no token.
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn delete_with_scanner_publication_lease(
+        &self,
+        volume: &str,
+        path: &str,
+        opt: DeleteOptions,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<()> {
+        trace!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            volume,
+            path,
+            recursive = opt.recursive,
+            immediate = opt.immediate,
+            fenced = scanner_publication_lease_token.is_some(),
+            op = "delete",
+            state = "started",
+            "Remote disk RPC started"
+        );
+
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(&opt)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(DeleteRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    options,
+                    scanner_publication_lease_token: scanner_publication_lease_token
+                        .map(|token| token.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
+                });
+                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
+                if scanner_publication_lease_token.is_some() {
+                    let canonical_body =
+                        canonical_body.map_err(|_| Error::other("delete request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
+                }
+
+                let response = client.delete(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
             },
             get_max_timeout_duration(),
         )
@@ -3444,47 +3533,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        trace!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            volume,
-            path,
-            recursive = opt.recursive,
-            immediate = opt.immediate,
-            op = "delete",
-            state = "started",
-            "Remote disk RPC started"
-        );
-
-        self.execute_with_timeout(
-            || async {
-                let options = serde_json::to_string(&opt)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let mut request = Request::new(DeleteRequest {
-                    disk: self.endpoint.to_string(),
-                    volume: volume.to_string(),
-                    path: path.to_string(),
-                    options,
-                });
-                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
-
-                let response = client.delete(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.delete_with_scanner_publication_lease(volume, path, opt, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -4040,10 +4089,21 @@ mod tests {
         NsScannerProbe(NsScannerCapabilityRequest),
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
+        ns_scanner_generation_support: Arc<StdMutex<Option<bool>>>,
+    }
+
+    impl Default for RecordingInternodeDataTransport {
+        fn default() -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::default(),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -4263,6 +4323,15 @@ mod tests {
             Self {
                 calls: Arc::default(),
                 ns_scanner_probe_status: Arc::new(StdMutex::new(Some(status))),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+            }
+        }
+
+        fn with_ns_scanner_generation_support(support: Option<bool>) -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::default(),
+                ns_scanner_generation_support: Arc::new(StdMutex::new(support)),
             }
         }
 
@@ -4943,6 +5012,23 @@ mod tests {
                 );
             }
             Ok(Uuid::from_u128(1))
+        }
+
+        async fn probe_ns_scanner_capability(
+            &self,
+            request: NsScannerCapabilityRequest,
+        ) -> Result<crate::storage_api_contracts::internode::NsScannerCapabilityResponse> {
+            let server_epoch = self.probe_ns_scanner(request).await?;
+            let supports_tier_registry_generation = *self
+                .ns_scanner_generation_support
+                .lock()
+                .expect("namespace scanner generation support lock poisoned");
+            Ok(crate::storage_api_contracts::internode::NsScannerCapabilityResponse {
+                version: crate::storage_api_contracts::internode::NS_SCANNER_PROTOCOL_VERSION,
+                server_epoch,
+                proof: Vec::new(),
+                supports_tier_registry_generation,
+            })
         }
 
         fn name(&self) -> &'static str {
@@ -6758,6 +6844,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_falls_back_without_generation_support() {
+        for support in [None, Some(false)] {
+            let transport = RecordingInternodeDataTransport::with_ns_scanner_generation_support(support);
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+            assert_eq!(
+                remote_disk
+                    .ns_scanner_server_epoch()
+                    .await
+                    .expect("missing generation support should be classified as unsupported"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_remote_disk_namespace_scanner_capability_rejects_legacy_transport() {
         let remote_disk = new_remote_disk_with_transport(Arc::new(RetryingOpenReadInternodeDataTransport::default())).await;
 
@@ -6809,7 +6911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_disk_walk_dir_preserves_skip_total_timeout_option() {
+    async fn test_remote_disk_walk_dir_preserves_control_options() {
         let transport = RecordingInternodeDataTransport::default();
         let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
         let opts = WalkDirOptions {
@@ -6817,6 +6919,7 @@ mod tests {
             base_dir: "prefix".to_string(),
             recursive: true,
             skip_total_timeout: true,
+            skip_hidden_prefix_check: true,
             ..Default::default()
         };
         let mut writer = Vec::new();
@@ -6833,6 +6936,7 @@ mod tests {
                 let sent_opts: WalkDirOptions =
                     serde_json::from_slice(&request.body).expect("walk_dir request body should deserialize");
                 assert!(sent_opts.skip_total_timeout);
+                assert!(sent_opts.skip_hidden_prefix_check);
                 assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),

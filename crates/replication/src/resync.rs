@@ -153,7 +153,7 @@ pub struct ResyncOpts {
     pub resync_before: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TargetReplicationResyncStatus {
     pub start_time: Option<OffsetDateTime>,
     pub last_update: Option<OffsetDateTime>,
