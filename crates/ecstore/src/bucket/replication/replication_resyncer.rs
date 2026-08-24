@@ -40,16 +40,17 @@ use super::replication_resync_boundary::ResyncStatusType;
 #[cfg(test)]
 use super::replication_resync_boundary::should_count_head_proxy_failure;
 use super::replication_resync_boundary::{
-    BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
-    resync_state_accepts_update, resync_status_duration, sanitize_resync_error_detail,
+    BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, decode_resync_file, encode_resync_file,
+    is_version_id_mismatch, resync_state_accepts_update, resync_status_duration, sanitize_resync_error_detail,
+    should_auto_resume_resync,
 };
 #[cfg(test)]
-use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
+use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX};
 #[cfg(test)]
 use super::replication_storage_boundary::ReplicationDeletedObject;
 use super::replication_storage_boundary::{
-    AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
-    ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
+    AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions,
+    ObjectToDelete, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
 };
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
@@ -428,7 +429,7 @@ impl ReplicationResyncer {
     where
         S: ReplicationObjectIO,
     {
-        let (bucket_status, status_duration) = {
+        let (updated_target, status_duration) = {
             let mut status_map = self.status_map.write().await;
             let now = OffsetDateTime::now_utc();
 
@@ -499,28 +500,62 @@ impl ReplicationResyncer {
 
             bucket_status.last_update = Some(now);
 
-            (bucket_status.clone(), status_duration)
+            (state.clone(), status_duration)
         };
 
-        save_resync_status(&opts.bucket, &bucket_status, obj_layer.clone()).await?;
-        if status != ResyncStatusType::ResyncCanceled {
-            let canceled_status = self
-                .status_map
-                .read()
-                .await
-                .get(&opts.bucket)
-                .filter(|current| {
-                    current.targets_map.get(&opts.arn).is_some_and(|target| {
-                        target.resync_id == opts.resync_id && target.resync_status == ResyncStatusType::ResyncCanceled
-                    })
-                })
-                .cloned();
-            if let Some(canceled_status) = canceled_status {
-                save_resync_status(&opts.bucket, &canceled_status, obj_layer).await?;
-                return Ok(());
+        // Persist through the CAS so a stale cached map can never clobber
+        // states other nodes finalized for other targets; re-run the staleness
+        // and canceled-is-terminal guards against the freshest persisted entry.
+        let updated_last_update = updated_target.last_update;
+        let (final_map, saved) = update_resync_status_cas(&opts.bucket, obj_layer, |persisted| {
+            if let Some(current) = persisted.targets_map.get(&opts.arn) {
+                if !resync_state_accepts_update(current, &opts) {
+                    debug!(
+                        event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        incoming_resync_id = %opts.resync_id,
+                        current_resync_id = %current.resync_id,
+                        reason = "stale_status_update",
+                        "Skipped persisting stale resync status update"
+                    );
+                    return Ok(false);
+                }
+                if current.resync_status == ResyncStatusType::ResyncCanceled && status != ResyncStatusType::ResyncCanceled {
+                    debug!(
+                        event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        incoming_status = %status,
+                        reason = "canceled_status_is_terminal",
+                        "Skipped resync status update after cancellation"
+                    );
+                    return Ok(false);
+                }
+            }
+            persisted.targets_map.insert(opts.arn.clone(), updated_target.clone());
+            persisted.last_update = updated_last_update;
+            Ok(true)
+        })
+        .await?;
+
+        // Converge this target's cached entry with what the persisted document
+        // decided (our update, or the newer/terminal state that outranked it).
+        {
+            let mut status_map = self.status_map.write().await;
+            if let Some(cached) = status_map.get_mut(&opts.bucket)
+                && let Some(final_target) = final_map.targets_map.get(&opts.arn)
+            {
+                cached.targets_map.insert(opts.arn.clone(), final_target.clone());
+                cached.last_update = final_map.last_update.or(cached.last_update);
             }
         }
-        if let Some(stats) = runtime_sources::replication_stats() {
+
+        if saved && let Some(stats) = runtime_sources::replication_stats() {
             stats.record_resync_status(&opts.bucket, status, status_duration).await;
         }
 
@@ -612,10 +647,16 @@ impl ReplicationResyncer {
                 }
                 _ = interval.tick() => {
 
-                    let status_map = self.status_map.read().await;
+                    let snapshot: Vec<(String, BucketReplicationResyncStatus)> = self
+                        .status_map
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(bucket, status)| (bucket.clone(), status.clone()))
+                        .collect();
 
                     let mut update = false;
-                    for (bucket, status) in status_map.iter() {
+                    for (bucket, status) in &snapshot {
                         for target in status.targets_map.values() {
                             if target.last_update.is_none() {
                                 update = true;
@@ -631,7 +672,14 @@ impl ReplicationResyncer {
                             }
 
                         if update {
-                            if let Err(err) = save_resync_status(bucket, status, api.clone()).await {
+                            // CAS-merge instead of a blind whole-map save: this
+                            // cache may lag other nodes' admissions and
+                            // cancellations, which must not be overwritten.
+                            let result = update_resync_status_cas(bucket, api.clone(), |persisted| {
+                                Ok(merge_local_resync_into_persisted(persisted, status))
+                            })
+                            .await;
+                            if let Err(err) = result {
                                 error!(
                                     event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
                                     component = LOG_COMPONENT_ECSTORE,
@@ -641,8 +689,8 @@ impl ReplicationResyncer {
                                     error = %err,
                                     "Failed to persist resync status"
                                 );
-                            } else {
-                                last_update_times.insert(bucket.clone(), status.last_update.expect("last_update should be set"));
+                            } else if let Some(last_update) = status.last_update {
+                                last_update_times.insert(bucket.clone(), last_update);
                             }
                         }
                     }
@@ -1451,17 +1499,109 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     })
 }
 
-pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
+/// Upper bound on optimistic retries for a `resync.bin` compare-and-swap
+/// update before giving up; contention on one bucket's status is a handful of
+/// writers (status transitions, the periodic saver, admissions), not a crowd.
+const RESYNC_STATUS_CAS_MAX_ATTEMPTS: usize = 32;
+
+/// Read-merge-write `resync.bin` under an ETag compare-and-swap.
+///
+/// Every writer used to persist its node's cached whole-bucket map, so one
+/// node's stale cache could silently resurrect a state another node had
+/// already finalized (e.g. flip a just-canceled intent back to `Pending`).
+/// `apply` receives the freshest persisted map and mutates it in place,
+/// returning `Ok(false)` to skip the write. On a concurrent write the load +
+/// apply + save cycle is retried against the new document. Returns the final
+/// map and whether this call wrote it.
+pub(crate) async fn update_resync_status_cas<S, F>(
     bucket: &str,
-    status: &BucketReplicationResyncStatus,
     api: Arc<S>,
-) -> Result<()> {
-    let data = encode_resync_file(status)?;
-
+    mut apply: F,
+) -> Result<(BucketReplicationResyncStatus, bool)>
+where
+    S: ReplicationObjectIO,
+    F: FnMut(&mut BucketReplicationResyncStatus) -> Result<bool>,
+{
     let config_file = ReplicationMetadataStore::bucket_resync_file_path(bucket);
-    ReplicationConfigStore::save(api, &config_file, data).await?;
+    for _ in 0..RESYNC_STATUS_CAS_MAX_ATTEMPTS {
+        let (mut status, preconditions) =
+            match ReplicationConfigStore::read_no_lock_with_metadata(api.clone(), &config_file).await {
+                Ok((data, object_info)) => {
+                    let etag = object_info
+                        .etag
+                        .filter(|etag| !etag.trim().is_empty())
+                        .ok_or_else(|| Error::other("replication resync status has no ETag for conditional update"))?;
+                    let status = if data.is_empty() {
+                        BucketReplicationResyncStatus::new()
+                    } else {
+                        decode_resync_file(&data)?
+                    };
+                    (
+                        status,
+                        HTTPPreconditions {
+                            if_match: Some(etag),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(Error::ConfigNotFound) => (
+                    BucketReplicationResyncStatus::new(),
+                    HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                Err(err) => return Err(err),
+            };
+        if !apply(&mut status)? {
+            return Ok((status, false));
+        }
+        match ReplicationConfigStore::save_conditional(api.clone(), &config_file, encode_resync_file(&status)?, preconditions)
+            .await
+        {
+            Ok(()) => return Ok((status, true)),
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::other("replication resync status conditional update did not converge"))
+}
 
-    Ok(())
+/// Merge this node's cached bucket resync map into the persisted map for the
+/// periodic saver. Per target: same run id overlays the fresher local state
+/// unless the persisted state is already terminal and the local one is not
+/// (a cancel/completion recorded by another node must stick); a different
+/// persisted run id means a newer admission elsewhere and is kept; targets
+/// unknown to disk are added. Returns whether `persisted` changed.
+pub(crate) fn merge_local_resync_into_persisted(
+    persisted: &mut BucketReplicationResyncStatus,
+    local: &BucketReplicationResyncStatus,
+) -> bool {
+    let mut changed = false;
+    for (arn, local_state) in &local.targets_map {
+        match persisted.targets_map.get(arn) {
+            Some(current) if current.resync_id == local_state.resync_id => {
+                let persisted_terminal = !should_auto_resume_resync(current.resync_status);
+                let local_terminal = !should_auto_resume_resync(local_state.resync_status);
+                if persisted_terminal && !local_terminal {
+                    continue;
+                }
+                if current != local_state {
+                    persisted.targets_map.insert(arn.clone(), local_state.clone());
+                    changed = true;
+                }
+            }
+            Some(_) => {}
+            None => {
+                persisted.targets_map.insert(arn.clone(), local_state.clone());
+                changed = true;
+            }
+        }
+    }
+    if changed && local.last_update.is_some() {
+        persisted.last_update = local.last_update;
+    }
+    changed
 }
 
 pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
@@ -3913,6 +4053,87 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+    fn resync_target_state(resync_id: &str, status: ResyncStatusType, replicated_count: i64) -> TargetReplicationResyncStatus {
+        TargetReplicationResyncStatus {
+            resync_id: resync_id.to_string(),
+            resync_status: status,
+            replicated_count,
+            ..Default::default()
+        }
+    }
+
+    /// Periodic-saver merge: fresher local progress overlays the same run,
+    /// but a terminal state persisted by another node must stick, a newer
+    /// admission elsewhere is kept, and locally-known targets are added.
+    #[test]
+    fn merge_local_resync_keeps_peer_terminal_and_newer_states() {
+        let mut persisted = BucketReplicationResyncStatus::new();
+        persisted.targets_map.insert(
+            "arn:same-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 1),
+        );
+        persisted.targets_map.insert(
+            "arn:canceled".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncCanceled, 0),
+        );
+        persisted.targets_map.insert(
+            "arn:new-run".to_string(),
+            resync_target_state("run-2", ResyncStatusType::ResyncPending, 0),
+        );
+
+        let mut local = BucketReplicationResyncStatus::new();
+        local.targets_map.insert(
+            "arn:same-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 9),
+        );
+        local.targets_map.insert(
+            "arn:canceled".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncPending, 0),
+        );
+        local.targets_map.insert(
+            "arn:new-run".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncStarted, 3),
+        );
+        local.targets_map.insert(
+            "arn:local-only".to_string(),
+            resync_target_state("run-1", ResyncStatusType::ResyncPending, 0),
+        );
+        local.last_update = Some(OffsetDateTime::now_utc());
+
+        assert!(merge_local_resync_into_persisted(&mut persisted, &local));
+        assert_eq!(persisted.targets_map["arn:same-run"].replicated_count, 9, "fresher local progress wins");
+        assert_eq!(
+            persisted.targets_map["arn:canceled"].resync_status,
+            ResyncStatusType::ResyncCanceled,
+            "peer terminal state must stick"
+        );
+        assert_eq!(
+            persisted.targets_map["arn:new-run"].resync_id, "run-2",
+            "newer admission elsewhere is kept"
+        );
+        assert!(persisted.targets_map.contains_key("arn:local-only"));
+        assert_eq!(persisted.last_update, local.last_update);
+    }
+
+    /// A terminal local state for the same run (completion/failure recorded by
+    /// this node) still overlays a non-terminal persisted state.
+    #[test]
+    fn merge_local_resync_reports_no_change_when_maps_agree() {
+        let mut persisted = BucketReplicationResyncStatus::new();
+        persisted
+            .targets_map
+            .insert("arn:same".to_string(), resync_target_state("run-1", ResyncStatusType::ResyncStarted, 5));
+        let local = persisted.clone();
+        assert!(!merge_local_resync_into_persisted(&mut persisted, &local));
+
+        let mut local = local.clone();
+        local
+            .targets_map
+            .insert("arn:same".to_string(), resync_target_state("run-1", ResyncStatusType::ResyncCompleted, 5));
+        assert!(merge_local_resync_into_persisted(&mut persisted, &local));
+        assert_eq!(persisted.targets_map["arn:same"].resync_status, ResyncStatusType::ResyncCompleted);
+    }
+
     use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
     use s3s::dto::{

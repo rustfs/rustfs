@@ -1982,6 +1982,20 @@ impl RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+            .await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -2013,9 +2027,18 @@ impl RemoteDisk {
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                     file_info_bin: file_info_bin.into(),
+                    scanner_publication_lease_token: scanner_publication_lease_token
+                        .map(|token| token.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                if scanner_publication_lease_token.is_some() {
+                    let canonical_body =
+                        canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
+                }
 
                 let response = client.rename_data(request).await?.into_inner();
 
@@ -2030,6 +2053,70 @@ impl RemoteDisk {
                 )?;
 
                 Ok(rename_data_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    /// Delete a path while binding the target-side operation to a scanner
+    /// publication lease. The ordinary `DiskAPI::delete` path keeps the
+    /// legacy digest/compatibility behavior by passing no token.
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn delete_with_scanner_publication_lease(
+        &self,
+        volume: &str,
+        path: &str,
+        opt: DeleteOptions,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<()> {
+        trace!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            volume,
+            path,
+            recursive = opt.recursive,
+            immediate = opt.immediate,
+            fenced = scanner_publication_lease_token.is_some(),
+            op = "delete",
+            state = "started",
+            "Remote disk RPC started"
+        );
+
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(&opt)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut request = Request::new(DeleteRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    options,
+                    scanner_publication_lease_token: scanner_publication_lease_token
+                        .map(|token| token.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
+                });
+                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
+                if scanner_publication_lease_token.is_some() {
+                    let canonical_body =
+                        canonical_body.map_err(|_| Error::other("delete request length cannot be represented"))?;
+                    crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
+                }
+
+                let response = client.delete(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
             },
             get_max_timeout_duration(),
         )
@@ -3446,47 +3533,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        trace!(
-            event = EVENT_REMOTE_DISK_RPC,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-            endpoint = %self.endpoint,
-            volume,
-            path,
-            recursive = opt.recursive,
-            immediate = opt.immediate,
-            op = "delete",
-            state = "started",
-            "Remote disk RPC started"
-        );
-
-        self.execute_with_timeout(
-            || async {
-                let options = serde_json::to_string(&opt)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let mut request = Request::new(DeleteRequest {
-                    disk: self.endpoint.to_string(),
-                    volume: volume.to_string(),
-                    path: path.to_string(),
-                    options,
-                });
-                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
-
-                let response = client.delete(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                Ok(())
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.delete_with_scanner_publication_lease(volume, path, opt, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

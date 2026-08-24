@@ -269,6 +269,36 @@ async fn data_usage_publish_fails_when_receiver_is_closed() {
 }
 
 #[tokio::test]
+async fn data_usage_publish_rejects_a_second_terminal_update_without_blocking() {
+    for (status, data_usage_info) in [
+        (ScannerCycleStatus::Complete, DataUsageInfo::default()),
+        (
+            ScannerCycleStatus::Superseded,
+            DataUsageInfo {
+                scanner_cycle: Some(7),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (updates, mut receiver) = mpsc::channel(1);
+        assert!(
+            publish_usage_snapshot(&updates, status, data_usage_info)
+                .await
+                .expect("first terminal update should be accepted")
+        );
+
+        let err =
+            tokio::time::timeout(Duration::from_secs(1), publish_usage_snapshot(&updates, status, DataUsageInfo::default()))
+                .await
+                .expect("a full terminal update must fail without waiting")
+                .expect_err("a second terminal update must be rejected");
+        assert!(err.to_string().contains("already queued"));
+        assert!(receiver.try_recv().is_ok(), "the first terminal update must remain owned by the receiver");
+        assert!(receiver.try_recv().is_err(), "the rejected second update must not enter the channel");
+    }
+}
+
+#[tokio::test]
 async fn multi_pool_scanner_cycle_publishes_combined_usage() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let bucket = format!("scanner-union-{}", Uuid::new_v4().simple());
@@ -736,7 +766,7 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
         ),
-        ScannerCycleStatus::Incomplete
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
 
     for status in [
@@ -785,6 +815,34 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
     }
 }
 
+#[test]
+fn unverified_activity_defers_partial_and_floor_cycles() {
+    let expected = ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+
+    assert_eq!(
+        classify_nsscanner_cycle(
+            true,
+            false,
+            false,
+            ScannerBucketScanStatus::Partial,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn structurally_complete_superseded_cycles_publish_without_claiming_convergence() {
     let (updates, mut receiver) = mpsc::channel(2);
@@ -803,6 +861,15 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
         !publish_usage_snapshot(&updates, ScannerCycleStatus::Incomplete, DataUsageInfo::default())
             .await
             .expect("incomplete snapshot suppression should succeed")
+    );
+    assert!(
+        !publish_usage_snapshot(
+            &updates,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            DataUsageInfo::default(),
+        )
+        .await
+        .expect("unverified activity suppression should succeed")
     );
 
     assert_eq!(
@@ -825,11 +892,7 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
 
 #[test]
 fn scanner_cycle_fails_closed_for_namespace_disappearance() {
-    for activity_status in [
-        ScannerCycleActivityStatus::Changed,
-        ScannerCycleActivityStatus::Unchanged,
-        ScannerCycleActivityStatus::Unverified,
-    ] {
+    for activity_status in [ScannerCycleActivityStatus::Changed, ScannerCycleActivityStatus::Unchanged] {
         assert_eq!(
             classify_nsscanner_cycle(
                 false,
@@ -842,6 +905,17 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
             ScannerCycleStatus::Incomplete
         );
     }
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::NamespaceNotFound,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
     assert_eq!(
         classify_nsscanner_cycle(
             true,

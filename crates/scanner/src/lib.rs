@@ -92,7 +92,7 @@ pub use scanner_io::{
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
-pub use storage_api::scan::SCANNER_ACTIVITY_PROTOCOL_VERSION;
+pub use storage_api::scan::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
@@ -796,17 +796,25 @@ where
     Some(admission)
 }
 
-pub(crate) async fn save_config_shared_with_preconditions<S>(
+pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence<S>(
     api: Arc<S>,
     file: &str,
     data: Bytes,
     sha256hex: Option<String>,
     preconditions: HTTPPreconditions,
+    scanner_publication_lease_fence: Option<&str>,
 ) -> EcstoreResult<ScannerObjectInfo>
 where
     S: ScannerObjectIO,
 {
     let mut reader = ScannerPutObjReader::from_prehashed_bytes(data, sha256hex)?;
+    let mut user_defined = HashMap::new();
+    if let Some(fence) = scanner_publication_lease_fence {
+        user_defined.insert(
+            storage_api::owner::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            fence.to_string(),
+        );
+    }
     api.put_object(
         RUSTFS_META_BUCKET,
         file,
@@ -814,6 +822,7 @@ where
         &ScannerObjectOptions {
             max_parity: true,
             http_preconditions: Some(preconditions),
+            user_defined,
             ..Default::default()
         },
     )

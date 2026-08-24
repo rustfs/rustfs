@@ -49,8 +49,8 @@ use crate::data_usage::quota_object_size;
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
-use crate::object_api::NamespaceLockFence;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::object_api::{NamespaceLockFence, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY};
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
@@ -63,6 +63,60 @@ use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
+const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
+
+fn take_scanner_publication_lease_tokens(user_defined: &mut HashMap<String, String>) -> Result<Option<HashMap<String, Uuid>>> {
+    let Some(encoded) = user_defined.remove(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if encoded.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES {
+        return Err(Error::other("scanner publication lease fence is too large"));
+    }
+    let encoded_tokens = serde_json::from_str::<HashMap<String, String>>(&encoded)
+        .map_err(|err| Error::other(format!("invalid scanner publication lease fence: {err}")))?;
+    if encoded_tokens.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES {
+        return Err(Error::other("scanner publication lease fence has too many entries"));
+    }
+    let mut tokens = HashMap::with_capacity(encoded_tokens.len());
+    for (host, token) in encoded_tokens {
+        if host.is_empty() || host.len() > 1024 {
+            return Err(Error::other("invalid scanner publication lease fence host"));
+        }
+        let token = Uuid::parse_str(&token)
+            .map_err(|err| Error::other(format!("invalid scanner publication lease fence token: {err}")))?;
+        if token.is_nil() {
+            return Err(Error::other("invalid scanner publication lease fence token"));
+        }
+        tokens.insert(host, token);
+    }
+    Ok(Some(tokens))
+}
+
+#[cfg(test)]
+mod scanner_publication_lease_fence_tests {
+    use super::*;
+
+    #[test]
+    fn scanner_publication_lease_fence_is_transient_and_validated() {
+        let token = Uuid::new_v4();
+        let mut metadata = HashMap::from([(
+            SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            serde_json::json!({"http://node-a:9000": token.to_string()}).to_string(),
+        )]);
+        let parsed = take_scanner_publication_lease_tokens(&mut metadata)
+            .expect("valid scanner publication lease fence should parse")
+            .expect("scanner publication lease fence should be present");
+        assert_eq!(parsed.get("http://node-a:9000"), Some(&token));
+        assert!(!metadata.contains_key(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY));
+
+        let mut malformed = HashMap::from([(
+            SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY.to_string(),
+            r#"{"http://node-a:9000":"not-a-uuid"}"#.to_string(),
+        )]);
+        assert!(take_scanner_publication_lease_tokens(&mut malformed).is_err());
+    }
+}
 
 struct PutObjectCommitCancellation {
     token: CancellationToken,
@@ -2177,6 +2231,7 @@ impl SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
+        let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut user_defined)?;
         if replication_lww_applicable(opts) {
             // Object Lock evaluation stamps category timestamps with this
             // receiver's clock. Pin them back to the source-authored times
@@ -2896,6 +2951,7 @@ impl SetDisks {
             let commit_bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
             let commit_capacity_scope_token = opts.capacity_scope_token;
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
+            let commit_scanner_publication_lease_tokens = scanner_publication_lease_tokens;
             tmp_cleanup_owned = true;
 
             let commit = move |cancellation: Option<CancellationToken>| async move {
@@ -3015,14 +3071,17 @@ impl SetDisks {
                 }
 
                 Self::assign_rename_data_indexes(&mut parts_metadatas);
-                let rename_result = SetDisks::rename_data_owned(
+                let rename_result = SetDisks::rename_data_owned_with_fence(
                     &commit_disks,
                     RUSTFS_META_TMP_BUCKET,
                     commit_tmp_dir.as_str(),
                     parts_metadatas,
                     &commit_bucket,
                     &commit_object,
-                    write_quorum,
+                    crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
+                        write_quorum,
+                        commit_scanner_publication_lease_tokens.as_ref(),
+                    ),
                 )
                 .await;
                 if quota_mutation_fence {
@@ -6418,6 +6477,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        // Scanner cleanup carries the per-peer lease fence as transient
+        // request metadata. Consume it before any delete-prefix fanout so it
+        // cannot be persisted or treated as user metadata.
+        let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut opts.user_defined)?;
         let preserve_delete_replication_state = should_preserve_delete_replication_state(&opts);
         let delete_config_snapshot = if opts.delete_prefix || opts.transition.expire_restored || preserve_delete_replication_state
         {
@@ -6544,7 +6607,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-            self.delete_prefix(bucket, object)
+            self.delete_prefix_with_scanner_publication_lease(bucket, object, scanner_publication_lease_tokens.as_ref())
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
@@ -6662,6 +6725,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let find_vid = Uuid::new_v4();
+        #[cfg(test)]
+        pause_delete_object_commit(bucket, object).await;
 
         if mark_delete && (opts.versioned || opts.version_suspended) {
             if !delete_marker {
@@ -6730,8 +6795,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             dfi.set_skip_tier_free_version();
         }
 
-        #[cfg(test)]
-        pause_delete_object_commit(bucket, object).await;
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
@@ -7904,9 +7967,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     /// for tests that never touch context-resolved services registered on the
     /// ambient context (tier config manager, expiry state, ...), because the
     /// isolated context starts every one of those cells fresh.
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_isolated(
-        disk_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
     }
 
@@ -12603,6 +12664,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    namespace_lock_lost_signal: None,
                     ..Default::default()
                 },
                 "test_data_movement",

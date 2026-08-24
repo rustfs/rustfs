@@ -33,7 +33,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::{DecommissionCanceler, PoolMeta};
+use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaWriteState};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -86,6 +86,8 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+pub const SCANNER_PUBLICATION_LEASE_TTL_MS: u64 = 60_000;
 
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
@@ -183,12 +185,12 @@ pub struct ECStore {
     /// or `decommission_cancelers`. The guarded sections may perform bounded
     /// async metadata work so check/init/start cannot race across operations.
     pub(crate) start_gate: Mutex<()>,
-    /// Serializes full-document pool metadata saves.
+    /// Serializes full-document pool metadata saves and retains a fail-closed
+    /// write block after startup observes an unreadable replica.
     ///
-    /// Lock order: acquire `pool_meta_save_gate` without holding `pool_meta`.
-    /// The saver then clones the latest `pool_meta` under a short read lock and
-    /// releases it before awaiting disk writes.
-    pub(crate) pool_meta_save_gate: Mutex<()>,
+    /// Lock order: acquire `pool_meta_save_gate`, then the distributed
+    /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
+    pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -344,6 +346,33 @@ impl ECStore {
         decommission || rebalance
     }
 
+    /// Return the storage-owned movement state and generation as one
+    /// authenticated activity snapshot.  The read lock is acquired before
+    /// the state locks (cancelers, pool metadata, then rebalance metadata),
+    /// matching the transition writer order and preventing a terminal state
+    /// from being reported with the preceding generation.
+    pub async fn scanner_data_movement_activity(&self) -> (bool, bool, u64) {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
+        let (active, blocked) = self.scanner_data_movement_snapshot_locked().await;
+        let blocked =
+            blocked || self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted();
+        self.ctx.set_scanner_publication_state(blocked);
+        (active, blocked, self.ctx.data_movement_generation())
+    }
+
+    pub fn scanner_data_movement_generation(&self) -> u64 {
+        self.ctx.data_movement_generation()
+    }
+
+    pub fn scanner_data_movement_generation_exhausted(&self) -> bool {
+        self.ctx.data_movement_generation_exhausted()
+    }
+
+    pub fn scanner_data_movement_changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.ctx.data_movement_generation_notify()
+    }
+
     /// Returns whether scanner metadata may still be hidden by a local
     /// data-movement state. Terminal failed/canceled decommission entries
     /// remain suspended until an operator clears or retries them, so they are
@@ -355,10 +384,16 @@ impl ECStore {
     }
 
     async fn scanner_data_usage_publication_snapshot_blocked(&self) -> bool {
-        if self.ctx.data_movement_operation_epoch_exhausted() {
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
             self.ctx.set_scanner_publication_state(true);
             return true;
         }
+        let (_, blocked) = self.scanner_data_movement_snapshot_locked().await;
+        self.ctx.set_scanner_publication_state(blocked);
+        blocked
+    }
+
+    async fn scanner_data_movement_snapshot_locked(&self) -> (bool, bool) {
         let decommission_cancelers = self.decommission_cancelers.read().await;
         let decommission_active = decommission_cancelers
             .iter()
@@ -385,8 +420,7 @@ impl ECStore {
             .is_some_and(is_rebalance_conflicting_with_decommission);
 
         let blocked = decommission_active || decommission_terminal || rebalance_active;
-        self.ctx.set_scanner_publication_state(blocked);
-        blocked
+        (decommission_active || rebalance_active, blocked)
     }
 
     /// Admit one short data-usage publication commit under the same
@@ -407,7 +441,7 @@ impl ECStore {
     pub async fn scanner_data_usage_publication_admission_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
-        if self.ctx.data_movement_operation_epoch_exhausted() {
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
             return None;
         }
         if self.scanner_data_usage_publication_snapshot_blocked().await {
@@ -424,6 +458,98 @@ impl ECStore {
         let (operation_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         drop(operation_guard);
         Some(epoch)
+    }
+
+    /// Acquire a storage-owned read admission for a coordinator's final
+    /// scanner publication.  The guard remains in the context's lease table,
+    /// so a local movement writer cannot pass the peer while its authoritative
+    /// PUT is in flight.
+    pub async fn acquire_scanner_publication_lease(
+        &self,
+        expected_generation: u64,
+        ttl: std::time::Duration,
+    ) -> Result<(Uuid, u64)> {
+        if ttl != crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL {
+            return Err(Error::other("scanner publication lease TTL is not supported"));
+        }
+
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_generation_exhausted()
+            || self.ctx.data_movement_operation_epoch_exhausted()
+            || self.ctx.data_movement_generation() != expected_generation
+        {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+
+        let token = Uuid::new_v4();
+        let expires_at = tokio::time::Instant::now() + ttl;
+        if !self
+            .ctx
+            .install_scanner_publication_lease(token, expires_at, expected_generation, operation_guard)
+            .await
+        {
+            return Err(Error::other("scanner publication lease capacity is exhausted"));
+        }
+
+        let context = Arc::clone(&self.ctx);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(expires_at).await;
+            context.expire_scanner_publication_lease(token, expires_at).await;
+        });
+        Ok((token, expected_generation))
+    }
+
+    pub async fn release_scanner_publication_lease(&self, token: Uuid) -> bool {
+        self.ctx.remove_scanner_publication_lease(token).await
+    }
+
+    /// Revalidate a previously acquired remote publication lease immediately
+    /// before the coordinator's final metadata write.  The operation read
+    /// guard makes the movement snapshot and token lookup one storage-owned
+    /// admission; a restarted context has no old token and therefore fails
+    /// closed even if its generation counter has returned to zero.
+    pub async fn validate_scanner_publication_lease(&self, token: Uuid, expected_generation: u64) -> Result<()> {
+        let _operation_guard = self.acquire_scanner_publication_lease_guard(token).await?;
+        if self.ctx.data_movement_generation_exhausted()
+            || self.ctx.data_movement_operation_epoch_exhausted()
+            || self.ctx.data_movement_generation() != expected_generation
+        {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+        if !self.ctx.scanner_publication_lease_is_active(token).await {
+            return Err(Error::other("scanner publication lease is unknown or expired"));
+        }
+        Ok(())
+    }
+
+    /// Acquire the target-side read guard bound to a previously granted lease.
+    /// The guard is returned to the RPC handler and must remain alive through
+    /// the complete rename/write operation.  A lease token is process-owned;
+    /// restart, expiry, generation changes, or blocked movement all reject it
+    /// before the target disk is touched.
+    pub async fn acquire_scanner_publication_lease_guard(&self, token: Uuid) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let operation_guard = operation_gate.read_owned().await;
+        if self.ctx.data_movement_generation_exhausted() || self.ctx.data_movement_operation_epoch_exhausted() {
+            return Err(Error::other("scanner publication lease generation is exhausted"));
+        }
+        if self.scanner_data_movement_snapshot_locked().await.1 {
+            return Err(Error::other("scanner publication lease is blocked by data movement"));
+        }
+        let Some(lease_generation) = self.ctx.scanner_publication_lease_generation(token).await else {
+            return Err(Error::other("scanner publication lease is unknown or expired"));
+        };
+        if lease_generation != self.ctx.data_movement_generation() {
+            return Err(Error::other("scanner publication lease generation is stale"));
+        }
+        Ok(operation_guard)
     }
 }
 
@@ -988,7 +1114,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -1084,6 +1210,149 @@ mod tests {
             .await
             .expect("idle store should admit the next publication");
         assert_eq!(next_epoch, 1);
+        assert_eq!(store.scanner_data_movement_generation(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_lease_blocks_movement_writer_until_release_or_expiry() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+        assert_eq!(generation, 0);
+
+        let gate = store.ctx.data_movement_operation_gate();
+        let (writer_started, writer_started_rx) = tokio::sync::oneshot::channel();
+        let movement_writer = tokio::spawn(async move {
+            let _ = writer_started.send(());
+            gate.write_owned().await
+        });
+        writer_started_rx
+            .await
+            .expect("movement writer should reach the gate before waiting");
+        assert!(
+            !movement_writer.is_finished(),
+            "a movement writer must wait while the remote lease owns the read guard"
+        );
+
+        assert!(store.release_scanner_publication_lease(token).await);
+        tokio::time::timeout(Duration::from_secs(1), movement_writer)
+            .await
+            .expect("movement writer should proceed after lease release")
+            .expect("movement writer task should not panic");
+
+        let (expiring_token, _) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("the store should grant a second publication lease");
+        let expiry_gate = store.ctx.data_movement_operation_gate();
+        let (expiry_started, expiry_started_rx) = tokio::sync::oneshot::channel();
+        let mut expiry_writer = tokio::spawn(async move {
+            let _ = expiry_started.send(());
+            expiry_gate.write_owned().await
+        });
+        expiry_started_rx
+            .await
+            .expect("expiry writer should reach the gate before waiting");
+        assert!(!expiry_writer.is_finished());
+        tokio::time::advance(crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), &mut expiry_writer)
+            .await
+            .expect("movement writer should proceed after lease expiry")
+            .expect("expiry writer task should not panic");
+        assert!(!store.release_scanner_publication_lease(expiring_token).await);
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_stale_generation_before_install() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let error = store
+            .acquire_scanner_publication_lease(1, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect_err("a stale movement generation must not acquire a lease");
+        assert!(error.to_string().contains("generation is stale"));
+    }
+
+    #[tokio::test]
+    async fn scanner_target_guard_keeps_movement_writer_fenced_after_lease_release() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, _) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+        let target_guard = store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect("the target-side rename should acquire its short guard");
+        assert!(store.release_scanner_publication_lease(token).await);
+
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let movement_writer = tokio::spawn(async move { movement_gate.write_owned().await });
+        tokio::task::yield_now().await;
+        assert!(!movement_writer.is_finished(), "the target guard must span the rename operation");
+        drop(target_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), movement_writer)
+            .await
+            .expect("movement writer should proceed after the target rename guard is dropped")
+            .expect("movement writer task should not panic");
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_restart_aba_token() {
+        let first_store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = first_store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("the initial instance should grant a publication lease");
+        first_store
+            .validate_scanner_publication_lease(token, generation)
+            .await
+            .expect("the current instance should validate its own live token");
+        first_store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect("the current instance should admit the target-side rename");
+
+        // A restarted storage instance starts its local generation at zero,
+        // but its process-owned lease table is empty.  The old token must not
+        // pass validation just because the numeric generation matches again.
+        let restarted_store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let error = restarted_store
+            .validate_scanner_publication_lease(token, generation)
+            .await
+            .expect_err("a token from a prior instance must fail closed after restart");
+        assert!(error.to_string().contains("unknown or expired"));
+        let error = restarted_store
+            .acquire_scanner_publication_lease_guard(token)
+            .await
+            .expect_err("a restarted instance must reject the target-side rename token");
+        assert!(error.to_string().contains("unknown or expired"));
+    }
+
+    #[tokio::test]
+    async fn movement_generation_notifies_waiters_and_fails_closed_at_maximum() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let notify = store.scanner_data_movement_changed();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        assert_eq!(store.ctx.advance_data_movement_operation_epoch(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("movement transition should wake scanner waiters");
+        assert_eq!(store.scanner_data_movement_generation(), 1);
+
+        store.ctx.set_data_movement_generation_for_test(u64::MAX - 1);
+        assert_eq!(store.ctx.advance_data_movement_generation(), Some(u64::MAX));
+        assert!(store.scanner_data_movement_generation_exhausted());
+        assert_eq!(store.ctx.advance_data_movement_generation(), None);
+        assert!(
+            store.scanner_data_usage_publication_admission_guard().await.is_none(),
+            "generation exhaustion must close publication admission"
+        );
     }
 
     #[tokio::test]
