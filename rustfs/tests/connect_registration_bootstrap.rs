@@ -456,7 +456,11 @@ async fn endpoint_ca_token_state_and_service_failures_are_closed_and_sanitized()
         .await
         .expect_err("malformed token must fail");
     assert!(matches!(error, RegistrationBootstrapError::Token(_)));
-    assert!(!malformed_state.exists());
+    assert_eq!(
+        fs::read(malformed_state.join(".bootstrap-ready")).expect("read durable state marker"),
+        b"v1\n"
+    );
+    assert_no_staging_files(&malformed_state);
 
     let expired = temp.path().join("expired-token.json");
     write_file(&expired, &token_document(OffsetDateTime::now_utc().unix_timestamp() - 1), 0o600);
@@ -521,6 +525,44 @@ async fn token_ca_and_state_paths_reject_sharing_symlinks_and_non_files() {
         assert!(matches!(error, RegistrationBootstrapError::RootCaFileSecurity));
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).expect("restore CA mode");
+
+    let missing_parent = temp.path().join("missing-parent");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind parent gate");
+    let error = register_from_protected_input(endpoint, &root, &missing_parent.join("state"), Some(&token))
+        .await
+        .expect_err("missing state parent must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateParentRequired));
+    assert!(!missing_parent.exists(), "bootstrap must not create the durable parent");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after parent gate");
+
+    let parent_state = temp.path().join("secure/connect/..");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind state gate");
+    let error = register_from_protected_input(endpoint, &root, &parent_state, Some(&token))
+        .await
+        .expect_err("parent state component must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateDirectorySecurity));
+    assert!(!temp.path().join("secure").exists());
+    assert!(!parent_state.join(".bootstrap-ready").exists());
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after state gate");
+
+    let marker_state = temp.path().join("unsafe-marker-state");
+    for directory in [
+        marker_state.clone(),
+        marker_state.join("identity"),
+        marker_state.join("credential"),
+    ] {
+        fs::create_dir_all(&directory).expect("create marker state directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("secure marker state directory");
+    }
+    let marker_target = temp.path().join("unsafe-marker-target");
+    write_file(&marker_target, b"v1\n", 0o600);
+    symlink(marker_target, marker_state.join(".bootstrap-ready")).expect("ready marker symlink");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o640)).expect("make token unsafe behind marker gate");
+    let error = register_from_protected_input(endpoint, &root, &marker_state, Some(&token))
+        .await
+        .expect_err("unsafe marker must fail before token access or network");
+    assert!(matches!(error, RegistrationBootstrapError::StateMarkerSecurity));
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("restore token after marker gate");
 
     let shared_state = temp.path().join("shared-state");
     fs::create_dir(&shared_state).expect("shared state directory");
@@ -616,6 +658,7 @@ fn assert_owner_only_files(state: &std::path::Path) {
 
     for path in [
         state.to_path_buf(),
+        state.join(".bootstrap-ready"),
         state.join("identity"),
         state.join("credential"),
         state.join("identity/device.key"),
