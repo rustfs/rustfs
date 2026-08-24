@@ -88,17 +88,20 @@ fn manual_transition_record_marks_unknown_when_cursor_would_skip_pending_page() 
     };
     let job_id = Uuid::new_v4();
     let mut record = ManualTransitionJobRecord::new(job_id, "manual-pending-page-bucket", &options, "owner-a");
-    record.report = ManualTransitionRunReport {
-        bucket: "manual-pending-page-bucket".to_string(),
-        prefix: options.prefix.clone(),
-        tier: options.tier,
-        scanned: 1000,
-        eligible: 2,
-        enqueued: 2,
-        transition_completed: 1,
-        continuation_token: Some("opaque-page-cursor".to_string()),
-        ..Default::default()
-    };
+    record.update_running_progress(
+        ManualTransitionRunReport {
+            bucket: "manual-pending-page-bucket".to_string(),
+            prefix: options.prefix.clone(),
+            tier: options.tier,
+            scanned: 1000,
+            eligible: 2,
+            enqueued: 2,
+            continuation_token: Some("opaque-page-cursor".to_string()),
+            ..Default::default()
+        },
+        ManualTransitionQueueSnapshot::default(),
+    );
+    record.report.transition_completed = 1;
 
     let marked = record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot::default());
 
