@@ -743,7 +743,12 @@ where
     let backup_seed = load_data_usage_for_bucket_removal(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await?
         .map(|(data_usage_info, _)| data_usage_info)
-        .or_else(|| primary_seed.clone());
+        .filter(|data_usage_info| !data_usage_info.usage_snapshot_bootstrap_pending)
+        .or_else(|| {
+            primary_seed
+                .clone()
+                .filter(|data_usage_info| !data_usage_info.usage_snapshot_bootstrap_pending)
+        });
     remove_bucket_usage_from_object_with_retries_and_publication(
         store,
         DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
@@ -2776,7 +2781,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: TokioMutex::new(()),
-            pool_meta_save_gate: TokioMutex::new(()),
+            pool_meta_save_gate: TokioMutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -4644,6 +4649,32 @@ mod tests {
         assert_eq!(state.put_count, 0);
         assert!(state.object.is_none());
         assert!(state.backup_object.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_does_not_seed_backup_from_pristine_bootstrap_marker() {
+        let marker = DataUsageInfo {
+            last_update: Some(SystemTime::now()),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_bootstrap_pending: true,
+            ..Default::default()
+        };
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&marker).expect("bootstrap marker should encode"), 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should preserve the pending primary without creating a backup");
+
+        let state = store.state.lock().await;
+        assert!(state.backup_object.is_none());
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("pending primary should remain").0)
+            .expect("pending primary should decode");
+        assert!(saved.usage_snapshot_bootstrap_pending);
     }
 
     #[tokio::test]

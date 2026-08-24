@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::*;
-use crate::core::pools::{PoolMetaReplicaState, local_decommission_queue_prefix, pool_meta_has_active_decommission};
+use crate::core::pools::{
+    PoolMetaReplicaState, PoolMetaWriteState, local_decommission_queue_prefix, pool_meta_has_active_decommission,
+};
 use crate::error::is_err_decommission_running;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
@@ -109,6 +111,14 @@ fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_
     rebalance_meta_loaded && !decommission_running
 }
 
+fn should_schedule_local_decommission_resume(
+    pool_indices: &[usize],
+    pool_meta_replica_state: PoolMetaReplicaState,
+    pool_meta_write_safe: bool,
+) -> bool {
+    !pool_indices.is_empty() && pool_meta_replica_state.repair_write_safe && pool_meta_write_safe
+}
+
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
     tokio::select! {
         _ = rx.cancelled() => false,
@@ -120,15 +130,19 @@ fn resolve_store_init_stage_result(result: Result<()>, stage: &str) -> Result<()
     result.map_err(|err| Error::other(format!("store init failed during {stage}: {err}")))
 }
 
-async fn load_pool_meta_for_startup<S>(pools: Vec<Arc<S>>) -> Result<(PoolMeta, PoolMetaReplicaState)>
+async fn load_pool_meta_for_startup<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+) -> Result<(PoolMeta, PoolMetaReplicaState)>
 where
     S: EcstoreObjectIO,
 {
     let mut meta = PoolMeta::default();
     let replica_state = meta
-        .load_no_lock_from_replicas(pools)
+        .load_no_lock_from_replicas_observing(pools, write_state)
         .await
         .map_err(|err| Error::other(format!("store init failed during load_pool_meta: {err}")))?;
+    write_state.observe_replicas(replica_state);
     Ok((meta, replica_state))
 }
 
@@ -143,6 +157,7 @@ async fn persist_pool_meta_for_startup_if_safe<S>(
     meta: &PoolMeta,
     pools: Vec<Arc<S>>,
     replica_state: PoolMetaReplicaState,
+    write_state: PoolMetaWriteState,
     topology_update: bool,
     elected_writer: bool,
 ) -> Result<()>
@@ -152,10 +167,14 @@ where
     if !elected_writer {
         return Ok(());
     }
+    let should_write = topology_update || (replica_state.needs_repair && replica_state.repair_write_safe);
     if topology_update {
         replica_state.ensure_write_safe("store init failed during save_validated_pool_meta")?;
     }
-    if topology_update || (replica_state.needs_repair && replica_state.repair_write_safe) {
+    if should_write {
+        write_state.ensure_write_safe("store init failed during save_validated_pool_meta")?;
+    }
+    if should_write {
         save_validated_pool_meta_for_startup(meta, pools).await?;
     }
     Ok(())
@@ -431,7 +450,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -475,7 +494,10 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         runtime_sources::ensure_boot_time().await;
 
-        let (meta, pool_meta_replica_state) = load_pool_meta_for_startup(self.pools.clone()).await?;
+        let (meta, pool_meta_replica_state) = {
+            let mut write_state = self.pool_meta_save_gate.lock().await;
+            load_pool_meta_for_startup(self.pools.clone(), &mut write_state).await?
+        };
         let update = meta.validate(self.pools.clone())?;
         let endpoints = runtime_sources::endpoint_pools_or_default();
         let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
@@ -487,14 +509,18 @@ impl ECStore {
         };
         // Only one local node should persist validated pool metadata here; otherwise
         // distributed startup can race on the same lock and replay the prior init bug.
-        persist_pool_meta_for_startup_if_safe(
-            &installed_pool_meta,
-            self.pools.clone(),
-            pool_meta_replica_state,
-            update,
-            should_persist_pool_meta,
-        )
-        .await?;
+        {
+            let write_state = self.pool_meta_save_gate.lock().await;
+            persist_pool_meta_for_startup_if_safe(
+                &installed_pool_meta,
+                self.pools.clone(),
+                pool_meta_replica_state,
+                *write_state,
+                update,
+                should_persist_pool_meta,
+            )
+            .await?;
+        }
 
         {
             let mut pool_meta = self.pool_meta.write().await;
@@ -538,7 +564,11 @@ impl ECStore {
         }
 
         let local_pool_indices = local_decommission_queue_prefix(&endpoints, &pool_indices)?;
-        if !local_pool_indices.is_empty() {
+        let pool_meta_write_safe = self
+            .ensure_pool_meta_side_effects_safe("decommission resume blocked while pool metadata requires recovery")
+            .await
+            .is_ok();
+        if should_schedule_local_decommission_resume(&local_pool_indices, pool_meta_replica_state, pool_meta_write_safe) {
             let store = self.clone();
 
             tokio::spawn(async move {
@@ -547,6 +577,16 @@ impl ECStore {
                 }
                 resume_local_decommission_after_init(store, rx, local_pool_indices).await;
             });
+        } else if !local_pool_indices.is_empty() {
+            error!(
+                event = EVENT_DECOMMISSION_RESUME_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                state = "blocked",
+                pool_indices = ?local_pool_indices,
+                reason = "pool_meta_write_blocked",
+                "Decommission resume blocked until pool metadata replicas are readable and consistent"
+            );
         }
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
@@ -575,11 +615,11 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, persist_pool_meta_for_startup_if_safe,
-        pool_first_endpoint_is_local, pool_meta_has_active_decommission, preflight_startup_rpc_secret_with,
-        resolve_startup_pool_defaults_with, resolve_store_init_stage_result, save_validated_pool_meta_for_startup,
-        should_auto_start_rebalance_after_init, should_retry_format_load, should_retry_local_decommission_resume,
-        wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, PoolMetaWriteState, load_pool_meta_for_startup,
+        persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local, pool_meta_has_active_decommission,
+        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
+        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init, should_retry_format_load,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
@@ -796,8 +836,9 @@ mod tests {
     #[tokio::test]
     async fn test_store_init_pool_meta_io_bypasses_namespace_lock_surface() {
         let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut write_state = PoolMetaWriteState::default();
 
-        let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()])
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut write_state)
             .await
             .expect("startup pool metadata load should tolerate missing metadata without locks");
         assert!(loaded.pools.is_empty());
@@ -822,8 +863,9 @@ mod tests {
         let corrupt = Arc::new(StartupPoolMetaStorage::new(vec![0, 1, 2]));
         let expected = init_test_pool_meta(None);
         let backup = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&expected)));
+        let mut write_state = PoolMetaWriteState::default();
 
-        let (loaded, replica_state) = load_pool_meta_for_startup(vec![corrupt.clone(), backup.clone()])
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![corrupt.clone(), backup.clone()], &mut write_state)
             .await
             .expect("startup should select the validated backup replica");
 
@@ -834,9 +876,16 @@ mod tests {
         assert!(corrupt.read_without_lock.load(Ordering::SeqCst));
         assert!(backup.read_without_lock.load(Ordering::SeqCst));
 
-        persist_pool_meta_for_startup_if_safe(&loaded, vec![corrupt.clone(), backup.clone()], replica_state, false, true)
-            .await
-            .expect("the elected startup writer should repair validated corrupt replicas");
+        persist_pool_meta_for_startup_if_safe(
+            &loaded,
+            vec![corrupt.clone(), backup.clone()],
+            replica_state,
+            write_state,
+            false,
+            true,
+        )
+        .await
+        .expect("the elected startup writer should repair validated corrupt replicas");
 
         let corrupt_write = corrupt
             .written_payload
@@ -858,26 +907,76 @@ mod tests {
     async fn test_store_init_pool_meta_does_not_repair_unreadable_replica() {
         let valid = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&init_test_pool_meta(None))));
         let unreadable = Arc::new(StartupPoolMetaStorage::unreadable());
+        let mut write_state = PoolMetaWriteState::default();
 
-        let (loaded, replica_state) = load_pool_meta_for_startup(vec![valid.clone(), unreadable.clone()])
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![valid.clone(), unreadable.clone()], &mut write_state)
             .await
             .expect("startup should use a validated replica without overwriting an unreadable copy");
         assert!(replica_state.needs_repair);
         assert!(!replica_state.repair_write_safe);
 
-        persist_pool_meta_for_startup_if_safe(&loaded, vec![valid.clone(), unreadable.clone()], replica_state, false, true)
-            .await
-            .expect("an unreadable copy should defer repair when no topology write is needed");
+        persist_pool_meta_for_startup_if_safe(
+            &loaded,
+            vec![valid.clone(), unreadable.clone()],
+            replica_state,
+            write_state,
+            false,
+            true,
+        )
+        .await
+        .expect("an unreadable copy should defer repair when no topology write is needed");
         assert!(!valid.wrote_without_lock.load(Ordering::SeqCst));
         assert!(!unreadable.wrote_without_lock.load(Ordering::SeqCst));
 
-        let err =
-            persist_pool_meta_for_startup_if_safe(&loaded, vec![valid.clone(), unreadable.clone()], replica_state, true, true)
-                .await
-                .expect_err("a topology update must not overwrite an unreadable replica");
+        let err = persist_pool_meta_for_startup_if_safe(
+            &loaded,
+            vec![valid.clone(), unreadable.clone()],
+            replica_state,
+            write_state,
+            true,
+            true,
+        )
+        .await
+        .expect_err("a topology update must not overwrite an unreadable replica");
         assert!(err.to_string().contains("cannot overwrite an unreadable replica"));
         assert!(!valid.wrote_without_lock.load(Ordering::SeqCst));
         assert!(!unreadable.wrote_without_lock.load(Ordering::SeqCst));
+        assert!(!super::should_schedule_local_decommission_resume(&[0], replica_state, true));
+        assert!(!super::should_schedule_local_decommission_resume(
+            &[0],
+            crate::core::pools::PoolMetaReplicaState {
+                needs_repair: false,
+                repair_write_safe: true,
+            },
+            false,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_store_init_pool_meta_stays_blocked_after_all_replicas_were_unreadable() {
+        let unreadable_a = Arc::new(StartupPoolMetaStorage::unreadable());
+        let unreadable_b = Arc::new(StartupPoolMetaStorage::unreadable());
+        let mut write_state = PoolMetaWriteState::default();
+
+        load_pool_meta_for_startup(vec![unreadable_a, unreadable_b], &mut write_state)
+            .await
+            .expect_err("startup must fail when no readable pool metadata replica exists");
+
+        let repaired = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&init_test_pool_meta(None))));
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![repaired.clone()], &mut write_state)
+            .await
+            .expect("a later startup retry may read the repaired replica");
+        assert!(replica_state.repair_write_safe);
+
+        let err = persist_pool_meta_for_startup_if_safe(&loaded, vec![repaired.clone()], replica_state, write_state, true, true)
+            .await
+            .expect_err("the same store instance must not write after observing unreadable replicas");
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+        assert!(!repaired.wrote_without_lock.load(Ordering::SeqCst));
+        assert!(!super::should_schedule_local_decommission_resume(&[0], replica_state, false));
     }
 
     #[test]

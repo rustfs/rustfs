@@ -404,8 +404,18 @@ mod tests {
         info!("✅ DELETE object succeeded");
 
         // Verify it's deleted
-        let result = client.get_object().bucket(bucket).key(key).send().await;
-        assert!(result.is_err(), "Object should not exist after DELETE");
+        let error = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect_err("Object should not exist after DELETE");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "GET after DELETE must return HTTP 404, got {error:?}"
+        );
 
         // Cleanup
         env.stop_server();

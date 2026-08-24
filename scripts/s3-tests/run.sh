@@ -584,19 +584,17 @@ check_server_ready_from_log() {
 
 # Test S3 API readiness
 test_s3_api_ready() {
-    # Step 1: Check if server is responding using /health endpoint
-    # /health is a probe path that bypasses readiness gate, so it can be used
-    # to check if the server is up and running, even if readiness gate is not ready yet
-    HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    # Step 1: Require the dependency-aware readiness endpoint.
+    READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         -X GET \
-        "http://${S3_HOST}:${S3_PORT}/health" \
+        "http://${S3_HOST}:${S3_PORT}/health/ready" \
         --max-time 5 2>/dev/null || echo "000")
 
-    if [ "${HEALTH_CODE}" = "000" ]; then
+    if [ "${READY_CODE}" = "000" ]; then
         # Connection failed - server might not be running or not listening yet
         return 1
-    elif [ "${HEALTH_CODE}" != "200" ]; then
-        # Health endpoint returned non-200 status, server might have issues
+    elif [ "${READY_CODE}" != "200" ]; then
+        # The service is live but its storage/IAM dependencies are not ready.
         return 1
     fi
 
@@ -617,16 +615,11 @@ test_s3_api_ready() {
         if echo "${RESPONSE}" | grep -q "503\|Service not ready"; then
             return 1  # Not ready yet (readiness gate is blocking S3 API)
         fi
-        # Other errors from awscurl - might be auth issues or other problems
-        # But server is up, so we'll consider it ready (S3 API might have other issues)
-        return 0
+        # Authentication, server, and transport failures are not readiness.
+        return 1
     fi
 
-    # Step 3: Fallback - if /health returns 200, server is up and readiness gate is ready
-    # Since /health is a probe path and returns 200, and we don't have awscurl to test S3 API,
-    # we can assume the server is ready. The readiness gate would have blocked /health if not ready.
-    # Note: Root path "/" with HEAD method returns 501 Not Implemented (S3 doesn't support HEAD on root),
-    # so we can't use it as a reliable test. Since /health already confirmed readiness, we return success.
+    # /health/ready is authoritative when the optional signed probe is absent.
     return 0
 }
 

@@ -722,9 +722,8 @@ impl ECStore {
         // overwrite a newer local transition after the writer commits.
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
-        let mut reloaded = PoolMeta::default();
-        resolve_store_rebalance_pool_meta_reload_result(
-            reloaded.load(self.pools[0].clone(), self.pools.clone()).await,
+        let reloaded = resolve_store_rebalance_pool_meta_reload_result(
+            self.load_runtime_pool_meta("store rebalance pool meta reload failed").await,
             "reload_pool_meta",
         )?;
 
@@ -933,11 +932,12 @@ mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
-    use crate::core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolStatus};
+    use crate::core::pools::{POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolStatus};
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::ObjectLockConfigSnapshot;
+    use crate::set_disk::get_lock_acquire_timeout;
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use arc_swap::ArcSwap;
@@ -2122,7 +2122,7 @@ mod tests {
 
     #[test]
     fn resolve_store_rebalance_pool_meta_reload_result_wraps_error_context() {
-        let err = resolve_store_rebalance_pool_meta_reload_result(Err(Error::SlowDown), "reload_pool_meta")
+        let err = resolve_store_rebalance_pool_meta_reload_result::<()>(Err(Error::SlowDown), "reload_pool_meta")
             .expect_err("failed pool meta reload should be wrapped");
         let err_message = err.to_string();
         assert!(err_message.contains("store rebalance pool meta reload failed during reload_pool_meta"));
@@ -2319,6 +2319,60 @@ mod tests {
             .save(store.pools.clone())
             .await
             .expect("pool meta snapshot should persist to every pool");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_runtime_load_waits_for_multi_pool_commit_fence() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-load-fence", &[2, 2]).await;
+        let old = PoolMeta::new(&store.pools, &PoolMeta::default());
+        old.save(store.pools.clone()).await.expect("old pool metadata should persist");
+        let mut newer = old.clone();
+        newer.pools[0].last_update += TimeDuration::seconds(1);
+
+        let pool_meta_lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool metadata lock should be created");
+        let pool_meta_guard = pool_meta_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("pool metadata write fence should be acquired");
+        newer
+            .save_for_startup(vec![store.pools[0].clone()])
+            .await
+            .expect("first replica should enter the new generation");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut load_task = tokio::spawn({
+            let store = store.clone();
+            let started = started.clone();
+            async move {
+                started.notify_one();
+                store.load_runtime_pool_meta("test runtime pool metadata load").await
+            }
+        });
+        started.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut load_task)
+                .await
+                .is_err(),
+            "runtime load must not observe a valid-old/valid-new intermediate state"
+        );
+
+        newer
+            .save_for_startup(vec![store.pools[1].clone()])
+            .await
+            .expect("second replica should enter the new generation");
+        drop(pool_meta_guard);
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load_task)
+            .await
+            .expect("runtime load should finish after commit publication")
+            .expect("runtime load task should not panic")
+            .expect("runtime load should select the completed snapshot");
+        assert_eq!(loaded.pools[0].last_update, newer.pools[0].last_update);
+        shutdown.cancel();
     }
 
     #[tokio::test]

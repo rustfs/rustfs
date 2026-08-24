@@ -251,7 +251,7 @@ fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
 }
 
 fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
-    let filter_has_size = |filter: &s3s::dto::LifecycleRuleFilter| {
+    let filter_has_size = |filter: &LifecycleRuleFilter| {
         filter.object_size_greater_than.is_some()
             || filter.object_size_less_than.is_some()
             || filter
@@ -1637,13 +1637,13 @@ mod tests {
     #[test]
     fn malformed_size_blocks_size_dependent_transition_but_allows_time_only_expiry() {
         let size_filtered = BucketLifecycleConfiguration {
-            rules: vec![s3s::dto::LifecycleRule {
-                status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 id: Some("size".to_string()),
-                filter: Some(s3s::dto::LifecycleRuleFilter {
+                filter: Some(LifecycleRuleFilter {
                     object_size_greater_than: Some(1),
                     ..Default::default()
                 }),
@@ -1676,8 +1676,8 @@ mod tests {
         let mixed_filters = BucketLifecycleConfiguration {
             rules: vec![
                 size_filtered.rules[0].clone(),
-                s3s::dto::LifecycleRule {
-                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -1733,13 +1733,13 @@ mod tests {
         ));
         assert!(lifecycle_rule_has_size_filter(
             &BucketLifecycleConfiguration {
-                rules: vec![s3s::dto::LifecycleRule {
-                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     id: None,
-                    filter: Some(s3s::dto::LifecycleRuleFilter {
+                    filter: Some(LifecycleRuleFilter {
                         object_size_greater_than: Some(1),
                         ..Default::default()
                     }),

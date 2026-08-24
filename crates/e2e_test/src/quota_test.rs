@@ -682,18 +682,26 @@ mod integration_tests {
         assert!(resp.contains("quota_limit"));
 
         // Normal user sets quota — should be denied
-        let set_resp = awscurl_put(
+        let set_error = awscurl_put(
             &get_url,
             &serde_json::json!({"quota": 2048, "quota_type": "HARD"}).to_string(),
             normal_ak,
             normal_sk,
         )
-        .await;
-        assert!(set_resp.is_err(), "normal user should not be able to set quota");
+        .await
+        .expect_err("normal user should not be able to set quota")
+        .to_string();
+        assert!(set_error.contains("AccessDenied"), "quota denial must return AccessDenied: {set_error}");
 
         // Normal user clears quota — should be denied
-        let del_resp = awscurl_delete(&get_url, normal_ak, normal_sk).await;
-        assert!(del_resp.is_err(), "normal user should not be able to clear quota");
+        let delete_error = awscurl_delete(&get_url, normal_ak, normal_sk)
+            .await
+            .expect_err("normal user should not be able to clear quota")
+            .to_string();
+        assert!(
+            delete_error.contains("AccessDenied"),
+            "quota deletion denial must return AccessDenied: {delete_error}"
+        );
 
         env.cleanup_bucket().await?;
         Ok(())

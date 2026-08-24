@@ -748,6 +748,14 @@ impl StorageReplicationPoolHandle {
         self.inner.clone().cancel_bucket_resync(opts).await
     }
 
+    pub(crate) async fn cancel_bucket_resync_for_removed_target(
+        &self,
+        bucket: &str,
+        arn: &str,
+    ) -> Result<Option<ecstore_bucket::replication::ResyncOpts>> {
+        self.inner.clone().cancel_bucket_resync_for_removed_target(bucket, arn).await
+    }
+
     pub(crate) async fn admit_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<bool> {
         self.inner.clone().admit_bucket_resync(opts).await
     }
@@ -872,10 +880,20 @@ pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     ecstore_bucket::replication::init_background_replication(store).await;
 }
 
+/// Reconcile accepted (pending/started) resync intents into the bucket's
+/// target metadata. Returns whether `targets` changed.
+///
+/// An intent whose target ARN is no longer configured is an orphan: the
+/// remote target was removed after the resync was admitted, or the record
+/// predates the atomic-admission contract. Nothing can be reconciled for it,
+/// so it is skipped here and left to the resync routine, which marks it
+/// `ResyncFailed` through `resolve_resync_target`. Failing startup on it
+/// would keep the whole server down over one stale replication record.
 fn apply_active_resync_intents(
+    bucket: &str,
     targets: &mut ecstore_bucket::target::BucketTargets,
     status: &ecstore_bucket::replication::BucketReplicationResyncStatus,
-) -> Result<bool> {
+) -> bool {
     let mut changed = false;
     for (arn, intent) in &status.targets_map {
         if !matches!(
@@ -885,18 +903,26 @@ fn apply_active_resync_intents(
         ) {
             continue;
         }
-        let target = targets
-            .targets
-            .iter_mut()
-            .find(|target| target.arn == *arn)
-            .ok_or_else(|| Error::other(format!("accepted replication resync target {arn} is not configured")))?;
+        let Some(target) = targets.targets.iter_mut().find(|target| target.arn == *arn) else {
+            tracing::warn!(
+                event = "replication_resync_intent_orphaned",
+                component = "storage",
+                subsystem = "replication",
+                result = "skipped",
+                bucket,
+                arn = %arn,
+                resync_status = ?intent.resync_status,
+                "accepted replication resync target is no longer configured; skipping startup reconcile"
+            );
+            continue;
+        };
         if target.reset_id != intent.resync_id || target.reset_before_date != intent.resync_before_date {
             target.reset_id = intent.resync_id.clone();
             target.reset_before_date = intent.resync_before_date;
             changed = true;
         }
     }
-    Ok(changed)
+    changed
 }
 
 pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -> Result<()> {
@@ -916,7 +942,7 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -
         } else {
             serde_json::from_slice(&metadata.bucket_targets_config_json).map_err(Error::other)?
         };
-        if !apply_active_resync_intents(&mut targets, &status)? {
+        if !apply_active_resync_intents(bucket, &mut targets, &status) {
             continue;
         }
         let encoded = serde_json::to_vec(&targets).map_err(Error::other)?;
@@ -1967,8 +1993,56 @@ mod tests {
             },
         );
 
-        assert!(apply_active_resync_intents(&mut targets, &status).expect("accepted intent should reconcile"));
+        assert!(apply_active_resync_intents("bucket-a", &mut targets, &status));
         assert_eq!(targets.targets[0].reset_id, "durable-id");
         assert_eq!(targets.targets[1].reset_id, "concurrent-id");
+    }
+
+    /// A pending/started intent whose target was removed (or predates the
+    /// atomic-admission contract) must not abort startup; it is skipped and
+    /// the remaining intents still reconcile.
+    #[test]
+    fn restart_reconcile_skips_orphaned_intent_without_failing_startup() {
+        let mut targets = ecstore_bucket::target::BucketTargets {
+            targets: vec![ecstore_bucket::target::BucketTarget {
+                arn: "arn:minio:replication::depl-1:configured".to_string(),
+                ..Default::default()
+            }],
+        };
+        let mut status = ecstore_bucket::replication::BucketReplicationResyncStatus::new();
+        for (arn, resync_status) in [
+            (
+                "arn:rustfs:replication::2ae1d6316a2f17d8:removed",
+                ecstore_bucket::replication::ResyncStatusType::ResyncStarted,
+            ),
+            (
+                "arn:minio:replication::depl-1:configured",
+                ecstore_bucket::replication::ResyncStatusType::ResyncPending,
+            ),
+        ] {
+            status.targets_map.insert(
+                arn.to_string(),
+                ecstore_bucket::replication::TargetReplicationResyncStatus {
+                    resync_id: "durable-id".to_string(),
+                    resync_status,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(apply_active_resync_intents("bucket-a", &mut targets, &status));
+        assert_eq!(targets.targets.len(), 1, "orphaned intent must not materialize a target");
+        assert_eq!(targets.targets[0].reset_id, "durable-id");
+
+        let mut only_orphan = ecstore_bucket::replication::BucketReplicationResyncStatus::new();
+        only_orphan.targets_map.insert(
+            "arn:rustfs:replication::2ae1d6316a2f17d8:removed".to_string(),
+            ecstore_bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "durable-id".to_string(),
+                resync_status: ecstore_bucket::replication::ResyncStatusType::ResyncStarted,
+                ..Default::default()
+            },
+        );
+        assert!(!apply_active_resync_intents("bucket-a", &mut targets, &only_orphan));
     }
 }

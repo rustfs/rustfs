@@ -1076,6 +1076,13 @@ pub async fn get_versioning_config(bucket: &str) -> Result<(VersioningConfigurat
     bucket_meta_sys.get_versioning_config(bucket).await
 }
 
+pub(crate) async fn has_authoritative_never_versioned_state(bucket: &str) -> Result<bool> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+
+    bucket_meta_sys.has_authoritative_never_versioned_state(bucket).await
+}
+
 pub async fn get_website_config(bucket: &str) -> Result<(WebsiteConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
@@ -1914,6 +1921,18 @@ impl BucketMetadataSys {
         }
     }
 
+    async fn has_authoritative_never_versioned_state(&self, bucket: &str) -> Result<bool> {
+        let BucketMetadataAuthority::Authoritative(metadata) = self.get_metadata_authority(bucket).await? else {
+            return Ok(false);
+        };
+
+        if metadata.versioning_config.is_none() && !metadata.versioning_config_xml.is_empty() {
+            return Err(Error::other("persisted bucket versioning configuration is invalid"));
+        }
+
+        Ok(metadata.versioning_config.is_none() && metadata.versioning_config_xml.is_empty())
+    }
+
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
         let bm = match self.get_metadata_authority(bucket).await? {
             BucketMetadataAuthority::Authoritative(bm) => bm,
@@ -2470,6 +2489,10 @@ mod tests {
             "malformed versioning metadata must block destructive requests"
         );
         assert!(
+            sys.has_authoritative_never_versioned_state(bucket).await.is_err(),
+            "malformed versioning metadata must not enable listing shortcuts"
+        );
+        assert!(
             sys.get_replication_config(bucket).await.is_err(),
             "malformed replication metadata must not be reported as ConfigNotFound"
         );
@@ -2492,7 +2515,49 @@ mod tests {
             sys.get_object_lock_config_state("authoritative-empty").await.unwrap(),
             ObjectLockConfigState::ConfirmedAbsent
         ));
+        assert!(
+            sys.has_authoritative_never_versioned_state("authoritative-empty")
+                .await
+                .unwrap(),
+            "authoritative config absence should identify a never-versioned bucket"
+        );
         assert!(matches!(sys.get_bucket_policy("authoritative-empty").await, Err(Error::ConfigNotFound)));
+
+        let mut versioned = BucketMetadata::new("authoritative-versioned");
+        versioned.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        versioned.versioning_config = Some(VersioningConfiguration {
+            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            ..Default::default()
+        });
+        sys.set("authoritative-versioned".to_string(), Arc::new(versioned)).await;
+        assert!(
+            !sys.has_authoritative_never_versioned_state("authoritative-versioned")
+                .await
+                .unwrap(),
+            "versioned buckets must retain delete-marker visibility probes"
+        );
+
+        let mut ambiguous = BucketMetadata::new("authoritative-ambiguous-versioning");
+        ambiguous.versioning_config = Some(VersioningConfiguration::default());
+        sys.set("authoritative-ambiguous-versioning".to_string(), Arc::new(ambiguous))
+            .await;
+        assert!(
+            !sys.has_authoritative_never_versioned_state("authoritative-ambiguous-versioning")
+                .await
+                .unwrap(),
+            "ambiguous versioning metadata must retain delete-marker visibility probes"
+        );
+
+        sys.fabricated_metadata
+            .write()
+            .await
+            .insert("fabricated-versioning".to_string());
+        assert!(
+            !sys.has_authoritative_never_versioned_state("fabricated-versioning")
+                .await
+                .unwrap(),
+            "fabricated metadata must retain delete-marker visibility probes"
+        );
 
         for dir in &dirs {
             std::fs::create_dir_all(dir.path().join("policy-only-legacy")).unwrap();

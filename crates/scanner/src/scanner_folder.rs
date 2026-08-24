@@ -49,7 +49,9 @@ use rustfs_filemeta::{
     MetaCacheHealCandidateKind,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, VersioningConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, LifecycleRuleFilter, ObjectLockConfiguration, VersioningConfiguration};
+#[cfg(test)]
+use s3s::dto::{ExpirationStatus, LifecycleRule};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;

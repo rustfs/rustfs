@@ -24,6 +24,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate as _;
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _, LineEnding};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -188,10 +189,8 @@ impl std::fmt::Debug for DeviceIdentity {
 impl DeviceIdentity {
     /// Generate a fresh P-256 key.
     pub fn generate() -> Self {
-        // p256 is pinned to rand_core 0.6 while the workspace `rand` is 0.10, so
-        // the RNG comes from p256's own re-export rather than the workspace one.
         Self {
-            signing_key: SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            signing_key: SigningKey::generate(),
         }
     }
 
@@ -249,7 +248,7 @@ impl DeviceIdentity {
     /// half of the group order before encoding.
     pub fn sign_registration(&self, transcript: &RegistrationTranscript) -> RegistrationProof {
         let signature: Signature = self.signing_key.sign(transcript.as_bytes());
-        let canonical = signature.normalize_s().unwrap_or(signature);
+        let canonical = signature.normalize_s();
 
         RegistrationProof {
             algorithm: PROOF_ALGORITHM.to_string(),

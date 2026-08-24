@@ -524,7 +524,7 @@ impl DefaultMultipartUsecase {
                 .await
                 .map_err(ApiError::from)?,
         );
-        let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
+        let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
         let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;

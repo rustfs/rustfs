@@ -137,8 +137,9 @@ fn published_proofs_verify_over_locally_rebuilt_transcripts() {
             .decode(request["proof"]["value"].as_str().expect("vector carries a proof"))
             .expect("proof decodes");
         let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
-        assert!(
-            signature.normalize_s().is_none(),
+        assert_eq!(
+            signature.normalize_s(),
+            signature,
             "vector '{name}' publishes a proof that is already low-S"
         );
 
@@ -305,8 +306,9 @@ fn proof_is_a_canonical_low_s_signature_that_verifies() {
     assert_eq!(raw.len(), 64, "the signature is a fixed-width r || s");
 
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
-    assert!(
-        signature.normalize_s().is_none(),
+    assert_eq!(
+        signature.normalize_s(),
+        signature,
         "s must already be in the lower half of the group order"
     );
 

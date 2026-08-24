@@ -200,6 +200,7 @@ hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "11.0.0" }
 openidconnect = { default-features = false, version = "4.0" }
 pbkdf2 = "0.13.0"
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "=0.10.0-rc.18" }
 rustls = { default-features = false, version = "0.23.43" }
 rustls-native-certs = "0.8"
@@ -351,7 +352,6 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.0" }
-rustfs-mimalloc-sys = { version = "0.5.0" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
