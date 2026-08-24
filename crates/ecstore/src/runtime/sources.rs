@@ -119,8 +119,8 @@ pub(crate) fn endpoint_erasure_set_count() -> Option<usize> {
     endpoint_pools().map(|endpoints| endpoints.es_count())
 }
 
-pub(crate) fn endpoint_pool_is_local(pool_index: usize) -> bool {
-    get_global_endpoints()
+pub(crate) fn endpoint_pool_is_local(endpoints: &EndpointServerPools, pool_index: usize) -> bool {
+    endpoints
         .as_ref()
         .get(pool_index)
         .is_some_and(|pool| pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local))

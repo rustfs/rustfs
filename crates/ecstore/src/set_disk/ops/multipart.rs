@@ -86,6 +86,8 @@ struct MultipartCommitBarrierState {
     pause: MultipartCommitPause,
     expected_arrivals: usize,
     arrivals: AtomicUsize,
+    #[cfg(test)]
+    committed: AtomicBool,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
 }
@@ -113,6 +115,8 @@ impl MultipartCommitBarrier {
             pause,
             expected_arrivals,
             arrivals: AtomicUsize::new(0),
+            #[cfg(test)]
+            committed: AtomicBool::new(false),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
         });
@@ -142,6 +146,11 @@ impl MultipartCommitBarrier {
 
     pub fn release(&self) {
         self.state.release.add_permits(self.state.expected_arrivals);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_observed(&self) -> bool {
+        self.state.committed.load(Ordering::Acquire)
     }
 }
 
@@ -260,6 +269,20 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
             .await
             .expect("multipart commit barrier should remain open")
             .forget();
+    }
+}
+
+#[cfg(test)]
+fn observe_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
+    let slot = MULTIPART_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("multipart commit barrier mutex should not poison");
+    if let Some(barrier) = slot
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+    {
+        barrier.committed.store(true, Ordering::Release);
     }
 }
 
@@ -556,6 +579,69 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str) -> disk::
 }
 
 impl SetDisks {
+    async fn discover_multipart_upload_paths(
+        &self,
+        orig_bucket: &str,
+        error_path: &str,
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize)> {
+        let disks = self.disks.read().await.clone();
+        if disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        let discovery_quorum = if self.default_parity_count == 0 {
+            disks.len()
+        } else {
+            (disks.len() / 2).max(1)
+        };
+        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
+        let mut candidate_counts = HashMap::<String, usize>::new();
+        let mut discovery_tasks = JoinSet::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let disk = disk.clone();
+            let orig_bucket = orig_bucket.to_string();
+            discovery_tasks.spawn(async move {
+                let result = match disk {
+                    Some(disk) => multipart_upload_paths_on_disk(disk, &orig_bucket).await,
+                    None => Err(DiskError::DiskNotFound),
+                };
+                (index, result)
+            });
+        }
+
+        while let Some(task_result) = discovery_tasks.join_next().await {
+            let Ok((index, result)) = task_result else {
+                continue;
+            };
+            match result {
+                Ok(paths) => {
+                    discovery_errors[index] = None;
+                    for path in paths {
+                        *candidate_counts.entry(path).or_insert(0) += 1;
+                    }
+                }
+                Err(err) => discovery_errors[index] = Some(err),
+            }
+        }
+
+        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
+            return Err(to_object_err(err.into(), vec![orig_bucket, error_path]));
+        }
+
+        let mut candidate_paths = candidate_counts
+            .into_iter()
+            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
+            .collect::<Vec<_>>();
+        candidate_paths.sort_unstable();
+        Ok((disks, candidate_paths, discovery_quorum))
+    }
+
+    pub(crate) async fn first_multipart_upload_path_for_decommission(&self, bucket: &str) -> Result<Option<String>> {
+        let (_, paths, _) = self
+            .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET)
+            .await?;
+        Ok(paths.into_iter().next())
+    }
+
     async fn acquire_multipart_upload_read_lock(
         &self,
         op: &'static str,
@@ -747,53 +833,7 @@ impl SetDisks {
         max_uploads: usize,
         expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
-        let disks = self.disks.read().await.clone();
-        if disks.is_empty() {
-            return Err(Error::ErasureReadQuorum);
-        }
-        let discovery_quorum = if self.default_parity_count == 0 {
-            disks.len()
-        } else {
-            (disks.len() / 2).max(1)
-        };
-        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
-        let mut candidate_counts = HashMap::<String, usize>::new();
-        let mut discovery_tasks = JoinSet::new();
-        for (index, disk) in disks.iter().enumerate() {
-            let disk = disk.clone();
-            let bucket = bucket.to_string();
-            discovery_tasks.spawn(async move {
-                let result = match disk {
-                    Some(disk) => multipart_upload_paths_on_disk(disk, &bucket).await,
-                    None => Err(DiskError::DiskNotFound),
-                };
-                (index, result)
-            });
-        }
-
-        while let Some(task_result) = discovery_tasks.join_next().await {
-            let Ok((index, result)) = task_result else {
-                continue;
-            };
-            match result {
-                Ok(paths) => {
-                    discovery_errors[index] = None;
-                    for path in paths {
-                        *candidate_counts.entry(path).or_insert(0) += 1;
-                    }
-                }
-                Err(err) => discovery_errors[index] = Some(err),
-            }
-        }
-
-        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        let candidate_paths = candidate_counts
-            .into_iter()
-            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
-            .collect::<Vec<_>>();
+        let (disks, candidate_paths, discovery_quorum) = self.discover_multipart_upload_paths(bucket, prefix).await?;
         let listed_uploads = stream::iter(candidate_paths)
             .map(|upload_path| {
                 let disks = &disks;
@@ -1320,6 +1360,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
             fence_commit_on_lock_loss(_upload_commit_guard.as_ref(), "put_object_part_commit", &upload_id_path)?;
             fence_commit_on_lock_loss(_part_commit_guard.as_ref(), "put_object_part_commit", &part_lock_path)?;
+            if opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_part_outer_lock",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
             let _ = self
@@ -1340,6 +1393,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }),
                 )
                 .await?;
+            #[cfg(test)]
+            observe_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterRename).await;
@@ -1720,7 +1775,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         .await
         .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
         #[cfg(test)]
-        observe_new_multipart_upload_commit(bucket, object);
+        {
+            observe_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost);
+            observe_new_multipart_upload_commit(bucket, object);
+        }
 
         // evalDisks
 
