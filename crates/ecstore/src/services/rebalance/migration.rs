@@ -102,11 +102,20 @@ pub(crate) trait MigrationBackend: Send + Sync {
 pub(crate) struct RebalanceMigrationBackend<'a> {
     source: &'a SetDisks,
     store: &'a ECStore,
+    lock_lost_signal: Option<std::sync::Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 }
 
 impl<'a> RebalanceMigrationBackend<'a> {
-    pub(crate) fn new(source: &'a SetDisks, store: &'a ECStore) -> Self {
-        Self { source, store }
+    pub(crate) fn new(
+        source: &'a SetDisks,
+        store: &'a ECStore,
+        lock_lost_signal: Option<std::sync::Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    ) -> Self {
+        Self {
+            source,
+            store,
+            lock_lost_signal,
+        }
     }
 }
 
@@ -130,7 +139,11 @@ impl MigrationBackend for RebalanceMigrationBackend<'_> {
         fi: &FileInfo,
         opts: &ObjectOptions,
     ) -> Result<()> {
-        self.store.decommission_tiered_object(bucket, object, fi, opts).await
+        let mut opts = opts.clone();
+        if let Some(signal) = self.lock_lost_signal.as_ref() {
+            opts.add_namespace_lock_lost_signal(std::sync::Arc::clone(signal));
+        }
+        self.store.decommission_tiered_object(bucket, object, fi, &opts).await
     }
 }
 
