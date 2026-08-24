@@ -65,8 +65,10 @@ use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
 use super::storage_api::object_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
+#[cfg(test)]
+use super::storage_api::object_usecase::data_usage::apply_bucket_usage_memory_overlay;
 use super::storage_api::object_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+    quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
     record_bucket_object_version_write_memory, record_bucket_object_write_memory,
     record_bucket_object_write_unknown_previous_memory,
 };
