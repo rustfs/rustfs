@@ -2713,10 +2713,17 @@ mod tests {
             let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
             let payload: serde_json::Value =
                 serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
-            assert_eq!(payload["status"], "ok");
-            assert_eq!(payload["ready"], true);
-            assert!(payload.get("details").is_none());
-            assert!(payload.get("degradedReasons").is_none());
+            assert_eq!(payload["status"], "degraded");
+            assert_eq!(payload["ready"], false);
+            assert_eq!(
+                payload["details"],
+                serde_json::json!({
+                    "storage": { "status": "disconnected", "ready": false },
+                    "iam": { "status": "disconnected", "ready": false },
+                    "lock": { "status": "connected", "ready": true },
+                })
+            );
+            assert_eq!(payload["degradedReasons"], serde_json::json!(["storage_and_iam_unavailable"]));
         })
         .await;
     }
