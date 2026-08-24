@@ -463,8 +463,18 @@ async fn test_e2e_sts_session_policy_delete_objects_object_prefix_only() -> Resu
     assert_eq!(error.key(), Some(denied_key));
     assert_eq!(error.code(), Some("AccessDenied"));
 
-    let allowed_head = parent_client.head_object().bucket(&bucket).key(allowed_key).send().await;
-    assert!(allowed_head.is_err(), "allowed-prefix object should have been deleted");
+    let allowed_head = parent_client
+        .head_object()
+        .bucket(&bucket)
+        .key(allowed_key)
+        .send()
+        .await
+        .expect_err("allowed-prefix object should have been deleted");
+    assert_eq!(
+        allowed_head.raw_response().map(|response| response.status().as_u16()),
+        Some(404),
+        "allowed-prefix object absence probe must return HTTP 404, got {allowed_head:?}"
+    );
 
     parent_client
         .head_object()
