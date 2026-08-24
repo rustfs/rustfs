@@ -33,7 +33,13 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
-use crate::storage_api::owner::{EcstoreEventArgs, ecstore_send_event};
+use crate::storage_api::owner::{
+    EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
+    EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
+    EcstoreVersioningConfiguration as VersioningConfiguration, ecstore_send_event,
+};
+#[cfg(test)]
+use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
@@ -49,9 +55,6 @@ use rustfs_filemeta::{
     MetaCacheHealCandidateKind,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use s3s::dto::{BucketLifecycleConfiguration, LifecycleRuleFilter, ObjectLockConfiguration, VersioningConfiguration};
-#[cfg(test)]
-use s3s::dto::{ExpirationStatus, LifecycleRule};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc;
