@@ -586,7 +586,10 @@ pub(crate) async fn save_transition_transaction_record(
         transition_transaction_record_object_name(transaction.transaction_id).map_err(transition_transaction_store_error)?;
     let data = transaction.encode().map_err(transition_transaction_store_error)?;
     config_boundary::save_config(api.clone(), &object, data.clone()).await?;
-    api.record_durable_ilm_decommission_progress(&object, &data).await
+    // Box::pin: the durable-receipt state machine is large and sits on the
+    // already-deep transition worker poll chain; keeping it inline overflows
+    // the default 2 MiB tokio worker stack in debug builds.
+    Box::pin(api.record_durable_ilm_decommission_progress(&object, &data)).await
 }
 
 pub(crate) async fn load_transition_transaction_record(
@@ -605,7 +608,8 @@ pub(crate) async fn delete_transition_transaction_record(
     let object =
         transition_transaction_record_object_name(transaction.transaction_id).map_err(transition_transaction_store_error)?;
     let data = transaction.encode().map_err(transition_transaction_store_error)?;
-    api.record_durable_ilm_decommission_terminal(&object, &data).await?;
+    // Box::pin: see save_transition_transaction_record.
+    Box::pin(api.record_durable_ilm_decommission_terminal(&object, &data)).await?;
     match config_boundary::delete_config(api, &object).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(err),
