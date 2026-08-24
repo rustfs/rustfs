@@ -113,8 +113,8 @@ mod tests {
     fn test_liveness_state_iam_not_ready() {
         let state = health_check_state(true, false, true, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
-        assert_eq!(state.status, "ok");
-        assert!(state.ready);
+        assert_eq!(state.status, "degraded");
+        assert!(!state.ready);
     }
 
     #[test]
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn test_readiness_probe_uses_node_collector_only() {
         assert_eq!(readiness_source_for_probe(HealthProbe::Readiness), Some(HealthReadinessSource::Node));
-        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), None);
+        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), Some(HealthReadinessSource::Node));
     }
 
     #[test]
@@ -256,12 +256,15 @@ mod tests {
             None,
             None,
         );
+        // Liveness HTTP status remains 200 (process is alive).
         assert_eq!(parts.status_code, StatusCode::OK);
         let payload = parts.payload.expect("GET should include payload");
-        assert_eq!(payload["status"], "ok");
-        assert_eq!(payload["ready"], true);
-        assert!(payload.get("details").is_none());
-        assert!(payload.get("degradedReasons").is_none());
+        // But `ready` now reflects actual readiness state.
+        assert_eq!(payload["status"], "degraded");
+        assert_eq!(payload["ready"], false);
+        // Dependency details are included when readiness report is present.
+        assert!(payload.get("details").is_some());
+        assert!(payload.get("degradedReasons").is_some());
     }
 
     #[test]
