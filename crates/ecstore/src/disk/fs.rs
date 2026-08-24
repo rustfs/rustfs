@@ -270,10 +270,7 @@ impl BucketExistenceCache {
 static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
     std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
 
-<<<<<<< HEAD
-=======
 /// Cached access check - reduces statx syscalls
->>>>>>> origin/main
 pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
     let path_buf = path.as_ref().to_path_buf();
 
