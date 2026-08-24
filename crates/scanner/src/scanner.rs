@@ -54,7 +54,7 @@ use rustfs_config::{
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_data_usage::observed_data_usage_is_newer;
-use rustfs_lock::NamespaceLockGuard;
+use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, mpsc};
@@ -184,6 +184,8 @@ fn notify_scanner_cycle_state_persist_test_hook(leader_epoch: u64) {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[non_exhaustive]
 pub struct ScannerCycleScheduleStatus {
+    execution_role: &'static str,
+    effective_interval_available: bool,
     effective_interval_seconds: u64,
     clean_idle_backoff_enabled: bool,
     clean_idle_backoff_multiplier: u64,
@@ -194,6 +196,8 @@ pub struct ScannerCycleScheduleStatus {
 impl Default for ScannerCycleScheduleStatus {
     fn default() -> Self {
         Self {
+            execution_role: "unknown",
+            effective_interval_available: false,
             effective_interval_seconds: 0,
             clean_idle_backoff_enabled: false,
             clean_idle_backoff_multiplier: 1,
@@ -230,6 +234,8 @@ fn record_scanner_cycle_schedule(
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *schedule = ScannerCycleScheduleStatus {
+        execution_role: "leader",
+        effective_interval_available: true,
         effective_interval_seconds,
         clean_idle_backoff_enabled,
         clean_idle_backoff_multiplier: clean_idle_backoff_multiplier.max(1),
@@ -238,8 +244,30 @@ fn record_scanner_cycle_schedule(
     };
 }
 
+fn record_scanner_cycle_schedule_role(execution_role: &'static str) {
+    let mut schedule = SCANNER_CYCLE_SCHEDULE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *schedule = ScannerCycleScheduleStatus {
+        execution_role,
+        ..ScannerCycleScheduleStatus::default()
+    };
+}
+
 fn reset_scanner_cycle_schedule() {
-    record_scanner_cycle_schedule(Duration::ZERO, false, 1, false, 0);
+    record_scanner_cycle_schedule_role("unknown");
+}
+
+enum ScannerLeaderLockFailure<'a> {
+    Contended,
+    Failed(&'a LockError),
+}
+
+fn classify_scanner_leader_lock_failure(error: &LockError) -> ScannerLeaderLockFailure<'_> {
+    match error {
+        LockError::Timeout { .. } => ScannerLeaderLockFailure::Contended,
+        error => ScannerLeaderLockFailure::Failed(error),
+    }
 }
 
 /// Returns the base cycle interval.
@@ -2041,6 +2069,7 @@ async fn run_data_scanner_with_maintenance_state(
     let mut guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
+                record_scanner_cycle_schedule_role("leader");
                 record_scanner_leader_lock_state("acquired");
                 global_metrics().record_scanner_leader_liveness("acquired", true, "").await;
                 debug!(
@@ -2055,20 +2084,38 @@ async fn run_data_scanner_with_maintenance_state(
                 guard
             }
             Err(e) => {
-                record_scanner_leader_lock_state("contended");
-                global_metrics()
-                    .record_scanner_leader_liveness("contended", false, e.to_string())
-                    .await;
-                debug!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_LOCK_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    lock_name = "leader.lock",
-                    state = "contended",
-                    error = ?e,
-                    "Scanner leader lock contended"
-                );
+                match classify_scanner_leader_lock_failure(&e) {
+                    ScannerLeaderLockFailure::Contended => {
+                        record_scanner_cycle_schedule_role("follower");
+                        record_scanner_leader_lock_state("contended");
+                        global_metrics().record_scanner_leader_liveness("contended", false, "").await;
+                        debug!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_LOCK_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            lock_name = "leader.lock",
+                            state = "contended",
+                            "Scanner leader lock contended"
+                        );
+                    }
+                    ScannerLeaderLockFailure::Failed(error) => {
+                        record_scanner_leader_lock_state("acquire_failed");
+                        global_metrics()
+                            .record_scanner_leader_liveness("acquire_failed", false, error.to_string())
+                            .await;
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_LOCK_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            lock_name = "leader.lock",
+                            state = "acquire_failed",
+                            error = %error,
+                            "Scanner leader lock acquisition failed"
+                        );
+                    }
+                }
                 return Ok(());
             }
         },

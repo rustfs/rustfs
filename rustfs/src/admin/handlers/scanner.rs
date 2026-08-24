@@ -389,6 +389,8 @@ mod tests {
         );
 
         let encoded = serde_json::to_value(response).expect("scanner status should serialize");
+        assert_eq!(encoded["cycle_schedule"]["execution_role"], "unknown");
+        assert_eq!(encoded["cycle_schedule"]["effective_interval_available"], false);
         assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_enabled"], false);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_multiplier"], 1);

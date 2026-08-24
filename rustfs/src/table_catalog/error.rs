@@ -64,6 +64,7 @@ pub(crate) enum TableCatalogStoreError {
     Conflict(String),
     Invalid(String),
     Unsupported(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -77,6 +78,7 @@ impl fmt::Display for TableCatalogStoreError {
             Self::Conflict(message) => write!(f, "table catalog conflict: {message}"),
             Self::Invalid(message) => write!(f, "invalid table catalog entry: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported table catalog operation: {message}"),
+            Self::Unavailable(message) => write!(f, "table catalog temporarily unavailable: {message}"),
             Self::Internal(message) => write!(f, "table catalog store error: {message}"),
         }
     }

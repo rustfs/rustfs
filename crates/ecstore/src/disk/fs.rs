@@ -227,7 +227,9 @@ pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await
 }
 
-// Bucket existence checks are frequent on object paths; keep short-lived results local.
+// Bucket existence cache - reduces statx syscalls for repeated bucket checks
+
+/// Cache for bucket directory existence checks.
 struct BucketExistenceCache {
     cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
     ttl: Duration,
@@ -268,6 +270,10 @@ impl BucketExistenceCache {
 static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
     std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
 
+<<<<<<< HEAD
+=======
+/// Cached access check - reduces statx syscalls
+>>>>>>> origin/main
 pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
     let path_buf = path.as_ref().to_path_buf();
 

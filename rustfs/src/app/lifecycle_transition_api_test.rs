@@ -1694,10 +1694,27 @@ async fn compensation_driven_copy_still_completes_transition() {
     assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
-async fn compensation_driven_complete_multipart_upload_still_transitions() {
+#[test]
+fn compensation_driven_complete_multipart_upload_still_transitions() {
+    std::thread::Builder::new()
+        .name("lifecycle-compensation-complete-multipart".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("compensation multipart test runtime should build");
+
+            runtime.block_on(compensation_driven_complete_multipart_upload_still_transitions_inner());
+        })
+        .expect("compensation multipart test thread should spawn")
+        .join()
+        .expect("compensation multipart test thread should finish");
+}
+
+async fn compensation_driven_complete_multipart_upload_still_transitions_inner() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultMultipartUsecase::from_global();
 

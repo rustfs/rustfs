@@ -5098,6 +5098,11 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         crate::table_catalog::TableCatalogStoreError::Unsupported(message) => {
             iceberg_rest_error(ICEBERG_ERROR_UNSUPPORTED_OPERATION, StatusCode::NOT_ACCEPTABLE, message)
         }
+        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => iceberg_rest_error(
+            ICEBERG_ERROR_REST,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "table catalog is temporarily unavailable",
+        ),
         crate::table_catalog::TableCatalogStoreError::Internal(message) => {
             iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
         }

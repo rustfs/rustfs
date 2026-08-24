@@ -277,6 +277,7 @@ fn table_catalog_store_result_label<T>(result: &TableCatalogStoreResult<T>) -> &
             | TableCatalogStoreError::TableNotFound(_),
         ) => "not_found",
         Err(TableCatalogStoreError::Unsupported(_)) => "unsupported",
+        Err(TableCatalogStoreError::Unavailable(_)) => "unavailable",
         Err(TableCatalogStoreError::Internal(_)) => "failure",
     }
 }
@@ -381,4 +382,18 @@ pub(crate) fn table_commit_result(
 ) -> TableCatalogStoreResult<TableCommitResult> {
     record_table_commit_result(table_bucket, namespace, table, commit_id, operation, started, &result);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_catalog_unavailable_result_label_is_stable() {
+        let result: TableCatalogStoreResult<()> = Err(TableCatalogStoreError::Unavailable(
+            "catalog publication authority is temporarily unavailable".to_string(),
+        ));
+
+        assert_eq!(table_catalog_store_result_label(&result), "unavailable");
+    }
 }

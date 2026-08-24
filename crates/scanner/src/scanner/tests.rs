@@ -4626,19 +4626,56 @@ fn scanner_cycle_schedule_status_reports_effective_backoff() {
 
     let status = scanner_cycle_schedule_status();
 
+    assert_eq!(status.execution_role, "leader");
+    assert!(status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 86_401);
     assert!(status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 2_048);
     assert!(status.superseded_retry_backoff_enabled);
     assert_eq!(status.superseded_cycles, 7);
 
+    record_scanner_cycle_schedule_role("follower");
+    let status = scanner_cycle_schedule_status();
+    assert_eq!(status.execution_role, "follower");
+    assert!(!status.effective_interval_available);
+    assert_eq!(status.effective_interval_seconds, 0);
+
     reset_scanner_cycle_schedule();
     let status = scanner_cycle_schedule_status();
+    assert_eq!(status.execution_role, "unknown");
+    assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
     assert!(!status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 1);
     assert!(!status.superseded_retry_backoff_enabled);
     assert_eq!(status.superseded_cycles, 0);
+}
+
+#[test]
+fn scanner_leader_lock_failure_classifies_only_timeout_as_expected_contention() {
+    let timeout = LockError::timeout(".rustfs.sys/leader.lock@latest", Duration::from_secs(5));
+    assert!(matches!(
+        classify_scanner_leader_lock_failure(&timeout),
+        ScannerLeaderLockFailure::Contended
+    ));
+
+    let failures = [
+        LockError::internal("lock service unavailable"),
+        LockError::network(
+            "leader lock transport unavailable",
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+        ),
+        LockError::QuorumNotReached {
+            required: 3,
+            achieved: 1,
+        },
+    ];
+    for failure in &failures {
+        assert!(matches!(
+            classify_scanner_leader_lock_failure(failure),
+            ScannerLeaderLockFailure::Failed(_)
+        ));
+    }
 }
 
 #[test]
