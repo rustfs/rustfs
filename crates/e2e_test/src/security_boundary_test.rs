@@ -87,7 +87,7 @@ async fn test_large_xml_body_rejection() -> Result<(), Box<dyn Error + Send + Sy
     Ok(())
 }
 
-/// Excessive multipart parts must be rejected.
+/// Multipart completion must reject part numbers above the 10,000-part limit.
 #[tokio::test]
 async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
@@ -107,11 +107,24 @@ async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + S
 
     let upload_id = create_result.upload_id().expect("upload_id should be present").to_string();
 
-    // Try to complete with too many parts (should be rejected).
-    let mut parts = Vec::new();
-    for i in 1..=10001 {
-        parts.push(CompletedPart::builder().part_number(i).e_tag(format!("etag-{i}")).build());
-    }
+    // Upload one real control part so a generic missing-part rejection cannot
+    // masquerade as enforcement of the 10,000-part boundary.
+    let uploaded = client
+        .upload_part()
+        .bucket(&bucket_name)
+        .key("test-large")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"valid-control-part"))
+        .send()
+        .await?;
+    let parts = vec![
+        CompletedPart::builder()
+            .part_number(1)
+            .e_tag(uploaded.e_tag().expect("uploaded part should return an ETag"))
+            .build(),
+        CompletedPart::builder().part_number(10001).e_tag("out-of-range").build(),
+    ];
 
     let result = client
         .complete_multipart_upload()
@@ -132,7 +145,16 @@ async fn test_excessive_multipart_parts() -> Result<(), Box<dyn Error + Send + S
         .await;
     let _ = client.delete_bucket().bucket(&bucket_name).send().await;
 
-    assert!(result.is_err(), "Server should reject excessive multipart parts");
+    let error = result.expect_err("server should reject a completion part number above 10000");
+    let service_error = error
+        .as_service_error()
+        .expect("part-limit rejection must be an S3 service error");
+    assert_eq!(service_error.code(), Some("InvalidPart"), "unexpected part-limit error: {error:?}");
+    assert_eq!(
+        service_error.message(),
+        Some("Part number 10001 must be between 1 and 10000"),
+        "completion must fail at the part-number boundary, not a later missing-part check"
+    );
 
     env.stop_server();
     Ok(())

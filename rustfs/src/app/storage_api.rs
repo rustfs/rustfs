@@ -1181,6 +1181,7 @@ pub(crate) mod multipart_usecase {
 
         pub(crate) mod multipart {
             pub(crate) use super::super::super::storage_contracts::{CompletePart, MultipartOperations, MultipartUploadResult};
+            pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 
         pub(crate) mod object {
