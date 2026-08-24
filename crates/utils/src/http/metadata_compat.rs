@@ -60,6 +60,8 @@ pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
+/// Active rebalance run id mirrored onto `rebalance.bin` object metadata.
+pub const SUFFIX_REBALANCE_RUN_ID: &str = "rebalance-run-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";

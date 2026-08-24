@@ -161,7 +161,7 @@ pub mod bucket {
         pub mod objectlock_sys {
             pub use crate::bucket::object_lock::objectlock_sys::{
                 BucketObjectLockSys, ObjectLockBlockReason, add_years, check_object_lock_for_deletion,
-                check_retention_for_modification, is_retention_active,
+                check_retention_for_modification, is_retention_active, replication_write_may_pass_worm_gate,
             };
         }
     }
@@ -243,8 +243,8 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
-        path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
@@ -442,6 +442,12 @@ pub mod rebalance {
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::rebalance::PausedRebalanceEntryTestFixture;
+        pub use crate::services::rebalance::test_store_with_persisted_rebalance_meta;
+    }
 }
 
 pub mod rio {
@@ -456,15 +462,15 @@ pub mod rpc {
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         PeerRestClient, PeerS3Client, S3PeerSys, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         ScannerBucketListing, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
-        check_and_record_signed_rpc_nonce, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
-        gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-        normalize_tonic_rpc_audience, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
-        sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
-        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-        verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer,
-        verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
-        verify_tonic_rpc_signature_with_bootstrap,
+        check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_ns_scanner_capability_with_tier_registry_generation,
+        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
+        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation,
+        verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 

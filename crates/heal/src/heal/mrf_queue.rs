@@ -33,7 +33,7 @@
 //! than waiting for the failed-object TTL to re-scan the path.
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
-use crate::heal::manager::HealManager;
+use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIntent};
@@ -491,12 +491,14 @@ async fn submit_mrf_heal_request(manager: &HealManager, intent: &MrfIntent) -> c
     let receipt = manager
         .submit_mrf_heal_request_with_receipt_and_identity(
             build_heal_request(intent),
-            intent.bucket.clone(),
-            intent.object.clone(),
-            intent.version_id,
-            intent.kind,
-            intent.scope,
-            intent.lease,
+            MrfRepairNoticeTarget {
+                bucket: intent.bucket.clone(),
+                object: intent.object.clone(),
+                version_id: intent.version_id,
+                kind: intent.kind,
+                scope: intent.scope,
+                lease: intent.lease,
+            },
         )
         .await?;
     Ok(receipt.result)

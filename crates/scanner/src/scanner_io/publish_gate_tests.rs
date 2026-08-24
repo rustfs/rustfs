@@ -167,7 +167,7 @@ fn stale_quota_uses_complete_baseline_plus_positive_deltas() {
     let (observed, _) = observational_data_usage_info(&[current], &expected, &all_buckets, &[], TEST_PLAN_DIGEST, 8, 3)
         .expect("complete set data is a valid observational baseline");
     assert_eq!(observed.objects_total_size, 30);
-    assert_eq!(observed.usage_snapshot_set_states[0].complete, true);
+    assert!(observed.usage_snapshot_set_states[0].complete);
 }
 
 #[test]

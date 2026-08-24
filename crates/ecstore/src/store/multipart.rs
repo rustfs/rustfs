@@ -196,6 +196,25 @@ async fn list_pool_multipart_uploads_for_incarnation(
 }
 
 impl ECStore {
+    async fn existing_multipart_pool_order(&self) -> Vec<usize> {
+        // A draining source must not hide a valid UploadID in an active target,
+        // while physical order within each phase preserves fail-closed errors.
+        let mut active = Vec::with_capacity(self.pools.len());
+        let mut draining = Vec::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
+            if self.is_suspended(pool.pool_idx).await {
+                draining.push(idx);
+            } else {
+                active.push(idx);
+            }
+        }
+        active.extend(draining);
+        active
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_multipart_uploads_for_bucket_incarnation(
         &self,
@@ -290,10 +309,8 @@ impl ECStore {
                 .await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
             return match pool
                 .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
                 .await
@@ -353,10 +370,8 @@ impl ECStore {
         let mut common_prefixes = HashSet::new();
         let mut source_truncated = false;
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
             let res = list_pool_multipart_uploads_for_incarnation(
                 pool,
                 bucket,
@@ -523,10 +538,8 @@ impl ECStore {
                 .await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
             let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
                 Ok(res) => return Ok(res),
                 Err(err) => {
@@ -586,10 +599,8 @@ impl ECStore {
             return self.pools[0].get_multipart_info(bucket, object, upload_id, opts).await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
 
             return match pool.get_multipart_info(bucket, object, upload_id, opts).await {
                 Ok(res) => Ok(res),
@@ -624,10 +635,8 @@ impl ECStore {
             return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
 
             let err = match pool.abort_multipart_upload(bucket, object, upload_id, opts).await {
                 Ok(_) => return Ok(()),
@@ -685,10 +694,8 @@ impl ECStore {
                 .await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
 
             let pool = pool.clone();
             let err = match pool
