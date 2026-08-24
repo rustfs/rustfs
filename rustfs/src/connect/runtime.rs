@@ -32,7 +32,6 @@ pub struct HeartbeatRuntime {
     shutdown: CancellationToken,
     status: watch::Receiver<HeartbeatStatus>,
     task: Option<JoinHandle<()>>,
-    inventory: Option<InventoryRuntime>,
 }
 
 impl HeartbeatRuntime {
@@ -40,21 +39,10 @@ impl HeartbeatRuntime {
         self.status.clone()
     }
 
-    pub(crate) fn with_inventory(mut self, inventory: Option<InventoryRuntime>) -> Self {
-        self.inventory = inventory;
-        self
-    }
-
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        if let Some(inventory) = self.inventory.as_ref() {
-            inventory.shutdown.cancel();
-        }
         if let Some(task) = self.task.take() {
             let _ = task.await;
-        }
-        if let Some(inventory) = self.inventory.take() {
-            inventory.shutdown().await;
         }
     }
 }
@@ -90,6 +78,20 @@ impl Drop for InventoryRuntime {
     }
 }
 
+pub(crate) async fn shutdown_connect_runtimes(heartbeat: Option<HeartbeatRuntime>, inventory: Option<InventoryRuntime>) {
+    let heartbeat = async move {
+        if let Some(runtime) = heartbeat {
+            runtime.shutdown().await;
+        }
+    };
+    let inventory = async move {
+        if let Some(runtime) = inventory {
+            runtime.shutdown().await;
+        }
+    };
+    tokio::join!(heartbeat, inventory);
+}
+
 pub fn spawn_heartbeat_runtime<F>(
     config: Option<HeartbeatConfig>,
     parent_shutdown: &CancellationToken,
@@ -101,6 +103,9 @@ where
     let Some(config) = config else {
         return Ok(None);
     };
+    if !config.transport_enabled() {
+        return Ok(None);
+    }
     let sender = HeartbeatSender::new(config.clone())?;
     let store = HeartbeatStateStore::new(config.state_path.clone());
     let lock = store.try_runtime_lock()?;
@@ -163,7 +168,6 @@ where
         shutdown,
         status: status_rx,
         task: Some(task),
-        inventory: None,
     }))
 }
 
@@ -184,9 +188,14 @@ where
         return Err(InventoryError::Schedule);
     }
     let retry_schedule = config.schedule;
-    let store = InventoryStateStore::from_heartbeat_path(&config.state_path)?;
+    let state_root = config.state_root().ok_or(InventoryError::StatePath)?;
+    let store = InventoryStateStore::from_state_root(state_root)?;
     let lock = store.try_runtime_lock()?;
-    let sender = InventorySender::new(config)?;
+    let sender = if config.transport_enabled() {
+        Some(InventorySender::new(config)?)
+    } else {
+        None
+    };
     let shutdown = parent_shutdown.child_token();
     let task_shutdown = shutdown.clone();
     let (status_tx, status_rx) = watch::channel(InventoryStatus::Starting);
@@ -197,8 +206,19 @@ where
             if task_shutdown.is_cancelled() {
                 break;
             }
-            let pending = match store.pending().await {
-                Ok(Some(pending)) => pending,
+            let pending = match if sender.is_some() { store.pending().await } else { Ok(None) } {
+                Ok(Some((pending, captured_at))) => {
+                    if let Err(error) = store
+                        .ensure_latest(pending.snapshot().clone(), captured_at, task_shutdown.clone())
+                        .await
+                    {
+                        if matches!(error, InventoryError::Cancelled) && task_shutdown.is_cancelled() {
+                            break;
+                        }
+                        return failed_inventory(&status_tx, error);
+                    }
+                    pending
+                }
                 Ok(None) => {
                     let snapshot = match cancellable(&task_shutdown, sample()).await {
                         Some(Ok(snapshot)) => snapshot,
@@ -218,6 +238,27 @@ where
                         Ok(content_hash) => content_hash,
                         Err(error) => return failed_inventory(&status_tx, error),
                     };
+                    let captured_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    if let Err(error) = store
+                        .publish_latest(snapshot.clone(), captured_at, task_shutdown.clone())
+                        .await
+                    {
+                        if matches!(error, InventoryError::Cancelled) && task_shutdown.is_cancelled() {
+                            break;
+                        }
+                        return failed_inventory(&status_tx, error);
+                    }
+                    if task_shutdown.is_cancelled() {
+                        break;
+                    }
+                    if sender.is_none() {
+                        backoff = retry_schedule.initial_backoff;
+                        let _ = status_tx.send(InventoryStatus::Unchanged { content_hash });
+                        if sleep_or_cancel(&task_shutdown, schedule.cadence.saturating_add(jitter(schedule.jitter))).await {
+                            break;
+                        }
+                        continue;
+                    }
                     match store.prepare(snapshot).await {
                         Ok(Some(pending)) => pending,
                         Ok(None) => {
@@ -233,7 +274,15 @@ where
                 }
                 Err(error) => return failed_inventory(&status_tx, error),
             };
-            let delivery = match cancellable(&task_shutdown, sender.send(&pending)).await {
+            let delivery = match cancellable(
+                &task_shutdown,
+                sender
+                    .as_ref()
+                    .expect("sender exists when delivery state is prepared")
+                    .send(&pending),
+            )
+            .await
+            {
                 Some(Ok(delivery)) => delivery,
                 Some(Err(error)) => return failed_inventory(&status_tx, error),
                 None => break,
@@ -261,14 +310,13 @@ where
                     let _ = status_tx.send(InventoryStatus::BackingOff { delay });
                     delay
                 }
-                InventoryDelivery::AuthenticationStopped { status, reason } => {
-                    let _ = status_tx.send(InventoryStatus::AuthenticationStopped { status, reason });
+                InventoryDelivery::AuthenticationStopped { status } => {
+                    let _ = status_tx.send(InventoryStatus::AuthenticationStopped { status, reason: None });
                     return;
                 }
-                InventoryDelivery::Rejected { status, reason } => {
-                    let suffix = reason.map_or_else(String::new, |reason| format!("; reason={reason}"));
+                InventoryDelivery::Rejected { status } => {
                     let _ = status_tx.send(InventoryStatus::Failed {
-                        reason: format!("Connect rejected inventory with HTTP {status}{suffix}"),
+                        reason: format!("connect_inventory_rejected_http_{status}"),
                     });
                     return;
                 }
@@ -290,6 +338,46 @@ fn failed(status: &watch::Sender<HeartbeatStatus>, error: HeartbeatError) {
     let _ = status.send(HeartbeatStatus::Failed {
         reason: error.to_string(),
     });
+}
+
+pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
+    use super::registration::CredentialValidationError;
+
+    match error {
+        HeartbeatError::Endpoint => "connect_heartbeat_endpoint",
+        HeartbeatError::RootCertificate => "connect_heartbeat_root_certificate",
+        HeartbeatError::Schedule => "connect_heartbeat_schedule",
+        HeartbeatError::NotRegistered => "connect_heartbeat_not_registered",
+        HeartbeatError::IdentityMissing => "connect_heartbeat_identity_missing",
+        HeartbeatError::IdentityCertificate => "connect_heartbeat_identity_certificate",
+        HeartbeatError::CredentialName => "connect_heartbeat_credential_name",
+        HeartbeatError::CredentialExpired => "connect_heartbeat_credential_expired",
+        HeartbeatError::NodeSummary => "connect_heartbeat_node_summary",
+        HeartbeatError::SequenceExhausted => "connect_heartbeat_sequence_exhausted",
+        HeartbeatError::AlreadyRunning => "connect_heartbeat_already_running",
+        HeartbeatError::StateConflict => "connect_heartbeat_state_conflict",
+        HeartbeatError::StateIo { .. } => "connect_heartbeat_state_io",
+        HeartbeatError::StateInvalid { .. } => "connect_heartbeat_state_invalid",
+        HeartbeatError::StateCorrupt { .. } => "connect_heartbeat_state_corrupt",
+        #[cfg(unix)]
+        HeartbeatError::StatePermissions { .. } => "connect_heartbeat_state_permissions",
+        HeartbeatError::ResponseTooLarge => "connect_heartbeat_response_too_large",
+        HeartbeatError::Response => "connect_heartbeat_response",
+        HeartbeatError::Url(_) => "connect_heartbeat_url",
+        HeartbeatError::Transport(_) => "connect_heartbeat_transport",
+        HeartbeatError::Identity(_) => "connect_heartbeat_identity",
+        HeartbeatError::IdentityStore(_) => "connect_heartbeat_identity_store",
+        HeartbeatError::CredentialStore(_) => "connect_heartbeat_credential_store",
+        HeartbeatError::CredentialValidation(error) => match error {
+            CredentialValidationError::Certificate => "connect_heartbeat_credential_certificate",
+            CredentialValidationError::Chain => "connect_heartbeat_credential_chain",
+            CredentialValidationError::Identity => "connect_heartbeat_credential_identity",
+            CredentialValidationError::Key => "connect_heartbeat_credential_key",
+            CredentialValidationError::Validity => "connect_heartbeat_credential_validity",
+            CredentialValidationError::CertificateRequest => "connect_heartbeat_credential_request",
+            CredentialValidationError::RotationTranscript => "connect_heartbeat_credential_rotation_transcript",
+        },
+    }
 }
 
 fn failed_inventory(status: &watch::Sender<InventoryStatus>, error: InventoryError) {
@@ -327,7 +415,51 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn heartbeat_shutdown_cancels_inventory_before_waiting_for_heartbeat() {
+    async fn state_only_configuration_does_not_start_heartbeat() {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+        let config = HeartbeatConfig::state_only(temp.path().to_path_buf());
+        let shutdown = CancellationToken::new();
+
+        assert!(
+            spawn_heartbeat_runtime(Some(config), &shutdown, || { CoarseNodeSummary::new(1, 0, 0).expect("summary") })
+                .expect("disabled transport")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtimes_expose_only_stable_machine_reasons() {
+        let error = HeartbeatError::StateIo {
+            path: std::path::PathBuf::from("/private/connect/state.json"),
+            source: std::io::Error::other("transport.internal"),
+        };
+        assert_eq!(heartbeat_failure_reason(&error), "connect_heartbeat_state_io");
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::StateCorrupt {
+                path: std::path::PathBuf::from("/private/connect/state.json"),
+            }),
+            "connect_heartbeat_state_corrupt"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialExpired),
+            "connect_heartbeat_credential_expired"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
+                super::super::registration::CredentialValidationError::Identity
+            )),
+            "connect_heartbeat_credential_identity"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
+                super::super::registration::CredentialValidationError::Key
+            )),
+            "connect_heartbeat_credential_key"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_shutdown_cancels_inventory_before_waiting_for_heartbeat() {
         let heartbeat_shutdown = CancellationToken::new();
         let inventory_shutdown = CancellationToken::new();
         let task_inventory_shutdown = inventory_shutdown.clone();
@@ -342,18 +474,18 @@ mod tests {
             task_inventory_shutdown.cancelled().await;
             let _ = inventory_stopped.send(());
         });
-        let runtime = HeartbeatRuntime {
+        let heartbeat = HeartbeatRuntime {
             shutdown: heartbeat_shutdown,
             status: heartbeat_status,
             task: Some(heartbeat_task),
-            inventory: Some(InventoryRuntime {
-                shutdown: inventory_shutdown,
-                status: inventory_status,
-                task: Some(inventory_task),
-            }),
+        };
+        let inventory = InventoryRuntime {
+            shutdown: inventory_shutdown,
+            status: inventory_status,
+            task: Some(inventory_task),
         };
 
-        let shutdown = tokio::spawn(runtime.shutdown());
+        let shutdown = tokio::spawn(shutdown_connect_runtimes(Some(heartbeat), Some(inventory)));
         tokio::time::timeout(Duration::from_millis(250), stopped)
             .await
             .expect("inventory cancellation must not wait for heartbeat")
