@@ -72,7 +72,7 @@ The reason string on each attribute is the classifier. Current classes:
 
 - **Needs a pre-started server** — `"requires running RustFS server at
   localhost:9000"` / `"Connects to existing rustfs server"`. These are the
-  `reliant/*` and `policy/test_runner` tests; start a server first (e.g.
+  `reliant/*` tests; start a server first (e.g.
   [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh)) or use
   `--run-ignored`.
 - **Heavy / external tool** — `"Starts a rustfs server; enable when running

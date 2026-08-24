@@ -1358,7 +1358,7 @@ mod tests {
         assert_eq!(component.last_usage_save_result, "success");
         assert_eq!(component.last_success_unix_secs, Some(450));
 
-        let mut legacy_snapshot = snapshot.clone();
+        let mut legacy_snapshot = snapshot;
         legacy_snapshot.usage_freshness.last_durable_success_unix_secs = 0;
         let legacy_component = super::summarize_usage_freshness(&legacy_snapshot);
         assert_eq!(legacy_component.last_success_unix_secs, Some(456));

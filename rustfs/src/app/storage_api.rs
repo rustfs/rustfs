@@ -31,6 +31,7 @@ pub(crate) mod admin {
 }
 
 pub(crate) mod capacity {
+    pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
     pub(crate) type RebalStatus = crate::storage::storage_api::ecstore_rebalance::RebalStatus;
@@ -590,6 +591,16 @@ pub(crate) mod bucket {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::is_retention_active(
                     mode,
                     retain_until_date,
+                )
+            }
+
+            pub(crate) fn replication_write_may_pass_worm_gate(
+                state: &crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState,
+                obj_info: &crate::storage::storage_api::ObjectInfo,
+                opts: &crate::storage::storage_api::StorageObjectOptions,
+            ) -> Result<bool, crate::storage::storage_api::StorageError> {
+                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::replication_write_may_pass_worm_gate(
+                    state, obj_info, opts,
                 )
             }
         }
