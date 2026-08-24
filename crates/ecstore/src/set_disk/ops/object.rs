@@ -11934,7 +11934,7 @@ mod transition_upload_integrity_tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn restore_finalize_rejects_acquired_lock_loss_after_commit() {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
@@ -11953,6 +11953,7 @@ mod transition_upload_integrity_tests {
             async { write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await },
         )
         .await;
+        tokio::time::pause();
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = RestoreFinalizeBarrier::install(bucket, object);
         let finalize_set = Arc::clone(&set_disks);
@@ -12677,7 +12678,7 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn data_movement_cleanup_aborts_after_outer_lock_loss() {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
@@ -12696,6 +12697,7 @@ mod transition_upload_integrity_tests {
             async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
         )
         .await;
+        tokio::time::pause();
         let expected = set_disks
             .load_file_info_versions_exact(bucket, object)
             .await
@@ -12737,7 +12739,7 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn data_movement_cleanup_aborts_after_bucket_fence_loss() {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
@@ -12756,6 +12758,7 @@ mod transition_upload_integrity_tests {
             async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
         )
         .await;
+        tokio::time::pause();
         let expected = set_disks
             .load_file_info_versions_exact(bucket, object)
             .await
@@ -12893,7 +12896,7 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn commit_lock_lost_after_upload_cleans_remote_candidate_and_preserves_source() {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
@@ -12912,6 +12915,7 @@ mod transition_upload_integrity_tests {
             async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
         )
         .await;
+        tokio::time::pause();
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
@@ -13344,7 +13348,7 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn tagging_lock_lost_before_metadata_write_fails_closed() {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
@@ -13362,6 +13366,7 @@ mod transition_upload_integrity_tests {
             async { write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await },
         )
         .await;
+        tokio::time::pause();
 
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = ObjectTaggingCommitBarrier::install(bucket, object);

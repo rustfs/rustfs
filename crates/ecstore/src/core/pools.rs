@@ -8112,6 +8112,20 @@ impl ECStore {
         Ok(decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time))
     }
 
+    async fn durable_ilm_receipt_run_token_for_generation(
+        &self,
+        source_pool_idx: usize,
+        generation: OffsetDateTime,
+    ) -> Result<String> {
+        let pool_meta = self.pool_meta.read().await;
+        ensure_decommission_generation(&pool_meta, source_pool_idx, generation)?;
+        let pool = pool_meta
+            .pools
+            .get(source_pool_idx)
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_meta.pools.len(), source_pool_idx))?;
+        Ok(decommission_durable_ilm_receipt_run_token(&pool.cmd_line, generation))
+    }
+
     async fn load_decommissioned_durable_ilm_target(
         &self,
         source_pool_idx: usize,
@@ -8188,7 +8202,16 @@ impl ECStore {
 
     async fn list_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<Vec<(usize, String)>> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let prefix = decommission_durable_ilm_receipt_run_prefix(&run_token);
+        self.list_decommission_durable_ilm_receipts_for_run(source_pool_idx, &run_token)
+            .await
+    }
+
+    async fn list_decommission_durable_ilm_receipts_for_run(
+        &self,
+        source_pool_idx: usize,
+        run_token: &str,
+    ) -> Result<Vec<(usize, String)>> {
+        let prefix = decommission_durable_ilm_receipt_run_prefix(run_token);
         let mut receipts = Vec::new();
         for pool_idx in 0..self.pools.len() {
             if pool_idx == source_pool_idx {
@@ -8212,7 +8235,16 @@ impl ECStore {
 
     async fn list_decommission_durable_ilm_manifest_receipts(&self, source_pool_idx: usize) -> Result<Vec<String>> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let prefix = decommission_durable_ilm_receipt_run_prefix(&run_token);
+        self.list_decommission_durable_ilm_manifest_receipts_for_run(source_pool_idx, &run_token)
+            .await
+    }
+
+    async fn list_decommission_durable_ilm_manifest_receipts_for_run(
+        &self,
+        source_pool_idx: usize,
+        run_token: &str,
+    ) -> Result<Vec<String>> {
+        let prefix = decommission_durable_ilm_receipt_run_prefix(run_token);
         let receipt_paths = self
             .list_decommission_durable_ilm_receipt_paths_in_pool(source_pool_idx, &prefix)
             .await?;
@@ -8227,15 +8259,23 @@ impl ECStore {
         Ok(receipt_paths)
     }
 
+    #[cfg(test)]
     async fn persist_decommission_durable_ilm_manifest(&self, source_pool_idx: usize) -> Result<()> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let receipt_paths = self.list_decommission_durable_ilm_manifest_receipts(source_pool_idx).await?;
+        self.persist_decommission_durable_ilm_manifest_for_run(source_pool_idx, &run_token)
+            .await
+    }
+
+    async fn persist_decommission_durable_ilm_manifest_for_run(&self, source_pool_idx: usize, run_token: &str) -> Result<()> {
+        let receipt_paths = self
+            .list_decommission_durable_ilm_manifest_receipts_for_run(source_pool_idx, run_token)
+            .await?;
         for receipt_path in &receipt_paths {
             self.read_decommission_durable_ilm_receipt(source_pool_idx, receipt_path)
                 .await?;
         }
-        let manifest = DecommissionDurableIlmManifest::new(&run_token, &receipt_paths)?;
-        let manifest_path = decommission_durable_ilm_manifest_path(&run_token);
+        let manifest = DecommissionDurableIlmManifest::new(run_token, &receipt_paths)?;
+        let manifest_path = decommission_durable_ilm_manifest_path(run_token);
         let encoded = manifest.encode()?;
         let mut attempt = 1;
         loop {
@@ -8247,7 +8287,7 @@ impl ECStore {
             .await
             {
                 Ok(existing) => {
-                    DecommissionDurableIlmManifest::decode(&existing, &run_token, &receipt_paths).map_err(|err| {
+                    DecommissionDurableIlmManifest::decode(&existing, run_token, &receipt_paths).map_err(|err| {
                         Error::other(format!(
                             "durable ILM expected manifest `{manifest_path}` in source pool {source_pool_idx} is invalid: {err}"
                         ))
@@ -8297,13 +8337,15 @@ impl ECStore {
         }
     }
 
-    async fn load_decommission_durable_ilm_manifest(
+    async fn load_decommission_durable_ilm_manifest_for_run(
         &self,
         source_pool_idx: usize,
+        run_token: &str,
     ) -> Result<HashMap<String, DecommissionDurableIlmReceipt>> {
-        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let receipt_paths = self.list_decommission_durable_ilm_manifest_receipts(source_pool_idx).await?;
-        let manifest_path = decommission_durable_ilm_manifest_path(&run_token);
+        let receipt_paths = self
+            .list_decommission_durable_ilm_manifest_receipts_for_run(source_pool_idx, run_token)
+            .await?;
+        let manifest_path = decommission_durable_ilm_manifest_path(run_token);
         let data = read_config_limited_preserve_empty(
             self.pools[source_pool_idx].clone(),
             &manifest_path,
@@ -8315,7 +8357,7 @@ impl ECStore {
                 "failed to read durable ILM expected manifest `{manifest_path}` from source pool {source_pool_idx}: {err}"
             ))
         })?;
-        DecommissionDurableIlmManifest::decode(&data, &run_token, &receipt_paths).map_err(|err| {
+        DecommissionDurableIlmManifest::decode(&data, run_token, &receipt_paths).map_err(|err| {
             Error::other(format!(
                 "durable ILM expected manifest `{manifest_path}` in source pool {source_pool_idx} is invalid: {err}"
             ))
@@ -8335,6 +8377,7 @@ impl ECStore {
         Ok(receipts)
     }
 
+    #[cfg(test)]
     async fn persist_decommission_durable_ilm_receipt(
         &self,
         source_pool_idx: usize,
@@ -8342,7 +8385,17 @@ impl ECStore {
         receipt: &DecommissionDurableIlmReceipt,
     ) -> Result<()> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let receipt_path = decommission_durable_ilm_receipt_path(&run_token, &receipt.source_path, &receipt.id_kind, &receipt.id);
+        self.persist_decommission_durable_ilm_receipt_for_run(target_pool_idx, receipt, &run_token)
+            .await
+    }
+
+    async fn persist_decommission_durable_ilm_receipt_for_run(
+        &self,
+        target_pool_idx: usize,
+        receipt: &DecommissionDurableIlmReceipt,
+        run_token: &str,
+    ) -> Result<()> {
+        let receipt_path = decommission_durable_ilm_receipt_path(run_token, &receipt.source_path, &receipt.id_kind, &receipt.id);
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut attempt = 1;
         loop {
@@ -8480,14 +8533,14 @@ impl ECStore {
         Ok(receipt)
     }
 
-    async fn load_decommission_durable_ilm_terminal_receipt(
+    async fn load_decommission_durable_ilm_terminal_receipt_for_run(
         &self,
         source_pool_idx: usize,
         path: &str,
         source_record: &ValidatedDurableIlmRecord,
+        run_token: &str,
     ) -> Result<Option<DecommissionDurableIlmReceipt>> {
-        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
-        let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, source_record.id_kind, &source_record.id);
+        let receipt_path = decommission_durable_ilm_receipt_path(run_token, path, source_record.id_kind, &source_record.id);
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut proof = None::<DecommissionDurableIlmReceipt>;
         for pool_idx in 0..self.pools.len() {
@@ -8553,8 +8606,18 @@ impl ECStore {
     }
 
     async fn verify_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
-        let expected_receipts = self.load_decommission_durable_ilm_manifest(source_pool_idx).await?;
-        let receipt_paths = self.list_decommission_durable_ilm_receipts(source_pool_idx).await?;
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        self.verify_decommission_durable_ilm_receipts_for_run(source_pool_idx, &run_token)
+            .await
+    }
+
+    async fn verify_decommission_durable_ilm_receipts_for_run(&self, source_pool_idx: usize, run_token: &str) -> Result<()> {
+        let expected_receipts = self
+            .load_decommission_durable_ilm_manifest_for_run(source_pool_idx, run_token)
+            .await?;
+        let receipt_paths = self
+            .list_decommission_durable_ilm_receipts_for_run(source_pool_idx, run_token)
+            .await?;
         let present_receipt_paths = receipt_paths
             .iter()
             .map(|(_, receipt_path)| receipt_path.as_str())
@@ -8918,11 +8981,24 @@ impl ECStore {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn verify_and_cleanup_decommissioned_durable_ilm_record(
         &self,
         source_pool_idx: usize,
         source_set: Arc<SetDisks>,
         path: &str,
+    ) -> Result<()> {
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
+        self.verify_and_cleanup_decommissioned_durable_ilm_record_for_run(source_pool_idx, source_set, path, &run_token)
+            .await
+    }
+
+    async fn verify_and_cleanup_decommissioned_durable_ilm_record_for_run(
+        &self,
+        source_pool_idx: usize,
+        source_set: Arc<SetDisks>,
+        path: &str,
+        run_token: &str,
     ) -> Result<()> {
         let namespace = classify_durable_ilm_record(path)?
             .ok_or_else(|| Error::other(format!("path `{path}` is not a durable ILM record")))?;
@@ -8942,11 +9018,11 @@ impl ECStore {
         let manifest_receipt = if let Some((target_pool_idx, target)) = target {
             let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
             let receipt = DecommissionDurableIlmReceipt::new(path, &target_record);
-            self.persist_decommission_durable_ilm_receipt(source_pool_idx, target_pool_idx, &receipt)
+            self.persist_decommission_durable_ilm_receipt_for_run(target_pool_idx, &receipt, run_token)
                 .await?;
             receipt
         } else {
-            self.load_decommission_durable_ilm_terminal_receipt(source_pool_idx, path, &source_record)
+            self.load_decommission_durable_ilm_terminal_receipt_for_run(source_pool_idx, path, &source_record, run_token)
                 .await?
                 .ok_or_else(|| {
                     Error::other(format!(
@@ -8955,7 +9031,7 @@ impl ECStore {
                     ))
                 })?
         };
-        self.persist_decommission_durable_ilm_receipt(source_pool_idx, source_pool_idx, &manifest_receipt)
+        self.persist_decommission_durable_ilm_receipt_for_run(source_pool_idx, &manifest_receipt, run_token)
             .await?;
 
         let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
@@ -9036,16 +9112,19 @@ impl ECStore {
         rx: &CancellationToken,
         generation: OffsetDateTime,
     ) -> Result<Vec<DecommissionUnresolvedEntry>> {
-        self.ensure_decommission_generation_current(idx, generation).await?;
+        let run_token = self.durable_ilm_receipt_run_token_for_generation(idx, generation).await?;
         let operation_gate = self.ctx.data_movement_operation_gate();
-        self.run_guarded_decommission_side_effect(rx, &operation_gate, || self.check_after_decommission_unfenced(idx, generation))
-            .await
+        self.run_guarded_decommission_side_effect(rx, &operation_gate, || {
+            self.check_after_decommission_unfenced(idx, generation, run_token)
+        })
+        .await
     }
 
     async fn check_after_decommission_unfenced(
         self: &Arc<Self>,
         idx: usize,
         generation: OffsetDateTime,
+        run_token: String,
     ) -> Result<Vec<DecommissionUnresolvedEntry>> {
         let unresolved_entries = {
             let pool_meta = self.pool_meta.read().await;
@@ -9112,6 +9191,7 @@ impl ECStore {
                 let callback_rx_cb = callback_rx.clone();
                 let unresolved_entries_by_identity_cb = unresolved_entries_by_identity.clone();
                 let resolved_unresolved_entries_cb = resolved_unresolved_entries.clone();
+                let run_token_cb = run_token.clone();
 
                 let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
                     let versions_found = versions_found_cb.clone();
@@ -9126,6 +9206,7 @@ impl ECStore {
                     let callback_rx = callback_rx_cb.clone();
                     let unresolved_entries_by_identity = unresolved_entries_by_identity_cb.clone();
                     let resolved_unresolved_entries = resolved_unresolved_entries_cb.clone();
+                    let run_token = run_token_cb.clone();
                     Box::pin(async move {
                         if callback_rx.is_cancelled() {
                             return;
@@ -9162,7 +9243,12 @@ impl ECStore {
 
                         if durable_ilm_record.is_some() {
                             if let Err(err) = store
-                                .verify_and_cleanup_decommissioned_durable_ilm_record(idx, source_set, &entry.name)
+                                .verify_and_cleanup_decommissioned_durable_ilm_record_for_run(
+                                    idx,
+                                    source_set,
+                                    &entry.name,
+                                    &run_token,
+                                )
                                 .await
                             {
                                 let mut first_err = entry_error.lock().await;
@@ -9319,8 +9405,9 @@ impl ECStore {
             }
         }
 
-        self.persist_decommission_durable_ilm_manifest(idx).await?;
-        self.verify_decommission_durable_ilm_receipts(idx).await?;
+        self.persist_decommission_durable_ilm_manifest_for_run(idx, &run_token)
+            .await?;
+        self.verify_decommission_durable_ilm_receipts_for_run(idx, &run_token).await?;
 
         Ok(verified_unresolved_entries)
     }
