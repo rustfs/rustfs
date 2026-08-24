@@ -181,22 +181,14 @@ jobs:
     needs: [ quick-checks ]
     runs-on: sm-standard-4
     timeout-minutes: 90
-    # Both lines are required. Job-level `permissions` replaces the workflow
-    # block rather than merging with it, so declaring only `actions: write`
-    # would drop `contents: read` and break this job's checkout and the
-    # repo-token the setup action hands to setup-protoc.
-    permissions:
-      contents: read
-      actions: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          # This job's token can cancel runs and delete Actions caches. Checkout
-          # otherwise writes it into .git/config, where a PR's own build.rs or
-          # proc-macro could read it back out.
+          # Checkout otherwise writes the token into .git/config, where a PR's
+          # own build.rs or proc-macro could read it back out.
           persist-credentials: false
 
       - name: Setup Rust environment
@@ -347,41 +339,36 @@ jobs:
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
 
-      # Early stop. Once this job has failed the PR cannot merge, so the sibling
-      # lanes are burning runners on a result nobody can act on: on run
-      # 30674613104 three lanes had already failed while Test and Lint and the
-      # rio-v2 variant kept going past 70 minutes.
-      #
-      # Only this job may cancel. The lanes that are NOT required checks
-      # (protocols, ILM, e2e, s3-tests) must never hold that power: a flake in
-      # one of them would turn the required "Test and Lint" into `cancelled`,
-      # which blocks the merge. Today a maintainer can merge with sftp red, and
-      # that has to stay true.
-      #
-      # These steps run last so the `if: always()` artifact upload above still
-      # captures logs and diagnostics before the run goes away.
+      # Record the reason before this job completes as FAILURE. A separate
+      # dependent job cancels sibling lanes only after GitHub has preserved this
+      # required check's failure verdict.
       - name: Annotate early-stop reason
-        if: failure() && github.event_name == 'pull_request'
-        run: |
-          {
-            echo "## CI early-stop"
-            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; cancelling run ${GITHUB_RUN_ID} to free runners."
-            echo "Sibling jobs showing **cancelled** were stopped by this job, not by their own failure."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # curl rather than `gh`: every existing `gh` call in this repo runs on
-      # ubuntu-latest, and the sm-standard-* images are custom and trimmed (they
-      # ship no C toolchain, see the e2e job below), so `gh` is not known to
-      # exist here.
-      #
-      # Fork PRs are excluded explicitly instead of relying on the error path:
-      # their GITHUB_TOKEN is forced read-only and job-level permissions cannot
-      # raise it, so the call would always 403. Skipping keeps their logs clean.
-      - name: Cancel run on failure (same-repo PR only)
         if: >-
           failure() && github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
+        run: |
+          {
+            echo "## CI early-stop"
+            echo "Job \`${GITHUB_JOB}\` (Test and Lint) failed; a follow-up job will cancel sibling lanes to free runners."
+            echo "Sibling jobs showing **cancelled** were stopped by the early-stop follow-up, not by their own failure."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Preserve the required Test and Lint FAILURE verdict before stopping sibling
+  # lanes. Cancelling from inside test-and-lint changed its own conclusion to
+  # CANCELLED and hid the actionable failure in the PR checks UI.
+  cancel-after-test-and-lint-failure:
+    name: Cancel siblings after Test and Lint failure
+    if: >-
+      failure() && needs.test-and-lint.result == 'failure'
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [ test-and-lint ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel remaining jobs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -389,7 +376,7 @@ jobs:
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel" || true
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/cancel"
 
   # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
   # drive the object layer through process-global singletons (the GLOBAL_ENV
