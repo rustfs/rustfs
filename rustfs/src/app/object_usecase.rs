@@ -66,7 +66,7 @@ use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
 use super::storage_api::object_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+    quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
     record_bucket_object_version_write_memory, record_bucket_object_write_memory,
     record_bucket_object_write_unknown_previous_memory,
 };
@@ -18079,7 +18079,7 @@ mod tests {
 
         async fn observed_bucket_usage(bucket: &str) -> Option<u64> {
             let mut usage = rustfs_data_usage::DataUsageInfo::default();
-            apply_bucket_usage_memory_overlay(&mut usage).await;
+            crate::app::storage_api::object_usecase::data_usage::apply_bucket_usage_memory_overlay(&mut usage).await;
             usage.buckets_usage.get(bucket).map(|value| value.size)
         }
 
