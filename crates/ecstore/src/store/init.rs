@@ -4316,6 +4316,8 @@ mod tests {
         let bucket = format!("reverse-decom-fixed-target-{}", uuid::Uuid::new_v4());
         let object = "ordinary.bin";
         let object_body = b"reverse ordinary generation".to_vec();
+        let self_copy_object = "source-only-self-copy.bin";
+        let self_copy_body = b"source only copy generation".to_vec();
         let multipart_object = "multipart.bin";
         let first_part = vec![b'm'; 5 * 1024 * 1024];
         let second_part = b"reverse multipart tail".to_vec();
@@ -4331,6 +4333,11 @@ mod tests {
             .put_object(&bucket, object, &mut source, &ObjectOptions::default())
             .await
             .expect("write ordinary source object to pool 1");
+        let mut self_copy_source = PutObjReader::from_vec(self_copy_body.clone());
+        store.pools[1]
+            .put_object(&bucket, self_copy_object, &mut self_copy_source, &ObjectOptions::default())
+            .await
+            .expect("write self-copy source object to pool 1");
 
         let upload = store.pools[1]
             .new_multipart_upload(&bucket, multipart_object, &ObjectOptions::default())
@@ -4371,6 +4378,69 @@ mod tests {
         }
         assert!(store.is_suspended(1).await, "pool 1 must be the reverse decommission source");
 
+        let self_copy_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut self_copy_reader = store
+            .get_object_reader(&bucket, self_copy_object, None, HeaderMap::new(), &self_copy_opts)
+            .await
+            .expect("read the suspended source before its target is committed");
+        let mut self_copy_info = self_copy_reader.object_info.clone();
+        let mut self_copy_source_body = Vec::new();
+        self_copy_reader
+            .stream
+            .read_to_end(&mut self_copy_source_body)
+            .await
+            .expect("drain the suspended self-copy source");
+        assert_eq!(self_copy_source_body, self_copy_body);
+        self_copy_info.metadata_only = true;
+        self_copy_info.put_object_reader = Some(PutObjReader::from_vec(self_copy_source_body));
+        store
+            .copy_object(
+                &bucket,
+                self_copy_object,
+                &bucket,
+                self_copy_object,
+                &mut self_copy_info,
+                &self_copy_opts,
+                &self_copy_opts,
+            )
+            .await
+            .expect("self-copy should read the suspended source and commit to an active pool");
+        assert_pool_object_present(&store.pools[0], &bucket, self_copy_object).await;
+        assert_pool_object_present(&store.pools[1], &bucket, self_copy_object).await;
+
+        let mut active_copy_reader = store
+            .get_object_reader(&bucket, self_copy_object, None, HeaderMap::new(), &self_copy_opts)
+            .await
+            .expect("read the active self-copy target while the source remains");
+        let active_copy_data_dir = active_copy_reader.object_info.data_dir;
+        let mut active_copy_info = active_copy_reader.object_info.clone();
+        let mut active_copy_body = Vec::new();
+        active_copy_reader
+            .stream
+            .read_to_end(&mut active_copy_body)
+            .await
+            .expect("drain the active self-copy target");
+        assert_eq!(active_copy_body, self_copy_body);
+        active_copy_info.metadata_only = true;
+        active_copy_info.put_object_reader = Some(PutObjReader::from_vec(active_copy_body));
+        let active_copy_result = store
+            .copy_object(
+                &bucket,
+                self_copy_object,
+                &bucket,
+                self_copy_object,
+                &mut active_copy_info,
+                &self_copy_opts,
+                &self_copy_opts,
+            )
+            .await
+            .expect("self-copy should keep using the committed active target");
+        assert_eq!(active_copy_result.data_dir, active_copy_data_dir);
+
+        let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
         let commit_barrier = crate::set_disk::PutObjectCommitBarrier::install(
             &bucket,
             object,
@@ -4419,7 +4489,50 @@ mod tests {
         drop(delete_barrier);
 
         commit_barrier.release();
+        cleanup_barrier.wait_until_paused().await;
         drop(commit_barrier);
+
+        let target_info = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read the committed active target before source cleanup");
+        assert_pool_object_present(&store.pools[1], &bucket, object).await;
+
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let routed_info = store
+            .get_object_info(&bucket, object, &read_opts)
+            .await
+            .expect("HEAD routing should prefer the active target before source cleanup");
+        assert_eq!(routed_info.data_dir, target_info.data_dir);
+
+        let mut ranged_reader = store
+            .get_object_reader(
+                &bucket,
+                object,
+                Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 8,
+                    end: 15,
+                }),
+                HeaderMap::new(),
+                &read_opts,
+            )
+            .await
+            .expect("ranged GET routing should prefer the active target before source cleanup");
+        assert_eq!(ranged_reader.object_info.data_dir, target_info.data_dir);
+        let mut ranged_body = Vec::new();
+        ranged_reader
+            .stream
+            .read_to_end(&mut ranged_body)
+            .await
+            .expect("drain the routed target range");
+        assert_eq!(ranged_body, object_body[8..=15]);
+
+        cleanup_barrier.release();
+        drop(cleanup_barrier);
         tokio::time::timeout(Duration::from_secs(60), worker)
             .await
             .expect("reverse ordinary decommission must not self-deadlock on the fixed target set")
