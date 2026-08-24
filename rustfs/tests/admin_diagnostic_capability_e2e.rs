@@ -6,6 +6,8 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
+#![recursion_limit = "256"]
+
 use bytes::Bytes;
 use chrono::Utc;
 use futures::stream;
