@@ -190,8 +190,7 @@ impl TestECStoreEnvBuilder {
     }
 
     /// Whether to run `init_bucket_metadata_sys` after the store comes up
-    /// (default `true`, as the heal bootstraps did). The IAM bootstrap test
-    /// opts out to preserve its historical semantics.
+    /// (default `true`, as the heal bootstraps did).
     pub fn init_bucket_metadata(mut self, yes: bool) -> Self {
         self.init_bucket_metadata = yes;
         self

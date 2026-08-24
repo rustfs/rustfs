@@ -94,7 +94,6 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     let temp_dir = tempfile::TempDir::with_prefix("rustfs_minio_iam_migration_").expect("temp directory must be created");
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .base_dir(temp_dir.path())
-        .init_bucket_metadata(false)
         .build()
         .await;
     env.make_bucket(LEGACY_META_BUCKET, false).await;

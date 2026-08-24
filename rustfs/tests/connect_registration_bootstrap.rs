@@ -278,7 +278,8 @@ fn prepare_inputs(temp: &tempfile::TempDir, root_pem: &str) -> (std::path::PathB
 }
 
 fn secure_tempdir() -> tempfile::TempDir {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("test requires a protected home directory"));
+    let home = std::fs::canonicalize(std::env::var_os("HOME").expect("test requires a protected home directory"))
+        .expect("test home directory must resolve without symlink components");
     tempfile::Builder::new()
         .prefix(".connect-registration-")
         .tempdir_in(home)
