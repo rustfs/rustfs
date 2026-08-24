@@ -14,3 +14,4 @@
 
 pub(crate) mod bridge;
 pub(crate) mod workspace;
+pub(crate) mod buffer_pool;
