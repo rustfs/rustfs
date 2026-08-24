@@ -279,6 +279,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod services {
+        pub(crate) use super::super::storage_contracts::StorageAdminApi;
         pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools, ServerContextSlot};
     }
 

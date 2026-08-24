@@ -219,7 +219,7 @@ def check_s3_tests_runner(root: Path) -> list[str]:
     return []
 
 
-def profile_selection(root: Path, profile: str) -> str:
+def profile_selection_entries(root: Path, profile: str) -> tuple[Path, list[str], dict[str, str]]:
     if not re.fullmatch(r"e2e-[a-z0-9-]+", profile):
         raise ValueError(f"invalid e2e profile name: {profile}")
     path = root / f".config/{profile}-selection.txt"
@@ -227,11 +227,39 @@ def profile_selection(root: Path, profile: str) -> str:
     values = dict(line.split("=", 1) for line in lines if "=" in line)
     if len(values) != len(lines) or any(not re.fullmatch(r"sha256(?:-[a-z0-9]+)?", key) for key in values):
         raise ValueError(f"{path.relative_to(root).as_posix()}: invalid sha256 entry")
+    return path, lines, values
+
+
+def profile_selection(root: Path, profile: str) -> str:
+    path, _, values = profile_selection_entries(root, profile)
     key = f"sha256-{sys.platform}"
     digest = values.get(key, values.get("sha256", ""))
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError(f"{path.relative_to(root).as_posix()}: missing sha256 for {sys.platform}")
     return digest
+
+
+def profile_listing_digest(listing: Path) -> tuple[int, str]:
+    data = json.loads(listing.read_text())
+    selected = sorted(
+        f"{suite_id}::{test_name}"
+        for suite_id, suite in data["rust-suites"].items()
+        for test_name, testcase in suite["testcases"].items()
+        if testcase.get("filter-match", {}).get("status") == "matches"
+    )
+    return len(selected), hashlib.sha256(("\n".join(selected) + "\n").encode()).hexdigest()
+
+
+def update_profile_selection(root: Path, profile: str, listing: Path, platform: str) -> tuple[int, str, str]:
+    if not re.fullmatch(r"[a-z0-9]+", platform):
+        raise ValueError(f"invalid platform name: {platform}")
+    path, lines, values = profile_selection_entries(root, profile)
+    key = "sha256" if "sha256" in values else f"sha256-{platform}"
+    if key not in values:
+        raise ValueError(f"{path.relative_to(root).as_posix()}: missing {key} entry")
+    count, digest = profile_listing_digest(listing)
+    path.write_text("\n".join(f"{key}={digest}" if line.startswith(f"{key}=") else line for line in lines) + "\n")
+    return count, digest, key
 
 
 def check_profile_definitions(root: Path) -> list[str]:
@@ -547,22 +575,15 @@ def check_scheduled_alerts(root: Path) -> list[str]:
 def check_profile_listing(root: Path, profile: str, listing: Path) -> list[str]:
     try:
         expected_digest = profile_selection(root, profile)
-        data = json.loads(listing.read_text())
-        selected = sorted(
-            f"{suite_id}::{test_name}"
-            for suite_id, suite in data["rust-suites"].items()
-            for test_name, testcase in suite["testcases"].items()
-            if testcase.get("filter-match", {}).get("status") == "matches"
-        )
-        digest = hashlib.sha256(("\n".join(selected) + "\n").encode()).hexdigest()
+        count, digest = profile_listing_digest(listing)
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         return [f"cannot read {profile} nextest listing: {error}"]
     if digest != expected_digest:
         return [
-            f"{profile} selection changed: count={len(selected)} sha256={digest}; "
+            f"{profile} selection changed: count={count} sha256={digest}; "
             f"expected sha256={expected_digest}"
         ]
-    print(f"{profile} selection OK: {len(selected)} tests, sha256={digest}")
+    print(f"{profile} selection OK: {count} tests, sha256={digest}")
     return []
 
 
@@ -706,6 +727,45 @@ class SelfTests(unittest.TestCase):
             )
             with mock.patch.object(sys, "platform", "linux"):
                 self.assertEqual(len(check_profile_listing(root, "e2e-full", listing)), 1)
+
+    def test_update_profile_selection_changes_only_requested_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".config").mkdir()
+            darwin_digest = "a" * 64
+            (root / ".config/e2e-full-selection.txt").write_text(
+                f"sha256-darwin={darwin_digest}\nsha256-linux={'b' * 64}\n"
+            )
+            listing = root / "listing.json"
+            listing.write_text(
+                json.dumps(
+                    {
+                        "rust-suites": {
+                            "suite": {
+                                "testcases": {"linux": {"filter-match": {"status": "matches"}}}
+                            }
+                        }
+                    }
+                )
+            )
+
+            count, digest, key = update_profile_selection(root, "e2e-full", listing, "linux")
+
+            self.assertEqual(count, 1)
+            self.assertEqual(key, "sha256-linux")
+            self.assertEqual(
+                (root / ".config/e2e-full-selection.txt").read_text(),
+                f"sha256-darwin={darwin_digest}\nsha256-linux={digest}\n",
+            )
+            with mock.patch.object(sys, "platform", "linux"):
+                self.assertEqual(check_profile_listing(root, "e2e-full", listing), [])
+            selection = root / ".config/e2e-smoke-selection.txt"
+            selection.write_text(f"sha256={'a' * 64}\n")
+
+            count, digest, key = update_profile_selection(root, "e2e-smoke", listing, "linux")
+
+            self.assertEqual((count, key), (1, "sha256"))
+            self.assertEqual(selection.read_text(), f"sha256={digest}\n")
 
     def test_scheduled_alerts_require_completion_watchdog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -984,9 +1044,18 @@ def main() -> int:
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
         return 0
+    if len(sys.argv) == 5 and sys.argv[1] == "--update-profile":
+        try:
+            count, digest, key = update_profile_selection(ROOT, sys.argv[2], Path(sys.argv[3]), sys.argv[4])
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"ERROR: cannot update {sys.argv[2]} selection: {error}", file=sys.stderr)
+            return 1
+        print(f"Updated .config/{sys.argv[2]}-selection.txt: count={count} {key}={digest}")
+        return 0
     if sys.argv[1:]:
         print(
-            "usage: check_test_wiring.py [--self-test | --check-profile PROFILE LISTING]",
+            "usage: check_test_wiring.py [--self-test | --check-profile PROFILE LISTING | "
+            "--update-profile PROFILE LISTING PLATFORM]",
             file=sys.stderr,
         )
         return 2

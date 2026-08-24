@@ -8176,7 +8176,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8185,7 +8185,7 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
             }
             Ok(quick_xml::events::Event::Empty(element)) => {
                 if depth == 0 {
-                    if seen_root || closed_root || element.name().as_ref() != b"LifecycleConfiguration" {
+                    if seen_root || closed_root || element.name().as_ref() != "LifecycleConfiguration" {
                         break false;
                     }
                     seen_root = true;
@@ -8208,7 +8208,9 @@ fn is_zero_rule_lifecycle_tombstone(raw: &[u8]) -> bool {
                 seen_declaration = true;
             }
             Ok(quick_xml::events::Event::DocType(_)) => break false,
-            Ok(quick_xml::events::Event::Text(text)) if depth == 0 && !text.iter().all(u8::is_ascii_whitespace) => {
+            Ok(quick_xml::events::Event::Text(text))
+                if depth == 0 && !text.as_ref().bytes().all(|byte| byte.is_ascii_whitespace()) =>
+            {
                 break false;
             }
             Ok(quick_xml::events::Event::Text(_)) => {}

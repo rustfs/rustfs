@@ -30,12 +30,16 @@ REQUIRE_TAIL_ERROR="false"
 MARKDOWN_OUT=""
 EXEMPTION_REASON="deliberate correctness tradeoff"
 declare -a COMPARE_CSVS=()
+declare -a COMPARE_LABELS=()
 
 usage() {
   cat <<'USAGE'
 Usage: hotpath_warp_ab_gate.sh --compare-csv <file> [--compare-csv <file> ...] [options]
 
   --compare-csv <file>   baseline_compare.csv to evaluate (repeatable).
+  --labeled-compare-csv <label> <file>
+                         Evaluate a CSV and identify its configuration in the
+                         result table (repeatable).
   --fail-pct <n>         Regression budget that fails the gate (default 10).
   --warn-pct <n>         Regression budget that warns (default 5).
   --allow-regression     Downgrade every FAIL to an exempted WARN (deliberate
@@ -50,7 +54,12 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --compare-csv) COMPARE_CSVS+=("$2"); shift 2 ;;
+    --compare-csv) COMPARE_CSVS+=("$2"); COMPARE_LABELS+=(""); shift 2 ;;
+    --labeled-compare-csv)
+      COMPARE_LABELS+=("$2")
+      COMPARE_CSVS+=("$3")
+      shift 3
+      ;;
     --fail-pct) FAIL_PCT="$2"; shift 2 ;;
     --warn-pct) WARN_PCT="$2"; shift 2 ;;
     --allow-regression) ALLOW_REGRESSION="true"; shift ;;
@@ -85,10 +94,19 @@ if [[ "$REQUIRE_TAIL_ERROR" == "true" ]]; then
   done
 fi
 
-# One awk pass over all CSVs. Emits TSV rows "verdict\tworkload\tmetric\tdelta"
+has_labels="false"
+for label in "${COMPARE_LABELS[@]}"; do
+  [[ -n "$label" ]] && has_labels="true"
+done
+label_separator=$'\034'
+compare_labels="$(IFS="$label_separator"; echo "${COMPARE_LABELS[*]}")"
+
+# One awk pass over all CSVs. Emits TSV rows
+# "verdict\tconfiguration\tworkload\tmetric\tdelta"
 # on stdout and a final "OVERALL\t<verdict>" line. Verdict is PASS/WARN/FAIL.
 gate_output="$(
-  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" -v strict="$REQUIRE_TAIL_ERROR" '
+  awk -v fail_pct="$FAIL_PCT" -v warn_pct="$WARN_PCT" -v strict="$REQUIRE_TAIL_ERROR" \
+      -v label_blob="$compare_labels" -v label_separator="$label_separator" '
     function classify(delta, higher_is_better,   regress) {
       if (delta == "" || delta == "N/A") return "SKIP"
       # Signed regression magnitude: positive means "worse than baseline".
@@ -97,14 +115,14 @@ gate_output="$(
       if (regress > warn_pct) return "WARN"
       return "PASS"
     }
-    function emit(v, workload, metric, delta,   rank) {
+    function emit(v, configuration, workload, metric, delta,   rank) {
       if (v == "SKIP") return
-      print v "\t" workload "\t" metric "\t" delta "%"
+      print v "\t" configuration "\t" workload "\t" metric "\t" delta "%"
       rank = (v == "FAIL") ? 3 : (v == "WARN") ? 2 : 1
       if (rank > worst) worst = rank
     }
-    function contract_failure(workload, metric) {
-      print "FAIL\t" workload "\t" metric "\tinvalid evidence"
+    function contract_failure(configuration, workload, metric) {
+      print "FAIL\t" configuration "\t" workload "\t" metric "\tinvalid evidence"
       if (3 > worst) worst = 3
     }
     function decimal(value) {
@@ -122,18 +140,26 @@ gate_output="$(
     function abs(value) {
       return value < 0 ? -value : value
     }
-    BEGIN { worst = 1 }
-    FNR == 1 { next }                      # skip each file header
+    BEGIN {
+      worst = 1
+      split(label_blob, file_labels, label_separator)
+    }
+    FNR == 1 {
+      file_index++
+      configuration = file_labels[file_index]
+      if (configuration == "") configuration = "-"
+      next
+    }
     {
       n = split($0, f, ",")
       if (n < 12) {
-        if (strict == "true") contract_failure(FILENAME, "compare-schema")
+        if (strict == "true") contract_failure(configuration, FILENAME, "compare-schema")
         next
       }
       workload = f[1] "/" f[2] "@" f[3]    # size/tool@concurrency
-      emit(classify(f[6],  1), workload, "reqps",      f[6])
-      emit(classify(f[9],  0), workload, "latency",    f[9])
-      emit(classify(f[12], 1), workload, "throughput", f[12])
+      emit(classify(f[6],  1), configuration, workload, "reqps",      f[6])
+      emit(classify(f[9],  0), configuration, workload, "latency",    f[9])
+      emit(classify(f[12], 1), configuration, workload, "throughput", f[12])
       if (strict == "true") {
         valid = n == 25
         for (i = 4; i <= 18; i++) {
@@ -147,12 +173,12 @@ gate_output="$(
         baseline_error_rate = f[22] / (f[20] + f[22]) * 100
         if (abs(f[23] - new_error_rate) > 0.005 || abs(f[24] - baseline_error_rate) > 0.005 || abs(f[25] - (new_error_rate - baseline_error_rate)) > 0.005) valid = 0
         if (!valid) {
-          contract_failure(workload, "tail-error-evidence")
+          contract_failure(configuration, workload, "tail-error-evidence")
           next
         }
-        emit(classify(f[15], 0), workload, "p90-latency", f[15])
-        emit(classify(f[18], 0), workload, "p99-latency", f[18])
-        emit(classify(f[25], 0), workload, "error-rate", f[25])
+        emit(classify(f[15], 0), configuration, workload, "p90-latency", f[15])
+        emit(classify(f[18], 0), configuration, workload, "p99-latency", f[18])
+        emit(classify(f[25], 0), configuration, workload, "error-rate", f[25])
       }
     }
     END {
@@ -182,14 +208,27 @@ render() {
     echo "> Gate FAIL exempted via \`--allow-regression\`: ${EXEMPTION_REASON}."
   fi
   echo
-  echo "| Workload | Metric | Δ vs baseline | Verdict |"
-  echo "| --- | --- | --- | --- |"
-  if [[ -z "$rows" ]]; then
-    echo "| _(no rows)_ | | | |"
+  if [[ "$has_labels" == "true" ]]; then
+    echo "| Configuration | Workload | Metric | Δ vs baseline | Verdict |"
+    echo "| --- | --- | --- | --- | --- |"
   else
-    printf '%s\n' "$rows" | while IFS=$'\t' read -r v workload metric delta; do
+    echo "| Workload | Metric | Δ vs baseline | Verdict |"
+    echo "| --- | --- | --- | --- |"
+  fi
+  if [[ -z "$rows" ]]; then
+    if [[ "$has_labels" == "true" ]]; then
+      echo "| _(no rows)_ | | | | |"
+    else
+      echo "| _(no rows)_ | | | |"
+    fi
+  else
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r v configuration workload metric delta; do
       [[ -z "$v" ]] && continue
-      echo "| $workload | $metric | $delta | $(emoji "$v") $v |"
+      if [[ "$has_labels" == "true" ]]; then
+        echo "| $configuration | $workload | $metric | $delta | $(emoji "$v") $v |"
+      else
+        echo "| $workload | $metric | $delta | $(emoji "$v") $v |"
+      fi
     done
   fi
 }
