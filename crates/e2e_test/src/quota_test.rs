@@ -155,6 +155,22 @@ impl QuotaTestEnv {
         Ok(stats.get("current_usage").and_then(|v| v.as_u64()).unwrap_or(0))
     }
 
+    async fn wait_for_bucket_usage(&self, expected: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let convergence = async {
+            loop {
+                let usage = self.get_bucket_usage().await?;
+                if usage == expected {
+                    return Ok::<u64, Box<dyn std::error::Error + Send + Sync>>(usage);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        };
+        match timeout(Duration::from_secs(30), convergence).await {
+            Ok(result) => result,
+            Err(_) => Err(format!("bucket usage did not converge to {expected} bytes within 30 seconds").into()),
+        }
+    }
+
     pub async fn set_bucket_quota_for(
         &self,
         bucket: &str,
@@ -444,8 +460,8 @@ mod integration_tests {
             .send()
             .await?;
 
-        // Check updated usage
-        let updated_usage = env.get_bucket_usage().await?;
+        // A completed scanner generation releases the conservative quota floor after a delete.
+        let updated_usage = env.wait_for_bucket_usage(256 * 1024).await?;
         assert_eq!(updated_usage, 256 * 1024);
 
         env.cleanup_bucket().await?;
