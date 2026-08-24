@@ -71,7 +71,7 @@ fn find_part_files(temp_dir: &str, bucket: &str, object_key: &str) -> io::Result
 }
 
 fn part_files_total_size(part_files: &[PathBuf]) -> io::Result<u64> {
-    part_files.iter().try_fold(0, |total, path| {
+    part_files.iter().try_fold(0u64, |total, path| {
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| io::Error::new(error.kind(), format!("failed to stat {}: {error}", path.display())))?;
         if !metadata.file_type().is_file() {
