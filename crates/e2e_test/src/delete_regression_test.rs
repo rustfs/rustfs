@@ -117,9 +117,18 @@ mod tests {
         );
 
         // Verify HEAD returns 404
-        let head = client.head_object().bucket(bucket).key("to-delete.txt").send().await;
-
-        assert!(head.is_err(), "RT-05 FAIL: HEAD on deleted object should return error, got success");
+        let error = client
+            .head_object()
+            .bucket(bucket)
+            .key("to-delete.txt")
+            .send()
+            .await
+            .expect_err("RT-05 FAIL: HEAD on deleted object should return 404, got success");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "RT-05 FAIL: HEAD on deleted object must return HTTP 404, got {error:?}"
+        );
 
         info!("RT-05 PASS: delete correctly removes object from LIST and HEAD");
         Ok(())
@@ -414,9 +423,18 @@ mod tests {
 
         // All HEAD requests should return 404
         for key in &keys {
-            let head = client.head_object().bucket(bucket).key(*key).send().await;
-
-            assert!(head.is_err(), "RT-05f FAIL: HEAD on deleted key '{key}' should return error");
+            let error = client
+                .head_object()
+                .bucket(bucket)
+                .key(*key)
+                .send()
+                .await
+                .expect_err("RT-05f FAIL: HEAD on deleted key should return 404, got success");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(404),
+                "RT-05f FAIL: HEAD on deleted key '{key}' must return HTTP 404, got {error:?}"
+            );
         }
 
         // LIST should be empty

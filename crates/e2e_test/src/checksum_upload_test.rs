@@ -199,8 +199,18 @@ mod tests {
         );
 
         // And the object must not have been stored.
-        let head = client.head_object().bucket(bucket).key(key).send().await;
-        assert!(head.is_err(), "Object must not exist after a rejected mismatched-checksum PutObject");
+        let error = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect_err("Object must not exist after a rejected mismatched-checksum PutObject");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "Rejected mismatched-checksum PutObject absence probe must return HTTP 404, got {error:?}"
+        );
         info!("PASSED: PutObject rejects mismatched SHA256 and stores nothing");
     }
 
@@ -552,8 +562,18 @@ mod tests {
                 msg.contains("BadDigest") || msg.to_lowercase().contains("digest") || msg.to_lowercase().contains("checksum"),
                 "{header}: expected a BadDigest/checksum error, got: {msg}"
             );
-            let head = client.head_object().bucket(bucket).key(&bad_key).send().await;
-            assert!(head.is_err(), "{header}: nothing must be stored after a rejected PutObject");
+            let error = client
+                .head_object()
+                .bucket(bucket)
+                .key(&bad_key)
+                .send()
+                .await
+                .expect_err("nothing must be stored after a rejected PutObject");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(404),
+                "{header}: rejected PutObject absence probe must return HTTP 404, got {error:?}"
+            );
 
             info!("PASSED additional-checksum verify-on-write: {header}");
         }
