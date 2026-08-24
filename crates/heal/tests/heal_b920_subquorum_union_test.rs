@@ -33,6 +33,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use walkdir::WalkDir;
 
@@ -133,6 +134,22 @@ fn remove_xl_meta_only(disk: &Path, bucket: &str, object: &str) {
         count_part_files(&object_dir(disk, bucket, object)) >= 1,
         "data shards must remain after removing only xl.meta"
     );
+}
+
+async fn wait_for_object_copies(disks: &[PathBuf], bucket: &str, object: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if disks.iter().all(|disk| {
+                let object_dir = object_dir(disk, bucket, object);
+                xl_meta_path(&object_dir).exists() && count_part_files(&object_dir) >= 1
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PUT rename tails must converge before corrupting the disk fixture");
 }
 
 fn deep_heal_opts() -> HealOpts {
@@ -254,6 +271,7 @@ mod serial_tests {
 
         let data_v1 = versioned_test_data(7);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         // EC4+4: parity = 4. Delete ONLY xl.meta on 5 disks (> parity), leaving the
         // data shards on all 8. Meta quorum (4) is now unreachable (3 metas), which
