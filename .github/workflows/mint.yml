@@ -155,7 +155,7 @@ jobs:
       - name: Wait for RustFS ready
         run: |
           for _ in {1..60}; do
-            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
+            if curl -sf http://127.0.0.1:9000/health/ready >/dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
             fi
