@@ -24,6 +24,7 @@
 
 use crate::common::{RustFSTestEnvironment, awscurl_get, awscurl_post, init_logging as common_init_logging, local_http_client};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -50,6 +51,9 @@ pub const VAULT_TOKEN: &str = "dev-root-token";
 pub const VAULT_TRANSIT_PATH: &str = "transit";
 pub const VAULT_KEY_NAME: &str = "rustfs-master-key";
 pub const ENV_TEST_VAULT_BIN: &str = "RUSTFS_TEST_VAULT_BIN";
+pub const SSE_C_KEY_MISMATCH_MESSAGE: &str =
+    "The provided encryption parameters did not match the ones used originally to encrypt the object.";
+pub const SSE_C_MISSING_PARAMETERS_MESSAGE: &str = "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.";
 
 /// Initialize tracing for KMS tests with KMS-specific log levels
 pub fn init_logging() {
@@ -61,6 +65,24 @@ pub fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
     BASE64.encode(hasher.finalize())
+}
+
+pub fn assert_s3_error<T, E>(result: Result<T, SdkError<E>>, status: u16, code: &str, message: &str, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    assert_eq!(
+        error.raw_response().map(|response| response.status().as_u16()),
+        Some(status),
+        "{context}: unexpected HTTP status: {error:?}"
+    );
+    let service_error = error
+        .as_service_error()
+        .expect("request failure should retain an S3 service error");
+    assert_eq!(service_error.code(), Some(code), "{context}: unexpected error code: {error:?}");
+    assert_eq!(service_error.message(), Some(message), "{context}: unexpected error message: {error:?}");
 }
 
 pub async fn kms_admin_request(
@@ -559,7 +581,13 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Download with wrong SSE-C key should fail");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "download with a wrong SSE-C key must be rejected",
+    );
     info!("✅ Correctly rejected download with wrong SSE-C key");
 
     info!("Error scenario tests completed successfully");
