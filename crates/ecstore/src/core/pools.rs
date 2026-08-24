@@ -33,7 +33,7 @@ use crate::bucket::{
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{
     CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
-    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config, save_config_with_opts,
+    read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config_with_opts,
     save_config_with_opts_quiet,
 };
 use crate::data_movement;
@@ -4848,7 +4848,7 @@ impl ECStore {
             let mut pool_meta = self.pool_meta.write().await;
             record_decommission_unresolved_entry(&mut pool_meta, idx, generation, entry)?;
         }
-        self.save_current_pool_meta()
+        self.save_current_pool_meta(&[idx])
             .await
             .map_err(|err| Error::other(format!("decommission unresolved entry ledger save failed: {err}")))
     }
@@ -9038,7 +9038,7 @@ impl ECStore {
         self.run_guarded_decommission_side_effect(rx, &operation_gate, || {
             self.check_after_decommission_unfenced(idx, generation)
         })
-            .await
+        .await
     }
 
     async fn check_after_decommission_unfenced(

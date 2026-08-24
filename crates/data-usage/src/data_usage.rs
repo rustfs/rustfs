@@ -573,6 +573,10 @@ pub struct DataUsageInfo {
     /// cycle (or retained a compatible last-known-good cache).
     #[serde(default)]
     pub usage_snapshot_partial: bool,
+    /// Durable marker for a first-start bootstrap that has not produced an
+    /// authoritative usage snapshot yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_bootstrap_pending: bool,
     /// Deprecated kept here for backward compatibility reasons
     pub bucket_sizes: HashMap<String, u64>,
     /// Per-disk snapshot information when available
@@ -1962,7 +1966,8 @@ impl DataUsageInfo {
 
     /// Whether this snapshot authoritatively covers every reported bucket.
     pub fn is_complete_bucket_usage_snapshot(&self) -> bool {
-        self.usage_snapshot_complete
+        !self.usage_snapshot_bootstrap_pending
+            && self.usage_snapshot_complete
             && self.last_update.is_some()
             && u64::try_from(self.buckets_usage.len()).ok() == Some(self.buckets_count)
     }
@@ -1971,7 +1976,8 @@ impl DataUsageInfo {
     /// admin display. Partial data is accepted only with unique set states,
     /// a plan digest for every state, and at least one usable generation.
     pub fn is_valid_partial_snapshot(&self) -> bool {
-        if !self.usage_snapshot_partial
+        if self.usage_snapshot_bootstrap_pending
+            || !self.usage_snapshot_partial
             || self.usage_snapshot_converged != Some(false)
             || self.last_update.is_none()
             || self.scanner_cycle.is_none()
