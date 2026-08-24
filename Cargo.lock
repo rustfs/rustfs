@@ -9235,7 +9235,6 @@ dependencies = [
  "rustfs-log-analyzer",
  "rustfs-madmin",
  "rustfs-mimalloc",
- "rustfs-mimalloc-sys",
  "rustfs-notify",
  "rustfs-object-capacity",
  "rustfs-object-data-cache",
