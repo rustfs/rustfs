@@ -12,29 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "mimalloc",
-    not(feature = "jemalloc")
-))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 use std::alloc::{GlobalAlloc, Layout};
 
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "mimalloc",
-    not(feature = "jemalloc")
-))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 #[derive(Default)]
 struct MiMallocAllocator;
 
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "mimalloc",
-    not(feature = "jemalloc")
-))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 // SAFETY: allocation operations are forwarded unchanged to MiMalloc, so
 // MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
 #[allow(unsafe_code)]
@@ -60,50 +45,17 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 }
 
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "mimalloc",
-    not(feature = "jemalloc")
-))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 #[global_allocator]
 static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::with(MiMallocAllocator);
 
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "jemalloc",
-    not(feature = "mimalloc"),
-    not(target_os = "windows")
-))]
-#[global_allocator]
-static GLOBAL: hotpath::CountingAllocator<tikv_jemallocator::Jemalloc> =
-    hotpath::CountingAllocator::with(tikv_jemallocator::Jemalloc);
-
-#[cfg(all(
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    not(any(feature = "mimalloc", feature = "jemalloc"))
-))]
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", target_os = "windows"))]
 #[global_allocator]
 static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::CountingAllocator::with(std::alloc::System);
 
-#[cfg(all(
-    not(all(feature = "hotpath", feature = "hotpath-alloc")),
-    feature = "mimalloc",
-    not(feature = "jemalloc")
-))]
+#[cfg(all(not(all(feature = "hotpath", feature = "hotpath-alloc")), not(target_os = "windows")))]
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
-
-#[cfg(all(
-    not(all(feature = "hotpath", feature = "hotpath-alloc")),
-    feature = "jemalloc",
-    not(feature = "mimalloc"),
-    not(target_os = "windows")
-))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
@@ -111,14 +63,7 @@ fn main() {
     rustfs::startup_entrypoint::run_process();
 }
 
-#[cfg(all(
-    test,
-    feature = "hotpath",
-    feature = "hotpath-alloc",
-    feature = "mimalloc",
-    not(feature = "jemalloc"),
-    not(target_os = "windows")
-))]
+#[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
 mod tests {
     #[test]
     // SAFETY: This test inspects a live allocation pointer with mimalloc's heap

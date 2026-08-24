@@ -169,24 +169,14 @@ impl AllocatorReclaimController {
 
 /// Return the allocator backend name used by reclaim and memory metrics.
 pub fn allocator_backend() -> &'static str {
-    #[cfg(all(feature = "mimalloc", not(target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     {
         "mimalloc"
     }
 
-    #[cfg(all(feature = "mimalloc", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     {
         "mimalloc-windows"
-    }
-
-    #[cfg(all(not(feature = "mimalloc"), feature = "jemalloc"))]
-    {
-        "jemalloc"
-    }
-
-    #[cfg(not(any(feature = "mimalloc", feature = "jemalloc")))]
-    {
-        "system"
     }
 }
 
@@ -378,13 +368,13 @@ pub fn allocator_reclaim_controller_snapshot(ctx: &CancellationToken) -> Allocat
     )
 }
 
-#[cfg(all(feature = "mimalloc", not(target_os = "windows")))]
+#[cfg(not(target_os = "windows"))]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
     rustfs_mimalloc::MiMalloc::collect(force);
     Ok(())
 }
 
-#[cfg(not(all(feature = "mimalloc", not(target_os = "windows"))))]
+#[cfg(target_os = "windows")]
 fn collect_allocator_memory(_force: bool) -> Result<(), String> {
     Err("allocator reclaim requires mimalloc on a non-Windows target".to_string())
 }
