@@ -21,7 +21,7 @@ use crate::model::LogLevel;
 pub(super) fn rules() -> Vec<Rule> {
     vec![
         Rule {
-            anchors: strings(["decommission_object err"]),
+            anchors: strings(["Decommission object migration failed"]),
             min_count: 3,
             ..base(
                 "decom-object-failed",
@@ -29,6 +29,7 @@ pub(super) fn rules() -> Vec<Rule> {
                 "ops",
                 "下线迁移部分对象失败",
                 any([
+                    contains("Decommission object migration failed"),
                     contains("decommission_object err"),
                     contains("get_object_reader err"),
                     contains("decommission_entry failed"),
