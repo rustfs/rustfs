@@ -35,7 +35,7 @@ use crate::disk::{
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, cached_access, invalidate_bucket_cache, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     is_quota_mutation_fence_path, os,
     os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
     quota_mutation_fence_path,
@@ -3558,7 +3558,7 @@ impl LocalIoBackend for StdBackend {
             let access_check_start = metrics_enabled.then(std::time::Instant::now);
             let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
             if !skip_access_checks(volume) {
-                access(&volume_dir)
+                cached_access(&volume_dir)
                     .await
                     .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
             }
@@ -3623,7 +3623,7 @@ impl LocalIoBackend for StdBackend {
     async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
         if !skip_access_checks(volume) {
-            access(&volume_dir)
+            cached_access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
@@ -3663,7 +3663,7 @@ impl LocalIoBackend for StdBackend {
     async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
         let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
         if !skip_access_checks(volume) {
-            access(&volume_dir)
+            cached_access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
@@ -3717,7 +3717,7 @@ impl LocalIoBackend for StdBackend {
             WriteMode::Append => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 if !skip_access_checks(volume) {
-                    access(&volume_dir)
+                    cached_access(&volume_dir)
                         .await
                         .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
                 }
@@ -5822,7 +5822,7 @@ impl LocalDisk {
     async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
-            && let Err(e) = access(&volume_dir).await
+            && let Err(e) = cached_access(&volume_dir).await
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
@@ -6744,7 +6744,7 @@ impl LocalDisk {
         let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
             Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
                 let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
-                if let Err(access_err) = access(&volume_dir).await {
+                if let Err(access_err) = cached_access(&volume_dir).await {
                     Err(to_access_error(access_err, DiskError::VolumeAccessDenied).into())
                 } else {
                     Err(err)
@@ -8134,7 +8134,7 @@ impl DiskAPI for LocalDisk {
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
-            && let Err(e) = access(&volume_dir).await
+            && let Err(e) = cached_access(&volume_dir).await
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
@@ -8342,7 +8342,7 @@ impl DiskAPI for LocalDisk {
 
                     if e == DiskError::FileNotFound {
                         if !skip_access_checks(volume)
-                            && let Err(err) = access(&volume_dir).await
+                            && let Err(err) = cached_access(&volume_dir).await
                             && err.kind() == ErrorKind::NotFound
                         {
                             resp.results[i] = CHECK_PART_VOLUME_NOT_FOUND;
@@ -8868,7 +8868,7 @@ impl DiskAPI for LocalDisk {
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound
                     && !skip_access_checks(volume)
-                    && let Err(e) = access(&volume_dir).await
+                    && let Err(e) = cached_access(&volume_dir).await
                 {
                     return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
                 }
@@ -8897,7 +8897,7 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
-            && let Err(e) = with_walk_stall_deadline(stall, access(&volume_dir)).await?
+            && let Err(e) = with_walk_stall_deadline(stall, cached_access(&volume_dir)).await?
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
@@ -9978,9 +9978,10 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.io_get_bucket_path(volume)?;
 
-        if let Err(e) = access(&volume_dir).await {
+        if let Err(e) = cached_access(&volume_dir).await {
             if e.kind() == ErrorKind::NotFound {
                 os::make_dir_all(&volume_dir, self.io_root()).await?;
+                invalidate_bucket_cache(&volume_dir);
                 return Ok(());
             }
             error!(
@@ -10038,7 +10039,7 @@ impl DiskAPI for LocalDisk {
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
-            access(&volume_dir)
+            cached_access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
@@ -10871,6 +10872,7 @@ impl DiskAPI for LocalDisk {
         // hit path skips the volume-access check, so nothing else would notice)
         // (rustfs/backlog#1177).
         self.io_backend.invalidate_cached_fds_for_volume(volume);
+        invalidate_bucket_cache(&p);
 
         Ok(())
     }

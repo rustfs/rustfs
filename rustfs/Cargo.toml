@@ -56,6 +56,9 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
+# Allocator features
+mimalloc = ["dep:rustfs-mimalloc", "dep:rustfs-mimalloc-sys"]
+jemalloc = ["dep:tikv-jemallocator"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -336,10 +339,14 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true, features = ["serde", "rayon"] }
-rustfs-mimalloc = { workspace = true }
+rustfs-mimalloc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rustfs-mimalloc-sys = { workspace = true, optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
