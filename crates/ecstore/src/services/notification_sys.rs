@@ -51,7 +51,7 @@ const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -210,6 +210,24 @@ pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToke
     fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
 }
 
+#[cfg(test)]
+pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
+    let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "pool-activation-test-topology".to_string());
+    let _ = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology.clone());
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.topology_conflict = false;
+    state.proof = Some(FleetCapabilityProof {
+        topology_fingerprint: topology,
+        peer_epochs: Arc::new(BTreeMap::new()),
+        expires_at: Instant::now() + Duration::from_secs(60 * 60),
+    });
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     let mut state = cross_pool_fence_fleet_proof_slot()
@@ -352,7 +370,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                    capability = "cross_pool_fence_v1",
+                    capability = "cross_pool_fence_v2",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -1121,9 +1139,21 @@ impl NotificationSys {
             }
         }
 
-        match store.stop_rebalance_for_id(expected_rebalance_id).await {
+        let local_rebalance_id = match expected_rebalance_id {
+            Some(expected_id) => Some(expected_id.to_owned()),
+            None => store.current_rebalance_id().await,
+        };
+        match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
             Ok(_) => {
-                if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+                let save_result = match local_rebalance_id.as_deref() {
+                    Some(expected_id) => {
+                        store
+                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                if let Err(err) = save_result {
                     error!(
                         event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                         component = LOG_COMPONENT_ECSTORE,

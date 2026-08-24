@@ -113,9 +113,10 @@ filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
 # Vault KMS tests share the fixed dev-server port 8200. serial_test's #[serial]
-# does not cross nextest process boundaries, so keep these tests in one group.
+# does not cross nextest process boundaries, so keep every Vault-backed test in
+# one group.
 [[profile.default.overrides]]
-filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
 # ---------------------------------------------------------------------------
@@ -409,7 +410,7 @@ path = "junit.xml"
 #     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (56 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
 #   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
-#     manual-localhost:9000 reliant/policy tests are ci-13's migration.
+#     manual-localhost:9000 reliant tests are ci-13's migration.
 #
 # Each e2e test spawns its own single-node rustfs server on a random port with
 # an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
@@ -453,5 +454,5 @@ filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
 [[profile.e2e-full.overrides]]
-filter = 'package(e2e_test) & test(/^kms::kms_vault_test::/)'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'

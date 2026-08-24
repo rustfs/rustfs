@@ -73,6 +73,7 @@ their issue closes.
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
+| `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation | `test_issue_2007_coalescer_prometheus_report.sh`; `docs/testing/issue-2007-coalescer-delay.md` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_gt1g_multipart_put_matrix.sh` | dev-tool | >1 GiB multipart PUT matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `sample_remote_rustfs_rss.sh` | dev-tool | Remote RustFS PID CPU/RSS TSV sampler for hotpath profiling runs | `test_sample_remote_rustfs_rss.sh`; backlog#1647 |

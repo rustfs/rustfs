@@ -239,6 +239,7 @@ pub(crate) mod rpc_consumer {
     }
 
     pub(crate) mod node_service {
+        pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
         };
@@ -398,7 +399,7 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
         is_reserved_or_invalid_bucket,
     };
 }
@@ -501,6 +502,8 @@ pub(crate) mod ecstore_notification {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_rebalance {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rebalance::test_util;
     pub(crate) use rustfs_ecstore::api::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
@@ -520,7 +523,7 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient,
         PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX,
-        check_and_record_signed_rpc_nonce, normalize_tonic_rpc_audience,
+        check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience,
         sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
@@ -1408,10 +1411,11 @@ where
 }
 
 pub(crate) trait StoragePeerS3ClientExt {
-    async fn heal_bucket(
+    async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
         opts: &rustfs_common::heal_channel::HealOpts,
+        fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
     async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()>;
     async fn list_bucket(&self, opts: &contract::bucket::BucketOptions) -> DiskResult<Vec<contract::bucket::BucketInfo>>;
@@ -1424,12 +1428,13 @@ pub(crate) trait StoragePeerS3ClientExt {
 }
 
 impl StoragePeerS3ClientExt for LocalPeerS3Client {
-    async fn heal_bucket(
+    async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
         opts: &rustfs_common::heal_channel::HealOpts,
+        fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem> {
-        ecstore_rpc::PeerS3Client::heal_bucket(self, bucket, opts).await
+        ecstore_rpc::PeerS3Client::heal_bucket_with_fence(self, bucket, opts, fenced_pools).await
     }
 
     async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()> {

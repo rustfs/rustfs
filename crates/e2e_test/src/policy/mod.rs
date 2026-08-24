@@ -18,5 +18,3 @@
 //! including single-value, multi-value, and nested variable scenarios.
 
 mod policy_variables_test;
-mod test_env;
-mod test_runner;
