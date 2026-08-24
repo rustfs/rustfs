@@ -208,8 +208,7 @@ where
                 break;
             }
             let pending = match if sender.is_some() { store.pending().await } else { Ok(None) } {
-                Ok(Some(pending)) => {
-                    let captured_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                Ok(Some((pending, captured_at))) => {
                     if let Err(error) = store
                         .ensure_latest(pending.snapshot().clone(), captured_at, task_shutdown.clone())
                         .await

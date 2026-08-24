@@ -442,14 +442,21 @@ impl InventoryStateStore {
         }
     }
 
-    pub(crate) async fn pending(&self) -> Result<Option<PendingInventory>, InventoryError> {
+    pub(crate) async fn pending(&self) -> Result<Option<(PendingInventory, String)>, InventoryError> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            let state = store.read()?;
+            let (state, persisted_at) = store.read_with_persisted_at()?;
             if state.pending.is_none() && state.next_sequence > MAX_SEQUENCE {
                 return Err(InventoryError::SequenceExhausted);
             }
-            Ok(state.pending)
+            state
+                .pending
+                .map(|pending| {
+                    persisted_at
+                        .map(|persisted_at| (pending, persisted_at))
+                        .ok_or(InventoryError::StateCorrupt)
+                })
+                .transpose()
         })
         .await
         .map_err(|_| InventoryError::StateIo)?
@@ -588,6 +595,10 @@ impl InventoryStateStore {
     }
 
     fn read(&self) -> Result<InventoryState, InventoryError> {
+        self.read_with_persisted_at().map(|(state, _)| state)
+    }
+
+    fn read_with_persisted_at(&self) -> Result<(InventoryState, Option<String>), InventoryError> {
         #[cfg(not(target_os = "linux"))]
         {
             Err(InventoryError::PlatformSecurity)
@@ -597,11 +608,15 @@ impl InventoryStateStore {
             self.validate_anchor()?;
             let mut file = match open_file_at(&self.directory, "state.json", false, false) {
                 Ok(file) => file,
-                Err(InventoryError::StateMissing) => return Ok(InventoryState::default()),
+                Err(InventoryError::StateMissing) => return Ok((InventoryState::default(), None)),
                 Err(error) => return Err(error),
             };
             validate_regular_file(&file)?;
             let bytes = read_bounded(&mut file)?;
+            let modified = file
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(|_| InventoryError::StateIo)?;
             self.validate_anchor()?;
             let state: InventoryState = serde_json::from_slice(&bytes).map_err(|_| InventoryError::StateInvalid)?;
             let last_hash_valid = state.last_accepted_content_hash.as_deref().is_none_or(valid_content_hash);
@@ -615,7 +630,12 @@ impl InventoryStateStore {
             if state.next_sequence > MAX_SEQUENCE + 1 || !last_hash_valid || !pending_valid {
                 return Err(InventoryError::StateCorrupt);
             }
-            Ok(state)
+            let modified = chrono::DateTime::<chrono::Utc>::from(modified);
+            if modified > chrono::Utc::now() + MAX_FUTURE_SKEW {
+                return Err(InventoryError::StateCorrupt);
+            }
+            let persisted_at = modified.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            Ok((state, Some(persisted_at)))
         }
     }
 

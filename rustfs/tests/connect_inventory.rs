@@ -507,6 +507,21 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
         assert_eq!(latest["snapshot"][field], original[field]);
     }
     runtime.shutdown().await;
+    let state = temp.path().join("private-config-secret/inventory/state.json");
+    let legacy_persisted_at = std::time::SystemTime::now() - Duration::from_secs(60 * 60);
+    fs::File::options()
+        .write(true)
+        .open(&state)
+        .expect("pending state")
+        .set_times(std::fs::FileTimes::new().set_modified(legacy_persisted_at))
+        .expect("legacy pending timestamp");
+    let legacy_persisted_at = chrono::DateTime::<chrono::Utc>::from(
+        fs::metadata(&state)
+            .and_then(|metadata| metadata.modified())
+            .expect("persisted pending timestamp"),
+    )
+    .format("%Y-%m-%dT%H:%M:%SZ")
+    .to_string();
     fs::remove_file(temp.path().join("private-config-secret/inventory/latest.json"))
         .expect("simulate a pending snapshot created before local persistence");
 
@@ -535,6 +550,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     )
     .expect("restored latest envelope");
     assert_eq!(restored_latest["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
+    assert_eq!(restored_latest["capturedAt"], legacy_persisted_at);
     let delivered = restart_server.seen.lock().expect("seen lock").clone();
     assert_eq!(delivered, vec![original.clone(), original.clone()]);
     assert_eq!(original["sequence"], 0);
