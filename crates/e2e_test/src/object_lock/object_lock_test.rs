@@ -24,6 +24,8 @@
 //! - PutObjectRetention modification restrictions
 //! - Default bucket retention is applied to new objects
 
+use std::borrow::Borrow;
+
 use super::common::*;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -70,19 +72,21 @@ fn retention_timestamp(days: i64) -> aws_sdk_s3::primitives::DateTime {
         .expect("retention timestamp should parse")
 }
 
-fn assert_access_denied<T, E>(result: Result<T, SdkError<E>>, context: &str)
+fn assert_access_denied<T, E, R>(result: Result<T, R>, context: &str)
 where
     T: std::fmt::Debug,
     E: ProvideErrorMetadata + std::fmt::Debug,
+    R: Borrow<SdkError<E>> + std::fmt::Debug,
 {
     let error = result.expect_err(context);
+    let sdk_error = error.borrow();
     assert_eq!(
-        error.raw_response().map(|response| response.status().as_u16()),
+        sdk_error.raw_response().map(|response| response.status().as_u16()),
         Some(403),
         "{context}: expected HTTP 403, got: {error:?}"
     );
     assert_eq!(
-        error.as_service_error().and_then(ProvideErrorMetadata::code),
+        sdk_error.as_service_error().and_then(ProvideErrorMetadata::code),
         Some("AccessDenied"),
         "{context}: expected AccessDenied, got: {error:?}"
     );

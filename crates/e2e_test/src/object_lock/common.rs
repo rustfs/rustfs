@@ -238,7 +238,7 @@ pub async fn delete_object_with_bypass(
     key: &str,
     version_id: Option<&str>,
     bypass_governance: bool,
-) -> Result<(), SdkError<DeleteObjectError>> {
+) -> Result<(), Box<SdkError<DeleteObjectError>>> {
     let mut request = client
         .delete_object()
         .bucket(bucket)
@@ -249,7 +249,7 @@ pub async fn delete_object_with_bypass(
         request = request.version_id(vid);
     }
 
-    request.send().await?;
+    request.send().await.map_err(Box::new)?;
     info!("Deleted object {} (bypass: {})", key, bypass_governance);
     Ok(())
 }
