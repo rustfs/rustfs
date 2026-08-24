@@ -62,8 +62,7 @@ impl BufferPool {
 }
 
 #[allow(dead_code)] // Integration pending: see module doc
-static EC_BUFFER_POOL: std::sync::LazyLock<BufferPool> =
-    std::sync::LazyLock::new(|| BufferPool::with_limits(16));
+static EC_BUFFER_POOL: std::sync::LazyLock<BufferPool> = std::sync::LazyLock::new(|| BufferPool::with_limits(16));
 
 #[allow(dead_code)] // Integration pending: see module doc
 pub(crate) fn get_ec_buffer(min_capacity: usize) -> Vec<u8> {

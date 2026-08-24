@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
 use std::future::poll_fn;
@@ -21,7 +22,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
-use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
