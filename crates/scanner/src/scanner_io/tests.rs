@@ -269,6 +269,36 @@ async fn data_usage_publish_fails_when_receiver_is_closed() {
 }
 
 #[tokio::test]
+async fn data_usage_publish_rejects_a_second_terminal_update_without_blocking() {
+    for (status, data_usage_info) in [
+        (ScannerCycleStatus::Complete, DataUsageInfo::default()),
+        (
+            ScannerCycleStatus::Superseded,
+            DataUsageInfo {
+                scanner_cycle: Some(7),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (updates, mut receiver) = mpsc::channel(1);
+        assert!(
+            publish_usage_snapshot(&updates, status, data_usage_info)
+                .await
+                .expect("first terminal update should be accepted")
+        );
+
+        let err =
+            tokio::time::timeout(Duration::from_secs(1), publish_usage_snapshot(&updates, status, DataUsageInfo::default()))
+                .await
+                .expect("a full terminal update must fail without waiting")
+                .expect_err("a second terminal update must be rejected");
+        assert!(err.to_string().contains("already queued"));
+        assert!(receiver.try_recv().is_ok(), "the first terminal update must remain owned by the receiver");
+        assert!(receiver.try_recv().is_err(), "the rejected second update must not enter the channel");
+    }
+}
+
+#[tokio::test]
 async fn multi_pool_scanner_cycle_publishes_combined_usage() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let bucket = format!("scanner-union-{}", Uuid::new_v4().simple());
