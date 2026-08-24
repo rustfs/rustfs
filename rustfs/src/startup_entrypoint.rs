@@ -66,7 +66,7 @@ async fn async_main() -> Result<()> {
 
     // Log container resource detection early in startup
     // This helps operators verify that RustFS correctly detected cgroup limits
-    crate::container_config::log_container_config();
+    crate::cgroup_resources::log_container_resources();
 
     let env_compat_report = bootstrap_external_prefix_compat()?;
 

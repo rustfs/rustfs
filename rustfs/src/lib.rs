@@ -82,7 +82,6 @@ pub mod cgroup_resources;
 pub mod cluster_snapshot;
 pub mod config;
 pub mod connect;
-pub mod container_config;
 pub mod delete_tail_activity;
 pub mod diagnose;
 pub mod embedded;

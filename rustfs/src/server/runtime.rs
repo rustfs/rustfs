@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::time::Duration;
-use sysinfo::{RefreshKind, System};
 
 use rustfs_obs::dial9::Dial9SessionGuard;
 
@@ -52,16 +51,9 @@ mod tests {
 
 #[inline]
 fn detect_cores() -> usize {
-    // Priority: cgroup limits > host CPU count
-    // This ensures containerized environments get correct CPU limits
-    let host_cores = {
-        let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
-        sys.refresh_cpu_all();
-        sys.cpus().len().max(1)
-    };
-
-    // Use cgroup-aware effective CPU cores
-    crate::cgroup_resources::effective_cpu_cores(host_cores)
+    // Uses cgroup-aware detection from cgroup_resources module
+    // Returns effective CPU cores considering cgroup limits and overrides
+    crate::cgroup_resources::container_resources().cpu_cores
 }
 
 #[inline]

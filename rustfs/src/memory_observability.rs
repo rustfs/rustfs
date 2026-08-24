@@ -20,13 +20,10 @@ use serde::Serialize;
 #[cfg(any(not(target_os = "windows"), test))]
 use serde_json::Value;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::System;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
-static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
@@ -154,25 +151,11 @@ struct AllocatorMemorySnapshot {
     observation: AllocatorMemoryObservation,
 }
 
-fn memory_system() -> &'static Mutex<System> {
-    MEMORY_SYSTEM.get_or_init(|| Mutex::new(System::new()))
-}
-
-fn refresh_total_memory() -> u64 {
-    let mut system = memory_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_memory();
-    system.total_memory()
-}
-
-/// Get effective total memory, considering cgroup limits.
+/// Get effective total memory from container resources.
 ///
-/// This function returns the minimum of host memory and cgroup memory limit.
-/// It uses the cgroup_resources module to detect container memory limits.
-fn refresh_effective_memory() -> (u64, &'static str) {
-    let host_memory = refresh_total_memory();
-    let effective = crate::cgroup_resources::effective_memory(host_memory);
-    let basis = crate::cgroup_resources::memory_basis(host_memory);
-    (effective, basis)
+/// Returns the effective memory (considering cgroup limits and overrides).
+fn refresh_effective_memory() -> u64 {
+    crate::cgroup_resources::container_resources().memory_bytes
 }
 
 fn read_optional_u64(path: &Path) -> Option<u64> {
@@ -407,55 +390,35 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
 }
 
 /// Record the effective memory total and its basis (host or cgroup).
-///
-/// This metric helps operators understand whether RustFS is using host memory
-/// or cgroup-limited memory for its calculations. In containerized environments,
-/// this should show "cgroup" with the container's memory limit.
-fn record_effective_memory(total_bytes: u64, basis: &str) {
+fn record_effective_memory(total_bytes: u64) {
+    let basis = crate::cgroup_resources::memory_basis();
     metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis.to_string()).set(total_bytes as f64);
 }
 
-/// Record cgroup resource detection results.
-///
-/// This metric helps operators verify that RustFS correctly detected cgroup limits.
-fn record_cgroup_resource_detection(resources: &crate::cgroup_resources::CgroupResources) {
-    if resources.detected {
-        metrics::gauge!("rustfs_cgroup_detected", "resource" => "cpu".to_string()).set(if resources.cpu_cores.is_some() {
-            1.0
-        } else {
-            0.0
-        });
-        metrics::gauge!("rustfs_cgroup_detected", "resource" => "memory".to_string()).set(if resources.memory_bytes.is_some() {
-            1.0
-        } else {
-            0.0
-        });
+/// Record container resource detection results.
+fn record_container_resource_detection() {
+    let res = crate::cgroup_resources::container_resources();
 
-        if let Some(cores) = resources.cpu_cores {
-            metrics::gauge!("rustfs_cgroup_cpu_cores_limit").set(cores as f64);
-        }
-        if let Some(bytes) = resources.memory_bytes {
-            metrics::gauge!("rustfs_cgroup_memory_limit_bytes").set(bytes as f64);
-        }
-    }
+    metrics::gauge!("rustfs_container_cpu_cores").set(res.cpu_cores as f64);
+    metrics::gauge!("rustfs_container_memory_bytes").set(res.memory_bytes as f64);
+    metrics::gauge!("rustfs_container_cgroup_detected").set(if res.cgroup_detected { 1.0 } else { 0.0 });
+    metrics::gauge!("rustfs_container_overridden").set(if res.overridden { 1.0 } else { 0.0 });
 }
 
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
     match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
-        // Use cgroup-aware effective memory instead of host memory
-        let (effective_memory, memory_basis) = refresh_effective_memory();
+        let effective_memory = refresh_effective_memory();
         let cgroup = read_cgroup_memory_snapshot();
         let allocator = read_allocator_memory_snapshot();
-        (resource, process, effective_memory, memory_basis, cgroup, allocator)
+        (resource, process, effective_memory, cgroup, allocator)
     })
     .await
     {
-        Ok((resource, process, effective_memory, memory_basis, cgroup, allocator)) => {
-            // Record memory usage with cgroup-aware effective memory
+        Ok((resource, process, effective_memory, cgroup, allocator)) => {
             record_memory_usage(process.resident_memory_bytes, effective_memory);
-            record_effective_memory(effective_memory, memory_basis);
+            record_effective_memory(effective_memory);
             record_cpu_usage(resource.cpu_percent);
             record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
 
@@ -485,18 +448,8 @@ pub fn init_memory_observability(ctx: CancellationToken) {
     let interval = Duration::from_secs(interval_secs.max(1));
     let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
 
-    // Record cgroup resource detection results at startup
-    let cgroup_res = crate::cgroup_resources::cgroup_resources();
-    record_cgroup_resource_detection(cgroup_res);
-    if cgroup_res.detected {
-        tracing::info!(
-            cpu_cores = ?cgroup_res.cpu_cores,
-            memory_bytes = ?cgroup_res.memory_bytes,
-            "cgroup resource limits detected"
-        );
-    } else {
-        tracing::debug!("no cgroup resource limits detected, using host values");
-    }
+    // Record container resource detection results at startup
+    record_container_resource_detection();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);

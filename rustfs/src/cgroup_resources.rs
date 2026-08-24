@@ -14,49 +14,73 @@
 
 //! Cgroup-aware resource detection for containerized environments.
 //!
-//! This module provides cgroup-aware detection of CPU and memory limits
-//! for RustFS running in containerized environments (Kubernetes, Docker, etc.).
+//! This module provides a single source of truth for detecting and applying
+//! container resource limits (CPU and memory) from cgroup v1/v2.
 //!
 //! # Platform Support
 //!
 //! - **Linux**: Full cgroup v1/v2 support
 //! - **macOS/Windows**: Falls back to host values (cgroup not available)
 //!
-//! # Problem
+//! # Design Principles
 //!
-//! When RustFS runs in a container, `sysinfo` reports the host's total CPU cores
-//! and memory, not the container's limits. This leads to:
-//! - Over-provisioned Tokio worker threads and blocking threads
-//! - Incorrect memory usage percentages in metrics
-//! - Memory budgets based on host RAM instead of container limits
-//!
-//! # Solution
-//!
-//! On Linux, this module reads cgroup v1/v2 limits directly from the filesystem:
-//! - CPU: `/sys/fs/cgroup/cpu.max` (v2) or `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` (v1)
-//! - Memory: `/sys/fs/cgroup/memory.max` (v2) or `/sys/fs/cgroup/memory/memory.limit_in_bytes` (v1)
-//!
-//! On other platforms, it returns None, allowing the caller to fall back to host values.
+//! - **Single source of truth**: All cgroup detection logic lives here
+//! - **Thread-safe**: Results are cached in `OnceLock` after first detection
+//! - **Zero-cost fallback**: Non-Linux platforms return host values immediately
+//! - **Environment overrides**: Operators can override detected values via env vars
 
 use std::sync::OnceLock;
 
-/// Cached cgroup resource limits (computed once at startup).
-static CGROUP_RESOURCES: OnceLock<CgroupResources> = OnceLock::new();
+// ============================================================================
+// Environment variable constants
+// ============================================================================
 
-/// Detected cgroup resource limits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CgroupResources {
-    /// CPU quota in cores (e.g., 2 means 2 cores). None if unlimited.
-    pub cpu_cores: Option<usize>,
-    /// Memory limit in bytes. None if unlimited.
-    pub memory_bytes: Option<u64>,
+/// Disable cgroup detection entirely (for testing or special cases).
+const ENV_DISABLE_CGROUP_DETECTION: &str = "RUSTFS_DISABLE_CGROUP_DETECTION";
+
+/// Override detected CPU cores (takes precedence over cgroup).
+const ENV_OVERRIDE_CPU_CORES: &str = "RUSTFS_OVERRIDE_CPU_CORES";
+
+/// Override detected memory limit in bytes (takes precedence over cgroup).
+const ENV_OVERRIDE_MEMORY_BYTES: &str = "RUSTFS_OVERRIDE_MEMORY_BYTES";
+
+// ============================================================================
+// Core types
+// ============================================================================
+
+/// Cached container resource configuration (computed once at startup).
+static CONTAINER_RESOURCES: OnceLock<ContainerResources> = OnceLock::new();
+
+/// Detected container resource limits with effective values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerResources {
+    /// Effective CPU cores (considering cgroup limits, overrides, and host).
+    pub cpu_cores: usize,
+    /// Effective memory limit in bytes (considering cgroup limits, overrides, and host).
+    pub memory_bytes: u64,
     /// Whether cgroup limits were detected.
-    pub detected: bool,
+    pub cgroup_detected: bool,
+    /// Whether values were overridden by environment variables.
+    pub overridden: bool,
 }
 
-// Linux-specific cgroup detection
+impl Default for ContainerResources {
+    fn default() -> Self {
+        Self {
+            cpu_cores: 1,
+            memory_bytes: 0,
+            cgroup_detected: false,
+            overridden: false,
+        }
+    }
+}
+
+// ============================================================================
+// Linux cgroup detection
+// ============================================================================
+
 #[cfg(target_os = "linux")]
-mod linux {
+mod cgroup {
     /// Cgroup v2 CPU limit path
     const CGROUP_V2_CPU_MAX_PATH: &str = "/sys/fs/cgroup/cpu.max";
     /// Cgroup v1 CPU quota path
@@ -80,29 +104,25 @@ mod linux {
 
     /// Detect CPU cores from cgroup v2 (`/sys/fs/cgroup/cpu.max`).
     ///
-    /// Format: `"$MAX_PERIOD"` or `"$QUOTA $PERIOD"` where MAX means unlimited.
+    /// Format: `"max"` (unlimited) or `"$QUOTA $PERIOD"` or `"$QUOTA"` (implicit period=100000).
     fn detect_cgroup_v2_cpus() -> Option<usize> {
         let content = std::fs::read_to_string(CGROUP_V2_CPU_MAX_PATH).ok()?;
         let parts: Vec<&str> = content.split_whitespace().collect();
 
         match parts.len() {
             1 => {
-                // Format: "$MAX" (unlimited) or "$QUOTA" with implicit period=100000
                 if parts[0] == "max" {
-                    return None; // Unlimited
+                    return None;
                 }
-                // Some systems use single value as quota with default period
                 let quota = parts[0].parse::<u64>().ok()?;
                 if quota == 0 {
                     return None;
                 }
-                let period = 100_000u64; // Default cgroup period
-                Some(quota.div_ceil(period) as usize)
+                Some(quota.div_ceil(100_000) as usize)
             }
             2 => {
-                // Format: "$QUOTA $PERIOD"
                 if parts[0] == "max" {
-                    return None; // Unlimited
+                    return None;
                 }
                 let quota = parts[0].parse::<u64>().ok()?;
                 let period = parts[1].parse::<u64>().ok()?;
@@ -119,19 +139,17 @@ mod linux {
     fn detect_cgroup_v1_cpus() -> Option<usize> {
         let quota = read_u64_from_file(CGROUP_V1_CPU_QUOTA_PATH)?;
         if quota == 0 || quota == u64::MAX {
-            return None; // Unlimited
+            return None;
         }
-
         let period = read_u64_from_file(CGROUP_V1_CPU_PERIOD_PATH).unwrap_or(100_000);
         if period == 0 {
             return None;
         }
-
         Some(quota.div_ceil(period) as usize)
     }
 
     /// Detect CPU cores from cgroup, trying v2 first, then v1.
-    pub(super) fn detect_cgroup_cpus() -> Option<usize> {
+    pub(super) fn detect_cpus() -> Option<usize> {
         detect_cgroup_v2_cpus().or_else(detect_cgroup_v1_cpus)
     }
 
@@ -140,7 +158,7 @@ mod linux {
         let content = std::fs::read_to_string(CGROUP_V2_MEMORY_MAX_PATH).ok()?;
         let trimmed = content.trim();
         if trimmed == "max" || trimmed.is_empty() {
-            return None; // Unlimited
+            return None;
         }
         trimmed.parse::<u64>().ok()
     }
@@ -156,164 +174,188 @@ mod linux {
     }
 
     /// Detect memory limit from cgroup, trying v2 first, then v1.
-    pub(super) fn detect_cgroup_memory() -> Option<u64> {
+    pub(super) fn detect_memory() -> Option<u64> {
         detect_cgroup_v2_memory().or_else(detect_cgroup_v1_memory)
     }
 }
 
-// Non-Linux platforms: cgroup not available
+// ============================================================================
+// Non-Linux fallback
+// ============================================================================
+
 #[cfg(not(target_os = "linux"))]
-mod linux {
+mod cgroup {
     /// Cgroup detection not available on non-Linux platforms.
-    pub(super) fn detect_cgroup_cpus() -> Option<usize> {
+    pub(super) fn detect_cpus() -> Option<usize> {
         None
     }
 
     /// Cgroup detection not available on non-Linux platforms.
-    pub(super) fn detect_cgroup_memory() -> Option<u64> {
+    pub(super) fn detect_memory() -> Option<u64> {
         None
     }
 }
 
-/// Detect all cgroup resources (called once and cached).
-fn detect_cgroup_resources() -> CgroupResources {
-    let cpu_cores = linux::detect_cgroup_cpus();
-    let memory_bytes = linux::detect_cgroup_memory();
-    let detected = cpu_cores.is_some() || memory_bytes.is_some();
+// ============================================================================
+// Resource detection and caching
+// ============================================================================
 
-    CgroupResources {
+/// Detect container resources (called once and cached).
+///
+/// Detection priority:
+/// 1. Environment variable overrides
+/// 2. cgroup v1/v2 limits (Linux only)
+/// 3. Host values from sysinfo
+fn detect_container_resources() -> ContainerResources {
+    // Check if cgroup detection is disabled
+    let cgroup_disabled = std::env::var(ENV_DISABLE_CGROUP_DETECTION)
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    // Detect cgroup limits if not disabled
+    let (cgroup_cpus, cgroup_memory) = if cgroup_disabled {
+        (None, None)
+    } else {
+        (cgroup::detect_cpus(), cgroup::detect_memory())
+    };
+
+    let cgroup_detected = cgroup_cpus.is_some() || cgroup_memory.is_some();
+
+    // Check for environment variable overrides
+    let override_cores = std::env::var(ENV_OVERRIDE_CPU_CORES)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0);
+
+    let override_memory = std::env::var(ENV_OVERRIDE_MEMORY_BYTES)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0);
+
+    let overridden = override_cores.is_some() || override_memory.is_some();
+
+    // Get host values for fallback
+    let host_cores = {
+        let mut sys =
+            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_memory().without_processes());
+        sys.refresh_cpu_all();
+        sys.cpus().len().max(1)
+    };
+
+    let host_memory = {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    };
+
+    // Determine effective values: override > cgroup > host
+    let cpu_cores = override_cores.or(cgroup_cpus).unwrap_or(host_cores).max(1);
+
+    let memory_bytes = override_memory.or(cgroup_memory).unwrap_or(host_memory);
+
+    ContainerResources {
         cpu_cores,
         memory_bytes,
-        detected,
+        cgroup_detected,
+        overridden,
     }
 }
 
-/// Get cached cgroup resource limits.
+/// Get cached container resource limits.
 ///
-/// This function is safe to call from multiple threads. The detection is performed
-/// once and the result is cached for the lifetime of the process.
-///
-/// # Platform Behavior
-///
-/// - **Linux**: Detects cgroup v1/v2 limits
-/// - **macOS/Windows**: Returns default (no limits detected)
-pub fn cgroup_resources() -> &'static CgroupResources {
-    CGROUP_RESOURCES.get_or_init(detect_cgroup_resources)
+/// This function is thread-safe. Detection is performed once and cached.
+pub fn container_resources() -> &'static ContainerResources {
+    CONTAINER_RESOURCES.get_or_init(detect_container_resources)
 }
 
-/// Get effective CPU cores, considering cgroup limits.
+/// Log container resource configuration at startup.
 ///
-/// Returns the minimum of host CPU count and cgroup CPU limit.
-/// If cgroup limit is not set, returns the host CPU count.
-///
-/// # Platform Behavior
-///
-/// - **Linux**: Returns min(host, cgroup_limit)
-/// - **macOS/Windows**: Returns host cores (no cgroup)
-pub fn effective_cpu_cores(host_cores: usize) -> usize {
-    let resources = cgroup_resources();
-    match resources.cpu_cores {
-        Some(cgroup_cores) => cgroup_cores.min(host_cores).max(1),
-        None => host_cores.max(1),
+/// Should be called once during startup to help operators verify detection.
+pub fn log_container_resources() {
+    let res = container_resources();
+
+    if res.overridden {
+        tracing::info!(
+            cpu_cores = res.cpu_cores,
+            memory_bytes = res.memory_bytes,
+            memory_mib = res.memory_bytes / (1024 * 1024),
+            cgroup_detected = res.cgroup_detected,
+            "container resources (overridden by environment variables)"
+        );
+    } else if res.cgroup_detected {
+        tracing::info!(
+            cpu_cores = res.cpu_cores,
+            memory_bytes = res.memory_bytes,
+            memory_mib = res.memory_bytes / (1024 * 1024),
+            "container resources (detected from cgroup)"
+        );
+    } else {
+        tracing::debug!(
+            cpu_cores = res.cpu_cores,
+            memory_bytes = res.memory_bytes,
+            "container resources (using host values)"
+        );
     }
 }
 
-/// Get effective memory, considering cgroup limits.
-///
-/// Returns the minimum of host memory and cgroup memory limit.
-/// If cgroup limit is not set, returns the host memory.
-///
-/// # Platform Behavior
-///
-/// - **Linux**: Returns min(host, cgroup_limit)
-/// - **macOS/Windows**: Returns host memory (no cgroup)
-pub fn effective_memory(host_memory: u64) -> u64 {
-    let resources = cgroup_resources();
-    match resources.memory_bytes {
-        Some(cgroup_memory) => cgroup_memory.min(host_memory),
-        None => host_memory,
-    }
+/// Get the memory basis string for metrics.
+pub fn memory_basis() -> &'static str {
+    let res = container_resources();
+    if res.cgroup_detected { "cgroup" } else { "host" }
 }
 
-/// Get the memory basis (host or cgroup) for the effective memory.
-///
-/// # Platform Behavior
-///
-/// - **Linux**: Returns "cgroup" if cgroup limit is active, "host" otherwise
-/// - **macOS/Windows**: Always returns "host"
-pub fn memory_basis(host_memory: u64) -> &'static str {
-    let resources = cgroup_resources();
-    match resources.memory_bytes {
-        Some(cgroup_memory) if cgroup_memory < host_memory => "cgroup",
-        _ => "host",
-    }
-}
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_cgroup_resources_default() {
-        let resources = CgroupResources::default();
-        assert_eq!(resources.cpu_cores, None);
-        assert_eq!(resources.memory_bytes, None);
-        assert!(!resources.detected);
+    fn test_container_resources_default() {
+        let resources = ContainerResources::default();
+        assert_eq!(resources.cpu_cores, 1);
+        assert_eq!(resources.memory_bytes, 0);
+        assert!(!resources.cgroup_detected);
+        assert!(!resources.overridden);
     }
 
     #[test]
-    fn test_effective_cpu_cores_no_cgroup() {
-        // Without cgroup limits, should return host cores
-        assert_eq!(effective_cpu_cores(8), 8);
-        assert_eq!(effective_cpu_cores(1), 1);
-    }
-
-    #[test]
-    fn test_effective_memory_no_cgroup() {
-        // Without cgroup limits, should return host memory
-        let host_mem = 8 * 1024 * 1024 * 1024;
-        assert_eq!(effective_memory(host_mem), host_mem);
-    }
-
-    #[test]
-    fn test_effective_cpu_cores_minimum_one() {
-        // Should always return at least 1
-        assert_eq!(effective_cpu_cores(0), 1);
-    }
-
-    #[test]
-    fn test_memory_basis_no_cgroup() {
-        let host_mem = 8 * 1024 * 1024 * 1024;
-        assert_eq!(memory_basis(host_mem), "host");
-    }
-
-    #[test]
-    fn test_cgroup_resources_cached() {
-        // Multiple calls should return the same resources
-        let res1 = cgroup_resources();
-        let res2 = cgroup_resources();
+    fn test_container_resources_cached() {
+        let res1 = container_resources();
+        let res2 = container_resources();
         assert_eq!(res1, res2);
+    }
+
+    #[test]
+    fn test_cpu_cores_minimum_one() {
+        // Even with 0 host cores, should return at least 1
+        let res = container_resources();
+        assert!(res.cpu_cores >= 1);
+    }
+
+    #[test]
+    fn test_memory_bytes_positive() {
+        let res = container_resources();
+        assert!(res.memory_bytes > 0);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_cgroup_detection() {
-        // On Linux, cgroup detection should work
-        let resources = cgroup_resources();
-        // In CI/container environments, cgroup might be available
+        let res = container_resources();
+        // On Linux, cgroup might or might not be available
         // Just verify the struct is valid
-        println!("Cgroup detected: {}", resources.detected);
-        println!("CPU cores: {:?}", resources.cpu_cores);
-        println!("Memory bytes: {:?}", resources.memory_bytes);
+        assert!(res.cpu_cores >= 1);
+        assert!(res.memory_bytes > 0);
     }
 
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_non_linux_cgroup_detection() {
-        // On non-Linux, cgroup detection should return None
-        let resources = cgroup_resources();
-        assert!(!resources.detected);
-        assert_eq!(resources.cpu_cores, None);
-        assert_eq!(resources.memory_bytes, None);
+        let res = container_resources();
+        assert!(!res.cgroup_detected);
+        assert!(!res.overridden);
     }
 }
