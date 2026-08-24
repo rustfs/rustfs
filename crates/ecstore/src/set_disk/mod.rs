@@ -620,8 +620,9 @@ impl SetDisks {
     }
 }
 
-/// Build an ad-hoc, deduplicated dirty scope from `disks`. Used by the heal
-/// path where disks are not in physical-slot order (backlog#1315).
+/// Build an ad-hoc, deduplicated dirty scope from `disks`. Used where the
+/// per-set generation fast path is intentionally bypassed: heal rewrites and
+/// an early-ACK tail whose first mark was drained before it completed.
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
     let mut unique = HashSet::with_capacity(disks.len());
     let mut scoped_disks = Vec::with_capacity(disks.len());
@@ -3091,6 +3092,9 @@ pub struct SetDisks {
     capacity_dirty_generation: Arc<AtomicU64>,
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
+    #[cfg(test)]
+    rename_tail_heal_capture:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_common::heal_channel::HealChannelRequest>>>>,
 }
 
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
@@ -3366,6 +3370,37 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    pub(in crate::set_disk) async fn submit_rename_tail_heal(&self, request: rustfs_common::heal_channel::HealChannelRequest) {
+        #[cfg(test)]
+        {
+            let capture = self
+                .rename_tail_heal_capture
+                .lock()
+                .expect("rename tail heal capture mutex should not poison")
+                .clone();
+            if let Some(capture) = capture {
+                let _ = capture.send(request);
+                return;
+            }
+        }
+
+        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::set_disk) fn capture_test_rename_tail_heals(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_common::heal_channel::HealChannelRequest> {
+        let (capture, requests) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = self
+            .rename_tail_heal_capture
+            .lock()
+            .expect("rename tail heal capture mutex should not poison");
+        assert!(slot.is_none(), "only one rename tail heal capture may be installed per set");
+        *slot = Some(capture);
+        requests
+    }
+
     fn storage_class_config_snapshot(&self) -> Arc<storageclass::Config> {
         #[cfg(test)]
         if let Some(config) = self
@@ -3669,6 +3704,8 @@ impl SetDisks {
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
             #[cfg(test)]
             storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(test)]
+            rename_tail_heal_capture: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -7514,7 +7551,7 @@ mod tests {
     // the ad-hoc scope the previous per-write construction produced, otherwise
     // dirty-disk keys diverge from the disk-cache keys and capacity counts drift.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn capacity_scope_memo_matches_adhoc_and_is_reused() {
         use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
 
@@ -7540,7 +7577,7 @@ mod tests {
     // write of each generation; steady-state writes skip it. Reverting the
     // generation skip makes the upgrade count grow per write and fails this test.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn record_capacity_scope_upgrades_registry_once_per_generation() {
         use rustfs_object_capacity::capacity_scope::{drain_global_dirty_scopes, global_dirty_upgrade_count};
 
@@ -7589,7 +7626,7 @@ mod tests {
     // backlog#1315: an offline slot must not force the per-write slow path, and
     // the resolved scope must still cover every online disk.
     #[tokio::test]
-    #[serial]
+    #[serial(capacity_dirty_scope)]
     async fn capacity_scope_tolerates_offline_slot_without_reallocating() {
         use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
 

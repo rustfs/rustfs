@@ -30,6 +30,7 @@ use super::object::{
 use crate::bucket::quota::reservation;
 use crate::crash_inject::{self, CrashPoint};
 use crate::multipart_listing::paginate_multipart_listing;
+use crate::set_disk::core::io_primitives::finish_rename_tail_heal;
 use futures::{StreamExt, stream};
 use std::future::Future;
 #[cfg(test)]
@@ -2580,7 +2581,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit_is_versioned = opts.versioned || opts.version_suspended;
         let commit_capacity_scope_token = opts.capacity_scope_token;
         let commit_object_lock_guard = object_lock_guard.take();
-        let detach_commit_owner = commit_object_lock_guard.is_some() || upload_guard.is_some() || quota_mutation_fence;
+        let commit_allows_early_ack = commit_object_lock_guard.is_some();
+        let detach_commit_owner = commit_allows_early_ack || upload_guard.is_some() || quota_mutation_fence;
         let commit = async move {
             let mut _object_lock_guard = commit_object_lock_guard;
             let mut _upload_guard = upload_guard;
@@ -2687,17 +2689,101 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
             // `get_object_info` lookup, so the backfill has no consumer here yet.
             Self::assign_rename_data_indexes(&mut parts_metadatas);
-            let rename_result = SetDisks::rename_data_owned(
+            let mut rename_result = SetDisks::rename_data_owned(
                 &commit_disks,
-                RUSTFS_META_MULTIPART_BUCKET,
-                &commit_upload_id_path,
+                (RUSTFS_META_MULTIPART_BUCKET, &commit_upload_id_path),
                 parts_metadatas,
-                &commit_bucket,
-                &commit_object,
+                (&commit_bucket, &commit_object),
                 write_quorum,
+                commit_allows_early_ack,
             )
             .await;
-            if quota_mutation_fence {
+            let mut rename_guard_release = None;
+            let mut needs_immediate_heal = false;
+            let mut tail_owns_staging_cleanup = false;
+            if let Ok(rename_commit) = rename_result.as_mut() {
+                commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
+                // Install the tail watcher before any post-commit await. The
+                // latch keeps namespace guards through their prior handoff point.
+                needs_immediate_heal = rename_commit.needs_immediate_heal();
+                if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
+                    tail_owns_staging_cleanup = true;
+                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                        commit_bucket.clone(),
+                        Some(commit_object.clone()),
+                        false,
+                        Some(HealChannelPriority::Normal),
+                        Some(commit_set.pool_index),
+                        Some(commit_set.set_index),
+                    );
+                    request.object_version_id = fi
+                        .version_id
+                        .or_else(|| commit_version_suspended.then(Uuid::nil))
+                        .map(|version_id| version_id.to_string());
+                    let object_lock_guard = _object_lock_guard.take();
+                    let upload_guard = _upload_guard.take();
+                    let cleanup_bucket = commit_bucket.clone();
+                    let cleanup_object = commit_object.clone();
+                    let heal_set = commit_set.clone();
+                    let cleanup_set = commit_set.clone();
+                    let committed_data_dir = fi.data_dir;
+                    let cleanup_parts = parts.clone();
+                    let cleanup_upload_path = commit_upload_id_path.clone();
+                    let cleanup_upload_id = commit_upload_id.clone();
+                    let fence_disks = commit_disks.clone();
+                    let fence_tokens = quota_fence_tokens.clone();
+                    let fence_bucket = commit_bucket.clone();
+                    let fence_object = commit_object.clone();
+                    let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
+                    rename_guard_release = Some(guard_release_tx);
+                    tokio::spawn(finish_rename_tail_heal(
+                        rename_tail_drain,
+                        guard_release_rx,
+                        (object_lock_guard, upload_guard),
+                        request,
+                        move || async move {
+                            if quota_mutation_fence {
+                                let _ = SetDisks::release_quota_mutation_fences(
+                                    &fence_disks,
+                                    &fence_tokens,
+                                    &fence_bucket,
+                                    &fence_object,
+                                    write_quorum,
+                                )
+                                .await;
+                            }
+                        },
+                        move |(object_lock_guard, upload_guard), targets| async move {
+                            drop(object_lock_guard);
+                            cleanup_set.cleanup_multipart_path(&cleanup_parts).await;
+                            cleanup_set
+                                .cleanup_rename_tail(
+                                    targets,
+                                    &cleanup_bucket,
+                                    &cleanup_object,
+                                    committed_data_dir,
+                                    transaction_epoch,
+                                )
+                                .await;
+                            if let Err(err) = cleanup_set
+                                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &cleanup_upload_path, write_quorum)
+                                .await
+                            {
+                                warn!(
+                                    bucket = %cleanup_bucket,
+                                    object = %cleanup_object,
+                                    upload_id = %cleanup_upload_id,
+                                    error = ?err,
+                                    "completed multipart upload staging cleanup did not reach write quorum"
+                                );
+                            }
+                            drop(upload_guard);
+                        },
+                        |request| async move { heal_set.submit_rename_tail_heal(request).await },
+                    ));
+                }
+            }
+            if quota_mutation_fence && !tail_owns_staging_cleanup {
                 let _ = SetDisks::release_quota_mutation_fences(
                     &commit_disks,
                     &quota_fence_tokens,
@@ -2714,16 +2800,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 Ok(result) => result,
                 Err(err) => return Err(err.into()),
             };
-            let online_disks = rename_commit.online_disks;
-            let convergence = rename_commit.convergence;
             let op_old_dir = rename_commit.data_dir;
             let cleanup_disks = rename_commit.cleanup_disks;
             let committed_file_info = rename_commit.committed_file_info;
-            let rename_tail_drain = rename_commit.tail_drain;
 
-            // Detach admission before any post-commit await: client cancellation
-            // must not couple durable convergence repair to cleanup work.
-            if convergence.needs_heal() {
+            if needs_immediate_heal {
                 let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
                     commit_bucket.clone(),
                     Some(commit_object.clone()),
@@ -2761,13 +2842,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts are swept by a retried completion or upload GC (rustfs/backlog#946).
             // Compiles to a no-op outside `#[cfg(test)]`.
             if crash_inject::should_crash_at(CrashPoint::MultipartAfterCommitBeforePartsCleanup, &commit_object) {
+                if let Some(release) = rename_guard_release.take() {
+                    let _ = release.send(false);
+                }
                 return Err(StorageError::Unexpected);
             }
 
             fi = committed_file_info;
             let committed_dir = fi.data_dir.unwrap_or_default().to_string();
-
-            commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &online_disks);
 
             fi.is_latest = true;
 
@@ -2778,30 +2860,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                 .await;
 
-            if let Some(rename_tail_drain) = rename_tail_drain {
-                let object_lock_guard = _object_lock_guard.take();
-                let upload_guard = _upload_guard.take();
-                let tail_bucket = commit_bucket.clone();
-                let tail_object = commit_object.clone();
-                tokio::spawn(async move {
-                    let _object_lock_guard = object_lock_guard;
-                    let _upload_guard = upload_guard;
-                    if let Err(err) = rename_tail_drain.await {
-                        warn!(
-                            event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_SET_DISK,
-                            state = "failed",
-                            bucket = %tail_bucket,
-                            object = %tail_object,
-                            error = %err,
-                            "rename tail drain failed"
-                        );
-                    }
-                });
-            } else {
-                drop(_object_lock_guard.take()); // release the object lock before multipart cleanup tail IO.
+            if let Some(release) = rename_guard_release.take() {
+                let _ = release.send(true);
             }
+            drop(_object_lock_guard.take()); // release the object lock before multipart cleanup tail IO.
 
             #[cfg(test)]
             pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterObjectPublication).await;
@@ -2814,14 +2876,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts; deleting them before the commit would strand the upload
             // permanently. This mirrors the "clean up only after commit" pattern
             // already used for the old data-dir GC and the upload-dir delete_all below.
-            commit_set.cleanup_multipart_path(&parts).await;
+            if !tail_owns_staging_cleanup {
+                commit_set.cleanup_multipart_path(&parts).await;
+            }
 
             if let Some(old_dir) = op_old_dir {
                 // backlog#898: best-effort reclaim of the dereferenced old data dir.
                 // Returns a receipt (never `Err`); a failed GC must not turn an
                 // already-committed multipart completion into a 503.
                 let cleanup = commit_set
-                    .commit_rename_data_dir(
+                    .commit_rename_data_dir_and_mark_capacity(
                         &cleanup_disks,
                         &commit_bucket,
                         &commit_object,
@@ -2845,9 +2909,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             #[cfg(test)]
             pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterRename).await;
 
-            if let Err(err) = commit_set
-                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &commit_upload_id_path, write_quorum)
-                .await
+            if !tail_owns_staging_cleanup
+                && let Err(err) = commit_set
+                    .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &commit_upload_id_path, write_quorum)
+                    .await
             {
                 warn!(
                     bucket = %commit_bucket,
@@ -2896,6 +2961,7 @@ mod tests {
     use crate::disk::{endpoint::Endpoint, format::FormatV3};
     use crate::layout::endpoints::SetupType;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
+    use crate::set_disk::core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
     // No-locker helpers resolve to the isolated-context variants (see
     // `hermetic_set_disks_isolated`); the guard-based tests build through
     // `hermetic_set_disks_with_lockers`, which stays on the bootstrap context
@@ -2903,6 +2969,7 @@ mod tests {
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
         hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
         hermetic_set_disks_isolated as hermetic_set_disks, hermetic_set_disks_with_lockers,
+        hermetic_set_disks_with_lockers_and_ctx,
     };
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -2910,7 +2977,11 @@ mod tests {
     use rustfs_config::server_config::KVS;
     use rustfs_lock::{LockClient, client::local::LocalClient};
     use serial_test::serial;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::HashSet,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
 
@@ -3281,6 +3352,203 @@ mod tests {
                 ..Default::default()
             }],
         )
+    }
+
+    #[tokio::test]
+    #[serial(capacity_dirty_scope)]
+    async fn recovered_disk_multipart_cleanup_marks_each_snapshot_it_mutates() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let recovered = disk_stores[0].clone();
+        let part_path = "recovered-multipart/part.1.meta";
+        recovered
+            .write_all(RUSTFS_META_MULTIPART_BUCKET, part_path, Bytes::from_static(b"stale part metadata"))
+            .await
+            .expect("recovered disk should contain staged part metadata");
+
+        set_disks.disks.write().await[0] = None;
+        let stale_snapshot = set_disks.get_disks_internal().await;
+        assert!(stale_snapshot[0].is_none(), "the pre-cleanup snapshot must exclude the disk");
+        set_disks.disks.write().await[0] = Some(recovered.clone());
+        let expected = capacity_scope_from_disks(&[Some(recovered.clone())])
+            .disks
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let _ = drain_global_dirty_scopes();
+
+        set_disks.cleanup_multipart_path(&[part_path.to_string()]).await;
+        assert!(matches!(
+            recovered.read_all(RUSTFS_META_MULTIPART_BUCKET, part_path).await,
+            Err(DiskError::FileNotFound)
+        ));
+        let part_marked = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+        assert!(expected.is_subset(&part_marked), "part cleanup must mark the recovered disk it mutated");
+
+        let upload_path = "recovered-multipart/upload/part.1";
+        recovered
+            .write_all(RUSTFS_META_MULTIPART_BUCKET, upload_path, Bytes::from_static(b"stale upload shard"))
+            .await
+            .expect("recovered disk should contain staged upload data");
+        set_disks
+            .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, "recovered-multipart/upload", 3)
+            .await
+            .expect("upload cleanup should use the recovered disk");
+        assert!(matches!(
+            recovered.read_all(RUSTFS_META_MULTIPART_BUCKET, upload_path).await,
+            Err(DiskError::FileNotFound)
+        ));
+        let upload_marked = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+        assert!(
+            expected.is_subset(&upload_marked),
+            "upload cleanup must mark the recovered disk it actually mutated"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(capacity_dirty_scope)]
+    async fn early_ack_multipart_holds_quota_fences_and_re_marks_capacity_after_tail_drain() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+            let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+            let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            instance_ctx.update_erasure_type(SetupType::DistErasure).await;
+            let (_temp_dirs, disk_stores, set_disks) =
+                hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, lockers, instance_ctx).await;
+            let bucket = "multipart-early-ack-capacity-scope";
+            let object = "multipart-early-ack-capacity-scope-object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let mut initial = PutObjReader::from_vec(vec![b'0'; 1 << 20]);
+            set_disks
+                .put_object(bucket, object, &mut initial, &ObjectOptions::default())
+                .await
+                .expect("initial object should commit before the multipart overwrite");
+            drop(
+                set_disks
+                    .acquire_write_lock_diag("multipart_capacity_fixture_ready", bucket, object)
+                    .await
+                    .expect("initial object tail should drain before the multipart overwrite"),
+            );
+            let multipart_body = vec![b'1'; 1 << 20];
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &multipart_body, &ObjectOptions::default()).await;
+            let (staged, _) = set_disks
+                .check_upload_id_exists(bucket, object, &upload_id, true)
+                .await
+                .expect("staged upload metadata should be readable");
+            let competing_upload_id = upload_id.clone();
+            let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+            let staged_part = format!(
+                "{upload_id_path}/{}/part.1",
+                staged.data_dir.expect("staged multipart data dir should exist")
+            );
+            signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
+            let candidate_disks = disk_stores.iter().cloned().map(Some).collect::<Vec<_>>();
+            let expected = capacity_scope_from_disks(&candidate_disks)
+                .disks
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let _ = drain_global_dirty_scopes();
+
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let complete_store = Arc::clone(&set_disks);
+            let complete = tokio::spawn(async move {
+                let mut opts = ObjectOptions::default();
+                assert!(opts.set_quota_admission(0, u64::MAX));
+                complete_store
+                    .complete_multipart_upload(bucket, object, &upload_id, parts, &opts)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("multipart completion should pause one tail disk during rename");
+            let cleanup_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+            complete
+                .await
+                .expect("early-ACK multipart task should join before tail release")
+                .expect("multipart completion should return after write quorum");
+            assert!(
+                rename_tasks.running() >= 1,
+                "the paused multipart tail disk must remain in flight after quorum ACK"
+            );
+
+            let initial = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&initial),
+                "the multipart quorum ACK must mark every candidate disk dirty"
+            );
+
+            let abort_store = Arc::clone(&set_disks);
+            let abort = tokio::spawn(async move {
+                abort_store
+                    .abort_multipart_upload(bucket, object, &competing_upload_id, &ObjectOptions::default())
+                    .await
+            });
+            signaling.wait_for_attempts(2).await;
+            assert!(!abort.is_finished(), "the detached tail owner must retain the multipart upload guard");
+
+            let retained_staging = futures::future::join_all(
+                disk_stores
+                    .iter()
+                    .map(|disk| disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &staged_part)),
+            )
+            .await
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+            assert_eq!(
+                retained_staging, 1,
+                "only the paused tail disk should still retain the multipart rename source"
+            );
+
+            signaling.set_target(rustfs_lock::ObjectKey::new(bucket, object));
+            let object_attempt = signaling.attempts.load(Ordering::Acquire) + 1;
+            let probe_store = Arc::clone(&set_disks);
+            let object_probe = tokio::spawn(async move {
+                probe_store
+                    .acquire_write_lock_diag("multipart_tail_object_guard_probe", bucket, object)
+                    .await
+            });
+            signaling.wait_for_attempts(object_attempt).await;
+            assert!(!object_probe.is_finished(), "the detached tail owner must retain the object guard");
+
+            rename_barrier.release();
+            object_probe
+                .await
+                .expect("object guard probe should join after the tail releases")
+                .expect("object guard probe should acquire after the tail releases");
+            tokio::time::timeout(Duration::from_secs(30), cleanup_barrier.wait_until_paused())
+                .await
+                .expect("the multipart tail should pause before reclaiming its old body");
+            let after_tail = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&after_tail),
+                "the multipart rename tail must re-mark capacity after the first scope was drained"
+            );
+            cleanup_barrier.release();
+            let abort_err = abort
+                .await
+                .expect("abort task should join after the tail releases")
+                .expect_err("the committed upload should no longer exist");
+            assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
+
+            for (disk_index, disk) in disk_stores.iter().enumerate() {
+                disk.read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .unwrap_or_else(|err| panic!("disk {disk_index} must claim its quota fence and finish the rename: {err}"));
+            }
+
+            let after_cleanup = drain_global_dirty_scopes().into_iter().collect::<HashSet<_>>();
+            assert!(
+                expected.is_subset(&after_cleanup),
+                "the multipart tail cleanup must re-mark capacity after its preceding scope was drained"
+            );
+        })
+        .await;
     }
 
     async fn put_test_part(
@@ -7469,13 +7737,30 @@ mod tests {
             let new = payload(0xC3);
             let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
             let parts_retry = parts_new.clone();
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
             crash_inject::arm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
             let crashed = complete(&set_disks, bucket, object, &u_new, parts_new).await;
             assert!(
                 matches!(crashed, Err(StorageError::Unexpected)),
                 "the armed post-commit crash point must be the failure that surfaced, got {crashed:?}"
             );
+            assert!(rename_tasks.running() >= 1, "the crash must interrupt an actual early-ACK tail handoff");
             crash_inject::disarm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+            rename_barrier.release();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the crash-interrupted rename tail should drain after release");
+            drop(
+                set_disks
+                    .acquire_write_lock_diag("post_commit_crash_tail_probe", bucket, object)
+                    .await
+                    .expect("the crash-interrupted tail should release its object guard"),
+            );
 
             // The commit landed: the new version reads back whole and correct.
             let (body, _etag) = read_object(&set_disks, bucket, object).await;
@@ -7519,7 +7804,7 @@ mod tests {
 
         #[tokio::test]
         #[serial(storage_class_env)]
-        async fn post_commit_crash_receipt_reclaims_old_data_after_restart() {
+        async fn post_commit_crash_reclaims_old_data_after_restart() {
             let _proof = install_remote_version_state_fleet_proof_for_test("object-transaction-fencing-test");
             let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
             let bucket = "multipart-crash-old-data-receipt";
@@ -7537,30 +7822,55 @@ mod tests {
                     complete(&set_disks, bucket, object, &u_old, parts_old)
                         .await
                         .expect("the old version should commit");
+                    drop(
+                        set_disks
+                            .acquire_write_lock_diag("post_commit_receipt_fixture_ready", bucket, object)
+                            .await
+                            .expect("the initial multipart tail should drain before inspecting one disk"),
+                    );
                     let old_dir = current_data_dir(&disk_stores[0], bucket, object).await;
 
                     let new = payload(0x52);
                     let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
+                    let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+                    let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
                     crash_inject::arm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
                     let crashed = complete(&set_disks, bucket, object, &u_new, parts_new).await;
                     assert!(
                         matches!(crashed, Err(StorageError::Unexpected)),
                         "the post-commit crash point must surface as unexpected, got {crashed:?}"
                     );
+                    assert!(rename_tasks.running() >= 1, "the crash must interrupt an actual early-ACK tail handoff");
                     crash_inject::disarm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+                    rename_barrier.release();
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while rename_tasks.running() != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the crash-interrupted rename tail should drain after release");
+                    drop(
+                        set_disks
+                            .acquire_write_lock_diag("post_commit_receipt_tail_probe", bucket, object)
+                            .await
+                            .expect("the crash-interrupted tail should release its object guard"),
+                    );
 
                     let (body, _) = read_object(&set_disks, bucket, object).await;
                     assert_eq!(body, new, "the committed replacement must remain readable after the crash");
+                    let mut receipts = 0;
                     for disk in &disk_stores {
-                        assert!(
-                            cleanup_receipt_exists(disk, bucket, object, old_dir).await,
-                            "post-commit crash must leave a durable old-data cleanup receipt"
-                        );
+                        receipts += usize::from(cleanup_receipt_exists(disk, bucket, object, old_dir).await);
                         assert!(
                             data_dir_exists(disk, bucket, object, old_dir).await,
                             "post-commit crash must leave old data for restart reconciliation"
                         );
                     }
+                    assert_eq!(
+                        receipts, 3,
+                        "the committed quorum must persist receipts while the crash-interrupted tail preserves staging"
+                    );
 
                     let restarted_endpoints = temp_dirs
                         .iter()
@@ -7605,7 +7915,12 @@ mod tests {
                         .reconcile_old_data_cleanup_receipts(bucket, object)
                         .await
                         .expect("restart receipt reconciliation should succeed");
-                    assert_eq!(removed, 4, "restart reconciler should delete all receipt targets");
+                    assert_eq!(removed, 3, "restart receipt reconciliation should delete the committed quorum's targets");
+                    let reclaimed = restarted_set
+                        .reclaim_orphan_data_dirs(bucket, object)
+                        .await
+                        .expect("restart orphan reconciliation should succeed");
+                    assert_eq!(reclaimed, 1, "the late commit without a receipt must remain reclaimable as an orphan");
                     for disk in &reloaded {
                         assert!(
                             !data_dir_exists(disk, bucket, object, old_dir).await,
