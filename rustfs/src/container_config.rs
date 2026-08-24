@@ -94,17 +94,15 @@ fn detect_container_config() -> ContainerConfig {
         (Some(override_val), _) => override_val,
         (None, Some(res)) => res.cpu_cores.unwrap_or_else(|| {
             // Fallback to host CPU count
-            let mut sys = sysinfo::System::new_with_specifics(
-                sysinfo::RefreshKind::everything().without_memory().without_processes(),
-            );
+            let mut sys =
+                sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_memory().without_processes());
             sys.refresh_cpu_all();
             sys.cpus().len().max(1)
         }),
         (None, None) => {
             // No cgroup, no override - use host CPU count
-            let mut sys = sysinfo::System::new_with_specifics(
-                sysinfo::RefreshKind::everything().without_memory().without_processes(),
-            );
+            let mut sys =
+                sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_memory().without_processes());
             sys.refresh_cpu_all();
             sys.cpus().len().max(1)
         }

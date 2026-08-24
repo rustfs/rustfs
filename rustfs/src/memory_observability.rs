@@ -420,10 +420,16 @@ fn record_effective_memory(total_bytes: u64, basis: &str) {
 /// This metric helps operators verify that RustFS correctly detected cgroup limits.
 fn record_cgroup_resource_detection(resources: &crate::cgroup_resources::CgroupResources) {
     if resources.detected {
-        metrics::gauge!("rustfs_cgroup_detected", "resource" => "cpu".to_string())
-            .set(if resources.cpu_cores.is_some() { 1.0 } else { 0.0 });
-        metrics::gauge!("rustfs_cgroup_detected", "resource" => "memory".to_string())
-            .set(if resources.memory_bytes.is_some() { 1.0 } else { 0.0 });
+        metrics::gauge!("rustfs_cgroup_detected", "resource" => "cpu".to_string()).set(if resources.cpu_cores.is_some() {
+            1.0
+        } else {
+            0.0
+        });
+        metrics::gauge!("rustfs_cgroup_detected", "resource" => "memory".to_string()).set(if resources.memory_bytes.is_some() {
+            1.0
+        } else {
+            0.0
+        });
 
         if let Some(cores) = resources.cpu_cores {
             metrics::gauge!("rustfs_cgroup_cpu_cores_limit").set(cores as f64);
