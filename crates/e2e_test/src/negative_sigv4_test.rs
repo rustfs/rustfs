@@ -34,6 +34,7 @@
 //! rejected header-SigV4 requests.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::request_signature_v4::{SIGN_V4_ALGORITHM, get_scope, get_signature, get_signing_key};
@@ -280,7 +281,8 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
     let mut env = RustFSTestEnvironment::new().await?;
     setup(&mut env).await?;
 
-    let path = format!("/{BUCKET}/tampered-payload.txt");
+    let key = "tampered-payload.txt";
+    let path = format!("/{BUCKET}/{key}");
     let claimed_body = b"the-body-i-claim-to-send";
     let actual_body = b"the-body-i-really-send!!";
     assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
@@ -295,17 +297,31 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            assert_ne!(status.as_u16(), 200, "payload mismatch must not succeed, body:\n{body}");
             assert!(
-                status.is_client_error() || status.is_server_error(),
-                "payload mismatch must be an error status, got {status}, body:\n{body}"
+                status.is_client_error(),
+                "payload mismatch must be rejected with a client error, got {status}, body:\n{body}"
             );
             info!(%status, "tampered payload rejected with error status");
         }
         // A mid-stream hash-mismatch abort surfacing as a transport error is
         // also a valid rejection (definitely not a 200 success).
-        Err(err) => info!(%err, "tampered payload rejected via transport error"),
+        Err(err) => {
+            assert!(!err.is_connect(), "connection failure is not proof of payload rejection: {err}");
+            assert!(!err.is_timeout(), "request timeout is not proof of payload rejection: {err}");
+            info!(%err, "tampered payload rejected via mid-stream transport error");
+        }
     }
+
+    let absent = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect_err("a tampered payload must not publish an object");
+    assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
     Ok(())
 }
 
