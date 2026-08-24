@@ -410,7 +410,7 @@ impl InventoryStateStore {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = path;
-            return Err(InventoryError::PlatformSecurity);
+            Err(InventoryError::PlatformSecurity)
         }
         #[cfg(target_os = "linux")]
         {
@@ -499,7 +499,7 @@ impl InventoryStateStore {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (now, after_open);
-            return Err(InventoryError::PlatformSecurity);
+            Err(InventoryError::PlatformSecurity)
         }
         #[cfg(target_os = "linux")]
         {
@@ -632,7 +632,7 @@ impl InventoryStateStore {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (destination, bytes, cancelled);
-            return Err(InventoryError::PlatformSecurity);
+            Err(InventoryError::PlatformSecurity)
         }
         #[cfg(target_os = "linux")]
         {
