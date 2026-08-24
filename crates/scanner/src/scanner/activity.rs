@@ -13,11 +13,13 @@
 // limitations under the License.
 /// Cycle wake/backoff policy and scanner activity observation (probing, generations, topology digest).
 use super::*;
+use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerCycleWakeReason {
     Timer,
     DirtyUsage,
+    MovementGeneration,
     ClusterActivity,
     ClusterMaintenance,
     ClusterActivityUnavailable,
@@ -250,6 +252,17 @@ impl ScannerCycleObservedGenerations {
     }
 }
 
+/// Movement state observed while a scanner waits for the next cycle.
+///
+/// Keeping the movement inputs together makes it harder for callers to pair a
+/// generation with the wrong notification or lock predicate.
+pub(super) struct ScannerMovementWaitContext<G, F> {
+    pub(super) movement_generation_seen: Option<u64>,
+    pub(super) movement_changed: Arc<Notify>,
+    pub(super) current_movement_generation: G,
+    pub(super) is_lock_lost: F,
+}
+
 pub(super) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,6 +275,8 @@ pub(crate) struct ScannerNodeActivity {
     pub(super) data_movement_active: bool,
     pub(super) dirty_usage_generation: u64,
     pub(super) dirty_usage_pending: bool,
+    pub(super) movement_generation: u64,
+    pub(super) publication_blocked: bool,
 }
 
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
@@ -278,6 +293,14 @@ pub(super) enum ScannerActivityObservation {
     NotRequired,
     Unchanged,
     Changed,
+    /// A storage-owned movement generation changed. This wake must bypass the
+    /// ordinary deferred cluster-activity backoff so publication can retry
+    /// after a transition reaches its terminal state.
+    MovementChanged,
+    /// A remote scanner process restarted. Publication leases are bound to the
+    /// process instance, so this must bypass deferred cluster-activity backoff
+    /// even when the restarted peer reports otherwise ordinary activity.
+    RemoteRestarted,
     MaintenanceChanged,
     Unverified,
 }
@@ -373,6 +396,8 @@ pub(super) fn scanner_activity_observed_work(observation: ScannerActivityObserva
     matches!(
         observation,
         ScannerActivityObservation::Changed
+            | ScannerActivityObservation::MovementChanged
+            | ScannerActivityObservation::RemoteRestarted
             | ScannerActivityObservation::MaintenanceChanged
             | ScannerActivityObservation::Unverified
     )
@@ -386,6 +411,7 @@ pub(super) fn scanner_activity_backoff_blocked_after_wake(currently_blocked: boo
     }
 }
 
+#[cfg(test)]
 pub(super) async fn wait_for_next_scanner_cycle<F>(
     ctx: &CancellationToken,
     delay: Duration,
@@ -397,61 +423,122 @@ pub(super) async fn wait_for_next_scanner_cycle<F>(
 where
     F: Fn() -> bool,
 {
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost,
+    };
+    wait_for_next_scanner_cycle_with_movement(
+        ctx,
+        delay,
+        ScannerCycleObservedGenerations {
+            dirty_usage: dirty_usage_generation_seen,
+            runtime_config: runtime_config_generation,
+            maintenance: maintenance_generation,
+            defer_cluster_activity: false,
+        },
+        &movement,
+    )
+    .await
+}
+
+pub(super) async fn wait_for_next_scanner_cycle_with_movement<G, F>(
+    ctx: &CancellationToken,
+    delay: Duration,
+    generations: ScannerCycleObservedGenerations,
+    movement: &ScannerMovementWaitContext<G, F>,
+) -> ScannerCycleWakeReason
+where
+    F: Fn() -> bool,
+    G: Fn() -> u64,
+{
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
     let lock_poll = tokio::time::sleep(SCANNER_LEADER_LOCK_POLL_INTERVAL);
     tokio::pin!(lock_poll);
 
     loop {
-        if is_lock_lost() {
+        if (movement.is_lock_lost)() {
             return ScannerCycleWakeReason::LeaderLockLost;
         }
-        if scanner_runtime_config_generation() != runtime_config_generation {
+        if scanner_runtime_config_generation() != generations.runtime_config {
             return ScannerCycleWakeReason::RuntimeConfig;
         }
-        if scanner_maintenance_generation() != maintenance_generation {
+        if scanner_maintenance_generation() != generations.maintenance {
             return ScannerCycleWakeReason::MaintenanceConfig;
         }
-        if dirty_usage_generation_seen.is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen) {
+        if generations
+            .dirty_usage
+            .is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen)
+        {
             return ScannerCycleWakeReason::DirtyUsage;
         }
+        if movement
+            .movement_generation_seen
+            .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+        {
+            return ScannerCycleWakeReason::MovementGeneration;
+        }
 
+        let movement_notification = movement.movement_changed.notified();
+        tokio::pin!(movement_notification);
+        movement_notification.as_mut().enable();
+        // A transition may finish between the initial generation read and
+        // registration with Notify. Re-check after `enable()` so that such a
+        // transition cannot be lost when it used `notify_waiters()`.
+        if movement
+            .movement_generation_seen
+            .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+        {
+            return ScannerCycleWakeReason::MovementGeneration;
+        }
         tokio::select! {
             _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
             _ = &mut sleep => return ScannerCycleWakeReason::Timer,
             _ = &mut lock_poll => {
-                if is_lock_lost() {
+                if (movement.is_lock_lost)() {
                     return ScannerCycleWakeReason::LeaderLockLost;
                 }
                 lock_poll.as_mut().reset(Instant::now() + SCANNER_LEADER_LOCK_POLL_INTERVAL);
             }
             _ = dirty_usage_bucket_notified() => {
-                if scanner_runtime_config_generation() != runtime_config_generation {
+                if scanner_runtime_config_generation() != generations.runtime_config {
                     return ScannerCycleWakeReason::RuntimeConfig;
                 }
-                if scanner_maintenance_generation() != maintenance_generation {
+                if scanner_maintenance_generation() != generations.maintenance {
                     return ScannerCycleWakeReason::MaintenanceConfig;
                 }
-                if dirty_usage_generation_seen
+                if generations
+                    .dirty_usage
                     .is_some_and(|seen| dirty_usage_buckets_pending() && dirty_usage_generation() != seen)
                 {
                     return ScannerCycleWakeReason::DirtyUsage;
                 }
             }
             _ = scanner_runtime_config_changed() => {
-                if scanner_runtime_config_generation() != runtime_config_generation {
+                if scanner_runtime_config_generation() != generations.runtime_config {
                     return ScannerCycleWakeReason::RuntimeConfig;
                 }
             }
             _ = scanner_maintenance_changed() => {
-                if scanner_maintenance_generation() != maintenance_generation {
+                if scanner_maintenance_generation() != generations.maintenance {
                     return ScannerCycleWakeReason::MaintenanceConfig;
+                }
+            }
+            _ = &mut movement_notification => {
+                if movement
+                    .movement_generation_seen
+                    .is_some_and(|seen| (movement.current_movement_generation)() != seen)
+                {
+                    return ScannerCycleWakeReason::MovementGeneration;
                 }
             }
         }
     }
 }
 
+#[cfg(test)]
 pub(super) async fn wait_for_next_scanner_cycle_with_activity<F, Probe, ProbeFuture>(
     ctx: &CancellationToken,
     delay: Duration,
@@ -459,10 +546,43 @@ pub(super) async fn wait_for_next_scanner_cycle_with_activity<F, Probe, ProbeFut
     activity_seen: &mut Option<ScannerActivitySnapshot>,
     generations: ScannerCycleObservedGenerations,
     is_lock_lost: F,
+    probe_activity: Probe,
+) -> ScannerCycleWakeReason
+where
+    F: Fn() -> bool,
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: Future<Output = Result<ScannerActivitySnapshot, String>>,
+{
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost,
+    };
+    wait_for_next_scanner_cycle_with_activity_and_movement(
+        ctx,
+        delay,
+        activity_poll_interval,
+        activity_seen,
+        generations,
+        movement,
+        probe_activity,
+    )
+    .await
+}
+
+pub(super) async fn wait_for_next_scanner_cycle_with_activity_and_movement<F, G, Probe, ProbeFuture>(
+    ctx: &CancellationToken,
+    delay: Duration,
+    activity_poll_interval: Option<Duration>,
+    activity_seen: &mut Option<ScannerActivitySnapshot>,
+    generations: ScannerCycleObservedGenerations,
+    movement: ScannerMovementWaitContext<G, F>,
     mut probe_activity: Probe,
 ) -> ScannerCycleWakeReason
 where
     F: Fn() -> bool,
+    G: Fn() -> u64,
     Probe: FnMut() -> ProbeFuture,
     ProbeFuture: Future<Output = Result<ScannerActivitySnapshot, String>>,
 {
@@ -475,15 +595,7 @@ where
         let wait_slice = activity_poll_interval
             .map(|interval| interval.max(Duration::from_secs(1)).min(remaining))
             .unwrap_or(remaining);
-        let wake_reason = wait_for_next_scanner_cycle(
-            ctx,
-            wait_slice,
-            generations.dirty_usage,
-            generations.runtime_config,
-            generations.maintenance,
-            &is_lock_lost,
-        )
-        .await;
+        let wake_reason = wait_for_next_scanner_cycle_with_movement(ctx, wait_slice, generations, &movement).await;
         if wake_reason != ScannerCycleWakeReason::Timer || Instant::now() >= deadline {
             return wake_reason;
         }
@@ -491,7 +603,7 @@ where
         let Some(_) = activity_poll_interval else {
             return ScannerCycleWakeReason::Timer;
         };
-        if is_lock_lost() {
+        if (movement.is_lock_lost)() {
             return ScannerCycleWakeReason::LeaderLockLost;
         }
 
@@ -500,7 +612,7 @@ where
         let lock_lost = async {
             loop {
                 tokio::time::sleep(SCANNER_LEADER_LOCK_POLL_INTERVAL).await;
-                if is_lock_lost() {
+                if (movement.is_lock_lost)() {
                     break;
                 }
             }
@@ -519,6 +631,9 @@ where
         }
         match observation {
             ScannerActivityObservation::Unchanged | ScannerActivityObservation::NotRequired => {}
+            ScannerActivityObservation::MovementChanged | ScannerActivityObservation::RemoteRestarted => {
+                return ScannerCycleWakeReason::ClusterActivity;
+            }
             ScannerActivityObservation::Changed if !generations.defer_cluster_activity => {
                 return ScannerCycleWakeReason::ClusterActivity;
             }
@@ -568,11 +683,22 @@ pub(super) fn compare_scanner_activity(
         let Some(previous_activity) = previous.get(host) else {
             continue;
         };
+        if host != LOCAL_SCANNER_ACTIVITY_NODE && previous_activity.instance_id != current_activity.instance_id {
+            return ScannerActivityObservation::RemoteRestarted;
+        }
         if host != LOCAL_SCANNER_ACTIVITY_NODE
             && previous_activity.instance_id == current_activity.instance_id
             && previous_activity.maintenance_generation != current_activity.maintenance_generation
         {
             return ScannerActivityObservation::MaintenanceChanged;
+        }
+
+        if previous_activity.instance_id == current_activity.instance_id
+            && (previous_activity.data_movement_active != current_activity.data_movement_active
+                || previous_activity.movement_generation != current_activity.movement_generation
+                || previous_activity.publication_blocked != current_activity.publication_blocked)
+        {
+            return ScannerActivityObservation::MovementChanged;
         }
     }
 
@@ -630,12 +756,28 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
         hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.dirty_usage_generation.to_be_bytes());
         hasher.update([u8::from(activity.dirty_usage_pending)]);
+        hasher.update(activity.movement_generation.to_be_bytes());
+        hasher.update([u8::from(activity.publication_blocked)]);
     }
     hasher.finalize().into()
 }
 
 pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivitySnapshot) -> bool {
-    snapshot.values().all(|activity| !activity.data_movement_active)
+    !snapshot.is_empty()
+        && snapshot.values().all(|activity| {
+            activity.protocol_version == SCANNER_ACTIVITY_PROTOCOL_VERSION
+                && activity.movement_generation != u64::MAX
+                && !activity.data_movement_active
+                && !activity.publication_blocked
+        })
+}
+
+pub(crate) fn scanner_activity_publication_lease_targets(snapshot: &ScannerActivitySnapshot) -> Vec<(String, String, u64)> {
+    snapshot
+        .iter()
+        .filter(|(host, _)| host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE)
+        .map(|(host, activity)| (host.clone(), activity.instance_id.clone(), activity.movement_generation))
+        .collect()
 }
 
 pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySnapshot) -> Vec<ScannerDirtyUsageAcknowledgement> {
@@ -695,11 +837,15 @@ pub(super) fn record_scanner_activity_instance(
 
 pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool) -> Result<ScannerActivitySnapshot, String> {
     let topology_digest = scanner_topology_digest(storeapi);
-    let data_movement_active = storeapi.scanner_data_movement_active().await;
+    let (data_movement_active, publication_blocked, movement_generation) = storeapi.scanner_data_movement_activity().await;
     let namespace_generation = storeapi.scanner_namespace_mutation_generation();
     let maintenance_generation = scanner_maintenance_generation();
     let dirty_usage = scanner_dirty_usage_state();
-    if namespace_generation == u64::MAX || maintenance_generation == u64::MAX || dirty_usage.generation == u64::MAX {
+    if namespace_generation == u64::MAX
+        || maintenance_generation == u64::MAX
+        || dirty_usage.generation == u64::MAX
+        || movement_generation == u64::MAX
+    {
         return Err("local scanner activity generation is exhausted".to_string());
     }
     let local_instance_id = crate::scanner_io::scanner_activity_epoch().to_string();
@@ -715,6 +861,8 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
             data_movement_active,
             dirty_usage_generation: dirty_usage.generation,
             dirty_usage_pending: dirty_usage.pending,
+            movement_generation,
+            publication_blocked,
         },
     )]);
     if !distributed {
@@ -732,39 +880,57 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
         if activity.namespace_generation == u64::MAX || activity.maintenance_generation == u64::MAX {
             return Err(format!("scanner activity peer {host} exhausted its activity generation"));
         }
-        let (peer_topology_digest, peer_data_movement_active, peer_dirty_usage_generation, peer_dirty_usage_pending) =
-            match activity.protocol_version {
-                SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
-                    return Err(format!("scanner activity peer {host} cannot verify data movement publication fencing"));
-                }
-                SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
-                    return Err(format!(
-                        "scanner activity peer {host} cannot safely share scanner cache locks with protocol {}",
-                        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION
-                    ));
-                }
-                SCANNER_ACTIVITY_PROTOCOL_VERSION => (
-                    activity
-                        .topology_digest
-                        .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
-                    activity
-                        .data_movement_active
-                        .ok_or_else(|| format!("scanner activity peer {host} omitted its data movement state"))?,
-                    activity
-                        .dirty_usage_generation
-                        .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage generation"))?,
-                    activity
-                        .dirty_usage_pending
-                        .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage state"))?,
-                ),
-                version => {
-                    return Err(format!(
-                        "scanner activity peer {host} uses protocol {version}, expected {}",
-                        SCANNER_ACTIVITY_PROTOCOL_VERSION
-                    ));
-                }
-            };
-        if peer_dirty_usage_generation == u64::MAX {
+        let (
+            peer_topology_digest,
+            peer_data_movement_active,
+            peer_dirty_usage_generation,
+            peer_dirty_usage_pending,
+            peer_movement_generation,
+            peer_publication_blocked,
+        ) = match activity.protocol_version {
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
+                return Err(format!("scanner activity peer {host} cannot verify data movement publication fencing"));
+            }
+            SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+                return Err(format!(
+                    "scanner activity peer {host} cannot safely share scanner cache locks with protocol {}",
+                    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION
+                ));
+            }
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
+                return Err(format!(
+                    "scanner activity peer {host} cannot verify terminal movement state with protocol {}",
+                    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION
+                ));
+            }
+            SCANNER_ACTIVITY_PROTOCOL_VERSION => (
+                activity
+                    .topology_digest
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
+                activity
+                    .data_movement_active
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its data movement state"))?,
+                activity
+                    .dirty_usage_generation
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage generation"))?,
+                activity
+                    .dirty_usage_pending
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage state"))?,
+                activity
+                    .movement_generation
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its movement generation"))?,
+                activity
+                    .publication_blocked
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its publication blocked state"))?,
+            ),
+            version => {
+                return Err(format!(
+                    "scanner activity peer {host} uses protocol {version}, expected {}",
+                    SCANNER_ACTIVITY_PROTOCOL_VERSION
+                ));
+            }
+        };
+        if peer_dirty_usage_generation == u64::MAX || peer_movement_generation == u64::MAX {
             return Err(format!("scanner activity peer {host} exhausted its dirty usage generation"));
         }
         if peer_topology_digest != topology_digest {
@@ -783,6 +949,8 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
                     data_movement_active: peer_data_movement_active,
                     dirty_usage_generation: peer_dirty_usage_generation,
                     dirty_usage_pending: peer_dirty_usage_pending,
+                    movement_generation: peer_movement_generation,
+                    publication_blocked: peer_publication_blocked,
                 },
             )
             .is_some()

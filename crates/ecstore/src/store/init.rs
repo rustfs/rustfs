@@ -677,7 +677,7 @@ mod tests {
     };
     use crate::{
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
-        core::pools::{POOL_META_FORMAT, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
+        core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
         disk::endpoint::Endpoint,
         error::{Error, Result, StorageError},
         io_support::rio::{WritePlan, compression_metadata_value},
@@ -691,7 +691,6 @@ mod tests {
             range::HTTPRangeSpec,
         },
     };
-    use byteorder::{LittleEndian, WriteBytesExt};
     #[cfg(feature = "test-util")]
     use futures::{StreamExt as _, TryStreamExt as _};
     use http::HeaderMap;
@@ -721,13 +720,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn startup_pool_meta_payload(meta: &PoolMeta) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
-            .expect("pool metadata format should encode");
-        data.write_u16::<LittleEndian>(POOL_META_VERSION)
-            .expect("pool metadata version should encode");
-        data.extend(rmp_serde::to_vec(meta).expect("legacy pool metadata payload should encode"));
-        data
+        meta.encode_config_data_for_test().expect("pool metadata should encode")
     }
 
     #[derive(Debug)]

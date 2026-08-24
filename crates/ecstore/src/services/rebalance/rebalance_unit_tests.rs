@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::control::validate_rebalance_disk_stats_coverage;
+use super::control::{fail_next_rebalance_activation_save_for_test, validate_rebalance_disk_stats_coverage};
 use super::meta::{
     RebalanceMetaMergeOutcome, RebalanceTerminalEvent, apply_rebalance_save_option, apply_rebalance_terminal_event,
     apply_stopped_at, classify_rebalance_terminal_event, clone_arc_by_index, clone_first_arc, clone_rebalance_pool_stats,
@@ -32,7 +32,11 @@ use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
     rebalance_delete_marker_opts,
 };
-use super::runtime::{should_fail_repeated_rebalance_bucket_defer, source_cleanup_defer_attempt};
+use super::runtime::{
+    RebalanceLocalActivationOutcome, commit_local_rebalance_worker_activation,
+    commit_local_rebalance_worker_activation_candidate, should_fail_repeated_rebalance_bucket_defer,
+    source_cleanup_defer_attempt, stage_local_rebalance_worker_activation,
+};
 use super::worker::{
     RebalanceEntryCleanupResult, ensure_rebalance_listing_disks_available, is_transient_rebalance_error,
     parse_rebalance_max_attempts, rebalance_listing_retry_delay, rebalance_migration_retry_delay,
@@ -48,6 +52,7 @@ use super::worker::{
 use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketConfigs,
     RebalanceBucketOutcome, RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
+    RebalanceStopPropagationRecord,
 };
 use super::{REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX};
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
@@ -2706,6 +2711,281 @@ async fn test_start_rebalance_for_id_rejects_stopped_metadata() {
         .expect_err("staged start must not restart stopped metadata");
 
     assert!(err.to_string().contains("was stopped before start"));
+}
+
+#[test]
+fn test_stopped_activation_state_prevents_worker_token_commit() {
+    let mut meta = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        stopped_at: Some(OffsetDateTime::now_utc()),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let outcome = commit_local_rebalance_worker_activation(&mut meta, "rebalance-a", tokio_util::sync::CancellationToken::new())
+        .expect("stopped metadata should produce a non-start outcome");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::NotStartedTerminal);
+    assert!(meta.cancel.is_none(), "stopped rebalance must not receive a worker token");
+}
+
+#[test]
+fn test_rebalance_activation_candidate_does_not_clobber_replacement_token() {
+    let mut local = RebalanceMeta {
+        id: "rebalance-a".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (candidate, outcome, must_persist) =
+        stage_local_rebalance_worker_activation(&local, "rebalance-a", CancellationToken::new(), OffsetDateTime::UNIX_EPOCH)
+            .expect("active activation candidate should be staged");
+    assert_eq!(outcome, RebalanceLocalActivationOutcome::Started);
+    assert!(!must_persist);
+
+    let replacement = CancellationToken::new();
+    local.cancel = Some(replacement.clone());
+    let err = commit_local_rebalance_worker_activation_candidate(&mut local, "rebalance-a", None, candidate)
+        .expect_err("a replacement token must reject the stale activation candidate");
+    assert!(err.to_string().contains("worker token changed"));
+    assert_eq!(local.cancel.as_ref(), Some(&replacement));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_rebalance_start_save_failure_retries_persisted_completed_state() {
+    let active = RebalanceMeta {
+        id: "rebalance-real-save-completed".to_string(),
+        percent_free_goal: 0.5,
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            init_free_space: 400,
+            init_capacity: 1_000,
+            bytes: 100,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (_temp_dirs, store) = super::test_store_with_persisted_rebalance_meta(active).await;
+
+    fail_next_rebalance_activation_save_for_test("rebalance-real-save-completed");
+    let err = store
+        .start_rebalance_under_gate()
+        .await
+        .expect_err("the injected first activation save must fail through the real start path");
+    assert!(err.to_string().contains("injected rebalance activation save failure"));
+    {
+        let local = store.rebalance_meta.read().await;
+        let local = local.as_ref().expect("local rebalance metadata should remain present");
+        assert_eq!(local.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(local.cancel.is_none(), "failed persistence must not publish a worker token");
+    }
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(store.pools[0].clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+
+    store
+        .start_rebalance_under_gate()
+        .await
+        .expect("the real start path must retry and persist the terminal candidate");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(store.pools[0].clone())
+        .await
+        .expect("retry-persisted completed metadata should be readable");
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Completed);
+    let local = store.rebalance_meta.read().await;
+    let local = local.as_ref().expect("local rebalance metadata should remain present");
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Completed);
+    assert!(local.cancel.is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_rebalance_start_save_failure_retries_persisted_stopped_state() {
+    let active = RebalanceMeta {
+        id: "rebalance-real-save-stopped".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (_temp_dirs, store) = super::test_store_with_persisted_rebalance_meta(active).await;
+    let stopped_at = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+    {
+        let mut local = store.rebalance_meta.write().await;
+        let local = local.as_mut().expect("local rebalance metadata should remain present");
+        local.stopped_at = Some(stopped_at);
+        local.pool_stats[0].info.status = RebalStatus::Stopped;
+        local.pool_stats[0].info.end_time = Some(stopped_at);
+    }
+
+    fail_next_rebalance_activation_save_for_test("rebalance-real-save-stopped");
+    let err = store
+        .start_rebalance_under_gate()
+        .await
+        .expect_err("the injected first stopped-state save must fail through the real start path");
+    assert!(err.to_string().contains("injected rebalance activation save failure"));
+    let mut after_failure = RebalanceMeta::new();
+    after_failure
+        .load(store.pools[0].clone())
+        .await
+        .expect("active metadata should remain readable after the failed save");
+    assert_eq!(after_failure.pool_stats[0].info.status, RebalStatus::Started);
+    {
+        let local = store.rebalance_meta.read().await;
+        let local = local.as_ref().expect("local rebalance metadata should remain present");
+        assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
+        assert!(local.cancel.is_none(), "failed persistence must not publish a worker token");
+    }
+
+    store
+        .start_rebalance_under_gate()
+        .await
+        .expect("the real start path must retry and persist the stopped candidate");
+
+    let mut persisted = RebalanceMeta::new();
+    persisted
+        .load(store.pools[0].clone())
+        .await
+        .expect("retry-persisted stopped metadata should be readable");
+    assert_eq!(persisted.stopped_at, Some(stopped_at));
+    assert_eq!(persisted.pool_stats[0].info.status, RebalStatus::Stopped);
+    let local = store.rebalance_meta.read().await;
+    let local = local.as_ref().expect("local rebalance metadata should remain present");
+    assert_eq!(local.pool_stats[0].info.status, RebalStatus::Stopped);
+    assert!(local.cancel.is_none());
+}
+
+#[tokio::test]
+async fn test_old_worker_cannot_mutate_replacement_rebalance_state() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            buckets: vec!["bucket-a".to_string()],
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let fi = FileInfo {
+        size: 128,
+        ..Default::default()
+    };
+
+    for err in [
+        store
+            .next_rebal_bucket(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not read replacement work"),
+        store
+            .bucket_rebalance_done(0, "bucket-a".to_string(), "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement bucket"),
+        store
+            .update_pool_stats_batch_for_rebalance(0, "bucket-a".to_string(), &[&fi], "rebalance-a")
+            .await
+            .expect_err("old worker must not update replacement stats"),
+        store
+            .check_if_rebalance_done(0, "rebalance-a")
+            .await
+            .expect_err("old worker must not complete replacement pool"),
+        store
+            .save_rebalance_stats_for_id(0, RebalSaveOpt::Stats, "rebalance-a")
+            .await
+            .expect_err("old save task must not persist replacement metadata"),
+        store
+            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, "rebalance-a")
+            .await
+            .expect_err("old stop path must not persist replacement metadata"),
+    ] {
+        assert!(err.to_string().contains("stale rebalance worker rejected"));
+    }
+
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.pool_stats[0].rebalanced_buckets.is_empty());
+    assert_eq!(meta.pool_stats[0].bytes, 0);
+    assert_eq!(meta.pool_stats[0].info.status, RebalStatus::Started);
+    assert!(meta.stopped_at.is_none());
+}
+
+#[tokio::test]
+async fn test_rebalance_metadata_reload_under_start_gate_does_not_reacquire_gate() {
+    let store = test_store_with_rebalance_meta(RebalanceMeta::default());
+    let _start_guard = store.start_gate.lock().await;
+
+    let err = store
+        .load_rebalance_meta_under_start_gate()
+        .await
+        .expect_err("empty test store should reach the metadata load without waiting on start_gate again");
+
+    assert!(err.to_string().contains("no pools available"));
+}
+
+#[tokio::test]
+async fn test_stale_stop_propagation_cannot_mutate_replacement_rebalance() {
+    let meta = RebalanceMeta {
+        id: "rebalance-b".to_string(),
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let store = test_store_with_rebalance_meta(meta);
+    let record = RebalanceStopPropagationRecord {
+        stop_failures: vec!["old rebalance stop failed".to_string()],
+        ..Default::default()
+    };
+
+    let err = store
+        .record_rebalance_stop_propagation("rebalance-a", record)
+        .await
+        .expect_err("old propagation failure must not mutate replacement metadata");
+
+    assert!(err.to_string().contains("stale rebalance worker rejected"));
+    let meta = store.rebalance_meta.read().await;
+    let meta = meta.as_ref().expect("replacement metadata should remain present");
+    assert_eq!(meta.id, "rebalance-b");
+    assert!(meta.last_refreshed_at.is_none());
+    assert!(meta.pool_stats[0].info.last_error.is_none());
 }
 
 fn test_store_with_rebalance_meta(meta: RebalanceMeta) -> Arc<crate::store::ECStore> {

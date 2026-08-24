@@ -41,6 +41,7 @@
 | copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
 | create_bucket_region_test | 2 | ✅ |
+| data_usage_test | 2 |  |
 | degraded_read_eof_regression_test | 3 |  |
 | delete_marker_migration_semantics_test | 2 | ✅ |
 | delete_object_no_content_length_test | 1 |  |
@@ -80,6 +81,7 @@
 | object_lambda_test | 16 | 🌙 |
 | object_lock | 34 |  |
 | overwrite_cleanup_regression_test | 1 |  |
+| policy | 6 |  |
 | presigned_negative_test | 7 | ✅ |
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |

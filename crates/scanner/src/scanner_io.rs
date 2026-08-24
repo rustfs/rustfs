@@ -239,6 +239,13 @@ fn classify_nsscanner_cycle(
     dirty_usage_status: DirtyUsageSnapshotStatus,
     activity_status: ScannerCycleActivityStatus,
 ) -> ScannerCycleStatus {
+    // The post-scan activity proof is required regardless of why the scan was
+    // incomplete.  Returning Incomplete first would apply the long ordinary
+    // retry/backoff path to an unverifiable publication and could acknowledge
+    // a cycle without a movement-generation proof.
+    if activity_status == ScannerCycleActivityStatus::Unverified {
+        return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+    }
     if budget_elapsed
         || cancelled
         || !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
@@ -252,7 +259,6 @@ fn classify_nsscanner_cycle(
 
     match (activity_status, dirty_usage_status) {
         (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        (ScannerCycleActivityStatus::Unverified, _) => ScannerCycleStatus::Incomplete,
         _ => ScannerCycleStatus::Superseded,
     }
 }
@@ -307,10 +313,16 @@ async fn scanner_cycle_activity_status(
     store: &ECStore,
     distributed: bool,
     before: &crate::scanner::ScannerActivitySnapshot,
-) -> ScannerCycleActivityStatus {
+) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>) {
     match crate::scanner::probe_scanner_activity(store, distributed).await {
-        Ok(after) if after == *before => ScannerCycleActivityStatus::Unchanged,
-        Ok(_) => ScannerCycleActivityStatus::Changed,
+        Ok(after) => {
+            let status = if after == *before {
+                ScannerCycleActivityStatus::Unchanged
+            } else {
+                ScannerCycleActivityStatus::Changed
+            };
+            (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
+        }
         Err(err) => {
             warn!(
                 target: "rustfs::scanner::io",
@@ -321,7 +333,7 @@ async fn scanner_cycle_activity_status(
                 error = %err,
                 "Scanner cycle activity verification failed"
             );
-            ScannerCycleActivityStatus::Unverified
+            (ScannerCycleActivityStatus::Unverified, Vec::new())
         }
     }
 }
@@ -599,6 +611,7 @@ pub(crate) struct ScannerCycleResult {
     publication_epoch: Option<u64>,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    remote_publication_lease_targets: Vec<(String, String, u64)>,
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
     required_cycle_floor: Option<u64>,
@@ -611,6 +624,7 @@ impl ScannerCycleResult {
             publication_epoch: None,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
+            remote_publication_lease_targets: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
@@ -647,6 +661,15 @@ impl ScannerCycleResult {
     ) -> Self {
         self.remote_dirty_usage_acknowledgements = acknowledgements;
         self
+    }
+
+    pub(crate) fn with_remote_publication_lease_targets(mut self, targets: Vec<(String, String, u64)>) -> Self {
+        self.remote_publication_lease_targets = targets;
+        self
+    }
+
+    pub(crate) fn remote_publication_lease_targets(&self) -> &[(String, String, u64)] {
+        &self.remote_publication_lease_targets
     }
 
     pub(crate) fn acknowledge_durable_usage(self) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {

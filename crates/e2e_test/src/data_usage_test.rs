@@ -59,7 +59,6 @@ where
 /// Regression test for data usage accuracy (issue #1012).
 /// Launches rustfs, writes 1000 objects, then asserts admin data usage reports the full count.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server and requires awscurl; enable when running full E2E"]
 async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -86,28 +85,20 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
         usage
             .buckets_usage
             .get(TEST_BUCKET)
-            .map(|bucket_usage| usage.objects_total_count >= 1000 && bucket_usage.objects_count >= 1000)
+            .map(|bucket_usage| usage.objects_total_count == 1000 && bucket_usage.objects_count == 1000)
             .unwrap_or(false)
     })
     .await?;
 
-    // Assert total object count and per-bucket count are not truncated
+    // Assert total object count and per-bucket count are exact.
     let bucket_usage = usage
         .buckets_usage
         .get(TEST_BUCKET)
         .cloned()
         .expect("bucket usage should exist");
 
-    assert!(
-        usage.objects_total_count >= 1000,
-        "total object count should be at least 1000, got {}",
-        usage.objects_total_count
-    );
-    assert!(
-        bucket_usage.objects_count >= 1000,
-        "bucket object count should be at least 1000, got {}",
-        bucket_usage.objects_count
-    );
+    assert_eq!(usage.objects_total_count, 1000, "total object count should be exact");
+    assert_eq!(bucket_usage.objects_count, 1000, "bucket object count should be exact");
 
     env.stop_server();
     Ok(())
@@ -116,7 +107,6 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
 /// Regression test for issue #3898.
 /// Versioned buckets should expose versions and delete markers through admin data usage.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Starts a rustfs server and requires awscurl; enable when running full E2E"]
 async fn data_usage_reports_versioned_objects_and_delete_markers() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 

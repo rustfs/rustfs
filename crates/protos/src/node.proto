@@ -111,6 +111,9 @@ message DeleteRequest {
   string volume = 2;
   string path = 3;
   string options = 4;
+  // Optional scanner publication lease token. When present, the target binds
+  // the complete delete operation to its movement read admission.
+  bytes scanner_publication_lease_token = 5;
 }
 
 message DeleteResponse {
@@ -281,6 +284,10 @@ message RenameDataRequest {
   string dst_volume = 5;
   string dst_path = 6;
   bytes file_info_bin = 7;
+  // Optional target-side scanner publication lease.  Empty preserves the
+  // legacy rename request body; a non-empty token is checked at the target's
+  // rename linearization point.
+  bytes scanner_publication_lease_token = 8;
 }
 
 message RenameDataResponse {
@@ -844,6 +851,52 @@ message ScannerActivityResponse {
   bytes response_proof = 7;
   uint64 dirty_usage_generation = 8;
   bool dirty_usage_pending = 9;
+  // v7 fields.  They are optional so v6 peers can continue to decode the
+  // response shape while newer readers fail closed when they are absent.
+  optional uint64 movement_generation = 10;
+  optional bool publication_blocked = 11;
+}
+
+// A short-lived storage-owned read admission used only around a final
+// scanner metadata publication.  It is intentionally separate from the
+// ScannerActivity observation wire so v6/v7 rolling compatibility remains
+// unchanged.
+message ScannerPublicationLeaseRequest {
+  bytes challenge = 1;
+  uint64 expected_movement_generation = 2;
+  uint64 ttl_ms = 3;
+  // The activity instance is a process session nonce.  It is intentionally
+  // separate from the storage-owned deployment identity returned by the
+  // lease response so a restart cannot reuse an old session token.
+  string expected_session_id = 4;
+  // A non-empty token turns the acquire RPC into an in-place validation of an
+  // existing lease.  Keeping this on the existing RPC lets old peers reject
+  // the proof without changing the v7 activity wire shape.
+  bytes token = 5;
+}
+
+message ScannerPublicationLeaseResponse {
+  bool success = 1;
+  bytes token = 2;
+  uint64 movement_generation = 3;
+  uint64 lease_ttl_ms = 4;
+  optional Error error = 5;
+  bytes response_proof = 6;
+  string owner_id = 7;
+  string session_id = 8;
+}
+
+message ScannerPublicationLeaseReleaseRequest {
+  bytes challenge = 1;
+  bytes token = 2;
+  string owner_id = 3;
+  string session_id = 4;
+}
+
+message ScannerPublicationLeaseReleaseResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes response_proof = 3;
 }
 
 message BackgroundHealStatusRequest {
@@ -1096,6 +1149,8 @@ service NodeService {
   // rpc CommitBinary() returns () {};
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {}; // auth-policy: body-bound
   rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {}; // auth-policy: body-bound
+  rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
+  rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
   rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
