@@ -147,14 +147,13 @@ where
                     delay
                 }
                 Delivery::AuthenticationStopped { status, reason } => {
-                    drop(reason);
-                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped { status, reason: None });
+                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped { status, reason });
                     return;
                 }
                 Delivery::Rejected { status, reason } => {
-                    drop(reason);
+                    let suffix = reason.map_or_else(String::new, |reason| format!("; reason={reason}"));
                     let _ = status_tx.send(HeartbeatStatus::Failed {
-                        reason: format!("connect_heartbeat_rejected_http_{status}"),
+                        reason: format!("Connect rejected heartbeat with HTTP {status}{suffix}"),
                     });
                     return;
                 }
@@ -337,7 +336,7 @@ where
 
 fn failed(status: &watch::Sender<HeartbeatStatus>, error: HeartbeatError) {
     let _ = status.send(HeartbeatStatus::Failed {
-        reason: heartbeat_failure_reason(&error).to_owned(),
+        reason: error.to_string(),
     });
 }
 
