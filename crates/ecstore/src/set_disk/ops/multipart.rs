@@ -87,6 +87,8 @@ struct MultipartCommitBarrierState {
     pause: MultipartCommitPause,
     expected_arrivals: usize,
     arrivals: AtomicUsize,
+    #[cfg(test)]
+    committed: AtomicBool,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
 }
@@ -114,6 +116,8 @@ impl MultipartCommitBarrier {
             pause,
             expected_arrivals,
             arrivals: AtomicUsize::new(0),
+            #[cfg(test)]
+            committed: AtomicBool::new(false),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
         });
@@ -143,6 +147,11 @@ impl MultipartCommitBarrier {
 
     pub fn release(&self) {
         self.state.release.add_permits(self.state.expected_arrivals);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_observed(&self) -> bool {
+        self.state.committed.load(Ordering::Acquire)
     }
 }
 
@@ -261,6 +270,20 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
             .await
             .expect("multipart commit barrier should remain open")
             .forget();
+    }
+}
+
+#[cfg(test)]
+fn observe_multipart_commit(bucket: &str, object: &str, pause: MultipartCommitPause) {
+    let slot = MULTIPART_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("multipart commit barrier mutex should not poison");
+    if let Some(barrier) = slot
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+    {
+        barrier.committed.store(true, Ordering::Release);
     }
 }
 
@@ -1338,6 +1361,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost).await;
             fence_commit_on_lock_loss(_upload_commit_guard.as_ref(), "put_object_part_commit", &upload_id_path)?;
             fence_commit_on_lock_loss(_part_commit_guard.as_ref(), "put_object_part_commit", &part_lock_path)?;
+            if opts
+                .namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost)
+            {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_part_outer_lock",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
 
             let _ = self
@@ -1358,6 +1394,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }),
                 )
                 .await?;
+            #[cfg(test)]
+            observe_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartAfterRename).await;
@@ -1738,7 +1776,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         .await
         .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
         #[cfg(test)]
-        observe_new_multipart_upload_commit(bucket, object);
+        {
+            observe_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost);
+            observe_new_multipart_upload_commit(bucket, object);
+        }
 
         // evalDisks
 

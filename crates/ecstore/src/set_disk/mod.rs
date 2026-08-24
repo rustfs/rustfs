@@ -800,6 +800,9 @@ pub(crate) use core::io_primitives::disk_call_counters;
 mod ctx;
 mod metadata;
 mod ops;
+
+#[cfg(test)]
+pub(crate) use ops::hermetic_set_disks_isolated;
 #[cfg(test)]
 pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 #[cfg(any(test, feature = "test-util"))]
@@ -1514,6 +1517,21 @@ mod prepared_get_object_metadata_tests {
 }
 
 impl SetDisks {
+    #[cfg(test)]
+    async fn pause_tiered_metadata_commit(bucket: &str, object: &str) {
+        let barrier = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned")
+            .as_ref()
+            .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+            .cloned();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+
     pub(crate) async fn prepare_get_object_metadata(
         &self,
         bucket: &str,
@@ -4926,6 +4944,8 @@ impl SetDisks {
         )?;
         let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
         let write_quorum = layout.write_quorum;
+        #[cfg(test)]
+        Self::pause_tiered_metadata_commit(bucket, object).await;
         if _lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || opts
                 .namespace_lock_fence
@@ -4978,6 +4998,66 @@ impl SetDisks {
         }
 
         resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+    }
+}
+
+#[cfg(test)]
+struct TieredMetadataCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct TieredMetadataCommitBarrier {
+    state: Arc<TieredMetadataCommitBarrierState>,
+}
+
+#[cfg(test)]
+static TIERED_METADATA_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TieredMetadataCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TieredMetadataCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TieredMetadataCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned");
+        assert!(slot.is_none(), "tiered metadata commit barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("tiered metadata write should reach its deterministic commit barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TieredMetadataCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TIERED_METADATA_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("tiered metadata commit barrier should not be poisoned");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
     }
 }
 

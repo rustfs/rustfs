@@ -13,55 +13,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aws_config::meta::region::RegionProviderChain;
+use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
     CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType, OutputSerialization,
 };
 use bytes::Bytes;
 use std::error::Error;
+use std::time::Duration;
 
-const ENDPOINT: &str = "http://localhost:9000";
-const ACCESS_KEY: &str = "rustfsadmin";
-const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "test-sql-bucket";
 const CSV_OBJECT: &str = "test-data.csv";
 const JSON_OBJECT: &str = "test-data.json";
+const SELECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
-    let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
-    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(region_provider)
-        .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
-        .load()
-        .await;
+type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-    let client = Client::from_conf(
-        aws_sdk_s3::Config::from(&shared_config)
-            .to_builder()
-            .force_path_style(true) // Important for S3-compatible services
-            .build(),
-    );
-
-    Ok(client)
+async fn create_test_environment() -> TestResult<(RustFSTestEnvironment, Client)> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = env.create_s3_client();
+    Ok((env, client))
 }
 
-async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
-    match client.create_bucket().bucket(BUCKET).send().await {
-        Ok(_) => {}
-        Err(e) => {
-            let error_str = e.to_string();
-            if !error_str.contains("BucketAlreadyOwnedByYou") && !error_str.contains("BucketAlreadyExists") {
-                return Err(e.into());
-            }
-        }
-    }
+async fn setup_test_bucket(client: &Client) -> TestResult<()> {
+    client.create_bucket().bucket(BUCKET).send().await?;
     Ok(())
 }
 
-async fn upload_test_csv(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn upload_test_csv(client: &Client) -> TestResult<()> {
     let csv_data = "name,age,city\nAlice,30,New York\nBob,25,Los Angeles\nCharlie,35,Chicago\nDiana,28,Boston";
 
     client
@@ -75,7 +57,7 @@ async fn upload_test_csv(client: &Client) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn upload_test_json(client: &Client) -> Result<(), Box<dyn Error>> {
+async fn upload_test_json(client: &Client) -> TestResult<()> {
     let json_data = r#"{"name":"Alice","age":30,"city":"New York"}
 {"name":"Bob","age":25,"city":"Los Angeles"}
 {"name":"Charlie","age":35,"city":"Chicago"}
@@ -93,33 +75,38 @@ async fn upload_test_json(client: &Client) -> Result<(), Box<dyn Error>> {
 
 async fn process_select_response(
     mut event_stream: aws_sdk_s3::operation::select_object_content::SelectObjectContentOutput,
-) -> Result<String, Box<dyn Error>> {
-    let mut total_data = Vec::new();
+) -> TestResult<String> {
+    tokio::time::timeout(SELECT_RESPONSE_TIMEOUT, async move {
+        let mut total_data = Vec::new();
+        let mut saw_end = false;
 
-    while let Ok(Some(event)) = event_stream.payload.recv().await {
-        match event {
-            aws_sdk_s3::types::SelectObjectContentEventStream::Records(records_event) => {
-                if let Some(payload) = records_event.payload {
-                    let data = payload.into_inner();
-                    total_data.extend_from_slice(&data);
+        while let Some(event) = event_stream.payload.recv().await? {
+            match event {
+                aws_sdk_s3::types::SelectObjectContentEventStream::Records(records_event) => {
+                    if let Some(payload) = records_event.payload {
+                        total_data.extend_from_slice(payload.as_ref());
+                    }
                 }
-            }
-            aws_sdk_s3::types::SelectObjectContentEventStream::End(_) => {
-                break;
-            }
-            _ => {
-                // Handle other event types (Stats, Progress, Cont, etc.)
+                aws_sdk_s3::types::SelectObjectContentEventStream::End(_) => {
+                    saw_end = true;
+                    break;
+                }
+                _ => {}
             }
         }
-    }
 
-    Ok(String::from_utf8(total_data)?)
+        if !saw_end {
+            return Err("Select response ended without an End event".into());
+        }
+        Ok(String::from_utf8(total_data)?)
+    })
+    .await
+    .map_err(|_| -> Box<dyn Error + Send + Sync> { "Select response timed out".into() })?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_basic() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -158,9 +145,8 @@ async fn test_select_object_content_csv_basic() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_aggregation() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -203,16 +189,15 @@ async fn test_select_object_content_csv_aggregation() -> Result<(), Box<dyn Erro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_json_basic() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_json(&client).await?;
 
     // Construct JSON query
     let sql = "SELECT s.name, s.age FROM S3Object s WHERE s.age > 28";
 
-    let json_input = JsonInput::builder().set_type(Some(JsonType::Document)).build();
+    let json_input = JsonInput::builder().set_type(Some(JsonType::Lines)).build();
 
     let input_serialization = InputSerialization::builder().json(json_input).build();
 
@@ -244,9 +229,8 @@ async fn test_select_object_content_json_basic() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_limit() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -286,9 +270,8 @@ async fn test_select_object_content_csv_limit() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_csv_order_by() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -318,9 +301,10 @@ async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>>
     println!("CSV Order By result: {result_str}");
 
     // Verify ordered by age descending
-    assert!(
-        result_str.lines().filter(|line| !line.trim().is_empty()).count() >= 2,
-        "Should return at least 2 records"
+    assert_eq!(
+        result_str.lines().filter(|line| !line.trim().is_empty()).count(),
+        2,
+        "Should return exactly 2 records"
     );
 
     // Check if contains highest age records
@@ -331,9 +315,8 @@ async fn test_select_object_content_csv_order_by() -> Result<(), Box<dyn Error>>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_error_handling() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
     upload_test_csv(&client).await?;
 
@@ -348,7 +331,7 @@ async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error
     let output_serialization = OutputSerialization::builder().csv(csv_output).build();
 
     // This query should fail because invalid_column doesn't exist
-    let result = client
+    let error = client
         .select_object_content()
         .bucket(BUCKET)
         .key(CSV_OBJECT)
@@ -357,18 +340,20 @@ async fn test_select_object_content_error_handling() -> Result<(), Box<dyn Error
         .input_serialization(input_serialization)
         .output_serialization(output_serialization)
         .send()
-        .await;
+        .await
+        .expect_err("a query referencing an unknown column must fail");
 
-    // Verify query fails (expected behavior)
-    assert!(result.is_err(), "Query with invalid column should fail");
+    assert_eq!(
+        error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("EvaluatorBindingDoesNotExist")
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_select_object_content_nonexistent_object() -> Result<(), Box<dyn Error>> {
-    let client = create_aws_s3_client().await?;
+async fn test_select_object_content_nonexistent_object() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
     setup_test_bucket(&client).await?;
 
     // Test query on nonexistent object
@@ -381,7 +366,7 @@ async fn test_select_object_content_nonexistent_object() -> Result<(), Box<dyn E
     let csv_output = CsvOutput::builder().build();
     let output_serialization = OutputSerialization::builder().csv(csv_output).build();
 
-    let result = client
+    let error = client
         .select_object_content()
         .bucket(BUCKET)
         .key("nonexistent.csv")
@@ -390,10 +375,10 @@ async fn test_select_object_content_nonexistent_object() -> Result<(), Box<dyn E
         .input_serialization(input_serialization)
         .output_serialization(output_serialization)
         .send()
-        .await;
+        .await
+        .expect_err("selecting a missing object must fail");
 
-    // Verify query fails (expected behavior)
-    assert!(result.is_err(), "Query on nonexistent object should fail");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
 
     Ok(())
 }

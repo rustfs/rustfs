@@ -751,16 +751,29 @@ pub(super) async fn persist_and_publish_cache_snapshot(
 }
 
 pub(super) async fn send_data_usage_update(updates: &mpsc::Sender<DataUsageInfo>, data_usage_info: DataUsageInfo) -> Result<()> {
-    updates.send(data_usage_info).await.map_err(|e| {
-        error!(
-            target: "rustfs::scanner::io",
-            event = EVENT_SCANNER_DATA_USAGE_STREAM,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_IO,
-            state = "send_failed",
-            error = %e,
-            "Scanner data usage publish failed"
-        );
-        StorageError::other("scanner data usage receiver closed before update delivery")
-    })
+    match updates.try_send(data_usage_info) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            error!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_DATA_USAGE_STREAM,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "send_failed",
+                "Scanner data usage publish failed because the receiver is closed"
+            );
+            Err(StorageError::other("scanner data usage receiver closed before update delivery"))
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            error!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_DATA_USAGE_STREAM,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "send_would_block",
+                "Scanner data usage publish rejected because an update is already queued"
+            );
+            Err(StorageError::other("scanner data usage update already queued"))
+        }
+    }
 }

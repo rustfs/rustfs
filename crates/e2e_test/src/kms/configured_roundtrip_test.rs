@@ -432,7 +432,6 @@ async fn test_configured_local_kms_admin_and_versioned_cleanup() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "requires a Vault binary"]
 async fn test_configured_vault_kms_admin_and_versioned_cleanup() -> TestResult {
     let mut env = VaultTestEnvironment::new().await?;
     env.start_vault().await?;

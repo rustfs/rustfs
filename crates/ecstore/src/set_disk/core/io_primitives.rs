@@ -3513,6 +3513,26 @@ pub(in crate::set_disk) struct RenameTailOutcome {
     pub(in crate::set_disk) cleanup: Vec<RenameTailCleanup>,
 }
 
+/// Options shared by the normal and early-ack rename fanouts. Keeping the
+/// quorum and optional scanner lease map together avoids widening either
+/// fanout helper's argument list while preserving the fence semantics.
+pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
+    write_quorum: usize,
+    scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+}
+
+impl<'a> RenameDataFenceOptions<'a> {
+    pub(in crate::set_disk) fn new(
+        write_quorum: usize,
+        scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+    ) -> Self {
+        Self {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        }
+    }
+}
+
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 type RenameDataLegacyTuple = (
     Vec<Option<DiskStore>>,
@@ -3793,16 +3813,51 @@ impl SetDisks {
         .map(RenameDataCommit::into_legacy_tuple)
     }
 
-    #[tracing::instrument(level = "debug", skip(disks, file_infos))]
-    async fn rename_data_owned_early_ack(
+    pub(in crate::set_disk) fn scanner_publication_lease_token_for_disk(
+        disk: Option<&DiskStore>,
+        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+    ) -> disk::error::Result<Option<Uuid>> {
+        let Some(disk) = disk else {
+            return Ok(None);
+        };
+        if disk.is_local() {
+            return Ok(None);
+        }
+        let Some(tokens) = scanner_publication_lease_tokens else {
+            return Ok(None);
+        };
+        let host = disk.endpoint().grid_host();
+        tokens
+            .get(&host)
+            .copied()
+            .ok_or_else(|| DiskError::other(format!("scanner publication lease token missing for remote disk host {host}")))
+            .map(Some)
+    }
+
+    pub(in crate::set_disk) fn scanner_publication_lease_tokens_for_disks(
+        disks: &[Option<DiskStore>],
+        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+    ) -> disk::error::Result<Vec<Option<Uuid>>> {
+        disks
+            .iter()
+            .map(|disk| Self::scanner_publication_lease_token_for_disk(disk.as_ref(), scanner_publication_lease_tokens))
+            .collect()
+    }
+
+    #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
+    async fn rename_data_owned_early_ack_with_fence(
         disks: &[Option<DiskStore>],
         src_bucket: &str,
         src_object: &str,
         file_infos: Vec<FileInfo>,
         dst_bucket: &str,
         dst_object: &str,
-        write_quorum: usize,
+        fence_options: RenameDataFenceOptions<'_>,
     ) -> disk::error::Result<RenameDataCommit> {
+        let RenameDataFenceOptions {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        } = fence_options;
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -3817,6 +3872,7 @@ impl SetDisks {
 
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
+        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
         let coordinator_disks = fanout_disks.clone();
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -3833,7 +3889,12 @@ impl SetDisks {
                 let successful_rename_completion_rank =
                     rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
                 let mut tasks = JoinSet::new();
-                for (i, (disk, file_info)) in fanout_disks.into_iter().zip(file_infos.iter()).enumerate() {
+                for (i, ((disk, file_info), scanner_publication_lease_token)) in fanout_disks
+                    .into_iter()
+                    .zip(file_infos.iter())
+                    .zip(fanout_fence_tokens.into_iter())
+                    .enumerate()
+                {
                     let src_bucket = fanout_src_bucket.clone();
                     let src_object = fanout_src_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
@@ -3870,7 +3931,14 @@ impl SetDisks {
 
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             let result = disk
-                                .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                                .rename_data_borrowed_with_fence(
+                                    &src_bucket,
+                                    &src_object,
+                                    file_info,
+                                    &dst_bucket,
+                                    &dst_object,
+                                    scanner_publication_lease_token,
+                                )
                                 .await;
                             if let Some(disk_wait_started) = disk_wait_started {
                                 let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
@@ -4112,20 +4180,44 @@ impl SetDisks {
         write_quorum: usize,
         allow_early_ack: bool,
     ) -> disk::error::Result<RenameDataCommit> {
+        Self::rename_data_owned_with_fence(
+            disks,
+            src,
+            file_infos,
+            dst,
+            allow_early_ack,
+            RenameDataFenceOptions::new(write_quorum, None),
+        )
+        .await
+    }
+
+    #[tracing::instrument(level = "debug", skip(disks, file_infos, fence_options))]
+    pub(in crate::set_disk) async fn rename_data_owned_with_fence(
+        disks: &[Option<DiskStore>],
+        src: (&str, &str),
+        file_infos: Vec<FileInfo>,
+        dst: (&str, &str),
+        allow_early_ack: bool,
+        fence_options: RenameDataFenceOptions<'_>,
+    ) -> disk::error::Result<RenameDataCommit> {
         let (src_bucket, src_object) = src;
         let (dst_bucket, dst_object) = dst;
         if allow_early_ack && put_rename_early_ack_enabled() {
-            return Self::rename_data_owned_early_ack(
+            return Self::rename_data_owned_early_ack_with_fence(
                 disks,
                 src_bucket,
                 src_object,
                 file_infos,
                 dst_bucket,
                 dst_object,
-                write_quorum,
+                fence_options,
             )
             .await;
         }
+        let RenameDataFenceOptions {
+            write_quorum,
+            scanner_publication_lease_tokens,
+        } = fence_options;
         if let Some(file_info) = disks
             .iter()
             .zip(file_infos.iter())
@@ -4151,6 +4243,7 @@ impl SetDisks {
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
         let fanout_file_infos = file_infos;
+        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
         let fanout_src_bucket = src_bucket.clone();
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
@@ -4165,8 +4258,9 @@ impl SetDisks {
             let futures = fanout_disks
                 .into_iter()
                 .zip(fanout_file_infos.iter())
+                .zip(fanout_fence_tokens.into_iter())
                 .enumerate()
-                .map(|(i, (disk, file_info))| {
+                .map(|(i, ((disk, file_info), scanner_publication_lease_token))| {
                     let src_bucket = fanout_src_bucket.clone();
                     let src_object = fanout_src_object.clone();
                     let dst_object = fanout_dst_object.clone();
@@ -4206,7 +4300,14 @@ impl SetDisks {
 
                         let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                         let result = disk
-                            .rename_data_borrowed(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                            .rename_data_borrowed_with_fence(
+                                &src_bucket,
+                                &src_object,
+                                file_info,
+                                &dst_bucket,
+                                &dst_object,
+                                scanner_publication_lease_token,
+                            )
                             .await;
                         if let Some(disk_wait_started) = disk_wait_started {
                             let duration_ms = disk_wait_started.elapsed().as_secs_f64() * 1000.0;
@@ -5590,18 +5691,32 @@ impl SetDisks {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
+        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None).await
+    }
+
+    /// Delete a prefix with an optional per-remote-disk scanner publication
+    /// lease fence. The fence is transient and never reaches disk metadata;
+    /// remote deletes without a matching token fail closed before the RPC.
+    pub(in crate::set_disk) async fn delete_prefix_with_scanner_publication_lease(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+    ) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
+        let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(&disks, scanner_publication_lease_tokens)?;
 
         let mut futures = Vec::with_capacity(disks.len());
 
-        for disk_op in disks.iter() {
+        for (disk_op, scanner_publication_lease_token) in disks.iter().zip(fanout_fence_tokens) {
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
             futures.push(async move {
                 if let Some(disk) = disk_op {
-                    disk.delete(
+                    disk.delete_with_scanner_publication_lease(
                         &bucket,
                         &prefix,
                         DeleteOptions {
@@ -5609,6 +5724,7 @@ impl SetDisks {
                             immediate: true,
                             ..Default::default()
                         },
+                        scanner_publication_lease_token,
                     )
                     .await
                 } else {
