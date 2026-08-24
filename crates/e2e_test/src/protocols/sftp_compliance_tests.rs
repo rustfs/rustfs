@@ -453,27 +453,28 @@ fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounte
 }
 
 /// Count TCP connections in CLOSE_WAIT against the given local port
-/// by shelling out to ss -tn state CLOSE-WAIT. The check is
-/// best-effort: if ss is missing on the host the function returns
-/// Ok(None) and the caller skips the assertion. The contract is zero
+/// by shelling out to ss -tn state CLOSE-WAIT. The oracle fails closed
+/// if ss is missing or cannot inspect socket state. The contract is zero
 /// CLOSE_WAIT entries attributable to the test.
 #[cfg(target_os = "linux")]
-async fn count_close_wait_on_port(port: u16) -> Result<Option<usize>> {
-    let output = match Command::new("ss").args(["-tn", "state", "CLOSE-WAIT"]).output().await {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
-    };
+async fn count_close_wait_on_port(port: u16, test_id: &str) -> Result<usize> {
+    let port_filter = format!("sport = :{port}");
+    let output = Command::new("ss")
+        .args(["-H", "-t", "-n", "state", "close-wait"])
+        .arg(&port_filter)
+        .output()
+        .await
+        .map_err(|error| anyhow!("{test_id} failed to run ss CLOSE_WAIT oracle: {error}"))?;
     if !output.status.success() {
-        return Ok(None);
+        return Err(anyhow!(
+            "{test_id} ss CLOSE_WAIT oracle exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let needle_local = format!(":{port} ");
-    let needle_local_eol = format!(":{port}\n");
-    let count = stdout
-        .lines()
-        .filter(|l| l.contains(&needle_local) || l.contains(needle_local_eol.trim_end()))
-        .count();
-    Ok(Some(count))
+    let count = stdout.lines().filter(|line| !line.trim().is_empty()).count();
+    Ok(count)
 }
 
 // CMPTST-01: medium-binary upload then download with SHA256 compare.
@@ -1400,7 +1401,7 @@ pub(crate) mod cmptst_24 {
     //    the JoinSet flushes finished tasks before the assertion runs.
     // 5. Assert the entered/finished session counters balance and that
     //    no CLOSE_WAIT sockets remain on the bind port (Linux ss(8)
-    //    only; the assertion skips with a warn if ss is unavailable).
+    //    only; missing or failed socket inspection is an error).
     pub(crate) async fn run_concurrent_half_close_no_leak() -> Result<()> {
         let env = ProtocolTestEnvironment::new().map_err(|e| anyhow!("{}", e))?;
         let host_key_dir = PathBuf::from(&env.temp_dir).join("sftp_host_keys");
@@ -1520,15 +1521,13 @@ pub(crate) mod cmptst_24 {
                 ));
             }
 
-            match count_close_wait_on_port(HALF_CLOSE_SFTP_PORT).await? {
-                Some(0) => info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}"),
-                Some(n) => {
-                    return Err(anyhow!(
-                        "{COMPLIANCE_TEST_OUTPUT_ID} {n} CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}, expected 0"
-                    ));
-                }
-                None => info!("{COMPLIANCE_TEST_OUTPUT_ID}: ss(8) unavailable, skipping CLOSE_WAIT assertion"),
+            let close_wait = count_close_wait_on_port(HALF_CLOSE_SFTP_PORT, COMPLIANCE_TEST_OUTPUT_ID).await?;
+            if close_wait != 0 {
+                return Err(anyhow!(
+                    "{COMPLIANCE_TEST_OUTPUT_ID} {close_wait} CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}, expected 0"
+                ));
             }
+            info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}");
 
             // Drop the keepalive vector now so the test process does
             // not leave the half-closed sockets dangling past the
@@ -1947,7 +1946,7 @@ pub(crate) mod cmptst_25 {
     //    plus two 15 s ticks worst-case = 60 s) to detect CLOSE_WAIT
     //    via /proc/net/tcp and cancel the parked session.
     // 5. Assert the session task counters balance and CLOSE_WAIT count
-    //    is zero (ss(8) only; skips with a warn when ss is missing).
+    //    is zero (ss(8) only; missing or failed socket inspection is an error).
     pub(crate) async fn run_wedge_kill_after_silence_in_close_wait() -> Result<()> {
         let env = ProtocolTestEnvironment::new().map_err(|e| anyhow!("{}", e))?;
         let host_key_dir = PathBuf::from(&env.temp_dir).join("sftp_host_keys");
@@ -2056,15 +2055,13 @@ pub(crate) mod cmptst_25 {
                 ));
             }
 
-            match count_close_wait_on_port(WEDGE_SFTP_PORT).await? {
-                Some(0) => info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}"),
-                Some(n) => {
-                    return Err(anyhow!(
-                        "{COMPLIANCE_TEST_OUTPUT_ID} {n} CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}, expected 0"
-                    ));
-                }
-                None => info!("{COMPLIANCE_TEST_OUTPUT_ID}: ss(8) unavailable, skipping CLOSE_WAIT assertion"),
+            let close_wait = count_close_wait_on_port(WEDGE_SFTP_PORT, COMPLIANCE_TEST_OUTPUT_ID).await?;
+            if close_wait != 0 {
+                return Err(anyhow!(
+                    "{COMPLIANCE_TEST_OUTPUT_ID} {close_wait} CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}, expected 0"
+                ));
             }
+            info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}");
 
             drop(keepalive);
             info!("PASS {COMPLIANCE_TEST_OUTPUT_ID}: wedged sessions killed by the watchdog");
