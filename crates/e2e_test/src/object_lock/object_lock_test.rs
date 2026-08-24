@@ -1475,7 +1475,7 @@ async fn test_put_retention_compliance_cannot_shorten() {
     )
     .await;
 
-    assert!(shorten_result.is_err(), "Shortening COMPLIANCE retention should fail");
+    assert_access_denied(shorten_result, "Shortening COMPLIANCE retention should fail");
 
     info!("✅ Test passed: Cannot shorten COMPLIANCE retention");
 }
@@ -1598,10 +1598,7 @@ async fn test_put_retention_governance_shorten_requires_bypass() {
     )
     .await;
 
-    assert!(
-        shorten_without_bypass.is_err(),
-        "Shortening GOVERNANCE retention without bypass should fail"
-    );
+    assert_access_denied(shorten_without_bypass, "Shortening GOVERNANCE retention without bypass should fail");
 
     // Shorten with bypass - should succeed
     let shorten_with_bypass = put_object_retention(
