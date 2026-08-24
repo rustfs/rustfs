@@ -68,9 +68,17 @@ FUZZ_TARGET=path_containment ./scripts/fuzz/run.sh
 # Nightly-style: 300s per target
 MAX_TOTAL_TIME=300 ./scripts/fuzz/run.sh
 
+# Replay a recorded libFuzzer seed
+FUZZ_TARGET=path_containment FUZZ_SEED=123456789 ./scripts/fuzz/run.sh
+
 # Skip build (use pre-built harness)
 SKIP_BUILD=1 FUZZ_TARGET=local_metadata ./scripts/fuzz/run.sh
 ```
+
+Each run writes `fuzz/artifacts/<target>/run-manifest.txt` with the target,
+libFuzzer seed, time budget, Git revision and dirty state, and runner mode. CI
+uploads that manifest with the corpus and any crash input so the exact run can
+be replayed.
 
 ## CI Workflow
 
