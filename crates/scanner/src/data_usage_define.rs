@@ -474,8 +474,14 @@ impl Serialize for DataUsageCacheInfo {
     {
         // Keep this metadata map-encoded so older readers can ignore fields
         // appended by newer scanner versions during rolling upgrades.
-        let field_count =
-            21 + usize::from(self.tier_registry_generation.is_some()) + usize::from(!self.size_reconciliation.is_empty());
+        let field_count = 16
+            + usize::from(self.tier_registry_generation.is_some())
+            + usize::from(!self.size_reconciliation.is_empty())
+            + usize::from(self.lkg_snapshot_complete)
+            + usize::from(self.lkg_next_cycle.is_some())
+            + usize::from(self.lkg_last_update.is_some())
+            + usize::from(self.lkg_leader_epoch.is_some())
+            + usize::from(self.lkg_scan_plan_digest.is_some());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -499,11 +505,21 @@ impl Serialize for DataUsageCacheInfo {
         if !self.size_reconciliation.is_empty() {
             state.serialize_entry("size_reconciliation", &self.size_reconciliation)?;
         }
-        state.serialize_entry("lkg_snapshot_complete", &self.lkg_snapshot_complete)?;
-        state.serialize_entry("lkg_next_cycle", &self.lkg_next_cycle)?;
-        state.serialize_entry("lkg_last_update", &self.lkg_last_update)?;
-        state.serialize_entry("lkg_leader_epoch", &self.lkg_leader_epoch)?;
-        state.serialize_entry("lkg_scan_plan_digest", &self.lkg_scan_plan_digest)?;
+        if self.lkg_snapshot_complete {
+            state.serialize_entry("lkg_snapshot_complete", &true)?;
+        }
+        if let Some(next_cycle) = self.lkg_next_cycle {
+            state.serialize_entry("lkg_next_cycle", &next_cycle)?;
+        }
+        if let Some(last_update) = self.lkg_last_update {
+            state.serialize_entry("lkg_last_update", &last_update)?;
+        }
+        if let Some(leader_epoch) = self.lkg_leader_epoch {
+            state.serialize_entry("lkg_leader_epoch", &leader_epoch)?;
+        }
+        if let Some(scan_plan_digest) = self.lkg_scan_plan_digest {
+            state.serialize_entry("lkg_scan_plan_digest", &scan_plan_digest)?;
+        }
         state.end()
     }
 }
