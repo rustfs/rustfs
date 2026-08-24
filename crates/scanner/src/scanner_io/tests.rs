@@ -151,8 +151,8 @@ async fn scanner_set_cache_admission_tracks_owner_snapshot_and_fails_closed() {
     let set = store.pools[0].disk_set[0].clone();
 
     assert!(
-        set.scanner_data_usage_publication_admission_guard().await.is_none(),
-        "a set must not publish before the owner has refreshed its movement snapshot"
+        set.scanner_data_usage_publication_admission_guard().await.is_some(),
+        "a set should refresh the idle owner snapshot before its first publication"
     );
     assert!(!store.scanner_data_usage_publication_blocked().await);
     assert!(

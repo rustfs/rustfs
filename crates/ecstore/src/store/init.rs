@@ -582,6 +582,8 @@ mod tests {
         wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
+    use crate::disk::DiskAPI;
+    #[cfg(feature = "test-util")]
     use crate::{
         bucket::lifecycle::{
             DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord,
@@ -1528,6 +1530,77 @@ mod tests {
             matches!(err, StorageError::ObjectNotFound(_, _) | StorageError::VersionNotFound(_, _, _)),
             "unexpected decommission source result: {err:?}"
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn seed_transitioned_free_version(
+        ctx: &Arc<crate::runtime::instance::InstanceContext>,
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> (uuid::Uuid, uuid::Uuid) {
+        let tier_name = format!("DECOMFREE{}", uuid::Uuid::new_v4().simple());
+        register_mock_tier(&ctx.tier_config_mgr(), &tier_name).await;
+
+        let mut reader = PutObjReader::from_vec(b"transitioned source bytes".to_vec());
+        let source = store.pools[0]
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write transitioned decommission source");
+        let source_version = source.version_id.expect("transitioned source must be versioned");
+        store.pools[0]
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(source_version.to_string()),
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: source.etag.clone().expect("transitioned source must have an ETag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("transition source before decommission");
+        store.pools[0]
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(source_version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete transitioned source version");
+
+        let versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("source versions should decode after transition delete")
+            .expect("source free version should remain after transition delete");
+        let free_version = versions
+            .versions
+            .iter()
+            .find(|version| version.tier_free_version())
+            .and_then(|version| version.version_id)
+            .expect("transition delete should create a free version");
+        (source_version, free_version)
     }
 
     async fn write_decommission_test_multipart_source(
@@ -4243,6 +4316,8 @@ mod tests {
         let bucket = format!("reverse-decom-fixed-target-{}", uuid::Uuid::new_v4());
         let object = "ordinary.bin";
         let object_body = b"reverse ordinary generation".to_vec();
+        let self_copy_object = "source-only-self-copy.bin";
+        let self_copy_body = b"source only copy generation".to_vec();
         let multipart_object = "multipart.bin";
         let first_part = vec![b'm'; 5 * 1024 * 1024];
         let second_part = b"reverse multipart tail".to_vec();
@@ -4258,6 +4333,11 @@ mod tests {
             .put_object(&bucket, object, &mut source, &ObjectOptions::default())
             .await
             .expect("write ordinary source object to pool 1");
+        let mut self_copy_source = PutObjReader::from_vec(self_copy_body.clone());
+        store.pools[1]
+            .put_object(&bucket, self_copy_object, &mut self_copy_source, &ObjectOptions::default())
+            .await
+            .expect("write self-copy source object to pool 1");
 
         let upload = store.pools[1]
             .new_multipart_upload(&bucket, multipart_object, &ObjectOptions::default())
@@ -4298,6 +4378,69 @@ mod tests {
         }
         assert!(store.is_suspended(1).await, "pool 1 must be the reverse decommission source");
 
+        let self_copy_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut self_copy_reader = store
+            .get_object_reader(&bucket, self_copy_object, None, HeaderMap::new(), &self_copy_opts)
+            .await
+            .expect("read the suspended source before its target is committed");
+        let mut self_copy_info = self_copy_reader.object_info.clone();
+        let mut self_copy_source_body = Vec::new();
+        self_copy_reader
+            .stream
+            .read_to_end(&mut self_copy_source_body)
+            .await
+            .expect("drain the suspended self-copy source");
+        assert_eq!(self_copy_source_body, self_copy_body);
+        self_copy_info.metadata_only = true;
+        self_copy_info.put_object_reader = Some(PutObjReader::from_vec(self_copy_source_body));
+        store
+            .copy_object(
+                &bucket,
+                self_copy_object,
+                &bucket,
+                self_copy_object,
+                &mut self_copy_info,
+                &self_copy_opts,
+                &self_copy_opts,
+            )
+            .await
+            .expect("self-copy should read the suspended source and commit to an active pool");
+        assert_pool_object_present(&store.pools[0], &bucket, self_copy_object).await;
+        assert_pool_object_present(&store.pools[1], &bucket, self_copy_object).await;
+
+        let mut active_copy_reader = store
+            .get_object_reader(&bucket, self_copy_object, None, HeaderMap::new(), &self_copy_opts)
+            .await
+            .expect("read the active self-copy target while the source remains");
+        let active_copy_data_dir = active_copy_reader.object_info.data_dir;
+        let mut active_copy_info = active_copy_reader.object_info.clone();
+        let mut active_copy_body = Vec::new();
+        active_copy_reader
+            .stream
+            .read_to_end(&mut active_copy_body)
+            .await
+            .expect("drain the active self-copy target");
+        assert_eq!(active_copy_body, self_copy_body);
+        active_copy_info.metadata_only = true;
+        active_copy_info.put_object_reader = Some(PutObjReader::from_vec(active_copy_body));
+        let active_copy_result = store
+            .copy_object(
+                &bucket,
+                self_copy_object,
+                &bucket,
+                self_copy_object,
+                &mut active_copy_info,
+                &self_copy_opts,
+                &self_copy_opts,
+            )
+            .await
+            .expect("self-copy should keep using the committed active target");
+        assert_eq!(active_copy_result.data_dir, active_copy_data_dir);
+
+        let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
         let commit_barrier = crate::set_disk::PutObjectCommitBarrier::install(
             &bucket,
             object,
@@ -4346,7 +4489,50 @@ mod tests {
         drop(delete_barrier);
 
         commit_barrier.release();
+        cleanup_barrier.wait_until_paused().await;
         drop(commit_barrier);
+
+        let target_info = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read the committed active target before source cleanup");
+        assert_pool_object_present(&store.pools[1], &bucket, object).await;
+
+        let read_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let routed_info = store
+            .get_object_info(&bucket, object, &read_opts)
+            .await
+            .expect("HEAD routing should prefer the active target before source cleanup");
+        assert_eq!(routed_info.data_dir, target_info.data_dir);
+
+        let mut ranged_reader = store
+            .get_object_reader(
+                &bucket,
+                object,
+                Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 8,
+                    end: 15,
+                }),
+                HeaderMap::new(),
+                &read_opts,
+            )
+            .await
+            .expect("ranged GET routing should prefer the active target before source cleanup");
+        assert_eq!(ranged_reader.object_info.data_dir, target_info.data_dir);
+        let mut ranged_body = Vec::new();
+        ranged_reader
+            .stream
+            .read_to_end(&mut ranged_body)
+            .await
+            .expect("drain the routed target range");
+        assert_eq!(ranged_body, object_body[8..=15]);
+
+        cleanup_barrier.release();
+        drop(cleanup_barrier);
         tokio::time::timeout(Duration::from_secs(60), worker)
             .await
             .expect("reverse ordinary decommission must not self-deadlock on the fixed target set")
@@ -4768,6 +4954,383 @@ mod tests {
             .await
             .expect_err("source cleanup must remove the decommissioned source versions");
 
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_entry_skips_cleanup_only_marker_when_free_version_is_present() {
+        let temp_dir = tempfile::tempdir().expect("create free-version decommission store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-free-marker", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("decom-free-marker-{}", uuid::Uuid::new_v4());
+        let object = "free-marker-object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create free-version decommission bucket");
+        let (_, free_version) = seed_transitioned_free_version(&ctx, &store, &bucket, object).await;
+        let source_free = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("source free-version metadata should decode")
+            .and_then(|versions| {
+                versions
+                    .versions
+                    .into_iter()
+                    .find(|version| version.version_id == Some(free_version) && version.tier_free_version())
+            })
+            .expect("source free-version identity should be present before decommission");
+        let mut target_reader = PutObjReader::from_vec(b"target ordinary bytes".to_vec());
+        let target_w = store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut target_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write unrelated target version");
+        let target_w_version = target_w.version_id.expect("target version should have an id");
+        let marker = store.pools[0]
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write cleanup-only delete marker");
+        assert!(marker.delete_marker);
+
+        mark_test_pool_decommissioning(&store, 0).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        store
+            .decommission_entry_for_test_with_bucket_incarnation(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                source_set.clone(),
+            )
+            .await
+            .expect("real decommission entry should migrate the free version");
+
+        let target_versions = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("target versions should decode")
+            .expect("target free version should be present");
+        assert!(
+            target_versions
+                .versions
+                .iter()
+                .any(|version| { version.version_id == Some(free_version) && version.tier_free_version() })
+        );
+        let migrated_free = target_versions
+            .versions
+            .iter()
+            .find(|version| version.version_id == Some(free_version) && version.tier_free_version())
+            .expect("migrated free-version identity should remain readable from target disks");
+        assert!(
+            crate::store::tiered_data_movement_source_matches(&source_free, migrated_free)
+                .expect("migrated free-version identity should decode")
+        );
+        let retained_w = target_versions
+            .versions
+            .iter()
+            .find(|version| version.version_id == Some(target_w_version))
+            .expect("unrelated target version should remain");
+        assert!(!retained_w.deleted && !retained_w.tier_free_version());
+        assert_eq!(retained_w.size, target_w.size);
+        assert_eq!(retained_w.get_etag(), target_w.etag);
+        assert!(
+            target_versions
+                .versions
+                .iter()
+                .all(|version| { version.tier_free_version() || !version.deleted })
+        );
+        assert!(
+            source_set
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("source versions should be readable after cleanup")
+                .is_none(),
+            "successful free-version migration should permit source cleanup"
+        );
+        let (heal_versions, _, _) = store
+            .heal_walk_versions_page(1, 0, &bucket, "", None, 2, 16, true)
+            .await
+            .expect("heal walk should decode the migrated free version");
+        let free_version_string = free_version.to_string();
+        let healed_free = heal_versions
+            .iter()
+            .find(|version| version.version_id.as_deref() == Some(free_version_string.as_str()))
+            .expect("heal walk should surface the migrated free version");
+        let healed_info = healed_free
+            .lifecycle_object_info
+            .as_ref()
+            .expect("heal walk should retain lifecycle identity for the migrated free version");
+        assert!(healed_info.transitioned_object.free_version);
+        assert_eq!(healed_info.transitioned_object.tier, source_free.transition_tier);
+        assert_eq!(healed_info.transitioned_object.name, source_free.transitioned_objname);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_entry_allows_free_version_consumed_before_source_lock() {
+        let temp_dir = tempfile::tempdir().expect("create consumed free-version store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-free-consumed", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("decom-free-consumed-{}", uuid::Uuid::new_v4());
+        let object = "free-consumed-object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create consumed free-version bucket");
+        let (_, free_version) = seed_transitioned_free_version(&ctx, &store, &bucket, object).await;
+
+        mark_test_pool_decommissioning(&store, 0).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let barrier = crate::store::object::DecommissionFreeVersionSourceRaceBarrier::install(&bucket, object);
+        let decommission = tokio::spawn({
+            let store = store.clone();
+            let bucket = bucket.clone();
+            let source_set = source_set.clone();
+            async move {
+                store
+                    .decommission_entry_for_test_with_bucket_incarnation(
+                        0,
+                        MetaCacheEntry {
+                            name: object.to_string(),
+                            ..Default::default()
+                        },
+                        bucket,
+                        source_set,
+                    )
+                    .await
+            }
+        });
+
+        barrier.wait_until_paused().await;
+        store.pools[0]
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(free_version.to_string()),
+                    incl_free_versions: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("lifecycle should consume the source free version before decommission locks it");
+        assert!(
+            source_set
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("consumed source metadata should remain readable")
+                .is_none(),
+            "the lifecycle delete should remove the source free version"
+        );
+
+        barrier.release();
+        decommission
+            .await
+            .expect("decommission task should join")
+            .expect("a concurrently consumed free version should not fail source cleanup");
+        assert!(
+            store.pools[1]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("target metadata should remain readable")
+                .is_none(),
+            "an already consumed free version should not be recreated on the target"
+        );
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn decommission_entry_rejects_subquorum_free_version_conflict_and_retains_source() {
+        let temp_dir = tempfile::tempdir().expect("create sub-quorum free-version store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-free-conflict", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("decom-free-conflict-{}", uuid::Uuid::new_v4());
+        let object = "free-conflict-object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create sub-quorum conflict bucket");
+        let (_, free_version) = seed_transitioned_free_version(&ctx, &store, &bucket, object).await;
+        let source_free = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("source free version should decode before crash replay setup")
+            .and_then(|versions| {
+                versions
+                    .versions
+                    .into_iter()
+                    .find(|version| version.version_id == Some(free_version))
+            })
+            .expect("source free version should be available for crash replay setup");
+
+        let mut target_reader = PutObjReader::from_vec(b"target ordinary bytes".to_vec());
+        let target = store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut target_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed ordinary target version");
+        let target_version = target.version_id.expect("target version must have an ID");
+        let target_disks = store.pools[1].get_disks_by_key(object).disks.read().await.clone();
+        for disk in target_disks.iter().skip(1) {
+            disk.as_ref()
+                .expect("target crash replay quorum disk should be online")
+                .write_metadata("", &bucket, object, source_free.clone())
+                .await
+                .expect("seed an equivalent free version on the target quorum");
+        }
+        let conflict_path = temp_dir
+            .path()
+            .join(format!("pool1/set0/disk0/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+        let encoded = tokio::fs::read(&conflict_path)
+            .await
+            .expect("target metadata should be readable");
+        let mut metadata = FileMeta::load(&encoded).expect("target metadata should decode");
+        let target_index = metadata
+            .versions
+            .iter()
+            .position(|version| version.header.version_id == Some(target_version))
+            .expect("target version should be present on the conflict disk");
+        let mut target_meta = metadata.versions[target_index]
+            .parse_version_meta()
+            .expect("target version metadata should decode");
+        target_meta
+            .object
+            .as_mut()
+            .expect("target conflict must remain an ordinary object")
+            .version_id = Some(free_version);
+        metadata.versions[target_index] = target_meta.try_into().expect("conflict metadata should encode");
+        let expected_conflict_meta = metadata.versions[target_index].meta.clone();
+        let expected_conflict = metadata.versions[target_index]
+            .into_fileinfo(&bucket, object, true)
+            .expect("conflict metadata should decode as an ordinary object");
+        let duplicate_free: rustfs_filemeta::FileMetaShallowVersion = rustfs_filemeta::FileMetaVersion::from(source_free.clone())
+            .try_into()
+            .expect("duplicate free metadata should encode");
+        metadata.versions.insert(target_index, duplicate_free);
+        tokio::fs::write(&conflict_path, metadata.marshal_msg().expect("conflict metadata should encode"))
+            .await
+            .expect("write sub-quorum conflict metadata");
+
+        mark_test_pool_decommissioning(&store, 0).await;
+        let source_set = store.pools[0].get_disks_by_key(object);
+        store
+            .decommission_entry_for_test_with_bucket_incarnation(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                source_set.clone(),
+            )
+            .await
+            .expect("conflicted decommission entry should retain the source and retry later");
+
+        let source_versions = source_set
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("retained source versions should decode")
+            .expect("source free version should be retained after conflict");
+        assert!(
+            source_versions
+                .versions
+                .iter()
+                .any(|version| { version.version_id == Some(free_version) && version.tier_free_version() })
+        );
+        let post_encoded = tokio::fs::read(&conflict_path)
+            .await
+            .expect("conflict metadata should remain readable");
+        let post_metadata = FileMeta::load(&post_encoded).expect("post-conflict metadata should decode");
+        let same_id = post_metadata
+            .versions
+            .iter()
+            .filter(|version| version.header.version_id == Some(free_version))
+            .collect::<Vec<_>>();
+        assert_eq!(same_id.len(), 2, "conflict metadata should retain both same-ID records");
+        assert_eq!(same_id.iter().filter(|version| version.header.free_version()).count(), 1);
+        assert_eq!(same_id.iter().filter(|version| !version.header.free_version()).count(), 1);
+        let post_conflict = same_id
+            .into_iter()
+            .find(|version| !version.header.free_version())
+            .expect("ordinary conflict version must remain addressable by the source ID");
+        let post_conflict_info = post_conflict
+            .into_fileinfo(&bucket, object, true)
+            .expect("post-conflict ordinary metadata should decode");
+        assert!(!post_conflict_info.deleted && !post_conflict_info.tier_free_version());
+        assert_eq!(post_conflict.meta, expected_conflict_meta);
+        assert_eq!(post_conflict_info.size, expected_conflict.size);
+        assert_eq!(post_conflict_info.data_dir, expected_conflict.data_dir);
+        assert_eq!(post_conflict_info.metadata, expected_conflict.metadata);
+        assert_eq!(post_conflict_info.get_etag(), expected_conflict.get_etag());
+
+        for disk_index in 0..4 {
+            let target_path = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let target_encoded = tokio::fs::read(&target_path)
+                .await
+                .expect("target metadata should remain readable");
+            let target_meta = FileMeta::load(&target_encoded).expect("target metadata should decode");
+            let same_id = target_meta
+                .versions
+                .iter()
+                .filter(|version| version.header.version_id == Some(free_version))
+                .collect::<Vec<_>>();
+            if disk_index == 0 {
+                assert_eq!(same_id.len(), 2);
+                assert!(same_id[0].header.free_version());
+                assert!(!same_id[1].header.free_version());
+            } else {
+                assert_eq!(same_id.len(), 1);
+                assert!(same_id[0].header.free_version());
+            }
+        }
+        let sweep_err = store
+            .check_after_decommission_for_test(0)
+            .await
+            .expect_err("final sweep must report the retained free version");
+        assert!(
+            sweep_err.to_string().contains("version(s) were found"),
+            "unexpected final sweep error: {sweep_err}"
+        );
         shutdown.cancel();
     }
 
