@@ -639,6 +639,18 @@ impl RustFSTestEnvironment {
         extra_env: &[(&str, &str)],
         cleanup_existing: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_rustfs_server_inner_with_binary(&binary_path, extra_args, extra_env, cleanup_existing)
+            .await
+    }
+
+    async fn start_rustfs_server_inner_with_binary(
+        &mut self,
+        binary_path: &Path,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+        cleanup_existing: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cleanup_existing {
             self.cleanup_existing_processes().await?;
         }
@@ -647,8 +659,7 @@ impl RustFSTestEnvironment {
 
         info!("Starting RustFS server with args: {:?}", args);
 
-        let binary_path = rustfs_binary_path();
-        let mut command = Command::new(&binary_path);
+        let mut command = Command::new(binary_path);
         command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
         // The embedded console would bind the fixed default port :9001, which
         // collides with unrelated local services (e.g. Docker Desktop). Tests
@@ -666,6 +677,19 @@ impl RustFSTestEnvironment {
         self.wait_for_server_ready().await?;
 
         Ok(())
+    }
+
+    /// Start a specific RustFS binary against this environment's isolated
+    /// data directory. Upgrade tests use this to seed an old on-disk format
+    /// before restarting the same environment with the workspace binary.
+    pub async fn start_rustfs_server_from_binary(
+        &mut self,
+        binary_path: &Path,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, true)
+            .await
     }
 
     /// Start RustFS server with basic configuration
