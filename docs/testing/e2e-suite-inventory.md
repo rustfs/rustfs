@@ -41,6 +41,7 @@
 | copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
 | create_bucket_region_test | 2 | ✅ |
+| data_usage_test | 2 |  |
 | degraded_read_eof_regression_test | 3 |  |
 | delete_marker_migration_semantics_test | 2 | ✅ |
 | delete_object_no_content_length_test | 1 |  |
