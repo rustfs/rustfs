@@ -6662,6 +6662,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let find_vid = Uuid::new_v4();
+        #[cfg(test)]
+        pause_delete_object_commit(bucket, object).await;
 
         if mark_delete && (opts.versioned || opts.version_suspended) {
             if !delete_marker {
@@ -6730,8 +6732,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             dfi.set_skip_tier_free_version();
         }
 
-        #[cfg(test)]
-        pause_delete_object_commit(bucket, object).await;
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
@@ -7904,9 +7904,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     /// for tests that never touch context-resolved services registered on the
     /// ambient context (tier config manager, expiry state, ...), because the
     /// isolated context starts every one of those cells fresh.
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_isolated(
-        disk_count: usize,
-    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(crate) async fn hermetic_set_disks_isolated(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
     }
 
@@ -12603,6 +12601,7 @@ mod transition_upload_integrity_tests {
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
+                    namespace_lock_lost_signal: None,
                     ..Default::default()
                 },
                 "test_data_movement",

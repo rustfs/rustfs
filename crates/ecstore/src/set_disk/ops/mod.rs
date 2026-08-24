@@ -25,3 +25,6 @@ pub(crate) mod list;
 pub(crate) mod locking;
 pub(crate) mod multipart;
 pub(crate) mod object;
+
+#[cfg(test)]
+pub(crate) use object::hermetic_set_disks_support::hermetic_set_disks_isolated;

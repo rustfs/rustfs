@@ -70,7 +70,9 @@ mod ecstore_notification {
 }
 
 #[allow(unused_imports)]
-mod ecstore_rebalance {
+pub(crate) mod ecstore_rebalance {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_rebalance::test_util;
     pub(crate) use crate::storage::storage_api::ecstore_rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
