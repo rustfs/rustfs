@@ -128,9 +128,17 @@ mod tests {
     #[test]
     fn test_readiness_state_lock_not_ready() {
         let state = health_check_state(true, true, false, true, HealthProbe::Readiness);
+        assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.status, "degraded");
+        assert!(!state.ready);
+    }
+
+    #[test]
+    fn test_liveness_state_lock_not_ready() {
+        let state = health_check_state(true, true, false, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
-        assert_eq!(state.status, "ok");
-        assert!(state.ready);
+        assert_eq!(state.status, "degraded");
+        assert!(!state.ready);
     }
 
     #[test]
@@ -265,6 +273,52 @@ mod tests {
         // Dependency details are included when readiness report is present.
         assert!(payload.get("details").is_some());
         assert!(payload.get("degradedReasons").is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_health_and_readiness_body_agree_when_only_lock_quorum_is_unavailable() {
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
+            let readiness_report = crate::shared_types::DependencyReadinessReport {
+                readiness: crate::shared_types::DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: false,
+                    peer_health_ready: true,
+                },
+                degraded_reasons: vec![crate::shared_types::ReadinessDegradedReason::LockQuorumUnavailable],
+            };
+
+            let liveness = build_health_response_parts(
+                Method::GET,
+                HealthProbe::Liveness,
+                Some(&readiness_report),
+                "rustfs-endpoint",
+                None,
+                None,
+            );
+            let readiness = build_health_response_parts(
+                Method::GET,
+                HealthProbe::Readiness,
+                Some(&readiness_report),
+                "rustfs-endpoint",
+                None,
+                None,
+            );
+
+            assert_eq!(liveness.status_code, StatusCode::OK);
+            assert_eq!(readiness.status_code, StatusCode::SERVICE_UNAVAILABLE);
+            let liveness_payload = liveness.payload.expect("GET should include liveness payload");
+            let readiness_payload = readiness.payload.expect("GET should include readiness payload");
+            assert_eq!(liveness_payload["status"], "degraded");
+            assert_eq!(readiness_payload["status"], "degraded");
+            assert_eq!(liveness_payload["ready"], false);
+            assert_eq!(readiness_payload["ready"], false);
+            assert_eq!(liveness_payload["details"]["lock"]["ready"], false);
+            assert_eq!(readiness_payload["details"]["lock"]["ready"], false);
+            assert_eq!(liveness_payload["degradedReasons"][0], "lock_quorum_unavailable");
+            assert_eq!(readiness_payload["degradedReasons"][0], "lock_quorum_unavailable");
+        });
     }
 
     #[test]
