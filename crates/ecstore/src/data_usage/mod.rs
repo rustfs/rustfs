@@ -2160,6 +2160,13 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                 {
                     // A scanner snapshot can be saved after newer writes but still miss them if it listed the bucket earlier.
                     let mut preserved = existing.clone();
+                    if preserved.pending_negative_delta > 0 && preserved.usage.size == candidate.get().usage.size {
+                        // The complete scanner snapshot has reconciled the
+                        // post-delete byte total. Keep the request-path object
+                        // counts until they also converge, but release the
+                        // conservative quota hold.
+                        preserved.pending_negative_delta = 0;
+                    }
                     preserved.stale_snapshot_pending = true;
                     candidate.insert(preserved);
                 }
@@ -2171,6 +2178,11 @@ async fn replace_bucket_usage_memory_from_info_if_generation(data_usage_info: &D
                     candidate.insert(existing.clone());
                 } else if existing.authoritative && existing.dirty {
                     let mut preserved = existing.clone();
+                    if preserved.pending_negative_delta > 0 && preserved.usage.size == 0 {
+                        // Omitting the bucket from a complete snapshot confirms
+                        // that its post-delete byte total is zero.
+                        preserved.pending_negative_delta = 0;
+                    }
                     preserved.stale_snapshot_pending = true;
                     candidate.insert(preserved);
                 }
@@ -5037,6 +5049,81 @@ mod tests {
         let reconciled = data_usage_info_for_test("bucket-a", 0, 75, SystemTime::UNIX_EPOCH + Duration::from_secs(101));
         replace_bucket_usage_memory_from_info(&reconciled).await;
         assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(75));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn negative_delta_releases_when_scanner_confirms_bytes_before_counts() {
+        clear_usage_memory_cache_for_test().await;
+
+        let baseline = data_usage_info_for_test("bucket-a", 2, 768, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_delete_memory("bucket-a", 512, true).await;
+        let mutation_update = memory_cache()
+            .read()
+            .await
+            .get("bucket-a")
+            .expect("delete usage should remain cached")
+            .usage_updated_at;
+
+        let stale = data_usage_info_for_test("bucket-a", 2, 768, mutation_update + Duration::from_nanos(1));
+        replace_bucket_usage_memory_from_info(&stale).await;
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(768));
+
+        let mut too_old_matching = data_usage_info_for_test("bucket-a", 1, 256, mutation_update - Duration::from_nanos(1));
+        too_old_matching
+            .buckets_usage
+            .get_mut("bucket-a")
+            .expect("matching bucket usage should exist")
+            .versions_count = 2;
+        too_old_matching.calculate_totals();
+        replace_bucket_usage_memory_from_info(&too_old_matching).await;
+        assert_eq!(
+            get_bucket_usage_memory("bucket-a").await,
+            Some(768),
+            "a matching byte total from before the delete cannot release the hold"
+        );
+
+        let mut reconciled = data_usage_info_for_test("bucket-a", 1, 256, mutation_update + Duration::from_nanos(2));
+        reconciled
+            .buckets_usage
+            .get_mut("bucket-a")
+            .expect("reconciled bucket usage should exist")
+            .versions_count = 2;
+        reconciled.calculate_totals();
+        replace_bucket_usage_memory_from_info(&reconciled).await;
+
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(256));
+        let cached = memory_cache().read().await;
+        let usage = cached.get("bucket-a").expect("reconciled usage should remain cached");
+        assert_eq!((usage.usage.objects_count, usage.usage.versions_count), (1, 1));
+        assert!(usage.stale_snapshot_pending);
+        assert_eq!(usage.pending_negative_delta, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn negative_delta_releases_when_complete_snapshot_omits_empty_bucket() {
+        clear_usage_memory_cache_for_test().await;
+
+        let baseline = data_usage_info_for_test("bucket-a", 1, 512, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_delete_memory("bucket-a", 512, true).await;
+        let mutation_update = memory_cache()
+            .read()
+            .await
+            .get("bucket-a")
+            .expect("delete usage should remain cached")
+            .usage_updated_at;
+
+        let complete_empty = DataUsageInfo {
+            last_update: Some(mutation_update + Duration::from_nanos(1)),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        replace_bucket_usage_memory_from_info(&complete_empty).await;
+
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(0));
     }
 
     #[tokio::test]
