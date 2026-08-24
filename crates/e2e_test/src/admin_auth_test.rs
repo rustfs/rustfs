@@ -33,6 +33,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client, rustfs_binary_path};
     use aws_sdk_s3::config::{Credentials, Region};
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::{Client, Config};
     use http::header::HOST;
     use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -368,10 +369,15 @@ mod tests {
             reqwest::StatusCode::FORBIDDEN,
             "stale root must be rejected on the admin API after rotation, body: {body}"
         );
-        let s3_old = s3_client_with(&env, &old_ak, &old_sk).list_buckets().send().await;
-        assert!(
-            s3_old.is_err(),
-            "stale root must be rejected on the S3 plane after rotation, got: {s3_old:?}"
+        let s3_old = s3_client_with(&env, &old_ak, &old_sk)
+            .list_buckets()
+            .send()
+            .await
+            .expect_err("stale root must be rejected on the S3 plane after rotation");
+        assert_eq!(
+            s3_old.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("InvalidAccessKeyId"),
+            "stale root must receive InvalidAccessKeyId after rotation: {s3_old:?}"
         );
 
         env.stop_server();
