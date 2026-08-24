@@ -311,15 +311,33 @@ mod serial_tests {
     /// data_blocks disks is genuinely unrecoverable. With grace disabled it must
     /// still be dangling-deleted (the delete path is LIVE and the guard is
     /// discriminating — it does not resurrect torn writes).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn deep_heal_torn_minority_is_dangling_deleted_with_grace_zero() {
+    #[test]
+    fn deep_heal_torn_minority_is_dangling_deleted_with_grace_zero() {
+        std::thread::Builder::new()
+            .name("deep-heal-torn-minority".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("deep heal torn-minority test runtime should build");
+
+                runtime.block_on(deep_heal_torn_minority_is_dangling_deleted_with_grace_zero_inner());
+            })
+            .expect("deep heal torn-minority test thread should spawn")
+            .join()
+            .expect("deep heal torn-minority test thread should finish");
+    }
+
+    async fn deep_heal_torn_minority_is_dangling_deleted_with_grace_zero_inner() {
         let (disk_paths, ecstore, heal_storage) = heal_env_n(4).await;
         let bucket = "b920-torn";
         let object = "obj.bin";
         create_versioned_bucket(&ecstore, bucket).await;
 
         let v1 = put_versioned(&ecstore, bucket, object, &versioned_test_data(3)).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         // EC2+2 (4 drives, parity 2, data_blocks 2). Wipe the object ENTIRELY
         // (meta + data) on 3 of 4 disks, leaving it on only 1 (< data_blocks 2):
