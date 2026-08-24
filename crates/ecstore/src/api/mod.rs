@@ -243,8 +243,8 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
-        path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+        path2_bucket_object, path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
