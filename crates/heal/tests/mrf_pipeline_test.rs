@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! HS-01 (rustfs/backlog#1865): MRF intent pipeline integration tests.
 //!
 //! Drives the real consumer loop (`spawn_mrf_consumer`) against a real
