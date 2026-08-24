@@ -28,6 +28,27 @@ pub(super) use strong::{
 };
 pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
 
+pub(in crate::table_catalog) fn catalog_lock_acquisition_error(
+    operation: &str,
+    err: rustfs_lock::LockError,
+) -> TableCatalogStoreError {
+    let unavailable = matches!(
+        &err,
+        rustfs_lock::LockError::Timeout { .. }
+            | rustfs_lock::LockError::Network { .. }
+            | rustfs_lock::LockError::AlreadyLocked { .. }
+            | rustfs_lock::LockError::InsufficientNodes { .. }
+            | rustfs_lock::LockError::QuorumNotReached { .. }
+            | rustfs_lock::LockError::QueueFull { .. }
+    );
+    let message = format!("failed to {operation}: {err}");
+    if unavailable {
+        TableCatalogStoreError::Unavailable(message)
+    } else {
+        TableCatalogStoreError::Internal(message)
+    }
+}
+
 fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
     validate_catalog_entry_version("table bucket", entry.version)?;
     if entry.table_bucket.is_empty() {
@@ -1839,7 +1860,7 @@ where
         let guard = lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog table lock: {err}")))?;
+            .map_err(|err| catalog_lock_acquisition_error("acquire catalog table lock", err))?;
         Ok(TableCatalogLockGuard::namespace(guard))
     }
 
@@ -1852,7 +1873,7 @@ where
         let guard = lock
             .get_read_lock(get_lock_acquire_timeout())
             .await
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to acquire catalog migration lock: {err}")))?;
+            .map_err(|err| catalog_lock_acquisition_error("acquire catalog migration lock", err))?;
         Ok(TableCatalogLockGuard::namespace(guard))
     }
 }
