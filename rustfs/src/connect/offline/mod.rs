@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Offline enrolment: joining a Connect tenant without a network.
+//! Air-gapped Connect enrolment and support-bundle production.
 //!
 //! An air-gapped cluster cannot perform the registration exchange, so an
 //! operator carries a signed challenge in and a signed response out. The device
@@ -20,20 +20,24 @@
 //! whose fingerprint is compiled into this binary, minting the key being
 //! enrolled, and signing the response.
 //!
-//! Nothing here opens a socket. That is the point of the surface, and it is
-//! asserted rather than assumed: the enrolment path takes bytes and returns
-//! bytes.
+//! The same enrolled key signs a deterministic bundle of the stopped runtime's
+//! persisted inventory and bounded host diagnostics. Nothing here opens a
+//! socket; upload is a separate, operator-controlled step.
 //!
 //! The trust model, the signing convention, and every rejection reason are
-//! frozen by `protocol/agent/v1/fixtures/offline-enrollment/` and by
+//! frozen by `protocol/agent/v1/fixtures/{offline-enrollment,bundle}/` and by
 //! `docs/adr/0009-offline-signing.md` on the Connect side.
 
+pub mod bundle_writer;
 pub mod collectors;
 pub mod enrollment;
 pub mod key_store;
+#[cfg(target_os = "linux")]
+mod manifest;
 pub mod manifest_entry;
 pub mod redaction;
 
+pub use bundle_writer::{BundleContext, BundleError, BundleReceipt, write_offline_bundle};
 pub use collectors::{CollectorError, OfflineCollector, OfflineDiagnostics, collect_offline_diagnostics};
 pub use enrollment::{EnrollmentError, OfflineEnrollment, VerifiedChallenge};
 pub use key_store::OfflineKeyStore;
