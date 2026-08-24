@@ -228,6 +228,7 @@ pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 }
 
 // Bucket existence cache - reduces statx syscalls for repeated bucket checks
+
 /// Cache for bucket directory existence checks.
 struct BucketExistenceCache {
     cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
@@ -276,9 +277,8 @@ pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
     if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
         if exists {
             return Ok(());
-        } else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
         }
+        return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
     }
 
     let result = fs::metadata(&path_buf).await;

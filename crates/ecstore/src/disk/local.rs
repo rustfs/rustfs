@@ -9981,7 +9981,9 @@ impl DiskAPI for LocalDisk {
 
         let volume_dir = self.io_get_bucket_path(volume)?;
 
-        if let Err(e) = cached_access(&volume_dir).await {
+        // Volume creation is a mutation boundary, so it must observe the live
+        // filesystem rather than a potentially stale existence-cache entry.
+        if let Err(e) = access(&volume_dir).await {
             if e.kind() == ErrorKind::NotFound {
                 os::make_dir_all(&volume_dir, self.io_root()).await?;
                 invalidate_bucket_cache(&volume_dir);
@@ -18426,6 +18428,29 @@ mod test {
         disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
+    }
+
+    #[tokio::test]
+    async fn make_volume_rechecks_stale_positive_existence_cache() {
+        let root_dir = tempfile::tempdir().expect("temporary disk root should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let volume_dir = disk.io_get_bucket_path("bucket").expect("bucket path should resolve");
+
+        fs::create_dir_all(&volume_dir)
+            .await
+            .expect("bucket directory should be created");
+        cached_access(&volume_dir)
+            .await
+            .expect("existing bucket should populate the cache");
+        fs::remove_dir(&volume_dir)
+            .await
+            .expect("bucket directory should be removed outside the cache");
+
+        disk.make_volume("bucket")
+            .await
+            .expect("volume creation should recheck the live filesystem");
+        assert!(fs::metadata(volume_dir).await.is_ok(), "volume directory should be recreated");
     }
 
     #[tokio::test]
