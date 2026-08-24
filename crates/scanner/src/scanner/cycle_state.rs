@@ -1318,8 +1318,8 @@ pub(super) async fn persisted_usage_floor(
     };
     for primary_path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
         let backup_path = format!("{primary_path}.bkp");
-        let primary_epoch = match read_config(storeapi.clone(), primary_path).await {
-            Ok(data) => {
+        let primary_epoch = match read_config_with_revision(storeapi.clone(), primary_path).await {
+            Ok((Some(data), _)) => {
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
                 })?;
@@ -1332,7 +1332,7 @@ pub(super) async fn persisted_usage_floor(
                 update_floor(&mut floor, &usage, primary_path)?;
                 Some(epoch)
             }
-            Err(EcstoreError::ConfigNotFound) => None,
+            Ok((None, _)) => None,
             Err(err) => {
                 return Err(ScannerError::Other(format!(
                     "failed to read scanner usage epoch floor from {primary_path}: {err}"
@@ -1340,8 +1340,8 @@ pub(super) async fn persisted_usage_floor(
             }
         };
         let mut any_found = primary_epoch.is_some();
-        match read_config(storeapi.clone(), &backup_path).await {
-            Ok(data) => {
+        match read_config_with_revision(storeapi.clone(), &backup_path).await {
+            Ok((Some(data), _)) => {
                 any_found = true;
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
@@ -1359,7 +1359,7 @@ pub(super) async fn persisted_usage_floor(
                     update_floor(&mut floor, &usage, &backup_path)?;
                 }
             }
-            Err(EcstoreError::ConfigNotFound) => {}
+            Ok((None, _)) => {}
             Err(err) => {
                 return Err(ScannerError::Other(format!(
                     "failed to read scanner usage epoch floor from {backup_path}: {err}"
@@ -1373,9 +1373,32 @@ pub(super) async fn persisted_usage_floor(
     }
 
     if !found_any {
-        return Err(ScannerError::Other(
-            "persisted scanner usage floor has no authoritative baseline".to_string(),
-        ));
+        let Some(publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
+            return Err(ScannerError::Other(
+                "scanner usage floor changed before pristine state confirmation".to_string(),
+            ));
+        };
+        for path in [
+            DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        ] {
+            match read_config_with_revision(storeapi.clone(), &path).await {
+                Ok((None, _)) => {}
+                Ok((Some(_), _)) => {
+                    return Err(ScannerError::Other(format!(
+                        "scanner usage floor changed while confirming pristine state: {path} appeared"
+                    )));
+                }
+                Err(err) => {
+                    return Err(ScannerError::Other(format!(
+                        "failed to confirm pristine scanner usage floor at {path}: {err}"
+                    )));
+                }
+            }
+        }
+        drop(publication_admission);
     }
     let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi, read_epoch).await else {
         return Err(ScannerError::Other(

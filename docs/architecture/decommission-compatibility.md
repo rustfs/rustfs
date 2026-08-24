@@ -153,6 +153,99 @@ No migration step is required for these decisions because this note documents th
 current RustFS behavior. Changing either decision later requires an operator
 compatibility note and updated characterization tests.
 
+## Tier Free Versions During Decommission
+
+A tier free version is an internal xl.meta record (`rustfs_filemeta::FREE_VERSION`,
+flagged `XL_FLAG_FREE_VERSION`) shaped like a delete marker. It is created by
+`MetaObject::init_free_version` when a version whose remote transition completed is
+deleted locally: the visible version is removed and the record keeps the remote-tier
+identity (tier, object name, version id, state, destination id) needed for an
+idempotent remote delete. Free versions are not user-visible versions; `num_versions`
+and all listing/GET paths exclude them.
+
+### Lifecycle And Consumers
+
+Creation: any local delete that removes a version whose transition status is
+`complete` appends the record via `MetaObject::delete_version` →
+`init_free_version` (skipped only when `skip_tier_free_version` is set, as on
+data-movement copies). The same deletes also persist a durable tier-journal
+entry on every user-facing path: S3 single deletes (`execute_delete_object` →
+`delete_object_with_tier_delete_journal`), S3 batch deletes, lifecycle expiry,
+and lifecycle delete-all all prepare and commit a journal entry around the
+delete. A journal entry is omitted when the removed version's transition state
+decodes as `TransitionVersionState::Unknown`, or on internal journal-less
+delete paths that never touch transitioned user objects.
+
+Consumption while the record exists: the background recovery loop started by
+`init_background_expiry` (spawned by `spawn_tier_free_version_recovery_once`,
+enabled by default) scans disks for pending records and re-enqueues them; the
+usage scanner does the same; the lifecycle worker then deletes the remote tier
+object idempotently and only afterwards removes the local record. Heal walks
+include free-version records in metadata healing. Transition planning,
+replication, restore, GET, listings, and usage aggregation never depend on
+them.
+
+### Decommission Handling
+
+The exact decommission inventory loader (`load_file_info_versions_exact` via
+`get_all_file_info_versions`) keeps free-version records inline in `versions`.
+The migration loop handles them before lifecycle expiry and delete-marker
+shortcuts. It selects a target pool using the free-version-aware lookup, then
+writes the original free record to every target disk with the normal metadata
+write quorum. The free-version marker, local version id, transition identity,
+transition state, and destination id are preserved at the FileInfo/metadata
+boundary.
+
+The source record is physically removed only after the target write quorum has
+committed and the source cleanup preflight still matches the exact inventory.
+If the lifecycle worker has already completed the remote delete and removed the
+source record before decommission acquires the source lock, decommission records
+that identity as already consumed and treats the missing source record as safe.
+If target capacity, metadata validation, lock fencing, or quorum fails, the
+source record remains and the entry records `state = "free_version_retained"`
+with reason `tier_free_version_migration_failed`; the worker retries the
+operation on a later pass. A target record with the same version id is accepted
+only when its free-version identity matches; a conflicting ordinary version or
+different free record is an overwrite error. This makes retries idempotent and
+prevents a free record from replacing a user-visible version.
+
+### Reference-Audit Result
+
+After migration, user-facing GET/list/transition/replication/restore paths still
+exclude the record. Recovery, usage scanning, lifecycle tier cleanup, and heal
+continue to see it when they request free versions, so an unresolved remote
+delete remains actionable on the target pool. The committed tier journal remains
+an independent retry source where one exists; it is not used as a reason to drop
+the xl.meta record. In particular, `Unknown` transition state records are
+migrated unchanged rather than discarded: the lifecycle worker retains them if
+remote identity validation cannot make a delete request.
+
+Each migrated record emits `state = "free_version_migrated"` with reason
+`tier_free_version_migrated`. A record consumed before migration emits
+`state = "free_version_consumed"` with reason
+`tier_free_version_already_consumed`. Each failed record emits the retained state
+and failure reason above. The entry also emits a disposition summary with
+migrated, consumed, retained, and total counts. The final decommission sweep uses
+the exact loader, counts free records still present, and emits one retained
+record/reason for each unresolved free version before failing the sweep. This
+makes successful migration, completed cleanup, and retained cleanup obligations
+visible instead of silently omitting free records.
+
+No new S3-visible version or admin response field is needed: free versions remain
+internal and are never counted as user-visible versions. The structured
+`decommission_entry` events are the operational status surface for the
+free-version disposition; the existing decommission item/failed counters still
+report the enclosing object migration result.
+
+Regression guard:
+
+- `decommission_tier_free_version_preserves_remote_identity`
+- `decommission_tier_free_version_resume_requires_write_quorum`
+- `decommission_tier_free_version_commit_rejects_lost_fence`
+- `test_decommission_cleanup_preflight_accepts_migrated_free_version_consumed_from_source`
+- `decommission_entry_skips_cleanup_only_marker_when_free_version_is_present`
+- `decommission_entry_rejects_subquorum_free_version_conflict_and_retains_source`
+
 ## Regression Guard
 
 The queued multi-pool contract is guarded by:

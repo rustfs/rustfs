@@ -2725,6 +2725,15 @@ impl MetaObject {
         self.meta_sys.retain(|k, _| !k.starts_with("X-Amz-Restore"));
     }
 
+    /// Builds the free-version cleanup record appended when a transitioned
+    /// version is removed from xl.meta. The record keeps the remote tier
+    /// identity so the lifecycle worker can issue the idempotent remote delete
+    /// and only then remove the record; until then the recovery scan and the
+    /// usage scanner keep re-enqueueing it. S3 and lifecycle deletes also
+    /// persist a committed tier-journal entry for the same remote delete. The
+    /// decommission path copies this record unchanged before source cleanup,
+    /// including when the transition state is unknown — see
+    /// docs/architecture/decommission-compatibility.md.
     pub fn init_free_version(&self, fi: &FileInfo) -> Result<(FileMetaVersion, bool)> {
         if fi.skip_tier_free_version() {
             return Ok((FileMetaVersion::default(), false));

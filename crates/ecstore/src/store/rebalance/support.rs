@@ -277,8 +277,19 @@ fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bo
     }
 }
 
+#[cfg(test)]
 pub(super) fn resolve_latest_object_info_candidates(
     candidates: Vec<LatestObjectInfoCandidate>,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+) -> Result<(ObjectInfo, usize)> {
+    resolve_latest_object_info_candidates_with_pool_state(candidates, &[], bucket, object, opts)
+}
+
+pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
+    candidates: Vec<LatestObjectInfoCandidate>,
+    suspended_pools: &[bool],
     bucket: &str,
     object: &str,
     opts: &ObjectOptions,
@@ -291,7 +302,15 @@ pub(super) fn resolve_latest_object_info_candidates(
             .filter(|candidate| latest_candidate_mod_time(candidate) == Some(latest_mod_time))
             .collect::<Vec<_>>();
 
-        latest_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.idx));
+        // A decommission source remains readable until its target commits. Once
+        // equivalent copies exist, prefer the active target without hiding a
+        // same-time identity conflict behind pool state.
+        latest_candidates.sort_by_key(|candidate| {
+            (
+                suspended_pools.get(candidate.idx).copied().unwrap_or(false),
+                std::cmp::Reverse(candidate.idx),
+            )
+        });
 
         let Some(winner) = latest_candidates.first() else {
             return Err(Error::ErasureReadQuorum);
