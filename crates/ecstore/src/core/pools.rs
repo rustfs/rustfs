@@ -3780,11 +3780,11 @@ impl PoolMeta {
         Ok(())
     }
 
-    async fn save_no_lock_armed<S>(
+    async fn save_no_lock_with_activation_fence<S>(
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        activation_fence: PoolRebalanceActivationFence,
     ) -> Result<bool>
     where
         S: EcstoreObjectIO,
@@ -3793,35 +3793,13 @@ impl PoolMeta {
         // Arm before the first replica write. If this future is dropped, the
         // mutex guard is released with the sticky write gate still blocked.
         write_state.block_writes();
-        self.save_no_lock_with_fence(pools, lock_lost).await?;
-        Ok(was_write_blocked)
-    }
-
-    #[cfg(test)]
-    async fn save_no_lock_observing<S>(&self, pools: Vec<Arc<S>>, write_state: &mut PoolMetaWriteState) -> Result<()>
-    where
-        S: EcstoreObjectIO,
-    {
-        let was_write_blocked = self.save_no_lock_armed(pools, write_state, None).await?;
-        write_state.restore_writes(was_write_blocked);
-        Ok(())
-    }
-
-    async fn save_no_lock_with_activation_fence<S>(
-        &self,
-        pools: Vec<Arc<S>>,
-        activation_fence: PoolRebalanceActivationFence,
-    ) -> Result<()>
-    where
-        S: EcstoreObjectIO,
-    {
         let data = self.encode_config_data()?;
         if data.is_empty() {
-            return Ok(());
+            return Ok(was_write_blocked);
         }
         let mut pools = pools.into_iter();
         let Some(canonical_pool) = pools.next() else {
-            return Ok(());
+            return Ok(was_write_blocked);
         };
         let mut opts = ObjectOptions {
             max_parity: true,
@@ -3865,6 +3843,33 @@ impl PoolMeta {
             }
         }
 
+        Ok(was_write_blocked)
+    }
+
+    async fn save_no_lock_armed<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+    ) -> Result<bool>
+    where
+        S: EcstoreObjectIO,
+    {
+        let was_write_blocked = write_state.write_blocked;
+        // Arm before the first replica write. If this future is dropped, the
+        // mutex guard is released with the sticky write gate still blocked.
+        write_state.block_writes();
+        self.save_no_lock_with_fence(pools, lock_lost).await?;
+        Ok(was_write_blocked)
+    }
+
+    #[cfg(test)]
+    async fn save_no_lock_observing<S>(&self, pools: Vec<Arc<S>>, write_state: &mut PoolMetaWriteState) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        let was_write_blocked = self.save_no_lock_armed(pools, write_state, None).await?;
+        write_state.restore_writes(was_write_blocked);
         Ok(())
     }
 
@@ -4748,7 +4753,7 @@ impl ECStore {
         let pool_meta_guard = pool_meta_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(decommission_pool_meta_lock_error)?;
+            .map_err(activation_pool_meta_lock_error)?;
         let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe(operation)?;
@@ -5002,10 +5007,8 @@ impl ECStore {
         }
 
         activation_fence.ensure_held()?;
-        let was_write_blocked = save_guard.write_blocked;
-        save_guard.block_writes();
-        latest_pool_meta
-            .save_no_lock_with_activation_fence(self.pools.clone(), activation_fence)
+        let was_write_blocked = latest_pool_meta
+            .save_no_lock_with_activation_fence(self.pools.clone(), &mut save_guard, activation_fence)
             .await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
@@ -11114,8 +11117,8 @@ mod pools_tests {
         missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
         publish_pool_meta_updates, reconcile_decommission_meta_buckets,
         reconcile_decommission_unresolved_entries_for_completion, record_decommission_unresolved_entry,
-        require_decommission_store, reserve_decommission_start_cancelers, resolve_decommission_bucket_done_save_result,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        require_decommission_store,
+        reserve_decommission_start_cancelers, resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
         resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
