@@ -80,6 +80,7 @@
 | object_lambda_test | 16 | 🌙 |
 | object_lock | 34 |  |
 | overwrite_cleanup_regression_test | 1 |  |
+| policy | 6 |  |
 | presigned_negative_test | 7 | ✅ |
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |

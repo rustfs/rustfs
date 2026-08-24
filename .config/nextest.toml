@@ -409,7 +409,7 @@ path = "junit.xml"
 #     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (56 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
 #   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
-#     manual-localhost:9000 reliant/policy tests are ci-13's migration.
+#     manual-localhost:9000 reliant tests are ci-13's migration.
 #
 # Each e2e test spawns its own single-node rustfs server on a random port with
 # an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
