@@ -128,14 +128,17 @@ token_for_client() {
   local client_id="$1"
   local client_secret="$2"
   local response_file="${WORK_DIR}/token-${client_id}.json"
-  curl --noproxy '*' -fsS "${ISSUER}/protocol/openid-connect/token" \
+  if ! curl --noproxy '*' -sS --fail-with-body "${ISSUER}/protocol/openid-connect/token" \
     --data-urlencode grant_type=password \
     --data-urlencode "client_id=${client_id}" \
     --data-urlencode "client_secret=${client_secret}" \
     --data-urlencode username=alice \
     --data-urlencode password=alice-password \
     --data-urlencode scope=openid \
-    >"${response_file}"
+    >"${response_file}"; then
+    cat "${response_file}" >&2
+    return 1
+  fi
   python3 - "${response_file}" "${ISSUER}" "${client_id}" <<'PY'
 import base64
 import json
