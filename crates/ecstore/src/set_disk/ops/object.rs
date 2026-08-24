@@ -1180,6 +1180,71 @@ static RESTORE_MULTIPART_UPLOAD_ID: std::sync::Mutex<Option<String>> = std::sync
 static RESTORE_MULTIPART_ABORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
+struct RestoreMetadataUpdateProbeState {
+    bucket: String,
+    object: String,
+    attempts: AtomicU64,
+}
+
+#[cfg(test)]
+struct RestoreMetadataUpdateProbe {
+    state: Arc<RestoreMetadataUpdateProbeState>,
+}
+
+#[cfg(test)]
+static RESTORE_METADATA_UPDATE_PROBE: OnceLock<std::sync::Mutex<Option<Arc<RestoreMetadataUpdateProbeState>>>> = OnceLock::new();
+
+#[cfg(test)]
+impl RestoreMetadataUpdateProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(RestoreMetadataUpdateProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            attempts: AtomicU64::new(0),
+        });
+        let mut slot = RESTORE_METADATA_UPDATE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("restore metadata update probe mutex should not poison");
+        assert!(slot.is_none(), "restore metadata update probe must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn attempts(&self) -> u64 {
+        self.state.attempts.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreMetadataUpdateProbe {
+    fn drop(&mut self) {
+        let mut slot = RESTORE_METADATA_UPDATE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("restore metadata update probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_restore_metadata_update_attempt(bucket: &str, object: &str) {
+    let probe = RESTORE_METADATA_UPDATE_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("restore metadata update probe mutex should not poison")
+        .as_ref()
+        .filter(|probe| probe.bucket == bucket && probe.object == object)
+        .cloned();
+    if let Some(probe) = probe {
+        probe.attempts.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
 fn restore_multipart_failure_is(point: RestoreMultipartFailurePoint) -> bool {
     *RESTORE_MULTIPART_FAILURE_POINT
         .lock()
@@ -7556,10 +7621,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if rerr.is_none() {
                 return Ok(());
             }
+            #[cfg(test)]
+            record_restore_metadata_update_attempt(bucket, object);
             restore_header_self.update_restore_metadata(bucket, object, oi, opts).await?;
             Err(rerr.unwrap())
         };
-        let mut oi = ObjectInfo::default();
         let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
             && opts.bucket_lifecycle_lock_fence.is_none()
         {
@@ -7592,13 +7658,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .get_object_fileinfo(bucket, object, &restore_read_opts, true, false)
             .await;
         drop(bucket_lifecycle_guard);
-        if let Err(err) = fi {
-            return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
-        }
-        let actual = fi?;
+        let actual = match fi {
+            Ok(actual) => actual,
+            Err(err) => return Err(to_object_err(err, vec![bucket, object])),
+        };
         let actual_fi = actual.fi();
 
-        oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let mut oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
@@ -9960,6 +10026,30 @@ mod transition_commit_failure_tests {
         let mut metadata = restore_operation_id_metadata(operation_id);
         metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
         metadata
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(restore_metadata_update_probe)]
+    async fn restore_fileinfo_failure_preserves_error_without_metadata_update() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-fileinfo-failure-bucket";
+        let object = "missing-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let probe = RestoreMetadataUpdateProbe::install(bucket, object);
+
+        let error = set_disks
+            .clone()
+            .restore_transitioned_object(bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("missing restore source must preserve its lookup error");
+
+        assert!(
+            matches!(&error, StorageError::ObjectNotFound(error_bucket, error_object) if error_bucket == bucket && error_object == object),
+            "missing restore source must remain a typed ObjectNotFound, got {error:?}"
+        );
+        assert_eq!(probe.attempts(), 0, "failed fileinfo lookup must not attempt restore metadata cleanup");
     }
 
     #[tokio::test]
