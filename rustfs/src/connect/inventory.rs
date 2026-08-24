@@ -1150,7 +1150,13 @@ mod tests {
     use super::*;
 
     fn safe_tempdir() -> tempfile::TempDir {
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory")
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).expect("private temporary directory");
+        }
+        temp
     }
 
     #[cfg(not(target_os = "linux"))]
