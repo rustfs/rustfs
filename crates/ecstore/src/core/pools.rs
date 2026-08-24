@@ -9035,10 +9035,8 @@ impl ECStore {
     ) -> Result<Vec<DecommissionUnresolvedEntry>> {
         self.ensure_decommission_generation_current(idx, generation).await?;
         let operation_gate = self.ctx.data_movement_operation_gate();
-        self.run_guarded_decommission_side_effect(rx, &operation_gate, || {
-            self.check_after_decommission_unfenced(idx, generation)
-        })
-        .await
+        self.run_guarded_decommission_side_effect(rx, &operation_gate, || self.check_after_decommission_unfenced(idx, generation))
+            .await
     }
 
     async fn check_after_decommission_unfenced(
@@ -11115,10 +11113,9 @@ mod pools_tests {
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
         merge_decommission_durable_ilm_receipts, merge_pool_meta_updates_for_save, merge_pool_status_refresh,
         missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
-        publish_pool_meta_updates, reconcile_decommission_meta_buckets,
-        reconcile_decommission_unresolved_entries_for_completion, record_decommission_unresolved_entry,
-        require_decommission_store,
-        reserve_decommission_start_cancelers, resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        publish_pool_meta_updates, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
+        record_decommission_unresolved_entry, require_decommission_store, reserve_decommission_start_cancelers,
+        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
         resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,

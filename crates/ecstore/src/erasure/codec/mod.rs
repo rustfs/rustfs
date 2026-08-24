@@ -13,5 +13,5 @@
 // limitations under the License.
 
 pub(crate) mod bridge;
-pub(crate) mod workspace;
 pub(crate) mod buffer_pool;
+pub(crate) mod workspace;

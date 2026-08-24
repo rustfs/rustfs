@@ -7332,6 +7332,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         commit_opts.no_lock = true;
         commit_opts.metadata_cache_safe = false;
         commit_opts.include_part_checksums = true;
+        // Note: Using clone() here is necessary because ObjectOptions has 124 fields.
+        // Future optimization: Consider using Cow<ObjectOptions> or a builder pattern.
         let transition_lock_guard = if opts.no_lock {
             None
         } else {
