@@ -442,6 +442,12 @@ pub mod rebalance {
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::rebalance::PausedRebalanceEntryTestFixture;
+        pub use crate::services::rebalance::test_store_with_persisted_rebalance_meta;
+    }
 }
 
 pub mod rio {

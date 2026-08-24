@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use crate::bucket::replication::replication_state_from_filemeta;
+#[cfg(test)]
+use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
         DurableIlmRecordCheckpoint, ILM_META_PREFIX, LifecycleExpiryConfigs, ValidatedDurableIlmRecord,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
-            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_in, eval_action_from_lifecycle,
-            lifecycle_delete_all_versions_blocked_by_replication,
+            LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_for_data_movement, apply_expiry_rule_in,
+            eval_action_from_lifecycle, lifecycle_delete_all_versions_blocked_by_replication,
         },
         classify_durable_ilm_record, get_expiry_configs,
         lifecycle::IlmAction,
@@ -32,6 +34,7 @@ use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{
     CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
     read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config, save_config_with_opts,
+    save_config_with_opts_quiet,
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
@@ -53,7 +56,6 @@ use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
     list::ListOperations as _,
-    namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
@@ -1098,6 +1100,7 @@ fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object
     Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
 }
 
+#[cfg(test)]
 fn load_decommission_entry_versions(entry: &MetaCacheEntry, bucket: &str, stage: &str) -> Result<FileInfoVersions> {
     entry
         .file_info_versions(bucket)
@@ -1661,7 +1664,7 @@ fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Res
     resolve_decommission_pool_meta_reload_result(result, "start_decommission")
 }
 
-fn decommission_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+fn activation_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -1671,12 +1674,12 @@ fn decommission_rebalance_meta_lock_error(err: rustfs_lock::LockError) -> Error 
             achieved,
         },
         other => Error::other(format!(
-            "failed to acquire rebalance metadata write lock before decommission start on {RUSTFS_META_BUCKET}/{REBAL_META_NAME}: {other}"
+            "failed to acquire rebalance activation lock on {RUSTFS_META_BUCKET}/{REBAL_META_NAME}: {other}"
         )),
     }
 }
 
-fn decommission_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
+fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -1686,8 +1689,247 @@ fn decommission_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
             achieved,
         },
         other => Error::other(format!(
-            "failed to acquire pool metadata write lock before decommission start on {RUSTFS_META_BUCKET}/{POOL_META_NAME}: {other}"
+            "failed to acquire pool activation lock on {RUSTFS_META_BUCKET}/{POOL_META_NAME}: {other}"
         )),
+    }
+}
+
+pub(crate) struct PoolRebalanceActivationFence {
+    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
+    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+    #[cfg(test)]
+    forced_lost: Arc<AtomicBool>,
+}
+
+impl PoolRebalanceActivationFence {
+    pub(crate) fn ensure_held(&self) -> Result<()> {
+        #[cfg(test)]
+        let forced_lost = self.forced_lost.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let forced_lost = false;
+        if forced_lost || self.pool_meta_guard.is_lock_lost() || self.rebalance_meta_guard.is_lock_lost() {
+            return Err(Error::other("activation lock lost before metadata commit or worker admission"));
+        }
+        if self
+            .fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof))
+        {
+            return Err(Error::other("pool activation fleet capability proof expired before commit"));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
+        opts.add_namespace_lock_guard(&self.pool_meta_guard);
+        opts.add_namespace_lock_guard(&self.rebalance_meta_guard);
+    }
+
+    #[cfg(test)]
+    fn force_lost_for_test(&self) {
+        self.forced_lost.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
+    pool: Arc<S>,
+    fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+) -> Result<PoolRebalanceActivationFence>
+where
+    S: crate::storage_api_contracts::namespace::NamespaceLocking<
+            Error = Error,
+            NamespaceLock = rustfs_lock::NamespaceLockWrapper,
+        >,
+{
+    // Activation lock order is always pool.bin -> rebalance.bin.
+    let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+    let pool_meta_guard = pool_meta_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(activation_pool_meta_lock_error)?;
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_write_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(activation_rebalance_meta_lock_error)?;
+
+    Ok(PoolRebalanceActivationFence {
+        pool_meta_guard,
+        rebalance_meta_guard,
+        fleet_proof,
+        #[cfg(test)]
+        forced_lost: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+pub(crate) async fn acquire_pool_activation_fleet_proof(
+    ctx: &crate::runtime::instance::InstanceContext,
+) -> Result<Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>> {
+    if !ctx.is_dist_erasure().await {
+        return Ok(None);
+    }
+    crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
+        .map(Some)
+        .ok_or_else(|| Error::other("pool activation requires a live fleet capability proof"))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PoolActivationStartKind {
+    Rebalance,
+    Decommission,
+}
+
+#[cfg(test)]
+struct PoolActivationDurableSaveBarrierState {
+    pool_key: usize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static POOL_ACTIVATION_DURABLE_SAVE_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<PoolActivationDurableSaveBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct PoolActivationDurableSaveBarrier {
+    state: Arc<PoolActivationDurableSaveBarrierState>,
+}
+
+#[cfg(test)]
+fn pool_activation_test_pool_key<S>(pool: &Arc<S>) -> usize {
+    Arc::as_ptr(pool).cast::<()>() as usize
+}
+
+#[cfg(test)]
+impl PoolActivationDurableSaveBarrier {
+    pub(crate) fn install<S>(pool: &Arc<S>) -> Self {
+        let state = Arc::new(PoolActivationDurableSaveBarrierState {
+            pool_key: pool_activation_test_pool_key(pool),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut barrier = POOL_ACTIVATION_DURABLE_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("pool activation durable save barrier should not be poisoned");
+        assert!(barrier.is_none(), "pool activation durable save barrier must be unique");
+        *barrier = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("activation should reach the post-durable-save barrier");
+    }
+
+    pub(crate) fn release_after_fence_loss(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolActivationDurableSaveBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut barrier = POOL_ACTIVATION_DURABLE_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("pool activation durable save barrier should not be poisoned");
+        if barrier.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *barrier = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn pause_pool_activation_after_durable_save<S>(pool: &Arc<S>, fence: &PoolRebalanceActivationFence) {
+    let pool_key = pool_activation_test_pool_key(pool);
+    let barrier = {
+        let mut barrier = POOL_ACTIVATION_DURABLE_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("pool activation durable save barrier should not be poisoned");
+        if barrier.as_ref().is_some_and(|state| state.pool_key == pool_key) {
+            barrier.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+        fence.force_lost_for_test();
+    }
+}
+
+#[cfg(test)]
+struct PoolActivationStartProbeState {
+    kind: PoolActivationStartKind,
+    attempted: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static POOL_ACTIVATION_START_PROBES: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<PoolActivationStartProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct PoolActivationStartProbe {
+    state: Arc<PoolActivationStartProbeState>,
+}
+
+#[cfg(test)]
+impl PoolActivationStartProbe {
+    pub(crate) fn install(kind: PoolActivationStartKind) -> Self {
+        let state = Arc::new(PoolActivationStartProbeState {
+            kind,
+            attempted: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        POOL_ACTIVATION_START_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("pool activation start probe should not be poisoned")
+            .push(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_attempted(&self) {
+        while !self.state.attempted.load(Ordering::Acquire) {
+            self.state.notify.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolActivationStartProbe {
+    fn drop(&mut self) {
+        let mut probes = POOL_ACTIVATION_START_PROBES
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .expect("pool activation start probe should not be poisoned");
+        probes.retain(|state| !Arc::ptr_eq(state, &self.state));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_pool_activation_start_attempt(kind: PoolActivationStartKind) {
+    let probes = POOL_ACTIVATION_START_PROBES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("pool activation start probe should not be poisoned")
+        .iter()
+        .filter(|state| state.kind == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    for state in probes {
+        state.attempted.store(true, Ordering::Release);
+        state.notify.notify_one();
     }
 }
 
@@ -2082,6 +2324,53 @@ async fn run_decommission_cleanup_mutation_hook(bucket: &str, object: &str, atte
         .clone();
     if let Some(hook) = hook {
         hook(bucket, object, attempt).await;
+    }
+}
+
+const DECOMMISSION_FREE_VERSION_MIGRATED_REASON: &str = "tier_free_version_migrated";
+const DECOMMISSION_FREE_VERSION_CONSUMED_REASON: &str = "tier_free_version_already_consumed";
+const DECOMMISSION_FREE_VERSION_RETAINED_REASON: &str = "tier_free_version_migration_failed";
+const DECOMMISSION_FREE_VERSION_SWEEP_REASON: &str = "tier_free_version_unresolved_after_decommission";
+const DECOMMISSION_FREE_VERSION_DISPOSITION_REASON: &str = "tier_free_version_disposition_recorded";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DecommissionFreeVersionDisposition {
+    migrated: usize,
+    consumed: usize,
+    retained: usize,
+}
+
+impl DecommissionFreeVersionDisposition {
+    fn record_migrated(&mut self) {
+        self.migrated += 1;
+    }
+
+    fn record_consumed(&mut self) {
+        self.consumed += 1;
+    }
+
+    fn record_retained(&mut self) {
+        self.retained += 1;
+    }
+
+    fn total(self) -> usize {
+        self.migrated.saturating_add(self.consumed).saturating_add(self.retained)
+    }
+}
+
+enum DecommissionFreeVersionAttempt {
+    Migrated,
+    Consumed,
+    CapacityFailure(Error),
+    Retry(Error),
+}
+
+fn classify_decommission_free_version_attempt(result: Result<()>) -> DecommissionFreeVersionAttempt {
+    match result {
+        Ok(()) => DecommissionFreeVersionAttempt::Migrated,
+        Err(err) if is_decommission_copy_cleanup_safe_error(&err) => DecommissionFreeVersionAttempt::Consumed,
+        Err(err) if is_decommission_target_capacity_error(&err) => DecommissionFreeVersionAttempt::CapacityFailure(err),
+        Err(err) => DecommissionFreeVersionAttempt::Retry(err),
     }
 }
 
@@ -2480,9 +2769,10 @@ fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSe
         return Err(Error::other("pool metadata recovery required: no storage pools available"));
     }
 
-    // Pool metadata has no durable generation. Semantically equivalent legacy/current
-    // encodings can be normalized, but different canonical snapshots require
-    // an operator-selected recovery source instead of an inferred winner.
+    // Pool metadata has no durable generation. Pool zero remains the canonical
+    // commit record because every writer saves it first and legacy startup read
+    // it alone. Divergent backups are ambiguous when pool zero is unavailable
+    // and require an operator-selected recovery source.
     let mut selected: Option<(usize, Vec<u8>, Vec<u8>, PoolMeta)> = None;
     let mut needs_repair = false;
     let mut repair_write_safe = true;
@@ -2514,11 +2804,19 @@ fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSe
                 observed_version = observed_version.max(meta.version);
                 if let Some((selected_idx, selected_raw, selected_canonical, _)) = selected.as_ref() {
                     if selected_canonical != &canonical {
-                        return Err(Error::other(format!(
-                            "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
-                        )));
+                        if *selected_idx == 0 {
+                            // Pool zero is the durable commit record: every
+                            // pool metadata writer commits it before replicas,
+                            // and pre-replica-recovery startup read it alone.
+                            needs_repair = true;
+                        } else {
+                            return Err(Error::other(format!(
+                                "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
+                            )));
+                        }
+                    } else {
+                        needs_repair |= selected_raw != &raw;
                     }
-                    needs_repair |= selected_raw != &raw;
                 } else {
                     selected = Some((idx, raw, canonical, meta));
                 }
@@ -3308,6 +3606,67 @@ impl PoolMeta {
         Ok(())
     }
 
+    async fn save_no_lock_with_activation_fence<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        activation_fence: PoolRebalanceActivationFence,
+    ) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        let data = self.encode_config_data()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut pools = pools.into_iter();
+        let Some(canonical_pool) = pools.next() else {
+            return Ok(());
+        };
+        let mut opts = ObjectOptions {
+            max_parity: true,
+            no_lock: true,
+            ..Default::default()
+        };
+        activation_fence.add_namespace_lock_fence(&mut opts);
+        activation_fence.ensure_held()?;
+        #[cfg(test)]
+        let barrier_pool = canonical_pool.clone();
+        save_config_with_opts(canonical_pool, POOL_META_NAME, data.clone(), &opts).await?;
+        #[cfg(test)]
+        pause_pool_activation_after_durable_save(&barrier_pool, &activation_fence).await;
+
+        // Pool zero is canonical. Once its save succeeds, later writes only
+        // replicate committed state and must not reuse the admission fence.
+        // Failed replicas remain repairable by the next full pool metadata save.
+        drop(activation_fence);
+        for (pool_index, pool) in pools.enumerate() {
+            if let Err(err) = save_config_with_opts_quiet(
+                pool,
+                POOL_META_NAME,
+                data.clone(),
+                &ObjectOptions {
+                    max_parity: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = pool_index + 1,
+                    state = "activation_replica_repair_pending",
+                    error = %err,
+                    "Decommission activation replica repair pending"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
         if let Some(stats) = self.pools.get_mut(idx) {
             if let Some(d) = &stats.decommission {
@@ -3813,6 +4172,30 @@ pub struct PoolSpaceInfo {
     pub used: usize,
 }
 
+#[cfg(test)]
+type DecommissionSpaceInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, Vec<(usize, PoolSpaceInfo)>>>;
+
+#[cfg(test)]
+static DECOMMISSION_SPACE_INFO_OVERRIDES: std::sync::OnceLock<DecommissionSpaceInfoOverrides> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_decommission_space_info_override_for_test(store_id: uuid::Uuid, space_infos: Vec<(usize, PoolSpaceInfo)>) {
+    DECOMMISSION_SPACE_INFO_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("decommission space info override should not be poisoned")
+        .insert(store_id, space_infos);
+}
+
+#[cfg(test)]
+fn take_decommission_space_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<(usize, PoolSpaceInfo)>> {
+    DECOMMISSION_SPACE_INFO_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("decommission space info override should not be poisoned")
+        .remove(&store_id)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DecomBucketInfo {
     pub name: String,
@@ -3843,8 +4226,12 @@ fn determine_decommission_final_state(items_failed: usize, was_cancelled: bool) 
     }
 }
 
-fn decommission_remaining_version_count(total_versions: usize, expired: usize) -> usize {
-    total_versions.saturating_sub(expired)
+fn decommission_remaining_version_count(versions: &[rustfs_filemeta::FileInfo], expired: usize) -> usize {
+    versions
+        .iter()
+        .filter(|version| !version.tier_free_version())
+        .count()
+        .saturating_sub(expired)
 }
 
 fn should_skip_decommission_delete_marker(
@@ -3907,6 +4294,7 @@ fn decommission_remote_tiered_opts(
         user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
+        incl_free_versions: version.tier_free_version(),
         include_part_checksums: true,
         http_preconditions: Some(data_movement::data_movement_target_precondition()),
         expected_bucket_incarnation_id,
@@ -3923,6 +4311,85 @@ fn lifecycle_action_removes_data_movement_version(action: IlmAction) -> bool {
 
 fn lifecycle_action_skips_heal_version(action: IlmAction) -> bool {
     action.delete()
+}
+
+#[cfg(test)]
+struct LifecycleDataMovementMutationBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct LifecycleDataMovementMutationBarrier {
+    state: Arc<LifecycleDataMovementMutationBarrierState>,
+}
+
+#[cfg(test)]
+static LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<LifecycleDataMovementMutationBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl LifecycleDataMovementMutationBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(LifecycleDataMovementMutationBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lifecycle data movement mutation barrier should not be poisoned");
+        assert!(slot.is_none(), "lifecycle data movement mutation barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("lifecycle data movement should reach its mutation boundary");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for LifecycleDataMovementMutationBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("lifecycle data movement mutation barrier should not be poisoned");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
+    if !has_run_fence_signal {
+        return;
+    }
+    let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("lifecycle data movement mutation barrier should not be poisoned")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
 }
 
 fn resolve_data_movement_lifecycle_expiry_result(action: IlmAction, apply_actions: bool, applied: bool) -> Result<bool> {
@@ -3944,6 +4411,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
+    lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> Result<bool> {
     let Some(lifecycle_config) = lifecycle_config else {
         return Ok(false);
@@ -3959,16 +4427,31 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 let Ok(bucket_incarnation_id) = store.bucket_incarnation_id_from_disk(bucket).await else {
                     return Ok(false);
                 };
-                let _ =
-                    apply_expiry_on_transitioned_object(store, &object_info, &event, event_source, bucket_incarnation_id).await;
+                let _ = match lock_lost_signal {
+                    Some(signal) => {
+                        apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    None => {
+                        apply_expiry_on_transitioned_object(store, &object_info, &event, event_source, bucket_incarnation_id)
+                            .await
+                    }
+                };
             }
             Ok(false)
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
+            #[cfg(test)]
+            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
-            let applied = !apply_actions || apply_expiry_rule_in(store, &event, event_source, &object_info).await;
+            let applied = !apply_actions
+                || match lock_lost_signal {
+                    Some(signal) => {
+                        apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
+                };
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
         _ => Ok(false),
@@ -4120,16 +4603,10 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("decommission start rebalance metadata load failed: no storage pools available"))?;
-        let pool_meta_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let _pool_meta_guard = pool_meta_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(decommission_pool_meta_lock_error)?;
-        let ns_lock = rebalance_pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
-        let _guard = ns_lock
-            .get_write_lock(get_lock_acquire_timeout())
-            .await
-            .map_err(decommission_rebalance_meta_lock_error)?;
+        #[cfg(test)]
+        observe_pool_activation_start_attempt(PoolActivationStartKind::Decommission);
+        let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        let activation_fence = acquire_pool_rebalance_activation_locks(rebalance_pool.clone(), fleet_proof).await?;
 
         let mut rebalance_meta = RebalanceMeta::new();
         match rebalance_meta
@@ -4175,7 +4652,10 @@ impl ECStore {
             latest_pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
-        latest_pool_meta.save_no_lock(self.pools.clone()).await?;
+        activation_fence.ensure_held()?;
+        latest_pool_meta
+            .save_no_lock_with_activation_fence(self.pools.clone(), activation_fence)
+            .await?;
         {
             let mut pool_meta = self.pool_meta.write().await;
             *pool_meta = latest_pool_meta;
@@ -4186,6 +4666,11 @@ impl ECStore {
 
     async fn ensure_decommission_rebalance_idle_after_refresh(&self) -> Result<()> {
         self.load_rebalance_meta().await?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
+    }
+
+    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self) -> Result<()> {
+        self.load_rebalance_meta_under_start_gate().await?;
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
     }
 
@@ -4244,6 +4729,11 @@ impl ECStore {
     }
 
     async fn get_decommission_all_pool_space_infos(&self) -> Result<Vec<(usize, PoolSpaceInfo)>> {
+        #[cfg(test)]
+        if let Some(space_infos) = take_decommission_space_info_override_for_test(self.id) {
+            return Ok(space_infos);
+        }
+
         let mut space_infos = Vec::with_capacity(self.pools.len());
         for idx in 0..self.pools.len() {
             space_infos.push((idx, self.get_decommission_pool_space_info(idx).await?));
@@ -5312,6 +5802,7 @@ impl ECStore {
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
+        let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut entry_blocked = false;
 
@@ -5320,6 +5811,115 @@ impl ECStore {
                 rx.cancel();
             }
             decommission_cancel_signal_result(rx.is_cancelled())?;
+
+            if version.tier_free_version() {
+                let version_id = version.version_id.map(|v| v.to_string());
+                let mut migration_error = None;
+                let mut migrated = false;
+                let mut consumed = false;
+                let mut capacity_failure = false;
+                for _ in 0..3 {
+                    match classify_decommission_free_version_attempt(
+                        run_decommission_side_effect(&rx, &operation_gate, || async {
+                            self.decommission_tiered_object(
+                                bucket.as_str(),
+                                &version.name,
+                                version,
+                                &decommission_remote_tiered_opts(
+                                    version,
+                                    version_id.clone(),
+                                    idx,
+                                    expected_bucket_incarnation_id,
+                                ),
+                            )
+                            .await
+                        })
+                        .await,
+                    ) {
+                        DecommissionFreeVersionAttempt::Migrated => {
+                            migrated = true;
+                            migration_error = None;
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::Consumed => {
+                            consumed = true;
+                            migration_error = None;
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::CapacityFailure(err) => {
+                            capacity_failure = true;
+                            migration_error = Some(err);
+                            break;
+                        }
+                        DecommissionFreeVersionAttempt::Retry(err) => migration_error = Some(err),
+                    }
+                }
+
+                if counted_versions.insert((version.version_id, version.deleted)) {
+                    let mut pool_meta = self.pool_meta.write().await;
+                    ensure_decommission_generation(&pool_meta, idx, generation)?;
+                    if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, !migrated && !consumed) {
+                        return Err(with_decommission_entry_context(
+                            "count_decommission_item",
+                            bucket.as_str(),
+                            entry.name.as_str(),
+                            err,
+                        ));
+                    }
+                }
+
+                if migrated || consumed {
+                    decommissioned += 1;
+                    cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
+                }
+                if migrated {
+                    free_version_disposition.record_migrated();
+                } else if consumed {
+                    free_version_disposition.record_consumed();
+                } else {
+                    free_version_disposition.record_retained();
+                }
+
+                debug!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %version.name,
+                    version_id = ?version_id,
+                    result = ?migration_error,
+                    reason = if migrated {
+                        DECOMMISSION_FREE_VERSION_MIGRATED_REASON
+                    } else if consumed {
+                        DECOMMISSION_FREE_VERSION_CONSUMED_REASON
+                    } else {
+                        DECOMMISSION_FREE_VERSION_RETAINED_REASON
+                    },
+                    state = if migrated {
+                        "free_version_migrated"
+                    } else if consumed {
+                        "free_version_consumed"
+                    } else {
+                        "free_version_retained"
+                    },
+                    "Decommission free-version disposition recorded"
+                );
+
+                if capacity_failure {
+                    return Err(with_decommission_entry_context(
+                        "decommission_tier_free_version",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        migration_error.expect("capacity failure must retain its error"),
+                    ));
+                }
+
+                if !migrated && !consumed {
+                    break;
+                }
+                continue;
+            }
 
             if run_decommission_side_effect(&rx, &operation_gate, || async {
                 should_skip_lifecycle_for_data_movement(
@@ -5330,6 +5930,7 @@ impl ECStore {
                     object_lock_config.as_ref(),
                     true,
                     &LcEventSrc::Decom,
+                    None,
                 )
                 .await
             })
@@ -5341,7 +5942,7 @@ impl ECStore {
                 continue;
             }
 
-            let remaining_versions = decommission_remaining_version_count(fivs.versions.len(), expired);
+            let remaining_versions = decommission_remaining_version_count(&fivs.versions, expired);
             if should_skip_decommission_delete_marker(version, remaining_versions, replication_config.is_some()) {
                 //
                 decommissioned += 1;
@@ -5807,6 +6408,24 @@ impl ECStore {
             }
         }
 
+        if free_version_disposition.total() > 0 {
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                free_versions_migrated = free_version_disposition.migrated,
+                free_versions_consumed = free_version_disposition.consumed,
+                free_versions_retained = free_version_disposition.retained,
+                free_versions_total = free_version_disposition.total(),
+                reason = DECOMMISSION_FREE_VERSION_DISPOSITION_REASON,
+                state = "free_version_disposition",
+                "Decommission free-version disposition summary"
+            );
+        }
+
         if should_cleanup_decommission_source_entry(decommissioned, fivs.versions.len(), expired) && durable_ilm_record.is_none()
         {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
@@ -5851,6 +6470,7 @@ impl ECStore {
                         lifecycle_guard: bucket_incarnation_fence
                             .as_ref()
                             .and_then(|guard| guard.namespace_lock_guard()),
+                        namespace_lock_lost_signal: None,
                         object_mutation_fence: Some(&source_cleanup_mutation_fence),
                     },
                     "decommission",
@@ -6055,6 +6675,36 @@ impl ECStore {
             None,
             expected_bucket_incarnation_id,
             source_changed_exhaustions,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn decommission_entry_for_test_with_bucket_incarnation(
+        self: &Arc<Self>,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+    ) -> Result<()> {
+        let expected_bucket_incarnation_id = if is_meta_bucketname(&bucket) {
+            None
+        } else {
+            Some(self.bucket_incarnation_id_from_disk(&bucket).await?)
+        };
+        let generation = self.active_decommission_generation(idx).await?;
+        self.decommission_entry(
+            CancellationToken::new(),
+            idx,
+            generation,
+            entry,
+            bucket,
+            set,
+            None,
+            None,
+            None,
+            expected_bucket_incarnation_id,
+            Arc::new(AtomicUsize::new(0)),
         )
         .await
     }
@@ -6809,7 +7459,11 @@ impl ECStore {
         validate_start_decommission_request(&indices, self.single_pool())?;
 
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
-        ensure_decommission_start_local_leader(&self.endpoints(), &indices)?;
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
+        let endpoints = self.endpoints();
+        ensure_decommission_start_local_leader(&endpoints, &indices)?;
 
         for idx in indices.iter().copied() {
             ensure_valid_decommission_pool_index(self.pools.len(), idx)?;
@@ -6843,7 +7497,8 @@ impl ECStore {
         }
 
         let _start_guard = self.start_gate.lock().await;
-        self.ensure_decommission_rebalance_idle_after_refresh().await?;
+        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate()
+            .await?;
 
         let all_space_infos = self.get_decommission_all_pool_space_infos().await?;
         // Signal cancellation before waiting for the movement writer so active
@@ -8048,11 +8703,14 @@ impl ECStore {
                             return;
                         }
 
-                        let mut fivs = match load_decommission_entry_versions(
+                        let mut fivs = match load_decommission_entry_exact_versions(
+                            &source_set,
                             &entry,
                             &bucket_name,
                             "check_after_decommission.file_info_versions",
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(fivs) => fivs,
                             Err(err) => {
                                 let mut first_err = entry_error.lock().await;
@@ -8069,7 +8727,23 @@ impl ECStore {
 
                         let mut remaining = 0;
                         let mut expired = 0;
-                        for version in &fivs.versions {
+                        for version in fivs.versions.iter().chain(fivs.free_versions.iter()) {
+                            if version.tier_free_version() {
+                                remaining += 1;
+                                debug!(
+                                    event = EVENT_DECOMMISSION_ENTRY,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    pool_index = idx,
+                                    bucket = %bucket_name,
+                                    object = %entry.name,
+                                    version_id = ?version.version_id,
+                                    reason = DECOMMISSION_FREE_VERSION_SWEEP_REASON,
+                                    state = "free_version_retained",
+                                    "Decommission final sweep retained a free version"
+                                );
+                                continue;
+                            }
                             let skip_lifecycle = match should_skip_lifecycle_for_data_movement(
                                 Arc::clone(&store),
                                 &bucket_name,
@@ -8078,6 +8752,7 @@ impl ECStore {
                                 object_lock_config.as_ref(),
                                 false,
                                 &LcEventSrc::Decom,
+                                None,
                             )
                             .await
                             {
@@ -8095,7 +8770,7 @@ impl ECStore {
                                 expired += 1;
                                 continue;
                             }
-                            let remaining_versions = decommission_remaining_version_count(fivs.versions.len(), expired);
+                            let remaining_versions = decommission_remaining_version_count(&fivs.versions, expired);
                             if should_skip_decommission_delete_marker(version, remaining_versions, replication_configured) {
                                 continue;
                             }
@@ -8267,6 +8942,137 @@ mod tests {
     use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
     use serde::Serialize;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_activation_replicates_commit_after_post_save_fence_loss() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
+        let start_store = Arc::clone(&store);
+        let start_task = tokio::spawn(async move {
+            start_store
+                .save_current_pool_meta_for_decommission_start(
+                    &[0],
+                    vec![(
+                        0,
+                        PoolSpaceInfo {
+                            free: 50,
+                            total: 100,
+                            used: 50,
+                        },
+                    )],
+                    Vec::new(),
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        barrier.release_after_fence_loss();
+        tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+            .await
+            .expect("decommission activation should finish after its canonical commit")
+            .expect("decommission activation task should not panic")
+            .expect("post-commit fence loss must not report the committed activation as failed");
+
+        let local = store.pool_meta.read().await;
+        assert!(pool_meta_has_active_decommission(&local));
+        drop(local);
+
+        for pool in &store.pools {
+            let mut persisted = PoolMeta::default();
+            persisted
+                .load_no_lock_from_replicas(vec![pool.clone()])
+                .await
+                .expect("every pool should retain readable committed decommission metadata");
+            assert!(
+                pool_meta_has_active_decommission(&persisted),
+                "every pool must adopt the canonical committed activation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_activation_adopts_canonical_commit_after_replica_failure() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
+        let start_store = Arc::clone(&store);
+        let start_task = tokio::spawn(async move {
+            start_store
+                .save_current_pool_meta_for_decommission_start(
+                    &[0],
+                    vec![(
+                        0,
+                        PoolSpaceInfo {
+                            free: 50,
+                            total: 100,
+                            used: 50,
+                        },
+                    )],
+                    Vec::new(),
+                )
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        let mut replica_disks = Vec::new();
+        for set in &store.pools[1].disk_set {
+            let mut disks = set.disks.write().await;
+            let saved = std::mem::take(&mut *disks);
+            *disks = vec![None; saved.len()];
+            replica_disks.push(saved);
+        }
+        barrier.release_after_fence_loss();
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+            .await
+            .expect("decommission activation should finish after its canonical commit")
+            .expect("decommission activation task should not panic")
+            .expect("a replica save failure must not report the committed activation as failed");
+
+        for (set, disks) in store.pools[1].disk_set.iter().zip(replica_disks) {
+            *set.disks.write().await = disks;
+        }
+
+        let local = store.pool_meta.read().await;
+        assert!(pool_meta_has_active_decommission(&local));
+        drop(local);
+
+        let mut canonical = PoolMeta::default();
+        canonical
+            .load_no_lock_from_replicas(vec![store.pools[0].clone()])
+            .await
+            .expect("the canonical committed decommission metadata should remain readable");
+        assert!(pool_meta_has_active_decommission(&canonical));
+
+        let mut replica = PoolMeta::default();
+        replica
+            .load_no_lock_from_replicas(vec![store.pools[1].clone()])
+            .await
+            .expect("the stale replica metadata should remain readable after disks recover");
+        assert!(!pool_meta_has_active_decommission(&replica));
+
+        let mut reloaded = PoolMeta::default();
+        let replica_state = reloaded
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("the canonical commit should remain reloadable after a replica recovers stale");
+        assert!(pool_meta_has_active_decommission(&reloaded));
+        assert!(replica_state.needs_repair);
+        assert!(replica_state.repair_write_safe);
+
+        let worker_cancel = CancellationToken::new();
+        store
+            .spawn_decommission_routines(Arc::clone(&store), worker_cancel.clone(), vec![0])
+            .await
+            .expect("the committed activation should admit its decommission worker");
+        let admitted_cancel = store.decommission_cancelers.read().await[0]
+            .clone()
+            .expect("the admitted decommission worker should have a cancellation token");
+        assert!(!admitted_cancel.is_cancelled());
+        worker_cancel.cancel();
+        assert!(admitted_cancel.is_cancelled());
+    }
+
     fn pool_meta_replica_test_meta(cmd_line: &str) -> PoolMeta {
         PoolMeta {
             version: POOL_META_VERSION,
@@ -8351,14 +9157,28 @@ mod tests {
     }
 
     #[test]
-    fn pool_meta_replica_selection_rejects_partial_write_divergence() {
+    fn pool_meta_replica_selection_prefers_valid_canonical_first_copy() {
+        let selection = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-canonical")),
+            decode_pool_meta_replica(pool_meta_replica_test_data("pool-stale")),
+        ])
+        .expect("pool zero is the durable commit record when a later replica is stale");
+
+        assert_eq!(selection.meta.pools[0].cmd_line, "pool-canonical");
+        assert!(selection.replica_state.needs_repair);
+        assert!(selection.replica_state.repair_write_safe);
+    }
+
+    #[test]
+    fn pool_meta_replica_selection_rejects_divergent_backups_without_canonical() {
         let err = select_pool_meta_replica(vec![
+            PoolMetaReplica::Corrupt("canonical unavailable".to_string()),
             decode_pool_meta_replica(pool_meta_replica_test_data("pool-old")),
             decode_pool_meta_replica(pool_meta_replica_test_data("pool-new")),
         ])
-        .expect_err("different valid snapshots have no safe ordering without a generation protocol");
+        .expect_err("divergent backups have no safe ordering when the canonical copy is unavailable");
 
-        assert!(err.to_string().contains("valid replicas in pools 0 and 1 diverge"));
+        assert!(err.to_string().contains("valid replicas in pools 1 and 2 diverge"));
     }
 
     #[test]
@@ -8627,13 +9447,6 @@ mod tests {
     }
 
     #[test]
-    fn decommission_remaining_version_count_excludes_only_expired_versions() {
-        assert_eq!(decommission_remaining_version_count(1, 0), 1);
-        assert_eq!(decommission_remaining_version_count(2, 1), 1);
-        assert_eq!(decommission_remaining_version_count(1, 1), 0);
-    }
-
-    #[test]
     fn lifecycle_action_removes_data_movement_version_rejects_delete_marker_action() {
         assert!(!lifecycle_action_removes_data_movement_version(IlmAction::DeleteAction));
     }
@@ -8687,6 +9500,21 @@ mod tests {
             "object".to_string(),
             "version".to_string()
         )));
+    }
+
+    #[test]
+    fn decommission_free_version_attempt_treats_missing_source_as_consumed() {
+        let attempt =
+            classify_decommission_free_version_attempt(Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())));
+
+        assert!(matches!(attempt, DecommissionFreeVersionAttempt::Consumed));
+    }
+
+    #[test]
+    fn decommission_free_version_attempt_preserves_capacity_failure() {
+        let attempt = classify_decommission_free_version_attempt(Err(Error::DiskFull));
+
+        assert!(matches!(attempt, DecommissionFreeVersionAttempt::CapacityFailure(Error::DiskFull)));
     }
 
     #[test]
@@ -8864,6 +9692,12 @@ mod tests {
         assert!(opts.include_part_checksums);
         assert!(opts.http_preconditions.is_some());
         assert_eq!(opts.expected_bucket_incarnation_id, Some(incarnation));
+        assert!(!opts.incl_free_versions);
+
+        let mut free_version = version;
+        free_version.set_tier_free_version();
+        let free_opts = decommission_remote_tiered_opts(&free_version, Some("free-version-id".to_string()), 9, Some(incarnation));
+        assert!(free_opts.incl_free_versions);
     }
 
     #[test]
@@ -9731,8 +10565,9 @@ mod pools_tests {
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
         DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT, DecomBucketInfo, DecommissionCanceler, DecommissionDurableIlmReceipt,
         DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState, DecommissionUnresolvedEntry,
-        ListCallback, POOL_META_V1_VERSION, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
-        QueuedDecommissionEntry, apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
+        ListCallback, POOL_META_NAME, POOL_META_V1_VERSION, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo,
+        PoolStatus, QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks,
+        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
         bind_missing_decommission_cancelers, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
         classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
         decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
@@ -9790,14 +10625,44 @@ mod pools_tests {
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_rio::Index;
+    use std::future::Future;
     use std::sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use std::task::{Context, Poll};
     use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct ActivationLockRecorder {
+        lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+        owner: &'static str,
+        resources: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::namespace::NamespaceLocking for ActivationLockRecorder {
+        type Error = Error;
+        type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
+
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> crate::error::Result<Self::NamespaceLock> {
+            self.resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned")
+                .push(object.to_string());
+            Ok(rustfs_lock::NamespaceLockWrapper::new(
+                rustfs_lock::NamespaceLock::with_local_manager(
+                    "activation-lock-test".to_string(),
+                    Arc::clone(&self.lock_manager),
+                ),
+                rustfs_lock::ObjectKey::new(bucket, object),
+                self.owner.to_string(),
+            ))
+        }
+    }
 
     fn noop_decommission_list_callback() -> ListCallback {
         Arc::new(|_| Box::pin(async {}))
@@ -9845,6 +10710,48 @@ mod pools_tests {
             last_update: OffsetDateTime::now_utc(),
             decommission,
         }
+    }
+
+    #[tokio::test]
+    async fn test_activation_fence_uses_one_lock_order_and_serializes_callers() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let first = Arc::new(ActivationLockRecorder {
+            lock_manager: Arc::clone(&manager),
+            owner: "first",
+            resources: StdMutex::new(Vec::new()),
+        });
+        let second = Arc::new(ActivationLockRecorder {
+            lock_manager: manager,
+            owner: "second",
+            resources: StdMutex::new(Vec::new()),
+        });
+
+        let first_guards = acquire_pool_rebalance_activation_locks(first.clone(), None)
+            .await
+            .expect("first activation should acquire both locks");
+        assert_eq!(
+            *first
+                .resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned"),
+            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+        );
+
+        let mut second_acquire = Box::pin(acquire_pool_rebalance_activation_locks(second.clone(), None));
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(second_acquire.as_mut().poll(&mut context), Poll::Pending));
+
+        drop(first_guards);
+        second_acquire
+            .await
+            .expect("second activation should acquire both locks after the first releases them");
+        assert_eq!(
+            *second
+                .resources
+                .lock()
+                .expect("activation lock recorder should not be poisoned"),
+            vec![POOL_META_NAME.to_string(), REBAL_META_NAME.to_string()]
+        );
     }
 
     #[test]

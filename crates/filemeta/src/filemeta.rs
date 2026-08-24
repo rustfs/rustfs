@@ -90,6 +90,21 @@ fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
 pub const TRANSITION_COMPLETE: &str = "complete";
 pub const TRANSITION_PENDING: &str = "pending";
 
+/// xl.meta key marking a tier free-version record.
+///
+/// A free version is a delete-marker-shaped cleanup hint appended by
+/// [`MetaObject::delete_version`] when a version whose remote transition
+/// completed is removed from xl.meta; it carries the remote tier identity for
+/// an idempotent remote delete and is never a user-visible version
+/// (`num_versions` excludes it). While the record exists it is consumed by the
+/// lifecycle free-version recovery scan and the usage scanner, which re-enqueue
+/// the pending remote delete, and by heal metadata walks. On S3 and lifecycle
+/// delete paths the same obligation is also carried by a committed tier-journal
+/// entry; deletes without such an entry (for example a removed version whose
+/// transition state decodes as unknown) rely on this record alone until the
+/// worker removes it after a successful remote delete. Decommission preserves
+/// the record and its remote identity on the target pool before source cleanup
+/// — see docs/architecture/decommission-compatibility.md.
 pub const FREE_VERSION: &str = "free-version";
 
 pub const TRANSITION_STATUS: &str = "transition-status";
@@ -447,6 +462,10 @@ impl FileMeta {
         };
 
         if let Some(fidx) = existing_idx {
+            let existing = self.versions[fidx].parse_version_meta()?;
+            if existing.free_version() != version.free_version() {
+                return Err(Error::other("cannot replace a free version with a non-free version"));
+            }
             return self.set_idx(fidx, version);
         }
 
@@ -1361,6 +1380,39 @@ mod test {
         assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
         assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
         assert!(fm.versions[0].header.sorts_before(&fm.versions[1].header));
+    }
+
+    #[test]
+    fn add_version_filemata_rejects_free_and_ordinary_same_id_replacement() {
+        let version_id = Uuid::new_v4();
+        let mut free_meta_sys = HashMap::new();
+        insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_FREE_VERSION, Vec::new());
+        let free_version = FileMetaVersion {
+            version_type: VersionType::Delete,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(version_id),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                meta_sys: free_meta_sys,
+            }),
+            ..Default::default()
+        };
+        let ordinary_version = valid_object_version(version_id, vec![10, 20]);
+
+        for (existing, replacement) in [
+            (free_version.clone(), ordinary_version.clone()),
+            (ordinary_version, free_version),
+        ] {
+            let mut fm = FileMeta::new();
+            fm.add_version_filemata(existing).expect("seed same-id version");
+            let before = fm.marshal_msg().expect("serialize original metadata");
+
+            let err = fm
+                .add_version_filemata(replacement)
+                .expect_err("free and ordinary versions with the same ID must not replace each other");
+
+            assert!(err.to_string().contains("cannot replace a free version"));
+            assert_eq!(fm.marshal_msg().expect("serialize rejected metadata"), before);
+        }
     }
 
     /// `add_version_filemata` positions an inserted version with

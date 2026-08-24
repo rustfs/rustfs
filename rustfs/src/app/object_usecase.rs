@@ -65,6 +65,8 @@ use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
 use super::storage_api::object_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
+#[cfg(test)]
+use super::storage_api::object_usecase::data_usage::apply_bucket_usage_memory_overlay;
 use super::storage_api::object_usecase::data_usage::{
     quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
     record_bucket_object_version_write_memory, record_bucket_object_write_memory,
@@ -18074,8 +18076,14 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn compressed_delete_requests_restore_usage_baseline() {
+    async fn compressed_delete_requests_update_observed_usage_without_releasing_quota_floor() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        async fn observed_bucket_usage(bucket: &str) -> Option<u64> {
+            let mut usage = rustfs_data_usage::DataUsageInfo::default();
+            apply_bucket_usage_memory_overlay(&mut usage).await;
+            usage.buckets_usage.get(bucket).map(|value| value.size)
+        }
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         if current_app_context().is_none() {
@@ -18132,9 +18140,14 @@ mod tests {
             .await
             .expect("single compressed delete should succeed");
         assert_eq!(
-            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            observed_bucket_usage(&bucket).await,
             Some(1_000),
             "single delete must subtract the logical accounting size"
+        );
+        assert_eq!(
+            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            Some(2_000),
+            "quota must retain the pre-delete floor until scanner reconciliation"
         );
 
         let mut batch_req = build_request(
@@ -18161,9 +18174,14 @@ mod tests {
             .await
             .expect("batch compressed delete should succeed");
         assert_eq!(
-            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            observed_bucket_usage(&bucket).await,
             Some(0),
             "batch delete must subtract the committed logical accounting size"
+        );
+        assert_eq!(
+            crate::app::storage_api::test::data_usage::get_bucket_usage_memory(&bucket).await,
+            Some(2_000),
+            "quota must retain both pending deletes until scanner reconciliation"
         );
 
         store
