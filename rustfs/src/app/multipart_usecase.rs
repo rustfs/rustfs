@@ -30,7 +30,9 @@ use super::storage_api::multipart_usecase::bucket::{
 use super::storage_api::multipart_usecase::compression::{is_disk_compressible, is_multipart_disk_compression_enabled};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
-use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
+use super::storage_api::multipart_usecase::contract::multipart::{
+    CompletePart, MAX_MULTIPART_PART_NUMBER, MultipartOperations as _, MultipartUploadResult,
+};
 use super::storage_api::multipart_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
@@ -153,6 +155,16 @@ fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_siz
 }
 
 fn validate_complete_multipart_parts(parts: &[CompletePart]) -> S3Result<()> {
+    if let Some(part) = parts
+        .iter()
+        .find(|part| !(1..=MAX_MULTIPART_PART_NUMBER as usize).contains(&part.part_num))
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidPart,
+            format!("Part number {} must be between 1 and {MAX_MULTIPART_PART_NUMBER}", part.part_num),
+        ));
+    }
+
     if parts.windows(2).any(|window| window[0].part_num >= window[1].part_num) {
         return Err(s3_error!(InvalidPartOrder, "Part numbers must be strictly increasing"));
     }
@@ -2502,6 +2514,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
+    }
+
+    #[test]
+    fn validate_complete_multipart_parts_enforces_part_number_range() {
+        validate_complete_multipart_parts(&[CompletePart {
+            part_num: MAX_MULTIPART_PART_NUMBER as usize,
+            ..Default::default()
+        }])
+        .expect("part number 10000 must remain valid");
+
+        for part_num in [0, MAX_MULTIPART_PART_NUMBER as usize + 1] {
+            let err = validate_complete_multipart_parts(&[CompletePart {
+                part_num,
+                ..Default::default()
+            }])
+            .expect_err("out-of-range complete part number must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+            let expected = format!("Part number {part_num} must be between 1 and {MAX_MULTIPART_PART_NUMBER}");
+            assert_eq!(err.message(), Some(expected.as_str()));
+        }
     }
 
     #[test]
