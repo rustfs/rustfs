@@ -18076,6 +18076,7 @@ mod tests {
     #[serial_test::serial]
     async fn compressed_delete_requests_update_observed_usage_without_releasing_quota_floor() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+        use crate::app::storage_api::test::data_usage::apply_bucket_usage_memory_overlay;
 
         async fn observed_bucket_usage(bucket: &str) -> Option<u64> {
             let mut usage = rustfs_data_usage::DataUsageInfo::default();

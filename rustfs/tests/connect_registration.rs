@@ -277,7 +277,7 @@ fn verify_rotation_request(request: &Value, current_public_key: &[u8], fingerpri
     assert_eq!(encoded.len(), 86);
     let raw = BASE64_URL_NO_PAD.decode(encoded).expect("proof base64url");
     let signature = Signature::from_slice(&raw).expect("fixed-width signature");
-    assert!(signature.normalize_s().is_none(), "rotation proof must be low-S");
+    assert_eq!(signature.normalize_s(), signature, "rotation proof must be low-S");
     let verifying = VerifyingKey::from_public_key_der(current_public_key).expect("current public key");
     verifying.verify(&transcript, &signature).expect("rotation proof verifies");
 

@@ -224,13 +224,12 @@ fn sync_directory(directory: &Path) {
 /// Fills `buffer` with operating-system randomness.
 ///
 /// The device nonce must be unpredictable: it is what stops a captured response
-/// being replayed as a fresh one. Sourced through p256's pinned rand_core 0.6
-/// rather than the workspace `rand` 0.10, matching `identity.rs`; the two are
-/// different crate versions and only the pinned one is on p256's own path.
+/// being replayed as a fresh one. Use the workspace rand 0.10 system RNG,
+/// matching the rand_core version used by the upgraded crypto stack.
 fn getrandom(buffer: &mut [u8]) -> Result<(), String> {
-    use p256::elliptic_curve::rand_core::{OsRng, RngCore as _};
+    use rand::{TryRng as _, rngs::SysRng};
 
-    OsRng
+    SysRng
         .try_fill_bytes(buffer)
         .map_err(|error| format!("the operating system random source failed: {error}"))
 }

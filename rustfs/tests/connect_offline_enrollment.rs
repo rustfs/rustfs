@@ -607,7 +607,7 @@ fn malleated_high_s_signature_is_refused_although_it_verifies_mathematically() {
     // Step one: the malleated pair really does verify under the signing key, so
     // a verifier cannot be excused for accepting it on mathematical grounds.
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("the malleated signature parses");
-    assert!(signature.normalize_s().is_some(), "the malleated signature must be the high-S form");
+    assert_ne!(signature.normalize_s(), signature, "the malleated signature must be the high-S form");
     let key = verifying_key(field(&published_key("signing"), "publicKey"));
     let input = signing_input(&domain_tag("enrollmentChallenge"), &signed_octets(&vector["document"]));
     key.verify(&input, &signature)
@@ -713,8 +713,9 @@ fn assert_response_proves_possession(built_envelope: &Value, label: &str) {
     let bytes = BASE64_URL_NO_PAD.decode(value).expect("signature is base64url");
     assert_eq!(bytes.len(), 64, "{label}: the signature is a fixed-width r || s");
     let signature = p256::ecdsa::Signature::from_slice(&bytes).expect("signature parses");
-    assert!(
-        signature.normalize_s().is_none(),
+    assert_eq!(
+        signature.normalize_s(),
+        signature,
         "{label}: this side must never emit the malleated high-S form it refuses to accept"
     );
 
