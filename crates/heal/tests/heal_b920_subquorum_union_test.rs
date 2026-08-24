@@ -234,6 +234,7 @@ mod serial_tests {
         create_versioned_bucket(&ecstore, bucket).await;
 
         let v1 = put_versioned(&ecstore, bucket, object, &versioned_test_data(1)).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         // Wipe the object entirely on disks 1..4, leaving it on ONLY disk[0]
         // (1/4 disks < read-quorum 2). effective listing_quorum for 4 drives is
@@ -387,6 +388,7 @@ mod serial_tests {
 
         let data_v1 = versioned_test_data(9);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         // EC4+4: wipe the object ENTIRELY on 4 disks, leaving full copies on the
         // other 4 (== data_blocks). Meta quorum (4) still holds, so this heals via
@@ -500,6 +502,7 @@ mod serial_tests {
 
         let data_v1 = versioned_test_data(11);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         // Drop the object entirely on ONE disk (its shard + meta gone), leaving it
         // on 3/4 (>= data_blocks 2). The union must still enumerate it.
@@ -545,6 +548,7 @@ mod serial_tests {
 
         let data_v1 = versioned_test_data(12);
         let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await;
+        wait_for_object_copies(&disk_paths, bucket, object).await;
 
         std::fs::remove_dir_all(object_dir(&disk_paths[3], bucket, object)).expect("wipe object on disk3");
         for disk in &disk_paths[..3] {
