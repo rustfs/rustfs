@@ -3,20 +3,17 @@
 //! This pool reuses Vec<u8> buffers to avoid repeated heap allocations
 //! in hot paths like EC encoding/decoding and data read/write.
 //!
-//! Status: Infrastructure ready, integration pending (backlog#2005).
-//! Once mimalloc lock contention is resolved, integrate into bitrot.rs
-//! and decode.rs hot paths for additional +2-5% improvement.
+//! Current integration: bitrot.rs (bitrot_verify path)
+//! Future integration: decode.rs, encode.rs
 
 use std::sync::Mutex;
 
 /// A thread-safe pool of reusable Vec<u8> buffers.
-#[allow(dead_code)] // Integration pending: see module doc
 pub(crate) struct BufferPool {
     buckets: Mutex<Vec<Vec<Vec<u8>>>>,
     max_per_bucket: usize,
 }
 
-#[allow(dead_code)] // Integration pending: see module doc
 impl BufferPool {
     pub(crate) fn new() -> Self {
         Self::with_limits(16)
@@ -61,15 +58,13 @@ impl BufferPool {
     }
 }
 
-#[allow(dead_code)] // Integration pending: see module doc
-static EC_BUFFER_POOL: std::sync::LazyLock<BufferPool> = std::sync::LazyLock::new(|| BufferPool::with_limits(16));
+static EC_BUFFER_POOL: std::sync::LazyLock<BufferPool> =
+    std::sync::LazyLock::new(|| BufferPool::with_limits(16));
 
-#[allow(dead_code)] // Integration pending: see module doc
 pub(crate) fn get_ec_buffer(min_capacity: usize) -> Vec<u8> {
     EC_BUFFER_POOL.get(min_capacity)
 }
 
-#[allow(dead_code)] // Integration pending: see module doc
 pub(crate) fn return_ec_buffer(buf: Vec<u8>) {
     EC_BUFFER_POOL.put(buf);
 }
