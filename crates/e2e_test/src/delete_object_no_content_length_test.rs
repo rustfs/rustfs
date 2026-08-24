@@ -155,8 +155,13 @@ mod tests {
             .key(key)
             .version_id(version_id)
             .send()
-            .await;
-        assert!(get_deleted_version.is_err(), "explicitly deleted version should no longer be readable");
+            .await
+            .expect_err("explicitly deleted version should no longer be readable");
+        assert_eq!(
+            get_deleted_version.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "explicitly deleted version absence probe must return HTTP 404, got {get_deleted_version:?}"
+        );
 
         Ok(())
     }
