@@ -245,7 +245,7 @@ rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
 
 # Connect device identity: P-256 keys, PKCS#10 certificate requests, ES256 proofs.
-p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+p256 = { workspace = true }
 rcgen = { workspace = true }
 
 # Async Runtime and Networking
@@ -340,9 +340,6 @@ rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys.workspace = true
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }

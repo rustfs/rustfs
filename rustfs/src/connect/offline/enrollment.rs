@@ -569,7 +569,7 @@ fn sign(key: &DeviceIdentity, tag: &[u8], bytes: &[u8]) -> Result<String, Enroll
     let signing_key = SigningKey::from_pkcs8_der(pkcs8.as_slice()).map_err(|_| EnrollmentError::ResponseNotProduced)?;
 
     let signature: Signature = signing_key.sign(&signature_input(tag, bytes));
-    let canonical = signature.normalize_s().unwrap_or(signature);
+    let canonical = signature.normalize_s();
 
     Ok(BASE64_URL_NO_PAD.encode(canonical.to_bytes()))
 }
