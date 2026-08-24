@@ -490,8 +490,8 @@ impl InventoryStateStore {
     ) -> Result<(), InventoryError> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || match store.read_latest(chrono::Utc::now()) {
-            Ok(latest) if latest.snapshot == snapshot => Ok(()),
-            Ok(_) | Err(InventoryError::StateMissing) => store.publish_latest_sync(snapshot, captured_at, &shutdown),
+            Ok(_) => Ok(()),
+            Err(InventoryError::StateMissing) => store.publish_latest_sync(snapshot, captured_at, &shutdown),
             Err(error) => Err(error),
         })
         .await
@@ -1602,6 +1602,35 @@ mod tests {
                 assert!(!state_root.join("inventory/latest.json").exists());
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_pending_does_not_replace_a_newer_local_snapshot() {
+        let temp = safe_tempdir();
+        let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
+        let current = snapshot();
+        store
+            .publish_latest_sync(
+                current.clone(),
+                "2026-08-23T01:02:03Z".to_owned(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .expect("current latest");
+        let legacy = InventorySnapshot::new("1.2.3", None, 2, 4, 900, 300, []).expect("legacy snapshot");
+
+        store
+            .ensure_latest(legacy, "2026-08-23T02:02:03Z".to_owned(), tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("existing latest remains authoritative");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-23T02:02:03Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
+        let persisted = store.read_latest(now).expect("latest");
+        assert_eq!(persisted.snapshot, current);
+        assert_eq!(persisted.captured_at, "2026-08-23T01:02:03Z");
+        assert_eq!(persisted.age, Duration::from_secs(60 * 60));
     }
 
     #[cfg(target_os = "linux")]
