@@ -1535,8 +1535,7 @@ mod tests {
         let mut decommission_task;
         let mut observed_rebalance_result = None;
         let mut observed_decommission_result = None;
-        let reached_activation;
-        if paused_kind == PoolActivationStartKind::Rebalance {
+        let reached_activation = if paused_kind == PoolActivationStartKind::Rebalance {
             let store = Arc::clone(&rebalance_store);
             rebalance_task =
                 tokio::spawn(async move { store.init_rebalance_start(vec!["bucket".to_string()]).await.map(|_| ()) });
@@ -1549,7 +1548,7 @@ mod tests {
             let probe = PoolActivationStartProbe::install(competing_kind);
             let store = Arc::clone(&decommission_store);
             decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
-            reached_activation = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 tokio::select! {
                     _ = probe.wait_until_attempted() => true,
                     result = &mut decommission_task => {
@@ -1559,7 +1558,7 @@ mod tests {
                 }
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or(false)
         } else {
             let store = Arc::clone(&decommission_store);
             decommission_task = tokio::spawn(async move { store.start_decommission(vec![0]).await });
@@ -1573,7 +1572,7 @@ mod tests {
             let store = Arc::clone(&rebalance_store);
             rebalance_task =
                 tokio::spawn(async move { store.init_rebalance_start(vec!["bucket".to_string()]).await.map(|_| ()) });
-            reached_activation = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 tokio::select! {
                     _ = probe.wait_until_attempted() => true,
                     result = &mut rebalance_task => {
@@ -1583,8 +1582,8 @@ mod tests {
                 }
             })
             .await
-            .unwrap_or(false);
-        }
+            .unwrap_or(false)
+        };
 
         // A competing start may be fenced while refreshing persisted metadata,
         // before it reaches the activation save, or at the activation commit.

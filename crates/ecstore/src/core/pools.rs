@@ -3744,9 +3744,10 @@ pub struct PoolSpaceInfo {
 }
 
 #[cfg(test)]
-static DECOMMISSION_SPACE_INFO_OVERRIDES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<uuid::Uuid, Vec<(usize, PoolSpaceInfo)>>>,
-> = std::sync::OnceLock::new();
+type DecommissionSpaceInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, Vec<(usize, PoolSpaceInfo)>>>;
+
+#[cfg(test)]
+static DECOMMISSION_SPACE_INFO_OVERRIDES: std::sync::OnceLock<DecommissionSpaceInfoOverrides> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn set_decommission_space_info_override_for_test(store_id: uuid::Uuid, space_infos: Vec<(usize, PoolSpaceInfo)>) {
