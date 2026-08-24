@@ -2685,7 +2685,10 @@ async fn test_start_rebalance_for_id_rejects_changed_metadata() {
         .await
         .expect_err("staged start must not start changed metadata");
 
-    assert!(err.to_string().contains("rebalance metadata changed before start"));
+    assert!(
+        err.to_string()
+            .contains("stale rebalance worker rejected during start rebalance")
+    );
 }
 
 #[tokio::test]
