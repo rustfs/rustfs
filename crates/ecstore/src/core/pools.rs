@@ -6265,30 +6265,6 @@ impl ECStore {
         Ok(())
     }
 
-    async fn decommission_buckets_concurrently(
-        self: &Arc<Self>,
-        rx: CancellationToken,
-        idx: usize,
-        pool: Arc<Sets>,
-        buckets: Vec<DecomBucketInfo>,
-        entry_budget: Arc<Semaphore>,
-        source_changed_exhaustions: Arc<AtomicUsize>,
-    ) -> Result<()> {
-        let store = Arc::clone(self);
-        run_decommission_buckets_bounded(rx, buckets, decommission_bucket_concurrency_limit(), move |bucket, rx| {
-            let store = Arc::clone(&store);
-            let pool = pool.clone();
-            let entry_budget = entry_budget.clone();
-            let source_changed_exhaustions = Arc::clone(&source_changed_exhaustions);
-            Box::pin(async move {
-                store
-                    .decommission_pending_bucket(rx, idx, pool, bucket, entry_budget, source_changed_exhaustions)
-                    .await
-            })
-        })
-        .await
-    }
-
     #[tracing::instrument(skip(self, rx))]
     async fn decommission_in_background(
         self: &Arc<Self>,
