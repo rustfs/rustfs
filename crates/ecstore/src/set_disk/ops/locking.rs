@@ -922,10 +922,11 @@ mod tests {
 
         // The List family runs through the borrow handle with unchanged
         // behavior: delete_all reports success even when the prefix is absent.
-        ListOperations::new(set_disks.ctx())
-            .delete_all("nonexistent-bucket", "nonexistent-prefix")
-            .await
-            .expect("delete_all via borrow handle should succeed");
+        let (result, observed_disks) = ListOperations::new(set_disks.ctx())
+            .delete_all_observed("nonexistent-bucket", "nonexistent-prefix", None)
+            .await;
+        result.expect("delete_all via borrow handle should succeed");
+        assert_eq!(observed_disks.len(), disk_count);
         set_disks
             .delete_all("nonexistent-bucket", "nonexistent-prefix")
             .await
