@@ -202,7 +202,7 @@ impl<'a> RotationRequest<'a> {
             .map_err(|_| CredentialValidationError::CertificateRequest)?;
         let signing_key = SigningKey::from_pkcs8_der(&key).map_err(|_| CredentialValidationError::CertificateRequest)?;
         let signature: Signature = signing_key.sign(&transcript);
-        let canonical = signature.normalize_s().unwrap_or(signature);
+        let canonical = signature.normalize_s();
 
         Ok(Self {
             protocol_version: PROTOCOL_VERSION,
