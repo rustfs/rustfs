@@ -56,6 +56,7 @@ use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
     list::ListOperations as _,
+    namespace::NamespaceLocking as _,
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
