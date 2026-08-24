@@ -16,13 +16,13 @@ use super::iam_error::iam_error_to_s3_error;
 use crate::{
     admin::runtime_sources::current_action_credentials,
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::has_space_be,
     },
-    auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    auth::constant_time_eq,
+    server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
@@ -98,22 +98,11 @@ impl Operation for ListGroups {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)]).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
@@ -154,22 +143,11 @@ impl Operation for GetGroup {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::GetGroupAdminAction)]).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -237,22 +215,11 @@ impl Operation for DeleteGroup {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)]).await?;
 
         let group = decode_delete_group_name(&params)?;
 
@@ -363,22 +330,11 @@ impl Operation for SetGroupStatus {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)]).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -488,22 +444,11 @@ impl Operation for UpdateGroupMembers {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
@@ -673,7 +618,31 @@ impl Operation for UpdateGroupMembers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
     use matchit::Router;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a group admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
 
     fn with_delete_group_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
         let mut router = Router::new();
@@ -726,5 +695,61 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("group name contains invalid characters"));
+    }
+
+    #[tokio::test]
+    async fn group_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&ListGroups {}, Method::GET, "/rustfs/admin/v3/groups").await;
+        assert_missing_credentials(&GetGroup {}, Method::GET, "/rustfs/admin/v3/group").await;
+        assert_missing_credentials(&DeleteGroup {}, Method::DELETE, "/rustfs/admin/v3/group/dev").await;
+        assert_missing_credentials(&SetGroupStatus {}, Method::PUT, "/rustfs/admin/v3/set-group-status").await;
+        assert_missing_credentials(&UpdateGroupMembers {}, Method::PUT, "/rustfs/admin/v3/update-group-members").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nasync fn ", "\npub(crate) async fn ", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    #[test]
+    fn group_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("group.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action) in [
+            ("ListGroups", "ListGroupsAdminAction"),
+            ("GetGroup", "GetGroupAdminAction"),
+            ("DeleteGroup", "RemoveUserFromGroupAdminAction"),
+            ("SetGroupStatus", "EnableGroupAdminAction"),
+            ("UpdateGroupMembers", "AddUserToGroupAdminAction"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_eq!(
+                block.matches("authorize_admin_request(").count(),
+                1,
+                "{handler} must use exactly one shared gate"
+            );
+            assert_eq!(
+                block.matches("Action::AdminAction(").count(),
+                1,
+                "{handler} must request exactly one admin action"
+            );
+            assert!(
+                block.contains(&format!("AdminAction::{action}")),
+                "{handler} must authorize with {action}"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }
