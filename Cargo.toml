@@ -354,7 +354,6 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.0" }
 rustfs-mimalloc-sys = { version = "0.5.0" }
-tikv-jemallocator = { version = "0.7.0" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
