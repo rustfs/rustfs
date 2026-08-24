@@ -239,8 +239,7 @@ fn detect_container_resources() -> ContainerResources {
 
     // Get host values from a single sysinfo::System instance (avoids double init)
     let (host_cores, host_memory) = {
-        let mut sys =
-            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_processes());
+        let mut sys = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_processes());
         sys.refresh_cpu_all();
         sys.refresh_memory();
         (sys.cpus().len().max(1), sys.total_memory())
