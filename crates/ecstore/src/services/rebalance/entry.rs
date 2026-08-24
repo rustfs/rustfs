@@ -1385,9 +1385,6 @@ mod tests {
     async fn real_rebalance_run_fence_loss_blocks_multipart_publication() {
         const REBALANCE_ID: &str = "rebalance-multipart-commit-fence";
         let bucket = crate::disk::RUSTFS_META_BUCKET;
-        let (_temp_dirs, store, _unused_store) =
-            crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
-        prepare_rebalance_test_volumes(store.as_ref()).await;
         for (object, pause, staged_commit) in [
             (
                 "rebalance-multipart-new-upload-fence",
@@ -1401,6 +1398,9 @@ mod tests {
             ),
             ("rebalance-multipart-completion-fence", MultipartCommitPause::BeforeQuotaRename, None),
         ] {
+            let (_temp_dirs, store, _unused_store) =
+                crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
+            prepare_rebalance_test_volumes(store.as_ref()).await;
             let source_set = store.pools[0].get_disks_by_key(object);
             let target_set = store.pools[1].get_disks_by_key(object);
             let upload = source_set
