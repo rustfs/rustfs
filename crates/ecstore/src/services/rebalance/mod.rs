@@ -91,6 +91,30 @@ pub(crate) async fn test_two_pool_stores(
     std::sync::Arc<crate::store::ECStore>,
     std::sync::Arc<crate::store::ECStore>,
 ) {
+    test_two_pool_stores_with_contexts(rebalance_meta, false).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_two_pool_stores_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_two_pool_stores_with_contexts(rebalance_meta, true).await
+}
+
+#[cfg(test)]
+async fn test_two_pool_stores_with_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+    isolate_node_contexts: bool,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
     use crate::core::pools::PoolMeta;
     use crate::layout::endpoints::{EndpointServerPools, SetupType};
 
@@ -125,22 +149,37 @@ pub(crate) async fn test_two_pool_stores(
     }
     let endpoint_pools: EndpointServerPools = pools.iter().map(|pool| pool.endpoints.clone()).collect::<Vec<_>>().into();
     ctx.set_endpoints(endpoint_pools.clone());
-    let make_store = || {
+    let other_ctx = if isolate_node_contexts {
+        let other_ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
+        other_ctx.update_erasure_type(SetupType::DistErasure).await;
+        *other_ctx.local_disk_map().write().await = ctx.local_disk_map().read().await.clone();
+        other_ctx.set_endpoints(endpoint_pools.clone());
+        other_ctx
+    } else {
+        std::sync::Arc::clone(&ctx)
+    };
+    let make_store = |store_ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>| {
         std::sync::Arc::new(crate::store::ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: std::collections::HashMap::new(),
             pools: pools.clone(),
-            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, std::sync::Arc::clone(&ctx)),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, std::sync::Arc::clone(&store_ctx)),
             pool_meta: tokio::sync::RwLock::new(pool_meta.clone()),
             rebalance_meta: tokio::sync::RwLock::new(rebalance_meta.clone()),
             decommission_cancelers: tokio::sync::RwLock::new(vec![None, None]),
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(()),
-            ctx: std::sync::Arc::clone(&ctx),
+            ctx: store_ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         })
     };
-    (temp_dirs, make_store(), make_store())
+    let store = make_store(ctx);
+    let other_store = make_store(other_ctx);
+    if isolate_node_contexts {
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&store), Vec::new()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&other_store), Vec::new()).await;
+    }
+    (temp_dirs, store, other_store)
 }
 
 #[cfg(test)]

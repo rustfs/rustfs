@@ -579,6 +579,69 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str) -> disk::
 }
 
 impl SetDisks {
+    async fn discover_multipart_upload_paths(
+        &self,
+        orig_bucket: &str,
+        error_path: &str,
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize)> {
+        let disks = self.disks.read().await.clone();
+        if disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        let discovery_quorum = if self.default_parity_count == 0 {
+            disks.len()
+        } else {
+            (disks.len() / 2).max(1)
+        };
+        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
+        let mut candidate_counts = HashMap::<String, usize>::new();
+        let mut discovery_tasks = JoinSet::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let disk = disk.clone();
+            let orig_bucket = orig_bucket.to_string();
+            discovery_tasks.spawn(async move {
+                let result = match disk {
+                    Some(disk) => multipart_upload_paths_on_disk(disk, &orig_bucket).await,
+                    None => Err(DiskError::DiskNotFound),
+                };
+                (index, result)
+            });
+        }
+
+        while let Some(task_result) = discovery_tasks.join_next().await {
+            let Ok((index, result)) = task_result else {
+                continue;
+            };
+            match result {
+                Ok(paths) => {
+                    discovery_errors[index] = None;
+                    for path in paths {
+                        *candidate_counts.entry(path).or_insert(0) += 1;
+                    }
+                }
+                Err(err) => discovery_errors[index] = Some(err),
+            }
+        }
+
+        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
+            return Err(to_object_err(err.into(), vec![orig_bucket, error_path]));
+        }
+
+        let mut candidate_paths = candidate_counts
+            .into_iter()
+            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
+            .collect::<Vec<_>>();
+        candidate_paths.sort_unstable();
+        Ok((disks, candidate_paths, discovery_quorum))
+    }
+
+    pub(crate) async fn first_multipart_upload_path_for_decommission(&self, bucket: &str) -> Result<Option<String>> {
+        let (_, paths, _) = self
+            .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET)
+            .await?;
+        Ok(paths.into_iter().next())
+    }
+
     async fn acquire_multipart_upload_read_lock(
         &self,
         op: &'static str,
@@ -770,53 +833,7 @@ impl SetDisks {
         max_uploads: usize,
         expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
-        let disks = self.disks.read().await.clone();
-        if disks.is_empty() {
-            return Err(Error::ErasureReadQuorum);
-        }
-        let discovery_quorum = if self.default_parity_count == 0 {
-            disks.len()
-        } else {
-            (disks.len() / 2).max(1)
-        };
-        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
-        let mut candidate_counts = HashMap::<String, usize>::new();
-        let mut discovery_tasks = JoinSet::new();
-        for (index, disk) in disks.iter().enumerate() {
-            let disk = disk.clone();
-            let bucket = bucket.to_string();
-            discovery_tasks.spawn(async move {
-                let result = match disk {
-                    Some(disk) => multipart_upload_paths_on_disk(disk, &bucket).await,
-                    None => Err(DiskError::DiskNotFound),
-                };
-                (index, result)
-            });
-        }
-
-        while let Some(task_result) = discovery_tasks.join_next().await {
-            let Ok((index, result)) = task_result else {
-                continue;
-            };
-            match result {
-                Ok(paths) => {
-                    discovery_errors[index] = None;
-                    for path in paths {
-                        *candidate_counts.entry(path).or_insert(0) += 1;
-                    }
-                }
-                Err(err) => discovery_errors[index] = Some(err),
-            }
-        }
-
-        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
-            return Err(to_object_err(err.into(), vec![bucket, prefix]));
-        }
-
-        let candidate_paths = candidate_counts
-            .into_iter()
-            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
-            .collect::<Vec<_>>();
+        let (disks, candidate_paths, discovery_quorum) = self.discover_multipart_upload_paths(bucket, prefix).await?;
         let listed_uploads = stream::iter(candidate_paths)
             .map(|upload_path| {
                 let disks = &disks;
@@ -2357,6 +2374,43 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         if opts.data_movement {
             rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD);
             fi.set_data_moved();
+        }
+
+        // Receiver-side LWW (rustfs/backlog#1953): the multipart replication
+        // transport carries the category values at CreateMultipartUpload (in
+        // the staged upload metadata) and the source category timestamps on
+        // the complete request. Read the destination version under the held
+        // object write lock and keep any category this site modified more
+        // recently. Only an absent version has no local state to compare;
+        // other read failures must leave the upload retryable rather than
+        // committing inbound metadata without the LWW check.
+        if crate::set_disk::ops::object::replication_lww_applicable(opts)
+            && let Some(version_id) = fi.version_id
+        {
+            match self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(version_id.to_string()),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: opts.versioned,
+                        version_suspended: opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(existing) => {
+                    let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
+                    crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
+                }
+                // Version absent: first replication of this version, nothing
+                // local to compare — the normal path, not a degraded one.
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => return Err(err),
+            }
         }
 
         for meta in parts_metadatas.iter_mut() {
@@ -7094,6 +7148,146 @@ mod tests {
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, parts, &ObjectOptions::default())
                 .await
+        }
+
+        /// Receiver-side LWW on the multipart replication transport
+        /// (rustfs/backlog#1953): a metadata-only replication of a multipart
+        /// source object rides CreateMultipartUpload (category values in the
+        /// upload metadata) + CompleteMultipartUpload (category timestamps in
+        /// the complete options). A stale inbound tagging timestamp must not
+        /// overwrite a newer locally-tagged destination version.
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_stale_replication_tags_keep_local() {
+            use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+            use rustfs_utils::http::{SUFFIX_TAGGING_TIMESTAMP, get_str};
+            use time::format_description::well_known::Rfc3339;
+
+            const T_OLD: &str = "2026-01-01T00:00:00Z";
+            const T_LOCAL: &str = "2026-02-01T00:00:00Z";
+
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-replication-lww-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            // Local destination version with newer tags.
+            let version_id = Uuid::new_v4();
+            let mut local_metadata = HashMap::new();
+            local_metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "site=local".to_string());
+            rustfs_utils::http::insert_str(&mut local_metadata, SUFFIX_TAGGING_TIMESTAMP, T_LOCAL.to_string());
+            let mut local_reader = PutObjReader::from_vec(b"local body".to_vec());
+            set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut local_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        user_defined: local_metadata,
+                        // Explicit-version PUTs require the bucket Object Lock snapshot.
+                        object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("local versioned put should commit");
+
+            // Inbound replication upload carrying older tags for the same version.
+            let mut inbound_metadata = HashMap::new();
+            inbound_metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "site=remote".to_string());
+            rustfs_utils::http::insert_str(&mut inbound_metadata, SUFFIX_TAGGING_TIMESTAMP, T_OLD.to_string());
+            let create_opts = ObjectOptions {
+                versioned: true,
+                user_defined: inbound_metadata,
+                ..Default::default()
+            };
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &payload(0x5a), &create_opts).await;
+            rewrite_staged_upload_version_id(&set_disks, bucket, object, &upload_id, Some(version_id)).await;
+
+            let complete_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                replication_tagging_timestamp: Some(OffsetDateTime::parse(T_OLD, &Rfc3339).expect("test timestamp should parse")),
+                ..Default::default()
+            };
+
+            // Make the destination version unreadable on quorum while the
+            // staged upload remains intact. The commit barrier lets the old
+            // fail-open path move past the LWW read; restoring the metadata
+            // there proves it would otherwise commit the stale tags.
+            let mut damaged_metadata = Vec::new();
+            for temp_dir in temp_dirs.iter().take(3) {
+                let path = temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+                let original = tokio::fs::read(&path).await.expect("destination xl.meta should be readable");
+                tokio::fs::write(&path, b"not an xl.meta")
+                    .await
+                    .expect("destination xl.meta should be corruptible");
+                damaged_metadata.push((path, original));
+            }
+
+            let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeLockLost);
+            let first_set = set_disks.clone();
+            let first_upload_id = upload_id.clone();
+            let first_parts = parts.clone();
+            let first_opts = complete_opts.clone();
+            let mut first_completion = tokio::spawn(async move {
+                first_set
+                    .complete_multipart_upload(bucket, object, &first_upload_id, first_parts, &first_opts)
+                    .await
+            });
+
+            let first_result = tokio::select! {
+                result = &mut first_completion => result.expect("first completion task should finish"),
+                () = barrier.wait_until_paused() => {
+                    for (path, original) in &damaged_metadata {
+                        tokio::fs::write(path, original).await.expect("destination xl.meta should be restorable");
+                    }
+                    barrier.release();
+                    first_completion.await.expect("released completion task should finish")
+                }
+            };
+            for (path, original) in &damaged_metadata {
+                tokio::fs::write(path, original)
+                    .await
+                    .expect("destination xl.meta should be restored");
+            }
+            drop(barrier);
+
+            let first_error = first_result.expect_err("unreadable destination metadata must fail before multipart commit");
+            assert!(
+                !(is_err_object_not_found(&first_error) || is_err_version_not_found(&first_error)),
+                "corrupt destination metadata must not be treated as an absent version: {first_error}"
+            );
+
+            set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("replication multipart completion should succeed even when a category keeps local values");
+
+            let info = set_disks
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("completed version should be readable");
+            assert_eq!(
+                info.user_tags.as_str(),
+                "site=local",
+                "older inbound multipart tags must not overwrite newer local tags"
+            );
+            assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_LOCAL));
         }
 
         #[tokio::test]

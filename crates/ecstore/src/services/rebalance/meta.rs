@@ -155,7 +155,7 @@ impl RebalanceMeta {
         self.save_with_opts(store, ObjectOptions::default()).await
     }
 
-    pub async fn save_with_opts<S>(&self, store: Arc<S>, opts: ObjectOptions) -> Result<()>
+    pub async fn save_with_opts<S>(&self, store: Arc<S>, mut opts: ObjectOptions) -> Result<()>
     where
         S: ObjectIO<
                 Error = Error,
@@ -187,6 +187,14 @@ impl RebalanceMeta {
 
         let msg = rmp_serde::to_vec(self)?;
         data.extend(msg);
+
+        if self.stopped_at.is_none() && is_rebalance_conflicting_with_decommission(self) {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_REBALANCE_RUN_ID,
+                self.id.clone(),
+            );
+        }
 
         save_config_with_opts(store, REBAL_META_NAME, data, &opts).await?;
 
@@ -864,10 +872,6 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
     RebalanceMetaMergeOutcome::Merged
 }
 
-#[allow(
-    dead_code,
-    reason = "stop-transition helper retained beside stop_rebalance_meta_snapshot; no caller yet (backlog#1823)"
-)]
 pub(super) fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
     for pool_stat in meta.pool_stats.iter_mut() {
         if pool_stat.info.status == RebalStatus::Started {
@@ -935,6 +939,9 @@ pub(super) fn stop_rebalance_meta_snapshot_for_id(
     }
 
     stop_rebalance_state(meta, now);
+    // The caller holds the activation writer after admission was cancelled,
+    // so all entry readers have drained and no later entry can be admitted.
+    mark_started_rebalance_pools_stopped(meta, now);
     meta.last_refreshed_at = Some(now);
     Ok(Some(meta.clone()))
 }

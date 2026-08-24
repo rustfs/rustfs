@@ -127,10 +127,16 @@ impl ECStore {
     #[tracing::instrument(skip_all)]
     pub async fn start_rebalance(self: &Arc<Self>) -> Result<()> {
         let _start_guard = self.start_gate.lock().await;
-        self.start_rebalance_under_gate().await
+        let _activation_guard = self.rebalance_activation_write_guard(None, "start rebalance").await?;
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
+        if self.start_rebalance_under_gate().await? {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+        Ok(())
     }
 
-    pub(super) async fn start_rebalance_under_gate(self: &Arc<Self>) -> Result<()> {
+    pub(super) async fn start_rebalance_under_gate(self: &Arc<Self>) -> Result<bool> {
         info!(
             event = EVENT_REBALANCE_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -148,7 +154,7 @@ impl ECStore {
             .await?
         {
             RebalanceWorkerActivationFence::Ready(fence) => fence,
-            RebalanceWorkerActivationFence::NotStartedTerminal => return Ok(()),
+            RebalanceWorkerActivationFence::NotStartedTerminal => return Ok(false),
         };
 
         let decommission_running = self.is_decommission_running().await;
@@ -176,7 +182,7 @@ impl ECStore {
                     reason = "already_in_progress",
                     "Skipped duplicate rebalance start"
                 );
-                return Ok(());
+                return Ok(false);
             }
             expected_cancel = meta.cancel.clone();
             (candidate, activation_outcome, must_persist) = stage_local_rebalance_worker_activation(
@@ -241,7 +247,7 @@ impl ECStore {
         drop(activation_fence);
 
         if activation_outcome != RebalanceLocalActivationOutcome::Started {
-            return Ok(());
+            return Ok(must_persist);
         }
 
         let participants = if let Some(ref meta) = *self.rebalance_meta.read().await {
@@ -269,7 +275,7 @@ impl ECStore {
                 reason = "no_participants",
                 "Skipped rebalance start because no pools are participating"
             );
-            return Ok(());
+            return Ok(must_persist);
         }
 
         #[cfg(test)]
@@ -345,7 +351,7 @@ impl ECStore {
                 reason = "no_local_participants",
                 "Skipped rebalance start because no local pools are participating"
             );
-            return Ok(());
+            return Ok(must_persist);
         }
 
         info!(
@@ -356,7 +362,7 @@ impl ECStore {
             worker_count = workers_started,
             "Rebalance started"
         );
-        Ok(())
+        Ok(true)
     }
 
     #[tracing::instrument(skip(self, rx))]
@@ -374,58 +380,89 @@ impl ECStore {
             let mut quit = false;
 
             loop {
+                let mut terminal_state_saved = false;
                 tokio::select! {
                     result = done_rx.recv() => {
                         quit = true;
                         let now = OffsetDateTime::now_utc();
                         let terminal_event = classify_rebalance_terminal_event(result, now);
                         msg = terminal_event.message().to_string();
-                        let mut rebalance_meta = store.rebalance_meta.write().await;
-                        super::control::ensure_rebalance_run_id(
-                            rebalance_meta.as_ref(),
-                            save_rebalance_id.as_ref(),
-                            "apply rebalance terminal event",
-                        )?;
-                        if let Some(meta) = rebalance_meta.as_mut() {
-                            let meta_stopped = meta.stopped_at.is_some();
-                            if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                                if matches!(&terminal_event, super::meta::RebalanceTerminalEvent::Completed { .. })
-                                    && has_rebalance_cleanup_warnings(pool_stat)
-                                {
-                                    pool_stat.info.stopping = false;
-                                    pool_stat.info.status = RebalStatus::Failed;
-                                    pool_stat.info.end_time = Some(now);
-                                    pool_stat.info.last_error = Some(
-                                        pool_stat
-                                            .cleanup_warnings
-                                            .last_message
-                                            .clone()
-                                            .unwrap_or_else(|| "rebalance source cleanup warnings prevented completion".to_string()),
-                                    );
-                                } else if should_preserve_rebalance_stopped_state(
-                                    meta_stopped,
-                                    pool_stat.info.status,
-                                    &terminal_event,
-                                ) {
-                                    debug!(
-                                        event = EVENT_REBALANCE_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                                        pool_index,
-                                        state = "stopped_preserved",
-                                        "Preserved stopped rebalance status"
-                                    );
+                        let movement_gate = store.ctx.data_movement_operation_gate();
+                        let movement_guard = movement_gate.write().await;
+                        let previous_meta = store.rebalance_meta.read().await.clone();
+                        let terminal_state_present = {
+                            let mut rebalance_meta = store.rebalance_meta.write().await;
+                            super::control::ensure_rebalance_run_id(
+                                rebalance_meta.as_ref(),
+                                save_rebalance_id.as_ref(),
+                                "apply rebalance terminal event",
+                            )?;
+                            if let Some(meta) = rebalance_meta.as_mut() {
+                                let meta_stopped = meta.stopped_at.is_some();
+                                if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
+                                    if matches!(&terminal_event, super::meta::RebalanceTerminalEvent::Completed { .. })
+                                        && has_rebalance_cleanup_warnings(pool_stat)
+                                    {
+                                        pool_stat.info.stopping = false;
+                                        pool_stat.info.status = RebalStatus::Failed;
+                                        pool_stat.info.end_time = Some(now);
+                                        pool_stat.info.last_error = Some(
+                                            pool_stat
+                                                .cleanup_warnings
+                                                .last_message
+                                                .clone()
+                                                .unwrap_or_else(|| "rebalance source cleanup warnings prevented completion".to_string()),
+                                        );
+                                    } else if should_preserve_rebalance_stopped_state(
+                                        meta_stopped,
+                                        pool_stat.info.status,
+                                        &terminal_event,
+                                    ) {
+                                        debug!(
+                                            event = EVENT_REBALANCE_STATE,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_REBALANCE,
+                                            pool_index,
+                                            state = "stopped_preserved",
+                                            "Preserved stopped rebalance status"
+                                        );
+                                    } else {
+                                        pool_stat.info.stopping = false;
+                                        apply_rebalance_terminal_event(
+                                            &mut pool_stat.info.status,
+                                            &mut pool_stat.info.end_time,
+                                            &mut pool_stat.info.last_error,
+                                            terminal_event,
+                                            now,
+                                        );
+                                    }
+                                    true
                                 } else {
-                                    pool_stat.info.stopping = false;
-                                    apply_rebalance_terminal_event(
-                                        &mut pool_stat.info.status,
-                                        &mut pool_stat.info.end_time,
-                                        &mut pool_stat.info.last_error,
-                                        terminal_event,
-                                        now,
-                                    );
+                                    false
                                 }
+                            } else {
+                                false
                             }
+                        };
+
+                        if terminal_state_present {
+                            if let Err(err) = store
+                                .save_rebalance_stats_inner(
+                                    pool_index,
+                                    RebalSaveOpt::Stats,
+                                    Some(save_rebalance_id.as_ref()),
+                                )
+                                .await
+                            {
+                                let mut rebalance_meta = store.rebalance_meta.write().await;
+                                *rebalance_meta = previous_meta;
+                                drop(movement_guard);
+                                return Err(Error::other(format!(
+                                    "rebalance terminal state save failed for pool {pool_index}: {err}"
+                                )));
+                            }
+                            store.ctx.advance_data_movement_operation_epoch();
+                            terminal_state_saved = true;
                         }
                     }
                     _ = timer.tick() => {
@@ -434,9 +471,10 @@ impl ECStore {
                     }
                 }
 
-                if let Err(err) = store
-                    .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
-                    .await
+                if !terminal_state_saved
+                    && let Err(err) = store
+                        .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
+                        .await
                 {
                     let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
                     error!("{} err: {:?}", msg, wrapped);
@@ -760,16 +798,14 @@ impl ECStore {
                     meta.percent_free_goal,
                 )
             {
-                pool_stat.info.status = RebalStatus::Completed;
-                pool_stat.info.end_time = Some(OffsetDateTime::now_utc());
                 info!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REBALANCE,
                     pool_index,
-                    state = "completed",
+                    state = "completion_ready",
                     percent_free = pfi,
-                    "Marked rebalance pool completed"
+                    "Rebalance pool reached completion goal"
                 );
                 return Ok(true);
             }
@@ -782,14 +818,23 @@ impl ECStore {
 impl ECStore {
     #[tracing::instrument(skip(self))]
     pub async fn save_rebalance_stats(&self, pool_idx: usize, opt: RebalSaveOpt) -> Result<()> {
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         self.save_rebalance_stats_inner(pool_idx, opt, None).await
     }
 
     pub async fn save_rebalance_stats_for_id(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: &str) -> Result<()> {
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
         self.save_rebalance_stats_inner(pool_idx, opt, Some(expected_id)).await
     }
 
-    async fn save_rebalance_stats_inner(&self, pool_idx: usize, opt: RebalSaveOpt, expected_id: Option<&str>) -> Result<()> {
+    pub(super) async fn save_rebalance_stats_inner(
+        &self,
+        pool_idx: usize,
+        opt: RebalSaveOpt,
+        expected_id: Option<&str>,
+    ) -> Result<()> {
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             if let Some(expected_id) = expected_id {

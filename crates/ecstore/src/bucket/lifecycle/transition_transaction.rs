@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::durable_namespace::TRANSITION_TRANSACTION_NAMESPACE;
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::lifecycle::tier_sweeper::{
     delete_confirmed_transition_candidate_exact_with_lease_idempotent,
@@ -42,7 +43,7 @@ const TRANSITION_TRANSACTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(6
 const TRANSITION_TRANSACTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const TRANSITION_TRANSACTION_SCHEMA: &str = "rustfs-transition-transaction-v1";
 pub const TRANSITION_TRANSACTION_PREFIX: &str = "ilm/transition-transactions";
-pub const TRANSITION_TRANSACTION_RECORD_PREFIX: &str = "ilm/transition-transactions/records";
+pub const TRANSITION_TRANSACTION_RECORD_PREFIX: &str = TRANSITION_TRANSACTION_NAMESPACE.prefix;
 pub const MAX_TRANSITION_TRANSACTION_SIZE: usize = 64 * 1024;
 
 pub type Result<T> = std::result::Result<T, TransitionTransactionError>;
@@ -584,7 +585,8 @@ pub(crate) async fn save_transition_transaction_record(
     let object =
         transition_transaction_record_object_name(transaction.transaction_id).map_err(transition_transaction_store_error)?;
     let data = transaction.encode().map_err(transition_transaction_store_error)?;
-    config_boundary::save_config(api, &object, data).await
+    config_boundary::save_config(api.clone(), &object, data.clone()).await?;
+    api.record_durable_ilm_decommission_progress(&object, &data).await
 }
 
 pub(crate) async fn load_transition_transaction_record(
@@ -596,8 +598,14 @@ pub(crate) async fn load_transition_transaction_record(
     TransitionTransaction::decode(transaction_id, &data).map_err(transition_transaction_store_error)
 }
 
-pub(crate) async fn delete_transition_transaction_record(api: Arc<ECStore>, transaction_id: Uuid) -> EcstoreResult<()> {
-    let object = transition_transaction_record_object_name(transaction_id).map_err(transition_transaction_store_error)?;
+pub(crate) async fn delete_transition_transaction_record(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+) -> EcstoreResult<()> {
+    let object =
+        transition_transaction_record_object_name(transaction.transaction_id).map_err(transition_transaction_store_error)?;
+    let data = transaction.encode().map_err(transition_transaction_store_error)?;
+    api.record_durable_ilm_decommission_terminal(&object, &data).await?;
     match config_boundary::delete_config(api, &object).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(err),
@@ -813,7 +821,7 @@ pub async fn finalize_missing_transition_transaction_for_operator(
     if probe != TransitionOperatorProbe::Missing {
         return Err(TransitionOperatorError::CandidateNotMissing(probe));
     }
-    delete_transition_transaction_record(api, transaction_id)
+    delete_transition_transaction_record(api, &transaction)
         .await
         .map_err(TransitionOperatorError::Store)
 }
@@ -849,22 +857,22 @@ pub async fn process_transition_transaction_record(
     match transaction.state {
         TransitionTransactionState::Uploaded => {
             delete_transition_remote_candidate(api.clone(), transaction).await?;
-            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            delete_transition_transaction_record(api, transaction).await?;
             Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
         }
         TransitionTransactionState::CleanupPending => match local_commit_matches_transaction(api.clone(), transaction).await {
             Ok(true) => {
-                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                delete_transition_transaction_record(api, transaction).await?;
                 Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
             }
             Ok(false) => {
                 delete_transition_remote_candidate(api.clone(), transaction).await?;
-                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                delete_transition_transaction_record(api, transaction).await?;
                 Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
             }
             Err(err) if transition_source_is_missing(&err) => {
                 delete_transition_remote_candidate(api.clone(), transaction).await?;
-                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                delete_transition_transaction_record(api, transaction).await?;
                 Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
             }
             Err(err) => Err(err),
@@ -872,7 +880,7 @@ pub async fn process_transition_transaction_record(
         TransitionTransactionState::LocalCommitStarted => {
             match local_commit_matches_transaction(api.clone(), transaction).await {
                 Ok(true) => {
-                    delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                    delete_transition_transaction_record(api, transaction).await?;
                     Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
                 }
                 Ok(false) => Ok(TransitionTransactionRecoveryOutcome::Retained),
@@ -881,7 +889,7 @@ pub async fn process_transition_transaction_record(
             }
         }
         TransitionTransactionState::AbortedNoRemote | TransitionTransactionState::Committed => {
-            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            delete_transition_transaction_record(api, transaction).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
         }
         TransitionTransactionState::UploadOutcomeUnknown => recover_unknown_upload_outcome(api, transaction).await,
@@ -907,7 +915,7 @@ async fn recover_unknown_upload_outcome(
         .map_err(Error::other)?
     {
         TransitionCandidateProbe::Missing => {
-            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            delete_transition_transaction_record(api, transaction).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
         }
         TransitionCandidateProbe::UnversionedPresent => {
@@ -925,7 +933,7 @@ async fn recover_unknown_upload_outcome(
             )
             .await
             .map_err(Error::other)?;
-            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            delete_transition_transaction_record(api, transaction).await?;
             Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
         }
         TransitionCandidateProbe::VersionedPresent(version_id) => {
@@ -958,7 +966,7 @@ async fn cleanup_recovered_unknown_upload_candidate(
         .map_err(transition_transaction_store_error)?;
     save_transition_transaction_record(api.clone(), &cleanup).await?;
     delete_transition_remote_candidate(api.clone(), &cleanup).await?;
-    delete_transition_transaction_record(api, cleanup.transaction_id).await?;
+    delete_transition_transaction_record(api, &cleanup).await?;
     Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
 }
 

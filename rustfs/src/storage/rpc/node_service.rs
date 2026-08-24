@@ -153,7 +153,7 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 1;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -1912,7 +1912,7 @@ impl Node for NodeService {
 
     async fn background_heal_status(
         &self,
-        _request: Request<BackgroundHealStatusRequest>,
+        request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
         if self.resolve_object_store().is_none() {
             return Ok(Response::new(BackgroundHealStatusResponse {
@@ -1922,7 +1922,7 @@ impl Node for NodeService {
             }));
         }
         let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
-        match heal::encode_node_heal_status(&snapshot) {
+        match heal::encode_node_heal_status(&snapshot, request.into_inner().protocol_version) {
             Ok(bg_heal_state) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: true,
                 bg_heal_state: bg_heal_state.into(),
@@ -1987,8 +1987,10 @@ impl Node for NodeService {
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
+        // Recover missing workers only after the reload merged newer state; a
+        // stale or duplicate reload must not spawn workers for an older generation.
         match store.reload_pool_meta().await {
-            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+            Ok(true) => match store.spawn_missing_local_decommission_routines().await {
                 Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
                     success: true,
                     error_info: None,
@@ -1998,6 +2000,10 @@ impl Node for NodeService {
                     error_info: Some(err.to_string()),
                 })),
             },
+            Ok(false) => Ok(Response::new(ReloadPoolMetaResponse {
+                success: true,
+                error_info: None,
+            })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
@@ -3303,7 +3309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_supported_v1_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v2_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3368,7 +3374,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &1_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &2_u32.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");

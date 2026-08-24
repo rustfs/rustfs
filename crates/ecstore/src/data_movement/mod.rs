@@ -813,7 +813,7 @@ pub(crate) fn is_equivalent_data_movement_metadata(
             .all(|(key, value)| source.user_defined.get(key) == Some(value))
 }
 
-fn is_equivalent_data_movement_object_identity(
+pub(crate) fn is_equivalent_data_movement_object_identity(
     source: &ObjectInfo,
     target: &ObjectInfo,
     compare_mod_time: bool,
@@ -1989,6 +1989,19 @@ mod tests {
         let expected = cleanup_test_versions(vec![migrated.clone(), expired.clone()]);
         let current = cleanup_test_versions(vec![migrated]);
         let allowed_missing = vec![source_cleanup_version_identity(&expired)];
+
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
+    }
+
+    #[test]
+    fn test_decommission_cleanup_preflight_accepts_migrated_free_version_consumed_from_source() {
+        let migrated = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "migrated");
+        let mut free_version = cleanup_test_file_info("object.txt", Uuid::from_u128(2), "tier-cleanup");
+        free_version.deleted = true;
+        free_version.set_tier_free_version();
+        let expected = cleanup_test_versions(vec![migrated.clone(), free_version.clone()]);
+        let current = cleanup_test_versions(vec![migrated]);
+        let allowed_missing = vec![source_cleanup_version_identity(&free_version)];
 
         assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &current, &allowed_missing));
     }

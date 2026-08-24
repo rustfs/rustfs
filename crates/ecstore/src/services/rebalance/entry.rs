@@ -255,7 +255,7 @@ impl ECStore {
         fivs.versions
             .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
-        // Entry lock order is bucket incarnation -> activation_gate -> rebalance.bin.
+        // Entry lock order is bucket incarnation -> activation_gate -> rebalance.bin -> movement gate.
         // Stop waits for in-flight entries through cleanup, but not for entries admitted later.
         ensure_rebalance_entry_active(&cancel)?;
         let run_guard = self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry").await?;
