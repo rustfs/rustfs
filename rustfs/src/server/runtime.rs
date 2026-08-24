@@ -50,7 +50,7 @@ mod tests {
 }
 
 #[inline]
-fn detect_cores().min(16) -> usize {
+fn detect_cores() -> usize {
     // Uses cgroup-aware detection from cgroup_resources module
     // Returns effective CPU cores considering cgroup limits and overrides
     crate::cgroup_resources::container_resources().cpu_cores
