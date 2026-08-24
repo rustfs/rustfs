@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, TierConfigReloadOutcome};
+use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, ScannerPublicationLease, TierConfigReloadOutcome};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -52,6 +52,12 @@ const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
+
+#[derive(Clone, Debug)]
+pub struct ScannerPublicationLeaseGrant {
+    pub host: String,
+    pub lease: ScannerPublicationLease,
+}
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -1491,6 +1497,102 @@ impl NotificationSys {
         aggregate_scanner_dirty_usage_acknowledgement_results(join_all(futures).await, failures)
     }
 
+    /// Acquire remote publication leases in a deterministic host order. A
+    /// missing/legacy peer is a hard publication deferral; already acquired
+    /// leases are released before returning so a partial acquisition cannot
+    /// pin movement on one peer.
+    pub async fn acquire_scanner_publication_leases(
+        &self,
+        mut targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        for pair in targets.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].0)));
+            }
+        }
+
+        let mut grants = Vec::with_capacity(targets.len());
+        for (host, session_id, generation) in targets {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == host)
+                .cloned()
+            else {
+                let _ = self.release_scanner_publication_leases(grants).await;
+                return Err(Error::other(format!("scanner publication lease peer {host} is unavailable")));
+            };
+            match client.acquire_scanner_publication_lease(&session_id, generation).await {
+                Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
+                Err(err) => {
+                    let _ = self.release_scanner_publication_leases(grants).await;
+                    return Err(Error::other(format!("scanner publication lease acquisition failed: {err}")));
+                }
+            }
+        }
+        Ok(grants)
+    }
+
+    pub async fn release_scanner_publication_leases(&self, mut grants: Vec<ScannerPublicationLeaseGrant>) -> Result<()> {
+        grants.sort_by(|left, right| right.host.cmp(&left.host));
+        let mut failures = Vec::new();
+        for grant in grants {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == grant.host)
+            else {
+                failures.push(format!("peer {} is unavailable", grant.host));
+                continue;
+            };
+            if let Err(err) = client.release_scanner_publication_lease(&grant.lease).await {
+                failures.push(format!("peer {} release failed: {err}", grant.host));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::other(format!(
+                "scanner publication lease release failures: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Revalidate every remote lease in deterministic host order immediately
+    /// before a final scanner metadata write.  A peer restart removes its
+    /// process-owned token table and changes its activity session, so an old
+    /// generation cannot pass this proof even when the numeric generation is
+    /// reused.
+    pub async fn validate_scanner_publication_leases(&self, grants: &[ScannerPublicationLeaseGrant]) -> Result<()> {
+        let mut grants = grants.to_vec();
+        grants.sort_by(|left, right| left.host.cmp(&right.host));
+        for pair in grants.windows(2) {
+            if pair[0].host == pair[1].host {
+                return Err(Error::other(format!("duplicate scanner publication lease target: {}", pair[0].host)));
+            }
+        }
+        for grant in grants {
+            let Some(client) = self
+                .peer_clients
+                .iter()
+                .flatten()
+                .find(|client| client.grid_host == grant.host)
+                .cloned()
+            else {
+                return Err(Error::other(format!("scanner publication lease peer {} is unavailable", grant.host)));
+            };
+            client
+                .validate_scanner_publication_lease(&grant.lease)
+                .await
+                .map_err(|err| Error::other(format!("scanner publication lease validation failed for {}: {err}", grant.host)))?;
+        }
+        Ok(())
+    }
+
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
@@ -2634,6 +2736,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_publication_lease_release_reports_all_unavailable_peers() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let grants = ["peer-a", "peer-b"]
+            .into_iter()
+            .map(|host| ScannerPublicationLeaseGrant {
+                host: host.to_string(),
+                lease: ScannerPublicationLease {
+                    token: Uuid::new_v4(),
+                    movement_generation: 3,
+                    owner_id: Uuid::new_v4().to_string(),
+                    session_id: "session-a".to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                },
+            })
+            .collect();
+
+        let error = sys
+            .release_scanner_publication_leases(grants)
+            .await
+            .expect_err("an unavailable peer must not silently release a remote lease");
+        let message = error.to_string();
+        assert!(message.contains("peer-a"));
+        assert!(message.contains("peer-b"));
+    }
+
+    #[tokio::test]
     async fn scanner_activity_probe_rejects_an_incomplete_peer_topology() {
         let client = PeerRestClient::new(
             "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
@@ -2755,6 +2889,8 @@ mod tests {
             data_movement_active: Some(false),
             dirty_usage_generation: Some(2),
             dirty_usage_pending,
+            movement_generation: Some(1),
+            publication_blocked: Some(false),
         };
 
         let pending = aggregate_scanner_dirty_usage_acknowledgement_results(

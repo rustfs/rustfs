@@ -242,14 +242,16 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
             ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN,
-            PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
-            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path,
-            collect_local_metrics, find_local_disk_by_ref, get_local_server_property, reload_bucket_metadata,
-            reload_transition_tier_config, remove_bucket_metadata, validate_batch_read_version_item_count,
+            PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS,
+            SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
+            UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
+            reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
+            validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -581,8 +583,8 @@ pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx,
-        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -614,6 +616,7 @@ pub(crate) const KMS_SIGNAL_SUBSYSTEM: &str = ecstore_rpc::KMS_SIGNAL_SUBSYSTEM;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
+pub(crate) const SCANNER_PUBLICATION_LEASE_TTL_MS: u64 = ecstore_storage::SCANNER_PUBLICATION_LEASE_TTL_MS;
 pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
 
 pub(crate) fn normalize_tonic_rpc_audience(value: &str) -> std::io::Result<String> {

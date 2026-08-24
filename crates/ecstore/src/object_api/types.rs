@@ -446,6 +446,11 @@ pub struct ObjectOptions {
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
 }
 
+/// Transient scanner-only carrier for target-side publication lease tokens.
+/// SetDisks consumes and removes this key before constructing durable
+/// FileInfo metadata; it must never appear in an S3-visible object.
+pub const SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY: &str = "x-rustfs-internal-scanner-publication-lease-fence-v1";
+
 impl ObjectOptions {
     pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
         self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {

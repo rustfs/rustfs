@@ -486,6 +486,160 @@ pub fn canonical_scanner_activity_response_body(
     Ok(body)
 }
 
+/// Builds the protocol-v7 response body.  The optional movement fields are
+/// presence-bound so a missing terminal-generation proof cannot authenticate
+/// as the value zero.
+pub fn canonical_scanner_activity_v7_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v3\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 8 + 4);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    body.push(u8::from(response.movement_generation.is_some()));
+    if let Some(generation) = response.movement_generation {
+        body.extend_from_slice(&generation.to_be_bytes());
+    }
+    body.push(u8::from(response.publication_blocked.is_some()));
+    if let Some(blocked) = response.publication_blocked {
+        body.push(u8::from(blocked));
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by the short-lived remote scanner publication
+/// lease request. This is a separate domain from ScannerActivity so v6/v7
+/// observation proofs remain byte-for-byte compatible.
+pub fn canonical_scanner_publication_lease_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let session_id = request.expected_session_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
+    body.extend_from_slice(&request.ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    // Empty keeps the original acquire body byte-for-byte compatible.  A
+    // non-empty token is the authenticated validation form used immediately
+    // before a coordinator commits its final publication.
+    let token = request.token.as_ref();
+    if !token.is_empty() {
+        body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+        body.extend_from_slice(token);
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by a remote scanner publication lease
+/// release request.
+pub fn canonical_scanner_publication_lease_release_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let token = request.token.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + token.len() + 16);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    let token = response.token.as_ref();
+    let owner_id = response.owner_id.as_bytes();
+    let session_id = response.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.push(u8::from(response.success));
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&response.movement_generation.to_be_bytes());
+    body.extend_from_slice(&response.lease_ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_release_response_body(
+    challenge: &[u8],
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+    response: &proto_gen::node_service::ScannerPublicationLeaseReleaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-response-v1\0";
+    let token = request.token.as_ref();
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 56,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.success));
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
 /// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
 /// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
 /// distinct field values can never collide into the same canonical bytes.
@@ -758,6 +912,11 @@ pub fn canonical_rename_data_request_body(
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
     body.push_bytes(&request.file_info_bin)?;
+    // Keep legacy rename requests byte-for-byte compatible.  The optional
+    // token is included only for the scanner's target-side lease fence.
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -840,6 +999,9 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.volume)?;
     body.push_str(&request.path)?;
     body.push_str(&request.options)?;
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
     Ok(body.finish())
 }
 
@@ -1002,6 +1164,7 @@ mod disk_mutation_canonical_tests {
             dst_volume: "dst-vol".into(),
             dst_path: "dst-path".into(),
             file_info_bin: vec![0x81, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
         for mutate in [
@@ -1013,6 +1176,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1173,6 +1337,7 @@ mod disk_mutation_canonical_tests {
             volume: "v".into(),
             path: "p".into(),
             options: "{\"o\":1}".into(),
+            scanner_publication_lease_token: Vec::new().into(),
         };
         let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
         for mutate in [
@@ -1180,6 +1345,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
             mutate(&mut request);
@@ -1565,8 +1731,12 @@ mod non_disk_mutation_canonical_tests {
 mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
-        canonical_scanner_activity_v4_response_body,
-        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+        canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
+        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
+        canonical_scanner_publication_lease_response_body,
+        proto_gen::node_service::{
+            ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        },
     };
 
     #[test]
@@ -1617,6 +1787,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 11,
             dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
         };
         let baseline =
             canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
@@ -1667,6 +1839,25 @@ mod scanner_activity_tests {
             canonical_scanner_activity_response_body(&[2; 16], &response)
                 .expect("scanner activity response with a different challenge should encode")
         );
+
+        let v7_baseline =
+            canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("scanner activity v7 response should encode");
+        for variant in [
+            ScannerActivityResponse {
+                movement_generation: Some(20),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                publication_blocked: Some(true),
+                ..response
+            },
+        ] {
+            assert_ne!(
+                v7_baseline,
+                canonical_scanner_activity_v7_response_body(&[1; 16], &variant)
+                    .expect("scanner activity v7 response variant should encode")
+            );
+        }
     }
 
     #[test]
@@ -1681,6 +1872,8 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             dirty_usage_generation: 0,
             dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
         };
         let baseline =
             canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
@@ -1712,6 +1905,72 @@ mod scanner_activity_tests {
             baseline,
             canonical_scanner_activity_v4_response_body(&[1; 16], &extended)
                 .expect("scanner activity v4 response should ignore v5 fields")
+        );
+    }
+
+    #[test]
+    fn scanner_publication_lease_canonical_bodies_bind_session_owner_and_generation() {
+        let request = ScannerPublicationLeaseRequest {
+            challenge: vec![1; 16].into(),
+            expected_movement_generation: 7,
+            ttl_ms: 60_000,
+            expected_session_id: "session-a".to_string(),
+            token: Vec::new().into(),
+        };
+        let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
+        for variant in [
+            ScannerPublicationLeaseRequest {
+                expected_movement_generation: 8,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                expected_session_id: "session-b".to_string(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                ttl_ms: 30_000,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                token: vec![3; 16].into(),
+                ..request
+            },
+        ] {
+            assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
+        }
+
+        let release_a = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            challenge: vec![2; 16].into(),
+            token: vec![3; 16].into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let release_b = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            owner_id: "owner-b".to_string(),
+            ..release_a.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_release_request_body(&release_a).unwrap(),
+            canonical_scanner_publication_lease_release_request_body(&release_b).unwrap()
+        );
+
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: vec![4; 16].into(),
+            movement_generation: 7,
+            lease_ttl_ms: 60_000,
+            error: None,
+            response_proof: Vec::new().into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let response_changed = ScannerPublicationLeaseResponse {
+            owner_id: "owner-b".to_string(),
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
         );
     }
 }

@@ -766,7 +766,7 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
             DirtyUsageSnapshotStatus::Current,
             ScannerCycleActivityStatus::Unverified,
         ),
-        ScannerCycleStatus::Incomplete
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
 
     for status in [
@@ -815,6 +815,34 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
     }
 }
 
+#[test]
+fn unverified_activity_defers_partial_and_floor_cycles() {
+    let expected = ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+
+    assert_eq!(
+        classify_nsscanner_cycle(
+            true,
+            false,
+            false,
+            ScannerBucketScanStatus::Partial,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn structurally_complete_superseded_cycles_publish_without_claiming_convergence() {
     let (updates, mut receiver) = mpsc::channel(2);
@@ -833,6 +861,15 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
         !publish_usage_snapshot(&updates, ScannerCycleStatus::Incomplete, DataUsageInfo::default())
             .await
             .expect("incomplete snapshot suppression should succeed")
+    );
+    assert!(
+        !publish_usage_snapshot(
+            &updates,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            DataUsageInfo::default(),
+        )
+        .await
+        .expect("unverified activity suppression should succeed")
     );
 
     assert_eq!(
@@ -855,11 +892,7 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
 
 #[test]
 fn scanner_cycle_fails_closed_for_namespace_disappearance() {
-    for activity_status in [
-        ScannerCycleActivityStatus::Changed,
-        ScannerCycleActivityStatus::Unchanged,
-        ScannerCycleActivityStatus::Unverified,
-    ] {
+    for activity_status in [ScannerCycleActivityStatus::Changed, ScannerCycleActivityStatus::Unchanged] {
         assert_eq!(
             classify_nsscanner_cycle(
                 false,
@@ -872,6 +905,17 @@ fn scanner_cycle_fails_closed_for_namespace_disappearance() {
             ScannerCycleStatus::Incomplete
         );
     }
+    assert_eq!(
+        classify_nsscanner_cycle(
+            false,
+            false,
+            false,
+            ScannerBucketScanStatus::NamespaceNotFound,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
     assert_eq!(
         classify_nsscanner_cycle(
             true,
