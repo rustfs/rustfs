@@ -297,6 +297,10 @@ pub(super) enum ScannerActivityObservation {
     /// ordinary deferred cluster-activity backoff so publication can retry
     /// after a transition reaches its terminal state.
     MovementChanged,
+    /// A remote scanner process restarted. Publication leases are bound to the
+    /// process instance, so this must bypass deferred cluster-activity backoff
+    /// even when the restarted peer reports otherwise ordinary activity.
+    RemoteRestarted,
     MaintenanceChanged,
     Unverified,
 }
@@ -393,6 +397,7 @@ pub(super) fn scanner_activity_observed_work(observation: ScannerActivityObserva
         observation,
         ScannerActivityObservation::Changed
             | ScannerActivityObservation::MovementChanged
+            | ScannerActivityObservation::RemoteRestarted
             | ScannerActivityObservation::MaintenanceChanged
             | ScannerActivityObservation::Unverified
     )
@@ -626,7 +631,9 @@ where
         }
         match observation {
             ScannerActivityObservation::Unchanged | ScannerActivityObservation::NotRequired => {}
-            ScannerActivityObservation::MovementChanged => return ScannerCycleWakeReason::ClusterActivity,
+            ScannerActivityObservation::MovementChanged | ScannerActivityObservation::RemoteRestarted => {
+                return ScannerCycleWakeReason::ClusterActivity;
+            }
             ScannerActivityObservation::Changed if !generations.defer_cluster_activity => {
                 return ScannerCycleWakeReason::ClusterActivity;
             }
@@ -676,6 +683,9 @@ pub(super) fn compare_scanner_activity(
         let Some(previous_activity) = previous.get(host) else {
             continue;
         };
+        if host != LOCAL_SCANNER_ACTIVITY_NODE && previous_activity.instance_id != current_activity.instance_id {
+            return ScannerActivityObservation::RemoteRestarted;
+        }
         if host != LOCAL_SCANNER_ACTIVITY_NODE
             && previous_activity.instance_id == current_activity.instance_id
             && previous_activity.maintenance_generation != current_activity.maintenance_generation
