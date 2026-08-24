@@ -80,6 +80,11 @@ use uuid::Uuid;
 
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(test)]
+tokio::task_local! {
+    static DIRECTORY_LISTING_ENTRY_PROBE_COUNT: Arc<AtomicUsize>;
+}
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const INLINE_METADATA_ROLLBACK_DIR_XOR: u128 = 0x7275737466735f696e6c696e655f7262;
 const DELETE_MARKER_ROLLBACK_FILE: &str = "xl.meta.delete-marker.rollback";
@@ -7057,6 +7062,7 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             if opts.recursive
                                 || opts.incl_deleted
+                                || opts.skip_hidden_prefix_check
                                 || self
                                     .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
                                     .await?
@@ -7201,6 +7207,10 @@ impl LocalDisk {
             if current.is_empty() {
                 continue;
             }
+
+            #[cfg(test)]
+            let _previous_probe_count =
+                DIRECTORY_LISTING_ENTRY_PROBE_COUNT.try_with(|probe_count| probe_count.fetch_add(1, Ordering::Relaxed));
 
             let entries = match with_walk_stall_timeout(stall, self.list_dir("", bucket, &current, -1)).await {
                 Ok(entries) => entries,
@@ -17509,6 +17519,86 @@ mod test {
 
         assert!(has_visible_object);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_visible_prefix_probe_cost() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        const PREFIX_COUNT: usize = 64;
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let mut expected_names = Vec::with_capacity(PREFIX_COUNT);
+
+        for index in 0..PREFIX_COUNT {
+            let prefix = format!("prefix-{index:04}");
+            let object_name = format!("{prefix}/nested/object");
+            let object_dir = bucket_dir.join(&object_name);
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("visible object directory should be created");
+
+            let mut metadata = FileMeta::default();
+            let mut file_info = FileInfo::new(&object_name, 1, 1);
+            file_info.mod_time = Some(OffsetDateTime::now_utc());
+            metadata.add_version(file_info).expect("visible metadata should be valid");
+            fs::write(
+                object_dir.join(STORAGE_FORMAT_FILE),
+                metadata.marshal_msg().expect("visible metadata should encode"),
+            )
+            .await
+            .expect("visible object metadata should be written");
+            expected_names.push(format!("{prefix}/"));
+        }
+
+        async fn scan_prefixes(disk: &LocalDisk, bucket: &str, skip_hidden_prefix_check: bool) -> (Vec<String>, usize) {
+            let probe_count = Arc::new(AtomicUsize::new(0));
+            let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+            let mut output = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                skip_hidden_prefix_check,
+                ..Default::default()
+            };
+            let mut objects_returned = 0;
+
+            DIRECTORY_LISTING_ENTRY_PROBE_COUNT
+                .scope(
+                    Arc::clone(&probe_count),
+                    disk.scan_dir("".to_string(), "".to_string(), &opts, &mut output, &mut objects_returned, false, None),
+                )
+                .await
+                .expect("scan_dir should succeed");
+            output.close().await.expect("metacache writer should close");
+            drop(output);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let names = reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>();
+
+            (names, probe_count.load(Ordering::Relaxed))
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be UTF-8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+
+        let (conservative_names, conservative_probes) = scan_prefixes(&disk, bucket, false).await;
+        let (fast_path_names, fast_path_probes) = scan_prefixes(&disk, bucket, true).await;
+
+        assert_eq!(conservative_names, expected_names);
+        assert_eq!(fast_path_names, expected_names);
+        assert_eq!(conservative_probes, PREFIX_COUNT * 3);
+        assert_eq!(fast_path_probes, 0);
     }
 
     #[tokio::test]

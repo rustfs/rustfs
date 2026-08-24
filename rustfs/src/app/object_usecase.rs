@@ -18081,7 +18081,7 @@ mod tests {
 
         async fn observed_bucket_usage(bucket: &str) -> Option<u64> {
             let mut usage = rustfs_data_usage::DataUsageInfo::default();
-            apply_bucket_usage_memory_overlay(&mut usage).await;
+            crate::app::storage_api::object_usecase::data_usage::apply_bucket_usage_memory_overlay(&mut usage).await;
             usage.buckets_usage.get(bucket).map(|value| value.size)
         }
 
