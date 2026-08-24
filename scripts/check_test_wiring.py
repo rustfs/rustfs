@@ -209,6 +209,20 @@ def check_runner_selection(root: Path) -> list[str]:
         errors.append("scripts/run_e2e_tests.sh: --test is documented as a pattern and must not force exact matching")
     if 'eval "$test_cmd"' in runner:
         errors.append("scripts/run_e2e_tests.sh: command construction must not use eval")
+    start = re.search(r"start_rustfs\(\) \{(?P<body>.*?)\n\}\n\n# Function to run tests", runner, re.DOTALL)
+    start_body = start.group("body") if start else ""
+    if '"http://localhost:9000/health/ready"' not in start_body or not re.search(
+        r"curl [^\n]*(?:--fail|-f(?:\s|$))", start_body
+    ):
+        errors.append("scripts/run_e2e_tests.sh: startup must require the ready endpoint to return HTTP success")
+    if start_body.count("return 0") != 1 or "nc -z" in start_body:
+        errors.append("scripts/run_e2e_tests.sh: startup readiness must not fall back to process or port liveness")
+    failed_start = re.search(r"if ! start_rustfs; then(?P<body>.*?)\n\s*fi", runner, re.DOTALL)
+    failed_start_commands = (
+        [line.strip() for line in failed_start.group("body").splitlines() if line.strip()] if failed_start else []
+    )
+    if failed_start_commands != ['print_error "Failed to start RustFS properly"', "exit 1"]:
+        errors.append("scripts/run_e2e_tests.sh: failed startup must not continue into tests")
     return errors
 
 
@@ -599,6 +613,39 @@ def validate(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def test_runner_readiness_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "scripts/run_e2e_tests.sh"
+            script.parent.mkdir(parents=True)
+            valid_runner = (
+                "start_rustfs() {\n"
+                '  curl --fail "http://localhost:9000/health/ready" && return 0\n'
+                "  return 1\n"
+                "}\n\n# Function to run tests\n"
+                "--include-ignored --test-threads=1\n"
+                "if ! start_rustfs; then\n"
+                '  print_error "Failed to start RustFS properly"\n'
+                "  exit 1\n"
+                "fi\n"
+            )
+            script.write_text(valid_runner)
+            self.assertEqual(check_runner_selection(root), [])
+
+            script.write_text(valid_runner.replace("/health/ready", "/health"))
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
+            script.write_text(valid_runner.replace("return 1", "nc -z localhost 9000 && return 0"))
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
+            script.write_text(
+                valid_runner.replace(
+                    '  print_error "Failed to start RustFS properly"\n  exit 1',
+                    '  if [ -n "$RUSTFS_PID" ]; then\n    echo continuing\n  else\n    exit 1\n  fi',
+                )
+            )
+            self.assertEqual(len(check_runner_selection(root)), 1)
+
     def test_e2e_requires_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
