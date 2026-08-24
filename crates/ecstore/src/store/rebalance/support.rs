@@ -67,7 +67,7 @@ pub(super) fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &Obj
     }
 }
 
-pub(super) fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
+pub(super) fn resolve_store_rebalance_pool_meta_reload_result<T>(result: Result<T>, stage: &str) -> Result<T> {
     result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
 }
 

@@ -97,6 +97,8 @@ impl ECStore {
             .first()
             .cloned()
             .ok_or_else(|| Error::other("heal format requires at least one storage pool"))?;
+        let mut write_state = self.pool_meta_save_gate.lock().await;
+        write_state.ensure_write_safe("heal format fence failed")?;
 
         // Metadata fence order is part of the decommission/rebalance protocol:
         // pool.bin must always be acquired before rebalance.bin.
@@ -110,8 +112,12 @@ impl ECStore {
         }
 
         let mut pool_meta = PoolMeta::default();
-        let replica_state = pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
-        replica_state.ensure_write_safe("heal format fence failed")?;
+        let replica_state = pool_meta
+            .load_no_lock_from_replicas_observing(self.pools.clone(), &mut write_state)
+            .await?;
+        write_state.observe_replicas(replica_state);
+        write_state.ensure_write_safe("heal format fence failed")?;
+        drop(write_state);
         if pool_meta.pools.len() != self.pools.len()
             || pool_meta.pools.iter().enumerate().any(|(pool_idx, pool)| {
                 pool.id != pool_idx || pool.cmd_line.is_empty() || pool.cmd_line != self.pools[pool_idx].endpoints.cmd_line
@@ -293,6 +299,10 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.read().await;
+        let save_guard = self.pool_meta_save_gate.lock().await;
+        save_guard.ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")?;
         let mut fenced_pools = BTreeSet::new();
         {
             let pool_meta = self.pool_meta.read().await;
@@ -320,9 +330,10 @@ impl ECStore {
         }
 
         let dispatch_fenced_pools = fenced_pools.iter().copied().collect::<Vec<_>>();
+        drop(save_guard);
         let mut res = self
             .peer_sys
-            .heal_bucket_with_fence(bucket, opts, &dispatch_fenced_pools)
+            .heal_bucket_with_fence_from_movement_guarded_coordinator(bucket, opts, &dispatch_fenced_pools)
             .await?;
         {
             let pool_meta = self.pool_meta.read().await;
@@ -479,16 +490,112 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys;
-    use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
+    use crate::cluster::rpc::PeerS3Client;
+    use crate::core::pools::{PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus};
+    use crate::disk::error::Result as DiskResult;
     use crate::disk::{DeleteOptions, DiskOption, format::FormatV3, new_disk};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalanceInfo, RebalanceStats};
-    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::bucket::{
+        BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+    };
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations};
     use crate::store::init_format::{load_format_erasure, save_format_file};
     use crate::store::init_local_disks_with_instance_ctx;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct BlockingHealPeer {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerS3Client for BlockingHealPeer {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> DiskResult<HealResultItem> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(HealResultItem::default())
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> DiskResult<BucketInfo> {
+            Ok(BucketInfo::default())
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            Some(vec![0, 1])
+        }
+    }
+
+    #[derive(Debug)]
+    struct WriterQueuedLocalHealPeer {
+        movement_gate: Arc<tokio::sync::RwLock<()>>,
+        writer_queued: Arc<tokio::sync::Notify>,
+        writer_acquired: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerS3Client for WriterQueuedLocalHealPeer {
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> DiskResult<HealResultItem> {
+            let _movement_guard = self
+                .movement_gate
+                .try_read()
+                .map_err(|_| crate::error::StorageError::SlowDown)?;
+            Ok(HealResultItem::default())
+        }
+
+        async fn heal_bucket_with_fence_from_movement_guarded_coordinator(
+            &self,
+            _bucket: &str,
+            _opts: &HealOpts,
+            _fenced_pools: &[usize],
+        ) -> DiskResult<HealResultItem> {
+            Ok(HealResultItem::default())
+        }
+
+        async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn list_bucket(&self, _opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> DiskResult<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> DiskResult<BucketInfo> {
+            let movement_gate = self.movement_gate.clone();
+            let writer_acquired = self.writer_acquired.clone();
+            tokio::spawn(async move {
+                let _movement_guard = movement_gate.write().await;
+                writer_acquired.notify_one();
+            });
+            while self.movement_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            self.writer_queued.notify_one();
+            Ok(BucketInfo::default())
+        }
+
+        fn get_pools(&self) -> Option<Vec<usize>> {
+            Some(vec![0, 1])
+        }
+    }
 
     async fn minimal_heal_pool(pool_idx: usize) -> Arc<Sets> {
         let format = FormatV3::new(1, 1);
@@ -529,7 +636,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -956,6 +1063,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_heal_blocks_before_dispatch_after_unreadable_pool_meta_replica() {
+        let store = minimal_heal_store().await;
+        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+
+        let err = store
+            .handle_heal_bucket("bucket", &HealOpts::default())
+            .await
+            .expect_err("bucket heal must stay blocked until restart after an unreadable replica");
+
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_releases_save_gate_before_peer_dispatch_and_holds_movement_snapshot() {
+        let mut store = minimal_heal_store().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let peer: Box<dyn PeerS3Client> = Box::new(BlockingHealPeer {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        store.peer_sys.clients = vec![Arc::new(peer)];
+        let store = Arc::new(store);
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let mut heal = tokio::spawn({
+            let store = store.clone();
+            async move { store.handle_heal_bucket("bucket", &HealOpts::default()).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("peer dispatch should start");
+        assert!(
+            store.pool_meta_save_gate.try_lock().is_ok(),
+            "coordinator must release its local save gate before waiting for peers"
+        );
+        assert!(
+            movement_gate.try_write().is_err(),
+            "bucket heal must hold the movement snapshot through peer dispatch"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut heal)
+            .await
+            .expect("bucket heal should finish after peer release")
+            .expect("bucket heal task should not panic")
+            .expect("bucket heal should succeed");
+    }
+
+    #[tokio::test]
+    async fn bucket_heal_local_fanout_does_not_reenter_movement_read_behind_queued_writer() {
+        let mut store = minimal_heal_store().await;
+        let movement_gate = store.ctx.data_movement_operation_gate();
+        let writer_queued = Arc::new(tokio::sync::Notify::new());
+        let writer_acquired = Arc::new(tokio::sync::Notify::new());
+        let peer: Box<dyn PeerS3Client> = Box::new(WriterQueuedLocalHealPeer {
+            movement_gate: movement_gate.clone(),
+            writer_queued: writer_queued.clone(),
+            writer_acquired: writer_acquired.clone(),
+        });
+        store.peer_sys.clients = vec![Arc::new(peer)];
+        let store = Arc::new(store);
+        let mut heal = tokio::spawn({
+            let store = store.clone();
+            async move { store.handle_heal_bucket("bucket", &HealOpts::default()).await }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer_queued.notified())
+            .await
+            .expect("movement writer should queue during local peer lookup");
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut heal)
+            .await
+            .expect("local fan-out must not reenter movement read behind the queued writer")
+            .expect("bucket heal task should not panic")
+            .expect("bucket heal should succeed");
+        tokio::time::timeout(std::time::Duration::from_secs(1), writer_acquired.notified())
+            .await
+            .expect("queued movement writer should proceed after bucket heal releases its read guard");
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn unscoped_heal_object_suspended_owner_semantics() {
         let (_temp_dir, store, shutdown) = multi_pool_heal_store().await;
@@ -1282,7 +1476,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         };

@@ -33,7 +33,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::{DecommissionCanceler, PoolMeta};
+use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaWriteState};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -185,12 +185,12 @@ pub struct ECStore {
     /// or `decommission_cancelers`. The guarded sections may perform bounded
     /// async metadata work so check/init/start cannot race across operations.
     pub(crate) start_gate: Mutex<()>,
-    /// Serializes full-document pool metadata saves.
+    /// Serializes full-document pool metadata saves and retains a fail-closed
+    /// write block after startup observes an unreadable replica.
     ///
-    /// Lock order: acquire `pool_meta_save_gate` without holding `pool_meta`.
-    /// The saver then clones the latest `pool_meta` under a short read lock and
-    /// releases it before awaiting disk writes.
-    pub(crate) pool_meta_save_gate: Mutex<()>,
+    /// Lock order: acquire `pool_meta_save_gate`, then the distributed
+    /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
+    pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -1114,7 +1114,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
