@@ -289,6 +289,7 @@ impl PendingInventory {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn is_valid(&self) -> bool {
         self.protocol_version == PROTOCOL_VERSION
             && self.sequence <= MAX_SEQUENCE
@@ -305,8 +306,8 @@ impl PendingInventory {
 pub(crate) enum InventoryDelivery {
     Accepted { content_hash: String, received_at: String },
     Retry { retry_after: Option<Duration> },
-    AuthenticationStopped { status: u16, reason: Option<String> },
-    Rejected { status: u16, reason: Option<String> },
+    AuthenticationStopped { status: u16 },
+    Rejected { status: u16 },
 }
 
 pub(crate) struct InventorySender {
@@ -350,10 +351,8 @@ impl InventorySender {
                 })
             }
             TelemetryDelivery::Retry { retry_after } => Ok(InventoryDelivery::Retry { retry_after }),
-            TelemetryDelivery::AuthenticationStopped { status, reason } => {
-                Ok(InventoryDelivery::AuthenticationStopped { status, reason })
-            }
-            TelemetryDelivery::Rejected { status, reason } => Ok(InventoryDelivery::Rejected { status, reason }),
+            TelemetryDelivery::AuthenticationStopped { status, .. } => Ok(InventoryDelivery::AuthenticationStopped { status }),
+            TelemetryDelivery::Rejected { status, .. } => Ok(InventoryDelivery::Rejected { status }),
         }
     }
 }
@@ -483,7 +482,7 @@ impl InventoryStateStore {
         self.read_latest_inner(now, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn read_latest_after_open(
         &self,
         now: chrono::DateTime<chrono::Utc>,

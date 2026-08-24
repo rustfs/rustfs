@@ -146,11 +146,13 @@ where
                     let _ = status_tx.send(HeartbeatStatus::BackingOff { delay });
                     delay
                 }
-                Delivery::AuthenticationStopped { status, .. } => {
+                Delivery::AuthenticationStopped { status, reason } => {
+                    drop(reason);
                     let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped { status, reason: None });
                     return;
                 }
-                Delivery::Rejected { status, .. } => {
+                Delivery::Rejected { status, reason } => {
+                    drop(reason);
                     let _ = status_tx.send(HeartbeatStatus::Failed {
                         reason: format!("connect_heartbeat_rejected_http_{status}"),
                     });
@@ -298,11 +300,11 @@ where
                     let _ = status_tx.send(InventoryStatus::BackingOff { delay });
                     delay
                 }
-                InventoryDelivery::AuthenticationStopped { status, .. } => {
+                InventoryDelivery::AuthenticationStopped { status } => {
                     let _ = status_tx.send(InventoryStatus::AuthenticationStopped { status, reason: None });
                     return;
                 }
-                InventoryDelivery::Rejected { status, .. } => {
+                InventoryDelivery::Rejected { status } => {
                     let _ = status_tx.send(InventoryStatus::Failed {
                         reason: format!("connect_inventory_rejected_http_{status}"),
                     });
@@ -339,14 +341,14 @@ fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
         HeartbeatError::IdentityMissing => "connect_heartbeat_identity_missing",
         HeartbeatError::IdentityCertificate => "connect_heartbeat_identity_certificate",
         HeartbeatError::CredentialName => "connect_heartbeat_credential_name",
-        HeartbeatError::CredentialExpired => "connect_heartbeat_credential_expired: not currently valid",
+        HeartbeatError::CredentialExpired => "connect_heartbeat_credential_expired",
         HeartbeatError::NodeSummary => "connect_heartbeat_node_summary",
         HeartbeatError::SequenceExhausted => "connect_heartbeat_sequence_exhausted",
         HeartbeatError::AlreadyRunning => "connect_heartbeat_already_running",
         HeartbeatError::StateConflict => "connect_heartbeat_state_conflict",
         HeartbeatError::StateIo { .. } => "connect_heartbeat_state_io",
         HeartbeatError::StateInvalid { .. } => "connect_heartbeat_state_invalid",
-        HeartbeatError::StateCorrupt { .. } => "connect_heartbeat_state_corrupt: violates the protocol invariants",
+        HeartbeatError::StateCorrupt { .. } => "connect_heartbeat_state_corrupt",
         #[cfg(unix)]
         HeartbeatError::StatePermissions { .. } => "connect_heartbeat_state_permissions",
         HeartbeatError::ResponseTooLarge => "connect_heartbeat_response_too_large",
@@ -359,8 +361,8 @@ fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
         HeartbeatError::CredentialValidation(error) => match error {
             CredentialValidationError::Certificate => "connect_heartbeat_credential_certificate",
             CredentialValidationError::Chain => "connect_heartbeat_credential_chain",
-            CredentialValidationError::Identity => "connect_heartbeat_credential_identity: wrong device identity",
-            CredentialValidationError::Key => "connect_heartbeat_credential_key: different device key",
+            CredentialValidationError::Identity => "connect_heartbeat_credential_identity",
+            CredentialValidationError::Key => "connect_heartbeat_credential_key",
             CredentialValidationError::Validity => "connect_heartbeat_credential_validity",
             CredentialValidationError::CertificateRequest => "connect_heartbeat_credential_request",
             CredentialValidationError::RotationTranscript => "connect_heartbeat_credential_rotation_transcript",
@@ -423,10 +425,26 @@ mod tests {
         };
         assert_eq!(heartbeat_failure_reason(&error), "connect_heartbeat_state_io");
         assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::StateCorrupt {
+                path: std::path::PathBuf::from("/private/connect/state.json"),
+            }),
+            "connect_heartbeat_state_corrupt"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialExpired),
+            "connect_heartbeat_credential_expired"
+        );
+        assert_eq!(
             heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
                 super::super::registration::CredentialValidationError::Identity
             )),
-            "connect_heartbeat_credential_identity: wrong device identity"
+            "connect_heartbeat_credential_identity"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
+                super::super::registration::CredentialValidationError::Key
+            )),
+            "connect_heartbeat_credential_key"
         );
     }
 

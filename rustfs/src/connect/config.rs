@@ -75,6 +75,7 @@ impl HeartbeatConfig {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn state_only(state_root: PathBuf) -> Self {
         Self {
             endpoint: String::new(),
