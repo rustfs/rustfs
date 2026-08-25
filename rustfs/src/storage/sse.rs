@@ -792,6 +792,7 @@ pub struct DecryptionMaterial {
     pub sse_type: SSEType,
     pub server_side_encryption: ServerSideEncryption,
     pub kms_key_id: Option<SSEKMSKeyId>,
+    #[allow(unused)]
     pub algorithm: SSECustomerAlgorithm,
     pub customer_key_md5: Option<SSECustomerKeyMD5>, // if use SSE-C, check key md5
 
@@ -2106,6 +2107,129 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 
     // No encryption detected
     Ok(None)
+}
+
+/// Response headers derived for a decrypted read without unwrapping the data key.
+#[derive(Debug)]
+pub struct SseReadResponseHeaders {
+    pub server_side_encryption: ServerSideEncryption,
+    pub sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    pub sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub ssekms_key_id: Option<SSEKMSKeyId>,
+}
+
+/// Read-side response classification for an object whose payload the object
+/// layer's encryption resolver already decrypted.
+///
+/// [`sse_decryption`] both unwraps the data key and derives the response
+/// headers. The GET path only needs the latter — its stream comes out of the
+/// object layer decrypted (see [`SseObjectEncryptionResolver`]) — so calling
+/// [`sse_decryption`] there performed a second KMS `Decrypt` per request whose
+/// key bytes were discarded. This function reproduces that call's header,
+/// validation, authorization and audit behavior from stored metadata alone.
+///
+/// Contract, mirrored from [`sse_decryption`] item by item:
+/// - SSE-C: missing request key/MD5 and stored/request MD5 mismatch fail with
+///   the same errors and precedence, and the provided key is fully validated.
+/// - Managed SSE: per-key `kms:Decrypt` authorization runs ahead of every other
+///   failure mode, and the request's KMS audit summary records the same
+///   scheme/key/version/outcome fields the unwrap-based path recorded. The
+///   success outcome is honest because a failed unwrap aborts the read in the
+///   object layer before response classification is ever reached.
+/// - Objects without SSE metadata — and managed metadata whose scheme cannot
+///   be established in this build — classify as `None`, exactly where
+///   [`sse_decryption`] returned `None`.
+pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Result<Option<SseReadResponseHeaders>, ApiError> {
+    if request
+        .metadata
+        .contains_key("x-amz-server-side-encryption-customer-algorithm")
+    {
+        let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
+            (Some(k), Some(md5)) => (k, md5),
+            _ => {
+                return Err(ssec_invalid_request(
+                    "The object was stored using a form of Server Side Encryption. \
+                     The correct parameters must be provided to retrieve the object.",
+                ));
+            }
+        };
+
+        let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
+        verify_ssec_key_match(key_md5, stored_md5)?;
+
+        let algorithm = request
+            .metadata
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|s| s.as_str())
+            .unwrap_or("AES256");
+        validate_ssec_params(SsecParams {
+            algorithm: algorithm.to_string(),
+            key: key.to_string(),
+            key_md5: key_md5.to_string(),
+        })?;
+
+        return Ok(Some(SseReadResponseHeaders {
+            server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+            sse_customer_algorithm: Some(SSECustomerAlgorithm::from(algorithm)),
+            sse_customer_key_md5: Some(key_md5.clone()),
+            ssekms_key_id: None,
+        }));
+    }
+
+    if !contains_managed_encryption_metadata(request.metadata) {
+        return Ok(None);
+    }
+
+    let sse_type = match request.metadata.get("x-amz-server-side-encryption").map(String::as_str) {
+        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(_) => SSEType::SseS3,
+        #[cfg(feature = "rio-v2")]
+        None => match infer_minio_managed_sse_type(request.metadata) {
+            Some(sse_type) => sse_type,
+            None => return Ok(None),
+        },
+        #[cfg(not(feature = "rio-v2"))]
+        None => return Ok(None),
+    };
+
+    // Same key-id resolution chain as the unwrap path, so authorization and the
+    // response header name the same key.
+    let normalized_metadata = normalize_managed_metadata(request.metadata, Some(recode_minio_kms_context));
+    let kms_key_id = normalized_metadata
+        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+        .or_else(|| request.metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    // Ahead of every other failure mode, so a denied caller learns nothing
+    // about the key beyond "not yours".
+    if let Err(error) = authorize_sse_kms_key(request.principal, sse_type, KmsAction::DecryptAction, &kms_key_id).await {
+        if let Some((sse_type, key_id)) = stored_managed_encryption_key(request.metadata) {
+            record_managed_kms_outcome(
+                request.principal,
+                sse_type,
+                Some(&key_id),
+                || stored_envelope_master_key_version(request.metadata),
+                Err(&error),
+            );
+        }
+        return Err(error);
+    }
+
+    record_managed_kms_outcome(
+        request.principal,
+        sse_type,
+        Some(&kms_key_id),
+        || stored_envelope_master_key_version(request.metadata),
+        Ok(()),
+    );
+
+    Ok(Some(SseReadResponseHeaders {
+        server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(sse_type).to_string()),
+        sse_customer_algorithm: None,
+        sse_customer_key_md5: None,
+        ssekms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
+    }))
 }
 
 // ============================================================================
@@ -3663,12 +3787,12 @@ mod tests {
         ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
         SSEType, SseDekProvider, SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
         apply_managed_decryption_material, apply_managed_encryption_material, authorize_sse_kms_object_read,
-        encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
-        extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse, kms_operation_error,
-        map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64, normalize_managed_metadata,
-        recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption,
-        sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
-        validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
+        classify_sse_read_response, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
+        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64,
+        normalize_managed_metadata, recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id,
+        sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
+        validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -6709,6 +6833,198 @@ mod tests {
         assert_eq!(audit_tag(&tags, "kmsKeyId").as_deref(), Some("finance-key"));
         assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("failure"));
         assert_eq!(audit_tag(&tags, "kmsErrorClass").as_deref(), Some("access_denied"));
+    }
+
+    // ========================================================================
+    // Read-side response classification (single-decrypt GET path)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn classification_reproduces_managed_read_headers_and_audit_without_a_kms_unwrap() {
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+        let _guard = lock_sse_test_state().await;
+
+        reset_sse_dek_provider();
+        let manager = configure_test_global_local_kms().await;
+        manager
+            .get_encryption_service()
+            .await
+            .expect("encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("classify-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("kms test key should be created");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
+
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("classify-key".to_string()),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 128,
+            principal: None,
+        })
+        .await
+        .expect("sse-kms encryption should succeed")
+        .expect("managed sse-kms material");
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+
+        // Header parity against the unwrap-based path, on the same metadata.
+        let unwrapped = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect("sse-kms decryption should succeed")
+        .expect("managed sse-kms material");
+
+        // Classification must not need a data-key unwrap at all: drop the
+        // provider before classifying, so any KMS round trip would fail loudly.
+        reset_sse_dek_provider();
+
+        let (read_principal, read_audit) = audited_principal(false, true);
+        let headers = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&read_principal),
+        })
+        .await
+        .expect("classification should succeed without a dek provider")
+        .expect("managed metadata must classify as encrypted");
+
+        assert_eq!(headers.server_side_encryption, unwrapped.server_side_encryption);
+        assert_eq!(headers.ssekms_key_id, unwrapped.kms_key_id);
+        assert_eq!(headers.sse_customer_algorithm, None);
+        assert_eq!(headers.sse_customer_key_md5, None);
+
+        // Audit parity: the same summary fields the unwrap-based read recorded.
+        let read_tags = read_audit.audit_tags();
+        assert_eq!(audit_tag(&read_tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&read_tags, "kmsKeyId").as_deref(), Some("classify-key"));
+        assert_eq!(audit_tag(&read_tags, "kmsOutcome").as_deref(), Some("success"));
+        assert_eq!(audit_tag(&read_tags, "kmsErrorClass"), None);
+    }
+
+    #[tokio::test]
+    async fn classification_denies_an_unauthorized_principal_with_the_same_audit_summary() {
+        let (principal, audit) = audited_principal(true, false);
+
+        let error = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &sse_kms_object_metadata(),
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: Some(&principal),
+        })
+        .await
+        .expect_err("an unauthorized principal must not classify against the key");
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+
+        let tags = audit.audit_tags();
+        assert_eq!(audit_tag(&tags, "sseType").as_deref(), Some("SSE-KMS"));
+        assert_eq!(audit_tag(&tags, "kmsKeyId").as_deref(), Some("finance-key"));
+        assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("failure"));
+        assert_eq!(audit_tag(&tags, "kmsErrorClass").as_deref(), Some("access_denied"));
+    }
+
+    #[tokio::test]
+    async fn classification_matches_ssec_validation_and_headers() {
+        let key = [0x42u8; 32];
+        let key_b64 = BASE64_STANDARD.encode(key);
+        let key_md5 = md5_base64(key);
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+            ("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5.clone()),
+        ]);
+
+        let headers = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: Some(&SSECustomerKey::from(key_b64.clone())),
+            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(key_md5.clone())),
+            principal: None,
+        })
+        .await
+        .expect("a matching customer key should classify")
+        .expect("SSE-C metadata must classify as encrypted");
+        assert_eq!(headers.server_side_encryption.as_str(), ServerSideEncryption::AES256);
+        assert_eq!(headers.sse_customer_algorithm.as_deref(), Some("AES256"));
+        assert_eq!(headers.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+        assert_eq!(headers.ssekms_key_id, None);
+
+        // Same error and precedence as `sse_decryption` when the key is absent…
+        let missing = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect_err("an SSE-C object must not classify without the customer key");
+        assert_eq!(missing.code, S3ErrorCode::InvalidRequest);
+
+        // …and when the provided key does not match the stored digest.
+        let other_key = [0x43u8; 32];
+        let mismatch = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: Some(&SSECustomerKey::from(BASE64_STANDARD.encode(other_key))),
+            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(md5_base64(other_key))),
+            principal: None,
+        })
+        .await
+        .expect_err("a mismatched customer key must not classify");
+        let parity = sse_decryption(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &metadata,
+            sse_customer_key: Some(&SSECustomerKey::from(BASE64_STANDARD.encode(other_key))),
+            sse_customer_key_md5: Some(&SSECustomerKeyMD5::from(md5_base64(other_key))),
+            principal: None,
+        })
+        .await
+        .expect_err("the unwrap-based path rejects the same mismatch");
+        assert_eq!(mismatch.code, parity.code);
+    }
+
+    #[tokio::test]
+    async fn classification_reports_plaintext_objects_as_unencrypted() {
+        let result = classify_sse_read_response(DecryptionRequest {
+            bucket: "finance",
+            key: "ledger.csv",
+            metadata: &HashMap::new(),
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect("plaintext metadata should classify cleanly");
+        assert!(result.is_none(), "objects without SSE metadata carry no SSE response headers");
     }
 
     #[test]

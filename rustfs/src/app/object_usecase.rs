@@ -96,10 +96,10 @@ use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
 };
 use super::storage_api::object_usecase::sse::{
-    DecryptionRequest, EncryptionRequest, SSEType, SseKmsPrincipal, apply_bucket_default_lock_retention,
-    authorize_sse_kms_object_read, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
+    DecryptionRequest, EncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention, authorize_sse_kms_object_read,
+    bucket_default_write_sse, build_ssec_read_headers, classify_sse_read_response, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-    get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_decryption, sse_encryption,
+    get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_encryption,
     validate_bucket_object_lock_enabled_state,
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
@@ -5310,21 +5310,19 @@ impl DefaultObjectUsecase {
             encryption_applied,
             final_stream,
             buffered_body,
-        ) = match sse_decryption(decryption_request).await? {
-            Some(material) => {
-                let server_side_encryption = Some(material.server_side_encryption.clone());
-                let sse_customer_algorithm = matches!(material.sse_type, SSEType::SseC).then_some(material.algorithm.clone());
-                let sse_customer_key_md5 = material.customer_key_md5.clone();
-                (
-                    server_side_encryption,
-                    sse_customer_algorithm,
-                    sse_customer_key_md5,
-                    material.kms_key_id,
-                    true,
-                    wrap_reader(stream),
-                    None,
-                )
-            }
+        ) = match classify_sse_read_response(decryption_request).await? {
+            // The stream is already decrypted by the object layer's encryption
+            // resolver; only the response headers, authorization and audit
+            // summary are derived here, without a second KMS unwrap.
+            Some(headers) => (
+                Some(headers.server_side_encryption),
+                headers.sse_customer_algorithm,
+                headers.sse_customer_key_md5,
+                headers.ssekms_key_id,
+                true,
+                wrap_reader(stream),
+                None,
+            ),
             None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
         };
 

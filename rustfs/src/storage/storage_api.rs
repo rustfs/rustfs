@@ -110,8 +110,9 @@ pub(crate) use super::ecfs_extend::{
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, authorize_sse_kms_object_read,
-    extract_server_side_encryption_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption,
-    strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    classify_sse_read_response, extract_server_side_encryption_from_headers, sse_decryption, sse_encryption,
+    sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
+    validate_ssec_for_read,
 };
 
 pub(crate) mod access_consumer {
@@ -355,14 +356,14 @@ pub(crate) mod s3_api_consumer {
 
 pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
-        EncryptionKeyKind, SSEType, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
+        EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode,
         map_get_object_reader_error, mark_encrypted_multipart_metadata,
     };
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
-        authorize_sse_kms_object_read, extract_server_side_encryption_from_headers, get_buffer_size_opt_in,
-        load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
+        authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
+        get_buffer_size_opt_in, load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
         validate_bucket_object_lock_enabled_state,
     };
 }

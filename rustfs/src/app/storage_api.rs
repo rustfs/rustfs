@@ -1045,12 +1045,12 @@ pub(crate) mod request_context {
 pub(crate) mod sse {
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
-        authorize_sse_kms_object_read, extract_server_side_encryption_from_headers, get_buffer_size_opt_in,
-        load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
+        authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
+        get_buffer_size_opt_in, load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
         validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::sse_consumer::{
-        EncryptionKeyKind, SSEType, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
+        EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, map_get_object_reader_error,
         mark_encrypted_multipart_metadata,
     };
