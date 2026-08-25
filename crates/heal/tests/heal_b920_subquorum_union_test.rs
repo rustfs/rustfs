@@ -354,9 +354,9 @@ mod serial_tests {
             with_dangling_grace_disabled(heal_storage.heal_object(bucket, object, Some(&v1), &deep_heal_opts()))
                 .await
                 .expect("heal_object call must not itself error");
-        // A dangling delete reports the version as gone (FileVersionNotFound),
-        // proving the destructive path fired for a genuinely torn write.
-        assert!(error.is_some(), "a torn (< data_blocks) version must NOT be silently treated as healed");
+        // Successful cleanup is a successful heal outcome. The on-disk checks
+        // below prove that the torn version was deleted rather than healed.
+        assert!(error.is_none(), "successful torn-version cleanup must not report a heal error");
         // Destructive-path PROOF: the stale minority copy on disk0 was purged by
         // the dangling delete (the guard correctly did NOT rescue a torn write).
         assert_eq!(
