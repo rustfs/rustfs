@@ -428,6 +428,16 @@ pub trait HealStorageAPI: Send + Sync {
         include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
 
+    /// Return the live erasure sets selected by this heal request.
+    ///
+    /// Recursive admin heals use these scopes with the cross-disk union walk so
+    /// objects surviving on only one returning disk are still discovered. The
+    /// `None` default preserves the read-quorum listing for alternate backends;
+    /// `Some(Vec::new())` means the selected topology currently has no live set.
+    async fn heal_erasure_set_scopes(&self, _opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        Ok(None)
+    }
+
     /// List versions for healing via a per-erasure-set DISK-WALK union enumerator
     /// (backlog#920). Unlike `list_objects_for_heal_page` (which reflects only the
     /// READ-QUORUM metadata view via `list_object_versions`), this surfaces every
@@ -1292,6 +1302,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         );
 
         Ok((page_objects, next_token, list_info.is_truncated))
+    }
+
+    async fn heal_erasure_set_scopes(&self, opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        self.ecstore
+            .heal_erasure_set_scopes(opts)
+            .await
+            .map(Some)
+            .map_err(Error::Storage)
     }
 
     async fn list_versions_for_heal_page_disk_walk(
