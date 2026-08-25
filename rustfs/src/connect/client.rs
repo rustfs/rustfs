@@ -249,10 +249,20 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<Option<DeviceCredential>, ClientError> {
-        match self.rotate_if_due_once(identity_store, credential_store, now_unix).await? {
-            RotationAttempt::Completed(credential) => Ok(credential),
-            RotationAttempt::Unavailable { status, .. } => Err(ClientError::Unavailable { status }),
+        let mut last_status = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.rotate_if_due_once(identity_store, credential_store, now_unix).await? {
+                RotationAttempt::Completed(credential) => return Ok(credential),
+                RotationAttempt::Unavailable {
+                    status: Some(status), ..
+                } => last_status = Some(status),
+                RotationAttempt::Unavailable { status: None, .. } => {}
+            }
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+            }
         }
+        Err(ClientError::Unavailable { status: last_status })
     }
 
     pub(crate) async fn rotate_if_due_once(
@@ -472,7 +482,7 @@ impl ConnectClient {
     async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<SingleRequest, ClientError> {
         let response = match request.send().await {
             Ok(response) => response,
-            Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+            Err(error) if error.is_timeout() || error.is_connect() => {
                 return Ok(SingleRequest::Unavailable {
                     status: None,
                     retry_after: None,

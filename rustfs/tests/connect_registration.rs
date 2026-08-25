@@ -713,6 +713,10 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
         vec![
             Reply::DelayedClose(Duration::from_millis(200)),
             Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
         ],
     )
     .await;
@@ -726,7 +730,7 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     assert!(matches!(second, Err(ClientError::Unavailable { .. })));
     let (request_id, certificate_request) = {
         let seen = retries.seen.lock().expect("seen lock");
-        assert_eq!(seen.len(), 2, "each rotation cycle makes one request");
+        assert_eq!(seen.len(), 6, "each public rotation call makes three attempts");
         for request in &seen[1..] {
             assert_eq!(request["requestId"], seen[0]["requestId"]);
             assert_eq!(request["certificateRequest"], seen[0]["certificateRequest"]);
@@ -1126,6 +1130,13 @@ async fn rotation_commit_recovers_after_each_durable_step() {
             .await,
         Err(ClientError::Unavailable { .. })
     ));
+    let failed_seen = failed.seen.lock().expect("seen lock");
+    assert_eq!(failed_seen.len(), 3, "public rotation keeps its bounded retry contract");
+    for request in &failed_seen[1..] {
+        assert_eq!(request["requestId"], failed_seen[0]["requestId"]);
+        assert_eq!(request["certificateRequest"], failed_seen[0]["certificateRequest"]);
+    }
+    drop(failed_seen);
 
     let pending_path = temp.path().join("credential/rotation.pending.json");
     let pending = fs::read(&pending_path).expect("read pending state");
