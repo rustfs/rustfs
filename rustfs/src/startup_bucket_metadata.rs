@@ -23,7 +23,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -> Result<Vec<String>> {
+pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, ctx: &CancellationToken) -> Result<Vec<String>> {
     let buckets_list = store
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -37,7 +37,7 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -
     try_migrate_bucket_metadata(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     try_migrate_iam_config(store).await;
-    reconcile_bucket_resync_target_intents(&buckets).await?;
+    reconcile_bucket_resync_target_intents(&buckets, ctx).await?;
 
     Ok(buckets)
 }
@@ -57,7 +57,7 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     try_migrate_iam_config(store.clone()).await;
     init_bucket_metadata_sys(store, buckets.clone()).await;
-    reconcile_bucket_resync_target_intents(&buckets).await?;
+    reconcile_bucket_resync_target_intents(&buckets, &ctx).await?;
 
     if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx, buckets.clone()).await?;

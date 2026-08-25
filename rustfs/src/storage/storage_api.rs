@@ -18,11 +18,19 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
 
+use rand::RngExt as _;
 use rustfs_storage_api as storage_contracts;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 const BUCKET_TARGETS_METADATA_LOCK_SHARDS: usize = 256;
+const BUCKET_RESYNC_LOCK_RETRY_BASE_MS: u64 = 100;
+const BUCKET_RESYNC_LOCK_RETRY_MAX_MS: u64 = 2_000;
+const EVENT_REPLICATION_RESYNC_INTENT_ORPHANED: &str = "replication_resync_intent_orphaned";
+const EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RECOVERED: &str = "replication_resync_startup_lock_recovered";
+const EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RETRY: &str = "replication_resync_startup_lock_retry";
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 static BUCKET_TARGETS_METADATA_LOCKS: LazyLock<Vec<Arc<Mutex<()>>>> = LazyLock::new(|| {
     (0..BUCKET_TARGETS_METADATA_LOCK_SHARDS)
         .map(|_| Arc::new(Mutex::new(())))
@@ -905,9 +913,9 @@ fn apply_active_resync_intents(
         }
         let Some(target) = targets.targets.iter_mut().find(|target| target.arn == *arn) else {
             tracing::warn!(
-                event = "replication_resync_intent_orphaned",
-                component = "storage",
-                subsystem = "replication",
+                event = EVENT_REPLICATION_RESYNC_INTENT_ORPHANED,
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
                 result = "skipped",
                 bucket,
                 arn = %arn,
@@ -925,14 +933,107 @@ fn apply_active_resync_intents(
     changed
 }
 
-pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -> Result<()> {
+fn bucket_resync_transaction_lock_retry_reason(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::Lock(rustfs_lock::LockError::Timeout { .. }) => Some("timeout"),
+        Error::Lock(rustfs_lock::LockError::Network { .. }) => Some("network"),
+        Error::Lock(rustfs_lock::LockError::InsufficientNodes { .. }) => Some("insufficient_nodes"),
+        Error::Lock(rustfs_lock::LockError::QuorumNotReached { .. }) => Some("quorum_not_reached"),
+        _ => None,
+    }
+}
+
+fn bucket_resync_transaction_lock_retry_ceiling_ms(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(5);
+    BUCKET_RESYNC_LOCK_RETRY_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(BUCKET_RESYNC_LOCK_RETRY_MAX_MS)
+}
+
+fn bucket_resync_transaction_lock_retry_delay(attempt: u32) -> std::time::Duration {
+    let ceiling_ms = bucket_resync_transaction_lock_retry_ceiling_ms(attempt);
+    std::time::Duration::from_millis(rand::rng().random_range(0..=ceiling_ms))
+}
+
+async fn retry_bucket_resync_transaction_lock<T, F, Fut>(bucket: &str, shutdown: &CancellationToken, mut acquire: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(Error::OperationCanceled),
+            result = acquire() => result,
+        };
+        match result {
+            Ok(guard) => {
+                if attempt > 0 {
+                    metrics::counter!("rustfs_replication_resync_startup_lock_recovered_total").increment(1);
+                    tracing::info!(
+                        event = EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RECOVERED,
+                        component = LOG_COMPONENT_STORAGE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                        result = "acquired",
+                        bucket,
+                        attempts = attempt,
+                        "startup resync reconcile acquired the bucket metadata transaction lock after retry"
+                    );
+                }
+                return Ok(guard);
+            }
+            Err(error) => {
+                let Some(reason) = bucket_resync_transaction_lock_retry_reason(&error) else {
+                    return Err(error);
+                };
+                attempt = attempt.saturating_add(1);
+                let retry_delay = bucket_resync_transaction_lock_retry_delay(attempt);
+                metrics::counter!("rustfs_replication_resync_startup_lock_retry_total", "reason" => reason).increment(1);
+                tracing::warn!(
+                    event = EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RETRY,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    state = "retrying",
+                    bucket,
+                    attempt,
+                    reason,
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    error = %error,
+                    "startup resync reconcile is retrying a transient bucket metadata transaction lock failure"
+                );
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Err(Error::OperationCanceled),
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn acquire_bucket_resync_transaction_lock(
+    bucket: &str,
+    shutdown: &CancellationToken,
+) -> Result<ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
+    retry_bucket_resync_transaction_lock(bucket, shutdown, || {
+        ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket)
+    })
+    .await
+}
+
+pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String], shutdown: &CancellationToken) -> Result<()> {
     let Some(pool) = ecstore_bucket::replication::get_global_replication_pool() else {
         return Err(Error::other("replication pool is not initialized"));
     };
 
     for bucket in buckets {
-        let transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_metadata_transaction_lock(bucket).await?;
-        let status = pool.get_bucket_resync_status(bucket).await?;
+        let status = pool.read_durable_bucket_resync_status(bucket).await?;
+        if status.targets_map.is_empty() {
+            continue;
+        }
+        let transaction_guard = acquire_bucket_resync_transaction_lock(bucket, shutdown).await?;
+        let status = pool.read_durable_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
         }
@@ -1917,8 +2018,10 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_active_resync_intents, bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata,
-        new_instance_ctx, scanner_maintenance_config_file,
+        BUCKET_RESYNC_LOCK_RETRY_MAX_MS, apply_active_resync_intents, bucket_resync_transaction_lock_retry_ceiling_ms,
+        bucket_resync_transaction_lock_retry_delay, bucket_resync_transaction_lock_retry_reason,
+        bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata, new_instance_ctx,
+        retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
     };
     use std::time::Duration;
 
@@ -1947,6 +2050,68 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn startup_resync_retries_only_transient_transaction_lock_errors() {
+        let timeout = super::Error::Lock(rustfs_lock::LockError::timeout("bucket", Duration::from_secs(5)));
+        assert_eq!(bucket_resync_transaction_lock_retry_reason(&timeout), Some("timeout"));
+
+        let network = super::Error::Lock(rustfs_lock::LockError::network(
+            "unreachable",
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "unreachable"),
+        ));
+        assert_eq!(bucket_resync_transaction_lock_retry_reason(&network), Some("network"));
+        assert_eq!(
+            bucket_resync_transaction_lock_retry_reason(&super::Error::Lock(rustfs_lock::LockError::QuorumNotReached {
+                required: 3,
+                achieved: 2,
+            },)),
+            Some("quorum_not_reached")
+        );
+        assert_eq!(bucket_resync_transaction_lock_retry_reason(&super::Error::DiskNotFound), None);
+    }
+
+    #[test]
+    fn startup_resync_transaction_lock_backoff_is_capped() {
+        assert_eq!(bucket_resync_transaction_lock_retry_ceiling_ms(1), 100);
+        assert_eq!(bucket_resync_transaction_lock_retry_ceiling_ms(2), 200);
+        assert_eq!(bucket_resync_transaction_lock_retry_ceiling_ms(3), 400);
+        assert_eq!(bucket_resync_transaction_lock_retry_ceiling_ms(8), BUCKET_RESYNC_LOCK_RETRY_MAX_MS);
+        assert_eq!(bucket_resync_transaction_lock_retry_ceiling_ms(u32::MAX), BUCKET_RESYNC_LOCK_RETRY_MAX_MS);
+        assert!(bucket_resync_transaction_lock_retry_delay(8) <= Duration::from_millis(BUCKET_RESYNC_LOCK_RETRY_MAX_MS));
+    }
+
+    #[tokio::test]
+    async fn startup_resync_retries_a_transaction_lock_timeout() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut attempts = 0;
+        let guard = retry_bucket_resync_transaction_lock("bucket", &shutdown, || {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                Err(super::Error::Lock(rustfs_lock::LockError::timeout("bucket", Duration::from_secs(5))))
+            } else {
+                Ok("guard")
+            })
+        })
+        .await
+        .expect("startup reconcile must retry a transaction lock timeout");
+
+        assert_eq!(guard, "guard");
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn startup_resync_lock_wait_honors_shutdown() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        let error =
+            match retry_bucket_resync_transaction_lock("bucket", &shutdown, std::future::pending::<super::Result<()>>).await {
+                Ok(_) => panic!("cancelled startup must not acquire a transaction lock"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, super::Error::OperationCanceled));
     }
 
     #[test]
