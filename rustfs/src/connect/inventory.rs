@@ -232,6 +232,30 @@ impl InventorySnapshot {
         Ok(hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower))
     }
 
+    pub(crate) fn rustfs_version(&self) -> &str {
+        &self.rustfs_version
+    }
+
+    pub(crate) fn node_count(&self) -> u16 {
+        self.node_count
+    }
+
+    pub(crate) fn drive_count(&self) -> u32 {
+        self.drive_count
+    }
+
+    pub(crate) fn capacity_total_bytes(&self) -> u64 {
+        self.capacity_total_bytes
+    }
+
+    pub(crate) fn capacity_used_bytes(&self) -> u64 {
+        self.capacity_used_bytes
+    }
+
+    pub(crate) fn coarse_flags(&self) -> &[InventoryFlag] {
+        &self.coarse_flags
+    }
+
     fn validate(&self) -> Result<(), InventoryError> {
         if !valid_version(&self.rustfs_version) {
             return Err(InventoryError::RustfsVersion);

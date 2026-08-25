@@ -16,11 +16,27 @@
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
-use rustfs::connect::offline::{CollectorError, RedactionSource, collect_offline_diagnostics, redact_json};
-use rustfs_madmin::{Disk, ITEM_OFFLINE, StorageInfo};
+#[cfg(target_os = "linux")]
+use rustfs::connect::offline::{CollectorError, collect_offline_diagnostics};
+use rustfs::connect::offline::{RedactionSource, redact_json};
+#[cfg(target_os = "linux")]
+use rustfs::connect::{
+    CredentialStore, HeartbeatConfig, IdentityStore, InventoryError, InventoryFlag, InventorySchedule, InventorySnapshot,
+    InventoryStatus, spawn_inventory_runtime,
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
+use tokio::sync::watch;
+#[cfg(target_os = "linux")]
 use tokio_util::sync::CancellationToken;
 
 fn fixture_dir() -> PathBuf {
@@ -164,127 +180,175 @@ fn connect_offline_collectors_reject_oversize_raw_input_before_parsing() {
     );
 }
 
+#[cfg(target_os = "linux")]
+async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(status.borrow_and_update().clone(), InventoryStatus::Unchanged { .. }) {
+                return;
+            }
+            status.changed().await.expect("inventory status channel");
+        }
+    })
+    .await
+    .expect("inventory persistence timeout");
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_inventory_failure(status: &mut watch::Receiver<InventoryStatus>) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(status.borrow_and_update().clone(), InventoryStatus::Failed { .. }) {
+                return;
+            }
+            status.changed().await.expect("inventory status channel");
+        }
+    })
+    .await
+    .expect("inventory failure timeout");
+}
+
+#[cfg(target_os = "linux")]
+fn private_directory(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private directory permissions");
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn connect_offline_collectors_emit_only_fixed_redacted_entries_and_honor_cancellation() {
-    let storage = StorageInfo {
-        disks: vec![
-            Disk {
-                endpoint: "https://node-a.private.example:9000/data-a".to_owned(),
-                drive_path: "/secret/customer/path-a".to_owned(),
-                uuid: "private-drive-a".to_owned(),
-                state: "ok".to_owned(),
-                total_space: 1_000,
-                used_space: 400,
-                ..Disk::default()
-            },
-            Disk {
-                endpoint: "https://node-a.private.example:9000/data-b".to_owned(),
-                drive_path: "/secret/customer/path-b".to_owned(),
-                uuid: "private-drive-b".to_owned(),
-                state: "unformatted".to_owned(),
-                total_space: 2_000,
-                used_space: 500,
-                ..Disk::default()
-            },
-            Disk {
-                endpoint: "https://node-b.private.example:9000/data-c".to_owned(),
-                drive_path: "/secret/customer/path-c".to_owned(),
-                uuid: "private-drive-c".to_owned(),
-                state: ITEM_OFFLINE.to_owned(),
-                total_space: 3_000,
-                used_space: 600,
-                healing: true,
-                ..Disk::default()
-            },
-        ],
-        ..StorageInfo::default()
-    };
-    let cancel = CancellationToken::new();
-    let entries = collect_offline_diagnostics(&storage, &cancel)
+async fn connect_offline_collectors_read_only_the_stopped_runtime_inventory() {
+    let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state root");
+    private_directory(&state);
+    let config = HeartbeatConfig::new(
+        "",
+        Vec::new(),
+        IdentityStore::new(state.join("identity")),
+        CredentialStore::new(state.join("credential")),
+        state.join("heartbeat/state.json"),
+    );
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_secs(60),
+            jitter: Duration::ZERO,
+        },
+        &shutdown,
+        || {
+            std::future::ready(InventorySnapshot::new(
+                "1.4.2",
+                None,
+                2,
+                3,
+                6_000,
+                1_500,
+                [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline],
+            ))
+        },
+    )
+    .expect("state-only inventory")
+    .expect("configured inventory");
+    let mut status = runtime.status();
+    wait_for_inventory(&mut status).await;
+
+    assert!(matches!(
+        collect_offline_diagnostics(&state, &CancellationToken::new()).await,
+        Err(CollectorError::Inventory(InventoryError::AlreadyRunning))
+    ));
+    runtime.shutdown().await;
+
+    let diagnostics = collect_offline_diagnostics(&state, &CancellationToken::new())
         .await
         .expect("collect fixed offline entries");
-    assert_eq!(entries.len(), 12);
-    let encoded = serde_json::to_string(&entries).expect("manifest entries serialize");
-    for forbidden in [
-        "node-a.private.example",
-        "node-b.private.example",
-        "/secret/customer/path-a",
-        "/secret/customer/path-b",
-        "/secret/customer/path-c",
-        "private-drive-a",
-        "private-drive-b",
-        "private-drive-c",
-    ] {
-        assert!(!encoded.contains(forbidden), "private storage metadata must not leave the collector");
-    }
-    assert!(entries.iter().all(|entry| entry.field_id.starts_with("offline.")));
-    assert!(entries.iter().all(|entry| entry.canonical_json.len() <= 16 * 1024));
+    assert_eq!(diagnostics.entries.len(), 12);
+    assert!(diagnostics.inventory_captured_at.ends_with('Z'));
+    assert!(diagnostics.inventory_age < Duration::from_secs(10));
+    assert!(diagnostics.entries.iter().all(|entry| entry.field_id.starts_with("offline.")));
+    assert!(
+        diagnostics
+            .entries
+            .iter()
+            .all(|entry| entry.canonical_json.len() <= 16 * 1024)
+    );
     let canonical = |field_id| {
-        entries
+        diagnostics
+            .entries
             .iter()
             .find(|entry| entry.field_id == field_id)
             .unwrap_or_else(|| panic!("missing {field_id}"))
             .canonical_json
             .as_str()
     };
+    assert_eq!(canonical("offline.rustfsVersion"), r#"{"rustfsVersion":"1.4.2"}"#);
     assert_eq!(canonical("offline.nodeCount"), r#"{"nodeCount":2}"#);
     assert_eq!(canonical("offline.driveCount"), r#"{"driveCount":3}"#);
     assert_eq!(canonical("offline.capacityUsedBytes"), r#"{"capacityUsedBytes":1500}"#);
     assert_eq!(canonical("offline.capacityTotalBytes"), r#"{"capacityTotalBytes":6000}"#);
     assert_eq!(
         canonical("offline.coarseHealthFlags"),
-        r#"{"coarseHealthFlags":{"degraded":true,"healing":true,"offlineDrives":1,"scanning":false}}"#
+        r#"{"coarseHealthFlags":["cluster.degraded","drive.offline"]}"#
     );
 
-    let healthy = StorageInfo {
-        disks: ["ok", "unformatted", "online"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, state)| Disk {
-                endpoint: format!("https://healthy.example:9000/data-{index}"),
-                state: state.to_owned(),
-                ..Disk::default()
-            })
-            .collect(),
-        ..StorageInfo::default()
-    };
-    let healthy_entries = collect_offline_diagnostics(&healthy, &CancellationToken::new())
-        .await
-        .expect("collect healthy storage summary");
-    assert_eq!(
-        healthy_entries
-            .iter()
-            .find(|entry| entry.field_id == "offline.coarseHealthFlags")
-            .expect("healthy coarse health entry")
-            .canonical_json,
-        r#"{"coarseHealthFlags":{"degraded":false,"healing":false,"offlineDrives":0,"scanning":false}}"#
-    );
-
-    cancel.cancel();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
     assert!(matches!(
-        collect_offline_diagnostics(&storage, &cancel).await,
+        collect_offline_diagnostics(&state, &cancelled).await,
         Err(CollectorError::Cancelled)
     ));
 
-    let oversized = StorageInfo {
-        disks: vec![Disk::default(); 4_097],
-        ..StorageInfo::default()
-    };
-    let active = CancellationToken::new();
+    fs::write(state.join("inventory/latest.json"), b"{}").expect("corrupt latest inventory");
     assert!(matches!(
-        collect_offline_diagnostics(&oversized, &active).await,
-        Err(CollectorError::StorageTopologyTooLarge)
+        collect_offline_diagnostics(&state, &CancellationToken::new()).await,
+        Err(CollectorError::Inventory(InventoryError::EnvelopeInvalid))
     ));
+}
 
-    let invalid_endpoint = StorageInfo {
-        disks: vec![Disk {
-            endpoint: "not-an-endpoint".to_owned(),
-            ..Disk::default()
-        }],
-        ..StorageInfo::default()
-    };
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_offline_collectors_reject_a_live_runtime_after_its_task_fails() {
+    let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state root");
+    private_directory(&state);
+    let config = HeartbeatConfig::new(
+        "",
+        Vec::new(),
+        IdentityStore::new(state.join("identity")),
+        CredentialStore::new(state.join("credential")),
+        state.join("heartbeat/state.json"),
+    );
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let sample_attempts = attempts.clone();
+    let runtime = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_millis(1),
+            jitter: Duration::ZERO,
+        },
+        &CancellationToken::new(),
+        move || {
+            let attempt = sample_attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if attempt == 0 {
+                InventorySnapshot::new("1.4.2", None, 1, 1, 100, 50, [])
+            } else {
+                Err(InventoryError::Capacity)
+            })
+        },
+    )
+    .expect("state-only inventory")
+    .expect("configured inventory");
+    let mut status = runtime.status();
+    wait_for_inventory_failure(&mut status).await;
+
     assert!(matches!(
-        collect_offline_diagnostics(&invalid_endpoint, &active).await,
-        Err(CollectorError::InvalidStorageEndpoint)
+        collect_offline_diagnostics(&state, &CancellationToken::new()).await,
+        Err(CollectorError::Inventory(InventoryError::AlreadyRunning))
     ));
+    runtime.shutdown().await;
+    collect_offline_diagnostics(&state, &CancellationToken::new())
+        .await
+        .expect("collector after runtime shutdown");
 }
