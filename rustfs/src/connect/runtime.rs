@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -57,7 +58,7 @@ pub struct InventoryRuntime {
     shutdown: CancellationToken,
     status: watch::Receiver<InventoryStatus>,
     task: Option<JoinHandle<()>>,
-    _lock: std::fs::File,
+    _lock: Arc<std::fs::File>,
 }
 
 impl InventoryRuntime {
@@ -191,7 +192,7 @@ where
     let retry_schedule = config.schedule;
     let state_root = config.state_root().ok_or(InventoryError::StatePath)?;
     let store = InventoryStateStore::from_state_root(state_root)?;
-    let lock = store.try_runtime_lock()?;
+    let lock = Arc::new(store.try_runtime_lock()?);
     let sender = if config.transport_enabled() {
         Some(InventorySender::new(config)?)
     } else {
@@ -200,7 +201,9 @@ where
     let shutdown = parent_shutdown.child_token();
     let task_shutdown = shutdown.clone();
     let (status_tx, status_rx) = watch::channel(InventoryStatus::Starting);
+    let task_lock = lock.clone();
     let task = tokio::spawn(async move {
+        let _lock = task_lock;
         let mut backoff = retry_schedule.initial_backoff;
         loop {
             if task_shutdown.is_cancelled() {
@@ -475,7 +478,7 @@ mod tests {
             task_inventory_shutdown.cancelled().await;
             let _ = inventory_stopped.send(());
         });
-        let inventory_lock = tempfile::tempfile().expect("inventory runtime lock");
+        let inventory_lock = Arc::new(tempfile::tempfile().expect("inventory runtime lock"));
         let heartbeat = HeartbeatRuntime {
             shutdown: heartbeat_shutdown,
             status: heartbeat_status,
@@ -498,5 +501,39 @@ mod tests {
             .await
             .expect("runtime shutdown")
             .expect("shutdown task");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_inventory_handle_keeps_the_lock_until_its_task_exits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).expect("state root");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("private state root");
+        let store = InventoryStateStore::from_state_root(&state).expect("inventory store");
+        let lock = Arc::new(store.try_runtime_lock().expect("runtime lock"));
+        let task_lock = lock.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, task_finished) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = released.await;
+            drop(task_lock);
+            let _ = finished.send(());
+        });
+        let (_, status) = watch::channel(InventoryStatus::Starting);
+        let runtime = InventoryRuntime {
+            shutdown: CancellationToken::new(),
+            status,
+            task: Some(task),
+            _lock: lock,
+        };
+
+        drop(runtime);
+        assert!(matches!(store.try_runtime_lock(), Err(InventoryError::AlreadyRunning)));
+        release.send(()).expect("release inventory task");
+        task_finished.await.expect("inventory task finished");
+        store.try_runtime_lock().expect("lock after task exit");
     }
 }
