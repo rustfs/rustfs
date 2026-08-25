@@ -145,6 +145,7 @@ where
                         rotation_backoff = schedule.initial_backoff;
                         rotation_retry_at = None;
                     }
+                    Some(Ok(RotationAttempt::ReenrollmentPending)) => {}
                     Some(Ok(RotationAttempt::Unavailable { retry_after, .. })) => {
                         let delay = retry_after
                             .unwrap_or(rotation_backoff)
@@ -163,7 +164,6 @@ where
                         });
                         return;
                     }
-                    Some(Err(ClientError::PendingRegistration)) => {}
                     Some(Err(error)) => return failed(&status_tx, rotation_failure(error)),
                     None => break,
                 }

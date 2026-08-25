@@ -32,8 +32,8 @@ use rcgen::{
     KeyUsagePurpose, SanType, SerialNumber,
 };
 use rustfs::connect::{
-    ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, HeartbeatConfig, HeartbeatSchedule,
-    HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
+    ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, HeartbeatConfig, HeartbeatError,
+    HeartbeatSchedule, HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
 };
 #[cfg(target_os = "linux")]
 use rustfs::connect::{InventorySchedule, InventorySnapshot, InventoryStatus, spawn_inventory_runtime};
@@ -885,7 +885,7 @@ async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartb
 }
 
 #[tokio::test]
-async fn heartbeat_runtime_preserves_pending_reenrollment() {
+async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
     let temp = tempfile::tempdir().expect("temp dir");
     let pki = TestPki::new();
     let (mut config, _, _) = due_runtime_config(&temp, &pki, "https://localhost/agent/");
@@ -901,6 +901,7 @@ async fn heartbeat_runtime_preserves_pending_reenrollment() {
     )
     .await;
     config.endpoint = server.endpoint.clone();
+    let corrupted_config = config.clone();
     assert!(matches!(
         client(&server, &pki, Duration::from_millis(250))
             .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(FRESH_TOKEN_UID))
@@ -936,6 +937,30 @@ async fn heartbeat_runtime_preserves_pending_reenrollment() {
             .count(),
         3
     );
+    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
+    assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
+    drop(paths);
+
+    let mut corrupted_pending: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+    corrupted_pending["requestId"] = json!("not-a-request-id");
+    let corrupted_pending = serde_json::to_vec(&corrupted_pending).expect("corrupted pending reenrollment JSON");
+    fs::write(&pending_path, &corrupted_pending).expect("corrupt pending reenrollment");
+    set_owner_only(&pending_path);
+    let corrupted_runtime = spawn_heartbeat_runtime(Some(corrupted_config), &shutdown, || {
+        CoarseNodeSummary::new(1, 1, 0).expect("node summary")
+    })
+    .expect("start heartbeat runtime with corrupt pending state")
+    .expect("configured runtime");
+    let mut corrupted_status = corrupted_runtime.status();
+    assert_eq!(
+        wait_for_heartbeat_status(&mut corrupted_status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+        HeartbeatStatus::Failed {
+            reason: HeartbeatError::StateConflict.to_string(),
+        }
+    );
+    corrupted_runtime.shutdown().await;
+    assert_eq!(fs::read(&pending_path).expect("preserved corrupt pending state"), corrupted_pending);
+    let paths = server.paths.lock().expect("paths lock");
     assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
     assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
 }

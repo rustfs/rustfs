@@ -54,6 +54,7 @@ pub struct ConnectClient {
 
 pub(crate) enum RotationAttempt {
     Completed(Option<DeviceCredential>),
+    ReenrollmentPending,
     Unavailable {
         status: Option<StatusCode>,
         retry_after: Option<Duration>,
@@ -118,7 +119,7 @@ impl ConnectClient {
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
         let _lock = credential_store.lock().await?;
-        if let Some((credential, _)) = self.load_valid_credential(identity_store, credential_store)? {
+        if let Some((credential, _, _)) = self.load_valid_credential(identity_store, credential_store)? {
             ensure_credential_time(&credential, unix_now())?;
             return Ok(credential);
         }
@@ -161,7 +162,7 @@ impl ConnectClient {
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
         let _lock = credential_store.lock().await?;
-        let (credential, _) = self
+        let (credential, _, _) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
@@ -253,6 +254,7 @@ impl ConnectClient {
         for attempt in 0..MAX_ATTEMPTS {
             match self.rotate_if_due_once(identity_store, credential_store, now_unix).await? {
                 RotationAttempt::Completed(credential) => return Ok(credential),
+                RotationAttempt::ReenrollmentPending => return Err(ClientError::PendingRegistration),
                 RotationAttempt::Unavailable {
                     status: Some(status), ..
                 } => last_status = Some(status),
@@ -272,11 +274,11 @@ impl ConnectClient {
         now_unix: i64,
     ) -> Result<RotationAttempt, ClientError> {
         let _lock = credential_store.lock().await?;
-        let (credential, identity) = self
+        let (credential, identity, reenrollment_pending) = self
             .load_valid_credential(identity_store, credential_store)?
             .ok_or(ClientError::NotRegistered)?;
-        if credential_store.load_pending_registration()?.is_some() {
-            return Err(ClientError::PendingRegistration);
+        if reenrollment_pending {
+            return Ok(RotationAttempt::ReenrollmentPending);
         }
         ensure_credential_time(&credential, now_unix)?;
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
@@ -342,7 +344,7 @@ impl ConnectClient {
         &self,
         identity_store: &IdentityStore,
         credential_store: &CredentialStore,
-    ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity)>, ClientError> {
+    ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity, bool)>, ClientError> {
         let Some(credential) = credential_store.load()? else {
             return Ok(None);
         };
@@ -357,7 +359,7 @@ impl ConnectClient {
                 }
                 validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
                 credential_store.clear_pending_registration()?;
-                return Ok(Some((credential, current)));
+                return Ok(Some((credential, current, false)));
             };
             let next_fingerprint = pending
                 .next_public_key_sha256
@@ -375,7 +377,7 @@ impl ConnectClient {
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                return Ok(Some((credential, current)));
+                return Ok(Some((credential, current, true)));
             }
             if public_key_fingerprint(&current) == next_fingerprint {
                 if !certificate_request_matches(&pending.certificate_request, &current)? {
@@ -398,11 +400,11 @@ impl ConnectClient {
             })?;
             credential_store.clear_pending_registration()?;
             let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
-            return Ok(Some((credential, current)));
+            return Ok(Some((credential, current, false)));
         }
         let Some(pending) = credential_store.load_pending_rotation()? else {
             validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
-            return Ok(Some((credential, current)));
+            return Ok(Some((credential, current, false)));
         };
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         if pending.device_name != credential.name || !is_request_id(&pending.request_id) {
@@ -416,7 +418,7 @@ impl ConnectClient {
             {
                 return Err(ClientError::PendingRotation);
             }
-            return Ok(Some((credential, current)));
+            return Ok(Some((credential, current, false)));
         }
 
         if public_key_fingerprint(&current) == pending.next_public_key_sha256 {
@@ -436,7 +438,7 @@ impl ConnectClient {
         }
         credential_store.clear_pending_rotation()?;
         let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
-        Ok(Some((credential, current)))
+        Ok(Some((credential, current, false)))
     }
 
     async fn send<F>(&self, success: StatusCode, mut request: F) -> Result<CredentialResponse, ClientError>
