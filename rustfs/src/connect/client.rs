@@ -52,6 +52,22 @@ pub struct ConnectClient {
     timeout: Duration,
 }
 
+pub(crate) enum RotationAttempt {
+    Completed(Option<DeviceCredential>),
+    Unavailable {
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+    },
+}
+
+enum SingleRequest {
+    Response(CredentialResponse),
+    Unavailable {
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+    },
+}
+
 impl ConnectClient {
     pub fn from_optional_config(config: Option<ConnectConfig<'_>>) -> Result<Option<Self>, ClientError> {
         config.map(Self::new).transpose()
@@ -233,6 +249,18 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<Option<DeviceCredential>, ClientError> {
+        match self.rotate_if_due_once(identity_store, credential_store, now_unix).await? {
+            RotationAttempt::Completed(credential) => Ok(credential),
+            RotationAttempt::Unavailable { status, .. } => Err(ClientError::Unavailable { status }),
+        }
+    }
+
+    pub(crate) async fn rotate_if_due_once(
+        &self,
+        identity_store: &IdentityStore,
+        credential_store: &CredentialStore,
+        now_unix: i64,
+    ) -> Result<RotationAttempt, ClientError> {
         let _lock = credential_store.lock().await?;
         let (credential, identity) = self
             .load_valid_credential(identity_store, credential_store)?
@@ -242,7 +270,7 @@ impl ConnectClient {
         }
         ensure_credential_time(&credential, now_unix)?;
         if credential.not_after_unix - now_unix > ROTATION_THRESHOLD_SECONDS {
-            return Ok(None);
+            return Ok(RotationAttempt::Completed(None));
         }
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         let next = identity_store.load_or_create_next()?;
@@ -278,7 +306,12 @@ impl ConnectClient {
         let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity))?;
         let path = format!("clusterDevices/{}:rotateCredential", credential.uid);
         let url = self.url(&path)?;
-        let response = self.send_once(StatusCode::OK, client.post(url).json(&body)).await?;
+        let response = match self.send_once(StatusCode::OK, client.post(url).json(&body)).await? {
+            SingleRequest::Response(response) => response,
+            SingleRequest::Unavailable { status, retry_after } => {
+                return Ok(RotationAttempt::Unavailable { status, retry_after });
+            }
+        };
         let rotated = validate_credential(
             response,
             &next,
@@ -292,7 +325,7 @@ impl ConnectClient {
         credential_store.save(&rotated)?;
         identity_store.commit_next(&next)?;
         credential_store.clear_pending_rotation()?;
-        Ok(Some(rotated))
+        Ok(RotationAttempt::Completed(Some(rotated)))
     }
 
     fn load_valid_credential(
@@ -433,17 +466,14 @@ impl ConnectClient {
                 tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
             }
         }
-        Err(ClientError::Unavailable {
-            status: last_status,
-            retry_after: None,
-        })
+        Err(ClientError::Unavailable { status: last_status })
     }
 
-    async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<CredentialResponse, ClientError> {
+    async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<SingleRequest, ClientError> {
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
-                return Err(ClientError::Unavailable {
+                return Ok(SingleRequest::Unavailable {
                     status: None,
                     retry_after: None,
                 });
@@ -452,14 +482,14 @@ impl ConnectClient {
         };
         let status = response.status();
         if status == success {
-            return decode_response(response).await;
+            return decode_response(response).await.map(SingleRequest::Response);
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             let reason = decode_reason(response).await;
             return Err(ClientError::AccessRevoked { status, reason });
         }
         if matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) || status.is_server_error() {
-            return Err(ClientError::Unavailable {
+            return Ok(SingleRequest::Unavailable {
                 status: Some(status),
                 retry_after: retry_after(response.headers(), Utc::now()),
             });
@@ -589,11 +619,8 @@ pub enum ClientError {
     AccessRevoked { status: StatusCode, reason: Option<String> },
     #[error("Connect rejected the request with HTTP {status}; reason={reason:?}")]
     Rejected { status: StatusCode, reason: Option<String> },
-    #[error("Connect is unavailable; last_status={status:?}; retry_after={retry_after:?}")]
-    Unavailable {
-        status: Option<StatusCode>,
-        retry_after: Option<Duration>,
-    },
+    #[error("Connect remained unavailable after bounded retries; last_status={status:?}")]
+    Unavailable { status: Option<StatusCode> },
     #[error("Connect response exceeded the 1 MiB credential-response limit")]
     ResponseTooLarge,
     #[error("Connect returned an invalid credential response")]

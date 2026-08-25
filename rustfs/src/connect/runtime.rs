@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{ClientError, ConnectClient, ConnectConfig};
+use super::client::{ClientError, ConnectClient, ConnectConfig, RotationAttempt};
 use super::config::HeartbeatConfig;
 use super::heartbeat::{CoarseNodeSummary, Delivery, HeartbeatError, HeartbeatSender, HeartbeatStateStore, HeartbeatStatus};
 use super::inventory::{
@@ -137,15 +137,15 @@ where
             if rotation_retry_at.is_none_or(|retry_at| Instant::now() >= retry_at) {
                 match cancellable(
                     &task_shutdown,
-                    rotation.rotate_if_due(&identity_store, &credential_store, Utc::now().timestamp()),
+                    rotation.rotate_if_due_once(&identity_store, &credential_store, Utc::now().timestamp()),
                 )
                 .await
                 {
-                    Some(Ok(_)) => {
+                    Some(Ok(RotationAttempt::Completed(_))) => {
                         rotation_backoff = schedule.initial_backoff;
                         rotation_retry_at = None;
                     }
-                    Some(Err(ClientError::Unavailable { retry_after, .. })) => {
+                    Some(Ok(RotationAttempt::Unavailable { retry_after, .. })) => {
                         let delay = retry_after
                             .unwrap_or(rotation_backoff)
                             .clamp(schedule.initial_backoff, schedule.max_backoff);
