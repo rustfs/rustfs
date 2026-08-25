@@ -128,14 +128,26 @@ token_for_client() {
   local client_id="$1"
   local client_secret="$2"
   local response_file="${WORK_DIR}/token-${client_id}.json"
-  curl --noproxy '*' -fsS "${ISSUER}/protocol/openid-connect/token" \
+  local http_status
+  if ! http_status="$(curl --noproxy '*' -sS \
+    -o "${response_file}" \
+    -w '%{http_code}' \
+    "${ISSUER}/protocol/openid-connect/token" \
     --data-urlencode grant_type=password \
     --data-urlencode "client_id=${client_id}" \
     --data-urlencode "client_secret=${client_secret}" \
     --data-urlencode username=alice \
     --data-urlencode password=alice-password \
-    --data-urlencode scope=openid \
-    >"${response_file}"
+    --data-urlencode scope=openid)"; then
+    echo "Keycloak token request failed for client ${client_id}" >&2
+    cat "${response_file}" >&2 2>/dev/null || true
+    return 1
+  fi
+  if [[ "${http_status}" != 200 ]]; then
+    echo "Keycloak token request for client ${client_id} returned HTTP ${http_status}" >&2
+    cat "${response_file}" >&2
+    return 1
+  fi
   python3 - "${response_file}" "${ISSUER}" "${client_id}" <<'PY'
 import base64
 import json

@@ -27,9 +27,12 @@
     {
       "id": "00000000-0000-0000-0000-000000000001",
       "username": "alice",
+      "firstName": "Alice",
+      "lastName": "CI",
       "email": "alice@example.test",
       "emailVerified": true,
       "enabled": true,
+      "requiredActions": [],
       "credentials": [
         {
           "type": "password",
