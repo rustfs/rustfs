@@ -302,6 +302,11 @@ pub struct TlsInspectOpts {
 
 /// Server subcommand options
 #[derive(Args, Clone)]
+#[command(after_help = "Allocator reclaim environment:
+  RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true|false  Enable allocator page reclaim after idle samples (default: true)
+  RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS=30    Sampling interval in seconds
+  RUSTFS_ALLOCATOR_RECLAIM_FORCE=true|false    Request forceful collection when supported
+  RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS=3    Consecutive idle samples required before reclaim")]
 pub struct ServerOpts {
     /// DIR points to a directory on a filesystem.
     #[arg(
@@ -611,5 +616,24 @@ mod tests {
 
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         assert!(help.to_string().contains("Unix only"));
+    }
+
+    #[test]
+    fn server_help_lists_allocator_reclaim_environment() {
+        let result = Cli::try_parse_from(["rustfs", "server", "--help"]);
+        let Err(help) = result else {
+            panic!("help exits without parsing server options");
+        };
+
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        for env in [
+            "RUSTFS_ALLOCATOR_RECLAIM_ENABLED",
+            "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS",
+            "RUSTFS_ALLOCATOR_RECLAIM_FORCE",
+            "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS",
+        ] {
+            assert!(help.contains(env), "server help should mention {env}");
+        }
     }
 }

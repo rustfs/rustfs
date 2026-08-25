@@ -14,6 +14,7 @@
 
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
+    connect::runtime::shutdown_connect_runtimes,
     server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
@@ -129,6 +130,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     let StartupServiceRuntime {
         optional_runtimes,
         heartbeat,
+        inventory,
         iam_bootstrap,
         enable_scanner,
     } = service_runtime;
@@ -163,9 +165,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         shutdown_token,
     )
     .await;
-    if let Some(heartbeat) = heartbeat {
-        heartbeat.shutdown().await;
-    }
+    shutdown_connect_runtimes(heartbeat, inventory).await;
     if let Err(err) = event_notifier_reconciler.await {
         tracing::warn!(
             target: "rustfs::main::run",

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::time::Duration;
-use sysinfo::{RefreshKind, System};
 
 use rustfs_obs::dial9::Dial9SessionGuard;
 
@@ -52,26 +51,32 @@ mod tests {
 
 #[inline]
 fn detect_cores() -> usize {
-    // Priority physical cores, fallback logic cores, minimum 1
-    let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
-    sys.refresh_cpu_all();
-    sys.cpus().len().max(1)
+    // Uses cgroup-aware detection from cgroup_resources module
+    // Returns effective CPU cores considering cgroup limits and overrides
+    crate::cgroup_resources::container_resources().cpu_cores
 }
 
 #[inline]
 fn compute_default_worker_threads() -> usize {
-    // Physical cores are used by default (closer to CPU compute resources and cache topology)
-    detect_cores()
+    // Cap at 16 worker threads for optimal small-object PUT performance.
+    // Now cgroup-aware: in containers, uses the container's CPU limit
+    detect_cores().min(16)
 }
 
 /// Default max_blocking_threads calculations based on sysinfo:
 /// 16 cores -> 1024; more than 16 cores are doubled by multiples:
 /// 1..=16 -> 1024, 17..=32 -> 2048, 33..=64 -> 4096, and so on.
+///
+/// For containerized environments with limited resources, this is capped
+/// to prevent excessive memory usage from thread stacks.
 fn compute_default_max_blocking_threads() -> usize {
     const BASE_CORES: usize = rustfs_config::DEFAULT_WORKER_THREADS;
     const BASE_THREADS: usize = rustfs_config::DEFAULT_MAX_BLOCKING_THREADS;
+    // Cap for small containers to prevent excessive memory usage
+    // Each blocking thread can use up to 1 MiB stack space
+    const SMALL_CONTAINER_MAX_THREADS: usize = 256;
 
-    let cores = detect_cores();
+    let cores = detect_cores().min(16);
 
     let mut threads = BASE_THREADS;
     let mut threshold = BASE_CORES;
@@ -80,6 +85,12 @@ fn compute_default_max_blocking_threads() -> usize {
     while cores > threshold {
         threads = threads.saturating_mul(2);
         threshold = threshold.saturating_mul(2);
+    }
+
+    // For small containers (<=4 cores), cap the blocking threads to prevent memory issues
+    // This prevents a 1 GiB container from allocating up to 1 GiB just for thread stacks
+    if cores <= 4 {
+        threads = threads.min(SMALL_CONTAINER_MAX_THREADS);
     }
 
     threads
