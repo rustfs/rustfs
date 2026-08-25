@@ -961,6 +961,44 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn console_liveness_omits_readiness_state() {
+        temp_env::async_with_vars([(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"))], async {
+            let object_traffic_health =
+                Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+            let _stalled = object_traffic_health
+                .track_write_storage()
+                .expect("write tracking must be enabled");
+            let app_context =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+            let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+            assert!(server_ctx.install(app_context));
+
+            let response = health_check(
+                Method::GET,
+                format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}")
+                    .parse()
+                    .expect("console liveness URI"),
+                Some(Extension(server_ctx)),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("console liveness body")
+                .to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("console liveness JSON");
+            assert_eq!(payload["status"], "ok");
+            assert!(payload.get("ready").is_none());
+            assert!(payload.get("degradedReasons").is_none());
+        })
+        .await;
+    }
+
     // setup_console_middleware_stack reads ENV_HEALTH_ENDPOINT_ENABLE (see above).
     #[tokio::test]
     #[serial]

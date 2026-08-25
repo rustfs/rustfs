@@ -54,6 +54,7 @@ pub(crate) struct HealthResponseParts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HealthPayloadContext<'a> {
+    pub(crate) probe: HealthProbe,
     pub(crate) health: HealthCheckState,
     pub(crate) storage_ready: bool,
     pub(crate) iam_ready: bool,
@@ -97,7 +98,8 @@ fn apply_object_traffic_snapshot(report: &mut DependencyReadinessReport, snapsho
 
 pub(crate) fn readiness_source_for_probe(probe: HealthProbe) -> Option<HealthReadinessSource> {
     match probe {
-        HealthProbe::Liveness | HealthProbe::Readiness => Some(HealthReadinessSource::Node),
+        HealthProbe::Liveness => None,
+        HealthProbe::Readiness => Some(HealthReadinessSource::Node),
         HealthProbe::ClusterWrite => Some(HealthReadinessSource::ClusterWrite),
         HealthProbe::ClusterRead => Some(HealthReadinessSource::ClusterRead),
     }
@@ -113,13 +115,12 @@ pub(crate) fn health_check_state(
     let ready = storage_ready && iam_ready && lock_quorum_ready && peer_health_ready;
 
     if probe == HealthProbe::Liveness {
-        // Liveness always returns HTTP 200 (process is alive), but the `ready`
-        // field now reflects actual node readiness so that callers who inspect
-        // the body get a truthful signal instead of a hardcoded `true`.
+        // Liveness is intentionally local and peer-independent. Dependency
+        // readiness belongs to `/health/ready` and the MinIO cluster probes.
         return HealthCheckState {
             status_code: StatusCode::OK,
-            status: if ready { "ok" } else { "degraded" },
-            ready,
+            status: "ok",
+            ready: true,
         };
     }
 
@@ -295,7 +296,7 @@ pub(crate) fn build_health_response_parts(
                     lock_quorum_ready,
                     health_check_state(storage_ready, iam_ready, lock_quorum_ready, peer_health_ready, probe),
                     readiness_report.degraded_reasons.clone(),
-                    true,
+                    probe != HealthProbe::Liveness,
                 )
             }
             (HealthProbe::Readiness | HealthProbe::ClusterWrite | HealthProbe::ClusterRead, None) => (
@@ -341,6 +342,7 @@ pub(crate) fn build_health_response_parts(
         None
     } else {
         Some(build_health_payload(HealthPayloadContext {
+            probe,
             health,
             storage_ready,
             iam_ready,
@@ -361,19 +363,28 @@ pub(crate) fn build_health_response_parts(
 
 pub(crate) fn build_health_payload(ctx: HealthPayloadContext<'_>) -> Value {
     if health_minimal_response_enabled() {
-        return json!({
-            "status": ctx.health.status,
-            "ready": ctx.health.ready,
-        });
+        return if ctx.probe == HealthProbe::Liveness {
+            json!({
+                "status": ctx.health.status,
+            })
+        } else {
+            json!({
+                "status": ctx.health.status,
+                "ready": ctx.health.ready,
+            })
+        };
     }
 
     let mut payload = json!({
         "status": ctx.health.status,
-        "ready": ctx.health.ready,
         "service": ctx.service,
         "timestamp": jiff::Zoned::now().to_string(),
         "version": env!("CARGO_PKG_VERSION"),
     });
+
+    if ctx.probe != HealthProbe::Liveness {
+        payload["ready"] = json!(ctx.health.ready);
+    }
 
     if ctx.include_dependency_details {
         payload["details"] = build_component_details(ctx.storage_ready, ctx.iam_ready, ctx.lock_quorum_ready, ctx.kms_ready);
@@ -491,7 +502,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn liveness_and_readiness_payloads_share_lock_quorum_readiness() {
+    fn liveness_payload_omits_lock_quorum_readiness() {
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
             let mut report = ready_report();
             report.readiness.lock_quorum_ready = false;
@@ -506,11 +517,12 @@ mod tests {
             assert_eq!(readiness.status_code, StatusCode::SERVICE_UNAVAILABLE);
             let liveness_payload = liveness.payload.expect("liveness GET should include payload");
             let readiness_payload = readiness.payload.expect("readiness GET should include payload");
-            assert_eq!(liveness_payload["ready"], false);
+            assert_eq!(liveness_payload["status"], "ok");
+            assert!(liveness_payload.get("ready").is_none());
+            assert!(liveness_payload.get("details").is_none());
+            assert!(liveness_payload.get("degradedReasons").is_none());
             assert_eq!(readiness_payload["ready"], false);
-            assert_eq!(liveness_payload["details"]["lock"]["ready"], false);
             assert_eq!(readiness_payload["details"]["lock"]["ready"], false);
-            assert_eq!(liveness_payload["degradedReasons"], json!(["lock_quorum_unavailable"]));
             assert_eq!(readiness_payload["degradedReasons"], json!(["lock_quorum_unavailable"]));
         });
     }
