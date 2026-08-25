@@ -26,6 +26,11 @@ use tokio_util::sync::CancellationToken;
 const BUCKET_TARGETS_METADATA_LOCK_SHARDS: usize = 256;
 const BUCKET_RESYNC_LOCK_RETRY_BASE_MS: u64 = 100;
 const BUCKET_RESYNC_LOCK_RETRY_MAX_MS: u64 = 2_000;
+const EVENT_REPLICATION_RESYNC_INTENT_ORPHANED: &str = "replication_resync_intent_orphaned";
+const EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RECOVERED: &str = "replication_resync_startup_lock_recovered";
+const EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RETRY: &str = "replication_resync_startup_lock_retry";
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 static BUCKET_TARGETS_METADATA_LOCKS: LazyLock<Vec<Arc<Mutex<()>>>> = LazyLock::new(|| {
     (0..BUCKET_TARGETS_METADATA_LOCK_SHARDS)
         .map(|_| Arc::new(Mutex::new(())))
@@ -908,9 +913,9 @@ fn apply_active_resync_intents(
         }
         let Some(target) = targets.targets.iter_mut().find(|target| target.arn == *arn) else {
             tracing::warn!(
-                event = "replication_resync_intent_orphaned",
-                component = "storage",
-                subsystem = "replication",
+                event = EVENT_REPLICATION_RESYNC_INTENT_ORPHANED,
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION,
                 result = "skipped",
                 bucket,
                 arn = %arn,
@@ -967,9 +972,9 @@ where
                 if attempt > 0 {
                     metrics::counter!("rustfs_replication_resync_startup_lock_recovered_total").increment(1);
                     tracing::info!(
-                        event = "replication_resync_startup_lock_recovered",
-                        component = "storage",
-                        subsystem = "replication",
+                        event = EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RECOVERED,
+                        component = LOG_COMPONENT_STORAGE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION,
                         result = "acquired",
                         bucket,
                         attempts = attempt,
@@ -986,9 +991,9 @@ where
                 let retry_delay = bucket_resync_transaction_lock_retry_delay(attempt);
                 metrics::counter!("rustfs_replication_resync_startup_lock_retry_total", "reason" => reason).increment(1);
                 tracing::warn!(
-                    event = "replication_resync_startup_lock_retry",
-                    component = "storage",
-                    subsystem = "replication",
+                    event = EVENT_REPLICATION_RESYNC_STARTUP_LOCK_RETRY,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
                     state = "retrying",
                     bucket,
                     attempt,
@@ -1023,12 +1028,12 @@ pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String], s
     };
 
     for bucket in buckets {
-        let status = pool.get_bucket_resync_status(bucket).await?;
+        let status = pool.read_durable_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
         }
         let transaction_guard = acquire_bucket_resync_transaction_lock(bucket, shutdown).await?;
-        let status = pool.get_bucket_resync_status(bucket).await?;
+        let status = pool.read_durable_bucket_resync_status(bucket).await?;
         if status.targets_map.is_empty() {
             continue;
         }
