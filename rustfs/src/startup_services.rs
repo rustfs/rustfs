@@ -59,7 +59,7 @@ pub(crate) async fn init_embedded_startup_runtime_services(
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<EmbeddedStartupServiceRuntime> {
     init_embedded_optional_service_runtime(config).await;
-    let buckets = init_embedded_bucket_metadata_runtime(store.clone()).await?;
+    let buckets = init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
     let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness, server_ctx)
         .await
         .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
