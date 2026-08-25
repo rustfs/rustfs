@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::client::{ClientError, ConnectClient, ConnectConfig};
 use super::config::HeartbeatConfig;
 use super::heartbeat::{CoarseNodeSummary, Delivery, HeartbeatError, HeartbeatSender, HeartbeatStateStore, HeartbeatStatus};
 use super::inventory::{
@@ -109,6 +110,14 @@ where
         return Ok(None);
     }
     let sender = HeartbeatSender::new(config.clone())?;
+    let rotation = ConnectClient::new(ConnectConfig {
+        endpoint: &config.endpoint,
+        root_ca_pem: &config.root_ca_pem,
+        timeout: config.schedule.timeout,
+    })
+    .map_err(HeartbeatError::CredentialRotation)?;
+    let identity_store = config.identity_store.clone();
+    let credential_store = config.credential_store.clone();
     let store = HeartbeatStateStore::new(config.state_path.clone());
     let lock = store.try_runtime_lock()?;
     let schedule = config.schedule;
@@ -121,6 +130,23 @@ where
         loop {
             if task_shutdown.is_cancelled() {
                 break;
+            }
+            match cancellable(
+                &task_shutdown,
+                rotation.rotate_if_due(&identity_store, &credential_store, Utc::now().timestamp()),
+            )
+            .await
+            {
+                Some(Ok(_)) | Some(Err(ClientError::Unavailable { .. })) | Some(Err(ClientError::Transport(_))) => {}
+                Some(Err(ClientError::AccessRevoked { status, reason })) => {
+                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped {
+                        status: status.as_u16(),
+                        reason,
+                    });
+                    return;
+                }
+                Some(Err(error)) => return failed(&status_tx, rotation_failure(error)),
+                None => break,
             }
             let pending = match store.prepare(sample(), Utc::now()).await {
                 Ok(pending) => pending,
@@ -344,6 +370,22 @@ fn failed(status: &watch::Sender<HeartbeatStatus>, error: HeartbeatError) {
     });
 }
 
+fn rotation_failure(error: ClientError) -> HeartbeatError {
+    match error {
+        ClientError::Endpoint => HeartbeatError::Endpoint,
+        ClientError::RootCertificate => HeartbeatError::RootCertificate,
+        ClientError::NotRegistered => HeartbeatError::NotRegistered,
+        ClientError::IdentityMissing => HeartbeatError::IdentityMissing,
+        ClientError::CredentialExpired | ClientError::CredentialNotYetValid => HeartbeatError::CredentialExpired,
+        ClientError::IdentityCertificate => HeartbeatError::IdentityCertificate,
+        ClientError::Identity(error) => HeartbeatError::Identity(error),
+        ClientError::IdentityStore(error) => HeartbeatError::IdentityStore(error),
+        ClientError::CredentialStore(error) => HeartbeatError::CredentialStore(error),
+        ClientError::Credential(error) => HeartbeatError::CredentialValidation(error),
+        error => HeartbeatError::CredentialRotation(error),
+    }
+}
+
 pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
     use super::registration::CredentialValidationError;
 
@@ -367,6 +409,7 @@ pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
         HeartbeatError::StatePermissions { .. } => "connect_heartbeat_state_permissions",
         HeartbeatError::ResponseTooLarge => "connect_heartbeat_response_too_large",
         HeartbeatError::Response => "connect_heartbeat_response",
+        HeartbeatError::CredentialRotation(_) => "connect_heartbeat_credential_rotation",
         HeartbeatError::Url(_) => "connect_heartbeat_url",
         HeartbeatError::Transport(_) => "connect_heartbeat_transport",
         HeartbeatError::Identity(_) => "connect_heartbeat_identity",
@@ -447,6 +490,10 @@ mod tests {
         assert_eq!(
             heartbeat_failure_reason(&HeartbeatError::CredentialExpired),
             "connect_heartbeat_credential_expired"
+        );
+        assert_eq!(
+            heartbeat_failure_reason(&HeartbeatError::CredentialRotation(ClientError::PendingRotation)),
+            "connect_heartbeat_credential_rotation"
         );
         assert_eq!(
             heartbeat_failure_reason(&HeartbeatError::CredentialValidation(
