@@ -28,6 +28,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use http::StatusCode;
     use http::header::HOST;
@@ -731,12 +732,7 @@ mod tests {
         create_bucket(&client, bucket).await.expect("Failed to create bucket");
 
         // Test that control characters are rejected
-        let invalid_keys = vec![
-            "file\0with\0null.txt",
-            "file\nwith\nnewline.txt",
-            "file\rwith\rcarriage.txt",
-            "file\twith\ttab.txt", // Tab might be allowed, but let's test
-        ];
+        let invalid_keys = ["file\0with\0null.txt", "file\nwith\nnewline.txt", "file\rwith\rcarriage.txt"];
 
         for key in invalid_keys {
             info!("Testing rejection of control character in key: {:?}", key);
@@ -747,17 +743,27 @@ mod tests {
                 .key(key)
                 .body(ByteStream::from_static(b"test"))
                 .send()
-                .await;
-
-            // Note: The validation happens on the server side, so we expect an error
-            // For null byte, newline, and carriage return
-            if key.contains('\0') || key.contains('\n') || key.contains('\r') {
-                assert!(result.is_err(), "Control character should be rejected for key: {key:?}");
-                if let Err(e) = result {
-                    info!("✅ Control character correctly rejected: {:?}", e);
-                }
-            }
+                .await
+                .expect_err("invalid control characters must be rejected by the server");
+            assert_eq!(
+                result.raw_response().map(|response| response.status().as_u16()),
+                Some(400),
+                "control character must return HTTP 400 for key {key:?}: {result:?}"
+            );
+            assert_eq!(
+                result.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some("InvalidArgument"),
+                "control character must return InvalidArgument for key {key:?}: {result:?}"
+            );
         }
+
+        let listed = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("server must remain healthy after rejected requests");
+        assert!(listed.contents().is_empty(), "rejected requests must not create objects");
 
         // Cleanup
         env.stop_server();
