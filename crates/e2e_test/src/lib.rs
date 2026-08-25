@@ -284,6 +284,7 @@ mod console_smoke_test;
 // plus non-admin 403 probes per endpoint (sec-4 pattern).
 #[cfg(test)]
 mod admin_iam_crud_test;
+mod admin_mfa_test;
 
 #[cfg(test)]
 mod admin_pools_test;
