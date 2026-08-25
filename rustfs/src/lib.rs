@@ -78,6 +78,7 @@ pub mod auth;
 pub mod auth_keystone;
 pub(crate) mod bitrot_selftest;
 pub mod capacity;
+pub mod cgroup_resources;
 pub mod cluster_snapshot;
 pub mod config;
 pub mod connect;

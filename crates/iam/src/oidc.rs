@@ -2273,6 +2273,7 @@ pub(crate) fn test_config(id: &str) -> OidcProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use rustfs_utils::egress::OutboundDnsPolicyRejection;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2641,12 +2642,15 @@ mod tests {
         )
     }
 
-    fn start_mock_oidc_discovery_server<F>(
+    fn start_mock_oidc_discovery_server_with_jwks<F, J>(
         build_discovery_issuer: F,
         max_requests: usize,
+        signing_alg: &'static str,
+        jwks_response: J,
     ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
         F: Fn(&str) -> (String, String, String) + Send + 'static,
+        J: Fn(usize) -> String + Send + 'static,
     {
         use std::io::Write;
         use std::net::{Shutdown, TcpListener};
@@ -2674,10 +2678,9 @@ mod tests {
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
             "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["RS256"],
+            "id_token_signing_alg_values_supported": [signing_alg],
         })
         .to_string();
-        let jwks_body = r#"{"keys":[]}"#;
         let (ready_tx, ready_rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
@@ -2687,6 +2690,7 @@ mod tests {
             let _ = ready_tx.send(());
 
             let mut seen = 0usize;
+            let mut jwks_fetches = 0usize;
             let start = Instant::now();
             let mut last_completed = Instant::now();
 
@@ -2719,7 +2723,11 @@ mod tests {
                     .expect("failed to set discovery mock read timeout");
 
                 let path = read_mock_oidc_request_path(&mut stream);
-                let response = mock_oidc_response(&path, &discovery_body, &expected_jwks_path, jwks_body);
+                let jwks_body = jwks_response(jwks_fetches);
+                if path == expected_jwks_path {
+                    jwks_fetches += 1;
+                }
+                let response = mock_oidc_response(&path, &discovery_body, &expected_jwks_path, &jwks_body);
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
                 let _ = stream.shutdown(Shutdown::Both);
@@ -2735,6 +2743,94 @@ mod tests {
             .expect("mock OIDC discovery server should become ready");
 
         Some((base, handle))
+    }
+
+    fn start_mock_oidc_discovery_server<F>(
+        build_discovery_issuer: F,
+        max_requests: usize,
+    ) -> Option<(String, std::thread::JoinHandle<()>)>
+    where
+        F: Fn(&str) -> (String, String, String) + Send + 'static,
+    {
+        start_mock_oidc_discovery_server_with_jwks(build_discovery_issuer, max_requests, "RS256", |_| {
+            r#"{"keys":[]}"#.to_string()
+        })
+    }
+
+    fn oidc_es256_key_and_jwk(kid: &str) -> (EncodingKey, serde_json::Value) {
+        let certified =
+            rcgen::generate_simple_self_signed(vec![format!("{kid}.invalid")]).expect("OIDC signing key should generate");
+        let encoding_key =
+            EncodingKey::from_ec_pem(certified.signing_key.serialize_pem().as_bytes()).expect("OIDC signing key should encode");
+        let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(&encoding_key, Algorithm::ES256)
+            .expect("OIDC public JWK should derive from signing key");
+        jwk.common.key_id = Some(kid.to_string());
+        jwk.common.public_key_use = Some(jsonwebtoken::jwk::PublicKeyUse::Signature);
+        (encoding_key, serde_json::to_value(jwk).expect("OIDC JWK should serialize"))
+    }
+
+    #[tokio::test]
+    async fn web_identity_verification_refreshes_rotated_jwks() {
+        let (_, initial_jwk) = oidc_es256_key_and_jwk("initial");
+        let (rotated_key, rotated_jwk) = oidc_es256_key_and_jwk("rotated");
+        let initial_jwks = serde_json::json!({ "keys": [initial_jwk] }).to_string();
+        let rotated_jwks = serde_json::json!({ "keys": [rotated_jwk] }).to_string();
+        let Some((base, handle)) = start_mock_oidc_discovery_server_with_jwks(
+            |base| (base.to_string(), format!("{base}/jwks"), "/jwks".to_string()),
+            4,
+            "ES256",
+            move |fetch| {
+                if fetch == 0 {
+                    initial_jwks.clone()
+                } else {
+                    rotated_jwks.clone()
+                }
+            },
+        ) else {
+            return;
+        };
+
+        let config = build_mocked_oidc_provider_config("rotating", &base);
+        let policy = OutboundPolicy::from_allowed_origins(&base).expect("loopback origin should be allowed");
+        let http_client = ReqwestHttpClient::with_policy(policy);
+        let state = OidcSys::discover_provider(&config, &http_client)
+            .await
+            .expect("initial OIDC discovery should succeed");
+        let sys = OidcSys {
+            configs: HashMap::from([(config.id.clone(), config.clone())]),
+            provider_states: RwLock::new(HashMap::from([(config.id.clone(), state)])),
+            state_store: OidcStateStore::new(),
+            http_client,
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_secs();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("rotated".to_string());
+        let token = jsonwebtoken::encode(
+            &header,
+            &serde_json::json!({
+                "iss": base,
+                "sub": "rotated-user",
+                "aud": config.client_id,
+                "iat": now,
+                "exp": now + 300,
+                "groups": ["readwrite"],
+            }),
+            &rotated_key,
+        )
+        .expect("rotated OIDC token should sign");
+
+        let (claims, provider_id) = sys
+            .verify_web_identity_token(&token)
+            .await
+            .expect("verification should refresh JWKS and accept the rotated key");
+        assert_eq!(provider_id, "rotating");
+        assert_eq!(claims.sub, "rotated-user");
+        assert_eq!(claims.groups, vec!["readwrite"]);
+        handle.join().expect("rotating JWKS mock server should exit cleanly");
     }
 
     fn start_mock_oidc_tls_discovery_server<F>(

@@ -25,6 +25,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
     use tracing::info;
@@ -285,7 +286,10 @@ mod tests {
         let output = result.unwrap();
 
         info!("📥 PutObject response - version_id: {:?}", output.version_id);
-        // version_id can be None or Some("null") for non-versioned buckets
+        assert!(
+            output.version_id().is_none() || output.version_id() == Some("null"),
+            "non-versioned PUT must omit version ID or return the S3 null version"
+        );
         info!("✅ PASSED: PutObject works correctly without versioning");
     }
 
@@ -317,7 +321,11 @@ mod tests {
             .send()
             .await;
         assert!(put_result.is_ok(), "PUT operation failed");
-        let _version_id = put_result.unwrap().version_id;
+        let version_id = put_result
+            .unwrap()
+            .version_id()
+            .expect("versioned PUT should return a version ID")
+            .to_string();
 
         // Test GET
         info!("📥 Testing GET operation");
@@ -341,15 +349,45 @@ mod tests {
 
         // Test DELETE
         info!("🗑️  Testing DELETE operation");
-        let delete_result = client.delete_object().bucket(bucket).key(key).send().await;
-        assert!(delete_result.is_ok(), "DELETE operation failed");
+        let delete_result = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("DELETE operation failed");
+        assert_eq!(delete_result.delete_marker(), Some(true));
+        let delete_marker_version_id = delete_result
+            .version_id()
+            .expect("versioned DELETE should return a delete marker version ID")
+            .to_string();
 
-        // Verify object is deleted (should return NoSuchKey or version marker)
-        let get_after_delete = client.get_object().bucket(bucket).key(key).send().await;
-        assert!(
-            get_after_delete.is_err() || get_after_delete.unwrap().delete_marker == Some(true),
-            "Object should be deleted or have delete marker"
+        let get_after_delete = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect_err("the current delete marker must hide the object");
+        assert_eq!(get_after_delete.raw_response().map(|response| response.status().as_u16()), Some(404));
+        assert_eq!(
+            get_after_delete.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("NoSuchKey")
         );
+
+        let versions = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .expect("ListObjectVersions failed after DELETE");
+        assert_eq!(versions.versions().len(), 1);
+        assert_eq!(versions.versions()[0].version_id(), Some(version_id.as_str()));
+        assert_eq!(versions.versions()[0].is_latest(), Some(false));
+        assert_eq!(versions.delete_markers().len(), 1);
+        assert_eq!(versions.delete_markers()[0].version_id(), Some(delete_marker_version_id.as_str()));
+        assert_eq!(versions.delete_markers()[0].is_latest(), Some(true));
 
         info!("✅ PASSED: All basic S3 operations work correctly");
     }
@@ -417,31 +455,59 @@ mod tests {
 
         let client = env.create_s3_client();
         env.create_test_bucket(bucket).await?;
+        enable_versioning(&client, bucket).await?;
 
         let key = "terraform.tfstate";
-        let response = client
+        let first_version = client
             .put_object()
             .bucket(bucket)
             .key(key)
             .body(ByteStream::from(b"v1".to_vec()))
             .send()
-            .await;
-        assert!(response.is_ok());
+            .await?
+            .version_id()
+            .ok_or("first Terraform state PUT omitted version ID")?
+            .to_string();
 
-        client.delete_object().bucket(bucket).key(key).send().await?;
+        let deleted = client.delete_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(deleted.delete_marker(), Some(true));
+        let delete_marker = deleted
+            .version_id()
+            .ok_or("Terraform state DELETE omitted delete marker version ID")?
+            .to_string();
 
-        let response = client
+        let second_version = client
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(b"v1".to_vec()))
+            .body(ByteStream::from(b"v2".to_vec()))
             .send()
-            .await;
+            .await?
+            .version_id()
+            .ok_or("second Terraform state PUT omitted version ID")?
+            .to_string();
 
-        assert!(response.is_ok());
+        let get_response = client.get_object().bucket(bucket).key(key).send().await?;
+        let current_body = get_response.body.collect().await?.into_bytes();
+        assert_eq!(current_body.as_ref(), b"v2");
 
-        let get_response = client.get_object().bucket(bucket).key(key).send().await;
-        assert!(get_response.is_ok(), "Object should exist after PUT");
+        let listed = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+        assert_eq!(listed.versions().len(), 2);
+        assert!(
+            listed
+                .versions()
+                .iter()
+                .any(|version| version.version_id() == Some(first_version.as_str()) && version.is_latest() == Some(false))
+        );
+        assert!(
+            listed
+                .versions()
+                .iter()
+                .any(|version| version.version_id() == Some(second_version.as_str()) && version.is_latest() == Some(true))
+        );
+        assert_eq!(listed.delete_markers().len(), 1);
+        assert_eq!(listed.delete_markers()[0].version_id(), Some(delete_marker.as_str()));
+        assert_eq!(listed.delete_markers()[0].is_latest(), Some(false));
 
         Ok(())
     }

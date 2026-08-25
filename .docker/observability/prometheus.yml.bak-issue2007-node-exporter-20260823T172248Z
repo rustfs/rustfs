@@ -1,0 +1,84 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+global:
+  scrape_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'rustfs-dev'  # Label to identify the cluster
+    replica: '1'  # Replica identifier
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: [ 'otel-collector:8888' ]  # Scrape metrics from Collector
+    scrape_interval: 10s
+
+  - job_name: 'rustfs-app-metrics'
+    static_configs:
+      - targets: [ 'otel-collector:8889' ]  # Application indicators
+    scrape_interval: 15s
+    metric_relabel_configs:
+      - source_labels: [ __name__ ]
+        regex: 'go_.*'
+        action: drop  # Drop Go runtime metrics if not needed
+
+  - job_name: 'tempo'
+    static_configs:
+      - targets: [ 'tempo:3200' ]  # Scrape metrics from Tempo
+
+  - job_name: 'jaeger'
+    static_configs:
+      - targets: [ 'jaeger:14269' ]  # Jaeger admin port (14269 is standard for admin/metrics)
+
+  - job_name: 'loki'
+    static_configs:
+      - targets: [ 'loki:3100' ]
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: [ 'localhost:9090' ]
+
+  - job_name: 'vulture'
+    static_configs:
+      - targets:
+          - 'vulture:8080'
+
+otlp:
+  promote_resource_attributes:
+    - service.instance.id
+    - service.name
+    - service.namespace
+    - cloud.availability_zone
+    - cloud.region
+    - container.name
+    - deployment.environment.name
+    - k8s.cluster.name
+    - k8s.container.name
+    - k8s.cronjob.name
+    - k8s.daemonset.name
+    - k8s.deployment.name
+    - k8s.job.name
+    - k8s.namespace.name
+    - k8s.pod.name
+    - k8s.replicaset.name
+    - k8s.statefulset.name
+  translation_strategy: NoUTF8EscapingWithSuffixes
+
+storage:
+  tsdb:
+    out_of_order_time_window: 30m

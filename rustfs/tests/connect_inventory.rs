@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(target_os = "linux")]
+
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +47,10 @@ const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const SNAPSHOT_UID: &str = "0198f4b0-4d00-7f40-9051-5b6c7d8e9fa3";
+
+fn safe_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory")
+}
 
 struct TestPki {
     root_params: CertificateParams,
@@ -244,6 +250,7 @@ fn config(temp: &tempfile::TempDir, pki: &TestPki, server: &TestServer) -> Heart
     if let Err(error) = fs::create_dir(temp.path().join("private-config-secret")) {
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "Connect state root");
     }
+    private_directory_mode(&temp.path().join("private-config-secret"));
     HeartbeatConfig {
         endpoint: server.endpoint.clone(),
         root_ca_pem: pki.root_pem.as_bytes().to_vec(),
@@ -394,6 +401,38 @@ fn connect_inventory_bounds_fail_instead_of_truncating_or_inventing_values() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_inventory_state_only_persists_without_constructing_transport() {
+    let temp = safe_tempdir();
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state root");
+    private_directory_mode(&state);
+    let config = HeartbeatConfig::new(
+        "",
+        Vec::new(),
+        IdentityStore::new(state.join("identity")),
+        CredentialStore::new(state.join("credential")),
+        state.join("heartbeat/state.json"),
+    );
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_inventory_runtime(Some(config), schedule(), &shutdown, || std::future::ready(Ok(snapshot())))
+        .expect("state-only inventory")
+        .expect("configured inventory");
+    let mut status = runtime.status();
+
+    assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, InventoryStatus::Unchanged { .. })).await,
+        InventoryStatus::Unchanged { .. }
+    ));
+    let envelope: Value = serde_json::from_slice(&fs::read(state.join("inventory/latest.json")).expect("latest inventory"))
+        .expect("latest envelope");
+    assert_eq!(envelope["formatVersion"], "v1");
+    assert_eq!(envelope["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
+    assert_eq!(envelope.as_object().expect("envelope object").len(), 4);
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn connect_inventory_rejects_deserialized_invalid_snapshots_before_state_or_network() {
     let pki = TestPki::new();
@@ -409,7 +448,7 @@ async fn connect_inventory_rejects_deserialized_invalid_snapshots_before_state_o
             "coarseFlags": []
         }))
         .expect("serde should not bypass the runtime validation boundary");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = safe_tempdir();
         let shutdown = CancellationToken::new();
         let runtime = spawn_inventory_runtime(Some(config(&temp, &pki, &server)), schedule(), &shutdown, move || {
             std::future::ready(Ok(invalid.clone()))
@@ -420,7 +459,7 @@ async fn connect_inventory_rejects_deserialized_invalid_snapshots_before_state_o
 
         assert!(matches!(
             wait_for(&mut status, |status| matches!(status, InventoryStatus::Failed { .. })).await,
-            InventoryStatus::Failed { reason } if reason.contains("version is outside protocol bounds")
+            InventoryStatus::Failed { reason } if reason == "connect_inventory_snapshot_version"
         ));
         assert!(!temp.path().join("private-config-secret/inventory/state.json").exists());
         runtime.shutdown().await;
@@ -433,7 +472,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     let pki = TestPki::new();
     let content_hash = snapshot().content_hash().expect("content hash");
     let first_server = server(&pki, vec![Reply::error(StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")]).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let shutdown = CancellationToken::new();
     let samples = Arc::new(AtomicUsize::new(0));
     let sampled = samples.clone();
@@ -451,7 +490,40 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     ));
     assert_eq!(samples.load(Ordering::Relaxed), 1);
     let original = first_server.seen.lock().expect("seen lock")[0].clone();
+    let latest: Value = serde_json::from_slice(
+        &fs::read(temp.path().join("private-config-secret/inventory/latest.json")).expect("latest inventory"),
+    )
+    .expect("latest envelope");
+    assert_eq!(latest["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
+    for field in [
+        "rustfsVersion",
+        "osVersion",
+        "nodeCount",
+        "driveCount",
+        "capacityTotalBytes",
+        "capacityUsedBytes",
+        "coarseFlags",
+    ] {
+        assert_eq!(latest["snapshot"][field], original[field]);
+    }
     runtime.shutdown().await;
+    let state = temp.path().join("private-config-secret/inventory/state.json");
+    let legacy_persisted_at = std::time::SystemTime::now() - Duration::from_secs(60 * 60);
+    fs::File::options()
+        .write(true)
+        .open(&state)
+        .expect("pending state")
+        .set_times(std::fs::FileTimes::new().set_modified(legacy_persisted_at))
+        .expect("legacy pending timestamp");
+    let legacy_persisted_at = chrono::DateTime::<chrono::Utc>::from(
+        fs::metadata(&state)
+            .and_then(|metadata| metadata.modified())
+            .expect("persisted pending timestamp"),
+    )
+    .format("%Y-%m-%dT%H:%M:%SZ")
+    .to_string();
+    fs::remove_file(temp.path().join("private-config-secret/inventory/latest.json"))
+        .expect("simulate a pending snapshot created before local persistence");
 
     let mut limited = Reply::error(StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED");
     limited.retry_after = Some("0");
@@ -473,10 +545,17 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
             if accepted == content_hash && received_at == "2026-08-22T01:02:03Z"
     ));
     assert_eq!(restart_samples.load(Ordering::Relaxed), 0);
+    let restored_latest: Value = serde_json::from_slice(
+        &fs::read(temp.path().join("private-config-secret/inventory/latest.json")).expect("restored latest inventory"),
+    )
+    .expect("restored latest envelope");
+    assert_eq!(restored_latest["snapshot"], serde_json::to_value(snapshot()).expect("snapshot JSON"));
+    assert_eq!(restored_latest["capturedAt"], legacy_persisted_at);
     let delivered = restart_server.seen.lock().expect("seen lock").clone();
     assert_eq!(delivered, vec![original.clone(), original.clone()]);
     assert_eq!(original["sequence"], 0);
     let encoded = serde_json::to_string(&original).expect("request JSON");
+    let persisted = serde_json::to_string(&latest).expect("persisted JSON");
     for forbidden in [
         "private-config-secret",
         "BEGIN CERTIFICATE",
@@ -486,9 +565,17 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
         "path",
     ] {
         assert!(!encoded.contains(forbidden), "request exposed {forbidden}");
+        assert!(!persisted.contains(forbidden), "persisted inventory exposed {forbidden}");
     }
     assert_eq!(original.as_object().expect("request object").len(), 10);
     restart.shutdown().await;
+    #[cfg(target_os = "linux")]
+    let latest_before_unchanged = {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(temp.path().join("private-config-secret/inventory/latest.json"))
+            .expect("latest metadata")
+            .ino()
+    };
 
     let unchanged_samples = Arc::new(AtomicUsize::new(0));
     let sampled = unchanged_samples.clone();
@@ -505,6 +592,17 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
     ));
     assert_eq!(unchanged_samples.load(Ordering::Relaxed), 1);
     assert_eq!(restart_server.seen.lock().expect("seen lock").len(), 2);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_ne!(
+            fs::metadata(temp.path().join("private-config-secret/inventory/latest.json"))
+                .expect("refreshed latest metadata")
+                .ino(),
+            latest_before_unchanged,
+            "a complete unchanged sample must refresh the local envelope"
+        );
+    }
     unchanged.shutdown().await;
 }
 
@@ -512,7 +610,7 @@ async fn connect_inventory_restart_replays_the_pending_request_and_then_skips_un
 async fn connect_inventory_disconnect_retries_without_resampling() {
     let pki = TestPki::new();
     let unavailable = server(&pki, Vec::new()).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let config = config(&temp, &pki, &unavailable);
     drop(unavailable);
     let shutdown = CancellationToken::new();
@@ -542,7 +640,7 @@ async fn connect_inventory_retries_an_incomplete_sample_before_delivery() {
     let pki = TestPki::new();
     let content_hash = snapshot().content_hash().expect("content hash");
     let server = server(&pki, vec![Reply::ok(&content_hash)]).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let shutdown = CancellationToken::new();
     let samples = Arc::new(AtomicUsize::new(0));
     let sampled = samples.clone();
@@ -562,6 +660,11 @@ async fn connect_inventory_retries_an_incomplete_sample_before_delivery() {
     let mut status = runtime.status();
 
     assert!(matches!(
+        wait_for(&mut status, |status| matches!(status, InventoryStatus::BackingOff { .. })).await,
+        InventoryStatus::BackingOff { .. }
+    ));
+    assert!(!temp.path().join("private-config-secret/inventory/latest.json").exists());
+    assert!(matches!(
         wait_for(&mut status, |status| matches!(status, InventoryStatus::Online { .. })).await,
         InventoryStatus::Online { content_hash: accepted, .. } if accepted == content_hash
     ));
@@ -575,7 +678,7 @@ async fn connect_inventory_unchanged_sample_resets_incomplete_backoff() {
     let pki = TestPki::new();
     let content_hash = snapshot().content_hash().expect("content hash");
     let server = server(&pki, vec![Reply::ok(&content_hash)]).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let shutdown = CancellationToken::new();
     let config = config(&temp, &pki, &server);
     let seed = spawn_inventory_runtime(Some(config.clone()), schedule(), &shutdown, || std::future::ready(Ok(snapshot())))
@@ -645,7 +748,7 @@ async fn connect_inventory_unchanged_sample_resets_incomplete_backoff() {
 async fn connect_inventory_revoked_device_stops_without_retrying() {
     let pki = TestPki::new();
     let server = server(&pki, vec![Reply::error(StatusCode::UNAUTHORIZED, "DEVICE_REVOKED")]).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let shutdown = CancellationToken::new();
     let runtime = spawn_inventory_runtime(Some(config(&temp, &pki, &server)), schedule(), &shutdown, || {
         std::future::ready(Ok(snapshot()))
@@ -656,7 +759,10 @@ async fn connect_inventory_revoked_device_stops_without_retrying() {
 
     assert!(matches!(
         wait_for(&mut status, |status| matches!(status, InventoryStatus::AuthenticationStopped { .. })).await,
-        InventoryStatus::AuthenticationStopped { status: 401, reason: Some(reason) } if reason == "DEVICE_REVOKED"
+        InventoryStatus::AuthenticationStopped {
+            status: 401,
+            reason: None
+        }
     ));
     assert_eq!(server.seen.lock().expect("seen lock").len(), 1);
     runtime.shutdown().await;
@@ -666,10 +772,11 @@ async fn connect_inventory_revoked_device_stops_without_retrying() {
 async fn connect_inventory_sequence_overflow_fails_before_sampling_or_network_delivery() {
     let pki = TestPki::new();
     let server = server(&pki, Vec::new()).await;
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = safe_tempdir();
     let config = config(&temp, &pki, &server);
     let state = temp.path().join("private-config-secret/inventory/state.json");
     fs::create_dir_all(state.parent().expect("state directory")).expect("create state directory");
+    private_directory_mode(state.parent().expect("state directory"));
     fs::write(
         &state,
         br#"{"nextSequence":9007199254740992,"pending":null,"lastAcceptedContentHash":null}"#,
@@ -689,7 +796,7 @@ async fn connect_inventory_sequence_overflow_fails_before_sampling_or_network_de
 
     assert!(matches!(
         wait_for(&mut status, |status| matches!(status, InventoryStatus::Failed { .. })).await,
-        InventoryStatus::Failed { reason } if reason.contains("sequence is exhausted")
+        InventoryStatus::Failed { reason } if reason == "connect_inventory_sequence_exhausted"
     ));
     assert_eq!(samples.load(Ordering::Relaxed), 0);
     assert!(server.seen.lock().expect("seen lock").is_empty());
@@ -702,10 +809,11 @@ async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_deliv
     let server = server(&pki, Vec::new()).await;
 
     for invalid_case in ["flags", "os-version"] {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = safe_tempdir();
         let config = config(&temp, &pki, &server);
         let state = temp.path().join("private-config-secret/inventory/state.json");
         fs::create_dir_all(state.parent().expect("state directory")).expect("create state directory");
+        private_directory_mode(state.parent().expect("state directory"));
         let mut pending = json!({
             "protocolVersion": "v1",
             "requestId": "00000000-0000-4000-8000-000000000001",
@@ -753,7 +861,7 @@ async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_deliv
                 matches!(status, InventoryStatus::Failed { .. } | InventoryStatus::BackingOff { .. })
             })
             .await,
-            InventoryStatus::Failed { reason } if reason.contains("violates the protocol invariants")
+            InventoryStatus::Failed { reason } if reason == "connect_inventory_state_corrupt"
         ));
         assert_eq!(samples.load(Ordering::Relaxed), 0);
         runtime.shutdown().await;
@@ -762,11 +870,20 @@ async fn connect_inventory_rejects_noncanonical_persisted_snapshots_before_deliv
     assert!(server.seen.lock().expect("seen lock").is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn private_mode(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private permissions");
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "linux")]
+fn private_directory_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("private directory permissions");
+}
+
+#[cfg(not(target_os = "linux"))]
 fn private_mode(_path: &std::path::Path) {}
+
+#[cfg(not(target_os = "linux"))]
+fn private_directory_mode(_path: &std::path::Path) {}

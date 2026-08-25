@@ -17,6 +17,7 @@
 
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{Client, Config};
 use tracing::info;
 
@@ -73,10 +74,14 @@ async fn test_bucket_policy_authenticated_user() -> Result<(), Box<dyn std::erro
     let user_client = create_user_client(&env, user_access, user_secret);
 
     // 4. Verify Access Denied initially (No Policy)
-    let result = user_client.list_objects_v2().bucket(bucket_name).send().await;
-    if result.is_ok() {
-        return Err("Should be Access Denied initially".into());
-    }
+    let denied = user_client
+        .list_objects_v2()
+        .bucket(bucket_name)
+        .send()
+        .await
+        .expect_err("a user without a bucket policy must be denied");
+    assert_eq!(denied.raw_response().map(|response| response.status().as_u16()), Some(403));
+    assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
 
     // 5. Apply Bucket Policy Allowed User
     let policy_json = serde_json::json!({

@@ -19,9 +19,9 @@
 //! complex workflows.
 
 use super::common::{
-    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, create_sse_c_config, sse_customer_key_md5_base64,
-    test_all_multipart_encryption_types, test_kms_key_management, test_multipart_upload_with_config, test_sse_c_encryption,
-    test_sse_kms_encryption, test_sse_s3_encryption,
+    EncryptionType, LocalKMSTestEnvironment, MultipartTestConfig, SSE_C_KEY_MISMATCH_MESSAGE, assert_s3_error,
+    create_sse_c_config, sse_customer_key_md5_base64, test_all_multipart_encryption_types, test_kms_key_management,
+    test_multipart_upload_with_config, test_sse_c_encryption, test_sse_kms_encryption, test_sse_s3_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
 use tracing::info;
@@ -191,7 +191,13 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
         .send()
         .await;
 
-    assert!(wrong_read_result.is_err(), "The encrypted file should not be readable with the wrong key");
+    assert_s3_error(
+        wrong_read_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "multipart SSE-C object GET with a wrong key must be rejected",
+    );
     info!("✅ Confirm that key isolation is working correctly");
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
