@@ -168,6 +168,60 @@ impl ECStore {
         }
     }
 
+    /// Return every live erasure set selected by an object-heal scope.
+    pub async fn heal_erasure_set_scopes(&self, opts: &HealOpts) -> Result<Vec<(usize, usize)>> {
+        let pools = self.get_pools_for_heal_object(opts)?;
+        let pool_meta = self.pool_meta.read().await;
+        let mut scopes = Vec::new();
+
+        for pool in pools {
+            let suspended_complete = pool_meta.is_suspended(pool.pool_idx).then(|| {
+                pool_meta
+                    .pools
+                    .get(pool.pool_idx)
+                    .and_then(|status| status.decommission.as_ref())
+                    .is_some_and(|decommission| decommission.complete)
+            });
+            if let Some(complete) = suspended_complete {
+                if opts.pool.is_some() {
+                    return Err(if complete {
+                        StorageError::InvalidArgument(
+                            "heal".to_string(),
+                            "pool".to_string(),
+                            format!("heal pool {} has completed decommission", pool.pool_idx),
+                        )
+                    } else {
+                        Error::SlowDown
+                    });
+                }
+                continue;
+            }
+
+            if let Some(set_idx) = opts.set {
+                if set_idx >= pool.disk_set.len() {
+                    return Err(StorageError::InvalidArgument(
+                        "heal".to_string(),
+                        "set".to_string(),
+                        format!(
+                            "invalid heal set index {set_idx} for pool {} with {} sets",
+                            pool.pool_idx,
+                            pool.disk_set.len()
+                        ),
+                    ));
+                }
+                scopes.push((pool.pool_idx, set_idx));
+            } else {
+                scopes.extend((0..pool.disk_set.len()).map(|set_idx| (pool.pool_idx, set_idx)));
+            }
+        }
+
+        if scopes.is_empty() {
+            return Err(Error::SlowDown);
+        }
+
+        Ok(scopes)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let mut r = HealResultItem {
@@ -640,6 +694,40 @@ mod tests {
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn heal_erasure_set_scopes_follow_requested_pool_and_set() {
+        let store = minimal_heal_store().await;
+
+        assert_eq!(
+            store
+                .heal_erasure_set_scopes(&HealOpts::default())
+                .await
+                .expect("unscoped heal should enumerate every live set"),
+            vec![(0, 0), (1, 0)]
+        );
+        assert_eq!(
+            store
+                .heal_erasure_set_scopes(&HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                })
+                .await
+                .expect("scoped heal should enumerate only its requested set"),
+            vec![(1, 0)]
+        );
+
+        let err = store
+            .heal_erasure_set_scopes(&HealOpts {
+                pool: Some(0),
+                set: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an invalid set scope must fail closed");
+        assert!(matches!(err, Error::InvalidArgument(..)));
     }
 
     fn pool_meta_with_decommission(info: PoolDecommissionInfo) -> PoolMeta {
