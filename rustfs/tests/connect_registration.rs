@@ -885,6 +885,62 @@ async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartb
 }
 
 #[tokio::test]
+async fn heartbeat_runtime_preserves_pending_reenrollment() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let (mut config, _, _) = due_runtime_config(&temp, &pki, "https://localhost/agent/");
+    let server = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = server.endpoint.clone();
+    assert!(matches!(
+        client(&server, &pki, Duration::from_millis(250))
+            .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(FRESH_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+    let pending_path = temp.path().join("credential/registration.pending.json");
+    let next_path = temp.path().join("identity/device.key.next");
+    let credential_path = temp.path().join("credential/device.crt.json");
+    let pending = fs::read(&pending_path).expect("pending reenrollment");
+    let next = fs::read(&next_path).expect("pending reenrollment key");
+    let credential = fs::read(&credential_path).expect("current credential");
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    assert_eq!(fs::read(&pending_path).expect("preserved pending reenrollment"), pending);
+    assert_eq!(fs::read(&next_path).expect("preserved pending reenrollment key"), next);
+    assert_eq!(fs::read(&credential_path).expect("preserved current credential"), credential);
+    let paths = server.paths.lock().expect("paths lock");
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with("registrationTokens:exchange"))
+            .count(),
+        3
+    );
+    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
+    assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
+}
+
+#[tokio::test]
 async fn heartbeat_retries_with_the_new_credential_after_concurrent_rotation() {
     let temp = tempfile::tempdir().expect("temp dir");
     let pki = TestPki::new();

@@ -163,6 +163,7 @@ where
                         });
                         return;
                     }
+                    Some(Err(ClientError::PendingRegistration)) => {}
                     Some(Err(error)) => return failed(&status_tx, rotation_failure(error)),
                     None => break,
                 }
