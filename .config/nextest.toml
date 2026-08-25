@@ -52,10 +52,20 @@ e2e-cluster-nightly = { max-threads = 1 }
 [scripts.setup.ecstore-large-stack]
 command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
 
+# The serial ILM selection builds the same deep storage futures in both the
+# lifecycle transition module and scanner integration binary. Different tests
+# in each have overflowed first across otherwise unrelated CI runs.
+[scripts.setup.lifecycle-large-stack]
+command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
+
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|prepared_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)))$/)'
 setup = 'ecstore-large-stack'
+
+[[profile.default.scripts]]
+filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
+setup = 'lifecycle-large-stack'
 
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(concurrent_config_writes_from_separate_nodes_do_not_lose_writes) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
@@ -149,6 +159,10 @@ path = "junit.xml"
 [[profile.ci.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|prepared_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)))$/)'
 setup = 'ecstore-large-stack'
+
+[[profile.ci.scripts]]
+filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
+setup = 'lifecycle-large-stack'
 
 # ===========================================================================
 # QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.
