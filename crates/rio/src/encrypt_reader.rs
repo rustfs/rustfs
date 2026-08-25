@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
 use rustfs_utils::{put_uvarint, put_uvarint_len};
@@ -24,6 +24,36 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
 
 const ENCRYPTION_BLOCK_SIZE: usize = 8 * 1024;
+
+/// Frame type bytes shared by the writer and reader.
+///
+/// v1 (`0x00`) frames authenticate only the ciphertext: the header (length +
+/// plaintext CRC32) and the end marker sit outside the AEAD, and frames are
+/// emitted per upstream read so their plaintext length varies.
+///
+/// v2 (`0x01`/`0x02`) frames fix both gaps while keeping the byte layout:
+/// - the 8-byte header and the frame's index are bound as AEAD associated
+///   data, so header tampering, frame reordering and cross-frame splicing
+///   fail authentication;
+/// - the final frame of a stream (or of each multipart part segment) carries
+///   its own type byte, authenticated via the AAD, so truncating trailing
+///   frames is detected — the unauthenticated `0xFF` end marker remains only
+///   as the segment delimiter;
+/// - every non-final frame carries exactly [`ENCRYPTION_BLOCK_SIZE`] plaintext
+///   bytes, giving fixed-length frames a closed-form offset mapping.
+const FRAME_TYPE_V1: u8 = 0x00;
+const FRAME_TYPE_V2: u8 = 0x01;
+const FRAME_TYPE_V2_FINAL: u8 = 0x02;
+const FRAME_TYPE_END: u8 = 0xFF;
+
+/// AEAD associated data of a v2 frame: the 8-byte header followed by the
+/// frame index within its segment, little-endian.
+fn v2_frame_aad(header: &[u8; 8], block_index: usize) -> [u8; 16] {
+    let mut aad = [0u8; 16];
+    aad[..8].copy_from_slice(header);
+    aad[8..].copy_from_slice(&(block_index as u64).to_le_bytes());
+    aad
+}
 
 pin_project! {
     /// A reader wrapper that encrypts data on the fly using AES-256-GCM.
@@ -38,6 +68,10 @@ pin_project! {
         read_buffer: Vec<u8>,
         block_index: usize,
         finished: bool,
+        // v2 framing (see the frame-type constants above)
+        frame_v2: bool,
+        pending: usize,
+        input_done: bool,
     }
 }
 
@@ -55,12 +89,87 @@ where
             read_buffer: vec![0u8; ENCRYPTION_BLOCK_SIZE],
             block_index: 0,
             finished: false,
+            frame_v2: false,
+            pending: 0,
+            input_done: false,
         }
     }
 
     pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
         Self::new(inner, key, multipart_part_nonce(base_nonce, part_number))
     }
+
+    /// Writer for the authenticated, fixed-frame v2 layout.
+    ///
+    /// Key and nonce derivation are identical to [`EncryptReader::new`]; only
+    /// the frame format changes (header + frame index bound as AEAD associated
+    /// data, an authenticated final frame, fixed-size non-final frames).
+    pub fn new_v2(inner: R, key: [u8; 32], nonce: [u8; 12]) -> Self {
+        let mut reader = Self::new(inner, key, nonce);
+        reader.frame_v2 = true;
+        reader
+    }
+
+    /// Multipart writer for the v2 layout; see [`EncryptReader::new_v2`].
+    pub fn new_multipart_v2(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        let mut reader = Self::new_multipart(inner, key, base_nonce, part_number);
+        reader.frame_v2 = true;
+        reader
+    }
+}
+
+/// Build one frame: header, plaintext-length uvarint, ciphertext. For v2
+/// frames the header and frame index are the AEAD associated data.
+fn build_frame(
+    cipher: &Aes256Gcm,
+    nonce_bytes: &[u8; 12],
+    type_byte: u8,
+    block_index: usize,
+    plaintext: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+    let nonce = &nonce;
+    let crc = {
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(plaintext);
+        hasher.finalize() as u32
+    };
+    let int_len = put_uvarint_len(plaintext.len() as u64);
+    // Ciphertext length is plaintext + 16-byte GCM tag, known ahead of
+    // encryption, so the header can be fixed before it becomes the AAD.
+    let clen = int_len + plaintext.len() + 16 + 4;
+    let mut header = [0u8; 8];
+    header[0] = type_byte;
+    header[1] = (clen & 0xFF) as u8;
+    header[2] = ((clen >> 8) & 0xFF) as u8;
+    header[3] = ((clen >> 16) & 0xFF) as u8;
+    header[4] = (crc & 0xFF) as u8;
+    header[5] = ((crc >> 8) & 0xFF) as u8;
+    header[6] = ((crc >> 16) & 0xFF) as u8;
+    header[7] = ((crc >> 24) & 0xFF) as u8;
+
+    let ciphertext = match type_byte {
+        FRAME_TYPE_V1 => cipher.encrypt(nonce, plaintext),
+        _ => {
+            let aad = v2_frame_aad(&header, block_index);
+            cipher.encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+        }
+    }
+    .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
+
+    let mut out = Vec::with_capacity(8 + int_len + ciphertext.len());
+    out.extend_from_slice(&header);
+    let mut plaintext_len_buf = [0u8; 10];
+    let encoded_len = put_uvarint(&mut plaintext_len_buf, plaintext.len() as u64);
+    out.extend_from_slice(&plaintext_len_buf[..encoded_len]);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }
 
 impl<R> AsyncRead for EncryptReader<R>
@@ -83,6 +192,56 @@ where
         if *this.finished {
             return Poll::Ready(Ok(()));
         }
+
+        if *this.frame_v2 {
+            // Accumulate a full block so every non-final frame carries exactly
+            // ENCRYPTION_BLOCK_SIZE plaintext bytes (fixed-length frames give
+            // range reads a closed-form offset mapping).
+            while !*this.input_done && *this.pending < ENCRYPTION_BLOCK_SIZE {
+                let mut temp_buf = ReadBuf::new(&mut this.read_buffer[*this.pending..ENCRYPTION_BLOCK_SIZE]);
+                match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        let n = temp_buf.filled().len();
+                        if n == 0 {
+                            *this.input_done = true;
+                        } else {
+                            *this.pending += n;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                }
+            }
+
+            // A short block is only ever the stream tail; EOF exactly on a block
+            // boundary emits that full block as non-final and an empty final
+            // frame on the next poll, so emptiness is always authenticated.
+            let is_final = *this.input_done && *this.pending < ENCRYPTION_BLOCK_SIZE;
+            let type_byte = if is_final { FRAME_TYPE_V2_FINAL } else { FRAME_TYPE_V2 };
+            let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
+            let mut out = build_frame(
+                this.cipher,
+                &block_nonce,
+                type_byte,
+                *this.block_index,
+                &this.read_buffer[..*this.pending],
+            )?;
+            if is_final {
+                let mut end_header = [0u8; 8];
+                end_header[0] = FRAME_TYPE_END;
+                out.extend_from_slice(&end_header);
+                *this.finished = true;
+            }
+            *this.pending = 0;
+            *this.block_index += 1;
+            *this.buffer = out;
+            *this.buffer_pos = 0;
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos += to_copy;
+            return Poll::Ready(Ok(()));
+        }
+
         // Read a fixed block size from inner.
         let mut temp_buf = ReadBuf::new(&mut this.read_buffer[..]);
         match this.inner.as_mut().poll_read(cx, &mut temp_buf) {
@@ -192,6 +351,13 @@ pin_project! {
         ciphertext_buf: Vec<u8>,
         ciphertext_read: usize,
         ciphertext_len: usize,
+        // v2 framing state (see the frame-type constants above)
+        current_frame_type: u8,
+        segment_frame_version: Option<u8>,
+        saw_final_frame: bool,
+        segment_frames: usize,
+        stream_saw_v2: bool,
+        segments_completed: usize,
     }
 }
 
@@ -219,6 +385,12 @@ where
             ciphertext_buf: Vec::new(),
             ciphertext_read: 0,
             ciphertext_len: 0,
+            current_frame_type: FRAME_TYPE_V1,
+            segment_frame_version: None,
+            saw_final_frame: false,
+            segment_frames: 0,
+            stream_saw_v2: false,
+            segments_completed: 0,
         }
     }
 
@@ -247,6 +419,12 @@ where
             ciphertext_buf: Vec::new(),
             ciphertext_read: 0,
             ciphertext_len: 0,
+            current_frame_type: FRAME_TYPE_V1,
+            segment_frame_version: None,
+            saw_final_frame: false,
+            segment_frames: 0,
+            stream_saw_v2: false,
+            segments_completed: 0,
         }
     }
 }
@@ -286,6 +464,30 @@ where
                             let n = temp_buf.filled().len();
                             if n == 0 {
                                 if *this.header_read == 0 {
+                                    // v2 segments end with an authenticated final
+                                    // frame; a clean EOF before it means trailing
+                                    // frames were dropped.
+                                    if *this.segment_frame_version == Some(2)
+                                        && !*this.saw_final_frame
+                                        && *this.segment_frames > 0
+                                    {
+                                        return Poll::Ready(Err(Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "encrypted stream truncated before its final frame",
+                                        )));
+                                    }
+                                    // A v2 multipart stream must deliver every
+                                    // listed part segment; a missing tail part
+                                    // would otherwise read as a clean end.
+                                    if *this.stream_saw_v2
+                                        && *this.multipart_mode
+                                        && *this.segments_completed < this.multipart_parts.len()
+                                    {
+                                        return Poll::Ready(Err(Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "encrypted stream ended before all part segments were read",
+                                        )));
+                                    }
                                     *this.finished = true;
                                     return Poll::Ready(Ok(()));
                                 }
@@ -315,7 +517,21 @@ where
                 *this.header_read = 0;
                 *this.header_done = false;
 
-                if typ == 0xFF {
+                if typ == FRAME_TYPE_END {
+                    // A v2 segment terminator is only valid right after the
+                    // segment's authenticated final frame; anywhere earlier it
+                    // marks dropped frames.
+                    if *this.segment_frame_version == Some(2) && !*this.saw_final_frame {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "encrypted segment terminator before the final frame",
+                        )));
+                    }
+                    *this.segments_completed += 1;
+                    *this.segment_frame_version = None;
+                    *this.saw_final_frame = false;
+                    *this.segment_frames = 0;
+
                     if *this.multipart_mode {
                         let next_part = if *this.current_part_index + 1 < this.multipart_parts.len() {
                             *this.current_part_index += 1;
@@ -342,9 +558,45 @@ where
                     continue;
                 }
 
+                let frame_version = match typ {
+                    FRAME_TYPE_V1 => 1,
+                    FRAME_TYPE_V2 | FRAME_TYPE_V2_FINAL => 2,
+                    other => {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown encrypted frame type {other:#04x}"),
+                        )));
+                    }
+                };
+                if *this.saw_final_frame {
+                    return Poll::Ready(Err(Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "encrypted frame after the segment's final frame",
+                    )));
+                }
+                match *this.segment_frame_version {
+                    None => *this.segment_frame_version = Some(frame_version),
+                    Some(version) if version != frame_version => {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "encrypted segment mixes frame format versions",
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                if frame_version == 2 {
+                    *this.stream_saw_v2 = true;
+                }
+                *this.current_frame_type = typ;
+
                 tracing::debug!(typ = typ, len = len, "decrypt block header");
 
                 if len == 0 {
+                    if frame_version == 2 {
+                        // Every v2 frame — including the empty final frame — has a
+                        // tagged payload; a zero length can only be a forgery.
+                        return Poll::Ready(Err(Error::new(std::io::ErrorKind::InvalidData, "zero-length v2 encrypted frame")));
+                    }
                     tracing::warn!("encountered zero-length encrypted block, treating as end of stream");
                     *this.finished = true;
                     *this.ciphertext_read = 0;
@@ -407,32 +659,52 @@ where
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
             let block_nonce = derive_block_nonce(this.current_nonce_base, *this.block_index);
             let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
-            let legacy_part_nonce = if *this.multipart_mode {
-                derive_legacy_part_nonce(this.base_nonce, *this.current_part)
+            let plaintext = if *this.current_frame_type != FRAME_TYPE_V1 {
+                // v2: the header and frame index are associated data, the nonce
+                // derivation is exactly the modern scheme, and there are no
+                // legacy fallbacks — any mismatch is tampering, not history.
+                let aad = v2_frame_aad(this.header_buf, *this.block_index);
+                this.cipher
+                    .decrypt(
+                        &nonce,
+                        Payload {
+                            msg: ciphertext,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| Error::new(std::io::ErrorKind::InvalidData, "v2 encrypted frame failed authentication"))?
             } else {
-                *this.base_nonce
-            };
-            let legacy_block_nonce = derive_block_nonce(&legacy_part_nonce, *this.block_index);
-            let plaintext = match this.cipher.decrypt(&nonce, ciphertext) {
-                Ok(plaintext) => plaintext,
-                Err(primary_err) => {
-                    let legacy_nonce =
-                        Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+                let legacy_part_nonce = if *this.multipart_mode {
+                    derive_legacy_part_nonce(this.base_nonce, *this.current_part)
+                } else {
+                    *this.base_nonce
+                };
+                let legacy_block_nonce = derive_block_nonce(&legacy_part_nonce, *this.block_index);
+                match this.cipher.decrypt(&nonce, ciphertext) {
+                    Ok(plaintext) => plaintext,
+                    Err(primary_err) => {
+                        let legacy_nonce =
+                            Nonce::try_from(legacy_block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
 
-                    match this.cipher.decrypt(&legacy_nonce, ciphertext) {
-                        Ok(plaintext) => plaintext,
-                        Err(_) => {
-                            // Accept previously written streams that reused the part nonce
-                            // for every block inside a segment.
-                            let legacy_part_nonce = Nonce::try_from(legacy_part_nonce.as_slice())
-                                .map_err(|_| Error::other("invalid nonce length"))?;
-                            this.cipher
-                                .decrypt(&legacy_part_nonce, ciphertext)
-                                .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
+                        match this.cipher.decrypt(&legacy_nonce, ciphertext) {
+                            Ok(plaintext) => plaintext,
+                            Err(_) => {
+                                // Accept previously written streams that reused the part nonce
+                                // for every block inside a segment.
+                                let legacy_part_nonce = Nonce::try_from(legacy_part_nonce.as_slice())
+                                    .map_err(|_| Error::other("invalid nonce length"))?;
+                                this.cipher
+                                    .decrypt(&legacy_part_nonce, ciphertext)
+                                    .map_err(|_| Error::other(format!("decrypt error: {primary_err}")))?
+                            }
                         }
                     }
                 }
             };
+            if *this.current_frame_type == FRAME_TYPE_V2_FINAL {
+                *this.saw_final_frame = true;
+            }
+            *this.segment_frames += 1;
 
             debug!(
                 part = *this.current_part,
@@ -466,6 +738,14 @@ where
             *this.block_index += 1;
             *this.ciphertext_read = 0;
             *this.ciphertext_len = 0;
+
+            if this.buffer.is_empty() {
+                // An authenticated empty frame (the v2 final frame of a
+                // block-aligned segment) carries no plaintext. Keep parsing:
+                // returning Ready with nothing appended would read as EOF to
+                // the caller and silently drop every remaining segment.
+                continue;
+            }
 
             let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
             buf.put_slice(&this.buffer[..to_copy]);
@@ -1044,5 +1324,228 @@ mod tests {
         let mut out = Vec::new();
         let res = decrypt_reader.read_to_end(&mut out).await;
         assert!(res.is_err(), "corrupted short encrypted block must return an error, not panic");
+    }
+
+    // ======================= v2 frame format =======================
+
+    /// Byte cost of one full v2 frame: 8B header + 2B uvarint(8192) + 8192B
+    /// plaintext + 16B GCM tag.
+    const V2_FULL_FRAME_LEN: usize = 8 + 2 + super::ENCRYPTION_BLOCK_SIZE + 16;
+
+    async fn v2_encrypt(data: &[u8], key: [u8; 32], nonce: [u8; 12]) -> Vec<u8> {
+        let mut encrypt_reader = EncryptReader::new_v2(BufReader::new(data), key, nonce);
+        let mut encrypted = Vec::new();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("v2 encryption succeeds");
+        encrypted
+    }
+
+    async fn v2_decrypt(bytes: Vec<u8>, key: [u8; 32], nonce: [u8; 12]) -> std::io::Result<Vec<u8>> {
+        let mut decrypt_reader = DecryptReader::new(Cursor::new(bytes), key, nonce);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await?;
+        Ok(decrypted)
+    }
+
+    #[tokio::test]
+    async fn v2_round_trips_every_boundary_length() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let block = super::ENCRYPTION_BLOCK_SIZE;
+        for len in [0usize, 1, block - 1, block, block + 1, 3 * block, 3 * block + 7] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let encrypted = v2_encrypt(&data, key, nonce).await;
+            let decrypted = v2_decrypt(encrypted, key, nonce).await.expect("round trip succeeds");
+            assert_eq!(decrypted, data, "length {len} must round-trip");
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_non_final_frames_are_fixed_length() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let block = super::ENCRYPTION_BLOCK_SIZE;
+        // 3 full frames + a 7-byte final frame + the 8-byte end marker.
+        let tail = 7usize;
+        let data: Vec<u8> = vec![0xAB; 3 * block + tail];
+        let encrypted = v2_encrypt(&data, key, nonce).await;
+        let final_frame_len = 8 + 1 + tail + 16;
+        assert_eq!(encrypted.len(), 3 * V2_FULL_FRAME_LEN + final_frame_len + 8);
+        for frame_index in 0..3 {
+            assert_eq!(encrypted[frame_index * V2_FULL_FRAME_LEN], super::FRAME_TYPE_V2);
+        }
+        assert_eq!(encrypted[3 * V2_FULL_FRAME_LEN], super::FRAME_TYPE_V2_FINAL);
+        assert_eq!(encrypted[encrypted.len() - 8], super::FRAME_TYPE_END);
+
+        // EOF exactly on a block boundary still authenticates emptiness with an
+        // empty final frame.
+        let aligned: Vec<u8> = vec![0xCD; block];
+        let encrypted = v2_encrypt(&aligned, key, nonce).await;
+        let empty_final_len = 8 + 1 + 16;
+        assert_eq!(encrypted.len(), V2_FULL_FRAME_LEN + empty_final_len + 8);
+    }
+
+    #[tokio::test]
+    async fn v2_rejects_header_tampering_reordering_and_truncation() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let block = super::ENCRYPTION_BLOCK_SIZE;
+        let data: Vec<u8> = (0..2 * block + 100).map(|i| (i % 249) as u8).collect();
+        let encrypted = v2_encrypt(&data, key, nonce).await;
+
+        // Flip a CRC byte in the first frame's header: the header is AAD, so
+        // authentication fails even though the ciphertext is untouched.
+        let mut crc_flip = encrypted.clone();
+        crc_flip[5] ^= 0x01;
+        v2_decrypt(crc_flip, key, nonce)
+            .await
+            .expect_err("header tampering must fail");
+
+        // Rewrite the final-frame type byte to non-final: same AAD binding.
+        let mut type_flip = encrypted.clone();
+        let final_offset = 2 * V2_FULL_FRAME_LEN;
+        assert_eq!(type_flip[final_offset], super::FRAME_TYPE_V2_FINAL);
+        type_flip[final_offset] = super::FRAME_TYPE_V2;
+        v2_decrypt(type_flip, key, nonce)
+            .await
+            .expect_err("final-flag tampering must fail");
+
+        // Swap the two full frames: the frame index is AAD, so replaying a
+        // frame at another position fails.
+        let mut swapped = encrypted.clone();
+        let (first, rest) = swapped.split_at_mut(V2_FULL_FRAME_LEN);
+        first.swap_with_slice(&mut rest[..V2_FULL_FRAME_LEN]);
+        v2_decrypt(swapped, key, nonce).await.expect_err("frame reordering must fail");
+
+        // Drop the final frame and end marker: a clean EOF before the final
+        // frame is truncation, not success.
+        let truncated = encrypted[..2 * V2_FULL_FRAME_LEN].to_vec();
+        v2_decrypt(truncated, key, nonce).await.expect_err("truncation must fail");
+
+        // Fabricate an early end marker where the final frame should be.
+        let mut early_end = encrypted[..2 * V2_FULL_FRAME_LEN].to_vec();
+        early_end.extend_from_slice(&[super::FRAME_TYPE_END, 0, 0, 0, 0, 0, 0, 0]);
+        v2_decrypt(early_end, key, nonce)
+            .await
+            .expect_err("forged end marker must fail");
+
+        // Unknown frame type and forged zero-length v2 frame both fail.
+        v2_decrypt(vec![0x07, 0, 0, 0, 0, 0, 0, 0], key, nonce)
+            .await
+            .expect_err("unknown frame type must fail");
+        v2_decrypt(vec![super::FRAME_TYPE_V2, 0, 0, 0, 0, 0, 0, 0], key, nonce)
+            .await
+            .expect_err("zero-length v2 frame must fail");
+
+        // The untampered stream still decrypts after all that.
+        let decrypted = v2_decrypt(encrypted, key, nonce).await.expect("control decrypt succeeds");
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn v2_rejects_mixed_frame_versions_within_a_segment() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let block = super::ENCRYPTION_BLOCK_SIZE;
+        let v2_stream = v2_encrypt(&vec![0x11; block], key, nonce).await;
+
+        // First full v2 frame followed by a v1 frame header: version mixing.
+        let mut mixed = v2_stream[..V2_FULL_FRAME_LEN].to_vec();
+        let mut v1_reader = EncryptReader::new(BufReader::new(&[0x22u8; 64][..]), key, nonce);
+        let mut v1_stream = Vec::new();
+        v1_reader.read_to_end(&mut v1_stream).await.expect("v1 encryption succeeds");
+        mixed.extend_from_slice(&v1_stream);
+        v2_decrypt(mixed, key, nonce)
+            .await
+            .expect_err("mixed frame versions must fail");
+    }
+
+    #[tokio::test]
+    async fn v2_multipart_round_trips_and_detects_missing_parts() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let part_one: Vec<u8> = vec![0x31; super::ENCRYPTION_BLOCK_SIZE + 11];
+        let part_two: Vec<u8> = vec![0x32; 300];
+
+        async fn encrypt_part_v2(data: &[u8], key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Vec<u8> {
+            let mut reader = EncryptReader::new_multipart_v2(BufReader::new(data), key, base_nonce, part_number);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.expect("part encryption succeeds");
+            out
+        }
+
+        let encrypted_one = encrypt_part_v2(&part_one, key, base_nonce, 1).await;
+        let encrypted_two = encrypt_part_v2(&part_two, key, base_nonce, 2).await;
+
+        let mut combined = encrypted_one.clone();
+        combined.extend_from_slice(&encrypted_two);
+        let mut decrypt_reader = DecryptReader::new_multipart(Cursor::new(combined), key, base_nonce, vec![1, 2]);
+        let mut decrypted = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("multipart v2 round trip succeeds");
+        let mut expected = part_one.clone();
+        expected.extend_from_slice(&part_two);
+        assert_eq!(decrypted, expected);
+
+        // Dropping the entire second part must not read as a clean end.
+        let mut decrypt_reader = DecryptReader::new_multipart(Cursor::new(encrypted_one), key, base_nonce, vec![1, 2]);
+        let mut decrypted = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect_err("a missing part segment must fail");
+    }
+
+    #[tokio::test]
+    async fn v2_multipart_serves_segments_after_a_block_aligned_part() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        // A block-aligned first part ends in an authenticated EMPTY final
+        // frame. That zero-plaintext frame must not surface as a zero-byte
+        // read (EOF to the caller) — the regression dropped every segment
+        // after it.
+        let part_one: Vec<u8> = (0..4 * super::ENCRYPTION_BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
+        let part_two: Vec<u8> = (0..super::ENCRYPTION_BLOCK_SIZE + 77)
+            .map(|i| ((i + 5) % 241) as u8)
+            .collect();
+
+        let mut combined = Vec::new();
+        for (data, part_number) in [(&part_one, 1usize), (&part_two, 2usize)] {
+            let mut reader = EncryptReader::new_multipart_v2(BufReader::new(&data[..]), key, base_nonce, part_number);
+            reader.read_to_end(&mut combined).await.expect("part encryption succeeds");
+        }
+
+        let mut decrypt_reader = DecryptReader::new_multipart(Cursor::new(combined), key, base_nonce, vec![1, 2]);
+        let mut decrypted = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("block-aligned multipart round trip succeeds");
+        let mut expected = part_one.clone();
+        expected.extend_from_slice(&part_two);
+        assert_eq!(decrypted.len(), expected.len(), "no segment may be dropped after an empty final frame");
+        assert_eq!(decrypted, expected);
     }
 }
