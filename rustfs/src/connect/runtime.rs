@@ -57,6 +57,7 @@ pub struct InventoryRuntime {
     shutdown: CancellationToken,
     status: watch::Receiver<InventoryStatus>,
     task: Option<JoinHandle<()>>,
+    _lock: std::fs::File,
 }
 
 impl InventoryRuntime {
@@ -200,7 +201,6 @@ where
     let task_shutdown = shutdown.clone();
     let (status_tx, status_rx) = watch::channel(InventoryStatus::Starting);
     let task = tokio::spawn(async move {
-        let _lock = lock;
         let mut backoff = retry_schedule.initial_backoff;
         loop {
             if task_shutdown.is_cancelled() {
@@ -331,6 +331,7 @@ where
         shutdown,
         status: status_rx,
         task: Some(task),
+        _lock: lock,
     }))
 }
 
@@ -474,6 +475,7 @@ mod tests {
             task_inventory_shutdown.cancelled().await;
             let _ = inventory_stopped.send(());
         });
+        let inventory_lock = tempfile::tempfile().expect("inventory runtime lock");
         let heartbeat = HeartbeatRuntime {
             shutdown: heartbeat_shutdown,
             status: heartbeat_status,
@@ -483,6 +485,7 @@ mod tests {
             shutdown: inventory_shutdown,
             status: inventory_status,
             task: Some(inventory_task),
+            _lock: inventory_lock,
         };
 
         let shutdown = tokio::spawn(shutdown_connect_runtimes(Some(heartbeat), Some(inventory)));

@@ -17,6 +17,11 @@
 use std::fs;
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -190,6 +195,20 @@ async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
 }
 
 #[cfg(target_os = "linux")]
+async fn wait_for_inventory_failure(status: &mut watch::Receiver<InventoryStatus>) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(status.borrow_and_update().clone(), InventoryStatus::Failed { .. }) {
+                return;
+            }
+            status.changed().await.expect("inventory status channel");
+        }
+    })
+    .await
+    .expect("inventory failure timeout");
+}
+
+#[cfg(target_os = "linux")]
 fn private_directory(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -285,4 +304,51 @@ async fn connect_offline_collectors_read_only_the_stopped_runtime_inventory() {
         collect_offline_diagnostics(&state, &CancellationToken::new()).await,
         Err(CollectorError::Inventory(InventoryError::EnvelopeInvalid))
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_offline_collectors_reject_a_live_runtime_after_its_task_fails() {
+    let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("safe temporary directory");
+    let state = temp.path().join("state");
+    fs::create_dir(&state).expect("state root");
+    private_directory(&state);
+    let config = HeartbeatConfig::new(
+        "",
+        Vec::new(),
+        IdentityStore::new(state.join("identity")),
+        CredentialStore::new(state.join("credential")),
+        state.join("heartbeat/state.json"),
+    );
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let sample_attempts = attempts.clone();
+    let runtime = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_millis(1),
+            jitter: Duration::ZERO,
+        },
+        &CancellationToken::new(),
+        move || {
+            let attempt = sample_attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if attempt == 0 {
+                InventorySnapshot::new("1.4.2", None, 1, 1, 100, 50, [])
+            } else {
+                Err(InventoryError::Capacity)
+            })
+        },
+    )
+    .expect("state-only inventory")
+    .expect("configured inventory");
+    let mut status = runtime.status();
+    wait_for_inventory_failure(&mut status).await;
+
+    assert!(matches!(
+        collect_offline_diagnostics(&state, &CancellationToken::new()).await,
+        Err(CollectorError::Inventory(InventoryError::AlreadyRunning))
+    ));
+    runtime.shutdown().await;
+    collect_offline_diagnostics(&state, &CancellationToken::new())
+        .await
+        .expect("collector after runtime shutdown");
 }
