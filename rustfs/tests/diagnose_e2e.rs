@@ -215,11 +215,8 @@ fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
     assert!(matches!(legacy, Ok(CommandResult::Server(_))));
 }
 
-/// True-binary smoke test. Ignored by default: building the full rustfs
-/// binary is expensive; run locally with
-/// `cargo test -p rustfs --test diagnose_e2e -- --ignored`.
+/// True-binary smoke test for the user-facing diagnose command.
 #[test]
-#[ignore = "builds the full rustfs binary; run with -- --ignored"]
 fn binary_smoke_diagnose_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("rustfs.log"), quorum_and_faulty_lines()).expect("write");
