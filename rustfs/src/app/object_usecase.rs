@@ -235,22 +235,6 @@ use crate::app::object_traffic_health::ObjectTrafficHealth;
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 fn s3s_body_error_to_io(err: StdError) -> io::Error {
-    match err.to_string().as_str() {
-        "UploadStreamError: Sha256Mismatch" => {
-            return io::Error::new(
-                io::ErrorKind::InvalidData,
-                rustfs_rio::ChecksumMismatch {
-                    want: AMZ_CONTENT_SHA256.to_string(),
-                    got: "payload sha256".to_string(),
-                },
-            );
-        }
-        "UploadStreamError: Incomplete" | "UploadStreamError: LengthMismatch" => {
-            return io::Error::new(io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 0 });
-        }
-        _ => {}
-    }
-
     io::Error::other(err)
 }
 
@@ -16248,6 +16232,43 @@ mod tests {
             zero_copy_eager_put_path_status(2 * 1024 * 1024, &headers, false, false, true),
             PUT_EAGER_STATUS_EXTRACT
         );
+    }
+
+    #[test]
+    fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
+        let error = s3s_body_error_to_io(Box::new(s3s::UploadStreamError::Sha256Mismatch));
+
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<s3s::UploadStreamError>()),
+            Some(s3s::UploadStreamError::Sha256Mismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
+        let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
+            s3s::UploadStreamError::Sha256Mismatch,
+        )))]));
+
+        let error = read_small_put_body_exact_direct(body, 1)
+            .await
+            .expect_err("SHA256 mismatch should reject the small PUT body");
+
+        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
+        let body = futures::stream::iter(vec![Err::<Bytes, s3s::UploadStreamError>(s3s::UploadStreamError::Sha256Mismatch)]);
+
+        let error = match read_zero_copy_put_body_exact(body, 1).await {
+            Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
     }
 
     struct FragmentedBody {
